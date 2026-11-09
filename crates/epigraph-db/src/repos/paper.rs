@@ -390,58 +390,86 @@ impl PaperRepository {
             .collect())
     }
 
-    /// [`Self::list_authors`] for several papers in ONE read, bounded in SQL:
-    /// at most `per_paper` authors of each (under the same predicate), plus
-    /// whether more exist. Papers with no readable author are absent from the
-    /// map. For a reader that lists several documents' authors at once (a
-    /// claim's provenance block), so neither the number of papers nor the
-    /// length of an author list turns one read into an unbounded one.
+    /// The authors of several papers in ONE read, bounded in SQL, as the
+    /// INGESTS named in `writers` wrote them: at most `per_paper` authors of
+    /// each paper (under [`Self::list_authors`]'s predicate), plus whether
+    /// more exist. Papers with no listed author are absent from the map. For
+    /// a reader that lists several documents' authors at once (a claim's
+    /// provenance block), so neither the number of papers nor the length of
+    /// an author list turns one read into an unbounded one.
     ///
-    /// `recorded` names, per paper, the authors a reader takes from a record
-    /// rather than from the edges alone (a claim's creating ingest records its
-    /// document's authors: `crate::ClaimIngestRecord::authors`), as `(paper,
-    /// agent)` pairs. Each listed author carries whether its pair is in
-    /// `recorded`, and those authors are listed FIRST (then the listing's own
-    /// order), so authorships other ingests added to the same paper, however
-    /// many and wherever they sort, can never push a recorded author out of
-    /// the `per_paper` window.
+    /// Each principal's ingest keeps its own authorship rows
+    /// (`crate::ingest_written`), so a paper's authors are a set of words,
+    /// one per ingest principal. `writers` names, per paper, the principals
+    /// whose rows this read takes, as `(paper, principal, rank)`: only a row
+    /// whose ingest-written marker's `by` is one of the paper's writers is
+    /// listed (compared as text, so a malformed marker matches nothing). An
+    /// author is listed ONCE: from its recorded row if it has one (below),
+    /// else from the lowest-ranked writer's row, a row not awaiting
+    /// countersignature before one that is, then the oldest.
+    ///
+    /// `recorded` names the authorships a reader takes from a record rather
+    /// than from the edges alone, as `(paper, author, principal)`: a claim's
+    /// creating ingest records its document's authors
+    /// (`crate::ClaimIngestRecord::authors`), and the row that backs a
+    /// recorded author is that SAME principal's own row, never another
+    /// ingest's row of the same author. Each listed author carries whether it
+    /// was listed from a recorded row; those are listed FIRST (then position
+    /// order), so authorships other ingests wrote, however many and wherever
+    /// they sort, can never push a recorded author out of the `per_paper`
+    /// window.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer, recorded))]
+    #[instrument(skip(executor, viewer, writers, recorded))]
     pub async fn list_authors_bounded<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         paper_ids: &[Uuid],
         per_paper: i64,
-        recorded: &[(Uuid, Uuid)],
+        writers: &[(Uuid, Uuid, i32)],
+        recorded: &[(Uuid, Uuid, Uuid)],
     ) -> Result<BoundedAuthorListings, DbError> {
         let mut out = BoundedAuthorListings::new();
-        if paper_ids.is_empty() || per_paper <= 0 {
+        if paper_ids.is_empty() || per_paper <= 0 || writers.is_empty() {
             return Ok(out);
         }
-        let in_record = "EXISTS (SELECT 1 FROM unnest($3::uuid[], $4::uuid[]) AS r(p, a) \
-                          WHERE r.p = p.id AND r.a = e.source_id)";
+        let written_by = crate::repos::ingest_written::ingest_written_by_sql("e");
+        let in_record = format!(
+            "EXISTS (SELECT 1 FROM unnest($3::uuid[], $4::uuid[], $5::uuid[]) AS r(p, a, w) \
+              WHERE r.p = p.id AND r.a = e.source_id AND r.w::text = {written_by})"
+        );
         let sql = viewer.splice(
             &format!(
                 "SELECT p.id, x.* \
                    FROM unnest($1::uuid[]) AS p(id) \
                   CROSS JOIN LATERAL ( \
-                        SELECT {columns}, {in_record} AS in_record, \
-                               row_number() OVER (ORDER BY {in_record} DESC, {order}) \
+                        SELECT d.*, \
+                               row_number() OVER (ORDER BY d.in_record DESC, \
+                                                  d.pos NULLS LAST, d.at, d.eid) \
                                    AS listing_rank \
-                          FROM edges e \
-                          JOIN agents a ON a.id = e.source_id \
-                         WHERE e.target_id = p.id AND {authored} \
-                           /* {{EDGE_VISIBILITY:e}} */ \
-                         ORDER BY {in_record} DESC, {order} \
+                          FROM ( \
+                                SELECT DISTINCT ON (e.source_id) \
+                                       {columns}, {in_record} AS in_record, \
+                                       {pos} AS pos, e.created_at AS at, e.id AS eid \
+                                  FROM edges e \
+                                  JOIN agents a ON a.id = e.source_id \
+                                  JOIN unnest($6::uuid[], $7::uuid[], $8::int[]) \
+                                       AS w(p, by, rank) \
+                                    ON w.p = p.id AND w.by::text = {written_by} \
+                                 WHERE e.target_id = p.id AND {authored} \
+                                   /* {{EDGE_VISIBILITY:e}} */ \
+                                 ORDER BY e.source_id, {in_record} DESC, w.rank, \
+                                          {pending}, e.created_at, e.id) d \
+                         ORDER BY d.in_record DESC, d.pos NULLS LAST, d.at, d.eid \
                          LIMIT $2) x \
                   ORDER BY p.id, x.listing_rank",
                 columns = author_listing_columns(),
                 authored = authored_in_force_readable(),
-                order = AUTHOR_LISTING_ORDER,
+                pos = AUTHOR_LISTING_POSITION,
+                pending = crate::agent_lookup::authorship_pending_sql("e"),
             ),
-            5,
+            9,
         );
         type Row = (
             Uuid,
@@ -454,18 +482,25 @@ impl PaperRepository {
             Option<String>,
             Option<String>,
             bool,
+            Option<i64>,
+            chrono::DateTime<chrono::Utc>,
+            Uuid,
             i64,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(paper_ids)
             .bind(per_paper.saturating_add(1))
-            .bind(recorded.iter().map(|(p, _)| *p).collect::<Vec<Uuid>>())
-            .bind(recorded.iter().map(|(_, a)| *a).collect::<Vec<Uuid>>());
+            .bind(recorded.iter().map(|(p, _, _)| *p).collect::<Vec<Uuid>>())
+            .bind(recorded.iter().map(|(_, a, _)| *a).collect::<Vec<Uuid>>())
+            .bind(recorded.iter().map(|(_, _, w)| *w).collect::<Vec<Uuid>>())
+            .bind(writers.iter().map(|(p, _, _)| *p).collect::<Vec<Uuid>>())
+            .bind(writers.iter().map(|(_, w, _)| *w).collect::<Vec<Uuid>>())
+            .bind(writers.iter().map(|(_, _, r)| *r).collect::<Vec<i32>>());
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let limit = usize::try_from(per_paper).unwrap_or(usize::MAX);
-        for (paper, a, name, pos, role, aff, pending, by, written, in_record, _rank) in
+        for (paper, a, name, pos, role, aff, pending, by, written, in_record, ..) in
             q.fetch_all(executor).await?
         {
             let entry = out.entry(paper).or_default();
@@ -1108,7 +1143,7 @@ pub struct PaperAuthorEdge {
 }
 
 /// What [`PaperRepository::list_authors_bounded`] returns: per paper, its
-/// listed authors (each with whether the caller's record names it) and
+/// listed authors (each with whether it was listed from a recorded row) and
 /// whether more exist.
 pub type BoundedAuthorListings =
     std::collections::HashMap<Uuid, (Vec<(PaperAuthorListing, bool)>, bool)>;
@@ -1145,6 +1180,11 @@ fn authored_in_force_readable() -> String {
         marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
     )
 }
+
+/// An authorship edge `e`'s extraction position, when it is a non-negative
+/// integer.
+const AUTHOR_LISTING_POSITION: &str = "CASE WHEN e.properties ->> 'position' ~ '^[0-9]{1,9}$' \
+     THEN (e.properties ->> 'position')::bigint END";
 
 /// The listing order: the extraction's position (missing last), then age.
 const AUTHOR_LISTING_ORDER: &str = "CASE WHEN e.properties ->> 'position' ~ '^[0-9]{1,9}$' \

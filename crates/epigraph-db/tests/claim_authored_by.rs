@@ -1185,9 +1185,23 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     )
     .await;
     // An authorship a LATER ingest of the same document added: listed apart,
-    // never primary.
+    // never primary. That ingest converged on the claim, so it recorded it.
     let added_later = author_node(&pool, "Added Later").await;
     authored(&pool, added_later, doc, second, json!({"position": 1})).await;
+    ingested(&pool, doc, claim, second, false, &[named_person, added_later]).await;
+    // A principal that ingested the same document key WITHOUT recording this
+    // claim: none of its rows, plain or pending, is an author of the claim.
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "outsider-ingester").await;
+    let outsider_name = author_node(&pool, "Outsider Name").await;
+    authored(&pool, outsider_name, doc, outsider, json!({"position": 0})).await;
+    authored(
+        &pool,
+        first_a,
+        doc,
+        outsider,
+        json!({"position": 0, "pending_countersign": true, "ingested_by": outsider.to_string()}),
+    )
+    .await;
     // An authorship no ingest wrote (a row from before the ingest marked its
     // edges, or a hand-written one): never an author.
     let unmarked = author_node(&pool, "Unmarked Author").await;
@@ -1221,6 +1235,14 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
         vec![first_a, first_b, second_author, third, unplaced],
         "by position (a shared one in recording order), a missing one last; never the \
          claim asserter, never the pending person, never an authorship no ingest wrote"
+    );
+    assert!(
+        !ids(&p.authors)
+            .iter()
+            .chain(ids(&p.pending_authors).iter())
+            .chain(ids(&p.added_authors).iter())
+            .any(|a| *a == outsider_name),
+        "a principal that never recorded the claim adds no author to it"
     );
     let by_id = |id: Uuid| p.authors.iter().find(|a| a.id == id).expect("listed");
     let t = by_id(third);
@@ -1282,7 +1304,11 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
             .iter()
             .map(|i| (i.agent.id, i.paper_id, i.created_claim))
             .collect::<Vec<_>>(),
-        vec![(ingester, doc, true), (second, other, false)],
+        vec![
+            (ingester, doc, true),
+            (second, other, false),
+            (second, doc, false)
+        ],
         "every ingester, oldest first"
     );
     assert_eq!(
@@ -1304,7 +1330,7 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     );
     assert_eq!(
         wire["ingesters"].as_array().map(Vec::len),
-        Some(2),
+        Some(3),
         "{wire}"
     );
 }
@@ -1331,6 +1357,9 @@ async fn a_recorded_author_is_never_pushed_out_by_added_ones(pool: PgPool) {
     let lead = author_node(&pool, "Recorded Lead").await;
     authored(&pool, lead, doc, ingester, json!({"position": 7})).await;
     ingested(&pool, doc, claim, ingester, true, &[lead]).await;
+    // The crowding ingest converged on the claim (its rows are read only
+    // for a claim it recorded).
+    ingested(&pool, doc, claim, other, false, &[]).await;
 
     let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
     let p = &literature(&block).paper;

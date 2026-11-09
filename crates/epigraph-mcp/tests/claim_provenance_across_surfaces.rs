@@ -370,10 +370,11 @@ async fn spine_wait(server: &EpiGraphMcpFull, pool: &PgPool, extraction: Documen
     .expect("spine ingests");
 }
 
-/// Every claim the paper keyed `doi` asserts.
+/// Every claim the paper keyed `doi` asserts, each once (every ingest
+/// principal writes its own assertion row).
 async fn claims_of_doc(pool: &PgPool, doi: &str) -> Vec<Uuid> {
     sqlx::query_scalar(
-        "SELECT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
+        "SELECT DISTINCT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
           WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim' \
           ORDER BY pc.target_id",
     )

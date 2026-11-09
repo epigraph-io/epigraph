@@ -326,17 +326,20 @@ pub struct PaperAuthorshipView {
     pub paper: PaperRefView,
     /// On the creating document, the claim's primary authors: those its
     /// creating ingest recorded when it created the claim, whose readable,
-    /// in-force, ingest-written `authored` edge is countersigned or
-    /// name-derived, in position order. On a corroborating document, its
-    /// countersigned and name-derived authors.
+    /// in-force `authored` edge WRITTEN BY THAT SAME INGEST is not awaiting
+    /// countersignature, in position order. On a corroborating document, the
+    /// authors the ingests that recorded the claim through it named, not
+    /// awaiting countersignature. Only the ingests that recorded the claim
+    /// contribute authors, each author once.
     pub authors: Vec<PaperAuthorView>,
     /// Authors an ingester named without speaking for them, not yet
     /// countersigned (`pending_countersign: true`, `named_by`). Never
     /// primary.
     pub pending_authors: Vec<PaperAuthorView>,
     /// On the creating document only: authors its creating ingest did not
-    /// record (a later ingest of the same document key added them), each
-    /// with `added_by`. Never primary; empty on a corroborating document.
+    /// record (a later ingest of the same document key that also recorded
+    /// the claim added them), each with `added_by`. Never primary; empty on
+    /// a corroborating document.
     pub added_authors: Vec<PaperAuthorView>,
     /// More than 50 readable authors exist (the three lists together).
     pub authors_truncated: bool,

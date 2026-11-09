@@ -68,13 +68,18 @@
 //!   which the record contract requires to be the claim's filer), with its
 //!   human and snapshot under the same rules, never presented as an author.
 //!
-//!   The recorded list names agents; whether each authorship is in force,
-//!   readable and countersigned is read from its `authored` edge, which may
-//!   be another ingester's row (the walk deduplicates authorships per
-//!   author and paper). That combines one ingest's word with another's edge
-//!   on purpose: the record decides WHO is primary, the edge can only take an
-//!   author away (retracted, hidden from this caller) or mark them pending,
-//!   never add one.
+//!   Each recorded author is backed by the creating ingest's OWN
+//!   `authored` row of the document (its ingest-written marker names the
+//!   same principal as the record), which says whether that authorship is in
+//!   force, readable and awaiting countersignature. Never another ingest's
+//!   row: every principal's ingest keeps its own rows (`crate::ingest_written`),
+//!   and the person's own countersigned authorship, written by the person's
+//!   own ingest, is not the creating ingest's word. So a stranger who names a
+//!   registered person on a document the person really authored, and creates
+//!   a claim under it, lists the person as PENDING on that claim, named by
+//!   the stranger. The record decides WHO may be primary; the creator's own
+//!   row can only take an author away (retracted, hidden from this caller,
+//!   absent) or mark them pending, never add one.
 //!
 //! Both carry, beside the tag:
 //!
@@ -96,14 +101,20 @@
 //! predicate and order (`PaperRepository::list_authors_bounded`, sharing them
 //! with `list_authors`, the read `query_paper` uses): in-force `authored`
 //! edges the caller can read, in position order, in ONE read for every listed
-//! document, bounded in SQL. An author an
-//! ingester named without speaking for them (`pending_countersign`) is
+//! document, bounded in SQL, and only the rows written by an ingest that
+//! RECORDED THIS CLAIM through that document (the marker's `by` is one of the
+//! claim's ingesters of it), each author once. A principal that ingested the
+//! same document key without recording this claim adds no author, pending or
+//! otherwise, to it. On the creating document an author not in the record
+//! (one the creator's own later ingest added, or one another ingester of the
+//! claim named) is listed under `added_authors`, with `added_by`. An author
+//! an ingester named without speaking for them (`pending_countersign`) is
 //! listed under `pending_authors`, with `named_by` (the ingester whose word
-//! it is), and never under `authors`, so a pending author is never shown as
-//! a primary author. At most [`MAX_PAPER_AUTHORS`] are listed per document
-//! (the three lists together): on the creating document the recorded
-//! authors first, so no number of later additions can push them out, then
-//! position order. Every authorship read is ingest-written
+//! it is: the row's marker), and never under `authors`, so a pending author
+//! is never shown as a primary author. At most [`MAX_PAPER_AUTHORS`] are
+//! listed per document (the three lists together): on the creating document
+//! the recorded authors first, so no number of later additions can push them
+//! out, then position order. Every authorship read is ingest-written
 //! (`crate::ingest_written_edge_sql`): a hand-written or pre-marker
 //! `authored` edge is no author.
 //!
@@ -236,17 +247,19 @@ pub struct PaperAuthor {
 pub struct PaperAuthorship {
     pub paper: PaperRef,
     /// On the creating document: the claim's primary authors, those the
-    /// creating ingest recorded, countersigned or name-derived, in position
-    /// order. On a corroborating document: its countersigned and name-derived
-    /// authors, in position order.
+    /// creating ingest recorded, on its own rows not awaiting
+    /// countersignature, in position order. On a corroborating document: the
+    /// authors the ingests that recorded the claim through it named, not
+    /// awaiting countersignature, in position order.
     pub authors: Vec<PaperAuthor>,
     /// Authors an ingester named without speaking for them, not yet
     /// countersigned, in position order. Never primary.
     pub pending_authors: Vec<PaperAuthor>,
-    /// On the creating document only: countersigned or name-derived authors
-    /// the creating ingest did NOT record (added by a later ingest of the
-    /// same document key), each with `added_by`. Never primary. Always empty
-    /// on a corroborating document.
+    /// On the creating document only: authors not awaiting countersignature
+    /// that the creating ingest did NOT record (added by a later ingest of
+    /// the same document key that also recorded this claim, the creator's
+    /// own included), each with `added_by`. Never primary. Always empty on a
+    /// corroborating document.
     pub added_authors: Vec<PaperAuthor>,
     /// More than [`MAX_PAPER_AUTHORS`] readable authors exist.
     pub authors_truncated: bool,
@@ -398,12 +411,33 @@ impl AuthoredByRepository {
         others.truncate(MAX_PAPERS);
         let mut paper_ids: Vec<Uuid> = creator_paper.into_iter().collect();
         paper_ids.extend(others.iter().copied());
+        // Whose authorship rows are read, per document: only the ingests
+        // that recorded THIS claim through it (each principal keeps its own
+        // rows), the creating ingest first. A principal that ingested the
+        // document without recording the claim adds no author to it.
+        let creator_key = ingests.creator.as_ref().map(|c| (c.paper_id, c.ingested_by));
+        let mut writers: Vec<(Uuid, Uuid, i32)> = Vec::new();
+        for r in &ingests.records {
+            let rank = i32::from(Some((r.paper_id, r.ingested_by)) != creator_key);
+            if !writers
+                .iter()
+                .any(|(p, w, _)| *p == r.paper_id && *w == r.ingested_by)
+            {
+                writers.push((r.paper_id, r.ingested_by, rank));
+            }
+        }
         // The creating document's primary authors: the ones its ingest
-        // recorded when it created the claim, nothing read from the edges.
-        let recorded: Vec<(Uuid, Uuid)> = ingests
+        // recorded when it created the claim, each backed by that ingest's
+        // OWN authorship row (never another ingest's row of the same author).
+        let recorded: Vec<(Uuid, Uuid, Uuid)> = ingests
             .creator
             .as_ref()
-            .map(|c| c.authors.iter().map(|a| (c.paper_id, *a)).collect())
+            .map(|c| {
+                c.authors
+                    .iter()
+                    .map(|a| (c.paper_id, *a, c.ingested_by))
+                    .collect()
+            })
             .unwrap_or_default();
         // The documents and their authors: two reads, both bounded (at most
         // 1 + MAX_PAPERS documents, at most MAX_PAPER_AUTHORS + 1 authors each).
@@ -431,6 +465,7 @@ impl AuthoredByRepository {
                 viewer,
                 &paper_ids,
                 i64::try_from(MAX_PAPER_AUTHORS).unwrap_or(i64::MAX),
+                &writers,
                 &recorded,
             )
             .await?;
@@ -492,8 +527,11 @@ impl AuthoredByRepository {
         };
 
         // `creating`: the document whose ingest created the claim, where only
-        // the recorded authors are primary. Every list keeps the listing's
-        // position order within itself.
+        // the recorded authors, on the creating ingest's own rows, are
+        // primary. Every list keeps the listing's position order within
+        // itself. Who named a pending author, or added one, is the row's
+        // ingest-written marker (`written_by`), the writer the database
+        // guard vouches for.
         let authorship = |id: Uuid, creating: bool| -> Option<PaperAuthorship> {
             let (paper, listing, authors_truncated) = listings.get(&id)?;
             let mut out = PaperAuthorship {
@@ -513,7 +551,7 @@ impl AuthoredByRepository {
                     affiliations: a.affiliations.clone(),
                     pending_countersign: a.pending_countersign,
                     named_by: if a.pending_countersign {
-                        a.ingested_by.map(author_ref)
+                        a.written_by.map(author_ref)
                     } else {
                         None
                     },
