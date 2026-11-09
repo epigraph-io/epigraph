@@ -1320,19 +1320,142 @@ async fn workflow_ingest_refuses_an_author_agent_id(pool: PgPool) {
 
 /// `query_paper(doi)` as a public viewer on `server`.
 async fn query_paper(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> Value {
+    query_paper_of(server, pool, doi, None).await
+}
+
+/// `query_paper(doi, ingested_by)` as a public viewer on `server`.
+async fn query_paper_of(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    doi: &str,
+    ingested_by: Option<Uuid>,
+) -> Value {
     let viewer = fixture::public_viewer(pool).await;
-    let r = tools::paper_queries::query_paper(
-        server,
-        &viewer,
-        QueryPaperParams {
-            doi: doi.to_string(),
-            limit: None,
-            offset: None,
-        },
-    )
-    .await
-    .expect("query_paper");
+    let params: QueryPaperParams = serde_json::from_value(json!({
+        "doi": doi,
+        "ingested_by": ingested_by.map(|u| u.to_string()),
+    }))
+    .expect("params");
+    let r = tools::paper_queries::query_paper(server, &viewer, params)
+        .await
+        .expect("query_paper");
     text(&r)
+}
+
+/// The listed claims of a `query_paper` answer, as `(content, created_claim)`.
+fn listed_claims(q: &Value) -> Vec<(String, Value)> {
+    let mut v: Vec<(String, Value)> = q["claims"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|c| {
+                    (
+                        c["content"].as_str().unwrap_or_default().to_string(),
+                        c["created_claim"].clone(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|x, y| x.0.cmp(&y.0));
+    v
+}
+
+/// The listed authors' names of a `query_paper` answer, in order.
+fn listed_authors(q: &Value) -> Vec<String> {
+    q["authors"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| x["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A paper is shared by its key, and a second ingester can ingest a
+/// different document under it. `query_paper` lists ONE ingest at a time:
+/// the first ingest's authors with the first ingest's claims only, and the
+/// second ingest's authors with its own claims only, each claim saying
+/// whether THAT ingest created it. A stranger's document is never listed
+/// beside the first ingest's authors. Both ingests are named in `ingests`,
+/// and `claim_count` counts every claim of the paper once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let (a_id, b_id) = (
+        a.server_agent_id().await.expect("a"),
+        b.server_agent_id().await.expect("b"),
+    );
+    let doi = "10.9999/per-ingest-listing";
+    ingest_wait(
+        &a,
+        &pool,
+        doc_with_atoms(doi, json!([{"name": "Ingrid Solvang"}]), &["A real finding."]),
+    )
+    .await;
+    ingest_wait(
+        &b,
+        &pool,
+        doc_with_atoms(
+            doi,
+            json!([{"name": "Ingrid Solvang"}, {"name": "Interloper Vexx"}]),
+            &["A fabricated finding."],
+        ),
+    )
+    .await;
+    let first = query_paper(&a, &pool, doi).await;
+    assert_eq!(first["ingested_by"], a_id.to_string(), "{first}");
+    assert_eq!(listed_authors(&first), vec!["Ingrid Solvang"], "{first}");
+    let contents: Vec<String> = listed_claims(&first).into_iter().map(|c| c.0).collect();
+    assert!(
+        contents.contains(&"A real finding.".to_string())
+            && !contents.contains(&"A fabricated finding.".to_string()),
+        "the first ingest lists its own claims only: {first}"
+    );
+    assert!(
+        listed_claims(&first).iter().all(|(_, created)| *created == json!(true)),
+        "the first ingest created every claim it lists: {first}"
+    );
+    let ingests: Vec<Value> = first["ingests"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| i["ingested_by"].clone())
+        .collect();
+    assert_eq!(
+        ingests,
+        vec![json!(a_id.to_string()), json!(b_id.to_string())],
+        "{first}"
+    );
+
+    let second = query_paper_of(&a, &pool, doi, Some(b_id)).await;
+    assert_eq!(second["ingested_by"], b_id.to_string(), "{second}");
+    assert_eq!(
+        listed_authors(&second),
+        vec!["Ingrid Solvang", "Interloper Vexx"],
+        "{second}"
+    );
+    let claims = listed_claims(&second);
+    assert!(
+        claims.contains(&("A fabricated finding.".to_string(), json!(true)))
+            && !claims.iter().any(|c| c.0 == "A real finding."),
+        "the second ingest lists its own claims only: {second}"
+    );
+    assert!(
+        claims
+            .iter()
+            .filter(|c| c.0 != "A fabricated finding.")
+            .all(|c| c.1 == json!(false)),
+        "the second ingest found the shared spine and created none of it: {second}"
+    );
+    assert_eq!(
+        first["claim_count"],
+        paper_claims(&pool, doi).await,
+        "claim_count counts every claim of the paper once"
+    );
 }
 
 /// The paper's author listing (`query_paper`) honours what the ingest
