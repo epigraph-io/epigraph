@@ -2023,7 +2023,10 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
             &doc_with_atoms(
                 d,
                 json!([{"name": name}]),
-                &["The replaced author's atom.", "A claim new in the re-ingest."],
+                &[
+                    "The replaced author's atom.",
+                    "A claim new in the re-ingest.",
+                ],
             ),
             None,
         )
