@@ -2278,3 +2278,75 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
     );
     assert_eq!(authored_in_force(&pool, human, d).await, 1);
 }
+
+/// A document ingest that converges on a claim the SAME agent already filed
+/// without a reasoning trace (a workflow operation atom written as the
+/// caller, a directly filed claim) found that claim; it did not create it.
+/// The walk must not rewrite the row's properties (a workflow atom's
+/// `kind` and `step_lineage_id` would be lost), must not hang its trace on
+/// it, and records `created_claim: false`, so the claim stays its filer's own
+/// and never reads as the document's literature. Whether the walk created
+/// a row is what its INSERT reports, never inferred from the row's author or
+/// trace.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_trace_less_claim_the_ingester_filed_itself_is_found_never_created(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let me = server.server_agent_id().await.expect("agent");
+    // The agent's own group, as its ingest owns rows.
+    ingest_wait(
+        &server,
+        &pool,
+        doc("10.9999/own-filed-warmup", json!([{"name": "Warm Up"}])),
+    )
+    .await;
+    let (group, visibility): (Uuid, String) = sqlx::query_as(
+        "SELECT owner_group_id, visibility::text FROM claims WHERE agent_id = $1 LIMIT 1",
+    )
+    .bind(me)
+    .fetch_one(&pool)
+    .await
+    .expect("the agent's group");
+    let text_of = "An operation the agent filed itself.";
+    let hash = epigraph_ingest::common::ids::content_hash(text_of);
+    let id = epigraph_ingest::common::ids::atom_id(&hash);
+    let lineage = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, labels, properties) \
+         VALUES ($1, $2, $3, 0.8, $4, true, $5, $6, \
+                 ARRAY['workflow:operation'], $7)",
+    )
+    .bind(id)
+    .bind(text_of)
+    .bind(hash.as_slice())
+    .bind(me)
+    .bind(&visibility)
+    .bind(group)
+    .bind(json!({"kind": "operation", "level": 3, "step_lineage_id": lineage.to_string()}))
+    .execute(&pool)
+    .await
+    .expect("the agent's own trace-less claim");
+
+    let doi = "10.9999/own-filed-converge";
+    ingest_wait(
+        &server,
+        &pool,
+        doc_with_atoms(doi, json!([{"name": "Warm Up"}]), &[text_of]),
+    )
+    .await;
+    let (props, trace): (Value, Option<Uuid>) =
+        sqlx::query_as("SELECT properties, trace_id FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("the claim");
+    assert_eq!(props["kind"], "operation", "{props}");
+    assert_eq!(props["step_lineage_id"], lineage.to_string(), "{props}");
+    assert_eq!(trace, None, "no trace hung on a row the walk did not write");
+    assert_eq!(
+        ingest_records(&pool, id).await,
+        vec![(doi.to_string(), me, false)],
+        "the ingest found the claim; it did not create it"
+    );
+    assert_eq!(creator_doi(&pool, id).await, None);
+}
