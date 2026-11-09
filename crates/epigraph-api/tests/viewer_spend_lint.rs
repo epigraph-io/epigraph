@@ -537,15 +537,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "provenance::record_provenance",
         ],
     ),
-    // stamped: the edges naming an evidence row already read through the
-    // viewer (F-edges-unfiltered owns their predicate).
+    // stamped: the claim edge naming an evidence row already read through
+    // the viewer (F-edges-unfiltered owns its predicate). The agent is the
+    // row's own signer, read with the row, not from an edge.
     (
         "edges.rs",
         "get_evidence",
-        &[
-            "sqlx::query_as(SELECT).fetch_optional",
-            "sqlx::query_as(SELECT).fetch_optional",
-        ],
+        &["sqlx::query_as(SELECT).fetch_optional"],
     ),
     (
         "edges.rs",
