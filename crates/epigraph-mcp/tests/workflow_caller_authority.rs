@@ -350,12 +350,10 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_writer_http_caller
         "no generation-1 row"
     );
 
-    // CALIBRATION: the lineage the stranger was refused on IS deletable — a
-    // stdio delete_step (the legacy stdio arm: the server agent reads the
-    // public row) drives its head to 0.05 — so the refusal above was the
-    // authority gate, not an unknown lineage.
+    // stdio has no audited admin path, and the server's own agent reads the
+    // public row but does not write its owner group: refused the same way.
     let public = fixture::public_viewer(&pool).await;
-    tools::step_ops::delete_step(
+    let err = tools::step_ops::delete_step(
         &server,
         &public,
         DeleteStepParams {
@@ -365,9 +363,34 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_writer_http_caller
         None,
     )
     .await
-    .expect("stdio soft-deletes the same step");
+    .expect_err("stdio may not soft-delete a step of a legacy row it only reads");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "refused by the legacy rule on stdio too: {}",
+        err.message
+    );
+    assert_eq!(lineage_truths(&pool, lineage).await, truths);
+
+    // CALIBRATION: the lineage the stranger was refused on IS deletable — the
+    // original ingester, a writer of the row's owner group, drives its head to
+    // 0.05 — so the refusals above were the authority gate, not an unknown
+    // lineage.
+    tools::step_ops::delete_step(
+        &server,
+        &owner_viewer,
+        DeleteStepParams {
+            canonical_name: "h3-legacy".to_string(),
+            step_lineage_id: lineage.to_string(),
+        },
+        Some(&owner_token),
+    )
+    .await
+    .expect("a writer of the owner group soft-deletes the same step");
     let after = lineage_truths(&pool, lineage).await;
-    assert_ne!(after, truths, "the stdio delete changed the lineage");
+    assert_ne!(
+        after, truths,
+        "the owner-group writer's delete changed the lineage"
+    );
     assert!(
         after.iter().any(|t| (t - 0.05).abs() < 1e-9),
         "its head is driven to 0.05: {after:?}"
@@ -500,12 +523,16 @@ async fn a_legacy_workflow_is_mutable_only_through_the_audited_admin_arm(pool: P
     assert_eq!(workflow_admin_audits(&pool, admin).await, 2);
 }
 
-/// A stdio caller that reads a legacy (unrecorded) workflow and writes its
-/// owner group is admitted (the stdio legacy arm, backlog 222289f3: stdio has
-/// no audited admin path to send it to), and the write is recorded as a
-/// `workflows.caller_write` row with `arm = "legacy"` and no token.
+/// On stdio a legacy (unrecorded) workflow admits exactly what it admits over
+/// HTTP without a token: a live writer of its owner group. A stdio caller that
+/// only READS the public row is refused, with a refusal naming the rule and
+/// nothing written; once it holds a writer membership of the row's owner
+/// group it is admitted, and the write is recorded as a
+/// `workflows.caller_write` row with `arm = "owner_group_writer"`, transport
+/// stdio and no token. (Before, any stdio caller that could read the row was
+/// admitted through a stdio-only legacy arm.)
 #[sqlx::test(migrations = "../../migrations")]
-async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
+async fn stdio_mutates_a_legacy_workflow_only_as_a_writer_of_its_owner_group(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let public = fixture::public_viewer(&pool).await;
     let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
@@ -518,6 +545,42 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
     )
     .await;
     let before = steps(&pool, "h3-legacy-stdio").await;
+    let err = tools::step_ops::add_step(
+        &server,
+        &public,
+        add("h3-legacy-stdio", "a stdio step"),
+        None,
+    )
+    .await
+    .expect_err("a stdio caller that only reads a public legacy row is refused");
+    assert!(
+        err.message.contains("no recorded submitter") && err.message.contains("owner group"),
+        "the refusal names the rule: {}",
+        err.message
+    );
+    assert_eq!(
+        steps(&pool, "h3-legacy-stdio").await,
+        before,
+        "nothing written"
+    );
+
+    // The server's own agent becomes a writer of the row's owner group.
+    let agent = server.server_agent_id().await.expect("the server's agent");
+    let group: Uuid =
+        sqlx::query_scalar("SELECT owner_group_id FROM workflows WHERE canonical_name = $1")
+            .bind("h3-legacy-stdio")
+            .fetch_one(&pool)
+            .await
+            .expect("the row's owner group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("writer membership");
     tools::step_ops::add_step(
         &server,
         &public,
@@ -525,7 +588,7 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
         None,
     )
     .await
-    .expect("the stdio legacy arm admits a readable public legacy row");
+    .expect("a writer of the row's owner group is admitted on stdio");
     assert_eq!(steps(&pool, "h3-legacy-stdio").await, before + 1);
     let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT details->>'arm', details->>'transport', details->>'client_id' \
@@ -537,8 +600,12 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
     .expect("one stdio provenance row");
     assert_eq!(
         row,
-        (Some("legacy".into()), Some("stdio".into()), None),
-        "recorded as the stdio legacy arm, with no token"
+        (
+            Some("owner_group_writer".into()),
+            Some("stdio".into()),
+            None
+        ),
+        "recorded as the owner-group writer arm on stdio, with no token"
     );
 }
 

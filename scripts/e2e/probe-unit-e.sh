@@ -240,13 +240,16 @@ q "SELECT '   doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI' = ANY(
         ||' evidence='||(SELECT count(*) FROM evidence ev JOIN claims c ON c.id=ev.claim_id WHERE 'doi:$DOI' = ANY(c.labels))
         ||' processed_by='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI' AND e.relationship='processed_by')"
 
-echo "--- CONVERGED ATOM owned by ANOTHER group (the workflow ingest's operation atom) ---"
+echo "--- CONVERGED ATOM written by the SAME caller's workflow ingest (its operation atom) ---"
 # Atoms are content-addressed: this document's first atom has the same text as
-# an operation atom the ingest_workflow arm above wrote, owned by the group the
-# workflow ingest landed in (the caller's own team or default group, private to
-# it since workflow writes are made as the caller; it was the
-# workflow-ingest-system agent's group before). The ingest resolves to that row
-# and must still land the rest of the document.
+# an operation atom the ingest_workflow arm above wrote. Both ingests go through
+# this one MCP session, and workflow writes are made as the caller, so that atom
+# is owned by (and private to) the CALLER's own group: this arm measures a
+# document ingest converging onto the caller's own workflow atom and still
+# landing the rest of the document. (It used to converge onto the
+# workflow-ingest-system agent's group, i.e. another group's atom; that is no
+# longer what this arm reaches.) Convergence onto ANOTHER agent's atom is pinned
+# by crates/epigraph-mcp/tests/ingest_caller_labels_foreign_claim.rs.
 DOI3="10.9999/unit-e-conv-$LABEL"
 DOC3='{"source":{"title":"Unit E convergence paper","doi":"'"$DOI3"'","source_type":"Paper","authors":[]},"thesis":"Unit E convergence thesis","thesis_derivation":"TopDown","sections":[{"title":"Convergence section","paragraphs":[{"text":"The convergence paragraph","atoms":["Write the operation atom claims","A fresh unit E atom beside a converged one"],"generality":[3,3],"confidence":0.8}]}],"relationships":[]}'
 q "SELECT '   converged atom before: owner='||COALESCE((SELECT owner_group_id::text FROM claims WHERE content='Write the operation atom claims'),'absent')"

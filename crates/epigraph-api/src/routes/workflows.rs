@@ -389,19 +389,18 @@ pub async fn store_workflow(
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows").await?;
-    let decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-        &mut tx,
+    let mut decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
+    let (mut tx, result) = execute_admitted_ingest(
+        tx,
+        None,
+        &viewer,
         &plan,
         &extraction,
-        &viewer,
         declared,
+        &mut decision,
     )
-    .await
-    .map_err(workflow_ingest_error)?;
+    .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
-    let mut decision = decision;
-    gate_planless_existing_row(&mut tx, None, &viewer, &result, &mut decision).await?;
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
@@ -442,8 +441,9 @@ pub async fn store_workflow(
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
-        // only for the row this call wrote (see the gate on `embedder` above).
-        {
+        // only on a row this call's insert CREATED: an existing row (one the
+        // walk was admitted under) keeps the goal embedding of its own goal.
+        if result.row_created {
             match embedder.generate(&request.goal).await {
                 Ok(qvec) => {
                     store_workflow_goal_embedding(&state, &viewer, "workflows", wf_id, &qvec).await;
@@ -479,9 +479,10 @@ pub async fn store_workflow(
     // `events` has no row security: every reader of the event stream sees a
     // row's payload. So the event announces only a workflow this call CREATED
     // as PUBLIC; a group-private plan's goal and id stay with its group.
-    let created_public = result
-        .decl
-        .is_some_and(|d| d.visibility_bind() == Some("public"));
+    let created_public = result.row_created
+        && result
+            .decl
+            .is_some_and(|d| d.visibility_bind() == Some("public"));
     if created_public {
         let _ =
             epigraph_db::EventRepository::insert(&state.db_pool, "workflow.created", None, &event)
@@ -2408,19 +2409,18 @@ pub async fn ingest_workflow(
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows/ingest").await?;
     let auth = Some(auth);
-    let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-        &mut tx,
+    let mut decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
+    let (mut tx, result) = execute_admitted_ingest(
+        tx,
+        auth,
+        &viewer,
         &plan,
         &extraction,
-        &viewer,
         declared,
+        &mut decision,
     )
-    .await
-    .map_err(workflow_ingest_error)?;
+    .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
-    let mut decision = decision;
-    gate_planless_existing_row(&mut tx, auth, &viewer, &result, &mut decision).await?;
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
@@ -2462,8 +2462,9 @@ pub async fn ingest_workflow(
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
-        // only for the row this call wrote (see the gate on `embedder` above).
-        {
+        // only on a row this call's insert CREATED: an existing row (one the
+        // walk was admitted under) keeps the goal embedding of its own goal.
+        if result.row_created {
             match embedder.generate(&extraction.source.goal).await {
                 Ok(qvec) => {
                     store_workflow_goal_embedding(
@@ -2898,12 +2899,18 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         // generations the caller cannot read (migration 202): the payload
         // conflicts with rows outside the caller's view. 409, not a 500 that
         // reads as transient and invites a retry.
+        //
+        // A walk stopped at an existing row it was not admitted over
+        // (`ExistingWorkflowNeedsAuthority`): `execute_admitted_ingest`
+        // checks the authority and retries, so it reaches here only
+        // unhandled. Its text names the workflow by name and generation only.
         e @ (epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. }
-        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }) => {
-            ApiError::Conflict {
-                reason: format!("workflow ingest: {e}"),
-            }
-        }
+        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+            ..
+        }) => ApiError::Conflict {
+            reason: format!("workflow ingest: {e}"),
+        },
         epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
             system_agent_unregistered(role)
         }
@@ -3471,7 +3478,10 @@ async fn record_api_authorship(
 /// transaction (see [`workflow_ingest_submitter`]).
 #[cfg(feature = "db")]
 struct ApiIngestDecision {
-    /// Whether this call creates the row (only then is a submitter recorded).
+    /// Whether this call created the row (only then is a submitter
+    /// recorded). Set from the row insert's own answer by
+    /// [`execute_admitted_ingest`]; before the walk it is only what the
+    /// pre-walk read saw.
     creating: bool,
     /// The submitter to record when creating, if any.
     submitter: Option<Uuid>,
@@ -3487,7 +3497,9 @@ struct ApiIngestDecision {
 /// The submitter an ingest should record, and the authority it needs, decided
 /// BEFORE the plan walk on the same transaction. The rule is the MCP twin's
 /// (`execute_workflow_ingest_with_inserted`): a re-ingest of an existing row
-/// records nothing and needs nothing (the executor writes nothing); a NEW
+/// records nothing and needs nothing here (the executor writes nothing, or
+/// stops before writing under a row with no plan, which
+/// [`execute_admitted_ingest`] then gates); a NEW
 /// generation of a canonical name that already has rows needs authority over
 /// that lineage's head and inherits its submitter, parent or no parent (the
 /// review's takeover: `generation + 1` with no parent recorded the attacker);
@@ -3550,39 +3562,86 @@ async fn workflow_ingest_submitter(
     })
 }
 
-/// A walk that WROTE under a row that already existed (`decision.creating` is
-/// false, yet the executor did not short-circuit): the row showed the caller
-/// no plan (no `executes` edge it can see, e.g. a row the pre-transaction
-/// ingest left behind), so its claims and edges were attached to it. That is a
-/// write to an existing workflow and needs the same authority as any other,
-/// checked on the same transaction before commit, so a refusal rolls the walk
-/// back. The grant joins `decision`, whose provenance rows record it.
+/// Run the plan walk AS THE CALLER, checking its lineage authority over any
+/// row the walk would write under that this call did not create.
+///
+/// The executor decides whether the row is new from its row insert's own
+/// answer. A row that already exists and shows the caller no plan (one the
+/// pre-walk read saw, e.g. a row the pre-transaction ingest left behind, or
+/// one ANOTHER caller committed while this call's insert waited on it, which
+/// no read made before the walk can see) stops the walk before anything is
+/// written under it (`ExistingWorkflowNeedsAuthority`). The caller must then
+/// pass the same gate as any other write to an existing workflow, on the same
+/// transaction; only if it is admitted does the walk run again with that row
+/// admitted. The grant joins `decision`, whose provenance rows record it, and
+/// `decision.creating` becomes the insert's answer.
+///
+/// Takes the route's caller-stamped transaction and hands it back, so the
+/// walk and the check run on it and the route goes on to record and commit.
 #[cfg(feature = "db")]
-async fn gate_planless_existing_row(
-    conn: &mut sqlx::PgConnection,
+async fn execute_admitted_ingest<'s>(
+    mut tx: epigraph_db::ScopedTx<'s>,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     viewer: &epigraph_db::Viewer,
-    result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
+    plan: &epigraph_ingest::common::plan::IngestPlan,
+    extraction: &epigraph_ingest::workflow::WorkflowExtraction,
+    declared: Option<epigraph_core::TenancyDecl>,
     decision: &mut ApiIngestDecision,
-) -> Result<(), ApiError> {
-    let Some(existing) = decision.anchors.existing else {
-        return Ok(());
+) -> Result<
+    (
+        epigraph_db::ScopedTx<'s>,
+        epigraph_ingest_executor::WorkflowIngestExecutionResult,
+    ),
+    ApiError,
+> {
+    let mut admitted: Option<Uuid> = None;
+    let result = loop {
+        match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+            &mut tx, plan, extraction, viewer, declared, admitted,
+        )
+        .await
+        {
+            Err(
+                epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+                    workflow_id: existing,
+                    ..
+                },
+            ) if admitted.is_none() => {
+                if !decision.grants.iter().any(|(a, _)| *a == existing) {
+                    let not_found = || ApiError::Forbidden {
+                        reason: format!(
+                            "workflow_ingest: canonical_name '{}' (generation {}) names a \
+                             workflow this caller cannot read. Nothing was written.",
+                            extraction.source.canonical_name, extraction.source.generation
+                        ),
+                    };
+                    let grant = workflow_authority(
+                        &mut tx,
+                        auth,
+                        viewer,
+                        viewer.principal(),
+                        existing,
+                        &not_found,
+                    )
+                    .await?;
+                    decision.admin |= grant.is_admin();
+                    decision.grants.push((existing, grant));
+                }
+                admitted = Some(existing);
+            }
+            other => break other.map_err(workflow_ingest_error)?,
+        }
     };
-    if result.already_ingested || decision.grants.iter().any(|(a, _)| *a == existing) {
-        return Ok(());
+    decision.creating = result.row_created;
+    // For a row this call did NOT create, the submitter the audit trail
+    // names is the row's own (the grant over the admitted row read it), never
+    // the caller's: no provenance row may read as if the caller created it.
+    if !result.row_created {
+        decision.submitter = admitted
+            .and_then(|row| decision.grants.iter().find(|(a, _)| *a == row))
+            .and_then(|(_, grant)| grant.owner);
     }
-    let not_found = || ApiError::Forbidden {
-        reason: format!(
-            "workflow_ingest: canonical_name '{}' (generation {}) names a workflow this caller \
-             cannot read. Nothing was written.",
-            result.canonical_name, result.generation
-        ),
-    };
-    let grant =
-        workflow_authority(conn, auth, viewer, viewer.principal(), existing, &not_found).await?;
-    decision.admin |= grant.is_admin();
-    decision.grants.push((existing, grant));
-    Ok(())
+    Ok((tx, result))
 }
 
 /// Record the submitter [`workflow_ingest_submitter`] decided, once, and the
@@ -3623,7 +3682,11 @@ async fn record_workflow_submitter(
                     "parent_canonical_name": extraction.source.parent_canonical_name,
                     "lineage_head_before": decision.anchors.lineage_head,
                     "linked_parent": decision.anchors.linked_parent,
-                    "recorded_submitter": decision.submitter,
+                    "recorded_submitter": if decision.creating {
+                        decision.submitter
+                    } else {
+                        None
+                    },
                 }),
             )
             .await?;

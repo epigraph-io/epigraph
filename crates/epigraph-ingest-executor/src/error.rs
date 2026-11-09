@@ -119,6 +119,27 @@ pub enum IngestExecutorError {
         generation: i32,
     },
 
+    /// A caller-authored ingest's row insert did nothing: a row with the
+    /// plan's `(canonical_name, generation)` already exists (read before the
+    /// walk, or committed by another caller while the insert waited on the
+    /// unique index), the ingest's stamp reads it, and it shows no plan. The
+    /// walk would attach the caller's claims and edges to a row it did not
+    /// create, so it stops here, before writing anything under the row, and
+    /// rolls back to where it began. The entry point must check its lineage
+    /// authority over `workflow_id` on the same transaction and, when it is
+    /// admitted, run the walk again with that row admitted. Never shown to a
+    /// caller as is: an entry point that does not handle it maps it to a
+    /// refusal that does not name the row.
+    #[error(
+        "workflow {canonical_name:?} generation {generation} already exists; writing under it \
+         needs authority over it. Nothing was written"
+    )]
+    ExistingWorkflowNeedsAuthority {
+        workflow_id: uuid::Uuid,
+        canonical_name: String,
+        generation: i32,
+    },
+
     /// Plan structure violated an executor invariant.
     /// A caller-authored workflow write names a lineage (its own
     /// `canonical_name`, or the `parent_canonical_name` it extends) that has

@@ -12,7 +12,16 @@
 //!
 //! `revoke-passkey` is the break-glass revoke: audited
 //! (`platform.passkey_revoked`), final, and the way back to the bootstrap
-//! path if a passkey is lost.
+//! path if a passkey is lost. Two modes, recorded as the audit row's `mode`:
+//!
+//! * LOST (the default): the passkey, and through migration 200's cascade the
+//!   unattested (`none`) passkeys it anchored. An attested backup enrolled on
+//!   one of its acts stays live: the person keeps working with it.
+//! * COMPROMISED (`--compromised`): the passkey and EVERY passkey whose anchor
+//!   lineage passes through it, attested ones included (migration 200's
+//!   `epigraph_revoke_passkey_compromised`), the same person's only. Whoever
+//!   held a stolen device could have confirmed the acts those were enrolled
+//!   on. Also on an already revoked passkey (lost, then found stolen).
 //!
 //! A LATER passkey (the person already holds a live one) is enrolled only on
 //! a confirmed `passkey.register` admin act of the person's own (migration
@@ -30,7 +39,9 @@
 //! what the definer did and leaves nothing.
 
 use chrono::{DateTime, Utc};
-use epigraph_db::{admin_act, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+use epigraph_db::{
+    admin_act, CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow,
+};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
@@ -107,6 +118,38 @@ pub async fn revoke(
         tx.rollback().await?;
     }
     Ok((revoked, row))
+}
+
+/// Revoke `passkey` as COMPROMISED, in one transaction (committed under
+/// `apply`): it and every passkey enrolled through it. Returns each passkey
+/// reached, nearest first, with the row as it stands.
+///
+/// # Errors
+/// The passkey does not exist, the reason is blank, or a statement failed.
+pub async fn revoke_compromised(
+    conn: &mut PgConnection,
+    passkey: Uuid,
+    reason: &str,
+    apply: bool,
+) -> anyhow::Result<Vec<(CompromisedRevoke, PasskeyRow)>> {
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    if PasskeyRepository::get(&mut tx, passkey).await?.is_none() {
+        anyhow::bail!("no passkey {passkey}; nothing was changed");
+    }
+    let reached = PasskeyRepository::revoke_compromised(&mut tx, passkey, reason).await?;
+    let mut out = Vec::with_capacity(reached.len());
+    for hit in reached {
+        let row = PasskeyRepository::get(&mut tx, hit.passkey)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("passkey {} vanished", hit.passkey))?;
+        out.push((hit, row));
+    }
+    if apply {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(out)
 }
 
 fn fmt_time(t: Option<DateTime<Utc>>) -> String {

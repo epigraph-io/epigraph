@@ -100,10 +100,13 @@
 //!   WRITE the row's owner group; then a recorded submitter admits the
 //!   submitter, its operator (the operator itself, as over HTTP), a delegate
 //!   (this server's agent live-linked to the submitter or to its operator), or a live
-//!   writer of the row's owner group (there is no admin arm without a token). Two stdio-only arms remain, both recorded:
-//!   a LEGACY row (no recorded submitter) that passes the read (and group
-//!   write) check is admitted (stdio has no audited admin path to send it to; an operator
-//!   ruling may close this), and a server with NO declared signer identity
+//!   writer of the row's owner group (there is no admin arm without a token). A
+//!   row with NO recorded submitter admits on stdio exactly what it admits over
+//!   HTTP without the admin arm: a live writer of its owner group, through the
+//!   same predicate. It used to admit any stdio caller that could READ it, so
+//!   an agent bound to any human could extend, edit, deprecate or take over
+//!   the head of every public legacy lineage of another group. One stdio-only
+//!   arm remains, recorded: a server with NO declared signer identity
 //!   (`--agent-key` / `--agent-model` absent, a random per-process agent) is
 //!   admitted on a submitted row that passes the same check, with a WARN, because
 //!   ownership is undecidable for it, exactly as
@@ -159,8 +162,8 @@
 //!   `delete_step` on the whole legacy corpus. A new generation of a legacy
 //!   lineage inherits no record, so platform lineage stays platform. No
 //!   submitter is backfilled: there is no provenance to backfill from. On
-//!   stdio a legacy row is admitted only to a caller that reads it and, for a
-//!   group row, writes its owner group (see STDIO above). When the custodian role
+//!   stdio a legacy row is admitted only to a live writer of its owner group
+//!   (see STDIO above). When the custodian role
 //!   (#529) lands, its check replaces `claims:admin` in `admin_arm`.
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
@@ -197,9 +200,6 @@ pub(crate) enum WorkflowArm {
     OwnerGroupWriter { group: uuid::Uuid },
     /// The AUDITED admin arm.
     Admin,
-    /// stdio only: a row with no recorded submitter (platform corpus) that
-    /// the caller reads (and, for a group row, whose owner group it writes).
-    StdioLegacy,
     /// stdio only: this server has no declared signer identity, so ownership
     /// of a submitted row is undecidable; admitted on a row that passes the
     /// read (and group write) check, with a WARN.
@@ -288,7 +288,9 @@ pub(crate) async fn require_workflow_authority(
     // plan migration 183 backfilled into its group) is the group's, not the
     // platform's, and is not called one.
     let Some(owner) = owner else {
-        if let Some(group) = owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await? {
+        if let Some(group) =
+            unrecorded_row_owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await?
+        {
             return Ok(grant(WorkflowArm::OwnerGroupWriter { group }));
         }
         let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
@@ -460,6 +462,20 @@ async fn delegate_arm(
         .then_some(principal))
 }
 
+/// The ONE arm a workflow with no recorded submitter admits without a
+/// token, on every transport: [`owner_group_arm`], a live writer of the row's
+/// owner group. HTTP and stdio both call this, so the rule for such a row
+/// cannot drift between them; HTTP then has the audited admin arm, which
+/// stdio lacks.
+async fn unrecorded_row_owner_group_arm(
+    conn: &mut sqlx::PgConnection,
+    caller_agent: uuid::Uuid,
+    view: Option<&(String, uuid::Uuid)>,
+    tool_name: &'static str,
+) -> Result<Option<uuid::Uuid>, McpError> {
+    owner_group_arm(conn, caller_agent, view, tool_name).await
+}
+
 /// The stdio arms of [`require_workflow_authority`] (backlog 222289f3; see the
 /// module doc's STDIO bullet). `caller` is the write identity, this server's
 /// own agent; the `viewer` a tool was handed is NOT consulted, so the check is
@@ -477,7 +493,9 @@ async fn delegate_arm(
 ///    itself, as over HTTP), a delegate of the submitter or of its operator
 ///    ([`delegate_arm`]), or a live writer of the row's owner group; a
 ///    server with no declared signer identity is admitted with a WARN
-///    (undecidable, as for claims). No submitter: the legacy stdio arm.
+///    (undecidable, as for claims). No submitter: a live writer of the row's
+///    owner group only ([`unrecorded_row_owner_group_arm`], HTTP's own
+///    predicate), else a refusal naming the rule.
 ///
 /// # Errors
 /// A refusal (nothing was written), or an internal error if the caller's view
@@ -549,8 +567,31 @@ async fn stdio_workflow_authority(
              Nothing was written."
         )));
     }
+    let view = (visibility, owner_group);
+    // A row with NO recorded submitter admits on stdio exactly what it admits
+    // over HTTP: a live writer of its owner group, through the SAME predicate
+    // (`unrecorded_row_owner_group_arm`). HTTP's other arm, the audited
+    // admin path, needs a token, so stdio has none. Reading the row is not
+    // enough: a public legacy row is readable by everyone, and before this an
+    // agent bound to ANY human could extend, edit or take over the head of
+    // every public legacy lineage over stdio.
     let Some(owner) = owner else {
-        return Ok(WorkflowArm::StdioLegacy);
+        if let Some(group) =
+            unrecorded_row_owner_group_arm(conn, caller_agent, Some(&view), tool_name).await?
+        {
+            return Ok(WorkflowArm::OwnerGroupWriter { group });
+        }
+        let kind = if view.0 == "group" {
+            "a group workflow written before batch H-b"
+        } else {
+            "legacy platform workflow, written before batch H-b"
+        };
+        return Err(crate::errors::invalid_params(format!(
+            "workflow {workflow_id} has no recorded submitter ({kind}); stdio caller agent \
+             {caller_agent} does not write the workflow's owner group. {tool_name} on a workflow \
+             with no recorded submitter requires a writer of its owner group (the audited \
+             claims:admin path needs an authenticated transport). Nothing was written."
+        )));
     };
     if caller_agent == owner {
         return Ok(WorkflowArm::Submitter);
@@ -561,7 +602,6 @@ async fn stdio_workflow_authority(
     if let Some(operator) = delegate_arm(conn, caller_agent, owner, tool_name).await? {
         return Ok(WorkflowArm::Delegate { operator });
     }
-    let view = (visibility, owner_group);
     if let Some(group) = owner_group_arm(conn, caller_agent, Some(&view), tool_name).await? {
         return Ok(WorkflowArm::OwnerGroupWriter { group });
     }
@@ -779,19 +819,13 @@ pub(crate) async fn record_caller_workflow_write(
         WorkflowArm::Operator => ("operator", Some(acting), None),
         WorkflowArm::Delegate { operator } => ("delegate", Some(operator), None),
         WorkflowArm::OwnerGroupWriter { group } => ("owner_group_writer", None, Some(group)),
-        WorkflowArm::StdioLegacy => ("legacy", None, None),
         WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None, None),
     };
     let (transport, client_id, token_jti) = match auth {
         Some(token) => ("http", Some(token.client_id), Some(token.jti)),
         None => ("stdio", None, None),
     };
-    if auth.is_some()
-        && matches!(
-            grant.arm,
-            WorkflowArm::StdioLegacy | WorkflowArm::StdioUndeclaredSigner
-        )
-    {
+    if auth.is_some() && matches!(grant.arm, WorkflowArm::StdioUndeclaredSigner) {
         return Err(internal_error_text(format!(
             "{tool_name}: a stdio-only {arm} grant on an authenticated call. Nothing was written."
         )));

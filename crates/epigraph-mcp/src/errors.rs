@@ -334,8 +334,16 @@ pub fn executor_caller_error(
         // generations the caller cannot read (migration 202): a caller
         // conflict, so an agent reads the reason instead of a logged internal
         // error.
+        //
+        // A walk stopped at an existing row it was not admitted over
+        // (`ExistingWorkflowNeedsAuthority`): an entry point checks its
+        // authority and retries, so it reaches here only unhandled. Its text
+        // names the workflow by name and generation, never by id.
         e @ (epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. }
-        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }) => McpError {
+        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+            ..
+        }) => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(format!("{context}: {e}")),
             data: None,
