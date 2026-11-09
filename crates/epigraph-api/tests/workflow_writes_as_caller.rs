@@ -2459,3 +2459,76 @@ async fn a_generation_zero_ingest_racing_another_callers_creation_writes_nothing
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// stdio: a row with no recorded submitter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// On stdio a workflow with NO recorded submitter admits exactly what the
+/// authenticated transports admit for it: a live writer of its owner group
+/// (stdio has no audited admin path). Reading the row is not enough. A stdio
+/// server whose agent is bound to a human that does not write the row's
+/// group is refused `add_step`, a new generation and `deprecate_workflow` on
+/// a public legacy row, each with a named refusal and nothing written; the
+/// operator's own linked agent, which writes the row's group, is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stdio_admits_only_an_owner_group_writer_on_a_row_with_no_submitter(pool: PgPool) {
+    let w = world(&pool).await;
+    let other_server = mcp_server(&pool, 0xB7).await;
+    let other = stdio_agent(&pool, &other_server, 0xB7).await;
+    link(&pool, other, w.rb).await;
+    let legacy = workflow_named(&pool, LEGACY, 0).await.expect("legacy row");
+    let (v, owner, submitter, _) = workflow_row(&pool, legacy).await;
+    assert_eq!(
+        (v.as_str(), owner, submitter),
+        ("public", w.op_g, None),
+        "PREMISE: a public row in the operator's group with no recorded submitter"
+    );
+    assert!(
+        !writes(&pool, other, w.op_g).await,
+        "PREMISE: the other human's stdio agent does not write the row's group"
+    );
+    let row_before = row_text(&pool, legacy).await;
+    let counts_before = row_counts(&pool).await;
+    let via = Via::McpStdio(&other_server);
+
+    let added = via.add_step(LEGACY, "acme stdio intruder step").await;
+    let added = added.expect_err("stdio add_step on another group's legacy row is refused");
+    let next = via
+        .ingest(&extraction(LEGACY, 1, 1), None)
+        .await
+        .expect_err("stdio: a new generation of another group's legacy lineage is refused");
+    let deprecated = via
+        .deprecate(legacy, false)
+        .await
+        .expect_err("stdio: deprecating another group's legacy row is refused");
+    for (what, text) in [
+        ("add_step", &added),
+        ("generation 1", &next),
+        ("deprecate", &deprecated),
+    ] {
+        assert!(
+            text.contains("no recorded submitter") && text.contains("owner group"),
+            "{what}: the refusal is the gate's own, naming the rule: {text}"
+        );
+    }
+    assert_eq!(workflow_named(&pool, LEGACY, 1).await, None);
+    assert_eq!(
+        row_text(&pool, legacy).await,
+        row_before,
+        "the row is untouched"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        counts_before,
+        "nothing was written"
+    );
+
+    // CALIBRATION: the operator's linked agent writes the row's group.
+    via_ok(
+        Via::McpStdio(&w.c_server)
+            .add_step(LEGACY, "acme stdio operator step")
+            .await
+            .map(|(id, _)| json!(id)),
+    );
+}
