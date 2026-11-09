@@ -103,10 +103,12 @@
 //!   writer of the row's owner group (there is no admin arm without a token). A
 //!   row with NO recorded submitter admits on stdio exactly what it admits over
 //!   HTTP without the admin arm: a live writer of its owner group, through the
-//!   same predicate. It used to admit any stdio caller that could READ it, so
-//!   an agent bound to any human could extend, edit, deprecate or take over
-//!   the head of every public legacy lineage of another group. One stdio-only
-//!   arm remains, recorded: a server with NO declared signer identity
+//!   same predicate. With no submitter there is no principal to act for, so
+//!   the delegate arm admits nothing there, on either transport. It used to
+//!   admit any stdio caller that could READ it, so an agent bound to any
+//!   human could extend, edit, deprecate or take over the head of every
+//!   public legacy lineage of another group. One stdio-only arm remains,
+//!   recorded: a server with NO declared signer identity
 //!   (`--agent-key` / `--agent-model` absent, a random per-process agent) is
 //!   admitted on a submitted row that passes the same check, with a WARN, because
 //!   ownership is undecidable for it, exactly as
@@ -467,6 +469,9 @@ async fn delegate_arm(
 /// owner group. HTTP and stdio both call this, so the rule for such a row
 /// cannot drift between them; HTTP then has the audited admin arm, which
 /// stdio lacks.
+/// The delegate arm ([`delegate_arm`]) is never asked about such a row: it
+/// admits an agent acting for a principal admitted by identity, and a row
+/// with no recorded submitter admits no one by identity.
 async fn unrecorded_row_owner_group_arm(
     conn: &mut sqlx::PgConnection,
     caller_agent: uuid::Uuid,

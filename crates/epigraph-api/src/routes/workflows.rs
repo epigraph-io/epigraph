@@ -3013,7 +3013,8 @@ impl ApiWorkflowGrant {
 /// token AND a live grant on the token's client record (migration 111's
 /// predicate), never the scope alone. A workflow with no record (written
 /// before batch H-b) admits a writer of its owner group or the audited admin
-/// arm; a caller with neither is refused.
+/// arm; a caller with neither is refused. The delegate arm (below) admits
+/// nothing there: with no submitter, no principal is admitted by identity.
 ///
 /// The owner-group writer arm: the caller reads the row and holds a live
 /// writer or admin membership of its owner group NOW (direct or through a
