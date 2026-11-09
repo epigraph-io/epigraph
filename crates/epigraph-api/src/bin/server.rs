@@ -181,8 +181,38 @@ async fn main() {
                 rp_id = %rp.config().rp_id,
                 origin = %rp.config().origin,
                 software_attestation = rp.config().allows_software_attestation(),
+                synced_anchored = rp.allows_synced_anchored(),
                 "passkey relying party configured"
             );
+            // The Android attestation status list's age, so a refresh job
+            // that stopped shows before the 48h refusal (never refuses boot).
+            match rp.android_status_report(std::time::SystemTime::now()) {
+                None => {}
+                Some(Ok(r)) if r.freshness == epigraph_passkey::android::StatusFreshness::Fresh => {
+                    tracing::info!(
+                        target: "elevate",
+                        path = %r.path.display(),
+                        age_hours = r.age.as_secs() / 3600,
+                        entries = r.entries,
+                        "Android attestation status list"
+                    );
+                }
+                Some(Ok(r)) => tracing::warn!(
+                    target: "elevate",
+                    path = %r.path.display(),
+                    age_hours = r.age.as_secs() / 3600,
+                    entries = r.entries,
+                    freshness = ?r.freshness,
+                    "the Android attestation status list is older than 24h: its refresh job has \
+                     missed a run; past 48h every Android enrollment and anchor is refused"
+                ),
+                Some(Err(why)) => tracing::warn!(
+                    target: "elevate",
+                    reason = %why,
+                    "the Android attestation status list cannot be checked; Android enrollments \
+                     and anchors are refused until it can"
+                ),
+            }
             Some(Arc::new(rp))
         }
         Some(Err(e)) => {

@@ -1464,6 +1464,8 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "PasskeyRepository::revoke",
         "epigraph_create_passkey_enrollment($",
         "epigraph_revoke_passkey($",
+        // 200's compromised revoke: the same maintenance act, wider.
+        "epigraph_revoke_passkey_compromised($",
         "INSERT INTO passkey_enrollments",
         "UPDATE passkey_enrollments",
         "DELETE FROM passkey_enrollments",
