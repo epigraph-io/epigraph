@@ -113,3 +113,61 @@ async fn stdio_framing_serves_handshake_tool_list_and_a_tool_call() {
     client.cancel().await.expect("client shuts down cleanly");
     let _ = served.await;
 }
+
+/// The tool manifest is per caller (`manifest_for` filters by transport, auth
+/// and elevation), so on a protocol that carries cache hints (2026-07-28 and
+/// later, SEP-2549) `tools/list` must be marked `cacheScope: "private"` with
+/// `ttlMs: 0`. rmcp's `#[tool_handler]` default marks the list `public`,
+/// which would let a shared cache serve one caller's manifest to another;
+/// `EpiGraphMcpFull::list_tools` replaces that default and leaves the hints
+/// unset, so rmcp fills the private ones.
+///
+/// Mutation: set `cache_scope: Some(CacheScope::Public)` on the
+/// `ListToolsResult` in `EpiGraphMcpFull::list_tools` -> this test fails.
+#[tokio::test]
+async fn tools_list_is_marked_private_and_uncached_for_cache_hint_peers() {
+    use rmcp::model::{CacheScope, ProtocolVersion};
+    use rmcp::{ClientLifecycleMode, ClientServiceExt};
+
+    let (server_end, client_end) = tokio::io::duplex(1 << 20);
+    let served = tokio::spawn(async move {
+        let running = server()
+            .serve(tokio::io::split(server_end))
+            .await
+            .expect("server side of the stdio handshake");
+        let _ = running.waiting().await;
+    });
+    // The default client still uses the legacy `initialize` handshake (it
+    // negotiates 2025-11-25, which carries no cache hints), so the 2026-07-28
+    // peer is selected explicitly: `server/discover` offering ONLY that
+    // version, so a successful start is itself the proof it was negotiated.
+    let client = ()
+        .serve_with_lifecycle(
+            tokio::io::split(client_end),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("the server accepts a 2026-07-28 discover start");
+
+    let listed = client
+        .peer()
+        .list_tools(None)
+        .await
+        .expect("tools/list over stdio");
+    assert!(!listed.tools.is_empty(), "the manifest is not empty");
+    assert_eq!(
+        listed.cache_scope,
+        Some(CacheScope::Private),
+        "a per-caller manifest must not be cacheable for other users"
+    );
+    assert_eq!(
+        listed.ttl_ms,
+        Some(0),
+        "and must not be served from a cache"
+    );
+
+    client.cancel().await.expect("client shuts down cleanly");
+    let _ = served.await;
+}
