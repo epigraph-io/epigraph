@@ -142,10 +142,15 @@
 --     creation: it names its operator for nothing filed after it was recorded,
 --     which never names a human for a claim the agent filed while not bound.
 --   * BEFORE a link's creation (an agent filed claims, then was linked), the
---     client allowance in force at `p_at` names its operator; with none, the
---     link's operator does, provided the link was not retired before `p_at`
---     (the operator owns the agent's earlier claims: 107 section 7's purpose
---     for a retired link).
+--     client allowance in force at `p_at` names its operator. With none, the
+--     link's operator does ONLY when the link was recorded already retired
+--     (retired, with no `operator.link_retired` audit row: 107 section 7's
+--     `epigraph_link_retired_agent`, whose whole purpose is that the operator
+--     owns what a historical identity filed before it was tied to them).
+--     A link created live (retired later or not) never reaches back before its
+--     own creation: the agent was bound to nobody then, so a claim it filed
+--     then names nobody. The discriminator is the 191-protected retirement
+--     row, which no application session can insert or backdate.
 --   * With NO link, the 149 allowance (`author_binding_clients`) in force at
 --     `p_at`: `added_at <= p_at` and not revoked at or before `p_at`; the
 --     latest such row if several.
@@ -240,6 +245,7 @@ DECLARE
     v_linked   timestamptz;
     v_retired  boolean;
     v_until    timestamptz;
+    v_recorded_retired boolean := false;
     v_allowed  uuid;
 BEGIN
     IF p_agent IS NULL OR p_at IS NULL THEN
@@ -257,6 +263,9 @@ BEGIN
              WHERE s.agent_id = p_agent
                AND s.event_type = 'operator.link_retired'
                AND s.details ->> 'operator_id' = v_operator::text;
+            -- No retirement row: recorded retired (or retired before 191
+            -- audited the flip), retired since its creation.
+            v_recorded_retired := v_until IS NULL;
             v_until := COALESCE(v_until, v_linked);
         ELSE
             v_until := 'infinity'::timestamptz;
@@ -276,7 +285,9 @@ BEGIN
     IF v_allowed IS NOT NULL THEN
         RETURN v_allowed;
     END IF;
-    IF v_operator IS NOT NULL AND p_at < v_until THEN
+    -- Before the link's creation, only a link recorded retired adopts the
+    -- agent's earlier claims (p_at < v_linked = v_until here).
+    IF v_operator IS NOT NULL AND v_recorded_retired THEN
         RETURN v_operator;
     END IF;
     RETURN NULL;

@@ -16,8 +16,10 @@
 //!   the binding RECORD through migration 199's `epigraph_operator_bound_at`:
 //!   its operator link from creation until retirement (107; a claim filed
 //!   while the link was live keeps naming the operator after it is retired,
-//!   and a claim filed after names nobody), else the migration-149 client
-//!   allowance in force then. At the present instant that is exactly the
+//!   and a claim filed before the link existed or after its retirement names
+//!   nobody), else the migration-149 client allowance in force then. The one
+//!   reach-back is a link recorded already retired (107 section 7), which
+//!   names its operator for what the identity filed before it was recorded. At the present instant that is exactly the
 //!   agent card's `operator_human`. No client, registration or membership
 //!   STATUS is read, so a reader cannot watch a suspension. No `OPERATED_BY`
 //!   edge decides it: any edges:write caller can write one between two
