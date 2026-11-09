@@ -616,21 +616,17 @@ impl PaperRepository {
             .collect())
     }
 
-    /// The predicate shared by [`Self::count_asserted_claims_by`] and
-    /// [`Self::list_asserted_claims_by`], over `e` (the assertion) and `c`
-    /// (the claim), static binds `$1` paper, `$2` principal (text), `$3`
-    /// bypass, `$4` groups: the in-force assertion `ingested_by`'s ingest
-    /// wrote, of a claim `viewer` may read.
+    /// The provenance half of the predicate [`Self::count_asserted_claims_by`]
+    /// and [`Self::list_asserted_claims_by`] share, over `e` (the assertion):
+    /// the in-force, ingest-written `paper -asserts-> claim` edge whose marker
+    /// names `$2` (the principal, text), from paper `$1`. Each caller spells
+    /// the same static visibility predicate (`$3` bypass, `$4` groups) over
+    /// `e` and `c` inline in its own SQL, so count and page stay one set.
     fn asserted_by_predicate() -> String {
         format!(
             "e.source_id = $1 AND e.source_type = 'paper' \
              AND e.target_type = 'claim' AND e.relationship = 'asserts' \
-             AND {in_force} AND {marked} AND {by} = $2::text \
-             AND ($3::bool OR e.visibility = 'public' \
-                  OR (e.owner_group_id = ANY($4::uuid[]) \
-                      AND (e.co_owner_group_id IS NULL \
-                           OR e.co_owner_group_id = ANY($4::uuid[])))) \
-             AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))",
+             AND {in_force} AND {marked} AND {by} = $2::text",
             in_force = crate::repos::edge::EDGE_IN_FORCE,
             marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
             by = crate::repos::ingest_written::ingest_written_by_sql("e"),
@@ -651,9 +647,16 @@ impl PaperRepository {
         paper_id: Uuid,
         ingested_by: Uuid,
     ) -> Result<i64, DbError> {
+        // Static four-bind spelling over the assertion and the claim; the
+        // same predicate as `list_asserted_claims_by`.
         let sql = format!(
             "SELECT COUNT(DISTINCT c.id) FROM edges e JOIN claims c ON c.id = e.target_id \
-              WHERE {pred}",
+              WHERE {pred} \
+                AND ($3::bool OR e.visibility = 'public' \
+                     OR (e.owner_group_id = ANY($4::uuid[]) \
+                         AND (e.co_owner_group_id IS NULL \
+                              OR e.co_owner_group_id = ANY($4::uuid[])))) \
+                AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))",
             pred = Self::asserted_by_predicate(),
         );
         let count: i64 = sqlx::query_scalar(&sql)
@@ -716,6 +719,11 @@ impl PaperRepository {
                         AS created_claim \
                FROM edges e JOIN claims c ON c.id = e.target_id \
               WHERE {pred} \
+                AND ($3::bool OR e.visibility = 'public' \
+                     OR (e.owner_group_id = ANY($4::uuid[]) \
+                         AND (e.co_owner_group_id IS NULL \
+                              OR e.co_owner_group_id = ANY($4::uuid[])))) \
+                AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[])) \
               ORDER BY c.created_at ASC, c.id \
               LIMIT $5 OFFSET $6",
             rel = crate::INGEST_RECORD_RELATIONSHIP,

@@ -2494,6 +2494,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_signed_reporting_conn",
+        "WRITE. create_signed_conn's body, also returning whether THIS call inserted the row (the document walk decides whether it created an atom from that, never from the row): the same dedup probes and INSERT; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
+    ),
+    (
+        "claim.rs",
         "create_with_id_if_absent_signed_conn",
         "WRITE. The signed twin of the unsigned form above it (backlog 4ff87716): the same INSERT plus the claim's v1 signature and signer_id, gated by v1_claim_signature_to_store; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
     ),
