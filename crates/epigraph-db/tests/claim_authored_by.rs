@@ -780,7 +780,10 @@ async fn each_ingesters_human_is_the_one_bound_when_it_ingested(pool: PgPool) {
 
     let claim = fixture::seed_public_claim(&pool, filer, "filed before either ingest").await;
     let calibrate = claim_block_as_filed(&pool, &scoped, stranger, claim, filer).await;
-    assert!(calibrate.corroboration().ingesters.is_empty(), "CALIBRATION");
+    assert!(
+        calibrate.corroboration().ingesters.is_empty(),
+        "CALIBRATION"
+    );
 
     let outcome: String = sqlx::query_scalar(
         "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'ingester test', true)",
@@ -791,7 +794,12 @@ async fn each_ingesters_human_is_the_one_bound_when_it_ingested(pool: PgPool) {
     .expect("retire");
     assert_eq!(outcome, "retired", "CALIBRATION");
     link(&pool, late, op2).await;
-    let d1 = paper(&pool, "10.0000/fixture.ingested-after-retire", "After Retire").await;
+    let d1 = paper(
+        &pool,
+        "10.0000/fixture.ingested-after-retire",
+        "After Retire",
+    )
+    .await;
     let d2 = paper(&pool, "10.0000/fixture.ingested-after-link", "After Link").await;
     ingested(&pool, d1, claim, retiring, false, &[]).await;
     ingested(&pool, d2, claim, late, false, &[]).await;
@@ -1326,8 +1334,16 @@ async fn a_recorded_author_is_never_pushed_out_by_added_ones(pool: PgPool) {
 
     let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
     let p = &literature(&block).paper;
-    assert_eq!(ids(&p.authors), vec![lead], "the recorded author stays listed");
-    assert_eq!(p.added_authors.len(), MAX_PAPER_AUTHORS - 1, "the rest of the window");
+    assert_eq!(
+        ids(&p.authors),
+        vec![lead],
+        "the recorded author stays listed"
+    );
+    assert_eq!(
+        p.added_authors.len(),
+        MAX_PAPER_AUTHORS - 1,
+        "the rest of the window"
+    );
     assert!(p.authors_truncated, "and the cut is reported");
     assert!(p
         .added_authors
