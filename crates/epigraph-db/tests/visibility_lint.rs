@@ -1810,7 +1810,70 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          asking about the claims it reused before it writes an edge to any of them; an id \
          missing from the answer exists but is invisible to the stamp and refuses the ingest. \
          The answer is never returned to a caller (the caller-filtered read is \
-         `tenancy_of_conn`, which takes a viewer).",
+         `tenancy_of_conn`, which takes a viewer). The claim visibility controls add two \
+         callers of the same shape, each on its caller-STAMPED transaction and each about ids \
+         it already holds: `ClaimRepository::write_tenancy_report` (below) and MCP \
+         `resolve_backlog_item`'s read of the original it resolves.",
+    ),
+    (
+        "claim_visibility.rs",
+        "writable_teams",
+        "READ through migration 206's app-callable definer `epigraph_writable_teams(agent)`: \
+         the TEAM groups one agent may write into (own writer/admin membership or its live \
+         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column; \
+         the definer answers the same on any connection, so there is nothing for a viewer to \
+         narrow.",
+    ),
+    (
+        "claim_visibility.rs",
+        "default_group_of",
+        "READ through 206's definer `epigraph_default_group(agent)`: one group id \
+         (`agents.default_group_id`, else the live human's). A preference about the agent, not \
+         a corpus row; validated by the caller against `writable_teams`.",
+    ),
+    (
+        "claim_visibility.rs",
+        "resolve_visibility_choice",
+        "Composes `writable_teams` and `default_group_of` (both definers) into the write-time \
+         visibility decision for one author. Reads no corpus row; the decision is enforced by \
+         the claims trigger and policies on the WRITE's stamped transaction.",
+    ),
+    (
+        "claim_visibility.rs",
+        "resolve_write_decl",
+        "`default_decl_for_author` (the home group, definer answer) plus \
+         `resolve_visibility_choice`. Declares a write's tenancy; reads no corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
+        "write_tenancy_report",
+        "READ of ONE claim's `visibility, owner_group_id` through `tenancy_on_session_conn`, for \
+         the id the same request just wrote or matched, on that write's caller-STAMPED \
+         transaction (API create_claim_core and submit_packet, MCP claim_tenancy_report): \
+         row security on the stamped connection is the filter, and only the caller's own \
+         claim's tenancy is reported back to it.",
+    ),
+    (
+        "claim_visibility.rs",
+        "set_default_group_conn",
+        "WRITE through 206's definer `epigraph_set_default_group`: the STAMPED session \
+         principal's own `agents.default_group_id`, authority checked in the body (VIS01 / \
+         VIS02) and audited. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "publicize_conn",
+        "WRITE through 206's definer `epigraph_publicize_claims` on a STAMPED transaction: the \
+         definer classifies every id against the session's own readable groups (an unreadable \
+         id is `not_found`) and the principal's live admin memberships, all or nothing, and \
+         audits. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "share_with_team_conn",
+        "WRITE through 206's definer `epigraph_share_claims_with_team` on a STAMPED \
+         transaction: as `publicize_conn`, classified against the session's readable groups, \
+         the principal's home group and its writable teams, all or nothing, audited.",
     ),
     (
         "security_event.rs",
