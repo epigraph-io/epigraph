@@ -29,10 +29,10 @@
 //!   path runs and the earlier agent is reported in `also_at_position`.
 //!   Which ingester made an attachment is read from the edge's
 //!   ingest-written marker, so one written before the marker existed is kept
-//!   for nobody. The exception is an operator replacement: when this
-//!   spelling's name-derived node was retracted from the paper (only the
-//!   maintenance path can retract an agent's edge), the explicit agent at
-//!   that position is kept for every ingester.
+//!   for nobody. A name-derived node whose authorship of the paper was
+//!   retracted (an operator replacement) is never credited again by the
+//!   name path (`action: "retracted_name_key"`, no `asserts`); the
+//!   replacing agent is reported in `also_at_position`.
 //!
 //! # Who asserts the claims (the explicit-author rule)
 //!
@@ -435,18 +435,18 @@ pub(crate) async fn resolve_document_authors(
     // never when this call names that agent explicitly itself: a re-run of the
     // same extraction must resolve exactly as the first run did.
     let this_call: HashSet<Uuid> = explicit.values().map(|e| e.node.id).collect();
-    // Name-derived authors an operator replacement retracted from this paper
-    // (only the maintenance path can retract an agent's edge): the explicit
-    // agent at that entry's position is then the operator's decision, kept
-    // for every ingester.
-    let replaced_by_operator: HashSet<Uuid> = if edges.iter().any(|e| e.explicit) {
+    // Authors whose authorship of this paper was retracted (an operator
+    // replacement) and that hold no in-force authorship of it now: the name
+    // path never credits one again (see the name path below).
+    let removed_here: HashSet<Uuid> = if authors.is_empty() {
+        HashSet::new()
+    } else {
         PaperRepository::retracted_author_ids_conn(conn, viewer, paper_id)
             .await
             .map_err(internal_error)?
             .into_iter()
+            .filter(|id| !edges.iter().any(|e| e.agent_id == *id))
             .collect()
-    } else {
-        HashSet::new()
     };
     let mut taken: HashSet<Uuid> = HashSet::new();
     let mut kept: HashMap<usize, Uuid> = HashMap::new();
@@ -464,31 +464,19 @@ pub(crate) async fn resolve_document_authors(
         // Not "or the agent's identity matches the name": an agent sets its
         // own display name and ORCID, so neither vouches for it, and the one
         // identity a name does fix (the key it derives) is the name path's
-        // own node, which the fallback attaches anyway. The one exception is
-        // the operator's: when this spelling's name-derived node was
-        // retracted from this paper (only maintenance can), the explicit
-        // agent at this position replaced it, and is kept for everyone.
+        // own node, which the fallback attaches anyway. Nor is an operator
+        // replacement adopted for other ingesters: "this node's authorship
+        // was retracted" says nothing trustworthy about who replaced it
+        // (the name path below only declines to credit the removed node).
         let same_spelling = |e: &&PaperAuthorEdge| {
             e.explicit
                 && e.author_name.as_deref() == Some(a.name.as_str())
                 && !this_call.contains(&e.agent_id)
         };
-        let pos = i64::try_from(i).ok();
-        let operator_replaced = if replaced_by_operator.is_empty() {
-            false
-        } else {
-            AgentRepository::get_by_public_key(&mut *conn, &name_key(&a.name))
-                .await
-                .map_err(internal_error)?
-                .is_some_and(|n| replaced_by_operator.contains(&Uuid::from(n.id)))
-        };
         let mut found: Vec<&PaperAuthorEdge> = edges
             .iter()
             .filter(same_spelling)
-            .filter(|e| {
-                (e.written_by == Some(writer) || (operator_replaced && e.position == pos))
-                    && !taken.contains(&e.agent_id)
-            })
+            .filter(|e| e.written_by == Some(writer) && !taken.contains(&e.agent_id))
             .collect();
         found.sort_by_key(|e| e.position != i64::try_from(i).ok());
         if let Some(e) = found.first() {
@@ -623,12 +611,19 @@ pub(crate) async fn resolve_document_authors(
                 .map_err(internal_error)?;
             (created.id.into(), false)
         };
+        // A name-derived node an operator removed from this paper (its
+        // authorship retracted, none in force) is not credited again: the
+        // walk's create-if-absent finds the retracted row and writes no
+        // `authored` edge, and this author writes no `asserts`, not even onto
+        // a claim new in this ingest. Fail-safe by construction: a retraction
+        // can only withhold credit here, never give it.
+        let removed = removed_here.contains(&agent_uuid);
         // The report is filled in below, once the whole list is resolved:
         // one candidates statement per document, not one per author.
         out.push(ResolvedAuthor {
             idx,
             agent_id: agent_uuid,
-            asserts: true,
+            asserts: !removed,
             explicit: false,
             pending: false,
             report: IngestAuthorReport {
@@ -636,13 +631,15 @@ pub(crate) async fn resolve_document_authors(
                 name: author.name.clone(),
                 position: idx,
                 status: if existed { "matched" } else { "created" },
-                action: if existed {
+                action: if removed {
+                    "retracted_name_key"
+                } else if existed {
                     "reused_name_key"
                 } else {
                     "created_name_key"
                 },
                 attribution: ATTRIBUTION_NAME_DERIVED,
-                asserts_claims: true,
+                asserts_claims: !removed,
                 pending_ingested_by: None,
                 display_name: None,
                 replaced: None,

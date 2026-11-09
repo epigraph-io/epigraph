@@ -585,12 +585,14 @@ impl PaperRepository {
             .collect())
     }
 
-    /// The agents whose `authored` edge into `paper_id` was RETRACTED (no
-    /// longer in force) and that `viewer` may read. An agent's edge into a
-    /// paper is world-owned (migration 120), so only the maintenance path
-    /// retracts one: the operator CLI replacing a name-derived author with an
-    /// explicit agent. A document ingest reads this to keep that replacement
-    /// for every later ingester.
+    /// The agents whose `authored` edge into `paper_id` was RETRACTED after
+    /// it was written (no longer in force, and not born retracted) and that
+    /// `viewer` may read: in practice the operator CLI replacing a
+    /// name-derived author with an explicit agent, since an agent's edge
+    /// into a paper is world-owned (migration 120) and generic writers refuse
+    /// the shape. A document ingest reads this only to WITHHOLD credit (its
+    /// name path never re-credits such an author), never to grant any, so a
+    /// row that reached this state another way can withhold, not forge.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
@@ -605,7 +607,7 @@ impl PaperRepository {
                    FROM edges e \
                   WHERE e.target_id = $1 AND e.target_type = 'paper' \
                     AND e.source_type = 'agent' AND e.relationship = 'authored' \
-                    AND NOT {in_force} \
+                    AND NOT {in_force} AND e.valid_to > e.created_at \
                     /* {{EDGE_VISIBILITY:e}} */",
                 in_force = crate::repos::edge::EDGE_IN_FORCE,
             ),

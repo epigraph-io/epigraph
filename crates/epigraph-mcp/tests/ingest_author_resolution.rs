@@ -1961,12 +1961,17 @@ async fn query_paper_reads_only_what_the_ingest_wrote(pool: PgPool) {
 }
 
 /// An operator replacement (the CLI retracts this spelling's name-derived
-/// author from the paper and attaches the chosen agent at its position) is
-/// the operator's decision, not one ingester's word: a DIFFERENT ingester's
-/// later name-only re-ingest keeps the chosen agent too, never brings the
-/// retracted name-derived node back, and reports what is stored.
+/// author from the paper and attaches the chosen agent) is never undone by a
+/// DIFFERENT ingester's later name-only re-ingest: the removed name-derived
+/// node is not credited again (no `authored` edge in force, and no `asserts`,
+/// not even onto a claim new in that re-ingest), the report says so
+/// (`retracted_name_key`, `asserts_claims: false`) and lists the chosen agent
+/// in `also_at_position`, and the chosen agent stays the paper's author. The
+/// re-ingest does not adopt the chosen agent either: a retraction says
+/// nothing trustworthy about who replaced the node, so it may only withhold
+/// credit.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_operator_replacement_is_kept_for_every_later_ingester(pool: PgPool) {
+async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPool) {
     let cli = privileged_server(&pool);
     let honest = app_role_server(&pool).await;
     let (_maintenance, viewer) = fixture::bypass(&pool).await;
@@ -2009,25 +2014,41 @@ async fn an_operator_replacement_is_kept_for_every_later_ingester(pool: PgPool) 
         0,
         "CALIBRATION: replaced"
     );
+    let key_asserts = asserts_on_doc(&pool, key, d).await;
 
     let json = text(
         &tools::ingestion::do_ingest_document(
             &honest,
             &public,
-            &doc_with_atoms(d, json!([{"name": name}]), &atoms),
+            &doc_with_atoms(
+                d,
+                json!([{"name": name}]),
+                &["The replaced author's atom.", "A claim new in the re-ingest."],
+            ),
             None,
         )
         .await
         .expect("another ingester's name-only re-ingest"),
     );
     let report = &json["authors"][0];
-    assert_eq!(report["agent_id"], human.to_string(), "{json}");
-    assert_eq!(report["action"], "kept_attached", "{json}");
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["action"], "retracted_name_key", "{json}");
     assert_eq!(report["asserts_claims"], false, "{json}");
+    assert!(
+        report["also_at_position"]
+            .as_array()
+            .is_some_and(|a| a.contains(&json!(human.to_string()))),
+        "the chosen agent is reported: {json}"
+    );
     assert_eq!(
         authored_in_force(&pool, key, d).await,
         0,
         "not brought back"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, d).await,
+        key_asserts,
+        "the removed node asserts nothing new, the new claim included"
     );
     assert_eq!(authored_in_force(&pool, human, d).await, 1);
 }

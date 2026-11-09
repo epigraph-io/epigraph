@@ -1980,6 +1980,9 @@ pub struct IngestAuthorReport {
     /// What the walk did: `attached_given` (this call's `agent_id`),
     /// `kept_attached` (no `agent_id` now, but this ingester attached one for
     /// this spelling on an earlier run, and it stays the author),
+    /// `retracted_name_key` (the name-derived author was removed from this
+    /// paper by an operator replacement: nothing is written for it and it
+    /// asserts nothing; the replacing agent is in `also_at_position`),
     /// `reused_name_key` or
     /// `created_name_key`.
     pub action: &'static str,
