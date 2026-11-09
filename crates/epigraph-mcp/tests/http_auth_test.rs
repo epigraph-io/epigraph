@@ -390,6 +390,75 @@ async fn wrong_scope_yields_scope_error() {
     );
 }
 
+/// The same scope gate on rmcp 3.x's STATELESS path. A peer on protocol
+/// 2026-07-28 sends self-contained requests (`MCP-Protocol-Version` header
+/// plus per-request `_meta`) with no `initialize` and no session, and rmcp
+/// dispatches them on a separate code path. `call_tool` decides authority from
+/// the HTTP `Parts` rmcp attaches to the request: with none it would treat the
+/// call as stdio (no scope gate, signer-agent authority). So a read+write
+/// bearer must still be refused an admin-only tool here, exactly as on the
+/// session path above.
+///
+/// Mutation: make `call_tool` ignore `Parts`
+/// (`let http_parts: Option<&Parts> = None;`) -> no `claims:admin` refusal.
+#[tokio::test]
+async fn stateless_2026_07_28_call_keeps_the_scope_gate() {
+    let addr = spawn_server().await;
+    let url = format!("http://{addr}/mcp");
+    let token = mint_token(SECRET, &["claims:read", "claims:write"]);
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "delete_edge",
+            "arguments": {"edge_id": "00000000-0000-0000-0000-000000000001"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {"name": "stateless-test", "version": "0.1.0"}
+            }
+        }
+    });
+    let mut resp = client()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", ACCEPT)
+        .header("Content-Type", CONTENT_TYPE)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "delete_edge")
+        .json(&body)
+        .send()
+        .await
+        .expect("stateless tools/call POST failed");
+    let status = resp.status();
+    assert!(
+        resp.headers().get(SESSION_HEADER).is_none(),
+        "CALIBRATION: a 2026-07-28 request must be served without a session"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let text = if resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    {
+        read_sse_data(&mut resp, deadline).await
+    } else {
+        resp.text().await.unwrap_or_default()
+    };
+    assert!(
+        status.is_success(),
+        "CALIBRATION: rmcp must accept the stateless request (status {status}): {text}"
+    );
+    assert!(
+        text.contains("claims:admin"),
+        "a read+write bearer must be refused delete_edge on the stateless path too; got: {text}"
+    );
+}
+
 // ─── Test 4: right scope passes auth ──────────────────────────────────────
 
 #[tokio::test]
