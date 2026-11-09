@@ -7,8 +7,9 @@
 //!   retired claim's outgoing edges froze onto current claims. The supersede
 //!   cascade invalidates them for the claim it just retired
 //!   (`retraction_cascade::cascade_after_supersede`); the delta reads them for
-//!   every retired claim (the retroactive sweep K10(3), which nothing applies:
-//!   operator decision OD-10).
+//!   every retired claim (the retroactive sweep K10(3), operator decision
+//!   OD-10, ruled by R-178(2) and R-179; its apply is the operator binary
+//!   `sweep_retired_source_bbas`, which plans from [`measure_k10_retro`]).
 //! * [`SUPERSEDES_EDGE_BBAS_SQL`]: the live BBAs keyed on a `supersedes` edge
 //!   (either spelling). K12(b) stops new ones being wired
 //!   (`sheaf::restriction_kind_with_profile` maps `supersedes` to Neutral);
@@ -273,7 +274,8 @@ SELECT count(*)
 pub struct DeltaItems {
     /// R-131: factorless claim-to-claim `corroborates` / `refutes` edges.
     pub r131: bool,
-    /// K10(3): BBAs from already-retired sources (OD-10, never applied).
+    /// K10(3): BBAs from already-retired sources (OD-10; applied only by the
+    /// operator binary `sweep_retired_source_bbas`).
     pub k10_retro: bool,
     /// K12(b): BBAs keyed on `supersedes` edges (DS), and the sheaf half.
     pub k12b: bool,
@@ -694,55 +696,13 @@ async fn measure(
     if !(opts.items.k10_retro || opts.items.k12b) {
         return Ok(report);
     }
-    // The name the cascade's frame lookup uses (`edge_factor`); read, never
-    // created here.
-    let frame_id = epigraph_db::FrameRepository::get_by_name(
-        &mut *conn,
-        viewer,
-        crate::edge_factor::BINARY_FRAME_NAME,
-    )
-    .await
-    .map_err(|e| format!("read the binary frame: {e}"))?
-    .map(|f| f.id);
+    let frame_id = binary_frame_id(&mut *conn, viewer).await?;
 
     let mut k10_rows = Vec::new();
     if opts.items.k10_retro {
-        k10_rows = retired_source_edge_bbas(&mut *conn, None)
-            .await
-            .map_err(|e| format!("K10(3) selection: {e}"))?;
-        let retracted: i64 = sqlx::query_scalar(RETIRED_SOURCE_RETRACTED_BBAS_SQL)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| format!("K10(3) retracted count: {e}"))?;
-        let delta = delta_block(
-            &mut *conn,
-            viewer,
-            frame_id,
-            &[("k10_retro", &k10_rows)],
-            opts.top,
-        )
-        .await?;
-        let edges: std::collections::BTreeSet<Uuid> = k10_rows.iter().map(|r| r.edge_id).collect();
-        let not_in_force: std::collections::BTreeSet<Uuid> = k10_rows
-            .iter()
-            .filter(|r| !r.edge_in_force)
-            .map(|r| r.edge_id)
-            .collect();
-        let sources: std::collections::BTreeSet<Uuid> =
-            k10_rows.iter().map(|r| r.source_id).collect();
-        let mut by_relationship = std::collections::BTreeMap::new();
-        for r in &k10_rows {
-            *by_relationship.entry(r.relationship.clone()).or_insert(0) += 1;
-        }
-        report.k10_retro = Some(K10RetroReport {
-            live_rows: k10_rows.len(),
-            edges: edges.len(),
-            edges_not_in_force: not_in_force.len(),
-            retired_sources: sources.len(),
-            retracted_key_kept: retracted,
-            by_relationship,
-            delta,
-        });
+        let (rows, k10) = measure_k10_retro(&mut *conn, viewer, frame_id, opts.top).await?;
+        k10_rows = rows;
+        report.k10_retro = Some(k10);
     }
     let mut k12b_rows = Vec::new();
     if opts.items.k12b {
@@ -794,6 +754,74 @@ async fn measure(
         );
     }
     Ok(report)
+}
+
+/// The binary frame's id, READ (never created): the frame the cascade's
+/// repair folds on, by the name its lookup uses (`edge_factor`). `None` when
+/// no such frame exists yet.
+///
+/// # Errors
+/// The read's error.
+pub async fn binary_frame_id(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Option<Uuid>, String> {
+    Ok(epigraph_db::FrameRepository::get_by_name(
+        &mut *conn,
+        viewer,
+        crate::edge_factor::BINARY_FRAME_NAME,
+    )
+    .await
+    .map_err(|e| format!("read the binary frame: {e}"))?
+    .map(|f| f.id))
+}
+
+/// The K10(3) measurement on `conn`, in whatever transaction it is in: the
+/// rows [`retired_source_edge_bbas`] selects for EVERY retired claim, and
+/// what removing all of them does to each claim holding one (as the
+/// cascade's repair would leave it; `frame_id` from [`binary_frame_id`]).
+///
+/// The dry-run delta's `k10_retro` block is this function's report, and the
+/// retroactive sweep's apply (`sweep_retired_source_bbas`) plans from the
+/// same call, so the rows it deletes are the rows this measured.
+///
+/// # Errors
+/// Any read's error.
+pub async fn measure_k10_retro(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Option<Uuid>,
+    top: usize,
+) -> Result<(Vec<EdgeKeyedBba>, K10RetroReport), String> {
+    let rows = retired_source_edge_bbas(&mut *conn, None)
+        .await
+        .map_err(|e| format!("K10(3) selection: {e}"))?;
+    let retracted: i64 = sqlx::query_scalar(RETIRED_SOURCE_RETRACTED_BBAS_SQL)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| format!("K10(3) retracted count: {e}"))?;
+    let delta = delta_block(&mut *conn, viewer, frame_id, &[("k10_retro", &rows)], top).await?;
+    let edges: std::collections::BTreeSet<Uuid> = rows.iter().map(|r| r.edge_id).collect();
+    let not_in_force: std::collections::BTreeSet<Uuid> = rows
+        .iter()
+        .filter(|r| !r.edge_in_force)
+        .map(|r| r.edge_id)
+        .collect();
+    let sources: std::collections::BTreeSet<Uuid> = rows.iter().map(|r| r.source_id).collect();
+    let mut by_relationship = std::collections::BTreeMap::new();
+    for r in &rows {
+        *by_relationship.entry(r.relationship.clone()).or_insert(0) += 1;
+    }
+    let report = K10RetroReport {
+        live_rows: rows.len(),
+        edges: edges.len(),
+        edges_not_in_force: not_in_force.len(),
+        retired_sources: sources.len(),
+        retracted_key_kept: retracted,
+        by_relationship,
+        delta,
+    };
+    Ok((rows, report))
 }
 
 async fn r131_report(conn: &mut sqlx::PgConnection) -> Result<R131Report, String> {
