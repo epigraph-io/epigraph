@@ -1184,6 +1184,18 @@ impl WorkflowRepository {
     /// [`DbError::InvalidData`] naming the retired head, rather than handing
     /// back a claim the caller cannot evolve or should not attach evidence to.
     ///
+    /// # The connection decides what this can see
+    ///
+    /// The step walk filters by `viewer` in the query, but on the application
+    /// role row security ALSO filters by whatever tenancy context the
+    /// connection carries. A raw pool connection carries none, so a
+    /// group-private workflow's steps and `executes` edges are dropped by the
+    /// session policy and this answers `Ok(None)` to the group's own members.
+    /// A request path therefore calls [`Self::resolve_step_claim_conn`] on a
+    /// connection stamped with the same viewer; this pool form only acquires
+    /// and delegates, for callers that run on a role row security does not
+    /// filter (tests, maintenance).
+    ///
     /// # Errors
     /// Returns `DbError` if a database query fails, and
     /// `DbError::InvalidData` when every head of the step's lineage is retired.
@@ -1194,19 +1206,41 @@ impl WorkflowRepository {
         step_index: usize,
         prefer_head: bool,
     ) -> Result<Option<Uuid>, DbError> {
-        let Some(max_gen) = Self::max_generation_by_canonical(pool, canonical_name)
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::resolve_step_claim_conn(&mut conn, viewer, canonical_name, step_index, prefer_head)
+            .await
+    }
+
+    /// [`Self::resolve_step_claim`] on a caller-supplied connection: the
+    /// primitive. All three statements (the latest generation, the root at
+    /// that generation and the step walk) run on `conn`, so on a connection
+    /// stamped with `viewer` they see exactly the rows that viewer may read.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_step_claim`].
+    pub async fn resolve_step_claim_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        canonical_name: &str,
+        step_index: usize,
+        prefer_head: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        let Some(max_gen) = Self::max_generation_by_canonical(&mut *conn, canonical_name)
             .await
             .map_err(DbError::from)?
         else {
             return Ok(None);
         };
-        let Some(workflow_id) = Self::find_root_by_canonical(pool, canonical_name, max_gen)
+        let Some(workflow_id) = Self::find_root_by_canonical(&mut *conn, canonical_name, max_gen)
             .await
             .map_err(DbError::from)?
         else {
             return Ok(None);
         };
-        let steps = Self::resolve_steps_to_heads(pool, viewer, workflow_id).await?;
+        let steps = Self::resolve_steps_to_heads_conn(conn, viewer, workflow_id).await?;
         let Some(step) = steps.into_iter().nth(step_index) else {
             return Ok(None);
         };
