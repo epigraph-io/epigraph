@@ -65,6 +65,8 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("list_events", "claims:read"),
     ("list_frames", "claims:read"),
     ("list_match_candidates", "claims:read"),
+    // The caller's own intake reports (migration 207).
+    ("list_my_bug_reports", "claims:read"),
     ("list_mcp_tools", "claims:read"),
     ("list_perspectives", "claims:read"),
     ("query_claims", "claims:read"),
@@ -139,6 +141,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("stage_claims", "claims:write"),
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
+    // Migration 207's write-only intake: the caller files into a group it
+    // need not belong to, through the definer, and reads nothing back.
+    ("submit_bug_report", "claims:write"),
     // The two claim-retiring ACTS (batch OA1, operator decision D1). The act
     // is the caller's own write to a claim it may write; the per-claim rule
     // (admin/writer membership in the owning group, for a dedup of both the
