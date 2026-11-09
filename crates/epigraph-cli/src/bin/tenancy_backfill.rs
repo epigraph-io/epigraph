@@ -2723,7 +2723,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         ),
         // 206: claim visibility controls, all five app-callable. The two
         // reads run on every claim write that names no visibility
-        // (`ClaimVisibilityRepository::resolve_visibility_choice`), so a
+        // (`ClaimRepository::resolve_visibility_choice`), so a
         // missing grant there is 42501 on every default write, an outage like
         // 107's actor read; the three writes are the publicize, share and
         // default-team surfaces, which would be refused outright.
