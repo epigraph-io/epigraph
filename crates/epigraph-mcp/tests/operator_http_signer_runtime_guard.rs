@@ -68,7 +68,12 @@ async fn spawn_listener(pool: PgPool, signer: AgentSigner) -> String {
     let revocation = Arc::new(epigraph_mcp::auth::DbAccessTokenRevocation::new(
         pool.clone(),
     ));
-    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
+    // `main` builds every listener from a `ScopedPool` (content reads refuse
+    // without one), so the fixture does too.
+    let scoped = fixture::scoped_pool(&pool).await;
+    let embedder = Arc::new(
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone()),
+    );
     let service = StreamableHttpService::new(
         move || {
             Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
@@ -76,7 +81,8 @@ async fn spawn_listener(pool: PgPool, signer: AgentSigner) -> String {
                 signer.clone(),
                 embedder.clone(),
                 false,
-            ))
+            )
+            .with_scoped_pool(scoped.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
@@ -422,13 +428,21 @@ async fn spawn_principal_less_listener(
         StreamableHttpServerConfig, StreamableHttpService,
     };
     let signer = Arc::new(signer);
-    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
-    let probe = Arc::new(epigraph_mcp::EpiGraphMcpFull::new_shared(
-        pool.clone(),
-        signer.clone(),
-        embedder.clone(),
-        false,
-    ));
+    // As in `spawn_listener`: `main` attaches a `ScopedPool`, and without one
+    // the CALIBRATION `get_claim` below is refused before any gate runs.
+    let scoped = fixture::scoped_pool(&pool).await;
+    let embedder = Arc::new(
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone()),
+    );
+    let probe = Arc::new(
+        epigraph_mcp::EpiGraphMcpFull::new_shared(
+            pool.clone(),
+            signer.clone(),
+            embedder.clone(),
+            false,
+        )
+        .with_scoped_pool(scoped.clone()),
+    );
     let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
         probe as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
     )
@@ -440,7 +454,8 @@ async fn spawn_principal_less_listener(
                 signer.clone(),
                 embedder.clone(),
                 false,
-            ))
+            )
+            .with_scoped_pool(scoped.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
