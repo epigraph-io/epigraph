@@ -358,17 +358,30 @@ pub struct CardRole {
 /// ingests a fabricated document under a new name is counted for that name,
 /// and the card says nothing more than that an ingest wrote it.
 ///
-/// * `authored_papers`: the agent's marked, in-force `authored -> paper`
-///   edges that are not pending its countersignature.
-/// * `pending_authored_papers`: the marked, in-force ones that are.
+/// Each principal whose ingest states a fact keeps its own marked row of it
+/// (see [`crate::ingest_written`]), so one paper can carry several
+/// authorships of one agent, one per ingest that named it. Every count is of
+/// distinct papers and claims.
+///
+/// * `authored_papers`: papers the agent has a marked, in-force
+///   `authored -> paper` edge to that is not awaiting its countersignature.
+///   "Not awaiting" is all it means: an edge without the pending mark (every
+///   name-derived author, every edge an ingest wrote for its own principal)
+///   counts, and a name-derived author node never countersigns anything.
+/// * `pending_authored_papers`: papers whose only marked, in-force
+///   authorships of the agent await its countersignature (an ingester named
+///   it). A paper the agent also authored by an authorship not awaiting it is
+///   counted in `authored_papers` only: another ingester's pending naming
+///   neither blocks nor replaces the agent's own.
 /// * `asserted_claims`: the agent's own claims, plus every claim it is
 ///   attributed by a marked, in-force `agent -asserts-> claim` edge BACKED by
-///   one of its counted authorships: a marked, in-force, countersigned
-///   `authored` edge to a paper whose marked, in-force `asserts` edge names
-///   the same claim, all three written by ingests of ONE principal
-///   ([`crate::same_ingest_sql`]). A pending authorship backs nothing, and a
-///   second ingester of the same DOI cannot borrow the first one's
-///   authorship to credit the author with claims of its own.
+///   one of its counted authorships: a marked, in-force `authored` edge, not
+///   awaiting countersignature, to a paper whose marked, in-force `asserts`
+///   edge names the same claim, all three written by ingests of ONE principal
+///   ([`crate::same_ingest_sql`]). So each ingest that NAMES the agent credits
+///   it with that ingest's claims, by that ingest's word; an ingest that does
+///   not name it credits it with nothing, even under the same DOI; and a
+///   pending authorship backs nothing.
 ///
 /// Not counted, by design: edges written before the marker existed (until an
 /// operator backfills them), any edge written over `POST /api/v1/edges` or
@@ -376,18 +389,20 @@ pub struct CardRole {
 /// attributions (no document, no countersign state behind them).
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CardCounts {
-    /// Visible in-force `authored` edges from the agent to a paper, except
-    /// those awaiting the agent's countersignature.
+    /// Visible papers the agent has an in-force `authored` edge to that is not
+    /// awaiting its countersignature (not "countersigned": a name-derived
+    /// author is never countersigned, and is never pending either).
     pub authored_papers: i64,
-    /// Visible in-force `authored` edges from the agent to a paper that an
-    /// ingester wrote naming it and that it has not countersigned
+    /// Visible papers whose only in-force `authored` edges from the agent were
+    /// written by an ingester naming it and await its countersignature
     /// ([`AUTHORSHIP_PENDING_PROPERTY`]): the ingester's word, not the
     /// agent's, so never in `authored_papers`.
     pub pending_authored_papers: i64,
     /// Visible claims the agent asserts, each claim once: those it filed
     /// (`claims.agent_id`), and those a document ingest attributed to it (an
-    /// in-force `asserts` edge from the agent, backed by its countersigned
-    /// in-force authorship of a paper asserting the claim).
+    /// in-force `asserts` edge from the agent, backed by that same ingest's
+    /// in-force authorship of a paper asserting the claim, not awaiting
+    /// countersignature).
     pub asserted_claims: i64,
     /// True when any count reached [`COUNT_CAP`] (the value shown is the cap).
     pub capped: bool,
@@ -872,8 +887,9 @@ impl AgentLookupRepository {
         Ok(out)
     }
 
-    /// Visible authored papers (countersigned, and pending apart) and asserted
-    /// claims of each of `ids`, capped. See [`CardCounts`] for what counts.
+    /// Visible authored papers (not awaiting countersignature, and pending
+    /// apart) and asserted claims of each of `ids`, capped. See
+    /// [`CardCounts`] for what counts.
     async fn counts(
         conn: &mut PgConnection,
         viewer: &Viewer,
@@ -885,17 +901,24 @@ impl AgentLookupRepository {
                 r"
             SELECT u.id,
                    (SELECT count(*) FROM (
-                        SELECT 1 FROM edges e
+                        SELECT DISTINCT e.target_id FROM edges e
                          WHERE e.source_id = u.id AND e.source_type = 'agent'
                            AND e.relationship = 'authored' AND e.target_type = 'paper'
                            AND {in_force_e} AND NOT {pending_e} AND {ingest_e}
                            /* {{EDGE_VISIBILITY:e}} */
                          LIMIT $2) p) AS papers,
                    (SELECT count(*) FROM (
-                        SELECT 1 FROM edges ep
+                        SELECT DISTINCT ep.target_id FROM edges ep
                          WHERE ep.source_id = u.id AND ep.source_type = 'agent'
                            AND ep.relationship = 'authored' AND ep.target_type = 'paper'
                            AND {in_force_ep} AND {pending_ep} AND {ingest_ep}
+                           AND NOT EXISTS (
+                               SELECT 1 FROM edges eo
+                                WHERE eo.source_id = u.id AND eo.source_type = 'agent'
+                                  AND eo.relationship = 'authored' AND eo.target_type = 'paper'
+                                  AND eo.target_id = ep.target_id
+                                  AND {in_force_eo} AND NOT {pending_eo} AND {ingest_eo}
+                                  /* {{EDGE_VISIBILITY:eo}} */)
                            /* {{EDGE_VISIBILITY:ep}} */
                          LIMIT $2) pp) AS pending_papers,
                    (SELECT count(*) FROM (
@@ -904,7 +927,7 @@ impl AgentLookupRepository {
                             /* {{VISIBILITY:c}} */
                           LIMIT $2)
                         UNION
-                        (SELECT c2.id FROM edges e2
+                        (SELECT DISTINCT c2.id FROM edges e2
                            JOIN claims c2 ON c2.id = e2.target_id
                           WHERE e2.source_id = u.id AND e2.source_type = 'agent'
                             AND e2.relationship = 'asserts' AND e2.target_type = 'claim'
@@ -930,6 +953,9 @@ impl AgentLookupRepository {
                 pending_e = authorship_pending_sql("e"),
                 in_force_ep = in_force("ep"),
                 pending_ep = authorship_pending_sql("ep"),
+                in_force_eo = in_force("eo"),
+                pending_eo = authorship_pending_sql("eo"),
+                ingest_eo = ingest_written_edge_sql("eo"),
                 in_force_e2 = in_force("e2"),
                 in_force_ea = in_force("ea"),
                 pending_ea = authorship_pending_sql("ea"),

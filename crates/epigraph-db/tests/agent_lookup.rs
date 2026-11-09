@@ -1707,7 +1707,8 @@ async fn a_pending_authorship_is_reported_apart_and_backs_no_claim(pool: PgPool)
         assert_eq!(k["asserted_claims"], 0, "{who}: {k}");
     }
 
-    // A countersigned authorship of the same shape counts (the control).
+    // An authorship of the same shape not awaiting countersignature counts
+    // (the control).
     let (author, _) = named(&pool, "Isolde Varrick").await;
     let p2 = paper(&pool, "10.9999/lookup.pending.2").await;
     let c2 = fixture::seed_public_claim(&pool, stranger, "a name-derived finding").await;
