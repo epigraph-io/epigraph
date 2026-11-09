@@ -1986,25 +1986,25 @@ pub struct IngestAuthorReport {
     /// `reused_name_key` or
     /// `created_name_key`.
     pub action: &'static str,
-    /// Who vouches for the STORED attribution: `name_derived` (the name
-    /// path), `caller` (the agent is the ingester), `operated_by_caller` (the
-    /// ingester is the human the agent acts for), `confirmed` (kept: an
-    /// earlier attachment the person or their operator made, which this
-    /// ingester does not speak for), or `pending_countersign` (the
-    /// authorship is an ingester's word, see `pending_ingested_by`; the agent
-    /// is listed as a pending author of the paper and asserts none of its
-    /// claims; no countersign route exists yet, so only an operator clears
-    /// the mark). An earlier pending authorship of this agent on this paper
-    /// stays pending whoever re-attaches it: no session can rewrite an
-    /// agent's edge.
+    /// Who vouches for THIS ingester's attribution (each ingest principal
+    /// keeps an `authored` row of its own): `name_derived` (the name path),
+    /// `caller` (the agent is the ingester), `operated_by_caller` (the
+    /// ingester is the human the agent acts for), `confirmed` (this
+    /// ingester's own earlier non-pending attachment, re-named now that it no
+    /// longer speaks for the agent: it stays as written and adds no
+    /// `asserts`), or `pending_countersign` (the authorship is this
+    /// ingester's word, see `pending_ingested_by`; the agent is listed as a
+    /// pending author in this ingester's listing of the paper and asserts
+    /// none of its claims; no countersign route exists yet, so only an
+    /// operator clears the mark). Another ingester's row, pending or not,
+    /// never decides this one.
     pub attribution: &'static str,
     /// True when this agent's `asserts` edges onto the document's claims were
     /// written by this call: only when this ingester speaks for the agent
     /// (`caller` / `operated_by_caller`) and its authorship is not pending.
     pub asserts_claims: bool,
-    /// On a `pending_countersign` author, the ingester recorded on the stored
-    /// authorship: the one whose word it is (an earlier ingester's, when this
-    /// call re-attached or kept it).
+    /// On a `pending_countersign` author, the ingester recorded on this
+    /// ingester's own stored authorship: always this call's ingester.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_ingested_by: Option<String>,
     /// The attached agent's own `display_name`, on an `explicit` author.
