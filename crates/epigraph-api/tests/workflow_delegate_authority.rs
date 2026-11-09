@@ -2044,3 +2044,166 @@ async fn a_delegate_owns_but_cannot_write_its_operators_claim_in_a_group_it_does
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A row with no recorded submitter
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A delegate inherits what its principal is admitted to BY IDENTITY. A
+/// workflow with NO recorded submitter has no principal to act for: every
+/// transport admits there only a live writer of its owner group (and, with a
+/// token, the audited admin arm). So the delegate arm admits nothing on such
+/// a row, and in particular it does not reopen the any-reader admission
+/// stdio used to give it.
+///
+/// The row is public in team group `t`: `p` writes `t`, its delegate `d` only
+/// reads it. `d` is refused `add_step` and a new generation on every
+/// transport, and `deprecate_workflow` on both MCP transports, by the
+/// no-submitter rule's own text, with nothing written and nothing recorded.
+/// CALIBRATIONS (after the refusals, since they write): `p` itself is
+/// admitted there through its MEMBERSHIP (recorded `owner_group_writer`),
+/// which a delegate does not inherit; and once the same row records `p` as
+/// its submitter, `d` is admitted over stdio as `p`'s delegate, so the
+/// missing submitter alone is what refused it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_admits_nothing_on_a_row_with_no_recorded_submitter(pool: PgPool) {
+    let w = world(&pool).await;
+    const UNRECORDED: &str = "acme-delegate-unrecorded";
+    Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    )
+    .ingest(&extraction(UNRECORDED, 2), public_in(w.t))
+    .await
+    .unwrap_or_else(|e| panic!("p ingests {UNRECORDED}: {e}"));
+    let wf = workflow_named(&pool, UNRECORDED).await;
+    sqlx::query("UPDATE workflows SET metadata = metadata - 'epigraph_submitted_by' WHERE id = $1")
+        .bind(wf)
+        .execute(&pool)
+        .await
+        .expect("drop the recorded submitter");
+    assert_eq!(
+        workflow_row(&pool, wf).await,
+        ("public".to_string(), w.t, None),
+        "PREMISE: public in t, no recorded submitter"
+    );
+    assert!(
+        !writes(&pool, w.d, w.t).await,
+        "PREMISE: d does not write t"
+    );
+    assert_eq!(
+        acting_operator(&pool, w.d).await,
+        Some(w.p),
+        "PREMISE: d acts for p, who writes t"
+    );
+    let row_before = workflow_row(&pool, wf).await;
+    let truth_before = workflow_truth(&pool, wf).await;
+    let counts_before = row_counts(&pool).await;
+
+    // Every outcome first, so a red run shows every transport and verb.
+    let mut outcomes: Vec<(String, Result<Value, String>)> = Vec::new();
+    for via in w.d_vias() {
+        let label = via.label();
+        outcomes.push((
+            format!("{label} add_step"),
+            via.add_step(UNRECORDED, &format!("acme unrecorded step via {label}"))
+                .await
+                .map(|id| json!(id)),
+        ));
+        outcomes.push((
+            format!("{label} generation 1"),
+            via.ingest(&extraction_gen(UNRECORDED, 1, 1), None).await,
+        ));
+        if !matches!(via, Via::Rest(..)) {
+            outcomes.push((format!("{label} deprecate"), via.deprecate(wf).await));
+        }
+    }
+    let admitted: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(what, _)| what.as_str())
+        .collect();
+    assert!(
+        admitted.is_empty(),
+        "a delegate is admitted nowhere on a row with no recorded submitter: {admitted:?} \
+         ({outcomes:?})"
+    );
+    for (what, outcome) in &outcomes {
+        let err = outcome.as_ref().expect_err("refused");
+        assert!(
+            err.contains("no recorded submitter") && err.contains("owner group"),
+            "{what}: refused by the no-submitter rule itself, naming it: {err}"
+        );
+    }
+    assert_eq!(
+        caller_writes(&pool, wf, w.d).await,
+        Vec::<CallerWrite>::new(),
+        "no provenance row records an admission of d"
+    );
+    assert_eq!(admin_writes(&pool, wf).await, 0, "no admin arm ran");
+    assert_eq!(
+        workflow_gen(&pool, UNRECORDED, 1).await,
+        None,
+        "no generation 1"
+    );
+    assert_eq!(
+        workflow_row(&pool, wf).await,
+        row_before,
+        "the row is untouched"
+    );
+    assert_eq!(
+        workflow_truth(&pool, wf).await,
+        truth_before,
+        "the row is not deprecated"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        counts_before,
+        "nothing was written"
+    );
+
+    // CALIBRATION A: p itself is admitted on this row, by its membership of t.
+    Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    )
+    .add_step(UNRECORDED, "acme unrecorded step by p")
+    .await
+    .expect("CALIBRATION A: p, a writer of t, adds a step");
+    let p_rows = caller_writes(&pool, wf, w.p).await;
+    assert_eq!(
+        p_rows
+            .iter()
+            .map(|r| (r.0.as_str(), r.1.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("add_step", "owner_group_writer")],
+        "CALIBRATION A: p is admitted by membership, not identity: {p_rows:?}"
+    );
+
+    // CALIBRATION B: the same row with p recorded as its submitter admits d.
+    sqlx::query(
+        "UPDATE workflows SET metadata = metadata || \
+                jsonb_build_object('epigraph_submitted_by', $2::text) WHERE id = $1",
+    )
+    .bind(wf)
+    .bind(w.p)
+    .execute(&pool)
+    .await
+    .expect("record p as the submitter");
+    Via::McpStdio(&w.d_server)
+        .add_step(UNRECORDED, "acme recorded step by d")
+        .await
+        .expect("CALIBRATION B: with p recorded, d is admitted as p's delegate");
+    let p_str = w.p.to_string();
+    assert_eq!(
+        caller_writes(&pool, wf, w.d).await,
+        vec![(
+            "add_step".to_string(),
+            "delegate".to_string(),
+            Some(p_str.clone()),
+            Some(p_str),
+            Some("stdio".to_string()),
+        )],
+        "CALIBRATION B: recorded as the delegation"
+    );
+}
