@@ -22,6 +22,14 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 async fn spawn_app(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
+    spawn_app_with(pool, false).await
+}
+
+/// `server_shaped`: build the state as `bin/server.rs` does
+/// (`AppState::with_scoped_pool`), so `state.db_pool` is the application-role
+/// pool too, not the harness superuser. Any read a handler makes on the raw
+/// pool then sees what the server's would: unstamped, so public rows only.
+async fn spawn_app_with(pool: &PgPool, server_shaped: bool) -> (SocketAddr, oneshot::Sender<()>) {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
             .fetch_one(pool)
@@ -36,8 +44,13 @@ async fn spawn_app(pool: &PgPool) -> (SocketAddr, oneshot::Sender<()>) {
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
             .await
             .expect("app-role ScopedPool");
-    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
-    state.scoped = Some(scoped);
+    let state = if server_shaped {
+        AppState::with_scoped_pool(scoped, ApiConfig::default())
+    } else {
+        let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+        state.scoped = Some(scoped);
+        state
+    };
     state
         .load_entity_type_cache()
         .await
@@ -280,4 +293,51 @@ async fn publicize_over_http_is_for_team_admins(pool: PgPool) {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["default_group_id"], t.to_string(), "{body}");
+}
+
+/// D-V4 over REST on a server-shaped state: resubmitting content the caller
+/// already holds PRIVATE, with no visibility (so the default, its team),
+/// returns the existing claim unchanged and SAYS so. The response reports the
+/// stored tenancy (private, the home group) and the "NOT re-scoped" note. Both
+/// come from reading the claim back, which only a read stamped with the caller
+/// can do: on the raw application pool the private row is invisible, and the
+/// response would echo the requested team with no note.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rest_resubmit_reports_the_stored_private_tenancy_and_the_note(pool: PgPool) {
+    let (addr, _stop) = spawn_app_with(&pool, true).await;
+    let t = team(&pool, "http-team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "http-resubmit").await;
+    add_member(&pool, t, alice, "writer").await;
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/claims",
+        alice,
+        claim_body(alice, "http resubmit", json!({"visibility": "private"})),
+    )
+    .await;
+    assert!(status == 200 || status == 201, "{status} {body}");
+    let id: Uuid = body["id"].as_str().expect("id").parse().unwrap();
+    assert_eq!(tenancy(&pool, id).await, ("group".to_string(), home));
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/claims",
+        alice,
+        claim_body(alice, "http resubmit", json!({})),
+    )
+    .await;
+    assert!(status == 200 || status == 201, "{status} {body}");
+    assert_eq!(body["id"], id.to_string(), "the existing claim: {body}");
+    assert_eq!(body["visibility"], "private", "{body}");
+    assert_eq!(body["owner_group_id"], home.to_string(), "{body}");
+    assert!(
+        body["visibility_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("NOT re-scoped")),
+        "{body}"
+    );
+    assert_eq!(tenancy(&pool, id).await, ("group".to_string(), home));
 }

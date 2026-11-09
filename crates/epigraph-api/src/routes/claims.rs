@@ -1186,18 +1186,21 @@ pub(crate) async fn create_claim_core(
     response.labels = request.labels;
     response.was_created = was_created;
     if let Some(r) = &resolved {
-        let report = ClaimRepository::write_tenancy_report(
-            &mut *state
-                .db_pool
-                .acquire()
-                .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: format!("Failed to acquire a connection: {e}"),
-                })?,
-            response.id,
-            r,
-            was_created,
-        )
+        // Read the stored tenancy back AS THE CALLER, on a transaction stamped
+        // like the write's (`begin_claim_write`). On the raw application pool
+        // a group-visible row is invisible, so the report would echo what was
+        // asked and drop D-V4's note for a resubmit that matched the caller's
+        // existing private or team claim. Nothing is written; the transaction
+        // rolls back on drop.
+        let report = async {
+            let mut rtx = state
+                .begin_claim_write(viewer, "create_claim_tenancy_report")
+                .await?;
+            Ok::<_, ApiError>(
+                ClaimRepository::write_tenancy_report(&mut rtx, response.id, r, was_created)
+                    .await?,
+            )
+        }
         .await;
         match report {
             Ok(rep) => {
@@ -1205,8 +1208,8 @@ pub(crate) async fn create_claim_core(
                 response.owner_group_id = Some(rep.owner_group_id);
                 response.visibility_note = rep.note;
             }
-            // Read on the unstamped pool: a group-visible row is not readable
-            // there, so report what was declared.
+            // The stamped read failed (begin, stamp or query): report what
+            // was declared rather than fail a claim that is already written.
             Err(_) => {
                 response.visibility = Some(r.resolved.to_string());
                 response.owner_group_id = r.decl.owner_group_bind();
