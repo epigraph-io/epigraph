@@ -608,6 +608,81 @@ async fn an_http_edge_create_cannot_carry_the_supersede_act_marker(pool: PgPool)
     assert_eq!(written, 0, "nothing written");
 }
 
+/// `properties.ingest_written` is the document ingest's proof that it wrote an
+/// `authored` / `asserts` edge, the only edges a provenance read counts. Over
+/// HTTP it is refused like the act marker: a create carrying it (here the
+/// caller's own AUTHORED edge, which is otherwise writable) is a 400 naming
+/// the key, with nothing written, and so is a patch adding it to the caller's
+/// own edge. (The database refuses it to every writer as well; this is the
+/// readable refusal.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_edge_write_cannot_carry_the_ingest_written_marker(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (w, w_g) = seed_agent_with_group(&pool, "http-ingest-marker-w").await;
+    let claim = seed_group_claim(&pool, w, w_g, "ingest marker patch target").await;
+    let forged = seed_public_claim(&pool, w, "ingest marker forged target").await;
+
+    let refused = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Json(authored_body(
+            w,
+            forged,
+            serde_json::json!({"ingest_written": "ingest_document"}),
+        )),
+    )
+    .await
+    .expect_err("the ingest marker is reserved");
+    let (status, body) = rendered(refused).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("ingest_written") && body.to_string().contains("reserved"),
+        "the refusal names the reserved key: {body}"
+    );
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE target_id = $1")
+        .bind(forged)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(written, 0, "nothing written");
+
+    let (_, Json(created)) = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Json(authored_body(
+            w,
+            claim,
+            serde_json::json!({"tool": "submit_claim"}),
+        )),
+    )
+    .await
+    .expect("CALIBRATION: W writes its own AUTHORED edge");
+    let refused = patch_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Path(created.edge.id),
+        Json(PatchEdgeRequest {
+            valid_to: None,
+            properties: Some(serde_json::json!({"ingest_written": "ingest_document"})),
+        }),
+    )
+    .await
+    .expect_err("the ingest marker is reserved on a patch");
+    let (status, body) = rendered(refused).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        row(&pool, created.edge.id)
+            .await
+            .5
+            .get("ingest_written")
+            .is_none(),
+        "nothing merged"
+    );
+}
+
 /// `PATCH /api/v1/edges/:id` refuses a merge carrying `properties.supersede_act`
 /// (400, the edge unchanged), on W's own `AUTHORED` edge (to a claim of W's
 /// group), which W may patch otherwise (the calibration merge, spelling a supersession `tool`, lands).

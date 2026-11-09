@@ -11,6 +11,7 @@ pub mod admin_scope_enforcement;
 pub mod agent;
 pub mod agent_identity;
 pub mod agent_key;
+pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
 pub mod atlas_layout;
@@ -55,6 +56,7 @@ pub mod graph_view;
 pub mod group;
 pub mod group_key_epoch;
 pub mod group_membership;
+pub mod ingest_written;
 pub mod instance_admin;
 pub mod learning_event;
 pub mod lineage;
@@ -109,6 +111,10 @@ pub use agent_identity::{
     PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
+pub use agent_lookup::{
+    AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef, AgentSearchHit,
+    CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use atlas_layout::{
@@ -177,6 +183,11 @@ pub use graph_view::{
     AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GqlColumn, GqlCondition,
     GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk, GraphNodeRow, GraphViewRepository,
     SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+};
+pub use ingest_written::{
+    create_ingest_written_edge_if_absent_conn, ingest_written_by_sql, ingest_written_edge_sql,
+    same_ingest_sql, without_ingest_marker, INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED,
+    INGEST_WRITTEN_PROPERTY, INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES,
 };
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
