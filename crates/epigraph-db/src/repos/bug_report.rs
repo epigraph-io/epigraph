@@ -1,0 +1,251 @@
+//! The bug-report intake (migration 207).
+//!
+//! Two calls, each one definer:
+//!
+//! * [`BugReportRepository::submit_conn`] files a report through
+//!   `epigraph_submit_bug_report`, as the session principal, into the intake
+//!   group the instance configured (`bug_report_intake_settings`). The caller
+//!   need not be a member of that group and learns nothing about its contents:
+//!   the answer is a [`BugReportReceipt`] and nothing else.
+//! * [`BugReportRepository::list_mine_conn`] reads the caller's own intake
+//!   reports through `epigraph_my_bug_reports`.
+//!
+//! Both run on the caller's STAMPED connection (`ScopedPool::begin_as`): the
+//! definers read the principal from the session, never from an argument. The
+//! intake group is not an argument either; it is read from the settings row
+//! inside the definer.
+//!
+//! Every refusal the definers raise carries a `BUGnn:` code and is returned
+//! as [`DbError::Refused`] with the database's message, so every surface
+//! answers it as the caller's error rather than a server fault.
+
+use crate::errors::{DbError, RefusalKind};
+use chrono::{DateTime, Utc};
+use epigraph_crypto::ContentHasher;
+use uuid::Uuid;
+
+/// The longest title the intake accepts, in characters.
+pub const MAX_TITLE_CHARS: usize = 200;
+/// The longest description (and repro) the intake accepts, in bytes.
+pub const MAX_DESCRIPTION_BYTES: usize = 20_480;
+/// The longest evidence text the intake accepts, in bytes.
+pub const MAX_EVIDENCE_BYTES: usize = 51_200;
+/// The severities the intake accepts.
+pub const SEVERITIES: &[&str] = &["blocker", "major", "minor"];
+
+/// One report, as the caller gave it.
+#[derive(Debug, Clone, Default)]
+pub struct BugReportInput {
+    pub title: String,
+    pub description: String,
+    pub severity: Option<String>,
+    pub component: Option<String>,
+    pub repro: Option<String>,
+    pub evidence: Option<String>,
+    /// The claim's embedding as pgvector text (`[0.1,...]`, 1536 values), when
+    /// the server computed one. Stored by the definer for operations search;
+    /// the reporter cannot read the claim, so it cannot read this either.
+    pub embedding: Option<String>,
+}
+
+/// What a submission answers: the new claim's id and when it was filed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BugReportReceipt {
+    pub claim_id: Uuid,
+    pub submitted_at: DateTime<Utc>,
+}
+
+/// One of the caller's own intake reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BugReportRow {
+    pub claim_id: Uuid,
+    pub title: Option<String>,
+    pub submitted_at: DateTime<Utc>,
+    /// The claim's labels NOW: triage's changes included.
+    pub labels: Vec<String>,
+    pub resolved: bool,
+    pub is_current: bool,
+}
+
+/// `None` for an absent or whitespace-only optional text, else the text as
+/// given. The definer applies the same rule, so the content both compose is
+/// the same.
+fn present(s: Option<&str>) -> Option<&str> {
+    s.filter(|t| !t.trim().is_empty())
+}
+
+impl BugReportInput {
+    /// The claim content the definer composes from the report, byte for byte:
+    /// the title, a blank line, the description, and the repro under a
+    /// `Repro:` heading when there is one. The definer refuses (BUG05) any
+    /// other content, so the digest computed over this is the stored row's.
+    #[must_use]
+    pub fn content(&self) -> String {
+        let mut s = format!("{}\n\n{}", self.title, self.description);
+        if let Some(r) = present(self.repro.as_deref()) {
+            s.push_str("\n\nRepro:\n");
+            s.push_str(r);
+        }
+        s
+    }
+
+    /// The evidence text the definer stores: the caller's evidence, else its
+    /// description.
+    #[must_use]
+    pub fn evidence_text(&self) -> &str {
+        present(self.evidence.as_deref()).unwrap_or(&self.description)
+    }
+}
+
+/// Classify a definer refusal by its code. `None` for anything that is not a
+/// `BUGnn:` refusal.
+fn refusal_kind(message: &str) -> Option<RefusalKind> {
+    let b = message.as_bytes();
+    if b.len() < 6
+        || !b.starts_with(b"BUG")
+        || !b[3].is_ascii_digit()
+        || !b[4].is_ascii_digit()
+        || b[5] != b':'
+    {
+        return None;
+    }
+    Some(match &message[..5] {
+        "BUG04" | "BUG05" => RefusalKind::Input,
+        "BUG03" | "BUG08" => RefusalKind::State,
+        _ => RefusalKind::Authority,
+    })
+}
+
+/// A `BUGnn:` refusal as [`DbError::Refused`] carrying the database's message;
+/// every other error unchanged.
+fn map_refusal(e: sqlx::Error) -> DbError {
+    if let sqlx::Error::Database(db) = &e {
+        if let Some(kind) = refusal_kind(db.message()) {
+            return DbError::Refused {
+                kind,
+                message: db.message().to_string(),
+            };
+        }
+    }
+    DbError::from(e)
+}
+
+/// The bug-report intake's two definers.
+pub struct BugReportRepository;
+
+impl BugReportRepository {
+    /// File `report` as the principal `conn` is stamped with.
+    ///
+    /// # Errors
+    /// [`DbError::Refused`] for every `BUGnn:` refusal (not configured, empty
+    /// or oversized input, unbound or system caller, rate limit); the claims
+    /// trigger's own refusals (OPL01, OPL02, ROL01) as their named variants;
+    /// `DbError::QueryFailed` otherwise.
+    pub async fn submit_conn(
+        conn: &mut sqlx::PgConnection,
+        report: &BugReportInput,
+    ) -> Result<BugReportReceipt, DbError> {
+        let content = report.content();
+        let content_hash = ContentHasher::hash(content.as_bytes());
+        let evidence_hash = ContentHasher::hash(report.evidence_text().as_bytes());
+        let (claim_id, submitted_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
+            "SELECT claim_id, submitted_at FROM public.epigraph_submit_bug_report( \
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&report.title)
+        .bind(&report.description)
+        .bind(report.severity.as_deref())
+        .bind(report.component.as_deref())
+        .bind(present(report.repro.as_deref()))
+        .bind(present(report.evidence.as_deref()))
+        .bind(&content)
+        .bind(content_hash.as_slice())
+        .bind(evidence_hash.as_slice())
+        .bind(report.embedding.as_deref())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_refusal)?;
+        Ok(BugReportReceipt {
+            claim_id,
+            submitted_at,
+        })
+    }
+
+    /// The stamped principal's own intake reports, newest first, at most
+    /// `limit` (clamped to 1..=200 by the definer).
+    ///
+    /// # Errors
+    /// [`DbError::Refused`] when the session has no principal (BUG01) or the
+    /// intake is not configured (BUG03); `DbError::QueryFailed` otherwise.
+    pub async fn list_mine_conn(
+        conn: &mut sqlx::PgConnection,
+        limit: i32,
+    ) -> Result<Vec<BugReportRow>, DbError> {
+        type Row = (Uuid, Option<String>, DateTime<Utc>, Vec<String>, bool, bool);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT claim_id, title, submitted_at, labels, resolved, is_current \
+               FROM public.epigraph_my_bug_reports($1)",
+        )
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(map_refusal)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(claim_id, title, submitted_at, labels, resolved, is_current)| BugReportRow {
+                    claim_id,
+                    title,
+                    submitted_at,
+                    labels,
+                    resolved,
+                    is_current,
+                },
+            )
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_is_title_blank_line_description_then_the_repro_heading() {
+        let mut r = BugReportInput {
+            title: "T".into(),
+            description: "D".into(),
+            ..Default::default()
+        };
+        assert_eq!(r.content(), "T\n\nD");
+        r.repro = Some("   ".into());
+        assert_eq!(r.content(), "T\n\nD", "a blank repro is no repro");
+        r.repro = Some("step 1".into());
+        assert_eq!(r.content(), "T\n\nD\n\nRepro:\nstep 1");
+    }
+
+    #[test]
+    fn evidence_falls_back_to_the_description() {
+        let mut r = BugReportInput {
+            title: "T".into(),
+            description: "D".into(),
+            ..Default::default()
+        };
+        assert_eq!(r.evidence_text(), "D");
+        r.evidence = Some(" \n".into());
+        assert_eq!(r.evidence_text(), "D");
+        r.evidence = Some("log".into());
+        assert_eq!(r.evidence_text(), "log");
+    }
+
+    #[test]
+    fn only_bug_codes_are_refusals() {
+        assert_eq!(refusal_kind("BUG04: x"), Some(RefusalKind::Input));
+        assert_eq!(refusal_kind("BUG03: x"), Some(RefusalKind::State));
+        assert_eq!(refusal_kind("BUG08: x"), Some(RefusalKind::State));
+        assert_eq!(refusal_kind("BUG07: x"), Some(RefusalKind::Authority));
+        assert_eq!(refusal_kind("OPL01: x"), None);
+        assert_eq!(refusal_kind("BUG"), None);
+        assert_eq!(refusal_kind("BUGGY: x"), None);
+    }
+}

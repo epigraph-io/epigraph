@@ -18,6 +18,7 @@ pub mod atom_axiom;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
+pub mod bug_report;
 pub mod challenge;
 pub mod claim;
 pub mod claim_context;
