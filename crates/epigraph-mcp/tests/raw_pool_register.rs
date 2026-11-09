@@ -452,6 +452,14 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         2,
         PRE_VIEWER,
     ),
+    // The delegate arm beside it (operator ruling R-183) makes the same
+    // caller-side definer read of the caller's acting operator link.
+    (
+        "epigraph-mcp/src/tools/claims.rs",
+        "delegate_arm_allows",
+        1,
+        PRE_VIEWER,
+    ),
     (
         "epigraph-mcp/src/tools/workflows.rs",
         "open",
@@ -935,7 +943,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 213;
+const HIGH_WATER: usize = 214;
 
 // ===========================================================================
 // The scanner.
