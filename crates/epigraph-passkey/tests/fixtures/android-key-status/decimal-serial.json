@@ -1,0 +1,11 @@
+{
+  "entries": {
+    "10023372562485960817": {
+      "status": "REVOKED",
+      "reason": "KEY_COMPROMISE"
+    },
+    "1089301f22f71a98b1ff169dcabee5af": {
+      "status": "REVOKED"
+    }
+  }
+}

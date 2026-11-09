@@ -28,6 +28,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-cli/src/backfill_factors.rs", "delete_edge_rows", 1, "SPEC §10.1 H3: rewire deletes an edge's BBAs; PR-F2 maps compound outcomes to keep, never to delete"),
     ("crates/epigraph-cli/src/backfill_factors.rs", "rewire_one", 1, "SPEC §4.1 W8: rewire restamps an edge BBA's tenancy columns; masses untouched"),
     ("crates/epigraph-cli/src/edge_rewire.rs", "restore_edge_rows", 1, "R-176(2) class E rollback: compare-and-swap of a targeted rewire's rows back to their recorded pre-image (masses, typing, created_at), only where the row is live and still holds what the rewire wrote; the rewire wrote no compound-ended edge, so neither does this"),
+    ("crates/epigraph-cli/src/k10_retro.rs", "const RESTORE_ROW_SQL", 1, "K10(3) retro sweep undo (OD-10; R-178(2), R-179): re-inserts a row the sweep deleted from its stored to_jsonb image, only where its id and its upsert key are free; the sweep deleted only live rows off retired sources, so the undo writes back exactly those"),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", 1, "SPEC §4.1 W13: raw INSERT of bootstrap BBAs; PR-W4"),
     ("crates/epigraph-cli/src/bin/experiment.rs", "analyze", 1, "SPEC §4.1 W13: CLI experiment outcome BBA; PR-W4"),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", 1, "SPEC §4.1 W13: CLI hypothesis prior BBA; PR-W4"),
@@ -47,6 +48,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-db/src/repos/mass_function.rs", "store_with_perspective", 1, "the one repo-layer INSERT INTO mass_functions every BBA writer goes through"),
     // --- epigraph-engine ----------------------------------------------------
     ("crates/epigraph-engine/src/edge_factor.rs", "auto_wire_ds_for_edge", 1, "SPEC §4.1 W8: edge-factor BBA; PR-F2 puts the compound guard inside this function"),
+    ("crates/epigraph-engine/src/retraction_cascade.rs", "const DELETE_EXACT_EDGE_ROWS_SQL", 1, "SPEC §11 K10(3) retro sweep (OD-10; R-178(2), R-179): deletes exactly the measured LIVE edge-keyed rows off a retired source (retracted_at IS NULL), returning each as stored for the undo; a lifecycle act on the holder, re-derived by the K10(2) repair"),
     // --- epigraph-mcp -------------------------------------------------------
     ("crates/epigraph-mcp/src/tools/ds.rs", "submit_ds_evidence", 1, "SPEC §4.1 W3: MCP submit_ds_evidence; warn-then-refuse on compounds is PR-W1a"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_for_claim", 1, "SPEC §4.1 W2: the first BBA of a newly created claim"),

@@ -16,6 +16,15 @@ repository.workspace = true
 # state in a database row between its two HTTP requests, which is the only
 # place an unauthenticated ceremony page can keep it.
 webauthn-rs = { version = "=0.5.5", features = ["danger-allow-state-serialisation"] }
+# The same pinned library webauthn-rs is built on, unmodified, for its
+# `verify_attestation_ca_chain`: a STORED attestation's chain is re-verified
+# against the roots configured now whenever the passkey anchors (P779-3), with
+# the very function registration used.
+webauthn-rs-core = "=0.5.5"
+# Already in the tree through webauthn-rs-core (same version, no features):
+# reads the Android KeyDescription and certificate serial numbers, which the
+# library parses only partly and records in a row the request DSN writes.
+x509-parser = "0.16"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -251,6 +251,7 @@ pub async fn cascade_after_supersede(
         viewer,
         frame_id,
         &stayed,
+        InertDelete::EdgePerspective,
         &mut inert_visited,
         &mut report,
     )
@@ -652,28 +653,35 @@ async fn invalidate_and_rewire(
 /// belief consistent with it, and is reported.
 ///
 /// Returns the newly queued holders (deduplicated against `visited`).
+///
+/// `delete` picks what goes per edge: the cascade's
+/// [`InertDelete::EdgePerspective`] (every live row keyed on the edge), or the
+/// retroactive sweep's [`InertDelete::ExactRows`] (exactly the selected rows,
+/// each recorded as stored).
 async fn invalidate_only(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     frame_id: Uuid,
     rows: &[crate::supersede_delta::EdgeKeyedBba],
+    mut delete: InertDelete<'_>,
     visited: &mut HashSet<Uuid>,
     report: &mut CascadeReport,
 ) -> Vec<Uuid> {
     let mut queued = Vec::new();
-    // Rows arrive ordered by edge; group each edge's holders.
-    let mut edges: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+    // Rows arrive ordered by edge; group each edge's holders and row ids.
+    let mut edges: Vec<(Uuid, Vec<Uuid>, Vec<Uuid>)> = Vec::new();
     for row in rows {
         match edges.last_mut() {
-            Some((edge, holders)) if *edge == row.edge_id => {
+            Some((edge, holders, ids)) if *edge == row.edge_id => {
                 if !holders.contains(&row.holder_id) {
                     holders.push(row.holder_id);
                 }
+                ids.push(row.mass_function_id);
             }
-            _ => edges.push((row.edge_id, vec![row.holder_id])),
+            _ => edges.push((row.edge_id, vec![row.holder_id], vec![row.mass_function_id])),
         }
     }
-    'edges: for (edge_id, holders) in &edges {
+    'edges: for (edge_id, holders, ids) in &edges {
         let mut sp = match conn.begin().await {
             Ok(sp) => sp,
             Err(e) => {
@@ -681,8 +689,22 @@ async fn invalidate_only(
                 return queued;
             }
         };
-        let deleted = match MassFunctionRepository::delete_for_perspective(&mut *sp, *edge_id).await
-        {
+        let mut images = Vec::new();
+        let removed = match &delete {
+            InertDelete::EdgePerspective => {
+                MassFunctionRepository::delete_for_perspective(&mut *sp, *edge_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            InertDelete::ExactRows(_) => delete_exact_edge_rows(&mut sp, *edge_id, ids)
+                .await
+                .map(|rows| {
+                    images = rows;
+                    images.len() as u64
+                })
+                .map_err(|e| e.to_string()),
+        };
+        let deleted = match removed {
             Ok(n) => n,
             Err(e) => {
                 report.note_error(&format!("invalidate BBA for stayed edge {edge_id}"), e);
@@ -712,6 +734,9 @@ async fn invalidate_only(
             continue;
         }
         report.invalidated_bbas += deleted;
+        if let InertDelete::ExactRows(out) = &mut delete {
+            out.extend(images);
+        }
         for holder in holders {
             if visited.insert(*holder) {
                 queued.push(*holder);
@@ -719,6 +744,123 @@ async fn invalidate_only(
         }
     }
     queued
+}
+
+/// What [`invalidate_only`] deletes on each edge.
+enum InertDelete<'a> {
+    /// Every live row keyed on the edge
+    /// ([`MassFunctionRepository::delete_for_perspective`]): the supersede
+    /// cascade's K10(2) arm.
+    EdgePerspective,
+    /// Exactly the selected rows, by id, each recorded as stored into the
+    /// vector: the retroactive sweep ([`sweep_retired_source_bbas`]), whose
+    /// undo needs every row it deleted and which must delete nothing its
+    /// measurement did not select (a live row on the same edge held by a
+    /// RETIRED claim is not selected, so it stays).
+    ExactRows(&'a mut Vec<DeletedEdgeBba>),
+}
+
+/// The retroactive sweep's delete: the LIVE rows among `ids` keyed on
+/// `edge_id`, each returned as stored (`to_jsonb(row)::text`, so every
+/// column, its floats included, comes back exact for the undo). A retracted
+/// row is never deleted (rulings R-79, R-103; migration 194 refuses it
+/// anyway).
+const DELETE_EXACT_EDGE_ROWS_SQL: &str = r#"-- VISIBILITY-EXEMPT: the K10(3) retroactive sweep runs on the privileged maintenance connection only.
+DELETE FROM mass_functions mf
+ WHERE mf.id = ANY($1) AND mf.perspective_id = $2 AND mf.retracted_at IS NULL
+RETURNING mf.id, mf.claim_id, to_jsonb(mf.*)::text"#;
+
+async fn delete_exact_edge_rows(
+    conn: &mut sqlx::PgConnection,
+    edge_id: Uuid,
+    ids: &[Uuid],
+) -> Result<Vec<DeletedEdgeBba>, sqlx::Error> {
+    let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(DELETE_EXACT_EDGE_ROWS_SQL)
+        .bind(ids)
+        .bind(edge_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, holder_id, row)| DeletedEdgeBba {
+            id,
+            holder_id,
+            edge_id,
+            row,
+        })
+        .collect())
+}
+
+/// One edge-keyed BBA the retroactive K10(3) sweep deleted, as it was stored.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeletedEdgeBba {
+    /// `mass_functions.id`.
+    pub id: Uuid,
+    /// The current claim that held it.
+    pub holder_id: Uuid,
+    /// The edge (sourced at a retired claim) it was keyed on.
+    pub edge_id: Uuid,
+    /// The whole row as `to_jsonb(row)::text`, every column exact: what an
+    /// undo re-inserts.
+    pub row: String,
+}
+
+/// What [`sweep_retired_source_bbas`] did.
+#[derive(Debug, Clone, Default)]
+pub struct RetiredSourceSweep {
+    /// The repair, exactly as the supersede cascade reports one.
+    pub report: CascadeReport,
+    /// Every row deleted, as stored.
+    pub deleted: Vec<DeletedEdgeBba>,
+}
+
+/// The retroactive K10(3) sweep (supersede SPEC §11 K10(3), operator
+/// decision OD-10; rulings R-178(2), R-179): the K10(2) arm of
+/// [`cascade_after_supersede`] run over claims retired BEFORE that arm
+/// existed. `rows` is the selection the dry-run delta measures
+/// ([`crate::supersede_delta::measure_k10_retro`]): live BBAs keyed on an edge
+/// sourced at a retired claim, held by a current claim.
+///
+/// The same semantics as the cascade's arm, per edge: one savepoint, the
+/// delete, and a repair probe of every holder before the savepoint commits;
+/// then one recompute pass over the holders, nothing re-wired from the
+/// retired source. One difference, so the sweep touches exactly what was
+/// measured: it deletes the selected rows BY ID ([`InertDelete::ExactRows`])
+/// rather than every live row keyed on the edge, and returns each as stored.
+///
+/// Best-effort like the cascade: a failure is in `report.errors` (that edge
+/// rolled back to its savepoint). A caller that needs all-or-nothing runs it
+/// inside its own transaction and rolls back on any error, as the operator
+/// binary does.
+pub async fn sweep_retired_source_bbas(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    rows: &[crate::supersede_delta::EdgeKeyedBba],
+) -> RetiredSourceSweep {
+    let mut sweep = RetiredSourceSweep::default();
+    if rows.is_empty() {
+        return sweep;
+    }
+    let frame_id = match ensure_binary_frame(&mut *conn, viewer).await {
+        Ok(id) => id,
+        Err(e) => {
+            sweep.report.note_error("ensure_binary_frame", e);
+            return sweep;
+        }
+    };
+    let mut visited: HashSet<Uuid> = HashSet::new();
+    let holders = invalidate_only(
+        &mut *conn,
+        viewer,
+        frame_id,
+        rows,
+        InertDelete::ExactRows(&mut sweep.deleted),
+        &mut visited,
+        &mut sweep.report,
+    )
+    .await;
+    repair_targets(&mut *conn, viewer, frame_id, &holders, &mut sweep.report).await;
+    sweep
 }
 
 /// PROBE whether this caller can repair `target_id`: run the same writes

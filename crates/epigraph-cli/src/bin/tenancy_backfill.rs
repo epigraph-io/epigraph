@@ -1636,6 +1636,23 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refolds or vacates its cache, which is the defect the function closes.
     // The stake that makes the owner a control here.
     ("epigraph_claim_is_compound", 193),
+    // 200, the anchored passkey path's reader of an enrollment's act and its
+    // confirming passkey. Fails SILENTLY under a non-member owner: its reads of
+    // the FORCEd `passkey_enrollments`, `pending_admin_acts` and
+    // `person_authenticators` then admit no row, so every anchored enrollment
+    // falls back to the attested ceremony without an error.
+    ("epigraph_enrollment_anchor", 200),
+    // 200's act-confirmer insert guard fails LOUD under a non-member owner (it
+    // reads no confirming passkey and refuses every act enrollment, ELV04);
+    // its anchored-revoke cascade fails SILENTLY (it finds no dependant, so a
+    // revoked anchor leaves the passkeys it anchored live).
+    ("epigraph_person_authenticators_guard_act_confirmer", 200),
+    ("epigraph_person_authenticators_revoke_anchored", 200),
+    // 200's compromised revoke (`revoke-passkey --compromised`) fails LOUD
+    // under a non-member owner: it reads no passkey and refuses (ELV04).
+    // 200 also re-states 124's `epigraph_person_authenticators_audit` (the
+    // revoke's `mode`), which stays registered at 124.
+    ("epigraph_revoke_passkey_compromised", 200),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2662,6 +2679,19 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_passkeys_for_act",
             "public.epigraph_passkeys_for_act(uuid)",
             true,
+        ),
+        // 200: the anchored enrollment page's reader, app-callable like 124's
+        // ceremony reader; the compromised revoke is a maintenance act like
+        // 124's revoke, which the request DSN must never call.
+        (
+            "epigraph_enrollment_anchor",
+            "public.epigraph_enrollment_anchor(uuid)",
+            true,
+        ),
+        (
+            "epigraph_revoke_passkey_compromised",
+            "public.epigraph_revoke_passkey_compromised(uuid, text)",
+            false,
         ),
         (
             "epigraph_confirm_admin_act",
