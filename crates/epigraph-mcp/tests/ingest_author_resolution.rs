@@ -1474,6 +1474,11 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
             sorted(vec![(d1.to_string(), a_id, true)]),
             "the creating ingest is recorded at creation"
         );
+        assert_eq!(
+            creator_doi(&pool, c).await.as_deref(),
+            Some(d1),
+            "the read contract names the creating ingest"
+        );
     }
 
     ingest_wait(
@@ -1553,6 +1558,11 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         ingest_records(&pool, direct).await,
         sorted(vec![(d3.to_string(), b_id, false)]),
         "a document repeating a directly filed claim never becomes its creator"
+    );
+    assert_eq!(
+        creator_doi(&pool, direct).await,
+        None,
+        "and the read names none"
     );
 }
 
@@ -1710,4 +1720,338 @@ async fn a_respelled_explicit_author_is_added_beside_and_reported(pool: PgPool) 
         "{json}"
     );
     assert_eq!(authored_in_force(&pool, key, doi).await, 1, "left in place");
+}
+
+/// The DOI of the creating paper the read contract
+/// (`ClaimIngestRepository::for_claim`, as the provenance block reads it)
+/// names for `claim`, for a public reader.
+async fn creator_doi(pool: &PgPool, claim: Uuid) -> Option<String> {
+    let viewer = fixture::public_viewer(pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let creator = epigraph_db::ClaimIngestRepository::for_claim(&mut conn, &viewer, claim)
+        .await
+        .expect("for_claim")
+        .creator?;
+    sqlx::query_scalar("SELECT doi FROM papers WHERE id = $1")
+        .bind(creator.paper_id)
+        .fetch_optional(pool)
+        .await
+        .expect("creator's paper")
+}
+
+/// The claims the paper keyed `doi` asserts (in force).
+async fn claims_of_doc(pool: &PgPool, doi: &str) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
+          WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim' \
+            AND pc.valid_to IS NULL ORDER BY 1",
+    )
+    .bind(doi)
+    .fetch_all(pool)
+    .await
+    .expect("the document's claims")
+}
+
+/// The spine walk records creation the same way: ingester A's spine of a
+/// document records `(doc, A, created)` on every thesis, section and
+/// paragraph claim it creates; ingester B's spine of the same document adds
+/// `(doc, B, not created)` to each and never a second creator; A's re-run
+/// adds nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_spine_records_its_creations_and_every_later_ingester(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let (a_id, b_id) = (
+        a.server_agent_id().await.expect("a"),
+        b.server_agent_id().await.expect("b"),
+    );
+    assert_ne!(a_id, b_id, "CALIBRATION: two ingesters");
+    let d = "10.9999/spine-record";
+    let extraction = || doc(d, json!([{"name": "Spine Recorder"}]));
+
+    spine(&a, &pool, extraction()).await;
+    let claims = claims_of_doc(&pool, d).await;
+    assert!(
+        claims.len() >= 3,
+        "CALIBRATION: thesis, section and paragraph claims: {claims:?}"
+    );
+    for c in &claims {
+        assert_eq!(
+            ingest_records(&pool, *c).await,
+            vec![(d.to_string(), a_id, true)],
+            "the spine records its creation of {c}"
+        );
+    }
+
+    spine(&b, &pool, extraction()).await;
+    assert_eq!(
+        claims_of_doc(&pool, d).await,
+        claims,
+        "CALIBRATION: b converged on every claim"
+    );
+    for c in &claims {
+        assert_eq!(
+            ingest_records(&pool, *c).await,
+            sorted(vec![
+                (d.to_string(), a_id, true),
+                (d.to_string(), b_id, false)
+            ]),
+            "a later spine ingester of {c} is recorded, never as its creator"
+        );
+        assert_eq!(
+            creator_doi(&pool, *c).await.as_deref(),
+            Some(d),
+            "the read contract names the creating spine ingest of {c}"
+        );
+    }
+
+    spine(&a, &pool, extraction()).await;
+    for c in &claims {
+        assert_eq!(
+            ingest_records(&pool, *c).await.len(),
+            2,
+            "no duplicate on {c}"
+        );
+    }
+}
+
+/// A stranger who attaches ITSELF by `agent_id` under a person's name is
+/// that stranger's word (non-pending, since the ingester is the agent), and
+/// is not kept for anyone else: a later ingester's name-only re-ingest
+/// attaches the name-derived author, reports the stranger in
+/// `also_at_position`, and its name-derived author asserts the document.
+/// The stranger's own name-only re-run keeps its attachment.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicit_attachment_is_kept_only_for_the_ingester_that_made_it(pool: PgPool) {
+    let squatter = app_role_server(&pool).await;
+    let honest = app_role_server(&pool).await;
+    let squatter_id = squatter.server_agent_id().await.expect("squatter");
+    let name = "Alaric Thornquist";
+    let d = "10.9999/author-self-squat";
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let json = ingest_wait(
+        &squatter,
+        &pool,
+        doc(
+            d,
+            json!([{"name": name, "agent_id": squatter_id.to_string()}]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        json["authors"][0]["attribution"], "caller",
+        "CALIBRATION {json}"
+    );
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &honest,
+            &viewer,
+            &doc(d, json!([{"name": name}])),
+            None,
+        )
+        .await
+        .expect("the honest re-ingest"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["action"], "created_name_key", "{json}");
+    let key = name_key_node(&pool, name)
+        .await
+        .expect("the name path ran: a name-derived node exists");
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["attribution"], "name_derived", "{json}");
+    assert_eq!(
+        report["also_at_position"],
+        json!([squatter_id.to_string()]),
+        "{json}"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, d).await,
+        paper_claims(&pool, d).await,
+        "the name-derived author asserts the document"
+    );
+
+    // The squatter's own name-only re-run keeps its own attachment.
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &squatter,
+            &viewer,
+            &doc(d, json!([{"name": name}])),
+            None,
+        )
+        .await
+        .expect("the squatter re-runs"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], squatter_id.to_string(), "{json}");
+    assert_eq!(report["action"], "kept_attached", "{json}");
+}
+
+/// `query_paper` reads a paper's provenance only as the document ingest
+/// wrote it: an `agent -authored-> paper` and a `paper -asserts-> claim`
+/// written any other way (here by the harness, as a forger with a database
+/// write or a pre-guard HTTP write would have left them) are neither listed
+/// nor counted. CONTROL: everything the real ingest wrote is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_reads_only_what_the_ingest_wrote(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let d = "10.9999/query-paper-ingest-written";
+    ingest_wait(
+        &server,
+        &pool,
+        doc(d, json!([{"name": "Wendeline Okafor"}])),
+    )
+    .await;
+    let before = query_paper(&server, &pool, d).await;
+    let ingested = paper_claims(&pool, d).await;
+    assert!(ingested > 0, "CALIBRATION {before}");
+    assert_eq!(before["asserted_claim_count"], ingested, "{before}");
+    assert_eq!(
+        before["authors"].as_array().map(Vec::len),
+        Some(1),
+        "{before}"
+    );
+
+    let (forger, _) = fixture::seed_agent_with_group(&pool, "query-paper-forger").await;
+    let foreign = fixture::seed_public_claim(&pool, forger, "a claim no ingest of d made").await;
+    let paper: Uuid = sqlx::query_scalar("SELECT id FROM papers WHERE doi = $1")
+        .bind(d)
+        .fetch_one(&pool)
+        .await
+        .expect("paper");
+    for (source, source_type, target, target_type, relationship) in [
+        (forger, "agent", paper, "paper", "authored"),
+        (paper, "paper", foreign, "claim", "asserts"),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(source)
+        .bind(source_type)
+        .bind(target)
+        .bind(target_type)
+        .bind(relationship)
+        .execute(&pool)
+        .await
+        .expect("a hand-written edge");
+    }
+
+    let after = query_paper(&server, &pool, d).await;
+    assert_eq!(
+        after["authors"], before["authors"],
+        "no forged author: {after}"
+    );
+    assert_eq!(
+        after["asserted_claim_count"], ingested,
+        "no forged assertion: {after}"
+    );
+    let listed: Vec<String> = after["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        !listed.contains(&foreign.to_string()),
+        "the forged assertion's claim is not on the page: {after}"
+    );
+    assert_eq!(listed.len() as i64, ingested.min(25), "{after}");
+}
+
+/// An operator replacement (the CLI retracts this spelling's name-derived
+/// author from the paper and attaches the chosen agent) is never undone by a
+/// DIFFERENT ingester's later name-only re-ingest: the removed name-derived
+/// node is not credited again (no `authored` edge in force, and no `asserts`,
+/// not even onto a claim new in that re-ingest), the report says so
+/// (`retracted_name_key`, `asserts_claims: false`) and lists the chosen agent
+/// in `also_at_position`, and the chosen agent stays the paper's author. The
+/// re-ingest does not adopt the chosen agent either: a retraction says
+/// nothing trustworthy about who replaced the node, so it may only withhold
+/// credit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPool) {
+    let cli = privileged_server(&pool);
+    let honest = app_role_server(&pool).await;
+    let (_maintenance, viewer) = fixture::bypass(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let name = "Ottoline Brackenridge";
+    let human = human_named(&pool, name).await;
+    let d = "10.9999/author-operator-replace";
+    let atoms = ["The replaced author's atom."];
+
+    tools::ingestion::do_ingest_document(
+        &cli,
+        &viewer,
+        &doc_with_atoms(d, json!([{"name": name}]), &atoms),
+        None,
+    )
+    .await
+    .expect("the name-only ingest");
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &cli,
+            &viewer,
+            &doc_with_atoms(
+                d,
+                json!([{"name": name, "agent_id": human.to_string()}]),
+                &atoms,
+            ),
+            None,
+        )
+        .await
+        .expect("the operator replacement"),
+    );
+    assert_eq!(
+        json["authors"][0]["replaced"]["agent_id"],
+        key.to_string(),
+        "CALIBRATION {json}"
+    );
+    assert_eq!(
+        authored_in_force(&pool, key, d).await,
+        0,
+        "CALIBRATION: replaced"
+    );
+    let key_asserts = asserts_on_doc(&pool, key, d).await;
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &honest,
+            &public,
+            &doc_with_atoms(
+                d,
+                json!([{"name": name}]),
+                &[
+                    "The replaced author's atom.",
+                    "A claim new in the re-ingest.",
+                ],
+            ),
+            None,
+        )
+        .await
+        .expect("another ingester's name-only re-ingest"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["action"], "retracted_name_key", "{json}");
+    assert_eq!(report["asserts_claims"], false, "{json}");
+    assert!(
+        report["also_at_position"]
+            .as_array()
+            .is_some_and(|a| a.contains(&json!(human.to_string()))),
+        "the chosen agent is reported: {json}"
+    );
+    assert_eq!(
+        authored_in_force(&pool, key, d).await,
+        0,
+        "not brought back"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, d).await,
+        key_asserts,
+        "the removed node asserts nothing new, the new claim included"
+    );
+    assert_eq!(authored_in_force(&pool, human, d).await, 1);
 }

@@ -10,7 +10,8 @@
 //!   is in force AND readable: a record whose assertion was retracted, or
 //!   whose paper never asserted the claim, is not listed;
 //! * an `asserts` edge with no record makes no ingest (never inferred from
-//!   the edge);
+//!   the edge), and only an ingest-written record on an ingest-written
+//!   assertion counts (a hand-written copy of either is no ingest);
 //! * a group-private assertion's record is invisible to an outsider, visible
 //!   to a member (the edges' own tenancy, set by the insert trigger);
 //! * the creator is the `created_claim` record whose ingester is the claim's
@@ -35,16 +36,37 @@ async fn paper(pool: &PgPool, doi: &str) -> Uuid {
         .expect("paper")
 }
 
-/// The ingest's `paper -asserts-> claim` edge, written as the walk writes it.
+/// The ingest's `paper -asserts-> claim` edge, written as the walk writes it
+/// (ingest-written; the first ingester's, which the paper's assertion
+/// deduplicates onto).
 async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("conn");
-    epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
-        &mut conn, None, paper, "paper", claim, "claim", "asserts", None, None, None,
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        Uuid::nil(),
+        paper,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
     )
     .await
     .expect("asserts")
     .0
     .id
+}
+
+/// A `paper -asserts-> claim` edge written outside the ingest (unmarked).
+async fn hand_asserts(pool: &PgPool, paper: Uuid, claim: Uuid) {
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        &mut conn, None, paper, "paper", claim, "claim", "asserts", None, None, None,
+    )
+    .await
+    .expect("unmarked asserts");
 }
 
 async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> bool {
@@ -174,5 +196,131 @@ async fn a_group_private_ingest_record_is_the_groups(pool: PgPool) {
     assert_eq!(
         read(&pool, &as_member, claim).await,
         (vec![(p, member, true)], Some(p))
+    );
+}
+
+/// The read takes only what the ingest wrote: a record carrying the
+/// ingest-written marker for its own ingester, resting on an ingest-written
+/// assertion. A record written by hand (no marker, as any writer that
+/// bypasses the walk would leave it), or a marked record on a paper whose
+/// assertion was written by hand, is no ingest. CONTROL: the walk's record
+/// on the walk's assertion is read, creator included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_an_ingest_written_record_on_an_ingest_written_assertion_is_read(pool: PgPool) {
+    let (filer, _) = fixture::seed_agent_with_group(&pool, "ingest-record-mark").await;
+    let claim = fixture::seed_public_claim(&pool, filer, "a marked claim").await;
+    let public = fixture::public_viewer(&pool).await;
+
+    // A hand-written record (the walk's properties, no marker) on the walk's
+    // assertion.
+    let p1 = paper(&pool, "10.9999/record-mark-1").await;
+    asserts(&pool, p1, claim).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'paper', $2, 'claim', 'ingested_claim', $3)",
+    )
+    .bind(p1)
+    .bind(claim)
+    .bind(serde_json::json!({
+        "ingested_by": filer.to_string(),
+        "created_claim": true,
+        "tool": "ingest_document",
+    }))
+    .execute(&pool)
+    .await
+    .expect("a hand-written record");
+    // The walk's record on a hand-written assertion.
+    let p2 = paper(&pool, "10.9999/record-mark-2").await;
+    hand_asserts(&pool, p2, claim).await;
+    assert!(record(&pool, p2, claim, filer, true).await);
+    assert_eq!(
+        read(&pool, &public, claim).await,
+        (vec![], None),
+        "neither half is the ingest's own: no record, no creator"
+    );
+
+    // CONTROL: the walk's record on the walk's assertion.
+    let p3 = paper(&pool, "10.9999/record-mark-3").await;
+    asserts(&pool, p3, claim).await;
+    assert!(record(&pool, p3, claim, filer, true).await);
+    assert_eq!(
+        read(&pool, &public, claim).await,
+        (vec![(p3, filer, true)], Some(p3))
+    );
+    let marker: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties -> 'ingest_written' FROM edges \
+          WHERE source_id = $1 AND relationship = 'ingested_claim'",
+    )
+    .bind(p3)
+    .fetch_one(&pool)
+    .await
+    .expect("the record's marker");
+    assert_eq!(
+        marker,
+        serde_json::json!({"tool": "ingest_document", "by": filer.to_string()}),
+        "the record names its ingester in the marker"
+    );
+}
+
+/// The record writer declares the ingest for its own INSERT only: once it
+/// returns, a later write on the same (stamped, application-role)
+/// transaction cannot carry the ingest-written marker.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_record_writer_declares_only_its_own_insert(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingest-record-declare").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "ingest-record-author").await;
+    let claim = fixture::seed_public_claim(&pool, ingester, "a declared claim").await;
+    let p = paper(&pool, "10.9999/record-declare").await;
+    let v = Viewer::resolve(&pool, ingester).await.expect("viewer");
+
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut tx,
+        None,
+        "ingest_document",
+        ingester,
+        p,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
+    )
+    .await
+    .expect("the walk's assertion");
+    assert!(ClaimIngestRepository::record_signed_conn(
+        &mut tx,
+        None,
+        p,
+        claim,
+        ingester,
+        true,
+        "ingest_document",
+        "test-pipeline",
+    )
+    .await
+    .expect("the record on the application role"));
+    let r = sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) VALUES ($1, 'agent', $2, 'claim', 'asserts', $3)",
+    )
+    .bind(author)
+    .bind(claim)
+    .bind(serde_json::json!({ "ingest_written": {"tool": "ingest_document"} }))
+    .execute(&mut *tx)
+    .await;
+    let refused = matches!(&r, Err(sqlx::Error::Database(e)) if e.message().contains("IWE01"));
+    assert!(
+        refused,
+        "a write after the record kept the ingest declaration: {r:?}"
     );
 }

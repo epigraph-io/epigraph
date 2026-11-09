@@ -21,13 +21,18 @@
 //!   collision would otherwise put every `asserts` edge of a stranger's paper
 //!   on a real person's node. Those agents are reported as `candidates`
 //!   (`status: "ambiguous"`). The one exception is a re-ingest of a document
-//!   whose author an earlier ingest attached by `agent_id`: the name-only
+//!   whose author THIS ingester attached by `agent_id` earlier: the name-only
 //!   entry with that same spelling keeps the explicit author
 //!   (`action: "kept_attached"`) instead of adding the name-derived node
-//!   beside it, unless that attachment is ANOTHER ingester's pending naming
-//!   (one ingester's word is not kept for the next one; the next one's
-//!   name path runs and the pending agent is reported in
-//!   `also_at_position`).
+//!   beside it. Another ingester's attachment, pending or not, is that
+//!   ingester's word and is not kept for the next one: the next one's name
+//!   path runs and the earlier agent is reported in `also_at_position`.
+//!   Which ingester made an attachment is read from the edge's
+//!   ingest-written marker, so one written before the marker existed is kept
+//!   for nobody. A name-derived node whose authorship of the paper was
+//!   retracted (an operator replacement) is never credited again by the
+//!   name path (`action: "retracted_name_key"`, no `asserts`); the
+//!   replacing agent is reported in `also_at_position`.
 //!
 //! # Who asserts the claims (the explicit-author rule)
 //!
@@ -430,29 +435,62 @@ pub(crate) async fn resolve_document_authors(
     // never when this call names that agent explicitly itself: a re-run of the
     // same extraction must resolve exactly as the first run did.
     let this_call: HashSet<Uuid> = explicit.values().map(|e| e.node.id).collect();
+    // Authors whose authorship of this paper was retracted (an operator
+    // replacement) and that hold no in-force authorship of it now: the name
+    // path never credits one again (see the name path below).
+    let removed_here: HashSet<Uuid> = if authors.is_empty() {
+        HashSet::new()
+    } else {
+        PaperRepository::retracted_author_ids_conn(conn, viewer, paper_id)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .filter(|id| !edges.iter().any(|e| e.agent_id == *id))
+            .collect()
+    };
     let mut taken: HashSet<Uuid> = HashSet::new();
     let mut kept: HashMap<usize, Uuid> = HashMap::new();
+    // Earlier explicit attachments by this spelling that are NOT kept for
+    // this ingester: reported in `also_at_position`, wherever they sit.
+    let mut declined: HashMap<usize, Vec<Uuid>> = HashMap::new();
     for (i, a) in authors.iter().enumerate() {
         if explicit.contains_key(&i) || a.is_placeholder() {
             continue;
         }
-        // A PENDING attachment is one ingester's word: kept only for that
-        // ingester. Anyone else's name-only re-ingest takes the name path, as
-        // without it, and reports the pending agent in `also_at_position`.
+        // An explicit attachment is the word of the ingester that made it:
+        // kept only for that ingester (the edge's ingest-written marker names
+        // it). Anyone else's name-only re-ingest takes the name path, as
+        // without it, and reports the earlier agent in `also_at_position`.
+        // Not "or the agent's identity matches the name": an agent sets its
+        // own display name and ORCID, so neither vouches for it, and the one
+        // identity a name does fix (the key it derives) is the name path's
+        // own node, which the fallback attaches anyway. Nor is an operator
+        // replacement adopted for other ingesters: "this node's authorship
+        // was retracted" says nothing trustworthy about who replaced it
+        // (the name path below only declines to credit the removed node).
+        let same_spelling = |e: &&PaperAuthorEdge| {
+            e.explicit
+                && e.author_name.as_deref() == Some(a.name.as_str())
+                && !this_call.contains(&e.agent_id)
+        };
         let mut found: Vec<&PaperAuthorEdge> = edges
             .iter()
-            .filter(|e| {
-                e.explicit
-                    && e.author_name.as_deref() == Some(a.name.as_str())
-                    && (!e.pending || e.ingested_by == Some(writer))
-                    && !this_call.contains(&e.agent_id)
-                    && !taken.contains(&e.agent_id)
-            })
+            .filter(same_spelling)
+            .filter(|e| e.written_by == Some(writer) && !taken.contains(&e.agent_id))
             .collect();
         found.sort_by_key(|e| e.position != i64::try_from(i).ok());
         if let Some(e) = found.first() {
             taken.insert(e.agent_id);
             kept.insert(i, e.agent_id);
+        } else {
+            let others: Vec<Uuid> = edges
+                .iter()
+                .filter(same_spelling)
+                .map(|e| e.agent_id)
+                .collect();
+            if !others.is_empty() {
+                declined.insert(i, others);
+            }
         }
     }
     let kept_ids: Vec<Uuid> = kept.values().copied().collect();
@@ -573,12 +611,19 @@ pub(crate) async fn resolve_document_authors(
                 .map_err(internal_error)?;
             (created.id.into(), false)
         };
+        // A name-derived node an operator removed from this paper (its
+        // authorship retracted, none in force) is not credited again: the
+        // walk's create-if-absent finds the retracted row and writes no
+        // `authored` edge, and this author writes no `asserts`, not even onto
+        // a claim new in this ingest. Fail-safe by construction: a retraction
+        // can only withhold credit here, never give it.
+        let removed = removed_here.contains(&agent_uuid);
         // The report is filled in below, once the whole list is resolved:
         // one candidates statement per document, not one per author.
         out.push(ResolvedAuthor {
             idx,
             agent_id: agent_uuid,
-            asserts: true,
+            asserts: !removed,
             explicit: false,
             pending: false,
             report: IngestAuthorReport {
@@ -586,13 +631,15 @@ pub(crate) async fn resolve_document_authors(
                 name: author.name.clone(),
                 position: idx,
                 status: if existed { "matched" } else { "created" },
-                action: if existed {
+                action: if removed {
+                    "retracted_name_key"
+                } else if existed {
                     "reused_name_key"
                 } else {
                     "created_name_key"
                 },
                 attribution: ATTRIBUTION_NAME_DERIVED,
-                asserts_claims: true,
+                asserts_claims: !removed,
                 pending_ingested_by: None,
                 display_name: None,
                 replaced: None,
@@ -625,15 +672,22 @@ pub(crate) async fn resolve_document_authors(
             explicit_entry.entry(r.agent_id).or_insert(r.idx);
         }
     }
-    // Whoever else the document already lists at an author's position.
+    // Whoever else the document already lists at an author's position, and
+    // any earlier explicit attachment by this spelling that was not kept.
     for r in &mut out {
         let pos = i64::try_from(r.idx).ok();
-        r.report.also_at_position = edges
+        let mut also: Vec<Uuid> = edges
             .iter()
             .filter(|e| e.position == pos && e.agent_id != r.agent_id)
-            .map(|e| e.agent_id.to_string())
+            .map(|e| e.agent_id)
             .collect();
-        r.report.also_at_position.dedup();
+        for id in declined.get(&r.idx).into_iter().flatten() {
+            if *id != r.agent_id && !also.contains(id) {
+                also.push(*id);
+            }
+        }
+        also.dedup();
+        r.report.also_at_position = also.iter().map(Uuid::to_string).collect();
     }
     // Other agents with each name-derived author's (folded) name: listed,
     // never chosen. An explicit author has no candidates.

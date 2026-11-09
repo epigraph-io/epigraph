@@ -38,9 +38,20 @@
 //!
 //! # The read contract ([`ClaimIngestRepository::for_claims`])
 //!
-//! A record counts only while the SAME paper's `asserts` edge onto the claim
-//! is in force and readable by the caller: a record without its assertion
-//! (the assertion retracted, or hidden from this caller) is not listed.
+//! A record counts only while it carries the ingest-written marker
+//! ([`crate::INGEST_WRITTEN_PROPERTY`], naming the same ingester as
+//! [`INGESTED_BY_PROPERTY`]) and the SAME paper's `asserts` edge onto the
+//! claim is in force, ingest-written and readable by the caller: a record
+//! without its assertion (the assertion retracted, or hidden from this
+//! caller) is not listed. A record or assertion that a supersede, dedup or
+//! merge cascade re-pointed onto another claim lost its marker in the move
+//! (migration 198), so it is not listed on the claim it now points at: the
+//! record is about the row that ingest created or found, never its
+//! successor. The paper's assertion is deduplicated on (paper, claim), so a
+//! second ingester's record rests on the first ingester's assertion; the
+//! read requires the assertion to be ingest-written, not to name the same
+//! ingester. A re-ingest of a document whose assertion predates the marker
+//! (an unmarked, legacy row) therefore records nothing readable.
 //! `creator` is the record with `created_claim: true` whose `ingested_by` is
 //! the claim's filer (`claims.agent_id`; the walk files every claim it
 //! creates), when there is one. A
@@ -155,6 +166,11 @@ impl ClaimIngestRepository {
             tx.commit().await?;
             return Ok(false);
         }
+        // Marked as the ingest's (migration 198's guard admits the key only
+        // under the declaration, for this INSERT alone), so a record that a
+        // cascade later re-points onto another claim loses the mark and stops
+        // counting (the read contract).
+        crate::repos::ingest_written::declare_ingest_written(&mut tx, true).await?;
         EdgeRepository::create_signed_conn(
             &mut tx,
             key,
@@ -168,11 +184,14 @@ impl ClaimIngestRepository {
                 CREATED_CLAIM_PROPERTY: created_claim,
                 "tool": tool,
                 "pipeline": pipeline,
+                (crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY):
+                    crate::repos::ingest_written::ingest_written_marker(tool, ingested_by),
             })),
             None,
             None,
         )
         .await?;
+        crate::repos::ingest_written::declare_ingest_written(&mut tx, false).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -218,12 +237,15 @@ impl ClaimIngestRepository {
                             AND r.relationship = '{rel}' \
                             AND r.properties ->> '{by}' ~ \
                                 '^[0-9a-fA-F]{{8}}-([0-9a-fA-F]{{4}}-){{3}}[0-9a-fA-F]{{12}}$' \
+                            AND {marked_r} \
+                            AND {marker_by_r} = r.properties ->> '{by}' \
                             AND {in_force_r} \
                             AND EXISTS ( \
                                 SELECT 1 FROM edges a \
                                  WHERE a.source_id = r.source_id AND a.source_type = 'paper' \
                                    AND a.target_id = r.target_id AND a.target_type = 'claim' \
                                    AND a.relationship = 'asserts' AND {in_force_a} \
+                                   AND {marked_a} \
                                    /* {{EDGE_VISIBILITY:a}} */) \
                             /* {{EDGE_VISIBILITY:r}} */ \
                             /* {{VISIBILITY:c}} */) k \
@@ -234,6 +256,9 @@ impl ClaimIngestRepository {
                 rel = INGEST_RECORD_RELATIONSHIP,
                 in_force_r = in_force("r"),
                 in_force_a = in_force("a"),
+                marked_r = crate::repos::ingest_written::ingest_written_edge_sql("r"),
+                marker_by_r = crate::repos::ingest_written::ingest_written_by_sql("r"),
+                marked_a = crate::repos::ingest_written::ingest_written_edge_sql("a"),
             ),
             3,
         );
@@ -286,9 +311,10 @@ impl ClaimIngestRepository {
 
 /// The relationships a generic edge writer (`POST /api/v1/edges`, the
 /// staged-edge promote) may never write, because readers trust them as the
-/// document ingest's own record: the paper's `asserts` onto a claim, any
-/// `authored` edge into a paper, and [`INGEST_RECORD_RELATIONSHIP`].
-/// Matched case-insensitively. Returns the refusal text, or `None`.
+/// document ingest's own record: the paper's `asserts` onto a claim (or its
+/// `authored`, a paper being the source of neither in any other writer), any
+/// `authored` edge into a paper, and [`INGEST_RECORD_RELATIONSHIP`]. Matched
+/// case-insensitively. Returns the refusal text, or `None`.
 #[must_use]
 pub fn ingest_only_edge_refusal(
     source_type: &str,
@@ -297,34 +323,123 @@ pub fn ingest_only_edge_refusal(
 ) -> Option<&'static str> {
     let rel = relationship.to_ascii_lowercase();
     let ingest_only = rel == INGEST_RECORD_RELATIONSHIP
-        || (rel == "asserts" && source_type == "paper")
+        || (source_type == "paper" && (rel == "asserts" || rel == "authored"))
         || (rel == "authored" && target_type == "paper");
     ingest_only.then_some(INGEST_ONLY_REFUSAL)
 }
 
 /// The refusal [`ingest_only_edge_refusal`] answers.
 pub const INGEST_ONLY_REFUSAL: &str =
-    "a paper's asserts edge onto a claim, an authored edge into a paper and the \
+    "a paper's asserts or authored edge, an authored edge into a paper and the \
      ingested_claim record are written only by the document ingest \
      (ingest_document / ingest_document_spine), which records who ingested the \
      document; nothing was written";
 
-/// An edge that attributes words or authorship TO an agent: `asserts` or
-/// `authored` (any case) with an `agent` source. A generic writer accepts it
-/// only from that agent itself or the human operating it
-/// ([`crate::AgentRepository::speaks_for`]).
+/// Relationships (lower-cased) that, FROM an `agent`, credit that agent with
+/// the target's content: it asserted, authored or generated it.
+pub const AGENT_SOURCE_AUTHORSHIP: &[&str] = &["asserts", "authored", "generated"];
+
+/// Relationships (lower-cased) that, TO an `agent`, credit that agent with
+/// the source's content: the source is attributed to, authored by,
+/// originated by, amplified (repeated or endorsed) by, generated by or
+/// interpreted by the agent. The reverse spellings of the same fact as
+/// [`AGENT_SOURCE_AUTHORSHIP`], and what `GET /api/v1/agents/:id/claims`
+/// (`attributed_to`) and the political-monitoring reads (`ORIGINATED_BY`,
+/// `AMPLIFIED_BY`) list as the agent's.
+pub const AGENT_TARGET_AUTHORSHIP: &[&str] = &[
+    "attributed_to",
+    "authored_by",
+    "originated_by",
+    "amplified_by",
+    "generated_by",
+    "interpreted_by",
+];
+
+/// Which endpoint of an edge an authorship-bearing relationship credits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditedEnd {
+    /// The source agent ([`AGENT_SOURCE_AUTHORSHIP`]).
+    Source,
+    /// The target agent ([`AGENT_TARGET_AUTHORSHIP`]).
+    Target,
+}
+
+/// The agent endpoint an edge credits with content, when it does: an
+/// [`AGENT_SOURCE_AUTHORSHIP`] relationship from an `agent`, or an
+/// [`AGENT_TARGET_AUTHORSHIP`] relationship to one (any case). A generic
+/// writer accepts such an edge only from that agent itself or the human
+/// operating it ([`crate::AgentRepository::speaks_for`]); the staged promote,
+/// which has no caller to ask, refuses it.
+#[must_use]
+pub fn credited_agent_end(
+    source_type: &str,
+    target_type: &str,
+    relationship: &str,
+) -> Option<CreditedEnd> {
+    let rel = relationship.to_ascii_lowercase();
+    if source_type == "agent" && AGENT_SOURCE_AUTHORSHIP.contains(&rel.as_str()) {
+        Some(CreditedEnd::Source)
+    } else if target_type == "agent" && AGENT_TARGET_AUTHORSHIP.contains(&rel.as_str()) {
+        Some(CreditedEnd::Target)
+    } else {
+        None
+    }
+}
+
+/// An edge that attributes words or authorship TO an agent through its
+/// source: [`credited_agent_end`] is [`CreditedEnd::Source`]. Kept for the
+/// callers that ask only about the source.
 #[must_use]
 pub fn is_agent_attribution(source_type: &str, relationship: &str) -> bool {
     source_type == "agent"
-        && (relationship.eq_ignore_ascii_case("asserts")
-            || relationship.eq_ignore_ascii_case("authored"))
+        && AGENT_SOURCE_AUTHORSHIP.contains(&relationship.to_ascii_lowercase().as_str())
 }
 
-/// The refusal for an agent attribution the caller does not speak for.
+/// The refusal for an authorship-bearing edge ([`credited_agent_end`]) whose
+/// credited agent the caller does not speak for.
 pub const AGENT_ATTRIBUTION_REFUSAL: &str =
-    "an asserts or AUTHORED edge from an agent may be written only by that agent \
-     itself or by the human who operates it through a live binding; nothing was \
-     written";
+    "an edge that credits an agent with content (asserts, authored or generated \
+     from it; attributed_to, authored_by, originated_by, amplified_by, \
+     generated_by or interpreted_by onto it) may be written only by that agent \
+     itself or by the human who operates it through a live binding; attribute a \
+     third party's document through the document ingest, which records it as \
+     pending their countersignature; nothing was written";
+
+/// The operator link's own edge (`agent -OPERATED_BY-> human`): written only
+/// when a link is recorded, never by a generic writer.
+pub const OPERATED_BY_RELATIONSHIP: &str = "operated_by";
+
+/// The refusal for a generic write of [`OPERATED_BY_RELATIONSHIP`].
+pub const OPERATED_BY_REFUSAL: &str =
+    "OPERATED_BY edges are written only when an operator link is recorded; a generic \
+     edge writer never writes one (whoever operates an agent is read from the link \
+     itself); nothing was written";
+
+/// SQL over the unaliased columns of a staged edge (`source_type`,
+/// `target_type`, `relationship`): true for every row a generic promote must
+/// refuse as provenance only the ingest, the link path or the credited agent
+/// writes. The same sets as [`ingest_only_edge_refusal`],
+/// [`credited_agent_end`] and [`OPERATED_BY_RELATIONSHIP`].
+#[must_use]
+pub fn staged_provenance_refusal_sql() -> String {
+    let list = |xs: &[&str]| {
+        xs.iter()
+            .map(|x| format!("'{x}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "(lower(relationship) IN ('{rec}', '{op}') \
+          OR (source_type = 'paper' AND lower(relationship) IN ('asserts', 'authored')) \
+          OR (target_type = 'paper' AND lower(relationship) = 'authored') \
+          OR (source_type = 'agent' AND lower(relationship) IN ({src})) \
+          OR (target_type = 'agent' AND lower(relationship) IN ({tgt})))",
+        rec = INGEST_RECORD_RELATIONSHIP,
+        op = OPERATED_BY_RELATIONSHIP,
+        src = list(AGENT_SOURCE_AUTHORSHIP),
+        tgt = list(AGENT_TARGET_AUTHORSHIP),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -340,6 +455,8 @@ mod tests {
             ("agent", "paper", "authored"),
             ("agent", "paper", "AUTHORED"),
             ("claim", "paper", "authored"),
+            ("paper", "claim", "AUTHORED"),
+            ("paper", "agent", "Authored"),
         ] {
             assert!(ingest_only_edge_refusal(s, t, r).is_some(), "{s} {r} {t}");
         }
@@ -367,5 +484,54 @@ mod tests {
         assert!(is_agent_attribution("agent", "AUTHORED"));
         assert!(!is_agent_attribution("paper", "asserts"));
         assert!(!is_agent_attribution("agent", "supports"));
+    }
+
+    #[test]
+    fn every_spelling_of_an_agents_authorship_names_the_credited_end() {
+        for (s, t, r) in [
+            ("agent", "claim", "asserts"),
+            ("agent", "claim", "AUTHORED"),
+            ("agent", "claim", "generated"),
+        ] {
+            assert_eq!(
+                credited_agent_end(s, t, r),
+                Some(CreditedEnd::Source),
+                "{s} {r} {t}"
+            );
+        }
+        for r in [
+            "attributed_to",
+            "ATTRIBUTED_TO",
+            "authored_by",
+            "ORIGINATED_BY",
+            "AMPLIFIED_BY",
+            "GENERATED_BY",
+            "interpreted_by",
+        ] {
+            assert_eq!(
+                credited_agent_end("claim", "agent", r),
+                Some(CreditedEnd::Target),
+                "{r}"
+            );
+        }
+        for (s, t, r) in [
+            ("claim", "agent", "asserts"),
+            ("agent", "claim", "attributed_to"),
+            ("claim", "claim", "GENERATED_BY"),
+            ("activity", "agent", "associated_with"),
+            ("agent", "agent", "AFFILIATED_WITH"),
+            ("span", "claim", "generated"),
+        ] {
+            assert_eq!(credited_agent_end(s, t, r), None, "{s} {r} {t}");
+        }
+        let sql = staged_provenance_refusal_sql();
+        for needle in [
+            "'ingested_claim'",
+            "'operated_by'",
+            "'generated'",
+            "'amplified_by'",
+        ] {
+            assert!(sql.contains(needle), "{needle} in {sql}");
+        }
     }
 }

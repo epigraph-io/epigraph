@@ -1978,8 +1978,12 @@ pub struct IngestAuthorReport {
     /// attached the name-derived node, never one of them).
     pub status: &'static str,
     /// What the walk did: `attached_given` (this call's `agent_id`),
-    /// `kept_attached` (no `agent_id` now, but an earlier ingest attached one
-    /// for this spelling, and it stays the author), `reused_name_key` or
+    /// `kept_attached` (no `agent_id` now, but this ingester attached one for
+    /// this spelling on an earlier run, and it stays the author),
+    /// `retracted_name_key` (the name-derived author was removed from this
+    /// paper by an operator replacement: nothing is written for it and it
+    /// asserts nothing; the replacing agent is in `also_at_position`),
+    /// `reused_name_key` or
     /// `created_name_key`.
     pub action: &'static str,
     /// Who vouches for the STORED attribution: `name_derived` (the name
@@ -2016,9 +2020,9 @@ pub struct IngestAuthorReport {
     /// `position`, left in place: an earlier ingest with a different spelling
     /// or order (replacement follows this entry's own spelling: an
     /// `agent_id` given with a different spelling than the name-derived
-    /// author's is ADDED here, beside it), or an earlier ingester's pending
-    /// naming that a name-only entry does not keep. This call did not change
-    /// them.
+    /// author's is ADDED here, beside it), or another ingester's explicit
+    /// attachment by this spelling (pending or not, at any position) that a
+    /// name-only entry does not keep. This call did not change them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub also_at_position: Vec<String>,
     /// Other agents whose case- and accent-folded name equals this author's
@@ -2539,9 +2543,16 @@ pub struct PaperResponse {
     pub doi: String,
     pub title: String,
     pub authors: Vec<AuthorResponse>,
-    /// Total asserted claims for the paper, independent of paging. Compare
+    /// How many claims the paper has in the graph, independent of paging:
+    /// the larger of `asserted_claim_count` and the claims labelled
+    /// `doi:<doi>` (a node-presence signal for a partially ingested paper,
+    /// which a claim's own writer can also set, so not provenance). Compare
     /// against `offset + returned` to decide whether another page exists.
     pub claim_count: i64,
+    /// The claims the document ingest recorded this paper asserting (its
+    /// ingest-written `asserts` edges): the provenance count, and the set
+    /// `claims` pages over.
+    pub asserted_claim_count: i64,
     /// `claims.len()` — the size of THIS page, not the total.
     pub returned: usize,
     /// Echo of the applied `offset` (after clamping).

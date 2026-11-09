@@ -245,6 +245,99 @@ fn one_author_extraction(
     .expect("fixture parses")
 }
 
+/// A second principal's REAL ingest under the same DOI, naming the same
+/// author with claims of its own, cannot borrow the first ingest's authorship:
+/// the document shares the paper row by DOI, the author's `authored` edge is
+/// the first ingest's (the second dedups onto it), and the second walk's
+/// paper assertions and attributions name the second principal. The card
+/// counts only the first ingest's attributions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_ingesters_document_under_the_same_doi_is_not_the_authors(pool: PgPool) {
+    let reader = app_server(&pool).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let v = fixture::public_viewer(&pool).await;
+    let doi = "10.9999/card-count.shared";
+    let author = "Marisol Quenby";
+    let first = common::build_scoped_test_server_generated_signer(
+        pool.clone(),
+        fixture::scoped_pool(&pool).await,
+    );
+    let second = common::build_scoped_test_server_generated_signer(
+        pool.clone(),
+        fixture::scoped_pool(&pool).await,
+    );
+    tools::ingestion::do_ingest_document(
+        &first,
+        &v,
+        &one_author_extraction(doi, author, "first"),
+        None,
+    )
+    .await
+    .expect("the first ingest");
+    let node: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE display_name = $1")
+        .bind(author)
+        .fetch_one(&pool)
+        .await
+        .expect("the name-derived author node");
+    let attributed = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(DISTINCT target_id) FROM edges \
+              WHERE source_id = $1 AND relationship = 'asserts' AND target_type = 'claim'",
+        )
+        .bind(node)
+        .fetch_one(&pool)
+        .await
+        .expect("attributions")
+    };
+    let firsts = attributed(pool.clone()).await;
+    assert!(
+        firsts > 0,
+        "CALIBRATION: the first ingest attributed claims"
+    );
+    let card = get(&reader, &pool, outsider, node).await;
+    assert_eq!(
+        card["counts"]["asserted_claims"], firsts,
+        "CALIBRATION: {card}"
+    );
+
+    tools::ingestion::do_ingest_document(
+        &second,
+        &v,
+        &one_author_extraction(doi, author, "second"),
+        None,
+    )
+    .await
+    .expect("the second ingest");
+    let all = attributed(pool.clone()).await;
+    assert!(
+        all > firsts,
+        "CALIBRATION: the second ingest attributed claims of its own"
+    );
+    for who in [outsider, node] {
+        let card = get(&reader, &pool, who, node).await;
+        assert_eq!(card["counts"]["authored_papers"], 1, "{card}");
+        assert_eq!(
+            card["counts"]["asserted_claims"], firsts,
+            "the second ingest's claims were credited to the author: {card}"
+        );
+    }
+    // (Asserted after the counts, so the previous head reads red on them.)
+    let principals: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT DISTINCT properties -> $2 ->> 'by' FROM edges \
+          WHERE source_id = $1 AND relationship = 'asserts'",
+    )
+    .bind(node)
+    .bind(epigraph_db::INGEST_WRITTEN_PROPERTY)
+    .fetch_all(&pool)
+    .await
+    .expect("principals");
+    assert_eq!(
+        principals.len(),
+        2,
+        "CALIBRATION: the two walks recorded two principals: {principals:?}"
+    );
+}
+
 /// The card's trusted-attribution rule against the REAL ingest walks (the
 /// document walk and the spine walk), not a hand-built copy of what they
 /// write: every in-force `asserts` edge the ingest gives a name-derived
@@ -260,9 +353,15 @@ async fn the_card_counts_every_attribution_the_real_ingest_writes(pool: PgPool) 
     );
     let v = fixture::public_viewer(&pool).await;
 
+    // Each walk runs twice: a first document that creates its claims, then a
+    // second document (another DOI, another author) with the same text, whose
+    // claims all CONVERGE on the first one's. Both write paths (a created claim
+    // and a converged one) must leave counted, ingest-written edges.
     for (walk, doi, author) in [
         ("document", "10.9999/card-count.doc", "Thaddeus Wrenfield"),
         ("spine", "10.9999/card-count.spine", "Philippa Ashcombe"),
+        ("document", "10.9999/card-count.doc.2", "Octavia Merrow"),
+        ("spine", "10.9999/card-count.spine.2", "Benedikt Ostrander"),
     ] {
         let x = one_author_extraction(doi, author, walk);
         if walk == "document" {
@@ -293,6 +392,59 @@ async fn the_card_counts_every_attribution_the_real_ingest_writes(pool: PgPool) 
             attributions > 0,
             "CALIBRATION ({walk}): the ingest attributed claims to its author"
         );
+        // Every authorship, paper assertion and attribution this walk wrote
+        // carries the ingest-written marker, naming the walk's tool and principal.
+        let tool = if walk == "document" {
+            "ingest_document"
+        } else {
+            "ingest_document_spine"
+        };
+        let marks: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT e.source_type::text, e.relationship::text, e.properties -> $2 ->> 'tool', \
+                    e.properties -> $2 ->> 'by' \
+               FROM edges e \
+              WHERE (e.source_id = $1 \
+                     OR e.source_id IN (SELECT a.target_id FROM edges a \
+                                         WHERE a.source_id = $1 AND a.relationship = 'authored')) \
+                AND e.relationship IN ('authored', 'asserts')",
+        )
+        .bind(node)
+        .bind(epigraph_db::INGEST_WRITTEN_PROPERTY)
+        .fetch_all(&pool)
+        .await
+        .expect("the walk's edges");
+        assert!(
+            marks.iter().any(|m| m.0 == "paper") && marks.iter().any(|m| m.1 == "authored"),
+            "CALIBRATION ({walk}): authorship and paper assertions read: {marks:?}"
+        );
+        if doi.ends_with(".2") {
+            let converged: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM edges e \
+                  WHERE e.source_id = $1 AND e.relationship = 'asserts' \
+                    AND (SELECT count(DISTINCT p.source_id) FROM edges p \
+                          WHERE p.target_id = e.target_id AND p.source_type = 'paper' \
+                            AND p.relationship = 'asserts') = 2",
+            )
+            .bind(node)
+            .fetch_one(&pool)
+            .await
+            .expect("converged claims");
+            assert_eq!(
+                converged, attributions,
+                "CALIBRATION ({walk}): the second document converged on every claim"
+            );
+        }
+        for m in &marks {
+            assert_eq!(
+                m.2.as_deref(),
+                Some(tool),
+                "{walk} ({doi}): an edge the walk wrote is not marked: {marks:?}"
+            );
+            assert!(
+                m.3.is_some() && m.3 == marks[0].3,
+                "{walk} ({doi}): the walk's edges do not all name its principal: {marks:?}"
+            );
+        }
 
         let card = get(&reader, &pool, outsider, node).await;
         assert_eq!(card["counts"]["authored_papers"], 1, "{walk}: {card}");

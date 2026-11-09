@@ -19,6 +19,11 @@
 //! `SUPERSEDES` edge on the retired claim was re-pointed (or, in the dedup
 //! repair, retracted as a colliding copy).
 //!
+//! The document ingest's record of a claim (`paper -ingested_claim->`) is
+//! about the row that ingest created or found: moved by any of the three, it
+//! loses its ingest-written marker, so the claim it then points at reads no
+//! ingest of that paper (the last test).
+//!
 //! Every act runs on the APPLICATION ROLE stamped as the claims' author; every
 //! edge half runs on the `epigraph_maintenance` role (the connection the
 //! inline cascade and the deferred replay use), twice, as a replay of an
@@ -656,5 +661,164 @@ async fn consolidate_leaves_upper_case_lineage_edges_on_the_sources(pool: PgPool
         ends(&pool, &[incoming, outgoing]).await,
         before,
         "both upper-case lineage edges stay on their sources"
+    );
+}
+
+// ── The document ingest's record of a claim stays with that claim ──────────
+
+/// `claim` created by `filer`'s ingest of a fresh paper, as the walk records
+/// it: the paper's ingest-written assertion and the creation record. Returns
+/// the paper and the record's edge id.
+async fn ingest_created(pool: &PgPool, filer: Uuid, claim: Uuid) -> (Uuid, Uuid) {
+    let paper: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $1) RETURNING id")
+            .bind(format!("10.9999/moved-record-{}", Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("paper");
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        filer,
+        paper,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
+    )
+    .await
+    .expect("the paper's assertion");
+    assert!(epigraph_db::ClaimIngestRepository::record_signed_conn(
+        &mut conn,
+        None,
+        paper,
+        claim,
+        filer,
+        true,
+        "ingest_document",
+        "test-pipeline",
+    )
+    .await
+    .expect("the creation record"));
+    let record: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND relationship = 'ingested_claim'",
+    )
+    .bind(paper)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("record id");
+    (paper, record)
+}
+
+/// The papers `viewer` reads as having ingested `claim`, and the creator's.
+async fn ingests_of(pool: &PgPool, filer: Uuid, claim: Uuid) -> (Vec<Uuid>, Option<Uuid>) {
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, filer)
+        .await
+        .expect("viewer");
+    let mut conn = pool.acquire().await.expect("conn");
+    let got = epigraph_db::ClaimIngestRepository::for_claim(&mut conn, &viewer, claim)
+        .await
+        .expect("for_claim");
+    (
+        got.records.iter().map(|r| r.paper_id).collect(),
+        got.creator.map(|c| c.paper_id),
+    )
+}
+
+async fn filer_of(pool: &PgPool, claim: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("filer")
+}
+
+/// A creation record says which document ingest created THAT row. The three
+/// replacement cascades re-point incoming claim edges onto the successor, the
+/// canonical or the merge, the record and its paper's assertion included;
+/// moved, both lose the ingest-written marker (migration 198), so the claim
+/// they now point at reads no ingest of that paper, and never as created by
+/// it, although its filer is the same ingester (which, without the marker
+/// requirement, would make it read as that paper's literature). CALIBRATION:
+/// before the act the retired claim reads the paper as its creator. This
+/// test: the supersede cascade.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_superseded_claims_ingest_record_names_no_ingest_on_its_successor(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
+    let old = claim_of(&pool, author, group, "ingest-created, superseded").await;
+    let (p, record) = ingest_created(&pool, author, old).await;
+    assert_eq!(
+        ingests_of(&pool, author, old).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
+    let new = supersede_act(&pool, author, group, old).await;
+    replay_supersede(&pool, old, new).await;
+    replay_supersede(&pool, old, new).await;
+    assert_eq!(
+        filer_of(&pool, new).await,
+        author,
+        "CALIBRATION: the same filer"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, new).await,
+        (vec![], None),
+        "the successor is no ingest's creation (record now on {:?})",
+        ends(&pool, &[record]).await
+    );
+}
+
+/// As above, for the dedup cascade: an ingest-created duplicate of a claim
+/// its filer filed directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_duplicates_ingest_record_names_no_ingest_on_its_canonical(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
+    let dup = claim_of(&pool, author, group, "ingest-created duplicate").await;
+    let canonical = claim_of(&pool, author, group, "filed directly").await;
+    let (p, record) = ingest_created(&pool, author, dup).await;
+    assert_eq!(
+        ingests_of(&pool, author, dup).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
+    dedup_act(&pool, author, group, dup, canonical).await;
+    replay_dedup(&pool, dup, canonical).await;
+    replay_dedup(&pool, dup, canonical).await;
+    assert_eq!(
+        ingests_of(&pool, author, canonical).await,
+        (vec![], None),
+        "the canonical stays the filer's own (record now on {:?})",
+        ends(&pool, &[record]).await
+    );
+}
+
+/// As above, for the merge cascade.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_merge_sources_ingest_record_names_no_ingest_on_the_merge(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
+    let a = claim_of(&pool, author, group, "ingest-created merge source").await;
+    let b = claim_of(&pool, author, group, "another merge source").await;
+    let (p, record) = ingest_created(&pool, author, a).await;
+    assert_eq!(
+        ingests_of(&pool, author, a).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
+    let merged = consolidate_act(&pool, author, group, vec![a, b]).await;
+    replay_consolidate(&pool, merged, vec![a, b]).await;
+    replay_consolidate(&pool, merged, vec![a, b]).await;
+    assert_eq!(
+        filer_of(&pool, merged).await,
+        author,
+        "CALIBRATION: the same filer"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, merged).await,
+        (vec![], None),
+        "the merge is no ingest's creation (record now on {:?})",
+        ends(&pool, &[record]).await
     );
 }
