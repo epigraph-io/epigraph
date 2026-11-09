@@ -104,7 +104,10 @@ async fn assert_created_at(pool: &PgPool, id: Uuid, expected: DateTime<Utc>) {
 }
 
 async fn run(pool: &PgPool, query: String) -> BTreeSet<Uuid> {
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(pool).await,
+        ApiConfig::default(),
+    );
     let viewer = public_viewer(pool).await;
     let Json(out) = execute_graph_query(
         ViewerExtractor(viewer),
@@ -290,7 +293,10 @@ async fn graph_query_limit_window_breaks_created_at_ties_by_id(pool: PgPool) {
 /// instead of in production.
 #[sqlx::test(migrations = "../../migrations")]
 async fn graph_query_window_order_plans_for_every_node_table(pool: PgPool) {
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    );
     for label in ["claim", "evidence", "agent", "trace"] {
         let viewer = public_viewer(&pool).await;
         let res = execute_graph_query(
@@ -319,7 +325,10 @@ async fn graph_query_window_order_plans_for_every_node_table(pool: PgPool) {
 /// group member, because only a viewer with a group bind appends a bind.
 #[sqlx::test(migrations = "../../migrations")]
 async fn graph_query_walk_plans_for_every_node_table(pool: PgPool) {
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    );
     let (member, _group) = seed_agent_with_group(&pool, "a12-gq-walk-member").await;
     for label in ["claim", "evidence", "agent", "trace"] {
         for query in [
