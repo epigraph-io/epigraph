@@ -3451,7 +3451,9 @@ struct ApiIngestDecision {
 /// The submitter an ingest should record, and the authority it needs, decided
 /// BEFORE the plan walk on the same transaction. The rule is the MCP twin's
 /// (`execute_workflow_ingest_with_inserted`): a re-ingest of an existing row
-/// records nothing and needs nothing (the executor writes nothing); a NEW
+/// records nothing and needs nothing here (the executor writes nothing, or
+/// stops before writing under a row with no plan, which
+/// [`execute_admitted_ingest`] then gates); a NEW
 /// generation of a canonical name that already has rows needs authority over
 /// that lineage's head and inherits its submitter, parent or no parent (the
 /// review's takeover: `generation + 1` with no parent recorded the attacker);
@@ -3585,6 +3587,14 @@ async fn execute_admitted_ingest<'s>(
         }
     };
     decision.creating = result.row_created;
+    // For a row this call did NOT create, the submitter the audit trail
+    // names is the row's own (the grant over the admitted row read it), never
+    // the caller's: no provenance row may read as if the caller created it.
+    if !result.row_created {
+        decision.submitter = admitted
+            .and_then(|row| decision.grants.iter().find(|(a, _)| *a == row))
+            .and_then(|(_, grant)| grant.owner);
+    }
     Ok((tx, result))
 }
 
@@ -3626,7 +3636,11 @@ async fn record_workflow_submitter(
                     "parent_canonical_name": extraction.source.parent_canonical_name,
                     "lineage_head_before": decision.anchors.lineage_head,
                     "linked_parent": decision.anchors.linked_parent,
-                    "recorded_submitter": decision.submitter,
+                    "recorded_submitter": if decision.creating {
+                        decision.submitter
+                    } else {
+                        None
+                    },
                 }),
             )
             .await?;

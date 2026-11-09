@@ -1043,8 +1043,9 @@ fn via_ok(r: Result<Value, String>) -> Value {
 /// An operator-linked agent with no team group writes into the group the
 /// system agent wrote to (the operator's group, now private to it), but as
 /// ITSELF; and it edits a step of
-/// the workflow the system agent wrote before this change (stdio's legacy arm:
-/// it reads the row and writes its group).
+/// the workflow the system agent wrote before this change (a row with no
+/// recorded submitter: on stdio the owner-group writer arm admits it, because
+/// it writes the row's group).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_operators_linked_agent_writes_where_the_system_agent_did_but_as_itself(pool: PgPool) {
     let w = world(&pool).await;
@@ -2456,6 +2457,21 @@ async fn a_generation_zero_ingest_racing_another_callers_creation_writes_nothing
                     && *acting == w.rb.to_string()
                     && group.as_deref() == Some(w.alpha.to_string().as_str())),
             "{name}: the owner-group arm admitted the writer over the winner's row: {arms:?}"
+        );
+        // The provenance does not record the racing writer as the row's
+        // submitter either: this call recorded none.
+        let recorded: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT details->'write'->>'recorded_submitter' FROM security_events \
+              WHERE event_type = 'workflows.caller_write' AND details->>'workflow_id' = $1::text",
+        )
+        .bind(wf)
+        .fetch_all(&pool)
+        .await
+        .expect("provenance rows");
+        assert!(
+            !recorded.is_empty() && recorded.iter().all(Option::is_none),
+            "{name}: the provenance records no submitter for a row the call did not create: \
+             {recorded:?}"
         );
     }
 

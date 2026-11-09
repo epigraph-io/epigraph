@@ -281,7 +281,17 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     })?;
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
-    let submitter = inherited.unwrap_or(Some(caller.agent_id()));
+    // `submitter` is what the audit trail names too: for a row this call did
+    // NOT create it is the row's own recorded submitter (the grant over the
+    // admitted row read it), never the caller, so no provenance row reads as
+    // if the caller had created it.
+    let submitter = if creating {
+        inherited.unwrap_or(Some(caller.agent_id()))
+    } else {
+        admitted
+            .and_then(|row| grants.iter().find(|(anchor, _)| *anchor == row))
+            .and_then(|(_, grant)| grant.owner)
+    };
     if creating {
         if let Some(submitter) = submitter {
             epigraph_db::WorkflowRepository::record_submitter(
@@ -311,7 +321,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 "parent_canonical_name": extraction.source.parent_canonical_name,
                 "lineage_head_before": anchors.lineage_head,
                 "linked_parent": anchors.linked_parent,
-                "recorded_submitter": submitter,
+                "recorded_submitter": if creating { submitter } else { None },
             }),
         )
         .await?;
