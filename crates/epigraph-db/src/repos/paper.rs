@@ -209,9 +209,11 @@ impl PaperRepository {
     }
 
     /// Count the claims this paper asserts: its ingest-written
-    /// (`crate::ingest_written_edge_sql`) `paper -asserts-> claim` edges. An
-    /// assertion written any other way (by hand, before the marker existed)
-    /// is not the ingest's and is not counted.
+    /// (`crate::ingest_written_edge_sql`) `paper -asserts-> claim` edges,
+    /// each claim once (every principal whose ingest of the paper asserts a
+    /// claim keeps an edge of its own, `crate::ingest_written`, so one claim
+    /// can carry several). An assertion written any other way (by hand,
+    /// before the marker existed) is not the ingest's and is not counted.
     ///
     /// This alone under-counts a partially-ingested paper: `do_ingest_document`
     /// / `do_ingest_document_spine` label every claim `doi:<doi>` *before*
@@ -238,7 +240,7 @@ impl PaperRepository {
         // predicate is spliced from `ingest_written`, the one place it is
         // defined).
         let sql = format!(
-            "SELECT COUNT(*) \
+            "SELECT COUNT(DISTINCT e.target_id) \
                FROM edges e \
               WHERE e.source_id = $1 \
                 AND e.source_type = 'paper' \
@@ -311,8 +313,11 @@ impl PaperRepository {
     /// never as a plain author: the same predicate the agent card counts by
     /// ([`crate::agent_lookup::authorship_pending_sql`]).
     ///
-    /// `query_paper`'s author list, and the reader a claim's literature
-    /// authorship should list a paper's authors with.
+    /// One row per authorship EDGE: every principal whose ingest names an
+    /// author keeps an edge of its own (`crate::ingest_written`), so an author
+    /// two principals' ingests named is listed once per principal, each row
+    /// with its own `written_by`. A reader groups by `written_by`; it never
+    /// shows one principal's rows beside another's claims.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -416,6 +421,9 @@ impl PaperRepository {
     /// [`Self::count_asserted_claims`] so a caller can tell a full page from
     /// the end of the set.
     ///
+    /// Each claim once (`SELECT DISTINCT`): every principal whose ingest of
+    /// the paper asserts a claim keeps an edge of its own.
+    ///
     /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry),
     /// so adding `OFFSET` (or the ingest-written predicate) needs no
     /// `cargo sqlx prepare`.
@@ -444,7 +452,7 @@ impl PaperRepository {
 
         let rows: Vec<Row> = sqlx::query_as(
             &r#"
-            SELECT
+            SELECT DISTINCT
                 c.id,
                 c.content,
                 c.truth_value,

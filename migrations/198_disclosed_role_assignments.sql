@@ -122,13 +122,21 @@
 -- walk's write identity>}`. It proves which principal's ingest wrote the
 -- edge, not that the document is genuine; a read that combines edges into
 -- one fact requires them to name the same principal (`same_ingest_sql`).
+-- Each principal whose ingest states the same fact writes its own marked
+-- row (the walk deduplicates only onto its own principal's row), so every
+-- row names exactly one principal; nothing here changes for that, since
+-- each row is still one declared INSERT.
 --
 -- EXISTING ROWS: before this guard any edges:write caller could set the key
 -- (it was an ordinary property), so every row that already carries it is a
 -- hand-written copy, never the walk's. This migration DROPS the key from
--- each such row before the guard exists (a NOTICE reports how many); the
--- rest of each row is untouched. Edges the ingest wrote before this carry no
--- marker either, and read as unproven until an operator backfills them.
+-- each such row (a NOTICE reports how many); the rest of each row is
+-- untouched. The strip runs AFTER the trigger is created, in the same
+-- transaction: CREATE TRIGGER takes SHARE ROW EXCLUSIVE on `edges`, held to
+-- commit, so no insert can land between the two and every earlier row is
+-- seen; and the guard admits an UPDATE that drops the key. Edges the ingest
+-- wrote before this carry no marker either, and read as unproven until an
+-- operator backfills them.
 --
 -- UNDO:
 --   DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
@@ -211,8 +219,16 @@ BEGIN
     RETURN NEW;
 END $$;
 
--- Drop every pre-existing copy of the key (see the header), BEFORE the
--- guard exists, so the strip itself is not refused.
+DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
+CREATE TRIGGER edges_ingest_written_guard
+    BEFORE INSERT OR UPDATE ON public.edges
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_edges_ingest_written_guard();
+
+-- Drop every pre-existing copy of the key (see the header). AFTER the guard
+-- exists: CREATE TRIGGER's lock (SHARE ROW EXCLUSIVE, held to commit) keeps
+-- every concurrent insert out until this transaction ends, so none lands
+-- between the strip and the guard; the guard admits this UPDATE, which only
+-- drops the key.
 DO $$
 DECLARE
     v_stripped bigint;
@@ -226,8 +242,3 @@ BEGIN
     RAISE NOTICE '198: dropped properties.ingest_written from % pre-existing edge row(s)',
                  v_stripped;
 END $$;
-
-DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
-CREATE TRIGGER edges_ingest_written_guard
-    BEFORE INSERT OR UPDATE ON public.edges
-    FOR EACH ROW EXECUTE FUNCTION public.epigraph_edges_ingest_written_guard();

@@ -272,3 +272,86 @@ async fn concurrent_writers_under_two_spellings_of_a_new_doi_converge(pool: PgPo
     );
     assert_eq!(id, held_id);
 }
+
+/// A paper's asserted claims are listed and counted once each, however many
+/// edges state the same fact, and its authors are listed once PER INGEST
+/// PRINCIPAL. Each principal whose ingest of a paper names an author (or
+/// asserts a claim) keeps an ingest-written edge of its own, so a paper
+/// ingested by two principals carries two `authored` edges for one author and
+/// two `asserts` edges for one claim: the claim is one claim, and the
+/// authorship is listed with each principal's `written_by`, never merged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let paper_id =
+        PaperRepository::get_or_create(&pool, "10.1234/parallel-edges", Some("Parallel"), None)
+            .await
+            .expect("create paper");
+    let author = AgentRepository::create(&pool, &make_agent(Some("Ysolde Pemberton")))
+        .await
+        .expect("create author")
+        .id;
+    let claim = ClaimRepository::create(
+        &pool,
+        &make_claim(author, "a twice-asserted finding", 0.5),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create claim")
+    .id;
+    let author: uuid::Uuid = author.into();
+    let mut principals = Vec::new();
+    for name in ["Ingester One", "Ingester Two"] {
+        let by: uuid::Uuid = AgentRepository::create(&pool, &make_agent(Some(name)))
+            .await
+            .expect("create ingester")
+            .id
+            .into();
+        principals.push(by);
+        let mut conn = pool.acquire().await.expect("conn");
+        for (src, st, tgt, tt, rel, props) in [
+            (author, "agent", paper_id, "paper", "authored", Some(serde_json::json!({"position": 0}))),
+            (paper_id, "paper", claim.into(), "claim", "asserts", None),
+        ] {
+            let (_, created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+                &mut conn,
+                None,
+                "ingest_document",
+                by,
+                src,
+                st,
+                tgt,
+                tt,
+                rel,
+                props,
+            )
+            .await
+            .expect("ingest-written edge");
+            assert!(created, "CALIBRATION: each principal writes its own {rel} edge");
+        }
+    }
+
+    let authors = PaperRepository::list_authors(&pool, &viewer, paper_id)
+        .await
+        .expect("list_authors");
+    let mut written_by: Vec<_> = authors.iter().map(|a| a.written_by).collect();
+    written_by.sort();
+    let mut expected: Vec<_> = principals.iter().copied().map(Some).collect();
+    expected.sort();
+    assert_eq!(
+        written_by, expected,
+        "the author is listed once per principal, each with its own writer: {authors:?}"
+    );
+    assert!(authors.iter().all(|a| a.agent_id == author));
+    assert_eq!(
+        PaperRepository::count_asserted_claims(&pool, &viewer, paper_id)
+            .await
+            .expect("count_asserted_claims"),
+        1,
+        "a claim counted twice"
+    );
+    let claims = PaperRepository::list_asserted_claims(&pool, &viewer, paper_id, 10, 0)
+        .await
+        .expect("list_asserted_claims");
+    assert_eq!(claims.len(), 1, "a claim listed twice");
+}

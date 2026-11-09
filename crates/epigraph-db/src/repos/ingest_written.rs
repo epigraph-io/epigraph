@@ -44,37 +44,64 @@
 //! refuses the key as well ([`crate::RESERVED_EDGE_PROPERTIES`]) so a caller
 //! gets a 400 rather than a database error.
 //!
+//! # One marked row per ingest principal
+//!
+//! A paper row is shared by DOI, so several principals can ingest the same
+//! document, and two of their ingests can state the same fact (both name an
+//! author; both documents assert a claim). A single deduplicated row would
+//! name only its FIRST writer, and a reader tying one ingest's edges together
+//! would find no authorship (or no paper assertion) for the second ingest.
+//! So the writer keeps ONE ROW OF THE FACT PER PRINCIPAL: it deduplicates only
+//! onto a row the same principal marked
+//! ([`EdgeRepository::create_if_absent_for_ingest_principal_signed_conn`]),
+//! and every row names exactly one principal, the one whose ingest wrote it
+//! and whose key signed it. "Every principal whose ingest wrote this fact" is
+//! the set of marked rows of the fact.
+//!
+//! Two kinds of row still stop the write, as one shared row did: a RETRACTED
+//! row of the fact, whoever wrote it (a retraction withholds the fact from
+//! every later ingest), and an UNMARKED row (see below).
+//!
 //! # What the marker proves, and what it does not
 //!
 //! It proves the ingest CODE PATH wrote the edge, and which principal ran that
 //! ingest (`by`). It does not prove the document is genuine, nor that two
 //! marked edges come from the same ingest: any caller with ingest scope can
-//! ingest a document under an existing DOI (the paper row is shared by DOI)
-//! and so add marked `paper -asserts-> claim` and `agent -asserts-> claim`
-//! edges to a paper another ingest wrote.
+//! ingest a document under an existing DOI and so add marked
+//! `paper -asserts-> claim` and `agent -asserts-> claim` edges to a paper
+//! another ingest wrote.
 //!
 //! So there are two predicates, and a read uses the one its question needs:
 //!
 //! * [`ingest_written_edge_sql`]: this one edge was written by an ingest;
 //! * [`same_ingest_sql`]: two marked edges were written by ingests of the SAME
-//!   principal. Every read that COMBINES edges into one fact (an author's
-//!   paper asserts a claim the author is credited with; a paper's author list
-//!   next to that paper's claims) must require it between every pair it
-//!   combines, or one ingester's real authorship backs another's graft.
+//!   principal: a principal present on both (each row names exactly one, so
+//!   this is equality of `by`). Every read that COMBINES edges into one fact
+//!   (an author's paper asserts a claim the author is credited with; a
+//!   paper's author list next to that paper's claims) must require it between
+//!   every pair it combines, or one ingester's real authorship backs
+//!   another's graft. Because every principal keeps its own rows, filtering a
+//!   fact's rows by one principal (`by` = the creating ingest's principal)
+//!   finds exactly what that principal's ingests said, never less.
 //!
 //! What remains, by design of a caller-driven ingest: a principal can still
 //! ingest a fabricated document of its own, naming any name, and every edge of
-//! that ingest is consistently marked by it. The marker names that principal
-//! (`by`); it does not vouch for it.
+//! that ingest is consistently marked by it. The same holds for a document
+//! under an existing DOI: an ingest that names a paper's existing author
+//! credits that author with ITS claims, by its own word. The marker names that
+//! principal (`by`); it does not vouch for it.
 //!
 //! # What it does not cover
 //!
 //! * Edges written before the marker existed carry none, and the walk's
 //!   create-if-absent never upgrades an existing row: legacy rows read as
 //!   unproven until an operator backfills them.
-//! * An existing unmarked row on the same `(source, target, relationship)`
+//! * An existing UNMARKED row on the same `(source, target, relationship)`
 //!   stops the walk writing a marked one (the walk dedups onto it), so a
-//!   writer that writes first can withhold credit.
+//!   writer that writes first, unmarked, can withhold credit; so can a
+//!   retraction of any principal's row of the fact.
+//! * Readers that do not deduplicate see one edge per principal: a paper's
+//!   author list and claim list must count each author and claim once.
 //! * The document ingest's record of each claim it asserted
 //!   (`paper -ingested_claim-> claim`, [`crate::ClaimIngestRepository`]) is
 //!   marked too, by its own writer: one record per (paper, claim, ingester),
@@ -132,10 +159,12 @@ pub fn ingest_written_by_sql(alias: &str) -> String {
 }
 
 /// SQL: true when the marked edges aliased `a` and `b` were written by
-/// ingests of the same principal. Plain `=`: a missing `by` on either side is
-/// NULL and never matches, so two markers without one are not "the same".
-/// Every read that combines ingest-written edges into one fact requires it
-/// between each pair it combines (see the module docs).
+/// ingests of the same principal: a principal present on both. Each marked
+/// row names exactly one principal (the writer keeps one row of a fact per
+/// principal), so that is equality of `by`. Plain `=`: a missing `by` on
+/// either side is NULL and never matches, so two markers without one are not
+/// "the same". Every read that combines ingest-written edges into one fact
+/// requires it between each pair it combines (see the module docs).
 #[must_use]
 pub fn same_ingest_sql(a: &str, b: &str) -> String {
     format!(
@@ -184,9 +213,12 @@ pub(crate) async fn declare_ingest_written(
 }
 
 /// Write one ingest edge, marked [`INGEST_WRITTEN_PROPERTY`] =
-/// `{"tool": tool, "by": by}` (`by`: the walk's write identity), as
-/// [`EdgeRepository::create_if_absent_including_retracted_signed_conn`] does
-/// (a dedup hit returns the existing row, marked or not, and writes nothing).
+/// `{"tool": tool, "by": by}` (`by`: the walk's write identity), unless `by`
+/// already wrote this fact: one row of the fact PER PRINCIPAL, through
+/// [`EdgeRepository::create_if_absent_for_ingest_principal_signed_conn`]. A
+/// dedup hit (`by`'s own row, a retracted row, or an unmarked row of the
+/// fact) returns that row and writes nothing; an in-force row another
+/// principal marked does not stop the write.
 ///
 /// Declares [`INGEST_WRITTEN_SETTING`] for this INSERT only, inside a
 /// savepoint of `conn`'s transaction (a transaction of its own on a bare
@@ -238,17 +270,16 @@ pub async fn create_ingest_written_edge_if_absent_conn(
         .bind(INGEST_WRITTEN_SETTING)
         .execute(&mut *sp)
         .await?;
-    let out = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+    let out = EdgeRepository::create_if_absent_for_ingest_principal_signed_conn(
         &mut sp,
         key,
+        by,
         source_id,
         source_type,
         target_id,
         target_type,
         relationship,
         Some(serde_json::Value::Object(props)),
-        None,
-        None,
     )
     .await?;
     sqlx::query("SELECT pg_catalog.set_config($1, '', true)")
