@@ -1343,6 +1343,43 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     );
 }
 
+/// A recorded author is primary only on the CREATING ingest's own
+/// authorship row. When the creator's record names an author but only
+/// another ingest of the claim wrote that author's row (the creator's own
+/// write was withheld, e.g. by an older row of the same fact), the other
+/// ingest's row never makes the author primary: it is that ingest's word,
+/// listed under `added_authors` with who wrote it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_recorded_author_is_primary_only_on_the_creating_ingests_own_row(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (later, _) = fixture::seed_agent_with_group(&pool, "later-ingester").await;
+    let claim = fixture::seed_public_claim(&pool, creator, "an own-row claim").await;
+    let doc = paper(&pool, "10.0000/fixture.ownrow", "Own Row Paper").await;
+    let lead = author_node(&pool, "Own Row Lead").await;
+    let borrowed = author_node(&pool, "Borrowed Row").await;
+    authored(&pool, lead, doc, creator, json!({"position": 0})).await;
+    authored(&pool, borrowed, doc, later, json!({"position": 1})).await;
+    ingested(&pool, doc, claim, creator, true, &[lead, borrowed]).await;
+    ingested(&pool, doc, claim, later, false, &[borrowed]).await;
+
+    let block = claim_block(&pool, &scoped, stranger, claim, creator).await;
+    let p = &literature(&block).paper;
+    assert_eq!(
+        ids(&p.authors),
+        vec![lead],
+        "only the creator's own row backs a primary author"
+    );
+    assert_eq!(ids(&p.added_authors), vec![borrowed], "{p:?}");
+    assert_eq!(
+        p.added_authors[0].added_by.as_ref().map(|a| a.id),
+        Some(later),
+        "the other ingest's word, with who wrote it"
+    );
+    assert!(p.pending_authors.is_empty(), "{p:?}");
+}
+
 /// No number of authorships a later ingest adds to the creating document
 /// can push a recorded (primary) author out of the bounded listing: the
 /// recorded authors are listed first in the one bounded read, whatever their
