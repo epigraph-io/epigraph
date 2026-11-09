@@ -41,19 +41,23 @@
 //! A record counts only while it carries the ingest-written marker
 //! ([`crate::INGEST_WRITTEN_PROPERTY`], naming the same ingester as
 //! [`INGESTED_BY_PROPERTY`]) and the SAME paper's `asserts` edge onto the
-//! claim is in force, ingest-written and readable by the caller: a record
-//! without its assertion (the assertion retracted, or hidden from this
-//! caller) is not listed. The record is about the row that ingest created
-//! or found, never its successor: the supersede, dedup and merge cascades
-//! leave every ingest-written edge (the record, the paper's assertion) on the
-//! retired row (`claim.rs`, `INGEST_WRITTEN_FROZEN`), so the retired claim
-//! keeps its record and its paper, and the successor reads none. Any other
-//! UPDATE that re-points one strips its marker (migration 198), so it would
-//! not be listed on the claim it then points at. The paper's assertion is deduplicated on (paper, claim), so a
-//! second ingester's record rests on the first ingester's assertion; the
-//! read requires the assertion to be ingest-written, not to name the same
-//! ingester. A re-ingest of a document whose assertion predates the marker
-//! (an unmarked, legacy row) therefore records nothing readable.
+//! claim, written by the SAME ingest principal (its marker names the
+//! record's ingester, `crate::same_ingest_sql`), is in force and readable by
+//! the caller. Every ingest principal keeps its own assertion of a fact, so
+//! a record is read only on its own ingester's word: a record without it (the
+//! assertion retracted, hidden from this caller, or only another principal's)
+//! is not listed. A re-ingest whose own assertion could not be written (an
+//! unmarked legacy row, or a retracted row, of the same fact stops the
+//! writer) therefore records nothing readable.
+//!
+//! The record is about the row that ingest created or found, never its
+//! successor: the supersede, dedup and merge cascades leave every
+//! ingest-written edge (the record, the paper's assertion) on the retired row
+//! (`claim.rs`, `INGEST_WRITTEN_FROZEN`), so the retired claim keeps its
+//! record and its paper, and the successor reads none. Any other UPDATE that
+//! re-points one strips its marker (migration 198), so it would not be listed
+//! on the claim it then points at.
+//!
 //! `creator` is the record with `created_claim: true` whose `ingested_by` is
 //! the claim's filer (`claims.agent_id`; the walk files every claim it
 //! creates), when there is one. A
@@ -131,7 +135,8 @@ impl ClaimIngestRepository {
     ///
     /// The dedup probe reads in any state, so a re-run never writes a second
     /// record, and a later re-run never turns a `created_claim: false` record
-    /// into a creator.
+    /// into a creator. It matches only a record MARKED as this ingester's: an
+    /// unmarked row naming the ingester never stops its marked record.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the probe or the INSERT fails.
@@ -148,16 +153,22 @@ impl ClaimIngestRepository {
     ) -> Result<bool, DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
+        // Only this ingester's own MARKED record stops the write: an unmarked
+        // row naming it (a hand write, or a record re-pointed by an UPDATE,
+        // which strips the marker) is not the walk's, and must never withhold
+        // the real record.
         let existing = sqlx::query_scalar::<_, Uuid>(&format!(
             "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path (the reason \
              `create_if_not_exists_conn` gives): it must see an existing record \
              whoever is asking, or every re-run writes a duplicate.\n\
-             SELECT id FROM edges \
-              WHERE source_id = $1 AND source_type = 'paper' \
-                AND target_id = $2 AND target_type = 'claim' \
-                AND relationship = '{INGEST_RECORD_RELATIONSHIP}' \
-                AND properties ->> '{INGESTED_BY_PROPERTY}' = $3 \
-              LIMIT 1"
+             SELECT e.id FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'paper' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
+                AND e.properties ->> '{INGESTED_BY_PROPERTY}' = $3 \
+                AND {marker_by} = $3 \
+              LIMIT 1",
+            marker_by = crate::repos::ingest_written::ingest_written_by_sql("e"),
         ))
         .bind(paper_id)
         .bind(claim_id)
@@ -247,7 +258,7 @@ impl ClaimIngestRepository {
                                  WHERE a.source_id = r.source_id AND a.source_type = 'paper' \
                                    AND a.target_id = r.target_id AND a.target_type = 'claim' \
                                    AND a.relationship = 'asserts' AND {in_force_a} \
-                                   AND {marked_a} \
+                                   AND {marked_a} AND {same_ingest_ar} \
                                    /* {{EDGE_VISIBILITY:a}} */) \
                             /* {{EDGE_VISIBILITY:r}} */ \
                             /* {{VISIBILITY:c}} */) k \
@@ -261,6 +272,7 @@ impl ClaimIngestRepository {
                 marked_r = crate::repos::ingest_written::ingest_written_edge_sql("r"),
                 marker_by_r = crate::repos::ingest_written::ingest_written_by_sql("r"),
                 marked_a = crate::repos::ingest_written::ingest_written_edge_sql("a"),
+                same_ingest_ar = crate::repos::ingest_written::same_ingest_sql("a", "r"),
             ),
             3,
         );
