@@ -1559,7 +1559,11 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         sorted(vec![(d3.to_string(), b_id, false)]),
         "a document repeating a directly filed claim never becomes its creator"
     );
-    assert_eq!(creator_doi(&pool, direct).await, None, "and the read names none");
+    assert_eq!(
+        creator_doi(&pool, direct).await,
+        None,
+        "and the read names none"
+    );
 }
 
 /// A stranger's PENDING naming of a person is not kept for a later
@@ -1972,22 +1976,39 @@ async fn an_operator_replacement_is_kept_for_every_later_ingester(pool: PgPool) 
     let d = "10.9999/author-operator-replace";
     let atoms = ["The replaced author's atom."];
 
-    tools::ingestion::do_ingest_document(&cli, &viewer, &doc_with_atoms(d, json!([{"name": name}]), &atoms), None)
-        .await
-        .expect("the name-only ingest");
+    tools::ingestion::do_ingest_document(
+        &cli,
+        &viewer,
+        &doc_with_atoms(d, json!([{"name": name}]), &atoms),
+        None,
+    )
+    .await
+    .expect("the name-only ingest");
     let key = name_key_node(&pool, name).await.expect("name-key node");
     let json = text(
         &tools::ingestion::do_ingest_document(
             &cli,
             &viewer,
-            &doc_with_atoms(d, json!([{"name": name, "agent_id": human.to_string()}]), &atoms),
+            &doc_with_atoms(
+                d,
+                json!([{"name": name, "agent_id": human.to_string()}]),
+                &atoms,
+            ),
             None,
         )
         .await
         .expect("the operator replacement"),
     );
-    assert_eq!(json["authors"][0]["replaced"]["agent_id"], key.to_string(), "CALIBRATION {json}");
-    assert_eq!(authored_in_force(&pool, key, d).await, 0, "CALIBRATION: replaced");
+    assert_eq!(
+        json["authors"][0]["replaced"]["agent_id"],
+        key.to_string(),
+        "CALIBRATION {json}"
+    );
+    assert_eq!(
+        authored_in_force(&pool, key, d).await,
+        0,
+        "CALIBRATION: replaced"
+    );
 
     let json = text(
         &tools::ingestion::do_ingest_document(
@@ -2003,6 +2024,10 @@ async fn an_operator_replacement_is_kept_for_every_later_ingester(pool: PgPool) 
     assert_eq!(report["agent_id"], human.to_string(), "{json}");
     assert_eq!(report["action"], "kept_attached", "{json}");
     assert_eq!(report["asserts_claims"], false, "{json}");
-    assert_eq!(authored_in_force(&pool, key, d).await, 0, "not brought back");
+    assert_eq!(
+        authored_in_force(&pool, key, d).await,
+        0,
+        "not brought back"
+    );
     assert_eq!(authored_in_force(&pool, human, d).await, 1);
 }
