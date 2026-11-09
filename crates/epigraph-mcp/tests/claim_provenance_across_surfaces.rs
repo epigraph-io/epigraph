@@ -168,7 +168,19 @@ async fn card_as(server: &EpiGraphMcpFull, pool: &PgPool, caller: Uuid, agent: U
     text(&out)
 }
 
+/// `query_paper` for `doi` as a public viewer: the paper's first ingest.
 async fn query_paper(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> Value {
+    query_paper_by(server, pool, doi, None).await
+}
+
+/// `query_paper` for `doi` as a public viewer, listing the ingest of
+/// principal `by` (the paper's first ingest when `None`).
+async fn query_paper_by(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    doi: &str,
+    by: Option<Uuid>,
+) -> Value {
     let viewer = fixture::public_viewer(pool).await;
     let r = tools::paper_queries::query_paper(
         server,
@@ -177,12 +189,29 @@ async fn query_paper(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> Valu
             doi: doi.to_string(),
             limit: None,
             offset: None,
-            ingested_by: None,
+            ingested_by: by.map(|u| u.to_string()),
         },
     )
     .await
     .expect("query_paper");
     text(&r)
+}
+
+/// The `agent_id` of every author `query_paper` listed, sorted.
+fn author_ids(listed: &Value) -> Vec<Value> {
+    sorted(
+        listed["authors"]
+            .as_array()
+            .unwrap_or_else(|| panic!("authors listed: {listed}"))
+            .iter()
+            .map(|a| a["agent_id"].clone())
+            .collect(),
+    )
+}
+
+fn sorted(mut v: Vec<Value>) -> Vec<Value> {
+    v.sort_by_key(ToString::to_string);
+    v
 }
 
 fn ids(list: &Value) -> Vec<Value> {
@@ -419,11 +448,25 @@ async fn a_later_ingest_of_the_creating_document_never_changes_its_primary_autho
         name_node(&pool, "Interloper Vexx").await,
         name_node(&pool, "Late Addendum").await,
     );
+    // Each principal's ingest keeps its own authorship rows: `query_paper`
+    // lists one ingest at a time (the first by default).
     let listed = query_paper(&a, &pool, d1).await;
     assert_eq!(
-        listed["authors"].as_array().map(Vec::len),
-        Some(3),
-        "CALIBRATION: both re-ingests wrote their authorship onto the paper: {listed}"
+        listed["ingests"].as_array().map(Vec::len),
+        Some(2),
+        "CALIBRATION: two principals ingested the document: {listed}"
+    );
+    assert_eq!(listed["ingested_by"], json!(a_id.to_string()), "{listed}");
+    assert_eq!(
+        author_ids(&listed),
+        sorted(vec![json!(ingrid), json!(late)]),
+        "CALIBRATION: the creator's own ingests wrote these authorships: {listed}"
+    );
+    let listed_b = query_paper_by(&a, &pool, d1, Some(b_id)).await;
+    assert_eq!(
+        author_ids(&listed_b),
+        sorted(vec![json!(ingrid), json!(vexx)]),
+        "CALIBRATION: the second principal's ingest wrote its own rows: {listed_b}"
     );
     let p1 = paper_id(&pool, d1).await;
     for caller in [stranger, a_id, b_id] {
