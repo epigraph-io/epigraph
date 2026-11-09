@@ -124,11 +124,16 @@ pub async fn submit_ds_evidence(
     // does something, so the response says it did not.
     let mut warnings = deprecated_parameter_warnings(method, params.gamma);
 
-    // Get frame from DB
-    let mut frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
+    // The frame, read as the CALLER on its stamped read. Frames carry tenancy,
+    // and on the application role an unstamped connection admits public rows
+    // only, so a member's own group-private frame answered "frame not found".
+    // Released at once: the write transaction below is taken separately.
+    let mut read = server.read_as(viewer, "submit_ds_evidence").await?;
+    let mut frame_row = FrameRepository::get_by_id(&mut *read, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
+    drop(read);
 
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;

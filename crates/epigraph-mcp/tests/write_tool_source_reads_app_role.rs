@@ -37,7 +37,7 @@ use epigraph_auth::AuthContext;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::types::ConsolidateClaimsParams;
+use epigraph_mcp::types::{ConsolidateClaimsParams, SubmitDsEvidenceParams};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -144,4 +144,56 @@ async fn consolidate_default_confidence_reads_the_members_private_sources(pool: 
          own private sources; got {truth} (0 means the sources were read on an unstamped \
          session and seen as missing)"
     );
+}
+
+// ───────────────────────────── submit_ds_evidence ─────────────────────────────
+
+/// A member files a BBA on its own private claim against its own private
+/// frame. On the plain pool the frame read answered `frame <id> not found`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_ds_evidence_reads_the_members_private_frame(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (agent, auth, viewer, group) = member(&pool).await;
+    let claim = private_claim(&pool, agent, group, "ds evidence target (private)", 0.5).await;
+
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("private-frame-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    sqlx::query("UPDATE frames SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(frame)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("privatise frame");
+
+    let params: SubmitDsEvidenceParams = serde_json::from_value(serde_json::json!({
+        "claim_id": claim.to_string(),
+        "frame_id": frame.to_string(),
+        "hypothesis_index": 0,
+        "masses": {"0": 0.7, "0,1": 0.3},
+    }))
+    .expect("params");
+    epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, params, Some(&auth))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "a member files evidence against its own private frame (an unstamped frame \
+                 read reports it missing): {}",
+                e.message
+            )
+        });
+
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(claim)
+    .bind(frame)
+    .fetch_one(&pool)
+    .await
+    .expect("count BBAs");
+    assert_eq!(n, 1, "the BBA landed on the private frame");
 }
