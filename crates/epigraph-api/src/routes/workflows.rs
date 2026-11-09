@@ -3163,9 +3163,9 @@ async fn workflow_authority(
     }
     Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
-         submitter, its submitter's operator, an agent acting for its submitter through a live \
-         operator link, a writer of its owner group, nor a live claims:admin holder. Nothing \
-         was written."
+         submitter, its submitter's operator, an agent acting for its submitter or for its \
+         submitter's operator through a live operator link, a writer of its owner group, nor a \
+         live claims:admin holder. Nothing was written."
     )))
 }
 
