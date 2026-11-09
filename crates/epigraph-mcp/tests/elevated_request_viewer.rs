@@ -909,7 +909,8 @@ async fn el8_log(pool: &PgPool) -> Vec<(String, i32, Vec<Uuid>, serde_json::Valu
 
 /// An elevated tool call through the real `call_tool` is recorded ONCE before
 /// its result returns: surface `mcp:get_claim`, the call's id-shaped argument,
-/// the token's jti, one row in the result, and no subject for a public row.
+/// the token's jti, the claim and its author as the result's rows, and no
+/// subject for a public row.
 /// A call whose result names B's private claim (the MCP read is not widened,
 /// so the tool answers "not found", naming the id) is recorded too, against
 /// B's group: the attempt is visible to B.
@@ -942,7 +943,11 @@ async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPoo
     assert_eq!(log.len(), 1, "{log:?}");
     let (surface, rows, groups, args) = &log[0];
     assert_eq!(surface, "mcp:get_claim");
-    assert_eq!(*rows, 1, "one row in the result");
+    // Two id-bearing objects: the claim and its `authored_by.agent` (P, who
+    // filed it). P is a registered human operator, bound to itself, which is
+    // not an operator, so `authored_by.human` is null and not counted. The
+    // recorder counts every nested row object.
+    assert_eq!(*rows, 2, "the claim and its author in the result");
     assert!(
         groups.is_empty(),
         "a public row names no subject: {groups:?}"

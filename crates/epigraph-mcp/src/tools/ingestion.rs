@@ -17,8 +17,7 @@ use epigraph_core::{
 };
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
-    AgentRepository, ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository,
-    ReasoningTraceRepository,
+    ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
 use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
 use epigraph_ingest::document::schema::ByteSpan;
@@ -182,6 +181,7 @@ pub async fn ingest_document(
     // `papers` row. The core re-derives (and re-checks) the same set.
     ingest_claim_labels(&extraction, &doi)?;
     refuse_lineage_relationships(&extraction)?;
+    refuse_bad_author_ids(&extraction)?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -215,7 +215,15 @@ pub async fn ingest_document(
         )
     })?;
 
-    preflight_write_authority(server, &viewer, "ingest_document", auth).await?;
+    preflight_write_authority(
+        server,
+        &viewer,
+        "ingest_document",
+        auth,
+        &extraction.source.authors,
+        &doi,
+    )
+    .await?;
     if params.wait.unwrap_or(false) {
         return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
     }
@@ -282,6 +290,8 @@ async fn preflight_write_authority(
     viewer: &epigraph_db::visibility::Viewer,
     tool_name: &'static str,
     auth: Option<&epigraph_auth::AuthContext>,
+    authors: &[epigraph_ingest::common::schema::AuthorEntry],
+    doi: &str,
 ) -> Result<(), McpError> {
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
@@ -293,7 +303,25 @@ async fn preflight_write_authority(
     // refused HERE, to the caller, instead of being told `queued` over a task
     // that writes nothing.
     tx.owner_decl(agent_id, tool_name).await?;
-    // Nothing was written on it; dropping it rolls back.
+    // Every explicit `source.authors[].agent_id` names an agent that may
+    // author (backlog 94cc12db), on the same connection the walk will use, so
+    // an unknown or system id is refused to the caller BEFORE the eager
+    // `papers` row, not in the detached task's log. On a re-ingest (the row
+    // exists) the name-derived authors an `agent_id` replaces are retracted
+    // here too, inside this transaction, so an author this caller cannot
+    // retract is refused now rather than in the task.
+    let existing_paper = find_paper_by_document_key(&server.pool, doi)
+        .await?
+        .map(|p| p.id);
+    crate::tools::ingest_authors::preflight_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        existing_paper,
+    )
+    .await?;
+    // Nothing is kept from it; dropping it rolls back (the retractions too).
     drop(tx);
     Ok(())
 }
@@ -316,6 +344,7 @@ pub async fn ingest_document_inline(
     // Before any write, for the reason given in `ingest_document` above.
     ingest_claim_labels(&extraction, &doi)?;
     refuse_lineage_relationships(&extraction)?;
+    refuse_bad_author_ids(&extraction)?;
 
     // Same detached-task ownership requirement, the same refusals (an elevated
     // request first, before the detach downgrades it) and the same
@@ -328,7 +357,15 @@ pub async fn ingest_document_inline(
         )
     })?;
 
-    preflight_write_authority(server, &viewer, "ingest_document_inline", auth).await?;
+    preflight_write_authority(
+        server,
+        &viewer,
+        "ingest_document_inline",
+        auth,
+        &extraction.source.authors,
+        &doi,
+    )
+    .await?;
     if wait {
         return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
     }
@@ -398,6 +435,15 @@ async fn ingest_in_request(
 fn refuse_lineage_relationships(extraction: &DocumentExtraction) -> Result<(), McpError> {
     epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
         .map_err(invalid_params)
+}
+
+/// Refuse a document whose `source.authors[].agent_id` is malformed, on a
+/// placeholder name, or repeated (backlog 94cc12db): a caller payload error,
+/// before any write, on every document entry point. Whether each id names an
+/// agent that may author is checked on a connection: in the handlers'
+/// preflight and again in the walk (`tools::ingest_authors`).
+fn refuse_bad_author_ids(extraction: &DocumentExtraction) -> Result<(), McpError> {
+    crate::tools::ingest_authors::parse_explicit_author_ids(&extraction.source.authors).map(|_| ())
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the
@@ -1004,6 +1050,7 @@ pub async fn do_ingest_document(
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
     refuse_lineage_relationships(extraction)?;
+    refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -1075,10 +1122,12 @@ pub async fn do_ingest_document(
     let mut tx = begin_ingest_tx(server, author, "ingest_document").await?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
-    // Each author gets a deterministic ed25519 keypair via
-    // `did_key_for_author` — same name (or ORCID, when present in the
-    // extraction) maps to the same agent across papers, which is how
-    // co-authorship lights up in the graph. Affiliations and roles are
+    // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
+    // Every other author gets a deterministic ed25519 keypair via
+    // `did_key_for_author` — same name maps to the same agent across papers,
+    // which is how co-authorship lights up in the graph — and is never
+    // attached to another agent that merely shares the name (those are
+    // reported as `candidates`; see `tools::ingest_authors`). Affiliations and roles are
     // not yet first-class on Agent and remain in the extraction JSON
     // pending an AgentRepository properties surface.
     let mut author_responses = Vec::new();
@@ -1144,92 +1193,51 @@ pub async fn do_ingest_document(
     } else {
         &extraction.source.authors
     };
-    // Migration 148: a document never names a system identity as its author.
-    // The legacy public-constant key is refused before the lookup (so it is
-    // never adopted, and never re-minted after a rotation), and an author that
-    // resolves to a REGISTERED system agent under any other key is skipped
-    // after it. One registry read per document, and none without authors.
-    let registered_system_agents = if authors.is_empty() {
-        Vec::new()
-    } else {
-        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut tx)
-            .await
-            .map_err(internal_error)?
-    };
-    for (idx, author) in authors.iter().enumerate() {
-        // Empty or placeholder name: no agent, no `authored` edge. Same original
-        // `idx` the planner skipped, so `author_agent_map` stays aligned.
-        if author.is_placeholder() {
-            if !author.name.trim().is_empty() {
-                tracing::warn!(
-                    paper = %paper_title,
-                    name = %author.name,
-                    author_index = idx,
-                    "ingest_document: dropping placeholder author name"
-                );
-            }
-            continue;
-        }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
-            tracing::warn!(
-                target: "ingest.authors",
-                author_index = idx,
-                "skipping an author whose name derives a system agent's legacy key: a document \
-                 cannot name a system identity as its author (migration 148)"
-            );
-            continue;
-        }
-        let agent_uuid: Uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(&mut *tx, &pub_key_bytes)
-                .await
-                .map_err(internal_error)?
-        {
-            let id: Uuid = existing.id.into();
-            if registered_system_agents.contains(&id) {
-                tracing::warn!(
-                    target: "ingest.authors",
-                    author_index = idx,
-                    "skipping an author that resolves to a registered system agent: a document \
-                     cannot name a system identity as its author (migration 148)"
-                );
-                continue;
-            }
-            id
-        } else {
-            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create_conn(&mut tx, &author_agent)
-                .await
-                .map_err(internal_error)?;
-            created.id.into()
-        };
+    // Explicit `agent_id`s, the name-derived default, migration 148's
+    // system-identity skips and the per-author report: `tools::ingest_authors`.
+    let resolved = crate::tools::ingest_authors::resolve_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        paper_id,
+        "ingest_document",
+        &paper_title,
+    )
+    .await?;
+    // The document's authors as THIS walk resolved them, in the extraction's
+    // order: written into every ingest record, and on the record of a claim
+    // this walk creates, the claim's primary authors (`ClaimIngestRecord::
+    // authors`), fixed at creation whatever a later ingest adds.
+    let mut recorded_authors: Vec<(usize, Uuid)> =
+        resolved.iter().map(|r| (r.idx, r.agent_id)).collect();
+    recorded_authors.sort_by_key(|(idx, _)| *idx);
+    let recorded_authors: Vec<Uuid> = recorded_authors.into_iter().map(|(_, a)| a).collect();
+    for r in resolved {
+        let author = &authors[r.idx];
         let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
             &mut tx,
             edge_key,
             "ingest_document",
             agent_id,
-            agent_uuid,
+            r.agent_id,
             "agent",
             paper_id,
             "paper",
             "authored",
-            Some(serde_json::json!({
-                // The ORIGINAL extraction index: it can have gaps where a
-                // placeholder author was dropped ([Unknown, Alice] gives Alice
-                // position 1 and no edge position 0).
-                "position": idx,
-                "role": author.roles.first().map_or("author", String::as_str),
-                "affiliations": author.affiliations,
-            })),
+            Some(crate::tools::ingest_authors::authored_edge_properties(
+                &r, author, agent_id,
+            )),
         )
         .await
         .map_err(internal_error)?;
-        author_agent_map.insert(idx, agent_uuid);
-        author_responses.push(AuthorResponse {
-            agent_id: agent_uuid.to_string(),
-            name: author.name.clone(),
-        });
+        // The plan's per-claim `asserts` edges come from this map: an author
+        // the ingester does not speak for is not in it, so it gets `authored`
+        // only (`tools::ingest_authors`, the explicit-author rule).
+        if r.asserts {
+            author_agent_map.insert(r.idx, r.agent_id);
+        }
+        author_responses.push(r.report);
     }
 
     // ── 4. Walk planned claims: dedup → claim/trace/evidence/embed ──
@@ -1330,6 +1338,20 @@ pub async fn do_ingest_document(
             )
             .await
             .map_err(internal_error)?;
+            // The ingest record: this walk converged on an existing claim.
+            epigraph_db::ClaimIngestRepository::record_signed_conn(
+                &mut tx,
+                edge_key,
+                paper_id,
+                persisted_id,
+                agent_id,
+                false,
+                &recorded_authors,
+                "ingest_document",
+                &pipeline_version,
+            )
+            .await
+            .map_err(internal_error)?;
             id_map.insert(planned.id, persisted_id);
             claim_ids.push(persisted_id.to_string());
             dedup_count += 1;
@@ -1406,6 +1428,21 @@ pub async fn do_ingest_document(
             "claim",
             "asserts",
             Some(planned.properties.clone()),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        // The ingest record: this walk CREATED the claim.
+        epigraph_db::ClaimIngestRepository::record_signed_conn(
+            &mut tx,
+            edge_key,
+            paper_id,
+            persisted_id,
+            agent_id,
+            true,
+            &recorded_authors,
+            "ingest_document",
+            &pipeline_version,
         )
         .await
         .map_err(internal_error)?;
@@ -1629,6 +1666,7 @@ pub async fn do_ingest_document(
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
+        ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
@@ -2055,6 +2093,7 @@ pub async fn do_ingest_document_spine(
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
     refuse_lineage_relationships(extraction)?;
+    refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -2179,93 +2218,50 @@ pub async fn do_ingest_document_spine(
     } else {
         &extraction.source.authors
     };
-    // Migration 148: a document never names a system identity as its author.
-    // The legacy public-constant key is refused before the lookup (so it is
-    // never adopted, and never re-minted after a rotation), and an author that
-    // resolves to a REGISTERED system agent under any other key is skipped
-    // after it. One registry read per document, and none without authors.
-    let registered_system_agents = if authors.is_empty() {
-        Vec::new()
-    } else {
-        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut tx)
-            .await
-            .map_err(internal_error)?
-    };
-    for (idx, author) in authors.iter().enumerate() {
-        // Empty or placeholder name: no agent, no `authored` edge. Same original
-        // `idx` the planner skipped, so `author_agent_map` stays aligned.
-        if author.is_placeholder() {
-            if !author.name.trim().is_empty() {
-                tracing::warn!(
-                    paper = %paper_title,
-                    name = %author.name,
-                    author_index = idx,
-                    "ingest_document_spine: dropping placeholder author name"
-                );
-            }
-            continue;
-        }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
-            tracing::warn!(
-                target: "ingest.authors",
-                author_index = idx,
-                "skipping an author whose name derives a system agent's legacy key: a document \
-                 cannot name a system identity as its author (migration 148)"
-            );
-            continue;
-        }
-        let agent_uuid: Uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(&mut *tx, &pub_key_bytes)
-                .await
-                .map_err(internal_error)?
-        {
-            let id: Uuid = existing.id.into();
-            if registered_system_agents.contains(&id) {
-                tracing::warn!(
-                    target: "ingest.authors",
-                    author_index = idx,
-                    "skipping an author that resolves to a registered system agent: a document \
-                     cannot name a system identity as its author (migration 148)"
-                );
-                continue;
-            }
-            id
-        } else {
-            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            AgentRepository::create_conn(&mut tx, &author_agent)
-                .await
-                .map_err(internal_error)?
-                .id
-                .into()
-        };
+    // Explicit `agent_id`s, the name-derived default, migration 148's
+    // system-identity skips and the per-author report: `tools::ingest_authors`.
+    let resolved = crate::tools::ingest_authors::resolve_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        paper_id,
+        "ingest_document_spine",
+        &paper_title,
+    )
+    .await?;
+    // The document's authors as THIS walk resolved them, in the extraction's
+    // order: written into every ingest record, and on the record of a claim
+    // this walk creates, the claim's primary authors (`ClaimIngestRecord::
+    // authors`), fixed at creation whatever a later ingest adds.
+    let mut recorded_authors: Vec<(usize, Uuid)> =
+        resolved.iter().map(|r| (r.idx, r.agent_id)).collect();
+    recorded_authors.sort_by_key(|(idx, _)| *idx);
+    let recorded_authors: Vec<Uuid> = recorded_authors.into_iter().map(|(_, a)| a).collect();
+    for r in resolved {
+        let author = &authors[r.idx];
         let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
             &mut tx,
             edge_key,
             "ingest_document_spine",
             agent_id,
-            agent_uuid,
+            r.agent_id,
             "agent",
             paper_id,
             "paper",
             "authored",
-            Some(serde_json::json!({
-                // The ORIGINAL extraction index: it can have gaps where a
-                // placeholder author was dropped ([Unknown, Alice] gives Alice
-                // position 1 and no edge position 0).
-                "position": idx,
-                "role": author.roles.first().map_or("author", String::as_str),
-                "affiliations": author.affiliations,
-            })),
+            Some(crate::tools::ingest_authors::authored_edge_properties(
+                &r, author, agent_id,
+            )),
         )
         .await
         .map_err(internal_error)?;
-        author_agent_map.insert(idx, agent_uuid);
-        author_responses.push(AuthorResponse {
-            agent_id: agent_uuid.to_string(),
-            name: author.name.clone(),
-        });
+        // As in `do_ingest_document`: `asserts` only from an author the
+        // ingester speaks for.
+        if r.asserts {
+            author_agent_map.insert(r.idx, r.agent_id);
+        }
+        author_responses.push(r.report);
     }
 
     // ── 3. Walk claims: levels 0–2 only ──
@@ -2359,6 +2355,20 @@ pub async fn do_ingest_document_spine(
             )
             .await
             .map_err(internal_error)?;
+            // The ingest record: this walk converged on an existing claim.
+            epigraph_db::ClaimIngestRepository::record_signed_conn(
+                &mut tx,
+                edge_key,
+                paper_id,
+                persisted_id,
+                agent_id,
+                false,
+                &recorded_authors,
+                "ingest_document_spine",
+                &pipeline_version,
+            )
+            .await
+            .map_err(internal_error)?;
             id_map.insert(planned.id, persisted_id);
             if planned.level == 2 {
                 para_dedup_count += 1;
@@ -2433,6 +2443,21 @@ pub async fn do_ingest_document_spine(
             "claim",
             "asserts",
             Some(planned.properties.clone()),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        // The ingest record: this walk CREATED the claim.
+        epigraph_db::ClaimIngestRepository::record_signed_conn(
+            &mut tx,
+            edge_key,
+            paper_id,
+            persisted_id,
+            agent_id,
+            true,
+            &recorded_authors,
+            "ingest_document_spine",
+            &pipeline_version,
         )
         .await
         .map_err(internal_error)?;
@@ -2547,6 +2572,7 @@ pub async fn do_ingest_document_spine(
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
+        ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
         paragraphs_embedded: queued,
@@ -2610,7 +2636,7 @@ mod tests {
         // ingested under PIPELINE_VERSION_BASE. Edges enforce target existence, so
         // create a real agent first.
         let agent_a = epigraph_core::Agent::new([7u8; 32], Some("test-agent-a".to_string()));
-        let agent_a_id: Uuid = AgentRepository::create(&pool, &agent_a)
+        let agent_a_id: Uuid = epigraph_db::AgentRepository::create(&pool, &agent_a)
             .await
             .expect("create agent a")
             .id
@@ -2643,7 +2669,7 @@ mod tests {
         // Insert a `processed_by` edge with the matching pipeline (different
         // target so it isn't deduped by the (source,target,relationship) key).
         let agent_b = epigraph_core::Agent::new([8u8; 32], Some("test-agent-b".to_string()));
-        let agent_b_id: Uuid = AgentRepository::create(&pool, &agent_b)
+        let agent_b_id: Uuid = epigraph_db::AgentRepository::create(&pool, &agent_b)
             .await
             .expect("create agent b")
             .id
@@ -2994,12 +3020,14 @@ mod tests {
             name: "Lawrence J. Gitman".to_string(),
             affiliations: Vec::new(),
             roles: Vec::new(),
+            agent_id: None,
         }];
         let mut b = src("Overview");
         b.authors = vec![epigraph_ingest::common::schema::AuthorEntry {
             name: "Amit Shah".to_string(),
             affiliations: Vec::new(),
             roles: Vec::new(),
+            agent_id: None,
         }];
         assert_ne!(
             resolve_doi(&extraction_of(a)),
@@ -3017,6 +3045,7 @@ mod tests {
                     name: (*n).to_string(),
                     affiliations: Vec::new(),
                     roles: Vec::new(),
+                    agent_id: None,
                 })
                 .collect();
             resolve_doi(&extraction_of(s))

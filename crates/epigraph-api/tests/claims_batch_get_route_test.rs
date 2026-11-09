@@ -342,6 +342,20 @@ async fn each_item_is_the_get_body_plus_is_current(pool: PgPool) {
         let get_trace = get_body.as_object_mut().unwrap().remove("trace_id");
         let batch_trace = batch_item.as_object_mut().unwrap().remove("trace_id");
         assert_eq!(batch_trace, get_trace, "trace_id of {id}");
+        // `authored_by` is GET's alone (several reads per claim); a batch item
+        // omits it rather than carry a different block.
+        assert!(
+            get_body
+                .as_object_mut()
+                .unwrap()
+                .remove("authored_by")
+                .is_some(),
+            "GET carries authored_by for {id}"
+        );
+        assert!(
+            batch_item.get("authored_by").is_none(),
+            "a batch item has no authored_by: {batch_item}"
+        );
         assert_eq!(batch_item, get_body, "batch item of {id} vs its GET body");
     }
 

@@ -345,6 +345,167 @@ async fn promote_all_staged_edges_refuses_a_reserved_dedup_key() {
     assert_eq!(staging_status(&pool, clean).await, "promoted");
 }
 
+/// A paper's `asserts` onto a claim and an agent-sourced `asserts` are the
+/// document ingest's (or the agent's own) to write: a staged row has no author
+/// who could speak for the agent. So are the reverse spellings of an agent's
+/// authorship (`claim -attributed_to-> agent` and the rest), a paper's
+/// `AUTHORED`, and an operator link's `OPERATED_BY`. The promote refuses each, on BOTH
+/// branches, naming the rows; nothing is written, not even a clean row named
+/// alongside, and every row stays `approved`. The clean row alone promotes
+/// (positive control: the refusal is the relationship's).
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_staged_edges_refuses_the_ingests_provenance_and_agent_attributions() {
+    let _serial = PROMOTE_SERIAL.lock().await;
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let claim = common::seed_claim(
+        &pool,
+        &format!("staged provenance {}", uuid::Uuid::new_v4()),
+    )
+    .await;
+    let paper: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $1) RETURNING id")
+            .bind(format!(
+                "10.9999/staged-provenance-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let agent = common::seed_system_agent(&pool).await;
+    let other = common::seed_system_agent(&pool).await;
+    let stage_row = |source: uuid::Uuid,
+                     source_type: &'static str,
+                     target: uuid::Uuid,
+                     target_type: &'static str,
+                     relationship: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "INSERT INTO edges_staging (source_id, source_type, target_id, target_type, \
+                                            relationship, properties, review_status) \
+                 VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, 'approved') RETURNING id",
+            )
+            .bind(source)
+            .bind(source_type)
+            .bind(target)
+            .bind(target_type)
+            .bind(relationship)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let stage = |source: uuid::Uuid, source_type: &'static str| {
+        stage_row(source, source_type, claim, "claim", "asserts")
+    };
+    let from_paper = stage(paper, "paper").await;
+    let from_agent = stage(agent, "agent").await;
+    // The same refusal for every other edge crediting an agent with content,
+    // in either direction, a paper's AUTHORED and an operator link's edge.
+    let mut more = Vec::new();
+    for (s, st, t, tt, r) in [
+        (claim, "claim", agent, "agent", "ATTRIBUTED_TO"),
+        (claim, "claim", agent, "agent", "attributed_to"),
+        (claim, "claim", agent, "agent", "authored_by"),
+        (claim, "claim", agent, "agent", "ORIGINATED_BY"),
+        (claim, "claim", agent, "agent", "AMPLIFIED_BY"),
+        (claim, "claim", agent, "agent", "GENERATED_BY"),
+        (claim, "claim", agent, "agent", "interpreted_by"),
+        (agent, "agent", claim, "claim", "generated"),
+        (paper, "paper", claim, "claim", "AUTHORED"),
+        (agent, "agent", other, "agent", "OPERATED_BY"),
+    ] {
+        more.push(stage_row(s, st, t, tt, r).await);
+    }
+    let (clean, c_src, c_tgt) =
+        stage_approved_edge(&pool, "CORROBORATES", serde_json::json!({"note": "ok"})).await;
+    let into_claim = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'asserts'",
+        )
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    let mut named = vec![from_paper, from_agent, clean];
+    named.extend(more.iter().copied());
+    let agent_edges = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM edges WHERE source_id = ANY($1) OR target_id = ANY($1)",
+        )
+        .bind(vec![agent, other])
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let agent_edges_before = agent_edges().await;
+    for body in [
+        serde_json::json!({ "edge_ids": named }),
+        serde_json::json!({}),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+            .bearer_auth(admin_token())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 400, "{body}: expected 400, got {status}: {text}");
+        assert!(
+            text.contains("document ingest")
+                && text.contains(&from_paper.to_string())
+                && text.contains(&from_agent.to_string()),
+            "{body}: the refusal names the rule and both staged rows: {text}"
+        );
+        for id in &more {
+            assert!(
+                text.contains(&id.to_string()),
+                "{body}: the refusal names every provenance row ({id}): {text}"
+            );
+        }
+        assert_eq!(into_claim().await, 0, "{body}: nothing written");
+        assert_eq!(
+            agent_edges().await,
+            agent_edges_before,
+            "{body}: nothing written"
+        );
+        assert_eq!(edges_between(&pool, c_src, c_tgt).await, 0, "{body}");
+        for id in &named {
+            assert_eq!(staging_status(&pool, *id).await, "approved", "{body}");
+        }
+    }
+
+    // Positive control: the clean row alone promotes.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+        .bearer_auth(admin_token())
+        .json(&serde_json::json!({"edge_ids": [clean]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "clean promote");
+    assert_eq!(edges_between(&pool, c_src, c_tgt).await, 1);
+
+    let mut cleanup = vec![from_paper, from_agent];
+    cleanup.extend(more);
+    sqlx::query("DELETE FROM edges_staging WHERE id = ANY($1)")
+        .bind(cleanup)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// `properties.supersede_act` marks a supersession's own `AUTHORED` edge,
 /// which the arming census and the edge migration key on; create and patch
 /// (HTTP and MCP) refuse it, and so does the promote route, on BOTH branches

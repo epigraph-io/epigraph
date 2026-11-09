@@ -14,7 +14,9 @@
 //! ownership until the handler is stamped.
 //!
 //! The five edge write handlers in `routes/edges.rs` were converted by W12b and
-//! are not in this register, and so were the in-scope edge statements of
+//! are not in this register, nor is `provenance.rs::set_provenance` (its
+//! four edges and the organization agents now go through one transaction
+//! stamped with the caller's viewer), and so were the in-scope edge statements of
 //! `conventions.rs::share_skill` (claim -> claim SHARED_BY) and
 //! `conventions.rs::forget_convention` (evidence -> claim REFUTES): both
 //! handlers hold a `Viewer`, and every other statement they make autocommits on
@@ -49,10 +51,6 @@
 //! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
 //! | crud.rs | create_reasoning_trace | claim -> trace HAS_TRACE | no |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
-//! | provenance.rs | set_provenance | claim -> agent ATTRIBUTED_TO | no |
-//! | provenance.rs | set_provenance | agent -> claim AUTHORED | no |
-//! | provenance.rs | set_provenance | agent -> agent AFFILIATED_WITH | no |
-//! | provenance.rs | set_provenance | claim -> agent WAS_ASSOCIATED_WITH | no |
 //! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
@@ -142,7 +140,6 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
     ("experiment_loop.rs", 4),
     ("perspective.rs", 1),
-    ("provenance.rs", 4),
     ("spans.rs", 3),
 ];
 
@@ -150,7 +147,10 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// left the register; see its note in [`UNSTAMPED`]); 27 -> 31 under R-50 only
 /// because `experiment_loop.rs`'s four writes moved here from
 /// [`RAW_INSERTS`] (whose high water fell 11 -> 2): no write was added.
-const HIGH_WATER: usize = 31;
+///
+/// 31 -> 27: `provenance.rs::set_provenance` writes its four edges on the
+/// caller's stamped transaction and left the register.
+const HIGH_WATER: usize = 27;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

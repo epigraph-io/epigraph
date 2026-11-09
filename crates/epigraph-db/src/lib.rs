@@ -86,6 +86,7 @@ pub use refusal_codes::{
 };
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
+pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
@@ -93,8 +94,11 @@ pub use repos::{
     PromptSnapshotIndex,
 };
 pub use repos::{
-    agent_lookup, AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef,
-    AgentSearchHit, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+    agent_lookup, authored_by, AgentAuthorship, AgentCard, AgentKind, AgentLookupRepository,
+    AgentNameMatch, AgentRef, AgentSearchHit, AuthorNode, AuthorRef, AuthoredBy,
+    AuthoredByRepository, CardCounts, CardRole, Corroboration, Filer, FindAgentQuery,
+    FindAgentResult, Ingester, LiteratureAuthorship, MatchTier, PaperAuthor, PaperAuthorship,
+    PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
@@ -145,10 +149,14 @@ pub use repos::{
     SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{
-    create_ingest_written_edge_if_absent_conn, ingest_written, ingest_written_by_sql,
-    ingest_written_edge_sql, same_ingest_sql, without_ingest_marker, INGEST_WRITTEN_BY_FIELD,
-    INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY, INGEST_WRITTEN_SETTING,
-    INGEST_WRITTEN_SHAPES,
+    create_ingest_written_edge_if_absent_conn, credited_agent_end, ingest_only_edge_refusal,
+    ingest_written, ingest_written_by_sql, ingest_written_edge_sql, is_agent_attribution,
+    same_ingest_sql, staged_provenance_refusal_sql, without_ingest_marker, ClaimIngestRecord,
+    ClaimIngestRepository, ClaimIngests, CreditedEnd, AGENT_ATTRIBUTION_REFUSAL,
+    AGENT_SOURCE_AUTHORSHIP, AGENT_TARGET_AUTHORSHIP, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
+    INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
+    INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
+    INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
@@ -162,9 +170,14 @@ pub use repos::{
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
+pub use repos::{
+    PaperAuthorEdge, PaperAuthorListing, AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY,
+    AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
+pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 // The Atlas layout reads and the operator build (migration 197).
 pub use repos::AtlasLayoutRepository;
 // The ego/placement reads the Explorer's claim page and graph canvas call.
