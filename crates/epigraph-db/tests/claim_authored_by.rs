@@ -587,11 +587,12 @@ async fn linked_at(pool: &PgPool, agent: Uuid) -> chrono::DateTime<Utc> {
 
 /// `authored_by.human` names the human the agent was BOUND to when the claim
 /// was filed, from the binding record (migration 199's
-/// `epigraph_operator_bound_at`): a link names its operator until it is
-/// retired, and nobody after; a link recorded already retired names its
-/// operator only for what the agent filed before the link was recorded; a
-/// client allowance names its operator while it is in force. Every reader
-/// sees the same.
+/// `epigraph_operator_bound_at`): a link names its operator from its creation
+/// until it is retired, and nobody before or after; a link recorded already
+/// retired (an identity tied to its operator after the fact, so that the
+/// operator owns what it filed) names its operator only for what the agent
+/// filed before the link was recorded; a client allowance names its operator
+/// while it is in force. Every reader sees the same.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_human_is_the_one_bound_when_the_claim_was_filed(pool: PgPool) {
     let scoped = app_scoped(&pool).await;
@@ -606,8 +607,8 @@ async fn the_human_is_the_one_bound_when_the_claim_was_filed(pool: PgPool) {
     for caller in [stranger, op] {
         assert_eq!(
             human_at(&pool, &scoped, caller, agent, linked - Duration::days(1)).await,
-            Some(op),
-            "before the link, with no allowance: the operator owns the agent's claims"
+            None,
+            "before a live link existed, with no allowance: bound to nobody then"
         );
         assert_eq!(
             human_at(
@@ -648,6 +649,11 @@ async fn the_human_is_the_one_bound_when_the_claim_was_filed(pool: PgPool) {
             human_at(&pool, &scoped, caller, agent, retired).await,
             None,
             "filed at or after the retirement"
+        );
+        assert_eq!(
+            human_at(&pool, &scoped, caller, agent, linked - Duration::days(1)).await,
+            None,
+            "a link retired later never reaches back before its creation"
         );
     }
 
@@ -721,6 +727,89 @@ async fn the_human_is_the_one_bound_when_the_claim_was_filed(pool: PgPool) {
             human_at(&pool, &scoped, caller, allowed, revoked_at).await,
             None,
             "filed at or after the revocation"
+        );
+    }
+}
+
+/// The block of claim `claim`, filed by `agent`, read with the claim row's
+/// REAL `created_at` (not a reading instant), as `caller` sees it.
+async fn claim_block_as_filed(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    caller: Uuid,
+    claim: Uuid,
+    agent: Uuid,
+) -> AuthoredBy {
+    let created_at: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT created_at FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("the claim's created_at");
+    let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
+    let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+    let out = AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim,
+        agent,
+        created_at,
+        PromptSnapshotAudience::OperatorAndAdmins,
+    )
+    .await
+    .expect("authored_by");
+    read.commit().await.expect("finish");
+    out
+}
+
+/// Each ingester's human is the one its agent was bound to when IT ingested
+/// (its record's time), not when the claim was filed and not now: an ingester
+/// whose live link was retired between the claim's filing and its ingest
+/// names nobody; one linked only after the claim was filed, and still linked
+/// when it ingested, names its operator; and the reading changes neither.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_ingesters_human_is_the_one_bound_when_it_ingested(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (op, _) = human(&pool, "Retired-link Operator").await;
+    let (op2, _) = human(&pool, "Later-link Operator").await;
+    let (filer, _) = fixture::seed_agent_with_group(&pool, "filer").await;
+    let (retiring, _) = fixture::seed_agent_with_group(&pool, "retiring-ingester").await;
+    let (late, _) = fixture::seed_agent_with_group(&pool, "late-linked-ingester").await;
+    link(&pool, retiring, op).await;
+
+    let claim = fixture::seed_public_claim(&pool, filer, "filed before either ingest").await;
+    let calibrate = claim_block_as_filed(&pool, &scoped, stranger, claim, filer).await;
+    assert!(calibrate.corroboration().ingesters.is_empty(), "CALIBRATION");
+
+    let outcome: String = sqlx::query_scalar(
+        "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'ingester test', true)",
+    )
+    .bind(retiring)
+    .fetch_one(&pool)
+    .await
+    .expect("retire");
+    assert_eq!(outcome, "retired", "CALIBRATION");
+    link(&pool, late, op2).await;
+    let d1 = paper(&pool, "10.0000/fixture.ingested-after-retire", "After Retire").await;
+    let d2 = paper(&pool, "10.0000/fixture.ingested-after-link", "After Link").await;
+    ingested(&pool, d1, claim, retiring, false, &[]).await;
+    ingested(&pool, d2, claim, late, false, &[]).await;
+
+    for caller in [stranger, op, op2] {
+        let block = claim_block_as_filed(&pool, &scoped, caller, claim, filer).await;
+        let AuthoredBy::Agent(a) = &block else {
+            panic!("converging ingests leave the filer the author: {block:?}");
+        };
+        assert_eq!(a.filer.human, None, "the filer was bound to nobody");
+        assert_eq!(
+            a.corroboration
+                .ingesters
+                .iter()
+                .map(|i| (i.agent.id, i.human.as_ref().map(|h| h.id)))
+                .collect::<Vec<_>>(),
+            vec![(retiring, None), (late, Some(op2))],
+            "each ingester's human at its own ingest"
         );
     }
 }
