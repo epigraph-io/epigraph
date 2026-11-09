@@ -2458,6 +2458,54 @@ async fn a_generation_zero_ingest_racing_another_callers_creation_writes_nothing
             "{name}: the owner-group arm admitted the writer over the winner's row: {arms:?}"
         );
     }
+
+    // CALIBRATION, REST store: an admitted writer that declares PUBLIC over a
+    // public row it did not create announces nothing. `events` has no row
+    // security, and a `workflow.created` event would carry its goal under the
+    // winner's id.
+    {
+        let name = "acme-race-writer-stored";
+        let created_events = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM events WHERE event_type = 'workflow.created'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("workflow.created events")
+        };
+        let events_before = created_events().await;
+        let via = Via::Rest(&w.router, w.rb);
+        let out = race_creation(
+            &pool,
+            name,
+            "public",
+            w.alpha,
+            w.dr,
+            via.store(
+                "Acme race writer stored",
+                &["acme racing writer step"],
+                Some(json!({"visibility": "public", "owner_group_id": w.alpha})),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{name}: an alpha writer's store is admitted: {e}"));
+        assert_eq!(out["already_ingested"], json!(false), "{name}: {out}");
+        let wf = root_id(name);
+        assert!(
+            !plan(&pool, wf).await.is_empty(),
+            "{name}: the plan is attached"
+        );
+        assert_eq!(
+            winner_row(&pool, wf).await.4,
+            Some(0.125),
+            "{name}: the goal embedding is the winner's"
+        );
+        assert_eq!(
+            created_events().await,
+            events_before,
+            "{name}: no `workflow.created` event for a row the call did not create"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
