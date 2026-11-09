@@ -2046,7 +2046,7 @@ async fn a_delegate_owns_but_cannot_write_its_operators_claim_in_a_group_it_does
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A row with no recorded submitter
+// A row with no recorded submitter, and a row with no plan
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A delegate inherits what its principal is admitted to BY IDENTITY. A
@@ -2206,4 +2206,109 @@ async fn a_delegate_admits_nothing_on_a_row_with_no_recorded_submitter(pool: PgP
         )],
         "CALIBRATION B: recorded as the delegation"
     );
+}
+
+/// The `recorded_submitter` of every `workflows.caller_write` row about `wf`
+/// written by `acting`, with its arm.
+async fn ingest_provenance(pool: &PgPool, wf: Uuid, acting: Uuid) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT details->>'arm', details->'write'->>'recorded_submitter' \
+           FROM security_events \
+          WHERE event_type = 'workflows.caller_write' \
+            AND details->>'action' = 'workflow_ingest' \
+            AND details->>'workflow_id' = $1::text AND details->>'acting_agent' = $2::text \
+          ORDER BY created_at, id",
+    )
+    .bind(wf)
+    .bind(acting)
+    .fetch_all(pool)
+    .await
+    .expect("ingest provenance rows")
+}
+
+/// An ingest into an EXISTING row that shows the caller no plan (a row the
+/// pre-transaction ingest left behind) stops the walk before anything is
+/// written under it and runs the lineage gate over that row on the same
+/// transaction (`ExistingWorkflowNeedsAuthority`), on MCP and REST alike.
+/// The delegate arm is part of that gate: `p`'s delegate fills `p`'s
+/// planless row on every transport, recorded as `delegate` (ahead of the
+/// owner-group arm, which `d` would also pass in `p_g`), and since the call
+/// did not create the row it records no submitter, and the row keeps `p`.
+/// Another principal's delegate (which cannot read `p_g`) is refused with
+/// nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_fills_its_operators_planless_row_through_the_rerun_gate(pool: PgPool) {
+    let w = world(&pool).await;
+    let p_rest = Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    );
+    let p_str = w.p.to_string();
+    for (i, via) in w.d_vias().into_iter().enumerate() {
+        let label = via.label();
+        let name = format!("acme-delegate-planless-{i}");
+        p_rest
+            .ingest(&extraction(&name, 2), group_in(w.p_g))
+            .await
+            .unwrap_or_else(|e| panic!("p ingests {name}: {e}"));
+        let wf = workflow_named(&pool, &name).await;
+        sqlx::query("DELETE FROM edges WHERE source_id = $1 AND relationship = 'executes'")
+            .bind(wf)
+            .execute(&pool)
+            .await
+            .expect("strip the plan");
+        assert!(steps_of(&pool, wf).await.is_empty(), "PREMISE: no plan");
+        assert_eq!(
+            workflow_row(&pool, wf).await,
+            ("group".to_string(), w.p_g, Some(p_str.clone())),
+            "PREMISE: p's row, private to p_g"
+        );
+        let mut refill = extraction(&name, 2);
+        refill["phases"][0]["steps"][1]["compound"] = json!(format!("{name} refilled step"));
+
+        // Another principal's delegate: refused, nothing written.
+        let ql = &w.q_delegator;
+        let counts_before = row_counts(&pool).await;
+        for other in [
+            Via::McpStdio(&w.e_server),
+            Via::McpHttp(
+                &w.mcp,
+                mcp_auth(ql.delegator_client, w.e, Some(ql.delegator), WRITE_SCOPES),
+            ),
+        ] {
+            let refused = other.ingest(&refill, None).await;
+            assert!(
+                refused.is_err(),
+                "{label}/{}: q's delegate is refused p's planless row: {refused:?}",
+                other.label()
+            );
+        }
+        assert_eq!(row_counts(&pool).await, counts_before, "nothing written");
+        assert!(steps_of(&pool, wf).await.is_empty(), "no plan attached");
+
+        let out = via
+            .ingest(&refill, None)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: p's delegate fills p's planless row: {e}"));
+        assert_eq!(
+            out["already_ingested"],
+            json!(false),
+            "{label}: the walk ran: {out}"
+        );
+        assert_eq!(
+            steps_of(&pool, wf).await.len(),
+            2,
+            "{label}: the plan is attached to the existing row"
+        );
+        assert_eq!(
+            workflow_row(&pool, wf).await,
+            ("group".to_string(), w.p_g, Some(p_str.clone())),
+            "{label}: the row keeps p as its submitter"
+        );
+        assert_eq!(
+            ingest_provenance(&pool, wf, w.d).await,
+            vec![("delegate".to_string(), None)],
+            "{label}: one gate admission, by the delegate arm, recording no submitter"
+        );
+    }
 }
