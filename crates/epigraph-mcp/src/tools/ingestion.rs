@@ -2005,31 +2005,36 @@ async fn persist_planned_claim(
         return Ok((planned.id, !was_new, was_new.then_some(agent_id)));
     }
 
-    // Atom: `create` dedupes on content_hash and returns the existing row.
-    // `persisted_id != planned.id` catches a hash collision against some other
-    // claim; `trace_id.is_some()` catches genuine atom convergence, where the
-    // earlier ingestion already wrote the provenance we must not overwrite.
+    // Atom: content-addressed, so `create` dedupes on content_hash and
+    // returns the existing row. Whether THIS call created the row is what its
+    // INSERT reports (`create_signed_reporting_conn`), never inferred from the
+    // row: an existing row is resolved to, never rewritten (no
+    // `set_properties`, no trace or evidence hung on it) and never recorded as
+    // this ingest's creation, whoever filed it and whether or not it has a
+    // trace.
     //
-    // `agent_id != agent_id` is the third convergence signal, and the one the
-    // other two miss: an existing TRACE-LESS atom written by ANOTHER author.
-    // Workflow operation atoms are exactly that — content-addressed with the same
-    // `atom_id` derivation, authored by the ingest-system agent, and carrying no
-    // trace. Treated as new, the walk would `set_properties` over that author's
-    // row (replacing its workflow metadata with this document's level/section)
-    // and hang this paper's trace and evidence on it; on a stamped transaction
-    // those writes are refused by `claims_tenancy`'s WITH CHECK and — before
-    // this signal existed — took the whole document down with them. MEASURED on
-    // a cleanly-migrated schema: a document whose atom converged onto a workflow
-    // operation atom wrote nothing (`processed_by=0 doc_claims=0`). Another
-    // author's claim is resolved to, never rewritten.
-    let persisted = ClaimRepository::create_signed_conn(&mut *conn, claim, decl, Some(signer_id))
-        .await
-        .map_err(internal_error)?;
+    // The inferred signals this replaces each missed a case. "It has a trace"
+    // missed a trace-less row; "another author wrote it" missed the SAME
+    // agent's trace-less row: a workflow operation atom written as the
+    // caller's own agent (same `atom_id` derivation, no trace), or a claim
+    // the agent filed directly without one. Treated as new, the walk
+    // overwrote that row's workflow metadata with this document's
+    // level/section (breaking step versioning), hung this paper's trace on
+    // it, and recorded `created_claim: true`, so the agent's own claim read as
+    // the document's literature. On a stamped transaction such writes onto
+    // another author's row were also refused by `claims_tenancy`'s WITH CHECK,
+    // which took the whole document down (measured before the author signal
+    // existed). `persisted_id != planned.id` still catches a hash collision
+    // against some other claim.
+    let (persisted, inserted) =
+        ClaimRepository::create_signed_reporting_conn(&mut *conn, claim, decl, Some(signer_id))
+            .await
+            .map_err(internal_error)?;
     let persisted_id: Uuid = persisted.id.into();
     let persisted_author: Uuid = persisted.agent_id.into();
     Ok((
         persisted_id,
-        persisted_id != planned.id || persisted.trace_id.is_some() || persisted_author != agent_id,
+        !inserted || persisted_id != planned.id,
         Some(persisted_author),
     ))
 }

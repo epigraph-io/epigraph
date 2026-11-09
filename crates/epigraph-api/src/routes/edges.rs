@@ -2421,6 +2421,9 @@ pub async fn graph_full(
 pub struct EvidenceDetailResponse {
     pub id: Uuid,
     pub claim_id: Option<Uuid>,
+    /// The agent that signed the evidence when it was stored (its own
+    /// record, `evidence.signer_id`); `null` for unsigned evidence. Never
+    /// read from an `agent -> evidence` edge, which any caller can post.
     pub agent_id: Option<Uuid>,
     pub evidence_type: String,
     pub content: Option<String>,
@@ -2511,18 +2514,14 @@ pub async fn get_evidence(
 
     let props = &row.properties;
 
-    // Extract claim_id and agent_id from edges pointing to this evidence
+    // The claim from the edge pointing to this evidence. The AGENT is the
+    // row's own record (its signer, stored with its signature by the writer),
+    // never the source of an `agent -> evidence` edge: any edges:write caller
+    // may post `supports` / `derived_from` / `uses_evidence` / `relates_to`
+    // from any agent onto any evidence (none credits the agent), so an edge
+    // would let a stranger name a person as the evidence's agent.
     let claim_edge: Option<SourceIdRow> = sqlx::query_as(
         "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'claim' LIMIT 1"
-    )
-    .bind(evidence_id)
-    .fetch_optional(&mut *read)
-    .await
-    .ok()
-    .flatten();
-
-    let agent_edge: Option<SourceIdRow> = sqlx::query_as(
-        "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'agent' LIMIT 1"
     )
     .bind(evidence_id)
     .fetch_optional(&mut *read)
@@ -2552,7 +2551,7 @@ pub async fn get_evidence(
     let response = EvidenceDetailResponse {
         id: row.id,
         claim_id: claim_edge.map(|r| r.source_id),
-        agent_id: agent_edge.map(|r| r.source_id),
+        agent_id: row.signer_id,
         evidence_type: ev_type,
         content,
         content_hash: hex::encode(&row.content_hash),
@@ -3070,7 +3069,9 @@ mod tests {
     fn every_relationship_is_sorted_for_agent_credit() {
         // Relations between claims, syntheses, traces, frames and other
         // non-agent nodes: an agent endpoint is not what they mean, and no
-        // reader takes one as the agent's statement.
+        // reader takes one as the agent's statement (the evidence detail's
+        // agent is the evidence row's signer, not an `agent -> evidence`
+        // edge).
         const STRUCTURAL: &[&str] = &[
             "supports",
             "contradicts",

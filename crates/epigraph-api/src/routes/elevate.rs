@@ -11,6 +11,23 @@
 //! it back; this module verifies it with `epigraph-passkey` and records it
 //! through migration 124's completion definer.
 //!
+//! A LATER passkey's enrollment (opened on a confirmed `passkey.register`
+//! act) takes the ANCHORED path when `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`
+//! is on and the act's confirming passkey anchors it
+//! (`epigraph_passkey::Passkeys::check_anchor` over migration 200's reader,
+//! which re-verifies the recorded confirmation, and the anchor's and its
+//! lineage's stored attestation against the roots configured NOW): a plain
+//! registration that asks for attestation but needs none, so a synced passkey
+//! can register (recorded `none`, answering `anchored_by`), and a hardware key
+//! whose attestation is trusted now is recorded attested and stands on its own
+//! (`anchored_by` null; an untrusted statement is dropped and the passkey
+//! recorded `none`).
+//! Migration 200's insert guard refuses the completion if the anchor was
+//! revoked meanwhile, and its cascade revokes the passkey with its anchor. The path is decided from
+//! those rows at the challenge AND again at the finish, never from the stored
+//! ceremony state (which the request DSN can write); a first passkey's
+//! maintenance enrollment has no anchor and is always attested.
+//!
 //! # Elevation: `/elevate/:ticket`
 //!
 //! `POST /api/v1/elevation/tickets` (`routes/elevation.rs`) opens a ticket for
@@ -80,8 +97,8 @@
 // UNSCOPED-POOL-EXEMPT: Pre-authentication. The ceremony pages are anonymous by
 // design (the enrollment or ticket id and the authenticator are their
 // credentials), so no principal exists to stamp a connection from; each site
-// calls one of migration 124's, 125's or 130's ceremony definers keyed by that
-// id, which need no stamp.
+// calls one of migration 124's, 125's, 130's or 200's ceremony definers keyed by
+// that id, which need no stamp.
 
 use std::sync::Arc;
 
@@ -96,11 +113,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use epigraph_db::{
     ActConfirmation, AdminActCeremony, AssertedCredential, CeremonyAct, CeremonyEnrollment,
-    CeremonyTicket, Confirmation, DbError, ElevationCeremony, PasskeyCeremony, VerifiedPasskey,
+    CeremonyTicket, Confirmation, DbError, ElevationCeremony, EnrollmentAnchor, PasskeyCeremony,
+    VerifiedPasskey,
 };
 use epigraph_passkey::{
-    act_challenge as act_challenge_of, AuthenticationState, PasskeyError, Passkeys,
-    RegistrationState, StoredPasskey, ACT_NONCE_LEN,
+    act_challenge as act_challenge_of, ActAnchor, AuthenticationState, LineagePasskey,
+    PasskeyError, Passkeys, RegistrationState, StoredPasskey, ACT_NONCE_LEN,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -231,6 +249,69 @@ async fn live(state: &AppState, id: Uuid) -> Result<CeremonyEnrollment, Box<Resp
     }
 }
 
+fn act_anchor(row: EnrollmentAnchor) -> ActAnchor {
+    // A lineage that does not read is an incomplete one: it anchors nothing.
+    let lineage = LineagePasskey::list_from_json(&row.anchor_lineage);
+    ActAnchor {
+        anchor_lineage_complete: row.anchor_lineage_complete && lineage.is_some(),
+        anchor_lineage: lineage.unwrap_or_default(),
+        act_id: row.act_id,
+        act_kind: row.act_kind,
+        act_outcome: row.act_outcome,
+        args_digest: row.args_digest,
+        act_challenge_state: row.act_challenge_state,
+        assertion_evidence: row.assertion_evidence,
+        enrollment_person: row.enrollment_person,
+        anchor_person: row.anchor_person,
+        anchor_credential_id: row.anchor_credential_id,
+        anchor_passkey: row.anchor_passkey,
+        anchor_aaguid: row.anchor_aaguid,
+        anchor_attestation_format: row.anchor_attestation_format,
+        anchor_backup_eligible: row.anchor_backup_eligible,
+        anchor_revoked: row.anchor_revoked,
+    }
+}
+
+/// The anchor of enrollment `id` when it takes the ANCHORED path: the
+/// setting is on, the enrollment was opened on an act, and
+/// `Passkeys::check_anchor` admits that act and its confirming passkey.
+/// `None`: the attested path (the setting off, a first passkey's maintenance
+/// enrollment, or an anchor that does not admit it, which is logged).
+async fn anchored(
+    state: &AppState,
+    rp: &Passkeys,
+    id: Uuid,
+) -> Result<Option<ActAnchor>, Box<Response>> {
+    if !rp.allows_synced_anchored() {
+        return Ok(None);
+    }
+    let mut conn = state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| Box::new(internal("acquire", &e)))?;
+    let row = PasskeyCeremony::anchor(&mut conn, id)
+        .await
+        .map_err(|e| Box::new(internal("read the enrollment's anchor", &e)))?;
+    let Some(anchor) = row.map(act_anchor) else {
+        return Ok(None);
+    };
+    match rp.check_anchor(&anchor) {
+        Ok(()) => Ok(Some(anchor)),
+        Err(refusal) => {
+            tracing::warn!(
+                target: "elevate.enroll",
+                enrollment = %id,
+                act = %anchor.act_id,
+                refusal = refusal.code(),
+                "the enrollment's act does not anchor an unattested passkey; the ceremony is \
+                 attested"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// The name an authenticator shows for the credential.
 fn user_name(e: &CeremonyEnrollment) -> String {
     e.label
@@ -313,8 +394,17 @@ pub async fn enroll_challenge(State(state): State<AppState>, Path(id): Path<Uuid
         Ok(e) => e,
         Err(resp) => return *resp,
     };
+    let anchor = match anchored(&state, &rp, id).await {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
     let name = user_name(&e);
-    let (options, ceremony) = match rp.start_registration(e.person_agent_id, &name, &name) {
+    let started = if anchor.is_some() {
+        rp.start_anchored_registration(e.person_agent_id, &name, &name)
+    } else {
+        rp.start_registration(e.person_agent_id, &name, &name)
+    };
+    let (options, ceremony) = match started {
         Ok(v) => v,
         Err(err) => return internal("start the registration", &err),
     };
@@ -360,13 +450,23 @@ pub async fn enroll_finish(
             )
         }
     };
-    let registered = match rp.finish_registration(&response, &RegistrationState::from_json(stored))
-    {
+    // Decided again from the rows, never from the stored state's kind.
+    let anchor = match anchored(&state, &rp, id).await {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+    let stored = RegistrationState::from_json(stored);
+    let finished = match &anchor {
+        Some(a) => rp.finish_anchored_registration(&response, &stored, a),
+        None => rp.finish_registration(&response, &stored),
+    };
+    let registered = match finished {
         Ok(r) => r,
         Err(err) => {
             tracing::warn!(
                 target: "elevate.enroll",
                 enrollment = %id,
+                anchored = anchor.is_some(),
                 error = %err,
                 "passkey registration refused"
             );
@@ -374,11 +474,18 @@ pub async fn enroll_finish(
                 PasskeyError::UserNotVerified => "user_not_verified",
                 PasskeyError::State(_) => "ceremony_state_unusable",
                 PasskeyError::Malformed { .. } => "malformed_response",
+                PasskeyError::Anchor(_) => "anchor_refused",
                 _ => "registration_refused",
             };
             return json_error(StatusCode::BAD_REQUEST, code, err.to_string());
         }
     };
+    // The act a passkey holds through: an anchored ceremony's passkey recorded
+    // `none`. One recorded attested there needs no anchor.
+    let anchored_by = anchor
+        .as_ref()
+        .filter(|_| registered.attestation_format == "none")
+        .map(|a| a.act_id);
     let mut conn = match state.db_pool.acquire().await {
         Ok(c) => c,
         Err(err) => return internal("acquire", &err),
@@ -399,6 +506,8 @@ pub async fn enroll_finish(
                 passkey = %passkey_id,
                 aaguid = %registered.aaguid,
                 format = %registered.attestation_format,
+                anchored = anchor.is_some(),
+                anchored_by = ?anchored_by,
                 "passkey registered"
             );
             harden(
@@ -408,6 +517,10 @@ pub async fn enroll_finish(
                         "passkey_id": passkey_id,
                         "aaguid": registered.aaguid,
                         "attestation_format": registered.attestation_format,
+                        // Only a passkey that holds through its anchor: one
+                        // recorded attested on the anchored path stands on
+                        // its own attestation.
+                        "anchored_by": anchored_by,
                     })),
                 )
                     .into_response(),

@@ -701,6 +701,14 @@ pub struct QueryPaperParams {
 
     #[schemars(description = "Asserted claims to skip (paging). Default 0.")]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Which ingest of the paper to list: the agent id of an ingester from a \
+                       previous response's `ingests[]`. Default: the paper's first ingest. \
+                       The authors and claims listed are always ONE ingest's own."
+    )]
+    #[serde(default)]
+    pub ingested_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1939,11 +1947,11 @@ pub(crate) fn split_epistemic<T: RecallGatedSignals>(
     }
 }
 
-/// One author of a paper as `query_paper` lists it: only authorships in
-/// force, in the extraction's order (`position`). An authorship an ingester
-/// named without speaking for the person (`pending_countersign`) is listed
-/// as PENDING, with the ingester that asserted it (`ingested_by`), never as a
-/// plain author.
+/// One author of a paper as `query_paper` lists it for ONE ingest: only
+/// that ingest's authorships in force, in the extraction's order
+/// (`position`). An authorship the ingester named without speaking for the
+/// person (`pending_countersign`) is listed as PENDING, with the ingester
+/// that asserted it (`ingested_by`), never as a plain author.
 #[derive(Debug, Serialize)]
 pub struct AuthorResponse {
     pub agent_id: String,
@@ -1986,25 +1994,25 @@ pub struct IngestAuthorReport {
     /// `reused_name_key` or
     /// `created_name_key`.
     pub action: &'static str,
-    /// Who vouches for the STORED attribution: `name_derived` (the name
-    /// path), `caller` (the agent is the ingester), `operated_by_caller` (the
-    /// ingester is the human the agent acts for), `confirmed` (kept: an
-    /// earlier attachment the person or their operator made, which this
-    /// ingester does not speak for), or `pending_countersign` (the
-    /// authorship is an ingester's word, see `pending_ingested_by`; the agent
-    /// is listed as a pending author of the paper and asserts none of its
-    /// claims; no countersign route exists yet, so only an operator clears
-    /// the mark). An earlier pending authorship of this agent on this paper
-    /// stays pending whoever re-attaches it: no session can rewrite an
-    /// agent's edge.
+    /// Who vouches for THIS ingester's attribution (each ingest principal
+    /// keeps an `authored` row of its own): `name_derived` (the name path),
+    /// `caller` (the agent is the ingester), `operated_by_caller` (the
+    /// ingester is the human the agent acts for), `confirmed` (this
+    /// ingester's own earlier non-pending attachment, re-named now that it no
+    /// longer speaks for the agent: it stays as written and adds no
+    /// `asserts`), or `pending_countersign` (the authorship is this
+    /// ingester's word, see `pending_ingested_by`; the agent is listed as a
+    /// pending author in this ingester's listing of the paper and asserts
+    /// none of its claims; no countersign route exists yet, so only an
+    /// operator clears the mark). Another ingester's row, pending or not,
+    /// never decides this one.
     pub attribution: &'static str,
     /// True when this agent's `asserts` edges onto the document's claims were
     /// written by this call: only when this ingester speaks for the agent
     /// (`caller` / `operated_by_caller`) and its authorship is not pending.
     pub asserts_claims: bool,
-    /// On a `pending_countersign` author, the ingester recorded on the stored
-    /// authorship: the one whose word it is (an earlier ingester's, when this
-    /// call re-attached or kept it).
+    /// On a `pending_countersign` author, the ingester recorded on this
+    /// ingester's own stored authorship: always this call's ingester.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_ingested_by: Option<String>,
     /// The attached agent's own `display_name`, on an `explicit` author.
@@ -2538,20 +2546,34 @@ pub struct CheckAlreadyIngestedResponse {
     pub matched_pipeline_versions: Vec<String>,
 }
 
+/// `query_paper`'s answer: the paper, and ONE ingest's own listing of it.
+///
+/// A paper is shared by its document key across every ingester, and each
+/// ingest principal's document ingest writes edges of its own. `authors`,
+/// `claims` and `asserted_claim_count` are the listed ingest's
+/// (`ingested_by`): that ingest's authors with that ingest's claims, never
+/// another ingest's beside them. Every ingest of the paper is in `ingests`;
+/// list another by passing its `ingested_by`.
 #[derive(Debug, Serialize)]
 pub struct PaperResponse {
     pub doi: String,
     pub title: String,
+    /// The ingest listed below (an agent id): the one asked for, or the
+    /// paper's first ingest. `null` when the paper has no readable ingest.
+    pub ingested_by: Option<String>,
+    /// The listed ingest's authors.
     pub authors: Vec<AuthorResponse>,
-    /// How many claims the paper has in the graph, independent of paging:
-    /// the larger of `asserted_claim_count` and the claims labelled
-    /// `doi:<doi>` (a node-presence signal for a partially ingested paper,
-    /// which a claim's own writer can also set, so not provenance). Compare
-    /// against `offset + returned` to decide whether another page exists.
+    /// The listed ingest's author list reached its cap.
+    pub authors_truncated: bool,
+    /// How many claims the paper has in the graph, independent of paging and
+    /// of which ingest is listed: the larger of the claims any ingest of the
+    /// paper asserts (each once) and the claims labelled `doi:<doi>` (a
+    /// node-presence signal for a partially ingested paper, which a claim's
+    /// own writer can also set, so not provenance). The duplicate-ingest
+    /// gate's number.
     pub claim_count: i64,
-    /// The claims the document ingest recorded this paper asserting (its
-    /// ingest-written `asserts` edges): the provenance count, and the set
-    /// `claims` pages over.
+    /// The claims the LISTED ingest asserts (its own ingest-written,
+    /// in-force `asserts` edges): the set `claims` pages over.
     pub asserted_claim_count: i64,
     /// `claims.len()` — the size of THIS page, not the total.
     pub returned: usize,
@@ -2559,9 +2581,39 @@ pub struct PaperResponse {
     pub offset: i64,
     /// Echo of the applied `limit` (after clamping).
     pub limit: i64,
-    /// `true` when `offset + returned < claim_count`, i.e. another page exists.
+    /// `true` when this page is full and `offset + returned <
+    /// asserted_claim_count`, i.e. another page of this ingest exists.
     pub has_more: bool,
-    pub claims: Vec<ClaimResponse>,
+    /// One page of the listed ingest's claims.
+    pub claims: Vec<PaperClaimResponse>,
+    /// Every ingest of the paper a reader can see, oldest first, at most
+    /// ten; the listed one included.
+    pub ingests: Vec<PaperIngestSummary>,
+    /// More ingests exist than are in `ingests`.
+    pub ingests_truncated: bool,
+}
+
+/// One claim of one ingest's listing of a paper.
+#[derive(Debug, Serialize)]
+pub struct PaperClaimResponse {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// THIS ingest created the claim: its document's authors are the
+    /// claim's primary authors. `false`: the ingest found the claim already
+    /// there (it corroborates; the claim's filer or creating ingest stays
+    /// primary).
+    pub created_claim: bool,
+}
+
+/// One ingest of a paper, as `query_paper` names it in `ingests`.
+#[derive(Debug, Serialize)]
+pub struct PaperIngestSummary {
+    /// The ingesting agent; pass it as `ingested_by` to list this ingest.
+    pub ingested_by: String,
+    /// The claims this ingest asserts.
+    pub asserted_claim_count: i64,
+    /// When this ingest first wrote to the paper.
+    pub first_written_at: String,
 }
 
 #[derive(Debug, Serialize)]

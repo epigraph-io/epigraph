@@ -16,10 +16,14 @@ pub mod embed_backfill;
 pub mod enrichment;
 #[cfg(feature = "db")]
 pub mod evidence_type_backfill;
+#[cfg(feature = "db")]
+pub mod k10_retro;
 #[cfg(feature = "genai")]
 pub mod matching_client;
 #[cfg(feature = "db")]
 pub mod operator;
+#[cfg(feature = "db")]
+pub mod r131_factor_mint;
 #[cfg(feature = "db")]
 pub mod recompute_betp;
 #[cfg(feature = "db")]

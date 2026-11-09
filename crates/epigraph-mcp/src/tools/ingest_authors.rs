@@ -29,10 +29,14 @@
 //!   path runs and the earlier agent is reported in `also_at_position`.
 //!   Which ingester made an attachment is read from the edge's
 //!   ingest-written marker, so one written before the marker existed is kept
-//!   for nobody. A name-derived node whose authorship of the paper was
-//!   retracted (an operator replacement) is never credited again by the
-//!   name path (`action: "retracted_name_key"`, no `asserts`); the
-//!   replacing agent is reported in `also_at_position`.
+//!   for nobody. A name-derived node an operator replacement removed from
+//!   the paper is never credited again by the name path (`action:
+//!   "retracted_name_key"`, no `asserts`); the replacing agent is reported in
+//!   `also_at_position`. "Removed by a replacement" is read only from the
+//!   replacement's own record: the replacing author's `authored` edge names
+//!   the node it replaced (`epigraph_db::AUTHORED_REPLACES_KEY`), which only
+//!   the maintenance replacement writes. Any other retraction, and any match
+//!   by position or spelling, is no replacement.
 //!
 //! # Who asserts the claims (the explicit-author rule)
 //!
@@ -46,10 +50,13 @@
 //! `ingested_by: <the ingester>`, and no `asserts` edge from that agent onto
 //! any claim; the agent card does not count that paper until the person
 //! countersigns. [`check_explicit_author_ids`] decides it, so the handlers'
-//! preflight and the walk's transaction decide it the same way. A STORED
-//! pending authorship of the agent on the paper stays pending whoever
-//! re-attaches it ([`effective_attribution`]): no application session can
-//! rewrite an agent's edge, and no countersign route exists yet.
+//! preflight and the walk's transaction decide it the same way. Every ingest
+//! principal keeps an `authored` row of its own, so only THIS ingester's
+//! stored authorship of the agent on the paper bears on what it writes
+//! ([`effective_attribution`]): its own pending row stays pending (no
+//! application session can rewrite an agent's edge, and no countersign route
+//! exists yet), while another principal's row, pending or confirmed, neither
+//! confirms this ingester's naming nor blocks the person's own.
 //!
 //! # Replacing the name-derived author on a re-ingest
 //!
@@ -97,10 +104,10 @@ pub const ATTRIBUTION_OPERATED: &str = "operated_by_caller";
 pub const ATTRIBUTION_PENDING: &str = "pending_countersign";
 /// The name path (no `agent_id`): the name-derived node, as always.
 pub const ATTRIBUTION_NAME_DERIVED: &str = "name_derived";
-/// An earlier attachment of this agent to this paper that is NOT pending
-/// (the person, or their operator, attached it), kept or re-named by an
-/// ingester that does not speak for the agent: it stays the agent's own,
-/// and this call writes no `asserts` for it.
+/// This ingester's OWN earlier attachment of this agent to this paper, NOT
+/// pending (written while it spoke for the agent), re-named after it no
+/// longer does: the row stays as written, and this call writes no `asserts`
+/// for it. Never reported for another principal's row.
 pub const ATTRIBUTION_CONFIRMED: &str = "confirmed";
 
 /// An explicit `agent_id` that passed every check, and whether the ingester
@@ -150,6 +157,19 @@ pub(crate) fn authored_edge_properties(
         props[epigraph_db::AUTHORED_INGESTED_BY_KEY] =
             serde_json::Value::String(ingester.to_string());
     }
+    // The replacement's own record of which name-derived author it removed:
+    // written only when this walk's retraction actually retracted that
+    // author's `authored` edge (only a maintenance connection can), and the
+    // one signal a later name path reads to withhold the removed author's
+    // credit (`PaperRepository::retracted_author_ids_conn`).
+    if let Some(r) = resolved
+        .report
+        .replaced
+        .as_ref()
+        .filter(|r| r.authored_edges_retracted > 0)
+    {
+        props[epigraph_db::AUTHORED_REPLACES_KEY] = serde_json::Value::String(r.agent_id.clone());
+    }
     props
 }
 
@@ -193,17 +213,29 @@ async fn attributions(
 
 /// The attribution an explicit or kept author is reported and written with,
 /// given this ingester's relation to it (`how`, from [`attributions`]) and
-/// the paper's STORED in-force authorship of that agent, if any. A stored
-/// pending authorship stays pending whoever re-attaches it (no application
-/// session can rewrite an agent's edge, so reporting anything else would
-/// contradict what readers see), and writes no `asserts`. A stored confirmed
-/// one stays the agent's own. Returns `(attribution, asserts, pending_by)`.
+/// THIS INGESTER's own stored in-force authorship of that agent on the paper
+/// (`own`: the row whose ingest-written marker names `writer`), if any.
+///
+/// Every ingest principal keeps an `authored` row of its own
+/// (`epigraph_db::ingest_written`), so the walk writes and reports only its
+/// own word. Another principal's row, confirmed or pending, never decides
+/// this ingester's attribution: a stranger naming a person who authored the
+/// paper themselves still writes a PENDING row of the stranger's own, and a
+/// person attaching themselves after a stranger's pending naming writes their
+/// own confirmed row and asserts.
+///
+/// This ingester's own pending row stays pending (the writer deduplicates
+/// onto it, and no application session can rewrite an agent's edge, so
+/// reporting anything else would contradict what readers see), and writes no
+/// `asserts`. Its own confirmed row, written while it spoke for the agent,
+/// stays confirmed, but writes no new `asserts` once it no longer does.
+/// Returns `(attribution, asserts, pending_by)`.
 fn effective_attribution(
     how: &'static str,
-    stored: Option<&PaperAuthorEdge>,
+    own: Option<&PaperAuthorEdge>,
     writer: Uuid,
 ) -> (&'static str, bool, Option<Uuid>) {
-    match stored {
+    match own {
         Some(e) if e.pending => (ATTRIBUTION_PENDING, false, e.ingested_by),
         Some(_) if how == ATTRIBUTION_PENDING => (ATTRIBUTION_CONFIRMED, false, None),
         _ if how == ATTRIBUTION_PENDING => (ATTRIBUTION_PENDING, false, Some(writer)),
@@ -435,9 +467,10 @@ pub(crate) async fn resolve_document_authors(
     // never when this call names that agent explicitly itself: a re-run of the
     // same extraction must resolve exactly as the first run did.
     let this_call: HashSet<Uuid> = explicit.values().map(|e| e.node.id).collect();
-    // Authors whose authorship of this paper was retracted (an operator
-    // replacement) and that hold no in-force authorship of it now: the name
-    // path never credits one again (see the name path below).
+    // Authors an operator replacement removed from this paper (the
+    // replacement's own record names them, `retracted_author_ids_conn`) and
+    // that hold no in-force authorship of it now: the name path never
+    // credits one again (see the name path below).
     let removed_here: HashSet<Uuid> = if authors.is_empty() {
         HashSet::new()
     } else {
@@ -552,8 +585,10 @@ pub(crate) async fn resolve_document_authors(
                 Some((id, name, how, "kept_attached"))
             });
         if let Some((id, display_name, how, action)) = given {
-            let stored = edges.iter().find(|e| e.agent_id == id);
-            let (attribution, asserts, pending_by) = effective_attribution(how, stored, writer);
+            let own = edges
+                .iter()
+                .find(|e| e.agent_id == id && e.written_by == Some(writer));
+            let (attribution, asserts, pending_by) = effective_attribution(how, own, writer);
             out.push(ResolvedAuthor {
                 idx,
                 agent_id: id,
@@ -676,17 +711,18 @@ pub(crate) async fn resolve_document_authors(
     // any earlier explicit attachment by this spelling that was not kept.
     for r in &mut out {
         let pos = i64::try_from(r.idx).ok();
-        let mut also: Vec<Uuid> = edges
+        // Each agent once: every ingest principal keeps a row of its own, so
+        // one author can sit at a position several times.
+        let mut also: Vec<Uuid> = Vec::new();
+        let at_position = edges
             .iter()
-            .filter(|e| e.position == pos && e.agent_id != r.agent_id)
-            .map(|e| e.agent_id)
-            .collect();
-        for id in declined.get(&r.idx).into_iter().flatten() {
-            if *id != r.agent_id && !also.contains(id) {
-                also.push(*id);
+            .filter(|e| e.position == pos)
+            .map(|e| e.agent_id);
+        for id in at_position.chain(declined.get(&r.idx).into_iter().flatten().copied()) {
+            if id != r.agent_id && !also.contains(&id) {
+                also.push(id);
             }
         }
-        also.dedup();
         r.report.also_at_position = also.iter().map(Uuid::to_string).collect();
     }
     // Other agents with each name-derived author's (folded) name: listed,

@@ -216,8 +216,10 @@ pub use method::{
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
 pub use paper::{
-    AssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperRepository, PaperRow,
-    AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+    AssertedClaimRow, IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing,
+    PaperIngestPrincipal, PaperRepository, PaperRow, AUTHORED_EXPLICIT_KEY,
+    AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY, AUTHORED_REPLACES_KEY,
+    AUTHORED_REPLACES_KEY_RESERVED,
 };
 pub use perspective::PerspectiveRepository;
 pub use political::{
@@ -259,8 +261,10 @@ pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
 pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
-pub use passkey::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
-pub use passkey_ceremony::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
+pub use passkey::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+pub use passkey_ceremony::{
+    CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey,
+};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
 pub use refresh_token::{

@@ -62,6 +62,10 @@ pub struct EvidenceDetailRow {
     pub source_url: Option<String>,
     pub properties: serde_json::Value,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The agent that signed the row when it was stored (`evidence.signer_id`,
+    /// set by the writer together with the signature): the evidence's own
+    /// record of its agent. `None` for unsigned evidence.
+    pub signer_id: Option<Uuid>,
 }
 
 /// Result row for [`EvidenceRepository::by_relationship_for_claim`].
@@ -777,7 +781,7 @@ impl EvidenceRepository {
     ) -> Result<Option<EvidenceDetailRow>, DbError> {
         let sql = viewer.splice(
             "SELECT e.id, e.raw_content, e.content_hash, e.source_url, \
-                    e.properties, e.created_at \
+                    e.properties, e.created_at, e.signer_id \
              FROM evidence e \
              WHERE e.id = $1 \
                /* {VISIBILITY:e} */",

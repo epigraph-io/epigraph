@@ -140,6 +140,7 @@ async fn query_paper_returns_real_labels_and_retirement_state(pool: PgPool) {
             doi: doi.to_string(),
             limit: Some(50),
             offset: None,
+            ingested_by: None,
         },
     )
     .await
@@ -212,6 +213,7 @@ async fn query_paper_serves_labels_of_the_callers_own_group_private_claims(pool:
             doi: doi.to_string(),
             limit: Some(50),
             offset: None,
+            ingested_by: None,
         },
     )
     .await

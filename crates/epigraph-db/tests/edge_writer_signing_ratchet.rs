@@ -100,6 +100,9 @@ const CALLS: &[&str] = &[
     // The document ingest's `paper -ingested_claim-> claim` record: a signed
     // twin taking the walk's key, so each walk's call is checked per site.
     "ClaimIngestRepository::record_signed_conn(",
+    // The document ingest's marked writer's primitive: one row of a fact per
+    // ingest principal (`ingest_written.rs`).
+    "EdgeRepository::create_if_absent_for_ingest_principal_signed_conn(",
 ];
 
 /// The after-the-fact signing call: one way a [`Signed`] writer attests.

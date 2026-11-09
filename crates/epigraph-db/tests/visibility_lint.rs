@@ -812,6 +812,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "passkey.rs",
+        "revoke_compromised",
+        "WRITE through migration 200's maintenance-only `epigraph_revoke_passkey_compromised`: \
+         the revoke stamp on one person's passkey and every passkey enrolled through it, \
+         authentication records with no tenancy columns.",
+    ),
+    (
+        "passkey.rs",
         "get",
         "READ of one `person_authenticators` row by id for the maintenance CLI. No tenancy \
          columns; 124's FORCEd policy shows an application connection no row at all.",
@@ -832,6 +839,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          is live, and enumerates nothing. An authentication record about a principal, not a \
          corpus row: no `visibility` / `owner_group_id`, and the page has no principal a \
          Viewer could carry.",
+    ),
+    (
+        "passkey_ceremony.rs",
+        "anchor",
+        "READ of ONE enrollment's anchor by id through migration 200's app-callable SECURITY \
+         DEFINER `epigraph_enrollment_anchor`, for the anonymous enrollment page's anchored \
+         path: the act a live enrollment was opened on and the passkey that confirmed it, and \
+         only while the enrollment is live; it enumerates nothing. Authentication records \
+         about one principal, not corpus rows, and the page has no principal a Viewer could \
+         carry.",
     ),
     (
         "passkey_ceremony.rs",
@@ -2477,6 +2494,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_signed_reporting_conn",
+        "WRITE. create_signed_conn's body, also returning whether THIS call inserted the row (the document walk decides whether it created an atom from that, never from the row): the same dedup probes and INSERT; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
+    ),
+    (
+        "claim.rs",
         "create_with_id_if_absent_signed_conn",
         "WRITE. The signed twin of the unsigned form above it (backlog 4ff87716): the same INSERT plus the claim's v1 signature and signer_id, gated by v1_claim_signature_to_store; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
     ),
@@ -2486,10 +2508,19 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
     ),
     (
+        "edge.rs",
+        "create_if_absent_for_ingest_principal_signed_conn",
+        "WRITE. The document ingest's per-principal dedup and signed INSERT (one row of a fact per \
+         ingest principal): the shared create-if-absent primitive with a VISIBILITY-EXEMPT \
+         write-path probe that also reads the marker's principal, plus the attestation columns; \
+         the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
         "ingest_written.rs",
         "create_ingest_written_edge_if_absent_conn",
-        "WRITE. The document ingest's marked writer: create_if_absent_including_retracted_signed_conn \
-         (the same VISIBILITY-EXEMPT dedup probe and INSERT, authorised by edges_tenancy's WITH \
+        "WRITE. The document ingest's marked writer: \
+         create_if_absent_for_ingest_principal_signed_conn (a VISIBILITY-EXEMPT dedup probe and \
+         INSERT, one row of a fact per ingest principal, authorised by edges_tenancy's WITH \
          CHECK on the walk's stamped transaction) with the ingest-written marker added and \
          migration 198's transaction-local declaration set around that INSERT only. Reads \
          nothing a viewer could filter; the walk spends its viewer on the stamp.",

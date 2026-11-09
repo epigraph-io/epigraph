@@ -148,7 +148,7 @@ async fn authored_in_force(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
 /// `doi` asserts.
 async fn asserts_on_doc(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM edges a \
+        "SELECT count(DISTINCT a.target_id) FROM edges a \
           WHERE a.source_id = $1 AND a.source_type = 'agent' AND a.relationship = 'asserts' \
             AND (a.valid_to IS NULL OR a.valid_to > now()) \
             AND EXISTS (SELECT 1 FROM edges pc JOIN papers p ON p.id = pc.source_id \
@@ -162,10 +162,11 @@ async fn asserts_on_doc(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
     .expect("count asserts on the document")
 }
 
-/// Claims the paper keyed `doi` asserts.
+/// Claims the paper keyed `doi` asserts, each once (every ingest principal
+/// keeps its own `asserts` edge of a claim).
 async fn paper_claims(pool: &PgPool, doi: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM edges pc JOIN papers p ON p.id = pc.source_id \
+        "SELECT count(DISTINCT pc.target_id) FROM edges pc JOIN papers p ON p.id = pc.source_id \
           WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim'",
     )
     .bind(doi)
@@ -1319,19 +1320,148 @@ async fn workflow_ingest_refuses_an_author_agent_id(pool: PgPool) {
 
 /// `query_paper(doi)` as a public viewer on `server`.
 async fn query_paper(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> Value {
+    query_paper_of(server, pool, doi, None).await
+}
+
+/// `query_paper(doi, ingested_by)` as a public viewer on `server`.
+async fn query_paper_of(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    doi: &str,
+    ingested_by: Option<Uuid>,
+) -> Value {
     let viewer = fixture::public_viewer(pool).await;
-    let r = tools::paper_queries::query_paper(
-        server,
-        &viewer,
-        QueryPaperParams {
-            doi: doi.to_string(),
-            limit: None,
-            offset: None,
-        },
-    )
-    .await
-    .expect("query_paper");
+    let params: QueryPaperParams = serde_json::from_value(json!({
+        "doi": doi,
+        "ingested_by": ingested_by.map(|u| u.to_string()),
+    }))
+    .expect("params");
+    let r = tools::paper_queries::query_paper(server, &viewer, params)
+        .await
+        .expect("query_paper");
     text(&r)
+}
+
+/// The listed claims of a `query_paper` answer, as `(content, created_claim)`.
+fn listed_claims(q: &Value) -> Vec<(String, Value)> {
+    let mut v: Vec<(String, Value)> = q["claims"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|c| {
+                    (
+                        c["content"].as_str().unwrap_or_default().to_string(),
+                        c["created_claim"].clone(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|x, y| x.0.cmp(&y.0));
+    v
+}
+
+/// The listed authors' names of a `query_paper` answer, in order.
+fn listed_authors(q: &Value) -> Vec<String> {
+    q["authors"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| x["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A paper is shared by its key, and a second ingester can ingest a
+/// different document under it. `query_paper` lists ONE ingest at a time:
+/// the first ingest's authors with the first ingest's claims only, and the
+/// second ingest's authors with its own claims only, each claim saying
+/// whether THAT ingest created it. A stranger's document is never listed
+/// beside the first ingest's authors. Both ingests are named in `ingests`,
+/// and `claim_count` counts every claim of the paper once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let (a_id, b_id) = (
+        a.server_agent_id().await.expect("a"),
+        b.server_agent_id().await.expect("b"),
+    );
+    let doi = "10.9999/per-ingest-listing";
+    ingest_wait(
+        &a,
+        &pool,
+        doc_with_atoms(
+            doi,
+            json!([{"name": "Ysolde Marrowgate"}]),
+            &["A real finding."],
+        ),
+    )
+    .await;
+    ingest_wait(
+        &b,
+        &pool,
+        doc_with_atoms(
+            doi,
+            json!([{"name": "Ysolde Marrowgate"}, {"name": "Interloper Vexx"}]),
+            &["A fabricated finding."],
+        ),
+    )
+    .await;
+    let first = query_paper(&a, &pool, doi).await;
+    assert_eq!(first["ingested_by"], a_id.to_string(), "{first}");
+    assert_eq!(listed_authors(&first), vec!["Ysolde Marrowgate"], "{first}");
+    let contents: Vec<String> = listed_claims(&first).into_iter().map(|c| c.0).collect();
+    assert!(
+        contents.contains(&"A real finding.".to_string())
+            && !contents.contains(&"A fabricated finding.".to_string()),
+        "the first ingest lists its own claims only: {first}"
+    );
+    assert!(
+        listed_claims(&first)
+            .iter()
+            .all(|(_, created)| *created == json!(true)),
+        "the first ingest created every claim it lists: {first}"
+    );
+    let ingests: Vec<Value> = first["ingests"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| i["ingested_by"].clone())
+        .collect();
+    assert_eq!(
+        ingests,
+        vec![json!(a_id.to_string()), json!(b_id.to_string())],
+        "{first}"
+    );
+
+    let second = query_paper_of(&a, &pool, doi, Some(b_id)).await;
+    assert_eq!(second["ingested_by"], b_id.to_string(), "{second}");
+    assert_eq!(
+        listed_authors(&second),
+        vec!["Ysolde Marrowgate", "Interloper Vexx"],
+        "{second}"
+    );
+    let claims = listed_claims(&second);
+    assert!(
+        claims.contains(&("A fabricated finding.".to_string(), json!(true)))
+            && !claims.iter().any(|c| c.0 == "A real finding."),
+        "the second ingest lists its own claims only: {second}"
+    );
+    assert!(
+        claims
+            .iter()
+            .filter(|c| c.0 != "A fabricated finding.")
+            .all(|c| c.1 == json!(false)),
+        "the second ingest found the shared spine and created none of it: {second}"
+    );
+    assert_eq!(
+        first["claim_count"],
+        paper_claims(&pool, doi).await,
+        "claim_count counts every claim of the paper once"
+    );
 }
 
 /// The paper's author listing (`query_paper`) honours what the ingest
@@ -1462,7 +1592,7 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         "10.9999/ingest-record-3",
     );
     let shared = "Shared atom of the ingest-record documents.";
-    let author = json!([{"name": "Ingrid Solvang"}]);
+    let author = json!([{"name": "Ysolde Marrowgate"}]);
     let doc1 = || doc_with_atoms(d1, author.clone(), &[shared, "Only in record one."]);
 
     ingest_wait(&a, &pool, doc1()).await;
@@ -1644,12 +1774,32 @@ async fn a_strangers_pending_naming_is_not_kept_for_a_later_ingester(pool: PgPoo
     assert_eq!(asserts_edges(&pool, victim).await, 0, "{json}");
 }
 
-/// The person named by a stranger re-attaches themselves explicitly: the
-/// stored authorship stays the stranger's pending one (no session can rewrite
-/// an agent's edge), so the report says pending, names the stranger, and
-/// writes no `asserts` that the card would then contradict.
+/// The properties of the `authored` edge from `agent` into the paper keyed
+/// `doi` that `by`'s document ingest wrote (its ingest-written marker names
+/// `by`), if there is one. Every ingest principal keeps a row of its own.
+async fn authored_props_by(pool: &PgPool, agent: Uuid, doi: &str, by: Uuid) -> Option<Value> {
+    sqlx::query_scalar(
+        "SELECT e.properties FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'authored' AND p.doi = $2 \
+            AND e.properties -> 'ingest_written' ->> 'by' = $3",
+    )
+    .bind(agent)
+    .bind(doi)
+    .bind(by.to_string())
+    .fetch_optional(pool)
+    .await
+    .expect("authored edge properties by principal")
+}
+
+/// The person named by a stranger attaches themselves explicitly. The
+/// stranger's pending naming is the stranger's own row; the person's ingest
+/// writes the person's own row, so the person is the caller, asserts the
+/// document, and their card counts the paper as theirs. The stranger's row
+/// stays pending and backs nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_person_reattaching_a_pending_authorship_is_told_it_is_still_pending(pool: PgPool) {
+async fn a_person_attaching_themselves_after_a_strangers_pending_naming_asserts_on_their_own_row(
+    pool: PgPool,
+) {
     let squatter = app_role_server(&pool).await;
     let person = app_role_server(&pool).await;
     let squatter_id = squatter.server_agent_id().await.expect("squatter");
@@ -1679,15 +1829,97 @@ async fn a_person_reattaching_a_pending_authorship_is_told_it_is_still_pending(p
         .expect("the person re-attaches"),
     );
     let report = &json["authors"][0];
+    assert_eq!(report["attribution"], "caller", "{json}");
+    assert_eq!(report["asserts_claims"], true, "{json}");
+    assert_eq!(report["pending_ingested_by"], Value::Null, "{json}");
+    assert_eq!(
+        asserts_on_doc(&pool, me, doi).await,
+        paper_claims(&pool, doi).await,
+        "{json}"
+    );
+    assert_eq!(json["ingested_by"], me.to_string(), "this call's ingester");
+    let own = authored_props_by(&pool, me, doi, me)
+        .await
+        .expect("the person's own authored row");
+    assert_eq!(own.get("pending_countersign"), None, "{own}");
+    let theirs = authored_props_by(&pool, me, doi, squatter_id)
+        .await
+        .expect("the stranger's pending row stays");
+    assert_eq!(theirs["pending_countersign"], true, "{theirs}");
+    let card = card_counts(&person, &pool, me).await;
+    assert_eq!(card["authored_papers"], 1, "{card}");
+    assert_eq!(card["pending_authored_papers"], 0, "{card}");
+}
+
+/// A stranger names, by agent_id, a person who already authored the paper
+/// through their own ingest. The stranger's word is a row of the stranger's
+/// own, and it is PENDING with the stranger as ingester: the person's own
+/// confirmed row never makes the stranger's naming confirmed. The stranger's
+/// claims get no `asserts` from the person, and the person's card is
+/// unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_naming_of_an_existing_author_is_its_own_pending_row(pool: PgPool) {
+    let person = app_role_server(&pool).await;
+    let stranger = app_role_server(&pool).await;
+    let me = person.server_agent_id().await.expect("person");
+    let stranger_id = stranger.server_agent_id().await.expect("stranger");
+    let doi = "10.9999/author-borrow";
+    let json = ingest_wait(
+        &person,
+        &pool,
+        doc_with_atoms(
+            doi,
+            json!([{"name": "Orsolya Quill", "agent_id": me.to_string()}]),
+            &["The person's own finding."],
+        ),
+    )
+    .await;
+    assert_eq!(json["authors"][0]["attribution"], "caller", "{json}");
+    let before = card_counts(&person, &pool, me).await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &stranger,
+            &viewer,
+            &doc_with_atoms(
+                doi,
+                json!([{"name": "Orsolya Quill", "agent_id": me.to_string()}]),
+                &["A finding only the stranger states."],
+            ),
+            None,
+        )
+        .await
+        .expect("the stranger's ingest"),
+    );
+    let report = &json["authors"][0];
     assert_eq!(report["attribution"], "pending_countersign", "{json}");
     assert_eq!(report["asserts_claims"], false, "{json}");
     assert_eq!(
         report["pending_ingested_by"],
-        squatter_id.to_string(),
+        stranger_id.to_string(),
         "{json}"
     );
-    assert_eq!(asserts_edges(&pool, me).await, 0, "{json}");
-    assert_eq!(json["ingested_by"], me.to_string(), "this call's ingester");
+    let row = authored_props_by(&pool, me, doi, stranger_id)
+        .await
+        .expect("the stranger wrote a row of its own");
+    assert_eq!(row["pending_countersign"], true, "{row}");
+    assert_eq!(row["ingested_by"], stranger_id.to_string(), "{row}");
+    let stranger_claim = claim_of(&pool, doi, "A finding only the stranger states.").await;
+    let person_asserts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'agent' \
+           AND relationship = 'asserts' AND target_id = $2",
+    )
+    .bind(me)
+    .bind(stranger_claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        person_asserts, 0,
+        "the person asserts nothing of the stranger's"
+    );
+    assert_eq!(card_counts(&person, &pool, me).await, before);
 }
 
 /// Replacement follows the entry's own SPELLING. A re-ingest with `agent_id`
@@ -1739,10 +1971,10 @@ async fn creator_doi(pool: &PgPool, claim: Uuid) -> Option<String> {
         .expect("creator's paper")
 }
 
-/// The claims the paper keyed `doi` asserts (in force).
+/// The claims the paper keyed `doi` asserts (in force), each once.
 async fn claims_of_doc(pool: &PgPool, doi: &str) -> Vec<Uuid> {
     sqlx::query_scalar(
-        "SELECT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
+        "SELECT DISTINCT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
           WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim' \
             AND pc.valid_to IS NULL ORDER BY 1",
     )
@@ -2054,4 +2286,211 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
         "the removed node asserts nothing new, the new claim included"
     );
     assert_eq!(authored_in_force(&pool, human, d).await, 1);
+}
+
+/// Every ingest principal keeps an `authored` row (and `asserts` rows) of its
+/// own, so the operator's replacement must close EVERY principal's rows of
+/// the removed author on the paper, not only its own or the first writer's:
+/// after two ingesters each attach the name-derived author and the operator
+/// replaces it, the node holds no in-force authorship of the paper, asserts
+/// none of its claims, and its card counts nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_replacement_closes_every_principals_rows_of_the_removed_author(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let cli = privileged_server(&pool);
+    let (_maintenance, viewer) = fixture::bypass(&pool).await;
+    let name = "Cosima Halberd";
+    let human = human_named(&pool, name).await;
+    let d = "10.9999/author-replace-every-principal";
+    for server in [&a, &b] {
+        ingest_wait(
+            server,
+            &pool,
+            doc_with_atoms(
+                d,
+                json!([{"name": name}]),
+                &["A finding both ingests state."],
+            ),
+        )
+        .await;
+    }
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    assert_eq!(
+        authored_in_force(&pool, key, d).await,
+        2,
+        "CALIBRATION: one authored row per ingest principal"
+    );
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &cli,
+            &viewer,
+            &doc_with_atoms(
+                d,
+                json!([{"name": name, "agent_id": human.to_string()}]),
+                &["A finding both ingests state."],
+            ),
+            None,
+        )
+        .await
+        .expect("the operator replacement"),
+    );
+    assert_eq!(
+        json["authors"][0]["replaced"]["agent_id"],
+        key.to_string(),
+        "CALIBRATION {json}"
+    );
+    assert_eq!(authored_in_force(&pool, key, d).await, 0, "{json}");
+    let in_force_asserts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges a \
+          WHERE a.source_id = $1 AND a.source_type = 'agent' AND a.relationship = 'asserts' \
+            AND (a.valid_to IS NULL OR a.valid_to > now())",
+    )
+    .bind(key)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(in_force_asserts, 0, "every principal's asserts are closed");
+    let card = card_counts(&a, &pool, key).await;
+    assert_eq!(card["authored_papers"], 0, "{card}");
+    assert_eq!(card["asserted_claims"], 0, "{card}");
+}
+
+/// Only the operator's own replacement withholds a name-derived author's
+/// credit from later name-only ingests. A retraction of the author's
+/// authorship that no replacement recorded (an UPDATE outside the
+/// maintenance replacement, which names no replacing agent) is no
+/// replacement: a later name-only ingest takes the name path as usual
+/// (`reused_name_key`, asserting), whatever the position or spelling, and
+/// although the paper has another author in force. The
+/// operator replacement test above is the control: there the replacing
+/// agent's own authorship records which node it replaced.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_operator_replacement_withholds_a_name_derived_authors_credit(pool: PgPool) {
+    let first = app_role_server(&pool).await;
+    let later = app_role_server(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let name = "Philippa Thornquist";
+    let d = "10.9999/author-unrecorded-retraction";
+    ingest_wait(
+        &first,
+        &pool,
+        doc_with_atoms(
+            d,
+            json!([{"name": name}, {"name": "Second Author"}]),
+            &["The first ingest's atom."],
+        ),
+    )
+    .await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let second = name_key_node(&pool, "Second Author")
+        .await
+        .expect("the co-author's node");
+    // A retraction no replacement recorded: in force before, retracted now.
+    sqlx::query(
+        "UPDATE edges e SET valid_to = now() FROM papers p \
+          WHERE p.id = e.target_id AND p.doi = $2 AND e.source_id = $1 \
+            AND e.relationship = 'authored'",
+    )
+    .bind(key)
+    .bind(d)
+    .execute(&pool)
+    .await
+    .expect("an unrecorded retraction");
+    assert_eq!(authored_in_force(&pool, key, d).await, 0, "CALIBRATION");
+    // CALIBRATION: another author's authorship of the paper stays in force,
+    // so only the replacement's own record (not "some in-force authorship")
+    // can tell this retraction from a replacement.
+    assert_eq!(authored_in_force(&pool, second, d).await, 1, "CALIBRATION");
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &later,
+            &public,
+            &doc_with_atoms(
+                d,
+                json!([{"name": name}, {"name": "Second Author"}]),
+                &["A later ingest's atom."],
+            ),
+            None,
+        )
+        .await
+        .expect("a later name-only ingest"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["action"], "reused_name_key", "{json}");
+    assert_eq!(report["asserts_claims"], true, "{json}");
+}
+
+/// A document ingest that converges on a claim the SAME agent already filed
+/// without a reasoning trace (a workflow operation atom written as the
+/// caller, a directly filed claim) found that claim; it did not create it.
+/// The walk must not rewrite the row's properties (a workflow atom's
+/// `kind` and `step_lineage_id` would be lost), must not hang its trace on
+/// it, and records `created_claim: false`, so the claim stays its filer's own
+/// and never reads as the document's literature. Whether the walk created
+/// a row is what its INSERT reports, never inferred from the row's author or
+/// trace.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_trace_less_claim_the_ingester_filed_itself_is_found_never_created(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let me = server.server_agent_id().await.expect("agent");
+    // The agent's own group, as its ingest owns rows.
+    ingest_wait(
+        &server,
+        &pool,
+        doc("10.9999/own-filed-warmup", json!([{"name": "Warm Up"}])),
+    )
+    .await;
+    let (group, visibility): (Uuid, String) = sqlx::query_as(
+        "SELECT owner_group_id, visibility::text FROM claims WHERE agent_id = $1 LIMIT 1",
+    )
+    .bind(me)
+    .fetch_one(&pool)
+    .await
+    .expect("the agent's group");
+    let text_of = "An operation the agent filed itself.";
+    let hash = epigraph_ingest::common::ids::content_hash(text_of);
+    let id = epigraph_ingest::common::ids::atom_id(&hash);
+    let lineage = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, labels, properties) \
+         VALUES ($1, $2, $3, 0.8, $4, true, $5, $6, \
+                 ARRAY['workflow:operation'], $7)",
+    )
+    .bind(id)
+    .bind(text_of)
+    .bind(hash.as_slice())
+    .bind(me)
+    .bind(&visibility)
+    .bind(group)
+    .bind(json!({"kind": "operation", "level": 3, "step_lineage_id": lineage.to_string()}))
+    .execute(&pool)
+    .await
+    .expect("the agent's own trace-less claim");
+
+    let doi = "10.9999/own-filed-converge";
+    ingest_wait(
+        &server,
+        &pool,
+        doc_with_atoms(doi, json!([{"name": "Warm Up"}]), &[text_of]),
+    )
+    .await;
+    let (props, trace): (Value, Option<Uuid>) =
+        sqlx::query_as("SELECT properties, trace_id FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("the claim");
+    assert_eq!(props["kind"], "operation", "{props}");
+    assert_eq!(props["step_lineage_id"], lineage.to_string(), "{props}");
+    assert_eq!(trace, None, "no trace hung on a row the walk did not write");
+    assert_eq!(
+        ingest_records(&pool, id).await,
+        vec![(doi.to_string(), me, false)],
+        "the ingest found the claim; it did not create it"
+    );
+    assert_eq!(creator_doi(&pool, id).await, None);
 }

@@ -450,13 +450,18 @@ async fn get_claim_doc() {}
 /// and `score`. `operator_human` (the human the agent is currently bound
 /// to: its live operator link, else its unrevoked client allowance; null
 /// once the link is retired) is shown to every reader; every other field is
-/// computed under the caller's viewer. `counts` holds `authored_papers`,
-/// `pending_authored_papers` (named by an ingester, not countersigned) and
-/// `asserted_claims`. They count only in-force edges that carry the document
-/// ingest's ingest-written marker, which no other writer can set (an edge
-/// written over `POST /api/v1/edges` never counts, whatever its shape), and
-/// an attribution only when one of the agent's counted authorships, written
-/// by an ingest of the same principal, backs it.
+/// computed under the caller's viewer. `counts` holds `authored_papers`
+/// (papers it has an authorship of that is not awaiting its countersignature;
+/// a name-derived author is never countersigned and never pending),
+/// `pending_authored_papers` (papers an ingester named it on, awaiting its
+/// countersignature, where it has no other authorship) and `asserted_claims`,
+/// each paper and claim once. They count only in-force edges that carry the
+/// document ingest's ingest-written marker, which no other writer can set (an
+/// edge written over `POST /api/v1/edges` never counts, whatever its shape),
+/// and an attribution only when the same principal's ingest wrote the
+/// agent's counted authorship of a paper and that paper's assertion of the
+/// claim: each ingest that names the agent credits it with that ingest's
+/// claims, and no other ingest does.
 /// Same code as MCP `find_agent`. Scope `claims:read`.
 #[utoipa::path(
     get,

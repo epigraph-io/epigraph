@@ -177,6 +177,7 @@ async fn query_paper(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> Valu
             doi: doi.to_string(),
             limit: None,
             offset: None,
+            ingested_by: None,
         },
     )
     .await

@@ -1607,7 +1607,10 @@ async fn a_forged_paper_assertion_backs_no_attribution(pool: PgPool) {
 /// author really authored, asserting a claim of its own and attributing it to
 /// that author, writes edges that each carry the marker, but they name the
 /// stranger, not the ingest that wrote the authorship: the chain does not
-/// hold and no reader's count moves.
+/// hold and no reader's count moves. (An ingest that NAMES the author writes
+/// an authorship of its own, and its claims are then the author's by that
+/// ingest's word: see
+/// `each_ingest_that_names_an_author_credits_it_with_that_ingests_claims`.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_second_ingest_of_the_same_paper_cannot_borrow_its_authorship(pool: PgPool) {
     let (outsider, _) = named(&pool, "outsider").await;
@@ -1704,7 +1707,8 @@ async fn a_pending_authorship_is_reported_apart_and_backs_no_claim(pool: PgPool)
         assert_eq!(k["asserted_claims"], 0, "{who}: {k}");
     }
 
-    // A countersigned authorship of the same shape counts (the control).
+    // An authorship of the same shape not awaiting countersignature counts
+    // (the control).
     let (author, _) = named(&pool, "Isolde Varrick").await;
     let p2 = paper(&pool, "10.9999/lookup.pending.2").await;
     let c2 = fixture::seed_public_claim(&pool, stranger, "a name-derived finding").await;
@@ -1779,4 +1783,210 @@ async fn retracted_authorships_and_attributions_do_not_count(pool: PgPool) {
         (1, 0),
         "a retracted attribution still counts: {k:?}"
     );
+}
+
+/// [`ingest_edge_as`] without its calibration that the write was new:
+/// returns whether the writer inserted a row (a deduplicated write returns
+/// the existing one).
+async fn ingest_edge_as_any(
+    pool: &PgPool,
+    writer: Uuid,
+    src: (Uuid, &str),
+    tgt: (Uuid, &str),
+    rel: &str,
+    props: Option<serde_json::Value>,
+) -> bool {
+    let scoped = app_pool(pool).await;
+    let v = viewer(pool, writer).await;
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    let (_row, created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut tx,
+        None,
+        "ingest_document",
+        writer,
+        src.0,
+        src.1,
+        tgt.0,
+        tgt.1,
+        rel,
+        props,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("ingest {rel} edge as {writer}: {e}"));
+    tx.commit().await.expect("commit");
+    created
+}
+
+/// Two principals' ingests of the same paper both name an author, each
+/// asserting a claim of its own. Each ingest's attribution is backed by that
+/// SAME ingest's authorship and paper assertion, so the author is credited
+/// with both claims, and the paper once. A deduplicated authorship that
+/// recorded only its first writer left the second ingest with no authorship
+/// of its own, so its claim was never credited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_ingest_that_names_an_author_credits_it_with_that_ingests_claims(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (first, _) = named(&pool, "ingest-runner-one").await;
+    let (second, _) = named(&pool, "ingest-runner-two").await;
+    let (author, _) = named(&pool, "Rosalind Ebberly").await;
+    let p = paper(&pool, "10.9999/lookup.per-ingest.1").await;
+    let c1 = fixture::seed_public_claim(&pool, first, "the first ingest's finding").await;
+    let c2 = fixture::seed_public_claim(&pool, second, "the second ingest's finding").await;
+    let authored = serde_json::json!({"position": 0, "role": "author"});
+    let attribution = serde_json::json!({"role": "author", "source": "document_attribution"});
+    for (by, c) in [(first, c1), (second, c2)] {
+        ingest_edge_as_any(
+            &pool,
+            by,
+            (author, "agent"),
+            (p, "paper"),
+            "authored",
+            Some(authored.clone()),
+        )
+        .await;
+        ingest_edge_as_any(&pool, by, (p, "paper"), (c, "claim"), "asserts", None).await;
+        ingest_edge_as_any(
+            &pool,
+            by,
+            (author, "agent"),
+            (c, "claim"),
+            "asserts",
+            Some(attribution.clone()),
+        )
+        .await;
+    }
+    for reader in [outsider, author, first, second] {
+        let k = card_as(&pool, reader, author).await.counts;
+        assert_eq!(
+            (
+                k.authored_papers,
+                k.pending_authored_papers,
+                k.asserted_claims
+            ),
+            (1, 0, 2),
+            "the second ingest's claim is not credited to the author it named, for {reader}: {k:?}"
+        );
+    }
+    let authorships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'authored'",
+    )
+    .bind(author)
+    .bind(p)
+    .fetch_one(&pool)
+    .await
+    .expect("authorships");
+    assert_eq!(authorships, 2, "CALIBRATION: one authorship per ingest");
+}
+
+/// The attribution must come from the ingest that wrote the authorship, not
+/// only the paper assertion. Here one principal's ingest wrote the author's
+/// authorship and the paper's assertion of X, and ANOTHER principal wrote the
+/// author's attribution of X: no single ingest said the author asserts X, so
+/// X is not counted. The control, Y, has all three edges from one ingest.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attribution_from_another_ingest_than_the_authorship_is_not_counted(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (ingester, _) = named(&pool, "ingest-runner").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (author, _) = named(&pool, "Cosima Wetherell").await;
+    let p = paper(&pool, "10.9999/lookup.attribution-tie.1").await;
+    let x = fixture::seed_public_claim(&pool, ingester, "a finding the author never stated").await;
+    let y = fixture::seed_public_claim(&pool, ingester, "the author's finding").await;
+    ingest_attribution(
+        &pool,
+        ingester,
+        author,
+        p,
+        y,
+        serde_json::json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    ingest_edge_as(&pool, ingester, (p, "paper"), (x, "claim"), "asserts", None).await;
+    ingest_edge_as(
+        &pool,
+        stranger,
+        (author, "agent"),
+        (x, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+    for reader in [outsider, author, stranger] {
+        let k = card_as(&pool, reader, author).await.counts;
+        assert_eq!(
+            (k.authored_papers, k.asserted_claims),
+            (1, 1),
+            "an attribution another ingest wrote was counted for {reader}: {k:?}"
+        );
+    }
+}
+
+/// A person's own, not-pending authorship of a paper outranks a stranger's
+/// pending naming of the same person on the same paper: the paper is the
+/// person's authored paper, not a pending one, and the person's own ingest's
+/// claims are credited. (A stranger who names someone writes its own pending
+/// authorship; it neither blocks nor replaces the person's own.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_persons_own_authorship_outranks_a_strangers_pending_naming(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (human, _) = named_human(&pool, "Aurelio Dunmore").await;
+    let p = paper(&pool, "10.9999/lookup.own-over-pending.1").await;
+    ingest_edge_as_any(
+        &pool,
+        stranger,
+        (human, "agent"),
+        (p, "paper"),
+        "authored",
+        Some(serde_json::json!({
+            "position": 0,
+            "role": "author",
+            "explicit_agent_id": true,
+            "pending_countersign": true,
+            "ingested_by": stranger.to_string(),
+        })),
+    )
+    .await;
+    let k = card_as(&pool, outsider, human).await.counts;
+    assert_eq!(
+        (k.authored_papers, k.pending_authored_papers),
+        (0, 1),
+        "CALIBRATION: the stranger's naming is pending"
+    );
+
+    // The person's own ingest of the same paper.
+    let c = fixture::seed_public_claim(&pool, human, "the person's own finding").await;
+    ingest_edge_as_any(
+        &pool,
+        human,
+        (human, "agent"),
+        (p, "paper"),
+        "authored",
+        Some(serde_json::json!({"position": 0, "role": "author"})),
+    )
+    .await;
+    ingest_edge_as_any(&pool, human, (p, "paper"), (c, "claim"), "asserts", None).await;
+    ingest_edge_as_any(
+        &pool,
+        human,
+        (human, "agent"),
+        (c, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+    for reader in [outsider, human, stranger] {
+        let k = card_as(&pool, reader, human).await.counts;
+        assert_eq!(
+            (
+                k.authored_papers,
+                k.pending_authored_papers,
+                k.asserted_claims
+            ),
+            (1, 0, 1),
+            "the person's own authorship did not outrank a stranger's pending naming, \
+             for {reader}: {k:?}"
+        );
+    }
 }

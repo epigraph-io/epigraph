@@ -660,3 +660,68 @@ async fn provenance_is_attached_only_by_the_filer_for_authors_it_speaks_for(pool
         ]
     );
 }
+
+/// The evidence detail's `agent_id` is the evidence row's own record (its
+/// signer, set by the writer that stored it), never the source of an
+/// `agent -> evidence` edge. A stranger may post `supports`,
+/// `derived_from`, `uses_evidence` or `relates_to` from a registered human
+/// onto someone's evidence (none of these credits the agent, so the edge
+/// route accepts them); the detail still names the evidence's signer, and
+/// names no agent for unsigned evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_edge_onto_evidence_never_names_its_agent(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "ev-stranger").await;
+    let (reader, _) = viewer_fixture::seed_agent_with_group(&pool, "ev-reader").await;
+    let (signer, _) = viewer_fixture::seed_agent_with_group(&pool, "ev-signer").await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "ev-human").await;
+    let claim = viewer_fixture::seed_public_claim(&pool, signer, "a claim with evidence").await;
+    let mut seeded = Vec::new();
+    for signed in [true, false] {
+        let ev = Uuid::new_v4();
+        let hash: Vec<u8> = ev.as_bytes().iter().copied().cycle().take(32).collect();
+        sqlx::query(
+            "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, \
+                                   properties, signature, signer_id) \
+             VALUES ($1, 'ev', $2, 'document', $3, '{}'::jsonb, $4, $5)",
+        )
+        .bind(ev)
+        .bind(&hash)
+        .bind(claim)
+        .bind(signed.then(|| vec![7_u8; 64]))
+        .bind(signed.then_some(signer))
+        .execute(&pool)
+        .await
+        .expect("seed evidence");
+        seeded.push((ev, signed.then_some(signer)));
+    }
+    for (ev, expected) in seeded {
+        for rel in ["supports", "derived_from", "uses_evidence", "relates_to"] {
+            let (status, body) =
+                post_edge(&state, stranger, (human, "agent"), (ev, "evidence"), rel).await;
+            assert!(
+                status.is_success() || status == StatusCode::CONFLICT,
+                "CALIBRATION: the route accepts human -{rel}-> evidence: {status} {body}"
+            );
+        }
+        let token = common::mint_token_with_agent(&["claims:read"], reader);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/evidence/{ev}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("request");
+        let resp = create_router(state.clone())
+            .oneshot(req)
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        let detail: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            detail["agent_id"],
+            expected.map_or(Value::Null, |s| json!(s.to_string())),
+            "the evidence's agent is its own record, never a stranger's edge: {detail}"
+        );
+    }
+}
