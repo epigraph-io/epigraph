@@ -579,3 +579,223 @@ async fn migration_198_drops_a_marker_written_before_the_guard(pool: PgPool) {
     );
     assert_eq!(after["section"], "kept", "only the key is dropped");
 }
+
+/// One write through the walk's writer on an `epigraph_app` transaction
+/// stamped as `by`, the principal the marker names. Returns the row and
+/// whether this call inserted it.
+async fn walk_write(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    by: Uuid,
+    src: (Uuid, &str),
+    tgt: (Uuid, &str),
+    rel: &str,
+) -> (epigraph_db::EdgeRow, bool) {
+    let v = viewer(pool, by).await;
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    let out = epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut tx,
+        None,
+        "ingest_document",
+        by,
+        src.0,
+        src.1,
+        tgt.0,
+        tgt.1,
+        rel,
+        Some(serde_json::json!({"position": 0, "role": "author"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the walk's {rel} write as {by}: {e}"));
+    tx.commit().await.expect("commit");
+    out
+}
+
+/// The principals named by the marked rows of one `(source, target,
+/// relationship)`, sorted.
+async fn principals_on(pool: &PgPool, src: Uuid, tgt: Uuid, rel: &str) -> Vec<String> {
+    let mut by: Vec<String> = sqlx::query_scalar(
+        "SELECT properties -> $4 ->> 'by' FROM edges \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = $3 \
+            AND properties ? $4",
+    )
+    .bind(src)
+    .bind(tgt)
+    .bind(rel)
+    .bind(KEY)
+    .fetch_all(pool)
+    .await
+    .expect("marked rows");
+    by.sort();
+    by
+}
+
+/// Every principal whose ingest writes the same fact keeps its own marked
+/// row. A paper is shared by DOI across every ingester, so two principals'
+/// ingests that name the same author write the same `author -authored->
+/// paper` fact; one deduplicated row would name only its first writer, and a
+/// reader tying an ingest's edges together by `by` would find no authorship
+/// for the second ingest. The same principal writing the fact again still
+/// writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_ingest_principal_writes_its_own_marked_edge(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (first, _) = fixture::seed_agent_with_group(&pool, "ingest-runner-one").await;
+    let (second, _) = fixture::seed_agent_with_group(&pool, "ingest-runner-two").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "Ottilie Marchbank").await;
+    let p = paper(&pool, "10.9999/marker.per-principal.1").await;
+    let x = fixture::seed_public_claim(&pool, first, "a shared finding").await;
+
+    for (src, tgt, rel) in [
+        ((author, "agent"), (p, "paper"), "authored"),
+        ((p, "paper"), (x, "claim"), "asserts"),
+        ((author, "agent"), (x, "claim"), "asserts"),
+    ] {
+        let (a, a_new) = walk_write(&pool, &scoped, first, src, tgt, rel).await;
+        assert!(
+            a_new,
+            "CALIBRATION ({rel}): the first ingest wrote the fact"
+        );
+        let (again, again_new) = walk_write(&pool, &scoped, first, src, tgt, rel).await;
+        assert!(
+            !again_new && again.id == a.id,
+            "{rel}: the same principal wrote the same fact twice"
+        );
+        let (b, b_new) = walk_write(&pool, &scoped, second, src, tgt, rel).await;
+        assert!(
+            b_new && b.id != a.id,
+            "{rel}: the second principal's ingest left no edge of its own"
+        );
+        assert_eq!(
+            b.properties[KEY]["by"],
+            second.to_string(),
+            "{rel}: the second principal's edge names it"
+        );
+        let (b_again, b_again_new) = walk_write(&pool, &scoped, second, src, tgt, rel).await;
+        assert!(!b_again_new && b_again.id == b.id, "{rel}: deduplicated");
+        let mut want = vec![first.to_string(), second.to_string()];
+        want.sort();
+        assert_eq!(
+            principals_on(&pool, src.0, tgt.0, rel).await,
+            want,
+            "{rel}: every ingest principal that wrote the fact is recorded, once"
+        );
+    }
+}
+
+/// What still stops a principal's own write of a fact:
+///
+/// * a RETRACTED row of that fact, whoever wrote it: a retraction (an
+///   operator's author replacement, an owner's withdrawal) withholds the fact
+///   from every later ingest, as it did when one row stood for all of them;
+/// * an UNMARKED row of that fact (a legacy row, or one another path wrote):
+///   the walk deduplicates onto it and writes nothing, so such a row can
+///   withhold credit, as before.
+///
+/// In both cases the writer returns that row, not a new one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_or_unmarked_row_still_stops_the_write(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (first, _) = fixture::seed_agent_with_group(&pool, "ingest-runner-one").await;
+    let (second, _) = fixture::seed_agent_with_group(&pool, "ingest-runner-two").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "Barnaby Thistlewood").await;
+
+    // Retracted: the first ingest's authorship, closed by a privileged
+    // retraction (no application session may close another's edge).
+    let retracted_paper = paper(&pool, "10.9999/marker.stops.retracted").await;
+    let (a, _) = walk_write(
+        &pool,
+        &scoped,
+        first,
+        (author, "agent"),
+        (retracted_paper, "paper"),
+        "authored",
+    )
+    .await;
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 second' WHERE id = $1")
+        .bind(a.id)
+        .execute(&pool)
+        .await
+        .expect("retract");
+    let (r, created) = walk_write(
+        &pool,
+        &scoped,
+        second,
+        (author, "agent"),
+        (retracted_paper, "paper"),
+        "authored",
+    )
+    .await;
+    assert!(
+        !created && r.id == a.id,
+        "a retracted row of the fact did not stop another principal's write"
+    );
+
+    // Unmarked: a row another path wrote, before the walk.
+    let unmarked_paper = paper(&pool, "10.9999/marker.stops.unmarked").await;
+    let v = viewer(&pool, first).await;
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    let plain = epigraph_db::EdgeRepository::create(
+        &mut *tx,
+        author,
+        "agent",
+        unmarked_paper,
+        "paper",
+        "authored",
+        Some(serde_json::json!({"position": 0})),
+        None,
+        None,
+    )
+    .await
+    .expect("an unmarked authored edge");
+    tx.commit().await.expect("commit");
+    let (r, created) = walk_write(
+        &pool,
+        &scoped,
+        second,
+        (author, "agent"),
+        (unmarked_paper, "paper"),
+        "authored",
+    )
+    .await;
+    assert!(
+        !created && r.id == plain,
+        "the walk wrote beside an unmarked row of the fact"
+    );
+    for p in [retracted_paper, unmarked_paper] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2",
+        )
+        .bind(author)
+        .bind(p)
+        .fetch_one(&pool)
+        .await
+        .expect("rows");
+        assert_eq!(n, 1, "one row of the fact, nothing added");
+    }
+}
+
+/// 198 installs the guard BEFORE it strips the pre-existing markers. In the
+/// other order an application insert carrying the key could commit between
+/// the strip and the trigger (the strip's UPDATE does not block an INSERT)
+/// and be trusted forever. With the trigger first, CREATE TRIGGER's lock
+/// (held to commit) blocks concurrent inserts, the strip sees every earlier
+/// row, and the guard already admits an UPDATE that drops the key.
+#[test]
+fn migration_198_installs_the_guard_before_it_strips() {
+    let sql: String = include_str!("../../../migrations/198_disclosed_role_assignments.sql")
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trigger = sql
+        .find("CREATE TRIGGER edges_ingest_written_guard")
+        .expect("198 creates the guard trigger");
+    let strip = sql
+        .find("UPDATE public.edges SET properties = properties - 'ingest_written'")
+        .expect("198 strips the pre-existing markers");
+    assert!(
+        trigger < strip,
+        "198 strips the markers before the guard exists, so an insert can land between them"
+    );
+}

@@ -245,88 +245,183 @@ fn one_author_extraction(
     .expect("fixture parses")
 }
 
-/// A second principal's REAL ingest under the same DOI, naming the same
-/// author with claims of its own, cannot borrow the first ingest's authorship:
-/// the document shares the paper row by DOI, the author's `authored` edge is
-/// the first ingest's (the second dedups onto it), and the second walk's
-/// paper assertions and attributions name the second principal. The card
-/// counts only the first ingest's attributions.
+/// A document extraction naming `authors`, as the ingest tools take it.
+fn authors_extraction(
+    doi: &str,
+    authors: &[&str],
+    tag: &str,
+) -> epigraph_ingest::schema::DocumentExtraction {
+    let mut x = one_author_extraction(doi, authors[0], tag);
+    x.source.authors = authors
+        .iter()
+        .map(|a| {
+            serde_json::from_value(serde_json::json!({
+                "name": a, "affiliations": [], "roles": ["author"]
+            }))
+            .expect("author entry")
+        })
+        .collect();
+    x
+}
+
+/// A server that ingests as a principal of its own (a generated signer).
+async fn ingest_server(pool: &PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+    common::build_scoped_test_server_generated_signer(
+        pool.clone(),
+        fixture::scoped_pool(pool).await,
+    )
+}
+
+/// The name-derived author node the ingest made for `name`.
+async fn node_named(pool: &PgPool, name: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM agents WHERE display_name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("the name-derived author node")
+}
+
+/// Every claim an ingest attributed to `who`, in force. A name-derived node
+/// files no claim of its own, so its card must count exactly these.
+async fn attributed_to(pool: &PgPool, who: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(DISTINCT target_id) FROM edges \
+          WHERE source_id = $1 AND relationship = 'asserts' AND target_type = 'claim' \
+            AND (valid_to IS NULL OR valid_to > now())",
+    )
+    .bind(who)
+    .fetch_one(pool)
+    .await
+    .expect("attributions")
+}
+
+/// `reader_id`'s `get_agent` counts of `who`.
+async fn counts_of(
+    reader: &epigraph_mcp::EpiGraphMcpFull,
+    pool: &PgPool,
+    reader_id: Uuid,
+    who: Uuid,
+) -> Value {
+    get(reader, pool, reader_id, who).await["counts"].clone()
+}
+
+/// Every principal's REAL ingest of a document is read on its own edges.
+/// The paper row is shared by DOI, so several principals can ingest the same
+/// document; each ingest that NAMES an author credits that author with that
+/// ingest's claims (by that ingest's word, as its marker records), and an
+/// ingest that does not name the author credits it with nothing. Both walks.
+///
+/// Before each principal kept its own authorship edge, a second principal's
+/// ingest naming an existing author deduplicated onto the first ingest's
+/// authorship, so the author named by both was credited with the first
+/// ingest's claims only, while a NEW name the second ingest added was
+/// credited with all of the second ingest's.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_second_ingesters_document_under_the_same_doi_is_not_the_authors(pool: PgPool) {
+async fn each_ingest_credits_the_authors_it_names_and_no_other(pool: PgPool) {
     let reader = app_server(&pool).await;
     let (outsider, _) = named(&pool, "outsider").await;
     let v = fixture::public_viewer(&pool).await;
     let doi = "10.9999/card-count.shared";
-    let author = "Marisol Quenby";
-    let first = common::build_scoped_test_server_generated_signer(
-        pool.clone(),
-        fixture::scoped_pool(&pool).await,
-    );
-    let second = common::build_scoped_test_server_generated_signer(
-        pool.clone(),
-        fixture::scoped_pool(&pool).await,
-    );
+    let (first_author, added, unrelated) = ("Marisol Quenby", "Ivo Interloper", "Cosimo Vell");
+    let first = ingest_server(&pool).await;
+    let second = ingest_server(&pool).await;
+    let third = ingest_server(&pool).await;
+
     tools::ingestion::do_ingest_document(
         &first,
         &v,
-        &one_author_extraction(doi, author, "first"),
+        &authors_extraction(doi, &[first_author], "first"),
         None,
     )
     .await
-    .expect("the first ingest");
-    let node: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE display_name = $1")
-        .bind(author)
-        .fetch_one(&pool)
-        .await
-        .expect("the name-derived author node");
-    let attributed = |pool: PgPool| async move {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(DISTINCT target_id) FROM edges \
-              WHERE source_id = $1 AND relationship = 'asserts' AND target_type = 'claim'",
-        )
-        .bind(node)
-        .fetch_one(&pool)
-        .await
-        .expect("attributions")
-    };
-    let firsts = attributed(pool.clone()).await;
+    .expect("the first principal's ingest");
+    let marisol = node_named(&pool, first_author).await;
+    let firsts = attributed_to(&pool, marisol).await;
     assert!(
         firsts > 0,
         "CALIBRATION: the first ingest attributed claims"
     );
-    let card = get(&reader, &pool, outsider, node).await;
     assert_eq!(
-        card["counts"]["asserted_claims"], firsts,
-        "CALIBRATION: {card}"
+        counts_of(&reader, &pool, outsider, marisol).await["asserted_claims"],
+        firsts,
+        "CALIBRATION"
     );
 
+    // The second principal names the same author (document walk), then that
+    // author and a new one (spine walk), each time with text of its own.
     tools::ingestion::do_ingest_document(
         &second,
         &v,
-        &one_author_extraction(doi, author, "second"),
+        &authors_extraction(doi, &[first_author], "second"),
         None,
     )
     .await
-    .expect("the second ingest");
-    let all = attributed(pool.clone()).await;
+    .expect("the second principal's document ingest");
+    tools::ingestion::do_ingest_document_spine(
+        &second,
+        &v,
+        &authors_extraction(doi, &[first_author, added], "second-spine"),
+        None,
+    )
+    .await
+    .expect("the second principal's spine ingest");
+    let ivo = node_named(&pool, added).await;
+    let all = attributed_to(&pool, marisol).await;
     assert!(
         all > firsts,
-        "CALIBRATION: the second ingest attributed claims of its own"
+        "CALIBRATION: the second principal's ingests attributed claims to the author"
     );
-    for who in [outsider, node] {
-        let card = get(&reader, &pool, who, node).await;
-        assert_eq!(card["counts"]["authored_papers"], 1, "{card}");
+    for who in [outsider, marisol] {
+        let k = get(&reader, &pool, who, marisol).await["counts"].clone();
+        assert_eq!(k["authored_papers"], 1, "{who}: {k}");
         assert_eq!(
-            card["counts"]["asserted_claims"], firsts,
-            "the second ingest's claims were credited to the author: {card}"
+            k["asserted_claims"], all,
+            "the claims of an ingest that named the author are not the author's, for {who}: {k}"
         );
     }
+    let k = counts_of(&reader, &pool, outsider, ivo).await;
+    assert_eq!(k["authored_papers"], 1, "{k}");
+    assert_eq!(k["asserted_claims"], attributed_to(&pool, ivo).await, "{k}");
+    assert!(
+        attributed_to(&pool, ivo).await < all - firsts,
+        "CALIBRATION: the added name was named only by the spine ingest"
+    );
+
+    // A third principal names only an unrelated author: the existing authors
+    // gain nothing from it.
+    tools::ingestion::do_ingest_document(
+        &third,
+        &v,
+        &authors_extraction(doi, &[unrelated], "third"),
+        None,
+    )
+    .await
+    .expect("the third principal's ingest");
+    let cosimo = node_named(&pool, unrelated).await;
+    assert_eq!(
+        counts_of(&reader, &pool, outsider, marisol).await["asserted_claims"],
+        all
+    );
+    assert_eq!(
+        counts_of(&reader, &pool, outsider, ivo).await["asserted_claims"],
+        attributed_to(&pool, ivo).await
+    );
+    let k = counts_of(&reader, &pool, outsider, cosimo).await;
+    assert_eq!(k["authored_papers"], 1, "{k}");
+    assert_eq!(
+        k["asserted_claims"],
+        attributed_to(&pool, cosimo).await,
+        "{k}"
+    );
+
     // (Asserted after the counts, so the previous head reads red on them.)
     let principals: Vec<Option<String>> = sqlx::query_scalar(
-        "SELECT DISTINCT properties -> $2 ->> 'by' FROM edges \
-          WHERE source_id = $1 AND relationship = 'asserts'",
+        "SELECT properties -> $3 ->> 'by' FROM edges \
+          WHERE source_id = $1 AND target_id = (SELECT id FROM papers WHERE doi = $2) \
+            AND relationship = 'authored' ORDER BY created_at",
     )
-    .bind(node)
+    .bind(marisol)
+    .bind(doi)
     .bind(epigraph_db::INGEST_WRITTEN_PROPERTY)
     .fetch_all(&pool)
     .await
@@ -334,8 +429,9 @@ async fn a_second_ingesters_document_under_the_same_doi_is_not_the_authors(pool:
     assert_eq!(
         principals.len(),
         2,
-        "CALIBRATION: the two walks recorded two principals: {principals:?}"
+        "CALIBRATION: one authorship per principal that named the author: {principals:?}"
     );
+    assert_ne!(principals[0], principals[1], "{principals:?}");
 }
 
 /// The card's trusted-attribution rule against the REAL ingest walks (the
