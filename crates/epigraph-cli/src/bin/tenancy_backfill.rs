@@ -1653,6 +1653,34 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // 200 also re-states 124's `epigraph_person_authenticators_audit` (the
     // revoke's `mode`), which stays registered at 124.
     ("epigraph_revoke_passkey_compromised", 200),
+    // 206, claim visibility controls. The two READS fail CLOSED and SILENTLY
+    // under a non-member owner. `epigraph_writable_teams` reads `groups`
+    // through 077's `groups_tenancy`, which on the unstamped connection it is
+    // called on admits no row, so it answers "no team": every write that names
+    // no visibility lands private instead of in the author's team, and every
+    // explicit team write is refused. `epigraph_default_group` reads only
+    // `agents` (readable to every role) and 149's `epigraph_human_of`, so its
+    // answer does not change; it is registered so the pre-flight still sees
+    // an owner the migration's guarded `OWNER TO` failed to set.
+    ("epigraph_writable_teams", 206),
+    ("epigraph_default_group", 206),
+    // 206's default-team write changes only the principal's own `agents` row
+    // and writes a principal-attributed audit row, both of which 077 admits
+    // for any owner, and its authority check goes through the read above, so a
+    // non-member owner changes nothing here unless that read is mis-owned too
+    // (then every non-NULL default is refused VIS02, loud).
+    ("epigraph_set_default_group", 206),
+    // 206's publicize fails LOUD whenever re-meeting an incident edge changes
+    // its `owner_group_id`: 115's `edges_owner_immutable` refuses that outside
+    // a privileged frame (42501, the whole call rolls back).
+    // It fails SILENTLY for an incident edge outside the caller's writable
+    // groups: 117's restrictive `edges_update_owner` filters that row out, so
+    // the claim goes public and the edge stays group-only.
+    ("epigraph_publicize_claims", 206),
+    // 206's private -> team share changes `claims.owner_group_id`, which 115's
+    // `claims_owner_immutable` refuses outside a privileged frame: every share
+    // fails LOUD (42501) with nothing moved.
+    ("epigraph_share_claims_with_team", 206),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2692,6 +2720,37 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_revoke_passkey_compromised",
             "public.epigraph_revoke_passkey_compromised(uuid, text)",
             false,
+        ),
+        // 206: claim visibility controls, all five app-callable. The two
+        // reads run on every claim write that names no visibility
+        // (`ClaimVisibilityRepository::resolve_visibility_choice`), so a
+        // missing grant there is 42501 on every default write, an outage like
+        // 107's actor read; the three writes are the publicize, share and
+        // default-team surfaces, which would be refused outright.
+        (
+            "epigraph_writable_teams",
+            "public.epigraph_writable_teams(uuid)",
+            true,
+        ),
+        (
+            "epigraph_default_group",
+            "public.epigraph_default_group(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_default_group",
+            "public.epigraph_set_default_group(uuid)",
+            true,
+        ),
+        (
+            "epigraph_publicize_claims",
+            "public.epigraph_publicize_claims(uuid[], text)",
+            true,
+        ),
+        (
+            "epigraph_share_claims_with_team",
+            "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
+            true,
         ),
         (
             "epigraph_confirm_admin_act",
