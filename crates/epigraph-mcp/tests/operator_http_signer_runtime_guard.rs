@@ -37,18 +37,28 @@ const SECRET: &[u8] = b"runtime-guard-test-secret-at-least-32-bytes!!";
 const ACCEPT: &str = "application/json, text/event-stream";
 const SESSION_HEADER: &str = "Mcp-Session-Id";
 const REFUSAL: &str = "has an operator link to";
+/// The tool's own answer to `get_claim` for a random id (`tools/claims.rs::get_claim`).
+const TOOL_NOT_FOUND: &str = "not found";
+/// `EpiGraphMcpFull::read_as`'s refusal on a server built without a ScopedPool.
+const SCOPED_POOL_REFUSAL: &str = "ScopedPool";
 const OPERATOR_REFUSAL: &str = "is the operator of linked agents";
 const HUMAN_REFUSAL: &str = "is a registered human operator";
 const ALLOWLIST_REFUSAL: &str = "is the agent of an allowlisted OAuth client";
 
-fn token() -> String {
+/// A `claims:read` bearer for a SEEDED agent principal. The principal matters
+/// for the CALIBRATION arm: a token with no agent principal is refused read
+/// authority by viewer resolution ("token carries no agent principal"), so its
+/// call never reaches the tool and "not refused by the link gate" would hold
+/// for a reason that has nothing to do with the gate.
+async fn token(pool: &PgPool) -> String {
+    let (caller, _) = fixture::seed_agent_with_group(pool, "runtime-guard-caller").await;
     let (token, _) = JwtConfig::from_secret(SECRET)
         .issue_access_token(
             Uuid::new_v4(),
             vec!["claims:read".to_string()],
             "service",
             None,
-            None,
+            Some(caller),
             ChronoDuration::minutes(5),
             epigraph_auth::AccessTokenBinding::NONE,
         )
@@ -223,16 +233,22 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
     let public_key = signer.public_key();
     let url = spawn_listener(pool.clone(), signer).await;
     let client = reqwest::Client::new();
-    let token = token();
+    let token = token(&pool).await;
     let session = handshake(&client, &url, &token).await;
 
-    // 1. CALIBRATION: unlinked signer, the call is dispatched (the tool's own
-    //    answer — not-found for a random claim id — is irrelevant).
+    // 1. CALIBRATION: unlinked signer, the call is dispatched AND answered by
+    //    the tool itself. For a random claim id that answer is the tool's own
+    //    "claim <id> not found"; asserting it (and the absence of the
+    //    no-ScopedPool refusal) is what stops this arm passing on a call that
+    //    failed for some other reason before the signer gate ever ran.
     let before = call(&client, &url, &token, &session, 2).await;
     assert!(
-        before.contains("data:") && !before.contains(REFUSAL),
-        "CALIBRATION: an unlinked signer's call must not be refused, or the refusal below \
-         proves nothing:\n{before}"
+        before.contains("data:")
+            && before.contains(TOOL_NOT_FOUND)
+            && !before.contains(SCOPED_POOL_REFUSAL)
+            && !before.contains(REFUSAL),
+        "CALIBRATION: an unlinked signer's call must reach the tool and get its own \
+         not-found answer, or the refusal below proves nothing:\n{before}"
     );
 
     // 2. Link the signer AFTER startup, as a later stdio process or an operator
