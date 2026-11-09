@@ -55,13 +55,21 @@ pub async fn consolidate_claims(
 
     // Default confidence: the strongest source discounted slightly, so a merge
     // never claims more certainty than its best input.
+    //
+    // The sources are read on the CALLER's stamped read, not the plain pool. On
+    // the application role an unstamped connection admits public rows only, so
+    // a member's own group-private sources read as missing, `best` stayed 0 and
+    // the merged claim was written with truth_value 0, with no error. The read
+    // is released before the write transaction below is taken, so the tool
+    // never holds two pooled connections.
     let merged_truth = match params.confidence {
         Some(c) => c.clamp(0.0, 1.0),
         None => {
+            let mut read = server.read_as(viewer, "consolidate_claims").await?;
             let mut best: f64 = 0.0;
             for id in &source_ids {
                 if let Ok(Some(c)) = ClaimRepository::get_by_id(
-                    &server.pool,
+                    &mut *read,
                     viewer,
                     epigraph_core::ClaimId::from_uuid(*id),
                 )
@@ -70,6 +78,7 @@ pub async fn consolidate_claims(
                     best = best.max(c.truth_value.value());
                 }
             }
+            drop(read);
             (best * 0.95).clamp(0.0, 1.0)
         }
     };
