@@ -209,8 +209,9 @@ pub use method::{
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
 pub use paper::{
-    AssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperRepository, PaperRow,
-    AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+    AssertedClaimRow, IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing,
+    PaperIngestPrincipal, PaperRepository, PaperRow, AUTHORED_EXPLICIT_KEY,
+    AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
 };
 pub use perspective::PerspectiveRepository;
 pub use political::{

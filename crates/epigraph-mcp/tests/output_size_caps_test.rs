@@ -586,6 +586,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
             doi: doi.to_string(),
             limit: None,
             offset: None,
+            ingested_by: None,
         },
     )
     .await
@@ -619,6 +620,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
                 doi: doi.to_string(),
                 limit: Some(100),
                 offset: None,
+                ingested_by: None,
             },
         )
         .await
@@ -655,6 +657,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
                     doi: doi.to_string(),
                     limit: Some(25),
                     offset: Some(offset),
+                    ingested_by: None,
                 },
             )
             .await
@@ -695,6 +698,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
                 doi: doi.to_string(),
                 limit: Some(100_000),
                 offset: None,
+                ingested_by: None,
             },
         )
         .await
@@ -748,6 +752,7 @@ async fn has_more_terminates_when_claim_count_comes_from_the_doi_label_floor(poo
                 doi: doi.to_string(),
                 limit: None,
                 offset: None,
+                ingested_by: None,
             },
         )
         .await

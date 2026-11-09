@@ -168,8 +168,8 @@ pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedP
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use repos::{
-    PaperAuthorEdge, PaperAuthorListing, AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY,
-    AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+    IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperIngestPrincipal,
+    AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
 };
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
