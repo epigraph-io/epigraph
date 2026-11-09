@@ -1653,6 +1653,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // 200 also re-states 124's `epigraph_person_authenticators_audit` (the
     // revoke's `mode`), which stays registered at 124.
     ("epigraph_revoke_passkey_compromised", 200),
+    // 207, the bug-report intake. The write fails LOUD under a non-member
+    // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
+    // `evidence` are refused by their WITH CHECK (the owner no longer passes
+    // `epigraph_definer_bypass()`), so no report is filed. The reporter's list
+    // fails SILENTLY: its reads of the FORCEd `security_events` and `claims`
+    // admit no row, so every reporter sees an empty list.
+    ("epigraph_submit_bug_report", 207),
+    ("epigraph_my_bug_reports", 207),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2693,6 +2701,19 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_revoke_passkey_compromised(uuid, text)",
             false,
         ),
+        // 207: the bug-report intake's two definers run on the request DSN
+        // (MCP submit_bug_report / list_my_bug_reports), so both are
+        // app-callable; a missing grant refuses every report (42501).
+        (
+            "epigraph_submit_bug_report",
+            "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
+            true,
+        ),
+        (
+            "epigraph_my_bug_reports",
+            "public.epigraph_my_bug_reports(integer)",
+            true,
+        ),
         (
             "epigraph_confirm_admin_act",
             "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
@@ -3590,6 +3611,9 @@ mod definer_register_tests {
         // the caller (or the maintenance owner of 168's resolution definer,
         // which is what lets that definer through).
         "epigraph_challenge_resolution_guard",
+        // 207: the intake settings' audit trigger. It runs as the session
+        // writing the settings row, which only a maintenance session can.
+        "epigraph_bug_report_intake_settings_audit",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
