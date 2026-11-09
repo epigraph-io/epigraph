@@ -1669,6 +1669,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // every linked agent's claims name no human (quiet, the stake that makes
     // the owner a control here).
     ("epigraph_operator_bound_at", 199),
+    // 202 (workflow writes as the caller), whether a workflow lineage name has
+    // rows the session cannot read. Fails OPEN under a non-member owner: its
+    // read of the FORCEd `workflows` is then row-security filtered exactly as
+    // the caller's would be, so a hidden generation reads as absent and a
+    // non-member mints the next generation of a lineage it cannot read (the
+    // takeover the function closes). The owner is load-bearing.
+    ("epigraph_workflow_name_has_hidden_rows", 202),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the

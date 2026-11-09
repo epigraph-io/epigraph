@@ -299,11 +299,9 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
 /// `INTERNAL_ERROR`, prefixed with `context`.
 ///
 /// The executor reaches the definer through `default_decl_for_author` (the
-/// workflow ingest's one declaration, `add_step`'s step claim). On the stamped
-/// paths `system_agent_write_authority` refuses a revoked system agent first,
-/// with its own `AgentCreation` error (#498's INTERNAL_ERROR, unchanged), so
-/// this arm is what a revocation racing the preflight, or the unstamped
-/// `do_ingest_workflow_via_pool` path, would surface.
+/// workflow ingest's one undeclared owner, `add_step`'s step claim): for a
+/// caller-authored write, the caller's own default declaration (`OPL01` /
+/// `OPL02` and migration 105's refusals are all the caller's to act on).
 pub fn executor_caller_error(
     context: &str,
     e: epigraph_ingest_executor::IngestExecutorError,
@@ -324,17 +322,28 @@ pub fn executor_caller_error(
         e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
             invalid_params(format!("{context}: {e}"))
         }
-        // A declared-tenancy refusal (the caller, or the system agent, does not
-        // write the declared group): a denial, as OPL02 is.
+        // A tenancy refusal (the caller does not write the declared or
+        // inherited group, or names no principal): a denial, as OPL02 is.
         e if e.is_declared_tenancy_refusal() => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(format!("{context}: {e}")),
             data: None,
         },
         // The plan's (canonical_name, generation) is held by a `workflows` row
-        // the ingest cannot read (migration 183): a caller conflict, so an
-        // agent reads the reason instead of a logged internal error.
-        e @ epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. } => McpError {
+        // the ingest cannot read (migration 183), or the lineage it writes has
+        // generations the caller cannot read (migration 202): a caller
+        // conflict, so an agent reads the reason instead of a logged internal
+        // error.
+        //
+        // A walk stopped at an existing row it was not admitted over
+        // (`ExistingWorkflowNeedsAuthority`): an entry point checks its
+        // authority and retries, so it reaches here only unhandled. Its text
+        // names the workflow by name and generation, never by id.
+        e @ (epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+            ..
+        }) => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(format!("{context}: {e}")),
             data: None,

@@ -2,40 +2,41 @@
 //! workflow that executes the step's lineage (the REST half; the MCP half is
 //! `epigraph-mcp/tests/evolve_step_lineage_authority.rs`).
 //!
-//! Before this gate the route checked only `claims:write` and row security, so
-//! any principal that writes the step's owning group could evolve a step a
-//! workflow executes: for a group-private workflow that is every writer and
-//! admin of the group, not only the workflow's submitter. `add_step`,
-//! `delete_step` and `deprecate_workflow` already require the workflow
-//! authority (the submitter, its operator, or the audited `claims:admin`
-//! path); `evolve_step` now requires the same over each workflow with an
-//! `executes` edge into ANY member of the parent's `step_lineage_id`, so:
+//! `add_step`, `delete_step` and `deprecate_workflow` require the workflow
+//! authority (the submitter, its operator, a live writer of the workflow's
+//! owner group, or the audited `claims:admin` path); `evolve_step` requires
+//! the same over each workflow with an `executes` edge into ANY member of the
+//! parent's `step_lineage_id`, so:
 //!
-//! * a writer of the group who is not the submitter is refused, with nothing
-//!   written;
-//! * the submitter and its operator are admitted, each write recorded as a
-//!   `workflows.caller_write` row;
-//! * an agent bound to the submitting human is refused (the operator ruling of
-//!   2026-10-13: the shared host credential gains no edit rights over a human's
-//!   workflows);
+//! * a READER of the group (it reads the plan, it does not write the group)
+//!   who is not the submitter is refused by the gate, with nothing written;
+//! * the submitter, its operator and a writer of the workflow's owner group
+//!   are admitted, each write recorded as a `workflows.caller_write` row
+//!   naming its arm;
+//! * an agent bound to the submitting human gains nothing through the binding
+//!   (the operator ruling of 2026-10-13: the shared host credential gains no
+//!   edit rights over a human's workflows); only a membership of its own
+//!   would admit it;
 //! * an already-evolved head that no workflow executes directly (the
 //!   `executes` edge stays on the frozen step) is still gated, because the
 //!   gate reads the whole lineage, not the parent's own edges;
 //! * a step two workflows execute needs authority over both;
 //! * a RETRACTED `executes` edge still counts: any writer of the group can
-//!   retract one, so a gate that skipped retracted edges would let that writer
-//!   lift it;
-//! * a workflow with no recorded submitter is admin-only, and the admin write
-//!   records a `workflows.admin_write` row;
+//!   retract one, so a gate that skipped retracted edges would let it lift the
+//!   gate for everyone else;
+//! * a workflow with no recorded submitter admits a writer of its owner group
+//!   or the audited admin path, whose write records a `workflows.admin_write`
+//!   row;
 //! * a claim no workflow executes is unaffected.
 //!
 //! Every arm runs on the production pool shape: the router's connections are
 //! `epigraph_app` (no BYPASSRLS), every request carries a real JWT through
 //! `create_router`, and the harness superuser only seeds and inspects. The
-//! plan is made group-private the way an administrative restriction does it
-//! (`PrivatizationRepository::restrict_claims_conn`), and the curator is given
-//! a writer row in the group, so that every refusal asserted here is the
-//! workflow gate's (its own text), never row security's.
+//! plan is ingested public (the explicit public tenancy) and made
+//! group-private the way an administrative restriction does it
+//! (`PrivatizationRepository::restrict_claims_conn`); the refused callers read
+//! the group, so every refusal asserted here is the workflow gate's (its own
+//! text, which comes before row security), never a not-found.
 #![cfg(feature = "db")]
 
 #[allow(dead_code)]
@@ -261,15 +262,33 @@ async fn role_group(pool: &PgPool, admin: Uuid) -> Uuid {
 
 /// Give `agent` a live `writer` row in `g`.
 async fn add_writer(pool: &PgPool, g: Uuid, agent: Uuid) {
+    add_member(pool, g, agent, "writer").await;
+}
+
+/// Give `agent` a live `reader` row in `g`: it reads the plan, it does not
+/// write the group.
+async fn add_reader(pool: &PgPool, g: Uuid, agent: Uuid) {
+    add_member(pool, g, agent, "reader").await;
+}
+
+async fn add_member(pool: &PgPool, g: Uuid, agent: Uuid, role: &str) {
     sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+         VALUES ($1, $2, ''::bytea, 0, $3)",
     )
     .bind(g)
     .bind(agent)
+    .bind(role)
     .execute(pool)
     .await
-    .expect("the writer row");
+    .expect("the membership row");
+}
+
+/// The explicit public tenancy, owned by `group`.
+fn public_in(extraction: Value, group: Uuid) -> Value {
+    let mut body = extraction;
+    body["tenancy"] = json!({"visibility": "public", "owner_group_id": group});
+    body
 }
 
 /// Restrict every claim the workflow executes to `('group', g)`, and check the
@@ -347,26 +366,34 @@ async fn evolve_rows(pool: &PgPool, event_type: &str) -> Vec<(Option<Uuid>, Valu
 }
 
 /// A group-private workflow ingested over REST by `curator` (its recorded
-/// submitter), restricted to G. `writer` created G (its `admin` row); the
-/// curator holds a `writer` row, so row security admits both of them on every
-/// write here and only the workflow gate tells them apart.
+/// submitter), public in G, then restricted to G. `writer` created
+/// G (its `admin` row) and the curator holds a `writer` row: both write G, so
+/// the owner-group writer arm admits both. `reader` holds a `reader` row: it
+/// reads the plan and is refused by the gate.
 struct Plan {
     api: Api,
     workflow_id: Uuid,
     g: Uuid,
     curator: Uuid,
+    /// The curator's own (personal) group.
+    curator_own: Uuid,
     writer: Uuid,
+    reader: Uuid,
     step: Uuid,
     step_edge: Uuid,
 }
 
 async fn private_plan(pool: &PgPool, name: &str) -> Plan {
-    let (curator, _) = fixture::seed_agent_with_group(pool, "workflow-plan-curator").await;
+    let (curator, curator_g) = fixture::seed_agent_with_group(pool, "workflow-plan-curator").await;
     let (writer, _) = fixture::seed_agent_with_group(pool, "workflow-plan-writer").await;
+    let (reader, _) = fixture::seed_agent_with_group(pool, "workflow-plan-reader").await;
     let g = role_group(pool, writer).await;
     add_writer(pool, g, curator).await;
+    add_reader(pool, g, reader).await;
     let api = Api::prod_shaped(pool).await;
-    let workflow_id = api.ingest(&token(curator), &extraction(name, 3)).await;
+    let workflow_id = api
+        .ingest(&token(curator), &public_in(extraction(name, 3), g))
+        .await;
     restrict_plan(pool, workflow_id, g).await;
     let (step, step_edge) = first_step(pool, workflow_id).await;
     Plan {
@@ -374,7 +401,9 @@ async fn private_plan(pool: &PgPool, name: &str) -> Plan {
         workflow_id,
         g,
         curator,
+        curator_own: curator_g,
         writer,
+        reader,
         step,
         step_edge,
     }
@@ -426,18 +455,20 @@ async fn assert_gate_refused(
 // The arms
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A writer (here G's own admin) who is not the submitter is refused on both
-/// edge types; the submitter is admitted and its write recorded.
+/// A reader of G who is not the submitter is refused on both edge types; a
+/// writer of G (here its own admin) who is not the submitter is admitted
+/// through the owner-group writer arm; the submitter is admitted; each
+/// admitted write is recorded with its arm.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_group_writer_who_is_not_the_submitter_cannot_evolve_an_executed_step(pool: PgPool) {
+async fn a_group_reader_is_refused_and_a_group_writer_is_admitted(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-writer").await;
 
     for edge_type in ["supersedes", "revises"] {
-        let content = format!("the writer's {edge_type} of the step");
+        let content = format!("the reader's {edge_type} of the step");
         assert_gate_refused(
             &pool,
             &p.api,
-            &token(p.writer),
+            &token(p.reader),
             p.step,
             &content,
             edge_type,
@@ -472,6 +503,20 @@ async fn a_group_writer_who_is_not_the_submitter_cannot_evolve_an_executed_step(
     assert_eq!(d["write"]["parent_claim_id"], p.step.to_string(), "{d}");
     assert_eq!(d["write"]["claim_id"], head.to_string(), "{d}");
     assert_eq!(d["write"]["edge_type"], "supersedes", "{d}");
+
+    // A writer of the owner group who did not submit the workflow: admitted.
+    let (status, body) = p
+        .api
+        .evolve(&token(p.writer), head, "the writer's revision", "revises")
+        .await;
+    assert_eq!(status, StatusCode::OK, "a writer of G evolves: {body}");
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let (agent, d) = &rows[1];
+    assert_eq!(*agent, Some(p.writer), "{d}");
+    assert_eq!(d["arm"], "owner_group_writer", "{d}");
+    assert_eq!(d["owner_group"], p.g.to_string(), "{d}");
+    assert_eq!(d["submitter"], p.curator.to_string(), "{d}");
 }
 
 /// The operator arm admits the submitter's human; an agent bound to that
@@ -492,9 +537,10 @@ async fn the_submitters_operator_may_evolve_and_a_bound_agent_may_not(pool: PgPo
     add_writer(&pool, p.g, h).await;
 
     // An agent bound to H through an allowlisted service client (migration
-    // 149, arm (c)), itself a writer of G.
+    // 149, arm (c)), itself a READER of G: the binding to H gives it no
+    // authority, and it holds no membership that would.
     let (bound, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-bound").await;
-    add_writer(&pool, p.g, bound).await;
+    add_reader(&pool, p.g, bound).await;
     let client: Uuid = sqlx::query_scalar(
         "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
                                     status, agent_id, legal_entity_name, legal_contact_email) \
@@ -580,11 +626,11 @@ async fn a_second_evolve_of_an_unexecuted_head_is_still_gated(pool: PgPool) {
     assert_eq!(direct, 0, "calibration: no workflow executes the new head");
 
     for edge_type in ["supersedes", "revises"] {
-        let content = format!("the writer's {edge_type} of the head");
+        let content = format!("the reader's {edge_type} of the head");
         assert_gate_refused(
             &pool,
             &p.api,
-            &token(p.writer),
+            &token(p.reader),
             head,
             &content,
             edge_type,
@@ -631,11 +677,17 @@ async fn a_second_evolve_of_an_unexecuted_head_is_still_gated(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_step_two_workflows_execute_needs_authority_over_both(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-shared").await;
-    let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
-    add_writer(&pool, p.g, other).await;
+    // `other` submits the second workflow, public in its own group (which the
+    // curator does not write), and only READS G: neither has authority over
+    // the other's workflow.
+    let (other, other_g) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
+    add_reader(&pool, p.g, other).await;
     let second = p
         .api
-        .ingest(&token(other), &extraction("acme-evolve-shared-b", 1))
+        .ingest(
+            &token(other),
+            &public_in(extraction("acme-evolve-shared-b", 1), other_g),
+        )
         .await;
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
@@ -695,8 +747,8 @@ async fn a_step_two_workflows_execute_needs_authority_over_both(pool: PgPool) {
 }
 
 /// Any writer of G can retract an `executes` edge of a G-private plan
-/// (`DELETE /api/v1/edges/:id`). Retracting it does not lift the gate, and
-/// does not lock the submitter out either.
+/// (`DELETE /api/v1/edges/:id`). Retracting it does not lift the gate for a
+/// caller without authority, and does not lock the submitter out either.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retracting_the_executes_edge_does_not_lift_the_gate(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-retracted").await;
@@ -724,9 +776,9 @@ async fn retracting_the_executes_edge_does_not_lift_the_gate(pool: PgPool) {
     assert_gate_refused(
         &pool,
         &p.api,
-        &token(p.writer),
+        &token(p.reader),
         p.step,
-        "the writer's revision after the retraction",
+        "the reader's revision after the retraction",
         "supersedes",
         p.workflow_id,
         GATE_TEXT,
@@ -753,28 +805,53 @@ async fn retracting_the_executes_edge_does_not_lift_the_gate(pool: PgPool) {
     assert_eq!(d["write"]["parent_claim_id"], p.step.to_string(), "{d}");
 }
 
-/// A workflow with no recorded submitter is platform corpus: a writer of G,
-/// even the agent that ingested it, is refused; the audited admin path is
-/// admitted and records a `workflows.admin_write` row on the application
-/// role; a `claims:admin` token whose client record grants nothing is
-/// refused ADM02.
+/// A workflow with no recorded submitter, whose ROW is owned by the curator's
+/// own group while its plan is private to G (the row is moved back to
+/// `('public', curator_own)` by the harness): a reader of G is refused; the
+/// curator, a writer of the row's owner group, is admitted through the
+/// owner-group writer arm; an admin that writes G (the step's group) but not
+/// the row's owner group reaches only the audited admin path, which records a
+/// `workflows.admin_write` row on the application role; a `claims:admin`
+/// token whose client record grants nothing is refused ADM02.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_executed_step_of_a_legacy_workflow_is_admin_only(pool: PgPool) {
+async fn an_executed_step_of_a_legacy_workflow_admits_a_group_writer_or_the_admin(pool: PgPool) {
     let p = private_plan(&pool, "acme-evolve-legacy").await;
     set_submitter(&pool, p.workflow_id, None).await;
+    sqlx::query("UPDATE workflows SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+        .bind(p.workflow_id)
+        .bind(p.curator_own)
+        .execute(&pool)
+        .await
+        .expect("the row in the curator's own group");
 
     assert_gate_refused(
         &pool,
         &p.api,
-        &token(p.curator),
+        &token(p.reader),
         p.step,
-        "the ingester's revision of a legacy step",
+        "the reader's revision of a legacy step",
         "revises",
         p.workflow_id,
         "has no recorded submitter",
     )
     .await;
+    let (status, body) = p
+        .api
+        .evolve(
+            &token(p.curator),
+            p.step,
+            "the ingester's revision",
+            "revises",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "a writer of G: {body}");
+    let rows = evolve_rows(&pool, CALLER_WRITE).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["arm"], "owner_group_writer", "{rows:?}");
+    assert!(rows[0].1["submitter"].is_null(), "{rows:?}");
 
+    // The admin writes G (the step's group) and not the row's owner group, so
+    // only the admin arm can admit it.
     let (admin, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-admin").await;
     add_writer(&pool, p.g, admin).await;
     let admin_scopes = &["claims:read", "claims:write", "claims:admin"];
@@ -820,7 +897,7 @@ async fn an_executed_step_of_a_legacy_workflow_is_admin_only(pool: PgPool) {
     assert_eq!(*agent, Some(admin), "the audit row names the admin: {d}");
     assert_eq!(d["workflow_id"], p.workflow_id.to_string(), "{d}");
     assert!(d["submitter"].is_null(), "{d}");
-    assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
+    assert_eq!(evolve_rows(&pool, CALLER_WRITE).await.len(), 1);
 }
 
 /// A G-private claim no workflow executes is evolved exactly as before, by

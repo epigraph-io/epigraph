@@ -813,6 +813,12 @@ pub struct StoreWorkflowParams {
     )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
+
+    #[schemars(
+        description = "Optional declared tenancy, as for ingest_workflow: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} keeps the workflow private to that group; {\"visibility\": \"public\", \"owner_group_id\": <uuid>} publishes it, owned by that group (the only way to make a new workflow public). You must yourself hold a live writer or admin membership of the group. Omitted: the workflow is private to its owner group, your one team group if you write exactly one, else your own default (personal) group."
+    )]
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -936,7 +942,7 @@ pub struct IngestWorkflowParams {
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
 
     #[schemars(
-        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest. The workflows row (canonical_name, goal, metadata, and the goal embedding unless embed is false) stays instance-readable, so keep those neutral. Omit for the default: public, except that a new generation of a group-private lineage (a later generation of its canonical_name, or a variant of a group-private parent) inherits that lineage's group, and the calling agent itself must then write that group."
+        description = "Optional declared tenancy for the workflow row and the claims this ingest creates. {\"visibility\": \"group\", \"owner_group_id\": <uuid>}: readable only by live members of the group. {\"visibility\": \"public\", \"owner_group_id\": <uuid>}: readable by everyone, owned by the group; this is the only way to make a new workflow public. Either way the calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), else the call is refused and nothing is written. Omitted: a NEW workflow is private to its owner group (your one team group if you write exactly one, else your own default group: your personal group, or your operator's for an operated agent); a new generation keeps its lineage's visibility (a public lineage stays public, in its group when you write it, else in your own group; a group lineage stays in its group, which you must write). Declaring public on a new generation of a group-private lineage is refused. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and, when tenancy is given, are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest."
     )]
     #[serde(default)]
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,

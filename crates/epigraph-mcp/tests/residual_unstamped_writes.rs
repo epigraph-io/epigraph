@@ -967,10 +967,11 @@ fn the_production_embedder_scan_sees_the_two_known_sites() {
 // this" and "you have to work at it".
 //
 // WHAT IT STILL DOES NOT PIN, stated so the next reader does not over-trust it:
-// that the `tx` came from the SYSTEM agent's viewer rather than some other one.
-// A stamped-from-the-wrong-author transaction is spelled `&mut tx` too. That
-// axis remains `scripts/e2e/probe-workflow.sh`'s, exactly as the header above
-// says for the first ratchet.
+// that the `tx` came from the CALLER's viewer (workflow writes are made as the
+// caller) rather than some other one. A stamped-from-the-wrong-author
+// transaction is spelled `&mut tx` too. That axis is pinned behaviourally by
+// `epigraph-api/tests/workflow_writes_as_caller.rs` (every created row's
+// `agent_id` is the caller's) and `scripts/e2e/probe-workflow.sh`.
 // ===========================================================================
 
 /// The executor entry points whose first argument decides whether the ingest is
@@ -998,12 +999,13 @@ const EXECUTOR_ENTRY_POINTS: &[&str] = &[
 const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
     (
         "epigraph-api/src/routes/workflows.rs",
-        4,
-        4,
-        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` (one \
-         `execute_workflow_ingest_plan` / `execute_workflow_ingest_plan_in_group` each) plus `POST /workflows/steps` and \
-         `/workflows/steps/delete`. All four stamp through this module's own \
-         `begin_system_ingest_stamped_tx`; none is exempt.",
+        3,
+        3,
+        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` share ONE \
+         `execute_workflow_ingest_plan_in_group` call (`execute_admitted_ingest`, which also \
+         checks the lineage gate over a row the walk did not create), plus `POST \
+         /workflows/steps` and `/workflows/steps/delete`. All three stamp through this \
+         module's own `begin_caller_workflow_tx`; none is exempt.",
     ),
     (
         "epigraph-mcp/src/tools/step_ops.rs",
@@ -1029,13 +1031,15 @@ const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
 
 /// The helper each production caller must use to obtain its `tx`. One NAME, two
 /// definitions: `epigraph-mcp`'s lives in `claim_helper.rs` and `epigraph-api`'s
-/// in `routes/workflows.rs`, with the same semantics and the same stamp.
-const STAMP_HELPER_NAME: &str = "begin_system_ingest_stamped_tx";
+/// in `routes/workflows.rs`, with the same semantics and the same stamp: the
+/// CALLER's own viewer (workflow writes are made as the caller; this was
+/// `begin_system_ingest_stamped_tx`, the shared system agent's stamp).
+const STAMP_HELPER_NAME: &str = "begin_caller_workflow_tx";
 
 /// Spellings that count as "this file names the stamp helper at all".
 const STAMP_HELPERS: &[&str] = &[
-    "claim_helper::begin_system_ingest_stamped_tx",
-    "begin_system_ingest_stamped_tx",
+    "claim_helper::begin_caller_workflow_tx",
+    "begin_caller_workflow_tx",
 ];
 
 /// `(relative file, total executor calls, calls passing `&mut tx`)`.

@@ -1845,9 +1845,20 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          lineage-takeover fix), to decide which existing rows need the caller's authority. \
          Since migration 183 (ruling R-74) `workflows` carries its plan's tenancy and row \
          security, so the stamp of the connection it runs on bounds what it sees: the ingest \
-         entry points call it on the plan walk's own transaction, stamped from the ingest \
-         system agent, which reads every group it ingests into; a caller viewer predicate could \
-         only hide an anchor and so skip an authority check.",
+         entry points call it on the plan walk's own transaction, stamped from the CALLER \
+         (workflow writes are made as the caller), after migration 202's \
+         `name_has_hidden_rows_conn` refused a name with rows that stamp cannot read; a caller \
+         viewer predicate could only hide an anchor and so skip an authority check.",
+    ),
+    (
+        "workflow.rs",
+        "name_has_hidden_rows_conn",
+        "READ of NO table directly: one boolean from migration 202's maintenance-owned \
+         definer, whether some `workflows` row of a name fails 183's read policy for the \
+         SESSION (its stamp's groups). The question is exactly what the caller's own view \
+         cannot answer (row security hides the rows asked about), so a viewer predicate is \
+         meaningless here; no row, id or count reaches a caller, and a true answer refuses \
+         the write.",
     ),
     (
         "workflow.rs",
@@ -1856,8 +1867,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          parent at `generation - 1` or the lineage's predecessor. Since migration 183 (ruling \
          R-74) `workflows` carries its plan's tenancy and row security, so the stamp of the \
          connection it runs on bounds what it sees: the executor and `ingest_anchors` both call \
-         it on the plan walk's system-agent-stamped transaction, so the row authority-checked \
-         is the row linked.",
+         it on the plan walk's caller-stamped transaction, so the row authority-checked is the \
+         row linked.",
     ),
     (
         "workflow.rs",
@@ -2395,6 +2406,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          write made on another principal's stamp (`add_step` into a group plan, on the \
          workflow-ingest system agent's stamp, ruling R-98), so a viewer predicate would ask \
          about the wrong principal; it returns one boolean and no row reaches a caller.",
+    ),
+    (
+        "group_membership.rs",
+        "live_team_writer_groups_conn",
+        "READ of the CALLER's own live writer/admin memberships (migration 077's \
+         `epigraph_live_memberships` definer, the read `Viewer::resolve` is built from) joined \
+         to `groups` on the caller's OWN stamp (groups_tenancy filters it to the stamp's \
+         groups). It answers which team group a caller-authored workflow write lands in \
+         (`epigraph_ingest_executor::owner`), a question about the writing principal itself on \
+         a transaction stamped from it; a spliced viewer would be the same set the stamp was \
+         computed from, and the live definer is what catches a membership revoked since. \
+         Returns group ids the caller writes, no row of anyone else.",
     ),
     (
         "group_membership.rs",
@@ -3628,9 +3651,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
          set of `deprecate_workflow`). Since migration 183 (ruling R-74) `workflows` carries \
          its plan's tenancy and row security, so the stamp of the connection it runs on bounds \
-         what it sees: on the system-agent stamp (MCP) every group it ingests into, on the \
-         caller's stamp (REST) the rows the caller reads; a descendant outside that set is not \
-         deprecated by this call.",
+         what it sees: on the caller's stamp the rows the caller reads. A cascade whose \
+         lineage has a row outside that set is refused (`canonical_names_of` + migration 202's \
+         hidden-rows check), never deprecated in part.",
+    ),
+    (
+        "workflow.rs",
+        "canonical_names_of",
+        "READ of `workflows` only: the distinct `canonical_name`s of a cascade's target rows, \
+         which `deprecate_workflow` hands to migration 202's hidden-rows check. Since migration \
+         183 (ruling R-74) `workflows` carries its plan's tenancy and row security, so the \
+         stamp of the connection it runs on (the caller's) bounds what it sees; the targets \
+         were themselves read on that stamp, and there is no read for a viewer to filter.",
     ),
     (
         "workflow.rs",

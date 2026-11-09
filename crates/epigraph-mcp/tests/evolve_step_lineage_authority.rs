@@ -3,8 +3,9 @@
 //! production pool shape, is `epigraph-api/tests/evolve_step_lineage_authority.rs`).
 //!
 //! `add_step`, `delete_step` and `deprecate_workflow` require the workflow
-//! authority of `tools/workflow_authority.rs` (the submitter, its operator, or
-//! the audited `claims:admin` path); `evolve_step` checked none, so any
+//! authority of `tools/workflow_authority.rs` (the submitter, its operator, a
+//! writer of the workflow's owner group, or the audited `claims:admin` path);
+//! `evolve_step` checked none, so any
 //! `claims:write` caller could branch or retire a step another caller's
 //! workflow executes. These arms pin:
 //!
@@ -97,8 +98,10 @@ fn token(agent: Uuid, client_id: Uuid) -> AuthContext {
     }
 }
 
-/// Ingest `canonical` as `submitter` over the authenticated transport; returns
-/// the workflow id and its level-2 step.
+/// Ingest `canonical` as `submitter` over the authenticated transport, public
+/// in its own group (the explicit public tenancy: every other caller here
+/// reads it and none writes that group); returns the workflow id and its
+/// level-2 step.
 async fn ingest_as(
     server: &EpiGraphMcpFull,
     pool: &PgPool,
@@ -111,7 +114,7 @@ async fn ingest_as(
         viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(viewer)),
             embed: None,
         },
         Some(auth),
