@@ -28,7 +28,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// and deliberately not `is_current`-filtered; an id it does not return gets `[]`.
 ///
 /// NOT ONE SNAPSHOT. The caller's row read and this label read are two
-/// statements on `server.pool`, so a concurrent `update_labels` between them can
+/// statements on the caller's stamped read (`conn`, from
+/// `EpiGraphMcpFull::read_as`). That is a bare connection in `Session` mode and a
+/// READ COMMITTED transaction otherwise, so each statement takes its own
+/// snapshot either way, and a concurrent `update_labels` between them can
 /// pair a row with its newer labels. That is the same accepted shape as
 /// `query_claims` (backlog `babd5904`); both errors propagate, so nothing is
 /// silently defaulted. `query_paper` and `query_undecomposed_claims` read the
