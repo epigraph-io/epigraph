@@ -2812,6 +2812,82 @@ async fn native_beside_public(pool: &PgPool, fx: &Fx, owner: Uuid) -> (Uuid, Uui
     (n0, n1, np)
 }
 
+/// In place the target IS the source, so a catch-up can only narrow the
+/// source's own public rows into its own private state: no act need be on
+/// record. A personal lineage with a natively private generation beside a
+/// public one is held by the main in-place act, whose hint names plain
+/// `--catch-up` (no act moved generation 0, so there is no manifest to name);
+/// a plain `--catch-up` then narrows generation 1 and its step, leaves
+/// generation 0 as it is, leaves nothing of the lineage public, exits 0, and
+/// its reversal restores exactly the state it found.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_in_place_narrows_a_public_generation_beside_a_native_private_one(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (n0, n1, np) = native_beside_public(&pool, &fx, fx.src).await;
+    let in_place = (fx.src, "group".to_string());
+    let src_public = (fx.src, "public".to_string());
+    let dir = scratch_dir();
+    let m1 = dir.join("m1.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m1, fx.src, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(
+            &r.stdout,
+            "HELD-LINEAGE\tmissing\t",
+            &["partly the target's", "--catch-up"]
+        ) && !line_with(&r.stdout, "HELD-LINEAGE\tmissing\t", &["--after-manifest"]),
+        "in place the hint names plain --catch-up, never a manifest no act wrote: {}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m1, fx.src, Some("3"), GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        tenancy(&pool, "workflows", n1).await,
+        src_public,
+        "PREMISE: the main act holds the lineage"
+    );
+
+    let m2 = dir.join("m2.jsonl");
+    let before = snapshot_sans_epoch(&pool).await;
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.src, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        !r.stdout.contains("HELD-LINEAGE\tmissing\t")
+            && line_with(&r.stdout, "WORKFLOW\t", &[&n1.to_string()])
+            && r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "an in-place catch-up takes the public generation: {}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.src, Some("1"), CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(tenancy(&pool, "workflows", n0).await, in_place);
+    assert_eq!(tenancy(&pool, "workflows", n1).await, in_place);
+    assert_eq!(tenancy(&pool, "claims", np).await, in_place);
+    assert_eq!(
+        app_reads_claims(&pool, &[np]).await,
+        Vec::<String>::new(),
+        "an unstamped session still reads the narrowed step"
+    );
+    let public: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM workflows WHERE canonical_name = 'missing' \
+            AND visibility = 'public'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(public, 0, "a generation of the lineage stayed public");
+
+    let rev = reverse(&pool, &m2, true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "the catch-up's reversal must restore exactly the state it found: {}",
+        rev.show()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The same shape in a MOVE: generation 0 natively in the TARGET's private
 /// state, generation 1 in SRC's public state. No act moved generation 0, so a
 /// catch-up must never take generation 1 into the target on a shared name: it

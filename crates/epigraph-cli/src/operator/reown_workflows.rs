@@ -61,18 +61,24 @@
 //!   generation in the TO state, and its other generations are STRAY (FROM,
 //!   or, in a move, the source's private state, which is neither FROM nor
 //!   TO). A lineage with no generation in TO is the main act's, never a
-//!   catch-up's: SKIPPED when it is all FROM, HELD otherwise. And the act
-//!   must be on record: at least one of the lineage's TO generations must be
-//!   one an `--after-manifest` (the manifest of the act it catches up to, or
-//!   of an earlier catch-up of it) moved into exactly this run's TO state. A
-//!   lineage whose TO generations no such manifest moved is HELD
-//!   (`NotActed`): the target may own it natively, and a catch-up must never
-//!   hand the source's private rows to a group just because that group owns
-//!   a generation of the same name. One recorded generation is enough: an
-//!   act takes a lineage only whole, so a TO generation it did not record
-//!   joined after it (an undeclared re-ingest lands in TO, see below).
-//!   Without `--after-manifest` every lineage with a TO generation is held.
-//!   The rule is the same in place. A catch-up
+//!   catch-up's: SKIPPED when it is all FROM, HELD otherwise. In a MOVE the
+//!   act must also be on record: at least one of the lineage's TO
+//!   generations must be one an `--after-manifest` (the manifest of the act
+//!   it catches up to, or of an earlier catch-up of it) moved into exactly
+//!   this run's TO state. A lineage whose TO generations no such manifest
+//!   moved is HELD (`NotActed`), by design: the target may own it natively,
+//!   a catch-up must never hand the source's rows to a group just because
+//!   that group owns a generation of the same name, and no act of this tool
+//!   takes such a lineage (it stays until a ruling). One recorded generation
+//!   is enough: an act takes a lineage only whole, so a TO generation it did
+//!   not record joined after it (an undeclared re-ingest lands in TO, see
+//!   below). Without `--after-manifest`, a move's catch-up holds every
+//!   lineage with a TO generation. IN PLACE no act need be on record, and
+//!   `NotActed` never applies: TO is the source's own private state, so a
+//!   catch-up can only narrow the source's own public generations (and
+//!   their plan rows) into it, whether its TO generations were narrowed by
+//!   an act or were private from the start. A plain `--catch-up` does it; an
+//!   `--after-manifest` is still checked there, but not needed. A catch-up
 //!   changes the stray generations and their plan rows under the main act's
 //!   rules, with ONE exemption from the hand-off rule, for the stray
 //!   generations' OWN rows ([`StrayScope`]): their `workflows` rows, the
@@ -412,8 +418,9 @@ pub struct Options {
     /// `--catch-up` (see [`Act::catch_up`]); needs `--visibility group`.
     pub catch_up: bool,
     /// `--after-manifest` (`--catch-up` only): the manifests of the acts a
-    /// catch-up follows. A catch-up takes a lineage only when one of its TO
-    /// generations is a row one of them moved into the TO state.
+    /// catch-up follows. A move's catch-up takes a lineage only when one of
+    /// its TO generations is a row one of them moved into the TO state; in
+    /// place they are checked but not needed.
     pub after_manifests: Vec<PathBuf>,
     /// Lineages per transaction (a component is never split).
     pub batch_size: usize,
@@ -648,13 +655,14 @@ pub enum LineageHold {
     NotPublic {
         generation: i32,
         visibility: String,
-        /// A source-private generation of a lineage with a generation in the
-        /// TO state: `--catch-up` takes it.
+        /// (A move only.) A source-private generation of a lineage with a
+        /// generation in the TO state: `--catch-up` takes it when an act on
+        /// record moved those generations there.
         catch_up: bool,
     },
-    /// `--catch-up`: the lineage has generations in the TO state, but no
-    /// `--after-manifest` moved any of them there (the target may own it
-    /// natively), so it is not a catch-up's.
+    /// `--catch-up` in a MOVE (never in place): the lineage has generations
+    /// in the TO state, but no `--after-manifest` moved any of them there
+    /// (the target may own it natively), so it is not a catch-up's.
     NotActed {
         target_gens: Vec<i32>,
     },
@@ -1359,7 +1367,8 @@ async fn classify_narrowing(
 
 /// Plan the listed lineages: which hold, which are done, and per component
 /// what moves. `acted` (`--catch-up`): the `workflows` rows the
-/// `--after-manifest`s moved into the TO state ([`acted_generations`]).
+/// `--after-manifest`s moved into the TO state ([`acted_generations`]); read
+/// only in a move (in place no act need be on record).
 ///
 /// # Errors
 /// A read fails.
@@ -1472,11 +1481,15 @@ pub async fn plan(
                 Some(w) => out.held.push((name.clone(), not_public(w, false))),
             }
             continue;
-        } else if !to_g.is_empty() && !to_g.iter().any(|w| acted.contains(&w.id)) {
-            // A stray lineage, but no act on record moved its TO generations:
-            // the target may own it natively, so its source rows are no
-            // catch-up's. Vacuous without a TO generation: whether such a
-            // lineage is a catch-up's at all is the stray rule's alone.
+        } else if !act.in_place() && !to_g.is_empty() && !to_g.iter().any(|w| acted.contains(&w.id))
+        {
+            // A stray lineage of a MOVE, but no act on record moved its TO
+            // generations: the target may own it natively, so its source rows
+            // are no catch-up's. In place TO is the source's own private
+            // state, so a catch-up only narrows the source's own public rows
+            // into it, and no act need be on record. Vacuous without a TO
+            // generation: whether such a lineage is a catch-up's at all is
+            // the stray rule's alone.
             out.held.push((
                 name.clone(),
                 LineageHold::NotActed {
@@ -2940,7 +2953,7 @@ pub struct RunReport {
 /// workflow rows than the operator confirmed, held a lineage on a hand-off, or
 /// left a plan row of a narrowed lineage public (a shortfall must not pass as
 /// success); else 0. A lineage the plan holds for its state (`NotPublic`,
-/// `OwnedElsewhere`, `PartlyMoved`, `NotActed`) is reported and exits 0: the
+/// `OwnedElsewhere`, `PartlyMoved`, a move's `NotActed`) is reported and exits 0: the
 /// dry run excluded it from the confirmed count, and it is not this act's.
 #[must_use]
 pub fn exit_code(report: &RunReport, opts: &Options) -> i32 {

@@ -834,17 +834,22 @@ enum Command {
         /// state; every other row keeps the hand-off rule, so a private
         /// derived row or an edge to a row outside the plans holds the lineage
         /// (exit 3 under `--apply`). Audited and reversed like the main act.
-        /// The act must be on record: see `--after-manifest`.
+        /// In a move the act must be on record: see `--after-manifest`. In
+        /// place no act need be: a plain `--catch-up` narrows the source's
+        /// public generations of any lineage with a generation in its private
+        /// state.
         #[arg(long)]
         catch_up: bool,
         /// With `--catch-up`, repeatable: the manifest of the act the catch-up
         /// follows (and of any earlier catch-up of it), from the same source
-        /// and target. A catch-up takes a lineage only when one of its
+        /// and target. A move's catch-up takes a lineage only when one of its
         /// target-state generations is a row such a manifest moved into the
         /// target state; any other lineage with a target-state generation (one
-        /// the target may own natively) is held and reported. Without it,
-        /// every such lineage is held. A held lineage is not a hand-off: an
-        /// `--apply` that holds only such lineages exits 0.
+        /// the target may own natively) is held by design and reported, and
+        /// no act of this tool takes it. Without it, a move's catch-up holds
+        /// every such lineage. In place it is checked but not needed. A held
+        /// lineage is not a hand-off: an `--apply` that holds only such
+        /// lineages exits 0.
         #[arg(long = "after-manifest")]
         after_manifest: Vec<PathBuf>,
         /// The operator (a person's agent id) the act is attributed to.
