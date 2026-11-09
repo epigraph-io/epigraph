@@ -415,7 +415,10 @@ impl AuthoredByRepository {
         // that recorded THIS claim through it (each principal keeps its own
         // rows), the creating ingest first. A principal that ingested the
         // document without recording the claim adds no author to it.
-        let creator_key = ingests.creator.as_ref().map(|c| (c.paper_id, c.ingested_by));
+        let creator_key = ingests
+            .creator
+            .as_ref()
+            .map(|c| (c.paper_id, c.ingested_by));
         let mut writers: Vec<(Uuid, Uuid, i32)> = Vec::new();
         for r in &ingests.records {
             let rank = i32::from(Some((r.paper_id, r.ingested_by)) != creator_key);

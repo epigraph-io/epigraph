@@ -893,7 +893,10 @@ async fn a_strangers_naming_never_makes_a_registered_author_primary_of_its_graft
     assert_eq!(
         authored_rows(&pool, d).await,
         {
-            let mut v = vec![(c_id, c_id.to_string(), false), (c_id, s_id.to_string(), true)];
+            let mut v = vec![
+                (c_id, c_id.to_string(), false),
+                (c_id, s_id.to_string(), true),
+            ];
             v.sort();
             v
         },
@@ -976,15 +979,28 @@ async fn a_strangers_naming_never_makes_a_registered_author_primary_of_its_graft
     spine_wait(
         &c,
         &pool,
-        doc_with_text(d2, me.clone(), "A thesis the author's own spine states.", &[]),
+        doc_with_text(
+            d2,
+            me.clone(),
+            "A thesis the author's own spine states.",
+            &[],
+        ),
     )
     .await;
     let c_created = created_by(&pool, d2, c_id).await;
-    assert!(!c_created.is_empty(), "CALIBRATION: the author's spine created claims");
+    assert!(
+        !c_created.is_empty(),
+        "CALIBRATION: the author's spine created claims"
+    );
     spine_wait(
         &s,
         &pool,
-        doc_with_text(d2, me.clone(), "A thesis only the stranger's spine states.", &[]),
+        doc_with_text(
+            d2,
+            me.clone(),
+            "A thesis only the stranger's spine states.",
+            &[],
+        ),
     )
     .await;
     let s_created = created_by(&pool, d2, s_id).await;
@@ -1107,7 +1123,10 @@ async fn every_surface_reads_one_ingests_own_rows_for_a_graft_under_a_shared_key
 
     // The cards: each counts the claims of the ingests that named it.
     let claim_set = |listed: &Value| -> Vec<Value> {
-        listed_claims(listed).into_iter().map(|(id, _)| id).collect()
+        listed_claims(listed)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     };
     let mut union = claim_set(&by_a);
     union.extend(claim_set(&by_s));
@@ -1140,7 +1159,11 @@ async fn every_surface_reads_one_ingests_own_rows_for_a_graft_under_a_shared_key
     .await;
     let late = name_node(&pool, "Late Addendum").await;
     let block = get_claim_as(&a, &pool, third, x).await;
-    assert_eq!(ids(&block["paper"]["authors"]), vec![json!(ingrid)], "{block}");
+    assert_eq!(
+        ids(&block["paper"]["authors"]),
+        vec![json!(ingrid)],
+        "{block}"
+    );
     assert_eq!(added(&block), vec![(json!(late), json!(a_id))], "{block}");
     let by_a = query_paper(&a, &pool, d).await;
     let card_late = card_as(&a, &pool, third, late).await["counts"].clone();
@@ -1171,7 +1194,10 @@ async fn a_strangers_earlier_pending_naming_never_demotes_the_authors_own_claim(
     let own = "An atom only the author's own ingest states.";
     ingest_wait(&s, &pool, doc_with_atoms(d, me.clone(), &[theirs])).await;
     ingest_wait(&c, &pool, doc_with_atoms(d, me.clone(), &[own])).await;
-    let (w, z) = (claim_of(&pool, d, theirs).await, claim_of(&pool, d, own).await);
+    let (w, z) = (
+        claim_of(&pool, d, theirs).await,
+        claim_of(&pool, d, own).await,
+    );
     assert!(
         created_by(&pool, d, c_id).await.contains(&z),
         "CALIBRATION: the author's own ingest created its claim"
@@ -1179,14 +1205,22 @@ async fn a_strangers_earlier_pending_naming_never_demotes_the_authors_own_claim(
     for caller in [third, c_id, s_id] {
         let block = get_claim_as(&c, &pool, caller, z).await;
         assert_eq!(block["ingested_by"]["agent"]["id"], json!(c_id), "{block}");
-        assert_eq!(ids(&block["paper"]["authors"]), vec![json!(c_id)], "{block}");
+        assert_eq!(
+            ids(&block["paper"]["authors"]),
+            vec![json!(c_id)],
+            "{block}"
+        );
         assert_eq!(
             block["paper"]["pending_authors"],
             json!([]),
             "a stranger's pending naming is not read on a claim it never recorded: {block}"
         );
         let block = get_claim_as(&c, &pool, caller, w).await;
-        assert_eq!(ids(&block["paper"]["authors"]), Vec::<Value>::new(), "{block}");
+        assert_eq!(
+            ids(&block["paper"]["authors"]),
+            Vec::<Value>::new(),
+            "{block}"
+        );
         assert_eq!(
             ids(&block["paper"]["pending_authors"]),
             vec![json!(c_id)],

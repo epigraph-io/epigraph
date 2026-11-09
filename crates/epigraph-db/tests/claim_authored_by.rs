@@ -1188,7 +1188,15 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     // never primary. That ingest converged on the claim, so it recorded it.
     let added_later = author_node(&pool, "Added Later").await;
     authored(&pool, added_later, doc, second, json!({"position": 1})).await;
-    ingested(&pool, doc, claim, second, false, &[named_person, added_later]).await;
+    ingested(
+        &pool,
+        doc,
+        claim,
+        second,
+        false,
+        &[named_person, added_later],
+    )
+    .await;
     // A principal that ingested the same document key WITHOUT recording this
     // claim: none of its rows, plain or pending, is an author of the claim.
     let (outsider, _) = fixture::seed_agent_with_group(&pool, "outsider-ingester").await;
