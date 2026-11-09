@@ -6,9 +6,12 @@
 //! (`epigraph-mcp/tests/ingest_author_resolution.rs` pins that, through the
 //! real ingest). Pinned here, with records written by the same writer
 //! (`ClaimIngestRepository::record_signed_conn`):
-//! * a record counts only while the SAME paper's `asserts` edge onto the claim
-//!   is in force AND readable: a record whose assertion was retracted, or
-//!   whose paper never asserted the claim, is not listed;
+//! * a record counts only while the SAME paper's `asserts` edge onto the claim,
+//!   written by the SAME ingest principal, is in force AND readable: a record
+//!   whose assertion was retracted, whose paper never asserted the claim, or
+//!   that rests on another principal's assertion of it, is not listed;
+//! * an unmarked record of (paper, claim, ingester) never stops the
+//!   ingester's own marked one from being written;
 //! * an `asserts` edge with no record makes no ingest (never inferred from
 //!   the edge), and only an ingest-written record on an ingest-written
 //!   assertion counts (a hand-written copy of either is no ingest);
@@ -36,16 +39,15 @@ async fn paper(pool: &PgPool, doi: &str) -> Uuid {
         .expect("paper")
 }
 
-/// The ingest's `paper -asserts-> claim` edge, written as the walk writes it
-/// (ingest-written; the first ingester's, which the paper's assertion
-/// deduplicates onto).
-async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid) -> Uuid {
+/// `by`'s ingest's `paper -asserts-> claim` edge, written as the walk writes
+/// it (ingest-written, marked by `by`: every ingest principal keeps its own).
+async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("conn");
     epigraph_db::create_ingest_written_edge_if_absent_conn(
         &mut conn,
         None,
         "ingest_document",
-        Uuid::nil(),
+        by,
         paper,
         "paper",
         claim,
@@ -117,19 +119,19 @@ async fn a_record_counts_only_with_its_papers_readable_in_force_assertion(pool: 
     );
     let public = fixture::public_viewer(&pool).await;
 
-    asserts(&pool, p1, claim).await;
+    asserts(&pool, p1, claim, filer).await;
     assert!(record(&pool, p1, claim, filer, true).await);
-    asserts(&pool, p2, claim).await;
+    asserts(&pool, p2, claim, other).await;
     assert!(record(&pool, p2, claim, other, false).await);
     // A paper that asserts the claim with NO record (an edge written outside
     // the ingest), and a record whose paper never asserted the claim.
-    asserts(&pool, p3, claim).await;
+    asserts(&pool, p3, claim, filer).await;
     let stray = paper(&pool, "10.9999/record-read-stray").await;
     assert!(record(&pool, stray, claim, other, false).await);
     // A record claiming creation for an ingester that is not the claim's
     // filer: the walk files every claim it creates, so it is a convergence.
     let p4 = paper(&pool, "10.9999/record-read-4").await;
-    asserts(&pool, p4, claim).await;
+    asserts(&pool, p4, claim, other).await;
     assert!(record(&pool, p4, claim, other, true).await);
 
     let (records, creator) = read(&pool, &public, claim).await;
@@ -174,7 +176,7 @@ async fn a_group_private_ingest_record_is_the_groups(pool: PgPool) {
     let (outsider, _) = fixture::seed_agent_with_group(&pool, "ingest-record-outsider").await;
     let claim = fixture::seed_group_claim(&pool, member, group, "a group's claim").await;
     let p = paper(&pool, "10.9999/record-group").await;
-    asserts(&pool, p, claim).await;
+    asserts(&pool, p, claim, member).await;
     assert!(record(&pool, p, claim, member, true).await);
     let vis: Vec<String> = sqlx::query_scalar(
         "SELECT visibility FROM edges WHERE source_id = $1 AND target_id = $2 ORDER BY 1",
@@ -214,7 +216,7 @@ async fn only_an_ingest_written_record_on_an_ingest_written_assertion_is_read(po
     // A hand-written record (the walk's properties, no marker) on the walk's
     // assertion.
     let p1 = paper(&pool, "10.9999/record-mark-1").await;
-    asserts(&pool, p1, claim).await;
+    asserts(&pool, p1, claim, filer).await;
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                             properties) \
@@ -242,7 +244,7 @@ async fn only_an_ingest_written_record_on_an_ingest_written_assertion_is_read(po
 
     // CONTROL: the walk's record on the walk's assertion.
     let p3 = paper(&pool, "10.9999/record-mark-3").await;
-    asserts(&pool, p3, claim).await;
+    asserts(&pool, p3, claim, filer).await;
     assert!(record(&pool, p3, claim, filer, true).await);
     assert_eq!(
         read(&pool, &public, claim).await,
@@ -323,4 +325,73 @@ async fn the_record_writer_declares_only_its_own_insert(pool: PgPool) {
         refused,
         "a write after the record kept the ingest declaration: {r:?}"
     );
+}
+
+/// A record counts only on its OWN ingester's assertion. Every ingest
+/// principal keeps a `paper -asserts-> claim` edge of its own, so ingester B's
+/// record of a claim that only A's ingest asserted (B wrote no assertion of
+/// it) rests on another principal's word and is not B's ingest of the claim.
+/// Once B's own assertion exists, B's record is read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_record_counts_only_on_its_own_ingesters_assertion(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "ingest-record-a").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "ingest-record-b").await;
+    let claim = fixture::seed_public_claim(&pool, a, "a claim two principals record").await;
+    let p = paper(&pool, "10.9999/record-own-assertion").await;
+    let public = fixture::public_viewer(&pool).await;
+
+    asserts(&pool, p, claim, a).await;
+    assert!(record(&pool, p, claim, a, true).await);
+    assert!(record(&pool, p, claim, b, false).await);
+    assert_eq!(
+        read(&pool, &public, claim).await,
+        (vec![(p, a, true)], Some(p)),
+        "b's record rests on a's assertion alone: not b's ingest of the claim"
+    );
+
+    asserts(&pool, p, claim, b).await;
+    assert_eq!(
+        read(&pool, &public, claim).await,
+        (vec![(p, a, true), (p, b, false)], Some(p)),
+        "with b's own assertion, b's record is read"
+    );
+}
+
+/// An UNMARKED record of (paper, claim, ingester), as a hand write or a
+/// cascade's re-point would leave it, never stops that ingester's own marked
+/// record: the walk's dedup probe matches only a marked record naming the
+/// same ingester, so a real later ingest is recorded and read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unmarked_record_never_stops_the_ingesters_own(pool: PgPool) {
+    let (filer, _) = fixture::seed_agent_with_group(&pool, "ingest-record-unmarked").await;
+    let claim = fixture::seed_public_claim(&pool, filer, "a claim with a stray record").await;
+    let p = paper(&pool, "10.9999/record-unmarked").await;
+    let public = fixture::public_viewer(&pool).await;
+    asserts(&pool, p, claim, filer).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'paper', $2, 'claim', 'ingested_claim', $3)",
+    )
+    .bind(p)
+    .bind(claim)
+    .bind(serde_json::json!({
+        "ingested_by": filer.to_string(),
+        "created_claim": true,
+        "tool": "ingest_document",
+    }))
+    .execute(&pool)
+    .await
+    .expect("an unmarked record");
+    assert_eq!(read(&pool, &public, claim).await, (vec![], None), "CALIBRATION");
+
+    assert!(
+        record(&pool, p, claim, filer, true).await,
+        "the ingest's own marked record is written beside the unmarked one"
+    );
+    assert_eq!(
+        read(&pool, &public, claim).await,
+        (vec![(p, filer, true)], Some(p))
+    );
+    assert!(!record(&pool, p, claim, filer, true).await, "a re-run dedups on it");
 }
