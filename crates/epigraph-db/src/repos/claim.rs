@@ -2210,6 +2210,28 @@ impl ClaimRepository {
         decl: TenancyDecl,
         signer_id: Option<Uuid>,
     ) -> Result<Claim, DbError> {
+        Ok(
+            Self::create_signed_reporting_conn(conn, claim, decl, signer_id)
+                .await?
+                .0,
+        )
+    }
+
+    /// [`Self::create_signed_conn`], also saying whether THIS call inserted
+    /// the row (`true`) or returned an existing one (`false`: a dedup hit,
+    /// unlocked or under the dedup lock). A caller that must not rewrite or
+    /// take credit for a row it did not write (the document walk's
+    /// `persist_planned_claim`) decides from this, never from the row's
+    /// author or trace.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signed_reporting_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
         // A dedup HIT on an already-committed row is answered here, unlocked
@@ -2223,7 +2245,7 @@ impl ClaimRepository {
         if let Some(existing) =
             Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         // The serialization scope, exactly as in `create_or_get_signed`: a real
@@ -2295,7 +2317,7 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
         signer_id: Option<Uuid>,
-    ) -> Result<Claim, DbError> {
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Row;
 
         let id: Uuid = claim.id.into();
@@ -2324,7 +2346,7 @@ impl ClaimRepository {
         if let Some(existing) =
             Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         let (signature, signer_id) = v1_claim_signature_to_store(
@@ -2386,14 +2408,17 @@ impl ClaimRepository {
 
         let truth_value = TruthValue::new(row.truth_value)?;
 
-        Ok(claim_from_row(
-            row.id,
-            row.content,
-            row.agent_id,
-            row.trace_id,
-            truth_value,
-            row.created_at,
-            row.updated_at,
+        Ok((
+            claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ),
+            true,
         ))
     }
 
