@@ -2279,6 +2279,57 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
     assert_eq!(authored_in_force(&pool, human, d).await, 1);
 }
 
+/// Only the operator's own replacement withholds a name-derived author's
+/// credit from later name-only ingests. A retraction of the author's
+/// authorship that no replacement recorded (an UPDATE outside the
+/// maintenance replacement, which names no replacing agent) is no
+/// replacement: a later name-only ingest takes the name path as usual
+/// (`reused_name_key`, asserting), whatever the position or spelling. The
+/// operator replacement test above is the control: there the replacing
+/// agent's own authorship records which node it replaced.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_operator_replacement_withholds_a_name_derived_authors_credit(pool: PgPool) {
+    let first = app_role_server(&pool).await;
+    let later = app_role_server(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let name = "Philippa Thornquist";
+    let d = "10.9999/author-unrecorded-retraction";
+    ingest_wait(
+        &first,
+        &pool,
+        doc_with_atoms(d, json!([{"name": name}]), &["The first ingest's atom."]),
+    )
+    .await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    // A retraction no replacement recorded: in force before, retracted now.
+    sqlx::query(
+        "UPDATE edges e SET valid_to = now() FROM papers p \
+          WHERE p.id = e.target_id AND p.doi = $2 AND e.source_id = $1 \
+            AND e.relationship = 'authored'",
+    )
+    .bind(key)
+    .bind(d)
+    .execute(&pool)
+    .await
+    .expect("an unrecorded retraction");
+    assert_eq!(authored_in_force(&pool, key, d).await, 0, "CALIBRATION");
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &later,
+            &public,
+            &doc_with_atoms(d, json!([{"name": name}]), &["A later ingest's atom."]),
+            None,
+        )
+        .await
+        .expect("a later name-only ingest"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["action"], "reused_name_key", "{json}");
+    assert_eq!(report["asserts_claims"], true, "{json}");
+}
+
 /// A document ingest that converges on a claim the SAME agent already filed
 /// without a reasoning trace (a workflow operation atom written as the
 /// caller, a directly filed claim) found that claim; it did not create it.
