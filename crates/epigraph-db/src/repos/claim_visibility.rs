@@ -3,7 +3,7 @@
 //! visibility later (publish a team claim; move a private claim into a team).
 //!
 //! Spec and owner decisions D-V1..D-V5: `docs/tenancy/claim-visibility-controls.md`.
-//! Database half: migration 200 (`epigraph_writable_teams`,
+//! Database half: migration 206 (`epigraph_writable_teams`,
 //! `epigraph_default_group`, `epigraph_set_default_group`,
 //! `epigraph_publicize_claims`, `epigraph_share_claims_with_team`).
 //!
@@ -172,7 +172,7 @@ fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
     }
 }
 
-/// Map a migration-200 refusal (`VIS01`..`VIS03`) to a designed refusal, and
+/// Map a migration-206 refusal (`VIS01`..`VIS03`) to a designed refusal, and
 /// anything else to the ordinary conversion.
 fn map_vis_error(e: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(db) = &e {
@@ -257,11 +257,11 @@ fn refusal_text(outcome: &str) -> &'static str {
 impl ClaimRepository {
     /// The TEAM groups `agent` may write a claim into, with `"own"` (its own
     /// writer/admin membership) or `"operator"` (its live human writes it,
-    /// owner decision D-V3). Read through migration 200's definer, so it
+    /// owner decision D-V3). Read through migration 206's definer, so it
     /// answers the same on an unstamped `epigraph_app` connection.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if the read fails or migration 200 is absent.
+    /// `DbError::QueryFailed` if the read fails or migration 206 is absent.
     pub async fn writable_teams(
         conn: &mut PgConnection,
         agent: Uuid,
@@ -279,7 +279,7 @@ impl ClaimRepository {
     /// one of [`Self::writable_teams`].
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if the read fails or migration 200 is absent.
+    /// `DbError::QueryFailed` if the read fails or migration 206 is absent.
     pub async fn default_group_of(
         conn: &mut PgConnection,
         agent: Uuid,
@@ -502,7 +502,7 @@ impl ClaimRepository {
     /// on `conn` (which must be stamped). All or nothing. Only a live admin of
     /// each claim's owning group may (owner decision D-V2). Sealed claims are
     /// refused. Derived rows follow, except pinned evidence, and incident edges
-    /// are re-met. One `claim.publicized` audit row is written (migration 200
+    /// are re-met. One `claim.publicized` audit row is written (migration 206
     /// section 4).
     ///
     /// # Errors
@@ -528,7 +528,7 @@ impl ClaimRepository {
 
     /// Move private claims (`('group', home)`) into a team the session principal
     /// writes. All or nothing. One `claim.shared_with_team` audit row is written
-    /// (migration 200 section 5).
+    /// (migration 206 section 5).
     ///
     /// # Errors
     /// As [`Self::publicize_conn`].

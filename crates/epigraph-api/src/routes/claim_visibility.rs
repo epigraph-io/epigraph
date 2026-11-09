@@ -1,5 +1,5 @@
 //! HTTP twins of the MCP visibility tools (docs/tenancy/claim-visibility-controls.md,
-//! migration 200):
+//! migration 206):
 //!
 //! * `POST /api/v1/claims/publicize` `{claim_ids, reason}`: group → public,
 //!   team admins only (owner decision D-V2);
@@ -9,7 +9,7 @@
 //!   default team (D-V1).
 //!
 //! Each runs ONE transaction stamped as the caller (`AppState::write_as`) and
-//! calls the migration-200 definer on it. The definer makes the authority
+//! calls the migration-206 definer on it. The definer makes the authority
 //! decision and writes the audit row, so this file and `epigraph-mcp`'s
 //! `tools/visibility.rs` cannot disagree about who may do what. A refusal maps
 //! by its kind (`ApiError::from(DbError)`: input 400, authority 403, state 409),

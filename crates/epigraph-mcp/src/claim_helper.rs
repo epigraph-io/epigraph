@@ -277,7 +277,7 @@ pub fn visibility_caller_error(e: epigraph_db::DbError) -> McpError {
 /// never public unless asked. Runs BEFORE the author-stamped transaction
 /// because a team the author writes only through its human (D-V3) must be
 /// stamped into it ([`begin_author_stamped_tx_for`]). Every read is a migration
-/// 200 or 107 definer, so the unstamped pool answers correctly.
+/// 206 or 107 definer, so the unstamped pool answers correctly.
 ///
 /// # Errors
 /// `INVALID_PARAMS` for a malformed or contradictory pair, and the caller

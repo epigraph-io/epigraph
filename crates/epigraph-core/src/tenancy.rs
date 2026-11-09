@@ -228,7 +228,7 @@ impl TenancyDecl {
 }
 
 /// What a caller-facing claim write ASKED for: the user-level vocabulary of
-/// `docs/tenancy/claim-visibility-controls.md` (migration 200).
+/// `docs/tenancy/claim-visibility-controls.md` (migration 206).
 ///
 /// The database keeps two values (`'public' | 'group'`). Callers speak three,
 /// and this is where the third comes from:

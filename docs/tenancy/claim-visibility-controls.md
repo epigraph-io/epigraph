@@ -1,7 +1,7 @@
 # Claim visibility controls: team by default, private and public on request, publish later
 
 Status: built, 2026-11-05. Branch `feat/claim-visibility-controls`. Owner decisions D-V1..D-V5 are
-recorded at the end (section 6), and the build follows them. Migration 200; `epigraph-db`
+recorded at the end (section 6), and the build follows them. Migration 206; `epigraph-db`
 `repos/claim_visibility.rs`; MCP `tools/visibility.rs`; HTTP `routes/claim_visibility.rs`.
 
 ## 1. Problem
@@ -36,7 +36,7 @@ maintenance connections. Under D9 no request-serving process holds a maintenance
 
 A **team group** is an active group of kind `team` or `community` that the author may write:
 the author holds a live `writer`/`admin` membership itself, or its live human does (D-V3). This
-is migration 200's `epigraph_writable_teams(agent)`, and its `via` column says which. Role-derived
+is migration 206's `epigraph_writable_teams(agent)`, and its `via` column says which. Role-derived
 memberships (165/179) count. Personal, world and seed groups never do, so the home group is never
 a team.
 
@@ -182,7 +182,7 @@ other path, so none is relaxed:
    `recompute_boundary_meet_conn` on a maintenance connection, which request processes do not
    hold (D9).
 
-So migration **200** adds two `SECURITY DEFINER` functions owned by `epigraph_maintenance`,
+So migration **206** adds two `SECURITY DEFINER` functions owned by `epigraph_maintenance`,
 `SET search_path = pg_catalog, pg_temp` with every public object schema-qualified (migration
 190's ratchet), EXECUTE revoked from PUBLIC and granted to `epigraph_app`. Their `UPDATE`s open
 a transaction-local "write window" (`search_path = public, pg_temp`) and close it straight
@@ -286,7 +286,7 @@ now measures the stamped structural edges), and the explicit-`public` fixtures.
   same condition. Otherwise the single team the author may write. Otherwise the write is
   **private**, and the response carries a `visibility_note` saying why: no team, or several and
   no default. A default write **never** falls back to public. `default_group_id` (062) was
-  unused. Migration 200 adds `epigraph_set_default_group`, served as MCP `set_default_group`
+  unused. Migration 206 adds `epigraph_set_default_group`, served as MCP `set_default_group`
   and REST `PUT /api/v1/agents/me/default-group`, validated against the same team list and
   audited (`agent.default_group_set`).
 * **D-V2 who may publicize: team admins only.** It takes the caller's **own** live `admin`

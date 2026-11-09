@@ -1,5 +1,5 @@
 //! User-level claim visibility controls (docs/tenancy/claim-visibility-controls.md,
-//! migration 200) on the APPLICATION ROLE.
+//! migration 206) on the APPLICATION ROLE.
 //!
 //! Every server here is built from ONE `ScopedPool` downgraded to `epigraph_app`
 //! (NOSUPERUSER, NOBYPASSRLS), and every "who can read it" question is asked on

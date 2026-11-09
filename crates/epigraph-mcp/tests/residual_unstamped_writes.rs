@@ -97,7 +97,7 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          team the author writes only through its live human (D-V3) has to be stamped INTO that \
          transaction (`begin_author_stamped_tx_for`'s grant). Every statement it runs is a \
          SECURITY DEFINER: `default_decl_for_author`'s 107 lookup and personal-group mint, and \
-         migration 200's `epigraph_writable_teams` / `epigraph_default_group` reads. The only \
+         migration 206's `epigraph_writable_teams` / `epigraph_default_group` reads. The only \
          row it can write is the author's own personal group, minted by the definer under its \
          own identity exactly as the stamped path mints it, so a viewer stamp on the calling \
          connection would change nothing the definers check.",

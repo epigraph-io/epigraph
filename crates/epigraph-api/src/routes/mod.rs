@@ -514,7 +514,7 @@ pub fn create_router_with_extensions(
             "/api/v1/mass-functions/:id/unretract",
             post(bba_retract::unretract_bba),
         )
-        // Claim visibility controls (migration 200,
+        // Claim visibility controls (migration 206,
         // docs/tenancy/claim-visibility-controls.md).
         .route(
             "/api/v1/claims/publicize",

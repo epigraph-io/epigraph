@@ -1,5 +1,5 @@
 //! The HTTP half of the claim visibility controls
-//! (docs/tenancy/claim-visibility-controls.md, migration 200) on the
+//! (docs/tenancy/claim-visibility-controls.md, migration 206) on the
 //! APPLICATION ROLE: `POST /api/v1/claims` (plain tier),
 //! `POST /api/v1/claims/publicize` and `PUT /api/v1/agents/me/default-group`,
 //! each on a transaction stamped from the caller as `epigraph_app`

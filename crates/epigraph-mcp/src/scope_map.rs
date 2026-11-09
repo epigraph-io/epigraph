@@ -161,7 +161,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // per-row rule as retract_bba (migration 184's un-retract definer).
     ("unretract_bba", "claims:write"),
     ("update_labels", "claims:write"),
-    // The visibility controls (migration 200, docs/tenancy/claim-visibility-
+    // The visibility controls (migration 206, docs/tenancy/claim-visibility-
     // controls.md). The per-claim rule is the definer's own: a live ADMIN of
     // the owning group to publish (owner decision D-V2); the author, or an admin
     // of the home group, to share a private claim with a team the caller

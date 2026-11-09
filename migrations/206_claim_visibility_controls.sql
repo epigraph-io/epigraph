@@ -1,4 +1,4 @@
--- 200: claim visibility controls -- team by default, private and public on
+-- 206: claim visibility controls -- team by default, private and public on
 -- request, and the audited acts that widen a claim later (owner request
 -- 2026-11-05; spec docs/tenancy/claim-visibility-controls.md).
 --
@@ -166,7 +166,7 @@ BEGIN
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('agent.default_group_set', v_principal, true,
             jsonb_build_object('previous', v_prev, 'default_group_id', p_group,
-                               'migration', 200, 'session_user', session_user::text));
+                               'migration', 206, 'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
     RETURN p_group;
 END $$;
@@ -359,7 +359,7 @@ BEGIN
                                'reason', p_reason,
                                'edges_widened', v_edges,
                                'evidence_kept_private', v_pinned,
-                               'migration', 200,
+                               'migration', 206,
                                'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
 
@@ -469,7 +469,7 @@ BEGIN
     VALUES ('claim.shared_with_team', v_principal, true,
             jsonb_build_object('claim_ids', to_jsonb(v_todo), 'from_group_id', v_home,
                                'to_group_id', p_group_id, 'reason', p_reason,
-                               'migration', 200, 'session_user', session_user::text));
+                               'migration', 206, 'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
 
     UPDATE pg_temp.vis_share v SET outcome = 'shared';
@@ -495,7 +495,7 @@ DO $$ BEGIN
         EXECUTE 'ALTER FUNCTION public.epigraph_share_claims_with_team(uuid[], uuid, text) '
                 'OWNER TO epigraph_maintenance';
     ELSE
-        RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; the 200 function '
+        RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; the 206 function '
                      'bodies stay owned by the migration runner.';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN

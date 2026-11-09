@@ -1,9 +1,9 @@
 //! `publicize_claims`, `share_claims_with_team` and `set_default_group`: the
 //! MCP side of the user-level claim visibility controls
-//! (`docs/tenancy/claim-visibility-controls.md`, migration 200).
+//! (`docs/tenancy/claim-visibility-controls.md`, migration 206).
 //!
 //! Each tool runs ONE transaction stamped from the caller's own write identity
-//! (`claim_helper::begin_author_stamped_tx`), and calls the migration-200
+//! (`claim_helper::begin_author_stamped_tx`), and calls the migration-206
 //! definer on it. The definer reads the caller from that stamp
 //! (`epigraph_principal_id()`), makes the authority decision, and writes the
 //! audit row in the same transaction. The tool decides nothing about authority

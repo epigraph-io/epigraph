@@ -600,11 +600,11 @@ impl Viewer {
     /// construction and not by a check that could be relaxed later.
     ///
     /// This viewer plus ONE team it may write only through its live human
-    /// (owner decision D-V3, migration 200), for the author-stamped transaction
+    /// (owner decision D-V3, migration 206), for the author-stamped transaction
     /// of a single team write.
     ///
     /// The grant is a [`crate::repos::TeamWriteGrant`], which only
-    /// `ClaimRepository::resolve_write_decl` mints, from migration 200's
+    /// `ClaimRepository::resolve_write_decl` mints, from migration 206's
     /// `epigraph_writable_teams` answering `via = 'operator'`. That is the same
     /// rule the claims trigger's writer scope applies
     /// (`epigraph_require_writer_scope` -> `epigraph_operator_writes_group`).

@@ -285,7 +285,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md)
     // runs each act on `AppState::write_as`, the transaction stamped with this
-    // viewer, and calls a migration-200 SECURITY DEFINER that reads the caller
+    // viewer, and calls a migration-206 SECURITY DEFINER that reads the caller
     // from that stamp (`epigraph_principal_id()`) and makes the authority
     // decision itself; a claim the caller cannot read is answered not-found by
     // the definer. `writable_teams` reports the caller's own teams back.
@@ -1233,7 +1233,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // `sqlx::query(UPDATE).execute` left this list.
     // Claim visibility controls (docs/tenancy/claim-visibility-controls.md):
     // `resolve_write_decl` (on a `db_pool.acquire`) runs only definers (107's
-    // author decl, migration 200's team list) for the AUTHOR, before the
+    // author decl, migration 206's team list) for the AUTHOR, before the
     // transaction; `Viewer::resolve` re-resolves the CALLER's own viewer once
     // when that resolution minted its home group mid-request;
     // `write_tenancy_report` (on a `db_pool.acquire`) reads back the row this
