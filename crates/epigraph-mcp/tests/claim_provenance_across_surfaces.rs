@@ -83,11 +83,17 @@ async fn named(pool: &PgPool, agent: Uuid, name: &str) {
 }
 
 fn doc_with_atoms(doi: &str, authors: Value, atoms: &[&str]) -> DocumentExtraction {
+    doc_with_text(doi, authors, &format!("Thesis of {doi}"), atoms)
+}
+
+/// As [`doc_with_atoms`], with the thesis `thesis`: a different thesis under
+/// the same document key is a claim no earlier ingest of it created.
+fn doc_with_text(doi: &str, authors: Value, thesis: &str, atoms: &[&str]) -> DocumentExtraction {
     let generality: Vec<u8> = atoms.iter().map(|_| 3).collect();
     serde_json::from_value(json!({
         "source": {"title": format!("Provenance {doi}"), "doi": doi,
                    "source_type": "Paper", "authors": authors},
-        "thesis": format!("Thesis of {doi}"),
+        "thesis": thesis,
         "thesis_derivation": "TopDown",
         "sections": [{"title": "S", "paragraphs": [{
             "text": format!("Paragraph of {doi}."),
@@ -774,4 +780,422 @@ async fn the_card_and_the_claim_name_the_same_human_while_the_binding_is_in_forc
             "a claim filed after revocation names nobody"
         );
     }
+}
+
+/// Every claim an ingest by `agent` of the document keyed `doi` CREATED
+/// (its creation record), read raw.
+async fn created_by(pool: &PgPool, doi: &str, agent: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT r.target_id FROM edges r JOIN papers p ON p.id = r.source_id \
+          WHERE p.doi = $1 AND r.relationship = 'ingested_claim' \
+            AND r.properties ->> 'ingested_by' = $2 \
+            AND r.properties ->> 'created_claim' = 'true' \
+          ORDER BY r.target_id",
+    )
+    .bind(doi)
+    .bind(agent.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("creation records")
+}
+
+/// `(author, the ingest principal that wrote the row, pending)` of every
+/// `authored` row onto the document keyed `doi`, read raw and sorted.
+async fn authored_rows(pool: &PgPool, doi: &str) -> Vec<(Uuid, String, bool)> {
+    let mut rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT e.source_id, \
+                COALESCE(e.properties -> 'ingest_written' ->> 'by', ''), \
+                COALESCE(e.properties ->> 'pending_countersign', 'false') = 'true' \
+           FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE p.doi = $1 AND e.relationship = 'authored'",
+    )
+    .bind(doi)
+    .fetch_all(pool)
+    .await
+    .expect("authored rows");
+    rows.sort();
+    rows
+}
+
+/// The ids of the claims `query_paper` listed, with `created_claim`.
+fn listed_claims(listed: &Value) -> Vec<(Value, Value)> {
+    listed["claims"]
+        .as_array()
+        .unwrap_or_else(|| panic!("claims listed: {listed}"))
+        .iter()
+        .map(|c| (c["id"].clone(), c["created_claim"].clone()))
+        .collect()
+}
+
+/// `(agent_id, pending_countersign, ingested_by)` of every author
+/// `query_paper` listed, sorted.
+fn listed_authors(listed: &Value) -> Vec<(Value, Value, Value)> {
+    let mut v: Vec<(Value, Value, Value)> = listed["authors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("authors listed: {listed}"))
+        .iter()
+        .map(|a| {
+            (
+                a["agent_id"].clone(),
+                a["pending_countersign"].clone(),
+                a["ingested_by"].clone(),
+            )
+        })
+        .collect();
+    v.sort_by_key(|t| t.0.to_string());
+    v
+}
+
+/// Every author id on a claim block's creating document, in all three lists.
+fn every_listed(block: &Value) -> Vec<Value> {
+    let mut v = Vec::new();
+    for list in ["authors", "pending_authors", "added_authors"] {
+        v.extend(ids(&block["paper"][list]));
+    }
+    sorted(v)
+}
+
+/// A stranger re-ingests a document key a registered principal authored
+/// (the principal's own ingest named itself), names that principal by
+/// `agent_id`, and adds a statement of its own. The stranger's naming is its
+/// own word about the principal: on the claim the stranger's ingest created,
+/// the principal is PENDING (named by the stranger), never a primary author,
+/// although the principal's own authorship of the document is in force. The
+/// claim block, `query_paper` (one ingest at a time) and the principal's
+/// card say the same about that claim, for every reader; the principal's own
+/// claims keep it primary and show nothing of the stranger's naming. Both
+/// walks.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_naming_never_makes_a_registered_author_primary_of_its_graft(pool: PgPool) {
+    let c = app_role_server(&pool).await;
+    let s = app_role_server(&pool).await;
+    let (c_id, s_id) = (
+        c.server_agent_id().await.expect("c"),
+        s.server_agent_id().await.expect("s"),
+    );
+    assert_ne!(c_id, s_id, "CALIBRATION: two principals");
+    named(&pool, c_id, "Cass Orvell").await;
+    let (third, _) = fixture::seed_agent_with_group(&pool, "provenance-third").await;
+    let me = json!([{"name": "Cass Orvell", "agent_id": c_id.to_string()}]);
+
+    // The document walk.
+    let d = "10.9999/provenance-graft";
+    let own = "An atom the author's own ingest stated.";
+    let graft = "An atom only the stranger's ingest states.";
+    ingest_wait(&c, &pool, doc_with_atoms(d, me.clone(), &[own])).await;
+    let x = claim_of(&pool, d, own).await;
+    let card_before = card_as(&c, &pool, third, c_id).await["counts"].clone();
+    let page_before = query_paper(&c, &pool, d).await;
+    ingest_wait(&s, &pool, doc_with_atoms(d, me.clone(), &[graft])).await;
+    let y = claim_of(&pool, d, graft).await;
+    let p = paper_id(&pool, d).await;
+    assert_eq!(
+        authored_rows(&pool, d).await,
+        {
+            let mut v = vec![(c_id, c_id.to_string(), false), (c_id, s_id.to_string(), true)];
+            v.sort();
+            v
+        },
+        "CALIBRATION: each principal's ingest wrote its own row; the stranger's is pending"
+    );
+    assert!(
+        created_by(&pool, d, s_id).await.contains(&y),
+        "CALIBRATION: the stranger's ingest created the grafted claim"
+    );
+
+    for caller in [third, c_id, s_id] {
+        let block = get_claim_as(&c, &pool, caller, y).await;
+        assert_eq!(block["source"], json!("literature"), "{block}");
+        assert_eq!(block["ingested_by"]["agent"]["id"], json!(s_id), "{block}");
+        assert_eq!(
+            ingesters(&block),
+            vec![(json!(s_id), json!(p), json!(true))],
+            "{block}"
+        );
+        assert_eq!(
+            ids(&block["paper"]["authors"]),
+            Vec::<Value>::new(),
+            "a stranger's naming of a registered author is never primary: {block}"
+        );
+        let pending = &block["paper"]["pending_authors"];
+        assert_eq!(ids(pending), vec![json!(c_id)], "{block}");
+        assert_eq!(pending[0]["named_by"]["id"], json!(s_id), "{block}");
+        assert_eq!(block["paper"]["added_authors"], json!([]), "{block}");
+
+        // The author's own claim: its own word only.
+        let own_block = get_claim_as(&c, &pool, caller, x).await;
+        assert_eq!(own_block["ingested_by"]["agent"]["id"], json!(c_id));
+        assert_eq!(
+            ids(&own_block["paper"]["authors"]),
+            vec![json!(c_id)],
+            "{own_block}"
+        );
+        assert_eq!(
+            every_listed(&own_block),
+            vec![json!(c_id)],
+            "the stranger recorded nothing on the author's claim, so none of its rows is read there: {own_block}"
+        );
+    }
+
+    // query_paper: the author's ingest (the first) never lists the graft;
+    // the stranger's ingest lists it, with the author pending.
+    let page = query_paper(&c, &pool, d).await;
+    assert_eq!(page["ingested_by"], json!(c_id.to_string()), "{page}");
+    assert_eq!(
+        listed_authors(&page),
+        vec![(json!(c_id), json!(false), Value::Null)],
+        "{page}"
+    );
+    assert!(
+        !listed_claims(&page).iter().any(|(id, _)| *id == json!(y)),
+        "the author's ingest does not list the graft: {page}"
+    );
+    assert_eq!(
+        page["asserted_claim_count"], page_before["asserted_claim_count"],
+        "{page}"
+    );
+    let by_s = query_paper_by(&c, &pool, d, Some(s_id)).await;
+    assert_eq!(
+        listed_authors(&by_s),
+        vec![(json!(c_id), json!(true), json!(s_id.to_string()))],
+        "the stranger's ingest names the author pending: {by_s}"
+    );
+    assert!(
+        listed_claims(&by_s).contains(&(json!(y), json!(true))),
+        "the stranger's ingest lists the graft as its creation: {by_s}"
+    );
+
+    // The card: the graft is not the author's.
+    let card_after = card_as(&c, &pool, third, c_id).await["counts"].clone();
+    assert_eq!(card_after, card_before, "the card does not move");
+
+    // The spine walk: a different thesis under the same key is a claim the
+    // stranger's spine creates.
+    let d2 = "10.9999/provenance-graft-spine";
+    spine_wait(
+        &c,
+        &pool,
+        doc_with_text(d2, me.clone(), "A thesis the author's own spine states.", &[]),
+    )
+    .await;
+    let c_created = created_by(&pool, d2, c_id).await;
+    assert!(!c_created.is_empty(), "CALIBRATION: the author's spine created claims");
+    spine_wait(
+        &s,
+        &pool,
+        doc_with_text(d2, me.clone(), "A thesis only the stranger's spine states.", &[]),
+    )
+    .await;
+    let s_created = created_by(&pool, d2, s_id).await;
+    assert!(
+        !s_created.is_empty(),
+        "CALIBRATION: the stranger's spine created a claim"
+    );
+    for y in &s_created {
+        for caller in [third, c_id] {
+            let block = get_claim_as(&c, &pool, caller, *y).await;
+            assert_eq!(block["ingested_by"]["agent"]["id"], json!(s_id), "{block}");
+            assert_eq!(
+                ids(&block["paper"]["authors"]),
+                Vec::<Value>::new(),
+                "the spine: a stranger's naming is never primary: {block}"
+            );
+            assert_eq!(ids(&block["paper"]["pending_authors"]), vec![json!(c_id)]);
+        }
+    }
+    for x in &c_created {
+        let block = get_claim_as(&c, &pool, third, *x).await;
+        assert_eq!(
+            every_listed(&block),
+            vec![json!(c_id)],
+            "the spine: the author's own claims list the author once, primary: {block}"
+        );
+        assert_eq!(ids(&block["paper"]["authors"]), vec![json!(c_id)]);
+    }
+}
+
+/// A principal re-ingests ANOTHER principal's document key, naming its
+/// existing name-derived author beside a new name, and states something of
+/// its own. Each surface reads that ingest's own rows: on the claim it
+/// created, both names are its own word (as for any document it ingests, a
+/// fabricated one included); on the claims the first ingest created, which
+/// it never recorded, neither its rows nor its new name appear. The card,
+/// the claim block and `query_paper` agree. When the creator's own later
+/// ingest adds a name, the claim block lists it as added (never primary),
+/// while the card counts the claim for it: the card counts what a paper the
+/// agent authored asserts, not who is a claim's primary author.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_surface_reads_one_ingests_own_rows_for_a_graft_under_a_shared_key(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let s = app_role_server(&pool).await;
+    let (a_id, s_id) = (
+        a.server_agent_id().await.expect("a"),
+        s.server_agent_id().await.expect("s"),
+    );
+    let (third, _) = fixture::seed_agent_with_group(&pool, "provenance-third").await;
+    let d = "10.9999/provenance-name-graft";
+    let first = "An atom the first ingest of the shared key stated.";
+    let graft = "An atom only the second principal's ingest states.";
+    ingest_wait(
+        &a,
+        &pool,
+        doc_with_atoms(d, json!([{"name": "Ingrid Solvang"}]), &[first]),
+    )
+    .await;
+    let x = claim_of(&pool, d, first).await;
+    let ingrid = name_node(&pool, "Ingrid Solvang").await;
+    ingest_wait(
+        &s,
+        &pool,
+        doc_with_atoms(
+            d,
+            json!([{"name": "Ingrid Solvang"}, {"name": "Interloper Vexx"}]),
+            &[graft],
+        ),
+    )
+    .await;
+    let z = claim_of(&pool, d, graft).await;
+    let vexx = name_node(&pool, "Interloper Vexx").await;
+    let p = paper_id(&pool, d).await;
+
+    // The first ingest's claim: none of the second principal's rows.
+    for caller in [third, a_id, s_id] {
+        let block = get_claim_as(&a, &pool, caller, x).await;
+        assert_eq!(
+            every_listed(&block),
+            vec![json!(ingrid)],
+            "a principal that never recorded the claim adds no author to it: {block}"
+        );
+        assert_eq!(ids(&block["paper"]["authors"]), vec![json!(ingrid)]);
+    }
+    // The graft: the second principal's own word, as a fabricated document
+    // naming the same names would be.
+    for caller in [third, a_id, s_id] {
+        let block = get_claim_as(&a, &pool, caller, z).await;
+        assert_eq!(block["ingested_by"]["agent"]["id"], json!(s_id), "{block}");
+        assert_eq!(
+            ingesters(&block),
+            vec![(json!(s_id), json!(p), json!(true))]
+        );
+        assert_eq!(
+            sorted(ids(&block["paper"]["authors"])),
+            sorted(vec![json!(ingrid), json!(vexx)]),
+            "{block}"
+        );
+        assert_eq!(block["paper"]["pending_authors"], json!([]), "{block}");
+        assert_eq!(block["paper"]["added_authors"], json!([]), "{block}");
+    }
+
+    // query_paper, one ingest at a time.
+    let by_a = query_paper(&a, &pool, d).await;
+    assert_eq!(by_a["ingested_by"], json!(a_id.to_string()), "{by_a}");
+    assert_eq!(
+        listed_authors(&by_a),
+        vec![(json!(ingrid), json!(false), Value::Null)],
+        "{by_a}"
+    );
+    assert!(!listed_claims(&by_a).iter().any(|(id, _)| *id == json!(z)));
+    let by_s = query_paper_by(&a, &pool, d, Some(s_id)).await;
+    assert_eq!(
+        author_ids(&by_s),
+        sorted(vec![json!(ingrid), json!(vexx)]),
+        "{by_s}"
+    );
+    assert!(listed_claims(&by_s).contains(&(json!(z), json!(true))));
+    assert!(!listed_claims(&by_s).iter().any(|(id, _)| *id == json!(x)));
+
+    // The cards: each counts the claims of the ingests that named it.
+    let claim_set = |listed: &Value| -> Vec<Value> {
+        listed_claims(listed).into_iter().map(|(id, _)| id).collect()
+    };
+    let mut union = claim_set(&by_a);
+    union.extend(claim_set(&by_s));
+    union.sort_by_key(ToString::to_string);
+    union.dedup();
+    let card_ingrid = card_as(&a, &pool, third, ingrid).await["counts"].clone();
+    assert_eq!(
+        card_ingrid["asserted_claims"],
+        json!(union.len()),
+        "the card credits the name with each ingest's own claims, the graft included, as the block and query_paper do: {card_ingrid}"
+    );
+    let card_vexx = card_as(&a, &pool, third, vexx).await["counts"].clone();
+    assert_eq!(
+        card_vexx["asserted_claims"],
+        json!(claim_set(&by_s).len()),
+        "{card_vexx}"
+    );
+
+    // The creator's own later ingest adds a name: added on the block,
+    // counted on the card (an assertion, not primary authorship).
+    ingest_wait(
+        &a,
+        &pool,
+        doc_with_atoms(
+            d,
+            json!([{"name": "Ingrid Solvang"}, {"name": "Late Addendum"}]),
+            &[first],
+        ),
+    )
+    .await;
+    let late = name_node(&pool, "Late Addendum").await;
+    let block = get_claim_as(&a, &pool, third, x).await;
+    assert_eq!(ids(&block["paper"]["authors"]), vec![json!(ingrid)], "{block}");
+    assert_eq!(added(&block), vec![(json!(late), json!(a_id))], "{block}");
+    let by_a = query_paper(&a, &pool, d).await;
+    let card_late = card_as(&a, &pool, third, late).await["counts"].clone();
+    assert_eq!(
+        card_late["asserted_claims"],
+        json!(claim_set(&by_a).len()),
+        "the card counts the creator's claims for its added name: {card_late}"
+    );
+}
+
+/// A stranger's earlier PENDING naming of a principal on a document key
+/// never demotes the principal on a claim the principal's own ingest of that
+/// key created: the stranger never recorded that claim, so its row is not
+/// read there. On the stranger's own claim the principal stays pending.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_earlier_pending_naming_never_demotes_the_authors_own_claim(pool: PgPool) {
+    let c = app_role_server(&pool).await;
+    let s = app_role_server(&pool).await;
+    let (c_id, s_id) = (
+        c.server_agent_id().await.expect("c"),
+        s.server_agent_id().await.expect("s"),
+    );
+    named(&pool, c_id, "Cass Orvell").await;
+    let (third, _) = fixture::seed_agent_with_group(&pool, "provenance-third").await;
+    let me = json!([{"name": "Cass Orvell", "agent_id": c_id.to_string()}]);
+    let d = "10.9999/provenance-pending-first";
+    let theirs = "An atom the stranger's earlier ingest stated.";
+    let own = "An atom only the author's own ingest states.";
+    ingest_wait(&s, &pool, doc_with_atoms(d, me.clone(), &[theirs])).await;
+    ingest_wait(&c, &pool, doc_with_atoms(d, me.clone(), &[own])).await;
+    let (w, z) = (claim_of(&pool, d, theirs).await, claim_of(&pool, d, own).await);
+    assert!(
+        created_by(&pool, d, c_id).await.contains(&z),
+        "CALIBRATION: the author's own ingest created its claim"
+    );
+    for caller in [third, c_id, s_id] {
+        let block = get_claim_as(&c, &pool, caller, z).await;
+        assert_eq!(block["ingested_by"]["agent"]["id"], json!(c_id), "{block}");
+        assert_eq!(ids(&block["paper"]["authors"]), vec![json!(c_id)], "{block}");
+        assert_eq!(
+            block["paper"]["pending_authors"],
+            json!([]),
+            "a stranger's pending naming is not read on a claim it never recorded: {block}"
+        );
+        let block = get_claim_as(&c, &pool, caller, w).await;
+        assert_eq!(ids(&block["paper"]["authors"]), Vec::<Value>::new(), "{block}");
+        assert_eq!(
+            ids(&block["paper"]["pending_authors"]),
+            vec![json!(c_id)],
+            "{block}"
+        );
+    }
+    let by_c = query_paper_by(&c, &pool, d, Some(c_id)).await;
+    assert_eq!(
+        listed_authors(&by_c),
+        vec![(json!(c_id), json!(false), Value::Null)],
+        "{by_c}"
+    );
 }
