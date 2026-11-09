@@ -2288,6 +2288,74 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
     assert_eq!(authored_in_force(&pool, human, d).await, 1);
 }
 
+/// Every ingest principal keeps an `authored` row (and `asserts` rows) of its
+/// own, so the operator's replacement must close EVERY principal's rows of
+/// the removed author on the paper, not only its own or the first writer's:
+/// after two ingesters each attach the name-derived author and the operator
+/// replaces it, the node holds no in-force authorship of the paper, asserts
+/// none of its claims, and its card counts nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_replacement_closes_every_principals_rows_of_the_removed_author(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let cli = privileged_server(&pool);
+    let (_maintenance, viewer) = fixture::bypass(&pool).await;
+    let name = "Cosima Halberd";
+    let human = human_named(&pool, name).await;
+    let d = "10.9999/author-replace-every-principal";
+    for server in [&a, &b] {
+        ingest_wait(
+            server,
+            &pool,
+            doc_with_atoms(
+                d,
+                json!([{"name": name}]),
+                &["A finding both ingests state."],
+            ),
+        )
+        .await;
+    }
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    assert_eq!(
+        authored_in_force(&pool, key, d).await,
+        2,
+        "CALIBRATION: one authored row per ingest principal"
+    );
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &cli,
+            &viewer,
+            &doc_with_atoms(
+                d,
+                json!([{"name": name, "agent_id": human.to_string()}]),
+                &["A finding both ingests state."],
+            ),
+            None,
+        )
+        .await
+        .expect("the operator replacement"),
+    );
+    assert_eq!(
+        json["authors"][0]["replaced"]["agent_id"],
+        key.to_string(),
+        "CALIBRATION {json}"
+    );
+    assert_eq!(authored_in_force(&pool, key, d).await, 0, "{json}");
+    let in_force_asserts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges a \
+          WHERE a.source_id = $1 AND a.source_type = 'agent' AND a.relationship = 'asserts' \
+            AND (a.valid_to IS NULL OR a.valid_to > now())",
+    )
+    .bind(key)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(in_force_asserts, 0, "every principal's asserts are closed");
+    let card = card_counts(&a, &pool, key).await;
+    assert_eq!(card["authored_papers"], 0, "{card}");
+    assert_eq!(card["asserted_claims"], 0, "{card}");
+}
+
 /// Only the operator's own replacement withholds a name-derived author's
 /// credit from later name-only ingests. A retraction of the author's
 /// authorship that no replacement recorded (an UPDATE outside the
