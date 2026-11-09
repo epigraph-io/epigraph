@@ -1252,7 +1252,8 @@ pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asser
 /// unmarked (legacy) paper edge keeps the ordinary rule.
 ///
 /// The key the cascades bind and test with `properties ? $n`.
-pub(crate) const INGEST_WRITTEN_FROZEN: &str = crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY;
+pub(crate) const INGEST_WRITTEN_FROZEN: &str =
+    crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY;
 
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///

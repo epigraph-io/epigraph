@@ -297,8 +297,8 @@ pub async fn query_paper(
     // claims and no linked assertion (a partial ingest) lists no ingest, so
     // nothing pages.
     let returned = claims.len();
-    let has_more = returned as i64 == limit
-        && offset.saturating_add(returned as i64) < asserted_claim_count;
+    let has_more =
+        returned as i64 == limit && offset.saturating_add(returned as i64) < asserted_claim_count;
 
     success_json(&PaperResponse {
         doi: paper.doi,

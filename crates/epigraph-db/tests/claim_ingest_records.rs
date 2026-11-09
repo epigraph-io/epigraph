@@ -383,7 +383,11 @@ async fn an_unmarked_record_never_stops_the_ingesters_own(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("an unmarked record");
-    assert_eq!(read(&pool, &public, claim).await, (vec![], None), "CALIBRATION");
+    assert_eq!(
+        read(&pool, &public, claim).await,
+        (vec![], None),
+        "CALIBRATION"
+    );
 
     assert!(
         record(&pool, p, claim, filer, true).await,
@@ -393,5 +397,8 @@ async fn an_unmarked_record_never_stops_the_ingesters_own(pool: PgPool) {
         read(&pool, &public, claim).await,
         (vec![(p, filer, true)], Some(p))
     );
-    assert!(!record(&pool, p, claim, filer, true).await, "a re-run dedups on it");
+    assert!(
+        !record(&pool, p, claim, filer, true).await,
+        "a re-run dedups on it"
+    );
 }

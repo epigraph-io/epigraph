@@ -1392,7 +1392,11 @@ async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(poo
     ingest_wait(
         &a,
         &pool,
-        doc_with_atoms(doi, json!([{"name": "Ingrid Solvang"}]), &["A real finding."]),
+        doc_with_atoms(
+            doi,
+            json!([{"name": "Ingrid Solvang"}]),
+            &["A real finding."],
+        ),
     )
     .await;
     ingest_wait(
@@ -1415,7 +1419,9 @@ async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(poo
         "the first ingest lists its own claims only: {first}"
     );
     assert!(
-        listed_claims(&first).iter().all(|(_, created)| *created == json!(true)),
+        listed_claims(&first)
+            .iter()
+            .all(|(_, created)| *created == json!(true)),
         "the first ingest created every claim it lists: {first}"
     );
     let ingests: Vec<Value> = first["ingests"]
@@ -1909,7 +1915,10 @@ async fn a_strangers_naming_of_an_existing_author_is_its_own_pending_row(pool: P
     .fetch_one(&pool)
     .await
     .expect("count");
-    assert_eq!(person_asserts, 0, "the person asserts nothing of the stranger's");
+    assert_eq!(
+        person_asserts, 0,
+        "the person asserts nothing of the stranger's"
+    );
     assert_eq!(card_counts(&person, &pool, me).await, before);
 }
 

@@ -738,7 +738,12 @@ async fn ingest_created(pool: &PgPool, filer: Uuid, claim: Uuid) -> (Uuid, Uuid,
 
 /// What the readers make of the paper after the ingest: how many claims it
 /// asserts, which ones, and how many claims its author's card credits.
-async fn paper_reads(pool: &PgPool, filer: Uuid, paper: Uuid, author: Uuid) -> (i64, Vec<Uuid>, i64) {
+async fn paper_reads(
+    pool: &PgPool,
+    filer: Uuid,
+    paper: Uuid,
+    author: Uuid,
+) -> (i64, Vec<Uuid>, i64) {
     let viewer = epigraph_db::visibility::Viewer::resolve(pool, filer)
         .await
         .expect("viewer");

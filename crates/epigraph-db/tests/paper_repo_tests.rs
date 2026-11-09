@@ -310,7 +310,14 @@ async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(
         principals.push(by);
         let mut conn = pool.acquire().await.expect("conn");
         for (src, st, tgt, tt, rel, props) in [
-            (author, "agent", paper_id, "paper", "authored", Some(serde_json::json!({"position": 0}))),
+            (
+                author,
+                "agent",
+                paper_id,
+                "paper",
+                "authored",
+                Some(serde_json::json!({"position": 0})),
+            ),
             (paper_id, "paper", claim.into(), "claim", "asserts", None),
         ] {
             let (_, created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
@@ -327,7 +334,10 @@ async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(
             )
             .await
             .expect("ingest-written edge");
-            assert!(created, "CALIBRATION: each principal writes its own {rel} edge");
+            assert!(
+                created,
+                "CALIBRATION: each principal writes its own {rel} edge"
+            );
         }
     }
 
