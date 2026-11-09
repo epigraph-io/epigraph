@@ -170,6 +170,7 @@ pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use repos::{
     IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperIngestPrincipal,
     AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+    AUTHORED_REPLACES_KEY, AUTHORED_REPLACES_KEY_RESERVED,
 };
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};

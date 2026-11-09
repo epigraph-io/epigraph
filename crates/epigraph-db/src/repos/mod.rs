@@ -211,7 +211,8 @@ pub use method::{
 pub use paper::{
     AssertedClaimRow, IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing,
     PaperIngestPrincipal, PaperRepository, PaperRow, AUTHORED_EXPLICIT_KEY,
-    AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+    AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY, AUTHORED_REPLACES_KEY,
+    AUTHORED_REPLACES_KEY_RESERVED,
 };
 pub use perspective::PerspectiveRepository;
 pub use political::{

@@ -29,10 +29,14 @@
 //!   path runs and the earlier agent is reported in `also_at_position`.
 //!   Which ingester made an attachment is read from the edge's
 //!   ingest-written marker, so one written before the marker existed is kept
-//!   for nobody. A name-derived node whose authorship of the paper was
-//!   retracted (an operator replacement) is never credited again by the
-//!   name path (`action: "retracted_name_key"`, no `asserts`); the
-//!   replacing agent is reported in `also_at_position`.
+//!   for nobody. A name-derived node an operator replacement removed from
+//!   the paper is never credited again by the name path (`action:
+//!   "retracted_name_key"`, no `asserts`); the replacing agent is reported in
+//!   `also_at_position`. "Removed by a replacement" is read only from the
+//!   replacement's own record: the replacing author's `authored` edge names
+//!   the node it replaced (`epigraph_db::AUTHORED_REPLACES_KEY`), which only
+//!   the maintenance replacement writes. Any other retraction, and any match
+//!   by position or spelling, is no replacement.
 //!
 //! # Who asserts the claims (the explicit-author rule)
 //!
@@ -152,6 +156,19 @@ pub(crate) fn authored_edge_properties(
         props[epigraph_db::AUTHORED_PENDING_KEY] = serde_json::Value::Bool(true);
         props[epigraph_db::AUTHORED_INGESTED_BY_KEY] =
             serde_json::Value::String(ingester.to_string());
+    }
+    // The replacement's own record of which name-derived author it removed:
+    // written only when this walk's retraction actually retracted that
+    // author's `authored` edge (only a maintenance connection can), and the
+    // one signal a later name path reads to withhold the removed author's
+    // credit (`PaperRepository::retracted_author_ids_conn`).
+    if let Some(r) = resolved
+        .report
+        .replaced
+        .as_ref()
+        .filter(|r| r.authored_edges_retracted > 0)
+    {
+        props[epigraph_db::AUTHORED_REPLACES_KEY] = serde_json::Value::String(r.agent_id.clone());
     }
     props
 }
@@ -450,9 +467,10 @@ pub(crate) async fn resolve_document_authors(
     // never when this call names that agent explicitly itself: a re-run of the
     // same extraction must resolve exactly as the first run did.
     let this_call: HashSet<Uuid> = explicit.values().map(|e| e.node.id).collect();
-    // Authors whose authorship of this paper was retracted (an operator
-    // replacement) and that hold no in-force authorship of it now: the name
-    // path never credits one again (see the name path below).
+    // Authors an operator replacement removed from this paper (the
+    // replacement's own record names them, `retracted_author_ids_conn`) and
+    // that hold no in-force authorship of it now: the name path never
+    // credits one again (see the name path below).
     let removed_here: HashSet<Uuid> = if authors.is_empty() {
         HashSet::new()
     } else {

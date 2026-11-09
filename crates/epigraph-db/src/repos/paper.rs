@@ -837,14 +837,15 @@ impl PaperRepository {
             .collect())
     }
 
-    /// The agents whose `authored` edge into `paper_id` was RETRACTED after
-    /// it was written (no longer in force, and not born retracted) and that
-    /// `viewer` may read: in practice the operator CLI replacing a
-    /// name-derived author with an explicit agent, since an agent's edge
-    /// into a paper is world-owned (migration 120) and generic writers refuse
-    /// the shape. A document ingest reads this only to WITHHOLD credit (its
-    /// name path never re-credits such an author), never to grant any, so a
-    /// row that reached this state another way can withhold, not forge.
+    /// The authors an OPERATOR REPLACEMENT removed from `paper_id`: agents
+    /// with a retracted `authored` edge into the paper (retracted after it
+    /// was written, never born retracted) whose removal the replacement
+    /// itself recorded. The replacing author's own in-force, ingest-written
+    /// `authored` edge into the paper names the removed agent
+    /// ([`AUTHORED_REPLACES_KEY`]), which only the maintenance replacement
+    /// writes. A retraction nothing recorded, or one matched only by position
+    /// or spelling, is no replacement and is not listed. The document walk's
+    /// name path never credits a listed agent again.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
@@ -860,8 +861,18 @@ impl PaperRepository {
                   WHERE e.target_id = $1 AND e.target_type = 'paper' \
                     AND e.source_type = 'agent' AND e.relationship = 'authored' \
                     AND NOT {in_force} AND e.valid_to > e.created_at \
+                    AND EXISTS (SELECT 1 FROM edges rp \
+                                 WHERE rp.target_id = $1 AND rp.target_type = 'paper' \
+                                   AND rp.source_type = 'agent' \
+                                   AND rp.relationship = 'authored' \
+                                   AND {in_force_rp} AND {marked_rp} \
+                                   AND rp.properties ->> '{replaces}' = e.source_id::text \
+                                   /* {{EDGE_VISIBILITY:rp}} */) \
                     /* {{EDGE_VISIBILITY:e}} */",
                 in_force = crate::repos::edge::EDGE_IN_FORCE,
+                in_force_rp = crate::repos::edge::EDGE_IN_FORCE.replace("e.", "rp."),
+                marked_rp = crate::repos::ingest_written::ingest_written_edge_sql("rp"),
+                replaces = AUTHORED_REPLACES_KEY,
             ),
             2,
         );
@@ -1000,6 +1011,21 @@ pub const AUTHORED_PENDING_KEY: &str = crate::agent_lookup::AUTHORSHIP_PENDING_P
 /// the document, which is the one asserting the authorship
 /// ([`crate::agent_lookup::AUTHORSHIP_INGESTED_BY_PROPERTY`]).
 pub const AUTHORED_INGESTED_BY_KEY: &str = crate::agent_lookup::AUTHORSHIP_INGESTED_BY_PROPERTY;
+/// Property on the REPLACING author's `authored` edge, written by the operator
+/// replacement only: the name-derived agent whose authorship of the paper
+/// that ingest retracted and this author replaces, as a UUID string. The
+/// walk writes it only when its retraction actually retracted an `authored`
+/// edge, which only a maintenance connection can do (an application session
+/// is refused before anything is written), and it is a reserved edge key
+/// ([`crate::RESERVED_EDGE_PROPERTIES`]), so no generic writer sets it. It is
+/// the one signal [`PaperRepository::retracted_author_ids_conn`] reads.
+pub const AUTHORED_REPLACES_KEY: &str = "replaces_author";
+
+/// The refusal for an application edge write whose `properties` carry
+/// [`AUTHORED_REPLACES_KEY`].
+pub const AUTHORED_REPLACES_KEY_RESERVED: &str =
+    "properties.replaces_author is reserved for the operator's author replacement \
+     (the document ingest on the maintenance connection); nothing was written";
 
 /// One in-force `authored` edge into a paper
 /// ([`PaperRepository::author_edges_conn`]).

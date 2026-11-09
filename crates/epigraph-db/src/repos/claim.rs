@@ -1103,6 +1103,7 @@ pub const RESERVED_EDGE_PROPERTIES: &[&str] = &[
     crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY,
     crate::repos::claim_ingest::INGESTED_BY_PROPERTY,
     crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY,
+    crate::repos::paper::AUTHORED_REPLACES_KEY,
 ];
 
 /// The refusal for an application edge write whose `properties` carry a key
@@ -1126,6 +1127,11 @@ pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<
             .is_some()
     {
         Some(crate::repos::claim_ingest::INGEST_RECORD_KEYS_RESERVED)
+    } else if properties
+        .get(crate::repos::paper::AUTHORED_REPLACES_KEY)
+        .is_some()
+    {
+        Some(crate::repos::paper::AUTHORED_REPLACES_KEY_RESERVED)
     } else {
         None
     }

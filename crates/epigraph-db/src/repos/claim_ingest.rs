@@ -491,6 +491,14 @@ mod tests {
             assert!(crate::RESERVED_EDGE_PROPERTIES.contains(&key), "{key}");
         }
         assert_eq!(
+            crate::reserved_edge_property_refusal(
+                &serde_json::json!({ crate::AUTHORED_REPLACES_KEY: "x" })
+            ),
+            Some(crate::AUTHORED_REPLACES_KEY_RESERVED),
+            "the replacement's record is reserved for generic writers"
+        );
+        assert!(crate::RESERVED_EDGE_PROPERTIES.contains(&crate::AUTHORED_REPLACES_KEY));
+        assert_eq!(
             crate::reserved_edge_property_refusal(&serde_json::json!({ "note": 1 })),
             None
         );
