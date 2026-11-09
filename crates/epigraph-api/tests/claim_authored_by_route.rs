@@ -468,6 +468,73 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
     assert_eq!(plain["ingesters"], json!([]), "{plain}");
 }
 
+/// The grafted claim on the wire. A person's own ingest of a document wrote
+/// the person's countersigned authorship; a stranger's ingest of the SAME
+/// document key named the person (its own row, pending) and created a claim,
+/// recording the person among its authors. GET /claims/:id lists the person
+/// as PENDING on the stranger's claim, named by the stranger, never as a
+/// primary author, for a third party, the person and the stranger alike; on
+/// the person's own claim the stranger, which never recorded it, adds
+/// nothing. The rows are the ones the walks write (each principal its own).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_graft_lists_the_named_person_pending_on_the_wire(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (third, _) = viewer_fixture::seed_agent_with_group(&pool, "third").await;
+    let (person, _) = viewer_fixture::seed_agent_with_group(&pool, "person").await;
+    named(&pool, person, "Cass Orvell").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "stranger").await;
+    named(&pool, stranger, "graft-fixture").await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title) VALUES ('10.0000/fixture.graft', 'Graft Paper') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("paper");
+    let own = viewer_fixture::seed_public_claim(&pool, person, "the person's own claim").await;
+    authored_edge(&pool, person, doc, person, json!({"position": 0})).await;
+    ingest_record(&pool, doc, own, person, true, &[person]).await;
+    let graft = viewer_fixture::seed_public_claim(&pool, stranger, "the stranger's graft").await;
+    authored_edge(
+        &pool,
+        person,
+        doc,
+        stranger,
+        json!({"position": 0, "pending_countersign": true, "ingested_by": stranger.to_string()}),
+    )
+    .await;
+    ingest_record(&pool, doc, graft, stranger, true, &[person]).await;
+
+    for caller in [third, person, stranger] {
+        let block = authored_by(&state, caller, graft).await;
+        assert_eq!(block["source"], json!("literature"), "{block}");
+        assert_eq!(block["ingested_by"]["agent"]["id"], json!(stranger));
+        let p = &block["paper"];
+        assert_eq!(
+            p["authors"],
+            json!([]),
+            "the stranger's naming is never primary: {block}"
+        );
+        assert_eq!(
+            p["pending_authors"],
+            json!([
+                {"id": person, "display_name": "Cass Orvell", "position": 0,
+                 "role": "author", "affiliations": [],
+                 "pending_countersign": true,
+                 "named_by": {"id": stranger, "display_name": "graft-fixture"},
+                 "added_by": null},
+            ]),
+            "{block}"
+        );
+        assert_eq!(p["added_authors"], json!([]), "{block}");
+
+        let mine = authored_by(&state, caller, own).await;
+        assert_eq!(mine["paper"]["authors"][0]["id"], json!(person), "{mine}");
+        assert_eq!(mine["paper"]["authors"].as_array().map(Vec::len), Some(1));
+        assert_eq!(mine["paper"]["pending_authors"], json!([]), "{mine}");
+        assert_eq!(mine["paper"]["added_authors"], json!([]), "{mine}");
+    }
+}
+
 /// The ingest's `asserts` edge and its record (with the authors it resolved),
 /// written with the walk's own primitives (ingest-written, by `by`). Returns
 /// the asserts edge.
