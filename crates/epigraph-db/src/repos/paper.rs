@@ -585,6 +585,39 @@ impl PaperRepository {
             .collect())
     }
 
+    /// The agents whose `authored` edge into `paper_id` was RETRACTED (no
+    /// longer in force) and that `viewer` may read. An agent's edge into a
+    /// paper is world-owned (migration 120), so only the maintenance path
+    /// retracts one: the operator CLI replacing a name-derived author with an
+    /// explicit agent. A document ingest reads this to keep that replacement
+    /// for every later ingester.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn retracted_author_ids_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT DISTINCT e.source_id \
+                   FROM edges e \
+                  WHERE e.target_id = $1 AND e.target_type = 'paper' \
+                    AND e.source_type = 'agent' AND e.relationship = 'authored' \
+                    AND NOT {in_force} \
+                    /* {{EDGE_VISIBILITY:e}} */",
+                in_force = crate::repos::edge::EDGE_IN_FORCE,
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
     /// Take `agent_id` off `paper_id` as an author: retract its in-force
     /// `authored` edge into the paper and its in-force `asserts` edges onto
     /// the claims THIS paper asserts, except a claim that another paper the

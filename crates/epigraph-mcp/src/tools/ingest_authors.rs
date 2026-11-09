@@ -29,7 +29,10 @@
 //!   path runs and the earlier agent is reported in `also_at_position`.
 //!   Which ingester made an attachment is read from the edge's
 //!   ingest-written marker, so one written before the marker existed is kept
-//!   for nobody.
+//!   for nobody. The exception is an operator replacement: when this
+//!   spelling's name-derived node was retracted from the paper (only the
+//!   maintenance path can retract an agent's edge), the explicit agent at
+//!   that position is kept for every ingester.
 //!
 //! # Who asserts the claims (the explicit-author rule)
 //!
@@ -432,6 +435,19 @@ pub(crate) async fn resolve_document_authors(
     // never when this call names that agent explicitly itself: a re-run of the
     // same extraction must resolve exactly as the first run did.
     let this_call: HashSet<Uuid> = explicit.values().map(|e| e.node.id).collect();
+    // Name-derived authors an operator replacement retracted from this paper
+    // (only the maintenance path can retract an agent's edge): the explicit
+    // agent at that entry's position is then the operator's decision, kept
+    // for every ingester.
+    let replaced_by_operator: HashSet<Uuid> = if edges.iter().any(|e| e.explicit) {
+        PaperRepository::retracted_author_ids_conn(conn, viewer, paper_id)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut taken: HashSet<Uuid> = HashSet::new();
     let mut kept: HashMap<usize, Uuid> = HashMap::new();
     // Earlier explicit attachments by this spelling that are NOT kept for
@@ -448,16 +464,31 @@ pub(crate) async fn resolve_document_authors(
         // Not "or the agent's identity matches the name": an agent sets its
         // own display name and ORCID, so neither vouches for it, and the one
         // identity a name does fix (the key it derives) is the name path's
-        // own node, which the fallback attaches anyway.
+        // own node, which the fallback attaches anyway. The one exception is
+        // the operator's: when this spelling's name-derived node was
+        // retracted from this paper (only maintenance can), the explicit
+        // agent at this position replaced it, and is kept for everyone.
         let same_spelling = |e: &&PaperAuthorEdge| {
             e.explicit
                 && e.author_name.as_deref() == Some(a.name.as_str())
                 && !this_call.contains(&e.agent_id)
         };
+        let pos = i64::try_from(i).ok();
+        let operator_replaced = if replaced_by_operator.is_empty() {
+            false
+        } else {
+            AgentRepository::get_by_public_key(&mut *conn, &name_key(&a.name))
+                .await
+                .map_err(internal_error)?
+                .is_some_and(|n| replaced_by_operator.contains(&Uuid::from(n.id)))
+        };
         let mut found: Vec<&PaperAuthorEdge> = edges
             .iter()
             .filter(same_spelling)
-            .filter(|e| e.written_by == Some(writer) && !taken.contains(&e.agent_id))
+            .filter(|e| {
+                (e.written_by == Some(writer) || (operator_replaced && e.position == pos))
+                    && !taken.contains(&e.agent_id)
+            })
             .collect();
         found.sort_by_key(|e| e.position != i64::try_from(i).ok());
         if let Some(e) = found.first() {

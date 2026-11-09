@@ -1927,3 +1927,54 @@ async fn query_paper_reads_only_what_the_ingest_wrote(pool: PgPool) {
     );
     assert_eq!(listed.len() as i64, ingested.min(25), "{after}");
 }
+
+/// An operator replacement (the CLI retracts this spelling's name-derived
+/// author from the paper and attaches the chosen agent at its position) is
+/// the operator's decision, not one ingester's word: a DIFFERENT ingester's
+/// later name-only re-ingest keeps the chosen agent too, never brings the
+/// retracted name-derived node back, and reports what is stored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_replacement_is_kept_for_every_later_ingester(pool: PgPool) {
+    let cli = privileged_server(&pool);
+    let honest = app_role_server(&pool).await;
+    let (_maintenance, viewer) = fixture::bypass(&pool).await;
+    let public = fixture::public_viewer(&pool).await;
+    let name = "Ottoline Brackenridge";
+    let human = human_named(&pool, name).await;
+    let d = "10.9999/author-operator-replace";
+    let atoms = ["The replaced author's atom."];
+
+    tools::ingestion::do_ingest_document(&cli, &viewer, &doc_with_atoms(d, json!([{"name": name}]), &atoms), None)
+        .await
+        .expect("the name-only ingest");
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &cli,
+            &viewer,
+            &doc_with_atoms(d, json!([{"name": name, "agent_id": human.to_string()}]), &atoms),
+            None,
+        )
+        .await
+        .expect("the operator replacement"),
+    );
+    assert_eq!(json["authors"][0]["replaced"]["agent_id"], key.to_string(), "CALIBRATION {json}");
+    assert_eq!(authored_in_force(&pool, key, d).await, 0, "CALIBRATION: replaced");
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &honest,
+            &public,
+            &doc_with_atoms(d, json!([{"name": name}]), &atoms),
+            None,
+        )
+        .await
+        .expect("another ingester's name-only re-ingest"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], human.to_string(), "{json}");
+    assert_eq!(report["action"], "kept_attached", "{json}");
+    assert_eq!(report["asserts_claims"], false, "{json}");
+    assert_eq!(authored_in_force(&pool, key, d).await, 0, "not brought back");
+    assert_eq!(authored_in_force(&pool, human, d).await, 1);
+}
