@@ -1394,7 +1394,7 @@ async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(poo
         &pool,
         doc_with_atoms(
             doi,
-            json!([{"name": "Ingrid Solvang"}]),
+            json!([{"name": "Ysolde Marrowgate"}]),
             &["A real finding."],
         ),
     )
@@ -1404,14 +1404,14 @@ async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(poo
         &pool,
         doc_with_atoms(
             doi,
-            json!([{"name": "Ingrid Solvang"}, {"name": "Interloper Vexx"}]),
+            json!([{"name": "Ysolde Marrowgate"}, {"name": "Interloper Vexx"}]),
             &["A fabricated finding."],
         ),
     )
     .await;
     let first = query_paper(&a, &pool, doi).await;
     assert_eq!(first["ingested_by"], a_id.to_string(), "{first}");
-    assert_eq!(listed_authors(&first), vec!["Ingrid Solvang"], "{first}");
+    assert_eq!(listed_authors(&first), vec!["Ysolde Marrowgate"], "{first}");
     let contents: Vec<String> = listed_claims(&first).into_iter().map(|c| c.0).collect();
     assert!(
         contents.contains(&"A real finding.".to_string())
@@ -1441,7 +1441,7 @@ async fn query_paper_lists_one_ingests_authors_with_that_ingests_claims_only(poo
     assert_eq!(second["ingested_by"], b_id.to_string(), "{second}");
     assert_eq!(
         listed_authors(&second),
-        vec!["Ingrid Solvang", "Interloper Vexx"],
+        vec!["Ysolde Marrowgate", "Interloper Vexx"],
         "{second}"
     );
     let claims = listed_claims(&second);
@@ -1592,7 +1592,7 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         "10.9999/ingest-record-3",
     );
     let shared = "Shared atom of the ingest-record documents.";
-    let author = json!([{"name": "Ingrid Solvang"}]);
+    let author = json!([{"name": "Ysolde Marrowgate"}]);
     let doc1 = || doc_with_atoms(d1, author.clone(), &[shared, "Only in record one."]);
 
     ingest_wait(&a, &pool, doc1()).await;
