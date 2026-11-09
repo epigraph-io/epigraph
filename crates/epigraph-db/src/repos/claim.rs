@@ -1227,6 +1227,27 @@ async fn non_public_frozen_relationships(
 /// keep the relationship's ordinary rule.
 pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
 
+/// Every replacement ([`migrate_superseded_edges`],
+/// [`repair_marked_duplicate`], [`migrate_consolidated_edges`]) leaves an
+/// edge carrying the document ingest's marker
+/// ([`crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY`]) on the claim it
+/// points at, whatever its source: a paper's `asserts`, its `ingested_claim`
+/// record, an author's `asserts`. Each records what ONE ingest stated about,
+/// or did to, THAT row (that its document asserts the claim, that it created
+/// or found the claim), and the readers trust it only as written. Moved,
+/// migration 198's guard would strip the marker and every reader would drop
+/// the claim from the paper (its count, its claims page, the author's card,
+/// the claim's ingest record), on both claims. Left in place, the paper keeps
+/// asserting the row its ingest created or found, which stays readable
+/// retired (`is_current = false`, `supersedes` naming the successor), and the
+/// claim the cascade points at reads no ingest of the paper. Agents'
+/// authorship already stays (R-133); this covers the paper-sourced edges with
+/// the same reasoning. The marker is the test, not the relationship: an
+/// unmarked (legacy) paper edge keeps the ordinary rule.
+///
+/// The key the cascades bind and test with `properties ? $n`.
+pub(crate) const INGEST_WRITTEN_FROZEN: &str = crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY;
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -1282,6 +1303,9 @@ async fn require_privileged_session(
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// EVERY supersession leaves the document ingest's own edges on the retired
+/// claim ([`INGEST_WRITTEN_FROZEN`]).
 ///
 /// Neither direction moves a RETRACTED edge (`valid_to` set): it is history
 /// about the retired claim, as the dedup and merge cascades already treat
@@ -1373,6 +1397,7 @@ async fn migrate_superseded_edges(
            AND NOT COALESCE(properties->>$7 = ANY($6), false) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
+           AND NOT (properties ? $8) \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -1382,6 +1407,7 @@ async fn migrate_superseded_edges(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -11934,6 +11960,10 @@ async fn migrate_consolidated_edges(
     // candidates either: they record who stated or wrote THAT source, and the
     // merged claim is content they never saw (ruling R-133, as in
     // `migrate_superseded_edges`). They stay on the retired source.
+    //
+    // Nor is an edge carrying the document ingest's marker
+    // (`INGEST_WRITTEN_FROZEN`): neither moved nor retracted as a redundant
+    // copy, it stays on the source its ingest created or found.
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -11957,6 +11987,7 @@ async fn migrate_consolidated_edges(
           AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT (e.source_type = 'agent' AND e.relationship = ANY($3))
           AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
+          AND NOT (e.properties ? $6)
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -11971,6 +12002,7 @@ async fn migrate_consolidated_edges(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -12654,7 +12686,8 @@ async fn repair_marked_duplicate(
     // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
     // Agents' authorship of the duplicate and act-marked edges stay on it
-    // (ruling R-133, as in `migrate_superseded_edges`). Both point AT the
+    // (ruling R-133, as in `migrate_superseded_edges`), and so do the
+    // document ingest's own edges (`INGEST_WRITTEN_FROZEN`). Both point AT the
     // claim they record, so the incoming re-point tests them; the collision
     // guards never meet an agent-sourced edge (they act on claim-sourced ones).
     let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
@@ -12864,6 +12897,9 @@ async fn repair_marked_duplicate(
            -- canonical is content they never saw (ruling R-133).
            AND NOT (source_type = 'agent' AND relationship = ANY($4)) \
            AND NOT COALESCE(properties->>$6 = ANY($5), false) \
+           -- The document ingest's own edges stay on the row its ingest
+           -- created or found (`INGEST_WRITTEN_FROZEN`).
+           AND NOT (properties ? $7) \
          RETURNING id",
     )
     .bind(canon_uuid)
@@ -12872,6 +12908,7 @@ async fn repair_marked_duplicate(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
     .fetch_all(&mut *conn)
     .await?;
 

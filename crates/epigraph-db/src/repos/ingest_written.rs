@@ -105,9 +105,10 @@
 //! * The document ingest's record of each claim it asserted
 //!   (`paper -ingested_claim-> claim`, [`crate::ClaimIngestRepository`]) is
 //!   marked too, by its own writer: one record per (paper, claim, ingester),
-//!   so it cannot go through the create-if-absent writer here. Its reader
-//!   requires the marker, so a record a supersede, dedup or merge cascade
-//!   re-points onto another claim (which drops the key) no longer counts.
+//!   so it cannot go through the create-if-absent writer here. The
+//!   supersede, dedup and merge cascades never re-point a marked edge (it
+//!   stays on the row the ingest created or found); any other re-point drops
+//!   the key, so the moved edge no longer counts.
 //! * The workflow executor's `agent -asserts-> claim` attributions are not
 //!   ingest-written edges: they name authors with no document behind them and
 //!   carry no countersign state.

@@ -43,11 +43,13 @@
 //! [`INGESTED_BY_PROPERTY`]) and the SAME paper's `asserts` edge onto the
 //! claim is in force, ingest-written and readable by the caller: a record
 //! without its assertion (the assertion retracted, or hidden from this
-//! caller) is not listed. A record or assertion that a supersede, dedup or
-//! merge cascade re-pointed onto another claim lost its marker in the move
-//! (migration 198), so it is not listed on the claim it now points at: the
-//! record is about the row that ingest created or found, never its
-//! successor. The paper's assertion is deduplicated on (paper, claim), so a
+//! caller) is not listed. The record is about the row that ingest created
+//! or found, never its successor: the supersede, dedup and merge cascades
+//! leave every ingest-written edge (the record, the paper's assertion) on the
+//! retired row (`claim.rs`, `INGEST_WRITTEN_FROZEN`), so the retired claim
+//! keeps its record and its paper, and the successor reads none. Any other
+//! UPDATE that re-points one strips its marker (migration 198), so it would
+//! not be listed on the claim it then points at. The paper's assertion is deduplicated on (paper, claim), so a
 //! second ingester's record rests on the first ingester's assertion; the
 //! read requires the assertion to be ingest-written, not to name the same
 //! ingester. A re-ingest of a document whose assertion predates the marker
