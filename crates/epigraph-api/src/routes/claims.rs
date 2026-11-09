@@ -324,14 +324,21 @@ pub struct IngesterView {
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
 pub struct PaperAuthorshipView {
     pub paper: PaperRefView,
-    /// The countersigned and name-derived authors from the document's
-    /// readable, in-force `authored` edges, in position order.
+    /// On the creating document, the claim's primary authors: those its
+    /// creating ingest recorded when it created the claim, whose readable,
+    /// in-force, ingest-written `authored` edge is countersigned or
+    /// name-derived, in position order. On a corroborating document, its
+    /// countersigned and name-derived authors.
     pub authors: Vec<PaperAuthorView>,
     /// Authors an ingester named without speaking for them, not yet
     /// countersigned (`pending_countersign: true`, `named_by`). Never
     /// primary.
     pub pending_authors: Vec<PaperAuthorView>,
-    /// More than 50 readable authors exist (both lists together).
+    /// On the creating document only: authors its creating ingest did not
+    /// record (a later ingest of the same document key added them), each
+    /// with `added_by`. Never primary; empty on a corroborating document.
+    pub added_authors: Vec<PaperAuthorView>,
+    /// More than 50 readable authors exist (the three lists together).
     pub authors_truncated: bool,
 }
 
@@ -358,6 +365,8 @@ pub struct PaperAuthorView {
     pub pending_countersign: bool,
     /// On a pending authorship, the ingester whose word it is.
     pub named_by: Option<AuthorRefView>,
+    /// On an added author, the ingester whose ingest added the authorship.
+    pub added_by: Option<AuthorRefView>,
 }
 
 /// One agent: the two fields `GET /api/v1/agents/:id` names.
@@ -419,6 +428,7 @@ impl From<epigraph_db::PaperAuthorship> for PaperAuthorshipView {
             affiliations: a.affiliations,
             pending_countersign: a.pending_countersign,
             named_by: a.named_by.map(Into::into),
+            added_by: a.added_by.map(Into::into),
         };
         Self {
             paper: PaperRefView {
@@ -428,6 +438,7 @@ impl From<epigraph_db::PaperAuthorship> for PaperAuthorshipView {
             },
             authors: p.authors.into_iter().map(author).collect(),
             pending_authors: p.pending_authors.into_iter().map(author).collect(),
+            added_authors: p.added_authors.into_iter().map(author).collect(),
             authors_truncated: p.authors_truncated,
         }
     }

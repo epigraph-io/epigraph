@@ -1093,16 +1093,18 @@ pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
 /// [`DUPLICATE_IDENTITY_PROPERTY`], [`SUPERSEDE_ACT_PROPERTY`],
 /// [`crate::INGEST_WRITTEN_PROPERTY`] (which migration 198's guard also
 /// refuses in the database, for every writer), and the document ingest
-/// record's [`crate::INGESTED_BY_PROPERTY`] and [`crate::CREATED_CLAIM_PROPERTY`]
-/// (an ingest record on a group-private claim is owned by that group, whose
-/// writers could otherwise patch a convergence into a creation, or rewrite
-/// who ingested it).
+/// record's [`crate::INGESTED_BY_PROPERTY`], [`crate::CREATED_CLAIM_PROPERTY`]
+/// and [`crate::INGEST_AUTHORS_PROPERTY`] (an ingest record on a
+/// group-private claim is owned by that group, whose writers could otherwise
+/// patch a convergence into a creation, rewrite who ingested it, or rewrite
+/// the primary authors the creating ingest recorded).
 pub const RESERVED_EDGE_PROPERTIES: &[&str] = &[
     DUPLICATE_IDENTITY_PROPERTY,
     SUPERSEDE_ACT_PROPERTY,
     crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY,
     crate::repos::claim_ingest::INGESTED_BY_PROPERTY,
     crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY,
+    crate::repos::claim_ingest::INGEST_AUTHORS_PROPERTY,
 ];
 
 /// The refusal for an application edge write whose `properties` carry a key
@@ -1123,6 +1125,9 @@ pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<
         .is_some()
         || properties
             .get(crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY)
+            .is_some()
+        || properties
+            .get(crate::repos::claim_ingest::INGEST_AUTHORS_PROPERTY)
             .is_some()
     {
         Some(crate::repos::claim_ingest::INGEST_RECORD_KEYS_RESERVED)

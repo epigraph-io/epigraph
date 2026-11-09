@@ -1189,6 +1189,14 @@ pub async fn do_ingest_document(
         &paper_title,
     )
     .await?;
+    // The document's authors as THIS walk resolved them, in the extraction's
+    // order: written into every ingest record, and on the record of a claim
+    // this walk creates, the claim's primary authors (`ClaimIngestRecord::
+    // authors`), fixed at creation whatever a later ingest adds.
+    let mut recorded_authors: Vec<(usize, Uuid)> =
+        resolved.iter().map(|r| (r.idx, r.agent_id)).collect();
+    recorded_authors.sort_by_key(|(idx, _)| *idx);
+    let recorded_authors: Vec<Uuid> = recorded_authors.into_iter().map(|(_, a)| a).collect();
     for r in resolved {
         let author = &authors[r.idx];
         let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
@@ -1322,6 +1330,7 @@ pub async fn do_ingest_document(
                 persisted_id,
                 agent_id,
                 false,
+                &recorded_authors,
                 "ingest_document",
                 &pipeline_version,
             )
@@ -1415,6 +1424,7 @@ pub async fn do_ingest_document(
             persisted_id,
             agent_id,
             true,
+            &recorded_authors,
             "ingest_document",
             &pipeline_version,
         )
@@ -2204,6 +2214,14 @@ pub async fn do_ingest_document_spine(
         &paper_title,
     )
     .await?;
+    // The document's authors as THIS walk resolved them, in the extraction's
+    // order: written into every ingest record, and on the record of a claim
+    // this walk creates, the claim's primary authors (`ClaimIngestRecord::
+    // authors`), fixed at creation whatever a later ingest adds.
+    let mut recorded_authors: Vec<(usize, Uuid)> =
+        resolved.iter().map(|r| (r.idx, r.agent_id)).collect();
+    recorded_authors.sort_by_key(|(idx, _)| *idx);
+    let recorded_authors: Vec<Uuid> = recorded_authors.into_iter().map(|(_, a)| a).collect();
     for r in resolved {
         let author = &authors[r.idx];
         let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
@@ -2329,6 +2347,7 @@ pub async fn do_ingest_document_spine(
                 persisted_id,
                 agent_id,
                 false,
+                &recorded_authors,
                 "ingest_document_spine",
                 &pipeline_version,
             )
@@ -2420,6 +2439,7 @@ pub async fn do_ingest_document_spine(
             persisted_id,
             agent_id,
             true,
+            &recorded_authors,
             "ingest_document_spine",
             &pipeline_version,
         )

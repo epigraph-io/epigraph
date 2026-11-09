@@ -698,6 +698,7 @@ async fn ingest_created(pool: &PgPool, filer: Uuid, claim: Uuid) -> (Uuid, Uuid)
         claim,
         filer,
         true,
+        &[],
         "ingest_document",
         "test-pipeline",
     )

@@ -158,6 +158,7 @@ pub use repos::{
     INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
     INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
+pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,

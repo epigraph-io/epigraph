@@ -18,6 +18,12 @@
 //!   identity, `claims.agent_id` of a claim it creates), as a UUID string;
 //! * [`CREATED_CLAIM_PROPERTY`]: `true` only on the ingest that created the
 //!   claim, `false` on every later ingest that converged on it;
+//! * [`INGEST_AUTHORS_PROPERTY`]: the document's authors as THIS ingest
+//!   resolved them (agent ids, in the extraction's order, at most
+//!   [`MAX_RECORDED_AUTHORS`]). On the creating record this is the claim's
+//!   primary author list, fixed when the claim was created: a later ingest of
+//!   the same document key that names more authors writes its own record and
+//!   its own authorships onto the paper, and never changes it;
 //! * `tool` (`ingest_document` / `ingest_document_spine`) and `pipeline` (the
 //!   walk's pipeline stamp), for the operator.
 //!
@@ -54,7 +60,8 @@
 //! (an unmarked, legacy row) therefore records nothing readable.
 //! `creator` is the record with `created_claim: true` whose `ingested_by` is
 //! the claim's filer (`claims.agent_id`; the walk files every claim it
-//! creates), when there is one. A
+//! creates), when there is one; only its [`ClaimIngestRecord::authors`] is
+//! read (every other record's is left empty). A
 //! claim with no creator record was not created by a document ingest that
 //! recorded it (a directly filed claim, or one ingested before this record
 //! existed): its filer is its author, and every listed paper corroborates.
@@ -75,14 +82,21 @@ pub const INGEST_RECORD_RELATIONSHIP: &str = "ingested_claim";
 pub const INGESTED_BY_PROPERTY: &str = "ingested_by";
 /// Record property: `true` only on the ingest that created the claim.
 pub const CREATED_CLAIM_PROPERTY: &str = "created_claim";
+/// Record property: the document's authors as the recording ingest resolved
+/// them, an array of agent-id strings in the extraction's order. On the
+/// creating record, the claim's primary authors.
+pub const INGEST_AUTHORS_PROPERTY: &str = "ingest_authors";
+/// Most authors one record names (the rest of a longer author list is not
+/// recorded; readers list at most `authored_by::MAX_PAPER_AUTHORS` anyway).
+pub const MAX_RECORDED_AUTHORS: usize = 500;
 
 /// The refusal for an application edge write whose `properties` carry
 /// [`INGESTED_BY_PROPERTY`] or [`CREATED_CLAIM_PROPERTY`]
 /// (`crate::reserved_edge_property_refusal`).
 pub const INGEST_RECORD_KEYS_RESERVED: &str =
-    "properties.ingested_by and properties.created_claim are reserved for the document \
-     ingest's own records (which ingest created a claim, who ingested a document); \
-     nothing was written";
+    "properties.ingested_by, properties.created_claim and properties.ingest_authors are \
+     reserved for the document ingest's own records (which ingest created a claim, who \
+     ingested a document, which authors it named); nothing was written";
 
 /// Most claims one [`ClaimIngestRepository::for_claims`] call reads.
 pub const FOR_CLAIMS_CAP: usize = 200;
@@ -103,6 +117,12 @@ pub struct ClaimIngestRecord {
     pub created_claim: bool,
     /// When the record was written (the ingest's transaction time).
     pub recorded_at: DateTime<Utc>,
+    /// On the creator record only: the document's authors as the creating
+    /// ingest resolved them when it created the claim
+    /// ([`INGEST_AUTHORS_PROPERTY`]), in its order; the claim's primary
+    /// authors. Empty on every other record, and on a creator record written
+    /// without the property.
+    pub authors: Vec<Uuid>,
 }
 
 /// Every readable ingest of one claim.
@@ -121,7 +141,9 @@ pub struct ClaimIngestRepository;
 
 impl ClaimIngestRepository {
     /// Record that `ingested_by`'s ingest of `paper_id` asserted `claim_id`,
-    /// and whether it CREATED the claim. Runs on the walk's own transaction,
+    /// whether it CREATED the claim, and the document's authors as this
+    /// ingest resolved them (`authors`, in order; duplicates dropped, at most
+    /// [`MAX_RECORDED_AUTHORS`]). Runs on the walk's own transaction,
     /// after the paper's `asserts` edge onto the claim, so the record commits
     /// with the claim and the assertion or not at all. Returns `true` when a
     /// record was written, `false` when this (paper, claim, ingester) was
@@ -141,6 +163,7 @@ impl ClaimIngestRepository {
         claim_id: Uuid,
         ingested_by: Uuid,
         created_claim: bool,
+        authors: &[Uuid],
         tool: &str,
         pipeline: &str,
     ) -> Result<bool, DbError> {
@@ -166,6 +189,13 @@ impl ClaimIngestRepository {
             tx.commit().await?;
             return Ok(false);
         }
+        let mut named: Vec<String> = Vec::new();
+        for a in authors {
+            let a = a.to_string();
+            if named.len() < MAX_RECORDED_AUTHORS && !named.contains(&a) {
+                named.push(a);
+            }
+        }
         // Marked as the ingest's (migration 198's guard admits the key only
         // under the declaration, for this INSERT alone), so a record that a
         // cascade later re-points onto another claim loses the mark and stops
@@ -182,6 +212,7 @@ impl ClaimIngestRepository {
             Some(serde_json::json!({
                 INGESTED_BY_PROPERTY: ingested_by.to_string(),
                 CREATED_CLAIM_PROPERTY: created_claim,
+                INGEST_AUTHORS_PROPERTY: named,
                 "tool": tool,
                 "pipeline": pipeline,
                 (crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY):
@@ -220,13 +251,22 @@ impl ClaimIngestRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT k.claim_id, k.paper_id, k.ingested_by, k.created_claim, \
-                        k.recorded_at, k.total \
+                        k.recorded_at, k.total, \
+                        CASE WHEN k.created_claim \
+                                  AND jsonb_typeof(k.named) = 'array' \
+                             THEN ARRAY(SELECT x.v::uuid \
+                                          FROM jsonb_array_elements_text(k.named) \
+                                               WITH ORDINALITY AS x(v, n) \
+                                         WHERE x.v ~ '{uuid_re}' AND x.n <= $3 \
+                                         ORDER BY x.n) \
+                             ELSE '{{}}'::uuid[] END AS authors \
                    FROM (SELECT r.target_id AS claim_id, r.source_id AS paper_id, \
                                 (r.properties ->> '{by}')::uuid AS ingested_by, \
                                 (COALESCE(r.properties ->> '{created}' = 'true', false) \
                                  AND c.agent_id = (r.properties ->> '{by}')::uuid) \
                                     AS created_claim, \
                                 r.created_at AS recorded_at, \
+                                r.properties -> '{named}' AS named, \
                                 row_number() OVER (PARTITION BY r.target_id \
                                                    ORDER BY r.created_at, r.id) AS n, \
                                 count(*) OVER (PARTITION BY r.target_id) AS total \
@@ -235,8 +275,7 @@ impl ClaimIngestRepository {
                           WHERE r.target_id = ANY($1::uuid[]) AND r.target_type = 'claim' \
                             AND r.source_type = 'paper' \
                             AND r.relationship = '{rel}' \
-                            AND r.properties ->> '{by}' ~ \
-                                '^[0-9a-fA-F]{{8}}-([0-9a-fA-F]{{4}}-){{3}}[0-9a-fA-F]{{12}}$' \
+                            AND r.properties ->> '{by}' ~ '{uuid_re}' \
                             AND {marked_r} \
                             AND {marker_by_r} = r.properties ->> '{by}' \
                             AND {in_force_r} \
@@ -253,6 +292,8 @@ impl ClaimIngestRepository {
                   ORDER BY k.claim_id, k.recorded_at, k.paper_id",
                 by = INGESTED_BY_PROPERTY,
                 created = CREATED_CLAIM_PROPERTY,
+                named = INGEST_AUTHORS_PROPERTY,
+                uuid_re = "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$",
                 rel = INGEST_RECORD_RELATIONSHIP,
                 in_force_r = in_force("r"),
                 in_force_a = in_force("a"),
@@ -260,16 +301,17 @@ impl ClaimIngestRepository {
                 marker_by_r = crate::repos::ingest_written::ingest_written_by_sql("r"),
                 marked_a = crate::repos::ingest_written::ingest_written_edge_sql("a"),
             ),
-            3,
+            4,
         );
-        type Row = (Uuid, Uuid, Uuid, bool, DateTime<Utc>, i64);
+        type Row = (Uuid, Uuid, Uuid, bool, DateTime<Utc>, i64, Vec<Uuid>);
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(ids)
-            .bind(RECORDS_PER_CLAIM_CAP);
+            .bind(RECORDS_PER_CLAIM_CAP)
+            .bind(i64::try_from(MAX_RECORDED_AUTHORS).unwrap_or(i64::MAX));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        for (claim, paper_id, ingested_by, created_claim, recorded_at, total) in
+        for (claim, paper_id, ingested_by, created_claim, recorded_at, total, authors) in
             q.fetch_all(&mut *conn).await?
         {
             let Some(entry) = out.get_mut(&claim) else {
@@ -280,6 +322,7 @@ impl ClaimIngestRepository {
                 ingested_by,
                 created_claim,
                 recorded_at,
+                authors,
             };
             if created_claim && entry.creator.is_none() {
                 entry.creator = Some(record.clone());
@@ -468,7 +511,12 @@ mod tests {
         ] {
             assert!(ingest_only_edge_refusal(s, t, r).is_none(), "{s} {r} {t}");
         }
-        for key in [INGESTED_BY_PROPERTY, CREATED_CLAIM_PROPERTY] {
+        assert_eq!(INGEST_AUTHORS_PROPERTY, "ingest_authors");
+        for key in [
+            INGESTED_BY_PROPERTY,
+            CREATED_CLAIM_PROPERTY,
+            INGEST_AUTHORS_PROPERTY,
+        ] {
             assert_eq!(
                 crate::reserved_edge_property_refusal(&serde_json::json!({ key: true })),
                 Some(INGEST_RECORD_KEYS_RESERVED),

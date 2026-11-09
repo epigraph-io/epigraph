@@ -329,6 +329,7 @@ async fn a_group_writer_cannot_rewrite_its_claims_ingest_record(pool: PgPool) {
             claim,
             other,
             false,
+            &[],
             "ingest_document",
             "test-pipeline",
         )
@@ -359,6 +360,7 @@ async fn a_group_writer_cannot_rewrite_its_claims_ingest_record(pool: PgPool) {
     for forged in [
         json!({"created_claim": true}),
         json!({"ingested_by": member.to_string()}),
+        json!({"ingest_authors": [member.to_string()]}),
     ] {
         let (status, body) =
             patch_edge(&state, member, record, json!({"properties": forged})).await;

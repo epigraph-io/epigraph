@@ -160,6 +160,7 @@ pub use claim_ingest::{
     CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY, INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED,
     INGEST_RECORD_RELATIONSHIP, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
+pub use claim_ingest::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
     DistantClaimsRow, NeighbourhoodThemeCoverage, RecomputedThemeRow, SplitCandidateRow,

@@ -78,6 +78,7 @@ async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool
         claim,
         by,
         created,
+        &[],
         "ingest_document",
         "test-pipeline",
     )
@@ -304,6 +305,7 @@ async fn the_record_writer_declares_only_its_own_insert(pool: PgPool) {
         claim,
         ingester,
         true,
+        &[],
         "ingest_document",
         "test-pipeline",
     )

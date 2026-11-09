@@ -365,13 +365,13 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
     .fetch_one(&pool)
     .await
     .expect("paper");
-    let asserts = ingest_record(&pool, doc, claim, ingester, true).await;
     let (second, _) = viewer_fixture::seed_agent_with_group(&pool, "second").await;
     named(&pool, second, "Second Author").await;
     let (first, _) = viewer_fixture::seed_agent_with_group(&pool, "first").await;
     named(&pool, first, "First Author").await;
     let (person, _) = viewer_fixture::seed_agent_with_group(&pool, "person").await;
     named(&pool, person, "Named Person").await;
+    let asserts = ingest_record(&pool, doc, claim, ingester, true, &[first, second, person]).await;
     authored_edge(
         &pool,
         second,
@@ -410,10 +410,10 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
         json!([
             {"id": first, "display_name": "First Author", "position": 0,
              "role": "corresponding", "affiliations": ["Fixture Institute"],
-             "pending_countersign": false, "named_by": null},
+             "pending_countersign": false, "named_by": null, "added_by": null},
             {"id": second, "display_name": "Second Author", "position": 1,
              "role": "author", "affiliations": [],
-             "pending_countersign": false, "named_by": null},
+             "pending_countersign": false, "named_by": null, "added_by": null},
         ]),
         "{block}"
     );
@@ -423,10 +423,12 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
             {"id": person, "display_name": "Named Person", "position": 2,
              "role": "author", "affiliations": [],
              "pending_countersign": true,
-             "named_by": {"id": ingester, "display_name": "ingest-fixture"}},
+             "named_by": {"id": ingester, "display_name": "ingest-fixture"},
+             "added_by": null},
         ]),
         "a pending author is apart, never primary: {block}"
     );
+    assert_eq!(p["added_authors"], json!([]), "{block}");
     assert_eq!(p["authors_truncated"], json!(false));
     assert_eq!(
         block["ingested_by"]["agent"],
@@ -466,9 +468,17 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
     assert_eq!(plain["ingesters"], json!([]), "{plain}");
 }
 
-/// The ingest's `asserts` edge and its creation record, written with the
-/// walk's own primitives (ingest-written, by `by`). Returns the asserts edge.
-async fn ingest_record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
+/// The ingest's `asserts` edge and its record (with the authors it resolved),
+/// written with the walk's own primitives (ingest-written, by `by`). Returns
+/// the asserts edge.
+async fn ingest_record(
+    pool: &PgPool,
+    paper: Uuid,
+    claim: Uuid,
+    by: Uuid,
+    created: bool,
+    authors: &[Uuid],
+) -> Uuid {
     let mut conn = pool.acquire().await.expect("conn");
     let e = epigraph_db::create_ingest_written_edge_if_absent_conn(
         &mut conn,
@@ -493,6 +503,7 @@ async fn ingest_record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, create
         claim,
         by,
         created,
+        authors,
         "ingest_document",
         "test-pipeline",
     )

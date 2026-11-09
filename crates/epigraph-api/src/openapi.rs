@@ -416,9 +416,11 @@ async fn unmark_duplicate_doc() {}
 /// for every reader, and `prompt_snapshot` only for the agent's linked human
 /// and admins (the prompt-history gate). `literature` (the document ingest
 /// recorded at creation that a document's ingest created the claim):
-/// `paper` (that document and its authors, the claim's primary authors;
-/// authors an ingester named without their countersignature are listed
-/// apart under `pending_authors`, never primary) and `ingested_by` (the
+/// `paper` (that document and its authors: the claim's primary authors are
+/// the ones its creating ingest recorded at creation; authors an ingester
+/// named without their countersignature are listed apart under
+/// `pending_authors`, and authors a later ingest of the same document added
+/// under `added_authors` with `added_by`, neither ever primary) and `ingested_by` (the
 /// filer, with the same three parts). Both carry `corroborated_by` (every
 /// other readable document whose ingest recorded the claim) and `ingesters`
 /// (every readable ingest, each with the human its agent was bound to then).

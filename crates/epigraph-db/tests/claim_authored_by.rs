@@ -885,10 +885,18 @@ async fn private_to(pool: &PgPool, edge: Uuid, group: Uuid) {
     assert_eq!(n, 1);
 }
 
-/// The ingest's record that `by` ingested `paper` and (per `created`)
-/// whether that ingest created the claim, written with the walk's own
+/// The ingest's record that `by` ingested `paper`, (per `created`) whether
+/// that ingest created the claim, and the authors it resolved (`authors`, on a
+/// creation the claim's primary authors), written with the walk's own
 /// primitive.
-async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) {
+async fn record(
+    pool: &PgPool,
+    paper: Uuid,
+    claim: Uuid,
+    by: Uuid,
+    created: bool,
+    authors: &[Uuid],
+) {
     let mut conn = pool.acquire().await.expect("conn");
     let wrote = ClaimIngestRepository::record_signed_conn(
         &mut conn,
@@ -897,6 +905,7 @@ async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool
         claim,
         by,
         created,
+        authors,
         "ingest_document",
         "test-pipeline",
     )
@@ -936,7 +945,14 @@ async fn ingest_edge(
 
 /// The document's `asserts` edge onto the claim, as `by`'s walk writes it,
 /// AND the ingest's record of it. Returns the asserts edge.
-async fn ingested(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
+async fn ingested(
+    pool: &PgPool,
+    paper: Uuid,
+    claim: Uuid,
+    by: Uuid,
+    created: bool,
+    authors: &[Uuid],
+) -> Uuid {
     let e = ingest_edge(
         pool,
         by,
@@ -946,7 +962,7 @@ async fn ingested(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bo
         json!({}),
     )
     .await;
-    record(pool, paper, claim, by, created).await;
+    record(pool, paper, claim, by, created, authors).await;
     e
 }
 
@@ -1015,9 +1031,7 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     let (second, _) = fixture::seed_agent_with_group(&pool, "second-ingester").await;
     let claim = fixture::seed_public_claim(&pool, ingester, "a literature fixture claim").await;
     let doc = paper(&pool, "10.0000/fixture.one", "Fixture Paper One").await;
-    ingested(&pool, doc, claim, ingester, true).await;
     let other = paper(&pool, "10.0000/fixture.two", "Fixture Paper Two").await;
-    ingested(&pool, other, claim, second, false).await;
     let other_author = author_node(&pool, "Other Author").await;
     authored(&pool, other_author, other, second, json!({"position": 0})).await;
 
@@ -1027,6 +1041,18 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     let second_author = author_node(&pool, "Second Author").await;
     let unplaced = author_node(&pool, "Unplaced Author").await;
     let named_person = author_node(&pool, "Named Person").await;
+    // The creating ingest records the authors it resolved; the converging
+    // document's ingest records its own.
+    ingested(
+        &pool,
+        doc,
+        claim,
+        ingester,
+        true,
+        &[first_a, first_b, second_author, third, unplaced],
+    )
+    .await;
+    ingested(&pool, other, claim, second, false, &[other_author]).await;
     authored(
         &pool,
         third,
@@ -1061,6 +1087,10 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
         json!({"position": 3, "pending_countersign": true, "ingested_by": second.to_string()}),
     )
     .await;
+    // An authorship a LATER ingest of the same document added: listed apart,
+    // never primary.
+    let added_later = author_node(&pool, "Added Later").await;
+    authored(&pool, added_later, doc, second, json!({"position": 1})).await;
     // An authorship no ingest wrote (a row from before the ingest marked its
     // edges, or a hand-written one): never an author.
     let unmarked = author_node(&pool, "Unmarked Author").await;
@@ -1116,6 +1146,17 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
         .all(|a| !a.pending_countersign && a.named_by.is_none()));
 
     assert_eq!(ids(&p.pending_authors), vec![named_person], "pending apart");
+    assert_eq!(
+        ids(&p.added_authors),
+        vec![added_later],
+        "an author the creating ingest did not record is listed apart"
+    );
+    assert_eq!(
+        p.added_authors[0].added_by.as_ref().map(|a| a.id),
+        Some(second),
+        "with the ingest that added it"
+    );
+    assert!(p.authors.iter().all(|a| a.added_by.is_none()));
     assert!(p.pending_authors[0].pending_countersign);
     assert_eq!(
         p.pending_authors[0].named_by.as_ref().map(|n| n.id),
@@ -1171,6 +1212,40 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     );
 }
 
+/// No number of authorships a later ingest adds to the creating document
+/// can push a recorded (primary) author out of the bounded listing: the
+/// recorded authors are listed first in the one bounded read, whatever their
+/// position and however many others sort before them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_recorded_author_is_never_pushed_out_by_added_ones(pool: PgPool) {
+    use epigraph_db::authored_by::MAX_PAPER_AUTHORS;
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "other-ingester").await;
+    let claim = fixture::seed_public_claim(&pool, ingester, "a pushed-at claim").await;
+    let doc = paper(&pool, "10.0000/fixture.pushout", "Crowded Paper").await;
+    // Written FIRST, at the lowest position: every one sorts before the
+    // recorded author in the listing's own order.
+    for i in 0..(MAX_PAPER_AUTHORS + 5) {
+        let a = author_node(&pool, &format!("Crowding Author {i}")).await;
+        authored(&pool, a, doc, other, json!({"position": 0})).await;
+    }
+    let lead = author_node(&pool, "Recorded Lead").await;
+    authored(&pool, lead, doc, ingester, json!({"position": 7})).await;
+    ingested(&pool, doc, claim, ingester, true, &[lead]).await;
+
+    let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
+    let p = &literature(&block).paper;
+    assert_eq!(ids(&p.authors), vec![lead], "the recorded author stays listed");
+    assert_eq!(p.added_authors.len(), MAX_PAPER_AUTHORS - 1, "the rest of the window");
+    assert!(p.authors_truncated, "and the cut is reported");
+    assert!(p
+        .added_authors
+        .iter()
+        .all(|a| a.added_by.as_ref().map(|b| b.id) == Some(other)));
+}
+
 /// Only the CREATING ingest makes a document primary. A claim no record
 /// says a document created (filed directly, then repeated by a document),
 /// or whose creation record names someone other than its filer, is the
@@ -1216,7 +1291,7 @@ async fn only_the_creating_ingest_makes_a_document_primary(pool: PgPool) {
     // Repeated by a document whose ingest did not create the claim.
     let repeated = fixture::seed_public_claim(&pool, filer, "stated, then repeated").await;
     let doc = paper(&pool, "10.0000/fixture.repeat", "Repeating Paper").await;
-    ingested(&pool, doc, repeated, other, false).await;
+    ingested(&pool, doc, repeated, other, false, &[]).await;
     let block = claim_block(&pool, &scoped, stranger, repeated, filer).await;
     let AuthoredBy::Agent(a) = &block else {
         panic!("a repeated claim stays its filer's: {block:?}");
@@ -1242,7 +1317,7 @@ async fn only_the_creating_ingest_makes_a_document_primary(pool: PgPool) {
     // A record that says "created" but names someone other than the filer.
     let misnamed = fixture::seed_public_claim(&pool, filer, "creation misattributed").await;
     let doc2 = paper(&pool, "10.0000/fixture.misnamed", "Misnamed Paper").await;
-    ingested(&pool, doc2, misnamed, other, true).await;
+    ingested(&pool, doc2, misnamed, other, true, &[]).await;
     assert!(
         matches!(
             claim_block(&pool, &scoped, stranger, misnamed, filer).await,
@@ -1266,7 +1341,7 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
 
     let hidden_claim = fixture::seed_public_claim(&pool, ingester, "privately asserted").await;
     let hidden_doc = paper(&pool, "10.0000/fixture.hidden", "Hidden Paper").await;
-    let e = ingested(&pool, hidden_doc, hidden_claim, ingester, true).await;
+    let e = ingested(&pool, hidden_doc, hidden_claim, ingester, true, &[]).await;
     private_to(&pool, e, group).await;
     authored(
         &pool,
@@ -1319,7 +1394,7 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     .await
     .expect("a retracted, ingest-written asserts edge");
     tx.commit().await.expect("commit");
-    record(&pool, old_doc, retracted_claim, ingester, true).await;
+    record(&pool, old_doc, retracted_claim, ingester, true, &[]).await;
     assert_eq!(
         as_json(claim_block(&pool, &scoped, member, retracted_claim, ingester).await),
         as_json(claim_block(&pool, &scoped, member, plain, ingester).await),
@@ -1329,9 +1404,9 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     // A public document with one public and one group-private author edge.
     let open_claim = fixture::seed_public_claim(&pool, ingester, "openly asserted").await;
     let open_doc = paper(&pool, "10.0000/fixture.open", "Open Paper").await;
-    ingested(&pool, open_doc, open_claim, ingester, true).await;
     let shown = author_node(&pool, "Shown Author").await;
     let kept = author_node(&pool, "Kept Author").await;
+    ingested(&pool, open_doc, open_claim, ingester, true, &[kept, shown]).await;
     authored(&pool, shown, open_doc, ingester, json!({"position": 1})).await;
     let k = authored(&pool, kept, open_doc, ingester, json!({"position": 0})).await;
     private_to(&pool, k, group).await;
@@ -1369,7 +1444,7 @@ async fn corroborating_documents_are_capped_and_every_ingester_is_listed(pool: P
         )
         .await;
         let (by, _) = fixture::seed_agent_with_group(&pool, "many-ingester").await;
-        ingested(&pool, d, claim, by, false).await;
+        ingested(&pool, d, claim, by, false, &[]).await;
         first_ingester.get_or_insert(by);
         docs.push(d);
     }
@@ -1416,14 +1491,14 @@ async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: Pg
 
     let hidden_claim = fixture::seed_public_claim(&pool, ingester, "privately asserted").await;
     let hidden_doc = paper(&pool, "10.0000/fixture.su.hidden", "Hidden Paper").await;
-    let e = ingested(&pool, hidden_doc, hidden_claim, ingester, true).await;
+    let e = ingested(&pool, hidden_doc, hidden_claim, ingester, true, &[]).await;
     private_to(&pool, e, group).await;
 
     let open_claim = fixture::seed_public_claim(&pool, ingester, "openly asserted").await;
     let open_doc = paper(&pool, "10.0000/fixture.su.open", "Open Paper").await;
-    ingested(&pool, open_doc, open_claim, ingester, true).await;
     let shown = author_node(&pool, "Shown Author").await;
     let kept = author_node(&pool, "Kept Author").await;
+    ingested(&pool, open_doc, open_claim, ingester, true, &[kept, shown]).await;
     authored(&pool, shown, open_doc, ingester, json!({"position": 1})).await;
     let k = authored(&pool, kept, open_doc, ingester, json!({"position": 0})).await;
     private_to(&pool, k, group).await;

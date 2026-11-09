@@ -348,46 +348,57 @@ impl PaperRepository {
     }
 
     /// [`Self::list_authors`] for several papers in ONE read, bounded in SQL:
-    /// at most `per_paper` authors of each (in the same order, under the same
-    /// predicate), plus whether more exist. Papers with no readable author
-    /// are absent from the map. For a reader that lists several documents'
-    /// authors at once (a claim's provenance block), so neither the number of
-    /// papers nor the length of an author list turns one read into an
-    /// unbounded one.
+    /// at most `per_paper` authors of each (under the same predicate), plus
+    /// whether more exist. Papers with no readable author are absent from the
+    /// map. For a reader that lists several documents' authors at once (a
+    /// claim's provenance block), so neither the number of papers nor the
+    /// length of an author list turns one read into an unbounded one.
+    ///
+    /// `recorded` names, per paper, the authors a reader takes from a record
+    /// rather than from the edges alone (a claim's creating ingest records its
+    /// document's authors: `crate::ClaimIngestRecord::authors`), as `(paper,
+    /// agent)` pairs. Each listed author carries whether its pair is in
+    /// `recorded`, and those authors are listed FIRST (then the listing's own
+    /// order), so authorships other ingests added to the same paper, however
+    /// many and wherever they sort, can never push a recorded author out of
+    /// the `per_paper` window.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
+    #[instrument(skip(executor, viewer, recorded))]
     pub async fn list_authors_bounded<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         paper_ids: &[Uuid],
         per_paper: i64,
-    ) -> Result<std::collections::HashMap<Uuid, (Vec<PaperAuthorListing>, bool)>, DbError> {
-        let mut out: std::collections::HashMap<Uuid, (Vec<PaperAuthorListing>, bool)> =
-            std::collections::HashMap::new();
+        recorded: &[(Uuid, Uuid)],
+    ) -> Result<BoundedAuthorListings, DbError> {
+        let mut out = BoundedAuthorListings::new();
         if paper_ids.is_empty() || per_paper <= 0 {
             return Ok(out);
         }
+        let in_record = "EXISTS (SELECT 1 FROM unnest($3::uuid[], $4::uuid[]) AS r(p, a) \
+                          WHERE r.p = p.id AND r.a = e.source_id)";
         let sql = viewer.splice(
             &format!(
                 "SELECT p.id, x.* \
                    FROM unnest($1::uuid[]) AS p(id) \
                   CROSS JOIN LATERAL ( \
-                        SELECT {columns}, \
-                               row_number() OVER (ORDER BY {order}) AS listing_rank \
+                        SELECT {columns}, {in_record} AS in_record, \
+                               row_number() OVER (ORDER BY {in_record} DESC, {order}) \
+                                   AS listing_rank \
                           FROM edges e \
                           JOIN agents a ON a.id = e.source_id \
                          WHERE e.target_id = p.id AND {authored} \
                            /* {{EDGE_VISIBILITY:e}} */ \
-                         ORDER BY {order} \
+                         ORDER BY {in_record} DESC, {order} \
                          LIMIT $2) x \
                   ORDER BY p.id, x.listing_rank",
                 columns = author_listing_columns(),
                 authored = authored_in_force_readable(),
                 order = AUTHOR_LISTING_ORDER,
             ),
-            3,
+            5,
         );
         type Row = (
             Uuid,
@@ -399,23 +410,27 @@ impl PaperRepository {
             bool,
             Option<String>,
             Option<String>,
+            bool,
             i64,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(paper_ids)
-            .bind(per_paper.saturating_add(1));
+            .bind(per_paper.saturating_add(1))
+            .bind(recorded.iter().map(|(p, _)| *p).collect::<Vec<Uuid>>())
+            .bind(recorded.iter().map(|(_, a)| *a).collect::<Vec<Uuid>>());
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let limit = usize::try_from(per_paper).unwrap_or(usize::MAX);
-        for (paper, a, name, pos, role, aff, pending, by, written, _rank) in
+        for (paper, a, name, pos, role, aff, pending, by, written, in_record, _rank) in
             q.fetch_all(executor).await?
         {
             let entry = out.entry(paper).or_default();
             if entry.0.len() < limit {
-                entry.0.push(author_listing((
-                    a, name, pos, role, aff, pending, by, written,
-                )));
+                entry.0.push((
+                    author_listing((a, name, pos, role, aff, pending, by, written)),
+                    in_record,
+                ));
             } else {
                 entry.1 = true;
             }
@@ -804,6 +819,12 @@ pub struct PaperAuthorEdge {
     /// edge the walk did not mark (written before the marker existed).
     pub written_by: Option<Uuid>,
 }
+
+/// What [`PaperRepository::list_authors_bounded`] returns: per paper, its
+/// listed authors (each with whether the caller's record names it) and
+/// whether more exist.
+pub type BoundedAuthorListings =
+    std::collections::HashMap<Uuid, (Vec<(PaperAuthorListing, bool)>, bool)>;
 
 /// The columns [`PaperRepository::list_authors`] and
 /// [`PaperRepository::list_authors_bounded`] read for one `authored` edge
