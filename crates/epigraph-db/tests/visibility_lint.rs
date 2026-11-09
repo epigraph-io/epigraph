@@ -2475,10 +2475,19 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
     ),
     (
+        "edge.rs",
+        "create_if_absent_for_ingest_principal_signed_conn",
+        "WRITE. The document ingest's per-principal dedup and signed INSERT (one row of a fact per \
+         ingest principal): the shared create-if-absent primitive with a VISIBILITY-EXEMPT \
+         write-path probe that also reads the marker's principal, plus the attestation columns; \
+         the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
         "ingest_written.rs",
         "create_ingest_written_edge_if_absent_conn",
-        "WRITE. The document ingest's marked writer: create_if_absent_including_retracted_signed_conn \
-         (the same VISIBILITY-EXEMPT dedup probe and INSERT, authorised by edges_tenancy's WITH \
+        "WRITE. The document ingest's marked writer: \
+         create_if_absent_for_ingest_principal_signed_conn (a VISIBILITY-EXEMPT dedup probe and \
+         INSERT, one row of a fact per ingest principal, authorised by edges_tenancy's WITH \
          CHECK on the walk's stamped transaction) with the ingest-written marker added and \
          migration 198's transaction-local declaration set around that INSERT only. Reads \
          nothing a viewer could filter; the walk spends its viewer on the stamp.",

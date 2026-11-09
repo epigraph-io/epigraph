@@ -190,6 +190,12 @@ enum DedupProbe {
     /// Any row, retracted included: an idempotent re-run never resurrects a
     /// retracted edge.
     AnyState,
+    /// The document ingest's marked write for ONE principal (the uuid): a row
+    /// counts as present when it is marked by that principal (any state), or
+    /// is unmarked, or is retracted. An in-force row marked by ANOTHER
+    /// principal does not: each principal's ingest keeps its own row of the
+    /// fact (see `crate::repos::ingest_written`).
+    IngestPrincipal(Uuid),
 }
 
 /// Outcome of [`EdgeRepository::create_symmetric_if_absent_oriented`].
@@ -655,6 +661,58 @@ impl EdgeRepository {
         .await
     }
 
+    /// The document ingest's dedup for a MARKED edge written by principal `by`
+    /// (`crate::create_ingest_written_edge_if_absent_conn` is its only
+    /// caller): one row of the fact PER INGEST PRINCIPAL, attested at INSERT
+    /// by `key` as [`Self::create_if_absent_including_retracted_signed_conn`].
+    ///
+    /// A row of `(source, target, relationship)` stops the write, and is
+    /// returned, when it is
+    ///
+    /// * marked by `by`, in any state: the same principal wrote the fact
+    ///   already (a retracted one is never resurrected);
+    /// * retracted, whoever wrote it: a retraction (an operator's author
+    ///   replacement, an owner's withdrawal) withholds the fact from every
+    ///   later ingest, as one shared row did;
+    /// * unmarked (a legacy row, or one another path wrote): the walk
+    ///   deduplicates onto it, as before.
+    ///
+    /// An in-force row marked by ANOTHER principal does not stop it: that
+    /// principal's ingest said the fact, and this one says it again on its
+    /// own row, which a reader ties to this ingest's other edges by `by`.
+    /// When several rows stop it, the returned one is `by`'s own if any, then
+    /// an in-force one, then the oldest.
+    ///
+    /// # Errors
+    /// As [`Self::create_signed_conn`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_absent_for_ingest_principal_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        by: Uuid,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_absent_conn(
+            conn,
+            key,
+            DedupProbe::IngestPrincipal(by),
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            None,
+            None,
+        )
+        .await
+    }
+
     /// Does the SESSION own edge `id` (its owner or co-owner is in the
     /// session's writable set)? The `owned_by_caller` a link tool or the HTTP
     /// create route reports next to a created or re-asserted edge: after
@@ -750,6 +808,22 @@ impl EdgeRepository {
                   WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
                   LIMIT 1"
                 .to_string(),
+            DedupProbe::IngestPrincipal(_) => {
+                let by = crate::repos::ingest_written::ingest_written_by_sql("e");
+                let marked = crate::repos::ingest_written::ingest_written_edge_sql("e");
+                format!(
+                    "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path (one row of the \
+                     fact per ingest principal; retracted and unmarked rows stop it).\n\
+                     SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                            e.relationship, e.properties, e.valid_from, e.valid_to \
+                       FROM edges e \
+                      WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
+                        AND ({by} = $4 OR NOT {marked} OR NOT {EDGE_IN_FORCE}) \
+                      ORDER BY COALESCE({by} = $4, false) DESC, {EDGE_IN_FORCE} DESC, \
+                               e.created_at, e.id \
+                      LIMIT 1"
+                )
+            }
         };
         #[allow(clippy::type_complexity)]
         let existing: Option<(
@@ -762,12 +836,18 @@ impl EdgeRepository {
             serde_json::Value,
             Option<chrono::DateTime<chrono::Utc>>,
             Option<chrono::DateTime<chrono::Utc>>,
-        )> = sqlx::query_as(&sql)
-            .bind(source_id)
-            .bind(target_id)
-            .bind(relationship_spellings(relationship))
+        )> = {
+            let q = sqlx::query_as(&sql)
+                .bind(source_id)
+                .bind(target_id)
+                .bind(relationship_spellings(relationship));
+            match probe {
+                DedupProbe::IngestPrincipal(by) => q.bind(by.to_string()),
+                DedupProbe::InForce | DedupProbe::AnyState => q,
+            }
             .fetch_optional(&mut *tx)
-            .await?;
+            .await?
+        };
 
         if let Some(row) = existing {
             tx.commit().await?;

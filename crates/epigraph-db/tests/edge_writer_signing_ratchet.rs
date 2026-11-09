@@ -97,6 +97,9 @@ const CALLS: &[&str] = &[
     "EdgeRepository::create_if_not_exists_signed_conn(",
     "EdgeRepository::create_if_absent_including_retracted_signed_conn(",
     "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(",
+    // The document ingest's marked writer's primitive: one row of a fact per
+    // ingest principal (`ingest_written.rs`).
+    "EdgeRepository::create_if_absent_for_ingest_principal_signed_conn(",
 ];
 
 /// The after-the-fact signing call: one way a [`Signed`] writer attests.
