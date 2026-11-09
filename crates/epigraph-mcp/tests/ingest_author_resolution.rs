@@ -148,7 +148,7 @@ async fn authored_in_force(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
 /// `doi` asserts.
 async fn asserts_on_doc(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM edges a \
+        "SELECT count(DISTINCT a.target_id) FROM edges a \
           WHERE a.source_id = $1 AND a.source_type = 'agent' AND a.relationship = 'asserts' \
             AND (a.valid_to IS NULL OR a.valid_to > now()) \
             AND EXISTS (SELECT 1 FROM edges pc JOIN papers p ON p.id = pc.source_id \
@@ -162,10 +162,11 @@ async fn asserts_on_doc(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
     .expect("count asserts on the document")
 }
 
-/// Claims the paper keyed `doi` asserts.
+/// Claims the paper keyed `doi` asserts, each once (every ingest principal
+/// keeps its own `asserts` edge of a claim).
 async fn paper_claims(pool: &PgPool, doi: &str) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM edges pc JOIN papers p ON p.id = pc.source_id \
+        "SELECT count(DISTINCT pc.target_id) FROM edges pc JOIN papers p ON p.id = pc.source_id \
           WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim'",
     )
     .bind(doi)
@@ -1644,12 +1645,32 @@ async fn a_strangers_pending_naming_is_not_kept_for_a_later_ingester(pool: PgPoo
     assert_eq!(asserts_edges(&pool, victim).await, 0, "{json}");
 }
 
-/// The person named by a stranger re-attaches themselves explicitly: the
-/// stored authorship stays the stranger's pending one (no session can rewrite
-/// an agent's edge), so the report says pending, names the stranger, and
-/// writes no `asserts` that the card would then contradict.
+/// The properties of the `authored` edge from `agent` into the paper keyed
+/// `doi` that `by`'s document ingest wrote (its ingest-written marker names
+/// `by`), if there is one. Every ingest principal keeps a row of its own.
+async fn authored_props_by(pool: &PgPool, agent: Uuid, doi: &str, by: Uuid) -> Option<Value> {
+    sqlx::query_scalar(
+        "SELECT e.properties FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'authored' AND p.doi = $2 \
+            AND e.properties -> 'ingest_written' ->> 'by' = $3",
+    )
+    .bind(agent)
+    .bind(doi)
+    .bind(by.to_string())
+    .fetch_optional(pool)
+    .await
+    .expect("authored edge properties by principal")
+}
+
+/// The person named by a stranger attaches themselves explicitly. The
+/// stranger's pending naming is the stranger's own row; the person's ingest
+/// writes the person's own row, so the person is the caller, asserts the
+/// document, and their card counts the paper as theirs. The stranger's row
+/// stays pending and backs nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_person_reattaching_a_pending_authorship_is_told_it_is_still_pending(pool: PgPool) {
+async fn a_person_attaching_themselves_after_a_strangers_pending_naming_asserts_on_their_own_row(
+    pool: PgPool,
+) {
     let squatter = app_role_server(&pool).await;
     let person = app_role_server(&pool).await;
     let squatter_id = squatter.server_agent_id().await.expect("squatter");
@@ -1679,15 +1700,94 @@ async fn a_person_reattaching_a_pending_authorship_is_told_it_is_still_pending(p
         .expect("the person re-attaches"),
     );
     let report = &json["authors"][0];
+    assert_eq!(report["attribution"], "caller", "{json}");
+    assert_eq!(report["asserts_claims"], true, "{json}");
+    assert_eq!(report["pending_ingested_by"], Value::Null, "{json}");
+    assert_eq!(
+        asserts_on_doc(&pool, me, doi).await,
+        paper_claims(&pool, doi).await,
+        "{json}"
+    );
+    assert_eq!(json["ingested_by"], me.to_string(), "this call's ingester");
+    let own = authored_props_by(&pool, me, doi, me)
+        .await
+        .expect("the person's own authored row");
+    assert_eq!(own.get("pending_countersign"), None, "{own}");
+    let theirs = authored_props_by(&pool, me, doi, squatter_id)
+        .await
+        .expect("the stranger's pending row stays");
+    assert_eq!(theirs["pending_countersign"], true, "{theirs}");
+    let card = card_counts(&person, &pool, me).await;
+    assert_eq!(card["authored_papers"], 1, "{card}");
+    assert_eq!(card["pending_authored_papers"], 0, "{card}");
+}
+
+/// A stranger names, by agent_id, a person who already authored the paper
+/// through their own ingest. The stranger's word is a row of the stranger's
+/// own, and it is PENDING with the stranger as ingester: the person's own
+/// confirmed row never makes the stranger's naming confirmed. The stranger's
+/// claims get no `asserts` from the person, and the person's card is
+/// unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_naming_of_an_existing_author_is_its_own_pending_row(pool: PgPool) {
+    let person = app_role_server(&pool).await;
+    let stranger = app_role_server(&pool).await;
+    let me = person.server_agent_id().await.expect("person");
+    let stranger_id = stranger.server_agent_id().await.expect("stranger");
+    let doi = "10.9999/author-borrow";
+    let json = ingest_wait(
+        &person,
+        &pool,
+        doc_with_atoms(
+            doi,
+            json!([{"name": "Orsolya Quill", "agent_id": me.to_string()}]),
+            &["The person's own finding."],
+        ),
+    )
+    .await;
+    assert_eq!(json["authors"][0]["attribution"], "caller", "{json}");
+    let before = card_counts(&person, &pool, me).await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &stranger,
+            &viewer,
+            &doc_with_atoms(
+                doi,
+                json!([{"name": "Orsolya Quill", "agent_id": me.to_string()}]),
+                &["A finding only the stranger states."],
+            ),
+            None,
+        )
+        .await
+        .expect("the stranger's ingest"),
+    );
+    let report = &json["authors"][0];
     assert_eq!(report["attribution"], "pending_countersign", "{json}");
     assert_eq!(report["asserts_claims"], false, "{json}");
     assert_eq!(
         report["pending_ingested_by"],
-        squatter_id.to_string(),
+        stranger_id.to_string(),
         "{json}"
     );
-    assert_eq!(asserts_edges(&pool, me).await, 0, "{json}");
-    assert_eq!(json["ingested_by"], me.to_string(), "this call's ingester");
+    let row = authored_props_by(&pool, me, doi, stranger_id)
+        .await
+        .expect("the stranger wrote a row of its own");
+    assert_eq!(row["pending_countersign"], true, "{row}");
+    assert_eq!(row["ingested_by"], stranger_id.to_string(), "{row}");
+    let stranger_claim = claim_of(&pool, doi, "A finding only the stranger states.").await;
+    let person_asserts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'agent' \
+           AND relationship = 'asserts' AND target_id = $2",
+    )
+    .bind(me)
+    .bind(stranger_claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(person_asserts, 0, "the person asserts nothing of the stranger's");
+    assert_eq!(card_counts(&person, &pool, me).await, before);
 }
 
 /// Replacement follows the entry's own SPELLING. A re-ingest with `agent_id`
@@ -1739,10 +1839,10 @@ async fn creator_doi(pool: &PgPool, claim: Uuid) -> Option<String> {
         .expect("creator's paper")
 }
 
-/// The claims the paper keyed `doi` asserts (in force).
+/// The claims the paper keyed `doi` asserts (in force), each once.
 async fn claims_of_doc(pool: &PgPool, doi: &str) -> Vec<Uuid> {
     sqlx::query_scalar(
-        "SELECT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
+        "SELECT DISTINCT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
           WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim' \
             AND pc.valid_to IS NULL ORDER BY 1",
     )
