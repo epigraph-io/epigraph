@@ -73,7 +73,7 @@
 //!     epigraph-operator passkey-enroll --person <uuid> --reason TEXT [--label TEXT] \
 //!         [--act <uuid>] [--apply]
 //!     epigraph-operator list-passkeys [--person <uuid>] [--include-revoked]
-//!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--apply]
+//!     epigraph-operator revoke-passkey --id <uuid> --reason TEXT [--compromised] [--apply]
 //!     epigraph-operator end-elevation (--session <uuid> | --person <uuid>) --reason TEXT [--apply]
 //!     epigraph-operator list-elevations [--person <uuid>] [--live]
 //!     epigraph-operator verify-confirmations [--since <RFC3339>] [--json]
@@ -254,6 +254,8 @@ enum Command {
         include_revoked: bool,
     },
     /// Revoke a passkey now (break-glass; audited; a revoked passkey is final).
+    /// By default a LOST device: the passkey and the unattested passkeys it
+    /// anchored. With --compromised, also every passkey enrolled through it.
     RevokePasskey {
         /// The passkey id (list-passkeys).
         #[arg(long)]
@@ -261,6 +263,13 @@ enum Command {
         /// Recorded on the passkey and in its audit row.
         #[arg(long)]
         reason: String,
+        /// The device may have been used by someone else (stolen, not lost):
+        /// also revoke every passkey whose anchor lineage passes through this
+        /// one (enrolled on an act it, or one of them, confirmed), attested
+        /// ones included, and end their elevations. Audited `mode =
+        /// compromised`. Works on an already revoked passkey too.
+        #[arg(long)]
+        compromised: bool,
         /// Commit. Without it, the revoke and its audit row roll back.
         #[arg(long)]
         apply: bool,
@@ -1462,7 +1471,42 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(0)
         }
-        Command::RevokePasskey { id, reason, apply } => {
+        Command::RevokePasskey {
+            id,
+            reason,
+            compromised: true,
+            apply,
+        } => {
+            let reached = passkey::revoke_compromised(&mut conn, id, &reason, apply).await?;
+            println!("MODE compromised\tpasskey={id}\treached={}", reached.len());
+            for (hit, row) in &reached {
+                println!(
+                    "{}{}\tdepth={}\t{}",
+                    if apply || !hit.revoked_now {
+                        ""
+                    } else {
+                        "WOULD BE "
+                    },
+                    if hit.revoked_now {
+                        "REVOKED"
+                    } else {
+                        "ALREADY-REVOKED"
+                    },
+                    hit.lineage_depth,
+                    passkey::describe(row)
+                );
+            }
+            if !apply {
+                println!("DRY RUN: every revoke and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::RevokePasskey {
+            id,
+            reason,
+            compromised: false,
+            apply,
+        } => {
             let (revoked, row) = passkey::revoke(&mut conn, id, &reason, apply).await?;
             println!(
                 "{}{}\t{}",
