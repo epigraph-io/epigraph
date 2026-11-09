@@ -21,14 +21,13 @@ use std::sync::Arc;
 
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
-use rmcp::RoleServer;
 
 use crate::host_guard::{streamable_http_server_config, HostAllowlist};
 
 /// How long an MCP HTTP session may go without a session event before rmcp
 /// ends it.
 ///
-/// rmcp 2.x's default is 5 minutes (rmcp 0.15 had no timer at all). The timer
+/// rmcp's default (2.x and 3.x) is 5 minutes (rmcp 0.15 had no timer at all). The timer
 /// is NOT an idle-client timer: rmcp's session worker re-arms it only on an
 /// inbound HTTP event or a message from the handler, and an in-flight tool
 /// call produces neither until it returns. Under the default, any single tool
@@ -79,7 +78,7 @@ pub fn mcp_http_listener<S, F>(
     factory: F,
 ) -> McpHttpListener<S>
 where
-    S: rmcp::Service<RoleServer> + Send + 'static,
+    S: rmcp::ServerHandler + Send + 'static,
     F: Fn() -> Result<S, std::io::Error> + Send + Sync + 'static,
 {
     let tcp_allowlist = (!crate::is_unix_listener(listen))

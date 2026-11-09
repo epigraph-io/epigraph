@@ -27,8 +27,8 @@ use axum::Router;
 use epigraph_mcp::federation::config::ExtensionConfig;
 use epigraph_mcp::federation::{FederationRegistry, SharedFederation};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult, ServerCapabilities,
-    ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -57,8 +57,8 @@ struct StubServer {
 }
 
 impl ServerHandler for StubServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -68,28 +68,25 @@ impl ServerHandler for StubServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let schema = serde_json::json!({ "type": "object", "properties": {} });
         let obj = schema.as_object().cloned().unwrap_or_default();
-        Ok(ListToolsResult {
-            tools: vec![Tool::new(
-                self.tool_name.clone(),
-                "stub downstream tool",
-                Arc::new(obj),
-            )],
-            meta: None,
-            next_cursor: None,
-        })
+        Ok(ListToolsResult::with_all_items(vec![Tool::new(
+            self.tool_name.clone(),
+            "stub downstream tool",
+            Arc::new(obj),
+        )]))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // Echo the tool name so the gateway test can confirm the DOWNSTREAM
         // (un-prefixed) name arrived, proving prefix stripping on the proxy path.
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "stub handled `{}`",
             request.name
-        ))]))
+        ))])
+        .into())
     }
 }
 

@@ -2844,7 +2844,7 @@ impl EpiGraphMcpFull {
 // Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
 // can be wrapped with durable event emission. Mirrors the macro's expansion
 // for `list_tools` and `get_tool` verbatim — see
-// `rmcp-macros/src/tool_handler.rs` (2.2.0) for the canonical body.
+// `rmcp-macros/src/tool_handler.rs` (3.9.0) for the canonical body.
 //
 // `call_tool` is the single chokepoint for every MCP tool invocation. We
 // emit one `tool.invoked` event per call (closes #61's tool.invoked
@@ -2852,8 +2852,8 @@ impl EpiGraphMcpFull {
 // emission is fire-and-forget; a failed event publish must not break tool
 // dispatch.
 impl ServerHandler for EpiGraphMcpFull {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(Self::server_instructions(self.read_only))
     }
 
@@ -2861,7 +2861,7 @@ impl ServerHandler for EpiGraphMcpFull {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         // For HTTP requests, the Bearer middleware (`auth::bearer_auth_middleware`)
         // inserts an `AuthContext` into request.extensions; rmcp's
         // `StreamableHttpService` forwards those into `context.extensions` via
@@ -2999,6 +2999,7 @@ impl ServerHandler for EpiGraphMcpFull {
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
+                    .map(rmcp::model::CallToolResponse::from)
                     .map_err(crate::errors::internal_error);
             }
 
@@ -3114,15 +3115,32 @@ impl ServerHandler for EpiGraphMcpFull {
         .await;
         match (elevated, recording) {
             (Some(viewer), Some((tool, arguments, jti))) => {
+                // An elevated call is recorded from its COMPLETE result. rmcp
+                // 3.x lets a tool answer with an intermediate result instead
+                // (`InputRequired` / `Task`); no kernel tool does, and one that
+                // did would leave nothing whole to record, so it is withheld
+                // (and the refusal recorded) rather than passed through
+                // unrecorded.
+                let complete = match result {
+                    Ok(rmcp::model::CallToolResponse::Complete(r)) => Ok(r),
+                    Ok(_) => Err(McpError::internal_error(
+                        "an elevated tool call must complete in one round trip; \
+                         the intermediate result is withheld"
+                            .to_string(),
+                        None,
+                    )),
+                    Err(e) => Err(e),
+                };
                 crate::elevated_access::record_elevated_call(
                     self,
                     &viewer,
                     &tool,
                     arguments.as_ref(),
                     jti,
-                    result,
+                    complete,
                 )
                 .await
+                .map(rmcp::model::CallToolResponse::from)
             }
             _ => result,
         }
@@ -3150,11 +3168,13 @@ impl ServerHandler for EpiGraphMcpFull {
             None => None,
         };
         let tools = self.manifest_for(http, auth.as_ref()).await;
-        Ok(rmcp::model::ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        })
+        // The manifest is per caller (above), so it carries no cache hints of
+        // its own: rmcp fills the absent ones with `ttlMs: 0` and
+        // `cacheScope: "private"` for peers on protocol 2026-07-28 or later
+        // (`ServerResult::fill_missing_cache_hints`), and omits them for
+        // older peers. A `Public` scope would let a shared cache serve one
+        // caller's manifest to another.
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {

@@ -94,10 +94,19 @@ ignore = [
     #
     # RUSTSEC-2026-0189 (rmcp streamable-HTTP server DNS rebinding, fixed in
     # rmcp >=1.4.0) was suppressed here pending the rmcp 0.x -> 1.x migration.
-    # That migration has landed: the workspace requires rmcp 2.2 and Cargo.lock
-    # resolves rmcp 2.2.0, so the entry matched nothing and is deleted. The
-    # MCP HTTP endpoint still relies on bearer-token checks at the proxy; that
-    # control does not depend on this entry.
+    # That migration has landed (the workspace now requires rmcp 3.9, below),
+    # so the entry matched nothing and is deleted. The MCP HTTP endpoint still
+    # relies on bearer-token checks at the proxy; that control does not depend
+    # on this entry.
+    #
+    # rmcp 2.2.0 (RUSTSEC-2026-0457, OAuth-client SSRF filter checked host
+    # strings rather than resolved addresses, fixed in >=3.7.0; and
+    # RUSTSEC-2026-0462, unbounded response-body buffering in the Streamable
+    # HTTP client, fixed in >=3.9.0) was cleared by moving the workspace rmcp
+    # requirement to 3.9, which resolves rmcp 3.9.0. No 2.x backport exists.
+    # The floor is a blocking ratchet in
+    # crates/epigraph-auth/tests/dependency_security_floor.rs. They were never
+    # suppressed; do not add them.
     #
     # zstd 0.13.3 (RUSTSEC-2026-0391) and zstd-safe 7.3.0 (RUSTSEC-2026-0398 /
     # -0403) were cleared by moving the workspace zstd requirement to 0.14.3,
