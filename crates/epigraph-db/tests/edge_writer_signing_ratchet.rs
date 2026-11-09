@@ -323,7 +323,7 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-api/src/routes/claims.rs",
         "create_claim_core",
-        3,
+        2,
         Signed,
     ),
     site(
@@ -631,13 +631,13 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document",
+        "do_ingest_document_with_visibility",
         5,
         Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
+        "do_ingest_document_spine_with_visibility",
         5,
         Signed,
     ),
