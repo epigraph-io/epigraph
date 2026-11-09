@@ -323,6 +323,15 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     // ── epigraph-mcp: identity, auth, plumbing ───────────────────────────
     ("epigraph-mcp/src/auth.rs", "is_revoked", 1, PRE_VIEWER),
+    // The workflow ingest resolves its write identity's own viewer on stdio,
+    // where the write identity is the server's agent and no viewer for it
+    // exists yet to stamp from.
+    (
+        "epigraph-mcp/src/tools/workflow_ingest.rs",
+        "execute_workflow_ingest_with_inserted",
+        1,
+        PRE_VIEWER,
+    ),
     (
         "epigraph-mcp/src/claim_helper.rs",
         "begin_author_stamped_tx",
@@ -775,15 +784,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         READ_PENDING,
     ),
     (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "assess_workflow_promotion",
-        3,
-        "READ_PENDING for the variant-parent lookup \
-         (WorkflowRepository::immediate_variant_parent, viewer-filtered over claims and edges); \
-         the two success_stats reads are NO_ROW_SECURITY (behavioral_executions carries no \
-         tenancy). Convert the first onto the caller's read.",
-    ),
-    (
         "epigraph-mcp/src/tools/workflow_hierarchical.rs",
         "find_workflow_hierarchical",
         3,
@@ -804,6 +804,15 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         NO_ROW_SECURITY,
     ),
+    // The document ingest's write-authority preflight looks up an existing
+    // `papers` row by document key (`find_paper_by_document_key`), the same
+    // read the two rows above make.
+    (
+        "epigraph-mcp/src/tools/ingestion.rs",
+        "preflight_write_authority",
+        1,
+        NO_ROW_SECURITY,
+    ),
     (
         "epigraph-mcp/src/tools/matching.rs",
         "decide_match_candidate",
@@ -813,12 +822,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/matching.rs",
         "retire_match_candidate",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "get_workflow_executions",
         1,
         NO_ROW_SECURITY,
     ),
@@ -932,7 +935,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 215;
+const HIGH_WATER: usize = 213;
 
 // ===========================================================================
 // The scanner.
