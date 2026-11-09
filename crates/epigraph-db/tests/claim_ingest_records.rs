@@ -262,3 +262,65 @@ async fn only_an_ingest_written_record_on_an_ingest_written_assertion_is_read(po
         "the record names its ingester in the marker"
     );
 }
+
+/// The record writer declares the ingest for its own INSERT only: once it
+/// returns, a later write on the same (stamped, application-role)
+/// transaction cannot carry the ingest-written marker.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_record_writer_declares_only_its_own_insert(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingest-record-declare").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "ingest-record-author").await;
+    let claim = fixture::seed_public_claim(&pool, ingester, "a declared claim").await;
+    let p = paper(&pool, "10.9999/record-declare").await;
+    let v = Viewer::resolve(&pool, ingester).await.expect("viewer");
+
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut tx,
+        None,
+        "ingest_document",
+        ingester,
+        p,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
+    )
+    .await
+    .expect("the walk's assertion");
+    assert!(ClaimIngestRepository::record_signed_conn(
+        &mut tx,
+        None,
+        p,
+        claim,
+        ingester,
+        true,
+        "ingest_document",
+        "test-pipeline",
+    )
+    .await
+    .expect("the record on the application role"));
+    let r = sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) VALUES ($1, 'agent', $2, 'claim', 'asserts', $3)",
+    )
+    .bind(author)
+    .bind(claim)
+    .bind(serde_json::json!({ "ingest_written": {"tool": "ingest_document"} }))
+    .execute(&mut *tx)
+    .await;
+    let refused = matches!(&r, Err(sqlx::Error::Database(e)) if e.message().contains("IWE01"));
+    assert!(
+        refused,
+        "a write after the record kept the ingest declaration: {r:?}"
+    );
+}

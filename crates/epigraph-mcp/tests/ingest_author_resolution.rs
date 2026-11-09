@@ -1474,6 +1474,11 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
             sorted(vec![(d1.to_string(), a_id, true)]),
             "the creating ingest is recorded at creation"
         );
+        assert_eq!(
+            creator_doi(&pool, c).await.as_deref(),
+            Some(d1),
+            "the read contract names the creating ingest"
+        );
     }
 
     ingest_wait(
@@ -1554,6 +1559,7 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         sorted(vec![(d3.to_string(), b_id, false)]),
         "a document repeating a directly filed claim never becomes its creator"
     );
+    assert_eq!(creator_doi(&pool, direct).await, None, "and the read names none");
 }
 
 /// A stranger's PENDING naming of a person is not kept for a later
@@ -1712,6 +1718,23 @@ async fn a_respelled_explicit_author_is_added_beside_and_reported(pool: PgPool) 
     assert_eq!(authored_in_force(&pool, key, doi).await, 1, "left in place");
 }
 
+/// The DOI of the creating paper the read contract
+/// (`ClaimIngestRepository::for_claim`, as the provenance block reads it)
+/// names for `claim`, for a public reader.
+async fn creator_doi(pool: &PgPool, claim: Uuid) -> Option<String> {
+    let viewer = fixture::public_viewer(pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let creator = epigraph_db::ClaimIngestRepository::for_claim(&mut conn, &viewer, claim)
+        .await
+        .expect("for_claim")
+        .creator?;
+    sqlx::query_scalar("SELECT doi FROM papers WHERE id = $1")
+        .bind(creator.paper_id)
+        .fetch_optional(pool)
+        .await
+        .expect("creator's paper")
+}
+
 /// The claims the paper keyed `doi` asserts (in force).
 async fn claims_of_doc(pool: &PgPool, doi: &str) -> Vec<Uuid> {
     sqlx::query_scalar(
@@ -1770,6 +1793,11 @@ async fn the_spine_records_its_creations_and_every_later_ingester(pool: PgPool) 
                 (d.to_string(), b_id, false)
             ]),
             "a later spine ingester of {c} is recorded, never as its creator"
+        );
+        assert_eq!(
+            creator_doi(&pool, *c).await.as_deref(),
+            Some(d),
+            "the read contract names the creating spine ingest of {c}"
         );
     }
 
