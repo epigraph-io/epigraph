@@ -157,6 +157,13 @@ impl WorkflowRepository {
     /// Idempotent on `(canonical_name, generation)` UNIQUE — repeated inserts
     /// of the same identity are silently ignored.
     ///
+    /// Returns whether THIS statement inserted the row (`RETURNING id`):
+    /// `false` when a row with the same `(canonical_name, generation)` already
+    /// existed, including one another transaction committed while this insert
+    /// waited on the unique index. That answer, not a read made before the
+    /// insert, is what tells a caller whether it created the row: a read made
+    /// earlier cannot see a concurrent creation that was still uncommitted.
+    ///
     /// Since migration 183 a row carries its plan's tenancy
     /// (`owner_group_id`, `visibility`), declared here and never defaulted
     /// (`workflows_require_tenancy`): a declared ingest passes
@@ -181,13 +188,14 @@ impl WorkflowRepository {
         parent_id: Option<Uuid>,
         metadata: serde_json::Value,
         decl: epigraph_core::TenancyDecl,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let inserted: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO workflows \
                     (id, canonical_name, generation, goal, parent_id, metadata, \
                      visibility, owner_group_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (canonical_name, generation) DO NOTHING",
+             ON CONFLICT (canonical_name, generation) DO NOTHING \
+             RETURNING id",
         )
         .bind(id)
         .bind(canonical_name)
@@ -197,9 +205,9 @@ impl WorkflowRepository {
         .bind(metadata)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
-        .execute(executor)
+        .fetch_optional(executor)
         .await?;
-        Ok(())
+        Ok(inserted.is_some())
     }
 
     /// The `metadata` key a `workflows` row records its SUBMITTER under (batch
@@ -2808,7 +2816,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn insert_root_creates_workflows_row(pool: sqlx::PgPool) {
         let id = uuid::Uuid::new_v4();
-        WorkflowRepository::insert_root(
+        let created = WorkflowRepository::insert_root(
             &pool,
             id,
             "deploy-canary",
@@ -2820,6 +2828,26 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(created, "the first insert creates the row");
+        // The same (canonical_name, generation) again, under another id: the
+        // insert does nothing and SAYS so, which is how a caller knows it
+        // did not create the row.
+        let again = WorkflowRepository::insert_root(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "deploy-canary",
+            0,
+            "Another goal.",
+            None,
+            serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !again,
+            "a conflicting insert reports that it created nothing"
+        );
 
         let row: (String, i32, String, serde_json::Value) = sqlx::query_as(
             "SELECT canonical_name, generation, goal, metadata FROM workflows WHERE id = $1",

@@ -291,9 +291,18 @@ pub struct WorkflowIngestExecutionResult {
     /// not the declared one, in plan order. On an idempotent re-ingest that is
     /// every planned claim of another tenancy. Always empty otherwise.
     pub reused_items: Vec<ReusedClaim>,
-    /// The tenancy of the `workflows` row and every claim this call CREATED;
-    /// `None` on an idempotent re-ingest (nothing created).
+    /// The tenancy of every claim this call CREATED, and of the `workflows`
+    /// row when [`Self::row_created`]; `None` on an idempotent re-ingest
+    /// (nothing created).
     pub decl: Option<epigraph_core::TenancyDecl>,
+    /// `true` exactly when THIS call's row insert created the `workflows`
+    /// row (`WorkflowRepository::insert_root`'s own answer). `false` on a
+    /// re-ingest and on a walk admitted under a row that already existed
+    /// (one read before the walk, or committed by another caller while the
+    /// insert waited). Every effect on the ROW itself (recording a submitter,
+    /// storing a goal embedding, announcing `workflow.created`) is keyed on
+    /// it, never on a read made before the walk.
+    pub row_created: bool,
 }
 
 /// A planned claim a declared-tenancy ingest reused rather than created, whose
@@ -425,7 +434,7 @@ pub async fn execute_workflow_ingest_plan(
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
-    execute_plan(conn, plan, extraction, None, None).await
+    execute_plan(conn, plan, extraction, None, None, None).await
 }
 
 /// Execute a workflow ingest plan AS THE CALLER: every row the walk creates
@@ -463,20 +472,64 @@ pub async fn execute_workflow_ingest_plan(
 /// unreadable to the stamp) refuses the ingest before any edge is written
 /// ([`IngestExecutorError::ReusedClaimOutsideCallerGroups`]).
 ///
+/// # A row this call did not create (`admitted`)
+///
+/// When the row insert does nothing, a row with the plan's
+/// `(canonical_name, generation)` already exists: one the caller's entry
+/// point read before the walk, or one ANOTHER caller committed while this
+/// insert waited on the unique index (a read made before the walk cannot see
+/// that one). Whether the caller created the row is decided by the insert's
+/// own answer ([`WorkflowIngestExecutionResult::row_created`]), never by such
+/// a read. If the row now shows a plan the walk returns `already_ingested`
+/// and writes nothing. Otherwise, unless `admitted` names that row, it stops
+/// with [`IngestExecutorError::ExistingWorkflowNeedsAuthority`] before writing
+/// anything under it, rolled back to where this call began. The entry point
+/// then checks its lineage authority over the row on the same transaction and,
+/// if the caller is admitted, calls again with `admitted: Some(row)`. Pass
+/// `None` on the first call.
+///
 /// # Errors
 /// As [`execute_workflow_ingest_plan`], plus
 /// [`IngestExecutorError::CallerUnidentified`] for a viewer with no principal,
 /// [`IngestExecutorError::CallerNotGroupWriter`],
-/// [`IngestExecutorError::InheritedGroupNotWritable`] and
-/// [`IngestExecutorError::ReusedClaimOutsideCallerGroups`].
+/// [`IngestExecutorError::InheritedGroupNotWritable`],
+/// [`IngestExecutorError::ReusedClaimOutsideCallerGroups`] and
+/// [`IngestExecutorError::ExistingWorkflowNeedsAuthority`].
 pub async fn execute_workflow_ingest_plan_in_group(
     conn: &mut sqlx::PgConnection,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
     caller: &epigraph_db::visibility::Viewer,
     declared: Option<epigraph_core::TenancyDecl>,
+    admitted: Option<Uuid>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
-    execute_plan(conn, plan, extraction, Some(caller), declared).await
+    // The attempt runs inside a savepoint, so a stop at an existing row the
+    // caller has not been admitted over leaves nothing this call wrote (a
+    // default group the owner resolution provisioned included) on the
+    // transaction the entry point then checks its authority on.
+    sqlx::query("SAVEPOINT epigraph_workflow_ingest_attempt")
+        .execute(&mut *conn)
+        .await?;
+    let out = execute_plan(conn, plan, extraction, Some(caller), declared, admitted).await;
+    match &out {
+        Err(IngestExecutorError::ExistingWorkflowNeedsAuthority { .. }) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT epigraph_workflow_ingest_attempt")
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT epigraph_workflow_ingest_attempt")
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(_) => {
+            sqlx::query("RELEASE SAVEPOINT epigraph_workflow_ingest_attempt")
+                .execute(&mut *conn)
+                .await?;
+        }
+        // Any other error: the entry point rolls the transaction back (it may
+        // be aborted, where a RELEASE would itself fail).
+        Err(_) => {}
+    }
+    out
 }
 
 /// What a NEW generation inherits from the lineage it extends: when no row
@@ -536,6 +589,7 @@ async fn execute_plan(
     extraction: &WorkflowExtraction,
     caller: Option<&epigraph_db::visibility::Viewer>,
     declared: Option<epigraph_core::TenancyDecl>,
+    admitted: Option<Uuid>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
     // WHO WRITES: the caller's own agent when there is a caller (every
     // request path), the system agent only for the caller-less entry point.
@@ -692,70 +746,27 @@ async fn execute_plan(
     }
 
     // ── 1. Idempotency gate: skip if workflow row already processed ──────
+    // The gate DECIDES on the stamp's view (every `executes` edge the stamp
+    // can read; for a caller-authored ingest that is the caller's own). A row
+    // the stamp cannot read at all is not found here, and its `insert_root`
+    // then inserts nothing and is refused (`WorkflowOutsideView`) before any
+    // claim is written. It REPORTS the caller's view only; see
+    // `executes_edges_created`. Asked again after the row insert when the
+    // insert did nothing (step 3): a row another caller committed meanwhile.
     if let Some(existing_id) =
         WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation).await?
     {
-        // The gate DECIDES on the stamp's view (every `executes` edge the
-        // stamp can read; for a caller-authored ingest that is the caller's
-        // own). A row the stamp cannot read at all is not found here, and its
-        // `insert_root` then inserts nothing and is refused
-        // (`WorkflowOutsideView`) before any claim is written. It REPORTS the
-        // caller's view only; see `executes_edges_created`.
-        let targets: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT target_id FROM edges \
-             WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
+        if let Some(done) = already_ingested_result(
+            &mut *conn,
+            plan,
+            extraction,
+            caller,
+            declared_parts,
+            existing_id,
         )
-        .bind(existing_id)
-        .fetch_all(&mut *conn)
-        .await?;
-
-        if !targets.is_empty() {
-            let visible_to_caller = match caller {
-                Some(caller) => {
-                    let mut ids: Vec<Uuid> = Vec::new();
-                    for id in &targets {
-                        if !ids.contains(id) {
-                            ids.push(*id);
-                        }
-                    }
-                    let readable: std::collections::HashSet<Uuid> =
-                        ClaimRepository::tenancy_of_conn(&mut *conn, caller, &ids)
-                            .await?
-                            .into_iter()
-                            .map(|(id, _, _)| id)
-                            .collect();
-                    targets.iter().filter(|t| readable.contains(t)).count()
-                }
-                None => 0,
-            };
-            let reused_items = match (declared_parts, caller) {
-                (Some(parts), Some(caller)) => {
-                    reused_with_another_tenancy(
-                        &mut *conn,
-                        plan.claims.iter().map(|c| c.id),
-                        caller,
-                        parts,
-                    )
-                    .await?
-                }
-                _ => Vec::new(),
-            };
-            return Ok(WorkflowIngestExecutionResult {
-                workflow_id: existing_id,
-                canonical_name: canonical_name.clone(),
-                generation,
-                claims_ingested: 0,
-                claims_skipped_dedup: 0,
-                executes_edges_created: visible_to_caller,
-                variant_of_edge_created: false,
-                relationship_edges_created: 0,
-                already_ingested: true,
-                inserted: Vec::new(),
-                inserted_edges: Vec::new(),
-                author_id: None,
-                reused_items,
-                decl: None,
-            });
+        .await?
+        {
+            return Ok(done);
         }
     }
 
@@ -807,7 +818,7 @@ async fn execute_plan(
     )
     .await?;
 
-    WorkflowRepository::insert_root(
+    let row_created = WorkflowRepository::insert_root(
         &mut *conn,
         workflow_id,
         canonical_name,
@@ -819,17 +830,50 @@ async fn execute_plan(
     )
     .await
     .map_err(|e| IngestExecutorError::WorkflowInsert(e.to_string()))?;
-    // `ON CONFLICT DO NOTHING` also skips a row this stamp cannot read (step 1
-    // did not find it): writing this plan's claims and edges under it would
-    // extend a plan the stamp has no view of. Refuse, so nothing is written.
-    if WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation)
+    if !row_created {
+        // The insert did nothing: the row exists. Decided by the insert's own
+        // answer, because a read made before it cannot see a row another
+        // caller was creating concurrently: this insert waited on that
+        // caller's uncommitted row and found it committed.
+        //
+        // `ON CONFLICT DO NOTHING` also skips a row this stamp cannot read:
+        // writing this plan's claims and edges under it would extend a plan
+        // the stamp has no view of. Refuse, so nothing is written.
+        let Some(existing_id) =
+            WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation)
+                .await?
+        else {
+            return Err(IngestExecutorError::WorkflowOutsideView {
+                canonical_name: canonical_name.to_string(),
+                generation,
+            });
+        };
+        // The row another caller committed may carry its plan: then this is
+        // a re-ingest, and it writes nothing.
+        if let Some(done) = already_ingested_result(
+            &mut *conn,
+            plan,
+            extraction,
+            caller,
+            declared_parts,
+            existing_id,
+        )
         .await?
-        .is_none()
-    {
-        return Err(IngestExecutorError::WorkflowOutsideView {
-            canonical_name: canonical_name.to_string(),
-            generation,
-        });
+        {
+            return Ok(done);
+        }
+        // A row with no plan this caller did not create. Attaching the walk
+        // to it is a write to an existing workflow: it needs the entry
+        // point's lineage authority over that row first, checked on this
+        // transaction before anything is written under it. The caller-less
+        // fixture path has no caller to check and keeps its old behaviour.
+        if caller.is_some() && admitted != Some(existing_id) {
+            return Err(IngestExecutorError::ExistingWorkflowNeedsAuthority {
+                workflow_id: existing_id,
+                canonical_name: canonical_name.to_string(),
+                generation,
+            });
+        }
     }
 
     // ── 3a. variant_of edge for hierarchical workflows (issue #51) ──────
@@ -1161,5 +1205,72 @@ async fn execute_plan(
         author_id: Some(author_id),
         reused_items,
         decl: Some(decl),
+        row_created,
     })
+}
+
+/// The idempotent re-ingest answer over `existing_id`, if that row already
+/// carries a plan the stamp can read (any `executes` edge): nothing is
+/// written, and the result reports the caller's view of the existing plan.
+/// `None` when the row shows no plan, so the walk is not a re-ingest.
+async fn already_ingested_result(
+    conn: &mut sqlx::PgConnection,
+    plan: &IngestPlan,
+    extraction: &WorkflowExtraction,
+    caller: Option<&epigraph_db::visibility::Viewer>,
+    declared_parts: Option<(&'static str, Uuid)>,
+    existing_id: Uuid,
+) -> Result<Option<WorkflowIngestExecutionResult>, IngestExecutorError> {
+    let targets: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT target_id FROM edges \
+         WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
+    )
+    .bind(existing_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let visible_to_caller = match caller {
+        Some(caller) => {
+            let mut ids: Vec<Uuid> = Vec::new();
+            for id in &targets {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+            let readable: std::collections::HashSet<Uuid> =
+                ClaimRepository::tenancy_of_conn(&mut *conn, caller, &ids)
+                    .await?
+                    .into_iter()
+                    .map(|(id, _, _)| id)
+                    .collect();
+            targets.iter().filter(|t| readable.contains(t)).count()
+        }
+        None => 0,
+    };
+    let reused_items = match (declared_parts, caller) {
+        (Some(parts), Some(caller)) => {
+            reused_with_another_tenancy(&mut *conn, plan.claims.iter().map(|c| c.id), caller, parts)
+                .await?
+        }
+        _ => Vec::new(),
+    };
+    Ok(Some(WorkflowIngestExecutionResult {
+        workflow_id: existing_id,
+        canonical_name: extraction.source.canonical_name.clone(),
+        generation: extraction.source.generation as i32,
+        claims_ingested: 0,
+        claims_skipped_dedup: 0,
+        executes_edges_created: visible_to_caller,
+        variant_of_edge_created: false,
+        relationship_edges_created: 0,
+        already_ingested: true,
+        inserted: Vec::new(),
+        inserted_edges: Vec::new(),
+        author_id: None,
+        reused_items,
+        decl: None,
+        row_created: false,
+    }))
 }

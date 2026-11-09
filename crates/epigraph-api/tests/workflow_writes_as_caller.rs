@@ -1225,6 +1225,7 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
         &x,
         &stale,
         Some(epigraph_core::TenancyDecl::group(w.alpha)),
+        None,
     )
     .await;
     assert!(
@@ -1244,7 +1245,7 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
         .await
         .expect("stamp from the stale viewer");
     let out = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-        &mut tx, &plan, &x, &stale, None,
+        &mut tx, &plan, &x, &stale, None, None,
     )
     .await
     .expect("an undeclared ingest still lands");
@@ -2147,6 +2148,314 @@ async fn a_member_by_role_and_by_roster_row_has_one_team_group(pool: PgPool) {
             workflow_row(&pool, uuid_of(&out["workflow_id"])).await.1,
             w.alpha,
             "{name}: the one team group"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A generation-0 ingest racing another caller's creation of the same row
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The row a generation-0 ingest of `name` writes (its deterministic id).
+fn root_id(name: &str) -> Uuid {
+    let x: epigraph_ingest::workflow::WorkflowExtraction =
+        serde_json::from_value(extraction(name, 0, 1)).expect("extraction");
+    epigraph_ingest::workflow::builder::root_workflow_id(&x)
+}
+
+/// What the racing caller must leave unchanged on the winner's row: its goal,
+/// metadata (the recorded submitter included), tenancy and goal embedding.
+async fn winner_row(pool: &PgPool, wf: Uuid) -> (String, Value, String, Uuid, Option<f32>) {
+    sqlx::query_as(
+        "SELECT goal, metadata, visibility::text, owner_group_id, \
+                (goal_embedding::real[])[3] \
+           FROM workflows WHERE id = $1",
+    )
+    .bind(wf)
+    .fetch_one(pool)
+    .await
+    .expect("the winner's row")
+}
+
+/// Another caller's IN-FLIGHT creation of generation 0 of `name` races `act`.
+///
+/// A harness transaction on its own connection inserts the winner's row
+/// (`visibility` in `owner`, submitted by `submitter`, a known goal
+/// embedding, no plan) and holds it open. `act` then runs on another
+/// connection: it reads no row (the winner is uncommitted) and its own row
+/// insert blocks on the `(canonical_name, generation)` unique index. Only once
+/// the database shows the act's backend WAITING on that lock does the winner
+/// commit, so the act's insert does nothing on a row it never saw before its
+/// walk. Returns the act's answer.
+async fn race_creation<F>(
+    pool: &PgPool,
+    name: &str,
+    visibility: &str,
+    owner: Uuid,
+    submitter: Uuid,
+    act: F,
+) -> Result<Value, String>
+where
+    F: std::future::Future<Output = Result<Value, String>>,
+{
+    let wf = root_id(name);
+    let mut winner = pool.begin().await.expect("the winner's transaction");
+    sqlx::query(
+        "INSERT INTO workflows \
+                (id, canonical_name, generation, goal, metadata, visibility, owner_group_id, \
+                 goal_embedding) \
+         VALUES ($1, $2, 0, 'the winner''s goal', \
+                 jsonb_build_object('epigraph_submitted_by', $3::text), $4, $5, \
+                 array_fill(0.125::real, ARRAY[1536])::vector)",
+    )
+    .bind(wf)
+    .bind(name)
+    .bind(submitter)
+    .bind(visibility)
+    .bind(owner)
+    .execute(&mut *winner)
+    .await
+    .expect("the winner's row");
+    let commit_when_blocked = async {
+        let mut blocked = false;
+        for _ in 0..400 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                    AND query ILIKE '%INSERT INTO workflows%'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        winner.commit().await.expect("the winner commits");
+        blocked
+    };
+    let (out, blocked) = tokio::join!(act, commit_when_blocked);
+    assert!(
+        blocked,
+        "PREMISE: the racing ingest's row insert waited on the winner's uncommitted row ({name})"
+    );
+    out
+}
+
+/// A generation-0 ingest that overlaps ANOTHER caller's in-flight creation of
+/// the same `(canonical_name, generation)` has read no row when it starts, and
+/// its row insert does nothing. It must not then pass as the row's creator:
+/// the lineage gate runs over the row the insert found, on the same
+/// transaction, before the walk writes anything under it. A caller that does
+/// not write the row's owner group (a non-member over a public row; a READER
+/// of the group over a group-private one) is refused, with nothing attached
+/// and the winner's goal embedding, goal, metadata and tenancy unchanged, and
+/// no `workflow.created` event announcing its goal. A writer of the owner
+/// group is admitted by the owner-group arm, and since it did not create the
+/// row, it records no submitter and stores no goal embedding on it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_generation_zero_ingest_racing_another_callers_creation_writes_nothing_to_it(
+    pool: PgPool,
+) {
+    let w = world(&pool).await;
+    let (nw, nw_g) = fixture::seed_human_operator(&pool, "acme-racing-outsider").await;
+    let (rd, _) = fixture::seed_human_operator(&pool, "acme-racing-reader").await;
+    add_roster_row(&pool, w.alpha, rd, "reader").await;
+    assert!(
+        !writes(&pool, nw, w.op_g).await && !writes(&pool, nw, w.alpha).await,
+        "PREMISE: nw writes neither group"
+    );
+    assert!(
+        !writes(&pool, rd, w.alpha).await,
+        "PREMISE: rd reads alpha and does not write it"
+    );
+    let rd_reads: bool = epigraph_db::visibility::Viewer::resolve(&pool, rd)
+        .await
+        .expect("resolve rd")
+        .group_bind()
+        .is_some_and(|g| g.contains(&w.alpha));
+    assert!(rd_reads, "PREMISE: rd reads alpha");
+
+    // (name, the winner's visibility and group, the racing caller, how).
+    let refused_arms: Vec<(&str, &str, Uuid, Via<'_>, Option<Value>)> = vec![
+        (
+            "acme-race-public-mcp",
+            "public",
+            w.op_g,
+            Via::McpHttp(&w.mcp, nw),
+            None,
+        ),
+        (
+            "acme-race-public-rest",
+            "public",
+            w.op_g,
+            Via::Rest(&w.router, nw),
+            None,
+        ),
+        // The racing caller declares PUBLIC in its own group: the plan would
+        // be public steps under another group's public workflow.
+        (
+            "acme-race-declared-public-mcp",
+            "public",
+            w.op_g,
+            Via::McpHttp(&w.mcp, nw),
+            Some(json!({"visibility": "public", "owner_group_id": nw_g})),
+        ),
+        (
+            "acme-race-declared-public-rest",
+            "public",
+            w.op_g,
+            Via::Rest(&w.router, nw),
+            Some(json!({"visibility": "public", "owner_group_id": nw_g})),
+        ),
+        (
+            "acme-race-group-reader-mcp",
+            "group",
+            w.alpha,
+            Via::McpHttp(&w.mcp, rd),
+            None,
+        ),
+        (
+            "acme-race-group-reader-rest",
+            "group",
+            w.alpha,
+            Via::Rest(&w.router, rd),
+            None,
+        ),
+    ];
+    for (name, visibility, owner, via, tenancy) in refused_arms {
+        let counts_before = row_counts(&pool).await;
+        let events_before = event_count(&pool).await;
+        let mut poisoned = extraction(name, 0, 2);
+        poisoned["source"]["goal"] = json!("acme racing poisoned goal");
+        let out = race_creation(
+            &pool,
+            name,
+            visibility,
+            owner,
+            w.dr,
+            via.ingest_with(&poisoned, tenancy),
+        )
+        .await;
+        let wf = root_id(name);
+        assert!(
+            out.is_err(),
+            "{name}: a racing caller without authority over the winner's row is refused: {out:?}"
+        );
+        assert!(
+            plan(&pool, wf).await.is_empty(),
+            "{name}: nothing was attached to the winner's row"
+        );
+        assert_eq!(
+            winner_row(&pool, wf).await,
+            (
+                "the winner's goal".to_string(),
+                json!({"epigraph_submitted_by": w.dr.to_string()}),
+                visibility.to_string(),
+                owner,
+                Some(0.125),
+            ),
+            "{name}: the winner's row is unchanged, its goal embedding included"
+        );
+        let (c, e, wfs, m) = counts_before;
+        assert_eq!(
+            row_counts(&pool).await,
+            (c, e, wfs + 1, m),
+            "{name}: only the winner's row was written"
+        );
+        assert_eq!(
+            event_count(&pool).await,
+            events_before,
+            "{name}: no event announces the racing caller's goal"
+        );
+    }
+
+    // REST `POST /workflows` (store) races the same way: its canonical name
+    // is the goal's slug.
+    {
+        let goal = "Acme race stored goal";
+        let name = "acme-race-stored-goal";
+        let counts_before = row_counts(&pool).await;
+        let events_before = event_count(&pool).await;
+        let via = Via::Rest(&w.router, nw);
+        let out = race_creation(
+            &pool,
+            name,
+            "public",
+            w.op_g,
+            w.dr,
+            via.store(
+                goal,
+                &["acme racing stored step"],
+                Some(json!({"visibility": "public", "owner_group_id": nw_g})),
+            ),
+        )
+        .await;
+        let wf = root_id(name);
+        assert!(out.is_err(), "store: the racing store is refused: {out:?}");
+        assert!(plan(&pool, wf).await.is_empty(), "store: nothing attached");
+        assert_eq!(
+            winner_row(&pool, wf).await.4,
+            Some(0.125),
+            "store: the goal embedding is unchanged"
+        );
+        let (c, e, wfs, m) = counts_before;
+        assert_eq!(row_counts(&pool).await, (c, e, wfs + 1, m));
+        assert_eq!(
+            event_count(&pool).await,
+            events_before,
+            "store: no `workflow.created` event under the winner's id"
+        );
+    }
+
+    // CALIBRATION: a writer of the owner group racing the same creation is
+    // admitted (the owner-group arm, recorded), fills the plan as itself, and
+    // records no submitter and no goal embedding on a row it did not create.
+    for (name, via) in [
+        ("acme-race-writer-mcp", Via::McpHttp(&w.mcp, w.rb)),
+        ("acme-race-writer-rest", Via::Rest(&w.router, w.rb)),
+    ] {
+        let out = race_creation(
+            &pool,
+            name,
+            "group",
+            w.alpha,
+            w.dr,
+            via.ingest(&extraction(name, 0, 2), None),
+        )
+        .await;
+        let out = out.unwrap_or_else(|e| panic!("{name}: an alpha writer is admitted: {e}"));
+        assert_eq!(out["already_ingested"], json!(false), "{name}: {out}");
+        let wf = root_id(name);
+        let plan = plan(&pool, wf).await;
+        assert!(!plan.is_empty(), "{name}: the writer's plan is attached");
+        for (id, _, agent, v, o) in &plan {
+            assert_eq!(
+                (*agent, v.as_str(), *o),
+                (w.rb, "group", w.alpha),
+                "{name}: claim {id} is the writer's, in alpha"
+            );
+        }
+        assert_eq!(
+            winner_row(&pool, wf).await,
+            (
+                "the winner's goal".to_string(),
+                json!({"epigraph_submitted_by": w.dr.to_string()}),
+                "group".to_string(),
+                w.alpha,
+                Some(0.125),
+            ),
+            "{name}: the winner's submitter and goal embedding are kept"
+        );
+        let arms = caller_write_arms(&pool, wf).await;
+        assert!(
+            arms.iter()
+                .any(|(arm, acting, group)| arm == "owner_group_writer"
+                    && *acting == w.rb.to_string()
+                    && group.as_deref() == Some(w.alpha.to_string().as_str())),
+            "{name}: the owner-group arm admitted the writer over the winner's row: {arms:?}"
         );
     }
 }

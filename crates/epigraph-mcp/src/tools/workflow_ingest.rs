@@ -41,6 +41,12 @@ pub struct IngestWorkflowResponse {
     pub executes_edges: usize,
     pub relationships_created: usize,
     pub already_ingested: bool,
+    /// Whether THIS call's row insert created the `workflows` row
+    /// (`WorkflowIngestExecutionResult::row_created`). Not part of the
+    /// answer: it keys the post-commit goal embedding, which is stored only on
+    /// a row the call created.
+    #[serde(skip)]
+    pub row_created: bool,
     /// Present only when the call DECLARED a tenancy: every planned claim the
     /// call did not create whose tenancy differs from the declared one
     /// (`epigraph_ingest_executor::ReusedClaim`). `visibility` and
@@ -163,7 +169,11 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     )
     .await
     .map_err(internal_error)?;
-    let creating = anchors.existing.is_none();
+    // Whether the row looked absent BEFORE the walk: only then are the
+    // lineage head and the linked parent checked here. Whether this call
+    // CREATED the row is the row insert's own answer (`result.row_created`),
+    // because a row another caller is still creating is invisible to this read.
+    let expect_create = anchors.existing.is_none();
     // `inherited`: `Some(x)` = the new row inherits submitter `x` (possibly no
     // record); `None` = a brand-new lineage, whose submitter is the caller.
     let mut inherited: Option<Option<uuid::Uuid>> = None;
@@ -181,7 +191,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
             extraction.source.canonical_name, extraction.source.generation
         ))
     };
-    if creating {
+    if expect_create {
         let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
             .into_iter()
@@ -210,11 +220,50 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         }
     }
 
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-        &mut tx, &plan, extraction, viewer, declared,
-    )
-    .await
-    .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
+    // A walk that would write under a row that already exists and shows this
+    // caller no plan (a row read before the walk, e.g. one the
+    // pre-transaction ingest left behind, or one ANOTHER caller committed
+    // while this call's row insert waited on it) stops before writing
+    // anything under it (`ExistingWorkflowNeedsAuthority`). That is a write to
+    // an existing workflow and needs the same authority as any other:
+    // checked here, on the same transaction, and only if the caller is
+    // admitted does the walk run again with that row admitted.
+    let mut admitted: Option<uuid::Uuid> = None;
+    let result = loop {
+        match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+            &mut tx, &plan, extraction, viewer, declared, admitted,
+        )
+        .await
+        {
+            Err(
+                epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+                    workflow_id: existing,
+                    ..
+                },
+            ) if admitted.is_none() => {
+                if !grants.iter().any(|(anchor, _)| *anchor == existing) {
+                    let grant = crate::tools::workflow_authority::require_workflow_authority(
+                        server,
+                        &mut tx,
+                        auth,
+                        caller,
+                        existing,
+                        "workflow_ingest",
+                        &not_found,
+                    )
+                    .await?;
+                    admin_write |= grant.is_admin();
+                    grants.push((existing, grant));
+                }
+                admitted = Some(existing);
+            }
+            other => {
+                break other
+                    .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?
+            }
+        }
+    };
+    let creating = result.row_created;
     // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
     // over HTTP, this server's pinned agent on stdio) AUTHORED every claim this
     // ingest CREATED (`result.inserted`: thesis, phase, step and operation
@@ -230,28 +279,6 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     .map_err(|e| {
         crate::errors::internal_error_logged("workflow ingest: could not record authorship", e)
     })?;
-    // A walk that WROTE under a row that already existed: the row showed this
-    // caller no plan (no `executes` edge it can see, e.g. a row the
-    // pre-transaction ingest left behind), so the executor did not short-circuit
-    // and attached the caller's claims and edges to it. That is a write to an
-    // existing workflow, and it needs the same authority as any other: checked
-    // here, on the same transaction, so a refusal rolls the whole walk back.
-    if let (Some(existing), false) = (anchors.existing, result.already_ingested) {
-        if !grants.iter().any(|(anchor, _)| *anchor == existing) {
-            let grant = crate::tools::workflow_authority::require_workflow_authority(
-                server,
-                &mut tx,
-                auth,
-                caller,
-                existing,
-                "workflow_ingest",
-                &not_found,
-            )
-            .await?;
-            admin_write |= grant.is_admin();
-            grants.push((existing, grant));
-        }
-    }
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
     let submitter = inherited.unwrap_or(Some(caller.agent_id()));
@@ -379,6 +406,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         executes_edges: result.executes_edges_created,
         relationships_created: result.relationship_edges_created,
         already_ingested: result.already_ingested,
+        row_created: result.row_created,
         reused_items: declared.map(|_| {
             result
                 .reused_items
@@ -538,6 +566,7 @@ pub async fn do_ingest_workflow_via_pool(
         executes_edges: result.executes_edges_created,
         relationships_created: result.relationship_edges_created,
         already_ingested: result.already_ingested,
+        row_created: result.row_created,
         reused_items: None,
     })
 }
@@ -653,14 +682,16 @@ pub(crate) async fn store_workflow_goal_embedding(
 }
 
 /// The `workflows` row whose goal embedding an ingest entry point may store:
-/// the row this call WROTE (created, or attached its plan to under the
-/// authority gate), never one a re-ingest short-circuited on. A re-ingest of
-/// an existing `(canonical_name, generation)` used to embed the REQUEST's goal
-/// and store it on the existing row, so any caller that could read a public
-/// workflow could re-rank it in every caller's `find_workflow_hierarchical`
-/// without writing its group or passing the lineage authority gate.
+/// only the row this call's insert CREATED (`row_created`), never one that
+/// already existed (a re-ingest, or a row the walk was admitted under, whose
+/// stored goal is not the request's). A re-ingest of an existing
+/// `(canonical_name, generation)` used to embed the REQUEST's goal and store
+/// it on the existing row, so any caller that could read a public workflow
+/// could re-rank it in every caller's `find_workflow_hierarchical` without
+/// writing its group or passing the lineage authority gate; a caller racing
+/// another's creation of the row did the same.
 pub(crate) fn goal_embedding_target(response: &IngestWorkflowResponse) -> Option<uuid::Uuid> {
-    if response.already_ingested {
+    if !response.row_created {
         return None;
     }
     uuid::Uuid::parse_str(&response.workflow_id).ok()
@@ -780,6 +811,9 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub workflow_id: String,
     pub claims_ingested: usize,
     pub already_ingested: bool,
+    /// As [`IngestWorkflowResponse::row_created`]; not part of the answer.
+    #[serde(skip)]
+    pub row_created: bool,
 }
 
 /// The highest generation of `canonical_name` the CALLER can see, read on its
@@ -858,6 +892,7 @@ async fn improve_workflow_hierarchy_with_inserted(
         workflow_id: response.workflow_id,
         claims_ingested: response.claims_ingested,
         already_ingested: response.already_ingested,
+        row_created: response.row_created,
     };
     Ok((improve_response, inserted))
 }
@@ -908,6 +943,7 @@ pub async fn improve_workflow_hierarchy_via_pool(
         workflow_id: response.workflow_id,
         claims_ingested: response.claims_ingested,
         already_ingested: response.already_ingested,
+        row_created: response.row_created,
     })
 }
 
@@ -938,7 +974,9 @@ pub async fn improve_workflow_hierarchy(
     // invisible to find_hierarchical_by_embedding's WHERE goal_embedding IS NOT NULL
     // filter — the embedding search silently surfaces the last-embedded generation
     // instead of the latest one. Mirrors the identical block in do_ingest_workflow.
-    if let Some(wf_id) = (!response.already_ingested)
+    // Only on a row this call created (see `goal_embedding_target`).
+    if let Some(wf_id) = response
+        .row_created
         .then(|| uuid::Uuid::parse_str(&response.workflow_id).ok())
         .flatten()
     {

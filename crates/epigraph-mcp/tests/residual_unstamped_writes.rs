@@ -897,12 +897,13 @@ const EXECUTOR_ENTRY_POINTS: &[&str] = &[
 const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
     (
         "epigraph-api/src/routes/workflows.rs",
-        4,
-        4,
-        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` (one \
-         `execute_workflow_ingest_plan` / `execute_workflow_ingest_plan_in_group` each) plus `POST /workflows/steps` and \
-         `/workflows/steps/delete`. All four stamp through this module's own \
-         `begin_caller_workflow_tx`; none is exempt.",
+        3,
+        3,
+        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` share ONE \
+         `execute_workflow_ingest_plan_in_group` call (`execute_admitted_ingest`, which also \
+         checks the lineage gate over a row the walk did not create), plus `POST \
+         /workflows/steps` and `/workflows/steps/delete`. All three stamp through this \
+         module's own `begin_caller_workflow_tx`; none is exempt.",
     ),
     (
         "epigraph-mcp/src/tools/step_ops.rs",
