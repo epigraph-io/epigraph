@@ -37,7 +37,10 @@ use epigraph_auth::AuthContext;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::types::{ConsolidateClaimsParams, SubmitDsEvidenceParams};
+use epigraph_mcp::tools::evolve_step::EvolveStepParams;
+use epigraph_mcp::types::{
+    ConsolidateClaimsParams, SubmitDsEvidenceParams, UpdateWithEvidenceParams,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -196,4 +199,243 @@ async fn submit_ds_evidence_reads_the_members_private_frame(pool: PgPool) {
     .await
     .expect("count BBAs");
     assert_eq!(n, 1, "the BBA landed on the private frame");
+}
+
+// ──────────────── update_with_evidence / evolve_step, by step name ────────────────
+
+async fn binary_truth(pool: &PgPool) {
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+            .fetch_optional(pool)
+            .await
+            .expect("read binary_truth");
+    if existing.is_none() {
+        epigraph_db::FrameRepository::create(
+            pool,
+            "binary_truth",
+            Some("canonical binary frame"),
+            &["TRUE".to_string(), "FALSE".to_string()],
+        )
+        .await
+        .expect("binary_truth");
+    }
+}
+
+struct PrivateWorkflow {
+    canonical: String,
+    /// The step claims, in plan order.
+    steps: Vec<Uuid>,
+}
+
+/// A PUBLIC workflows row whose two level-2 steps and their `executes` edges
+/// are private to `group` (the shape of `hierarchical_outcome_stamped_reads.rs`),
+/// recorded as submitted by `submitter` so `evolve_step`'s lineage gate admits
+/// it. Only a stamped member session can walk this plan.
+async fn private_workflow(pool: &PgPool, submitter: Uuid, group: Uuid) -> PrivateWorkflow {
+    let canonical = format!("private-steps-{}", Uuid::new_v4());
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        pool,
+        workflow_id,
+        &canonical,
+        0,
+        "A workflow whose steps only one group can read.",
+        None,
+        serde_json::json!({ "epigraph_submitted_by": submitter.to_string() }),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
+
+    let mut steps = Vec::new();
+    for i in 0..2 {
+        let c = private_claim(
+            pool,
+            submitter,
+            group,
+            &format!("{canonical} private step {i}"),
+            0.5,
+        )
+        .await;
+        sqlx::query("UPDATE claims SET properties = jsonb_build_object('level', 2) WHERE id = $1")
+            .bind(c)
+            .execute(pool)
+            .await
+            .expect("level 2");
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, 'workflow', $2, 'claim', 'executes', jsonb_build_object('plan_index', $3::int))",
+        )
+        .bind(workflow_id)
+        .bind(c)
+        .bind(i)
+        .execute(pool)
+        .await
+        .expect("executes edge");
+        steps.push(c);
+    }
+
+    let shapes: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id FROM claims WHERE id = ANY($1) \
+         UNION ALL \
+         SELECT visibility::text, owner_group_id FROM edges \
+          WHERE source_id = $2 AND relationship = 'executes'",
+    )
+    .bind(&steps)
+    .bind(workflow_id)
+    .fetch_all(pool)
+    .await
+    .expect("tenancy read-back");
+    assert_eq!(shapes.len(), 4, "two step claims and two executes edges");
+    for (vis, owner) in &shapes {
+        assert_eq!(
+            (vis.as_str(), *owner),
+            ("group", group),
+            "fixture shape: {shapes:?}"
+        );
+    }
+    PrivateWorkflow { canonical, steps }
+}
+
+fn uwe_by_name(canonical: &str, data: &str) -> UpdateWithEvidenceParams {
+    UpdateWithEvidenceParams {
+        canonical_name: Some(canonical.to_string()),
+        step_index: Some(0),
+        claim_id: String::new(),
+        evidence_type: "empirical".into(),
+        evidence_data: data.into(),
+        source_url: None,
+        supports: true,
+        strength: 0.8,
+        labels: vec![],
+    }
+}
+
+async fn evidence_on(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM evidence WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count evidence")
+}
+
+/// A member adds evidence to step 0 of a workflow whose steps are private to
+/// its group, addressing it by name. A stranger's identical call cannot
+/// resolve the step and writes nothing (the fail-open half).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_by_name_resolves_the_members_private_step(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let (agent, auth, viewer, group) = member(&pool).await;
+    let (_s, stranger_auth, stranger) = seed_caller(&pool, &["claims:write"]).await;
+    let wf = private_workflow(&pool, agent, group).await;
+
+    let theirs = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &stranger,
+        uwe_by_name(&wf.canonical, "a stranger's evidence by name"),
+        Some(&stranger_auth),
+    )
+    .await;
+    assert!(
+        matches!(&theirs, Err(e) if e.message.contains("no step at index 0")),
+        "a stranger must not resolve another group's private step: {:?}",
+        theirs.map(|r| first_text(&r))
+    );
+    assert_eq!(
+        evidence_on(&pool, wf.steps[0]).await,
+        0,
+        "the stranger wrote nothing"
+    );
+
+    let mine = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe_by_name(&wf.canonical, "the member's evidence by name"),
+        Some(&auth),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "a member resolves its own group's private step by name (an unstamped walk \
+             answers `no step at index 0`): {}",
+            e.message
+        )
+    });
+    let ev = parse_uuid_field(&first_text(&mine), "evidence_id");
+    let on: Uuid = sqlx::query_scalar("SELECT claim_id FROM evidence WHERE id = $1")
+        .bind(ev)
+        .fetch_one(&pool)
+        .await
+        .expect("the evidence row");
+    assert_eq!(on, wf.steps[0], "the evidence is on step 0 of the plan");
+}
+
+fn evolve_by_name(canonical: &str, content: &str) -> EvolveStepParams {
+    EvolveStepParams {
+        parent_id: String::new(),
+        canonical_name: Some(canonical.to_string()),
+        step_index: Some(0),
+        step_lineage_id: String::new(),
+        content: content.to_string(),
+        edge_type: "revises".to_string(),
+        rationale: Some("app-role step resolution".to_string()),
+        level: Some(2),
+    }
+}
+
+/// The submitting member evolves step 0 of its group-private plan by name; a
+/// stranger's identical call cannot resolve the step and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_by_name_resolves_the_members_private_step(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (agent, auth, viewer, group) = member(&pool).await;
+    let (_s, stranger_auth, stranger) = seed_caller(&pool, &["claims:write"]).await;
+    let wf = private_workflow(&pool, agent, group).await;
+
+    let stranger_content = "a stranger's revision by name";
+    let theirs = epigraph_mcp::tools::evolve_step::evolve_step(
+        &server,
+        &stranger,
+        evolve_by_name(&wf.canonical, stranger_content),
+        Some(&stranger_auth),
+    )
+    .await;
+    assert!(
+        matches!(&theirs, Err(e) if e.message.contains("no step at index 0")),
+        "a stranger must not resolve another group's private step: {:?}",
+        theirs.map(|r| first_text(&r))
+    );
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(stranger_content)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(n, 0, "the stranger wrote nothing");
+
+    let mine = epigraph_mcp::tools::evolve_step::evolve_step(
+        &server,
+        &viewer,
+        evolve_by_name(&wf.canonical, "the member's revision by name"),
+        Some(&auth),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "the submitting member evolves its own group's private step by name (an \
+             unstamped walk answers `no step at index 0`): {}",
+            e.message
+        )
+    });
+    let edge = parse_uuid_field(&first_text(&mine), "edge_id");
+    let ends: (Uuid, Uuid) = sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+        .bind(edge)
+        .fetch_one(&pool)
+        .await
+        .expect("the lineage edge");
+    assert!(
+        ends.0 == wf.steps[0] || ends.1 == wf.steps[0],
+        "the new step's lineage edge joins step 0 of the plan: {ends:?} vs {}",
+        wf.steps[0]
+    );
 }

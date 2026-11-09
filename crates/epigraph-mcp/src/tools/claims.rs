@@ -1321,16 +1321,25 @@ pub async fn update_with_evidence(
         }
         parse_uuid(params.claim_id.trim())?
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
-        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
-            .await
-            // `InvalidData` (every head of the step's lineage is retired) is
-            // the caller's to fix, not an internal error.
-            .map_err(crate::errors::db_caller_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
-                ))
-            })?
+        // On the caller's stamped read, not the plain pool: the step walk's
+        // claims and `executes` edges are tenancy-filtered, and an unstamped
+        // application session admits public rows only, so a group-private
+        // workflow's steps answered "no step" to the group's own members. The
+        // read is released before anything below takes a write transaction.
+        let mut read = server.read_as(viewer, "update_with_evidence").await?;
+        let resolved = epigraph_db::WorkflowRepository::resolve_step_claim_conn(
+            &mut *read, viewer, name, idx, true,
+        )
+        .await
+        // `InvalidData` (every head of the step's lineage is retired) is
+        // the caller's to fix, not an internal error.
+        .map_err(crate::errors::db_caller_error)?;
+        drop(read);
+        resolved.ok_or_else(|| {
+            invalid_params(format!(
+                "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
+            ))
+        })?
     } else {
         return Err(invalid_params(
             "provide a claim to update: either `claim_id`, or both `canonical_name` and `step_index`",

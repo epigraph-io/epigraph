@@ -194,7 +194,10 @@
 //!   `claims_in_themes_at_dim` is itself an unconverted wrapper over the
 //!   converted `claims_in_themes_at_dim_since` — so they are convertible
 //!   whenever a shard wants them and are deferred only to keep this pass to one
-//!   rule.
+//!   rule. (Those are PR-27's counts. Since then `workflow.rs::resolve_step_claim`
+//!   has moved class: it is now a `Pool::acquire` wrapper over the
+//!   connection-taking primitive `resolve_step_claim_conn`, which MCP's
+//!   `update_with_evidence` and `evolve_step` call on the caller's stamped read.)
 //!
 //!   Do not read the count of unconverted functions as a count of blockers: the
 //!   paragraph this replaced did exactly that. Calling
