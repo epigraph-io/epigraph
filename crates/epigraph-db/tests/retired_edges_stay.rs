@@ -737,6 +737,28 @@ async fn filer_of(pool: &PgPool, claim: Uuid) -> Uuid {
         .expect("filer")
 }
 
+/// Whether `claim`'s `authored_by` block, filed by `filer` and read as the
+/// filer, is a document's (`literature`).
+async fn reads_as_literature(pool: &PgPool, filer: Uuid, claim: Uuid) -> bool {
+    let scoped = fixture::scoped_pool(pool).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, filer)
+        .await
+        .expect("viewer");
+    let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+    let block = epigraph_db::AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim,
+        filer,
+        chrono::Utc::now(),
+        epigraph_db::PromptSnapshotAudience::OperatorAndAdmins,
+    )
+    .await
+    .expect("authored_by");
+    read.commit().await.expect("finish");
+    matches!(block, epigraph_db::AuthoredBy::Literature(_))
+}
+
 /// A creation record says which document ingest created THAT row. The three
 /// replacement cascades re-point incoming claim edges onto the successor, the
 /// canonical or the merge, the record and its paper's assertion included;
@@ -756,6 +778,10 @@ async fn a_superseded_claims_ingest_record_names_no_ingest_on_its_successor(pool
         (vec![p], Some(p)),
         "CALIBRATION"
     );
+    assert!(
+        reads_as_literature(&pool, author, old).await,
+        "CALIBRATION: the claim block reads the paper as the creator"
+    );
     let new = supersede_act(&pool, author, group, old).await;
     replay_supersede(&pool, old, new).await;
     replay_supersede(&pool, old, new).await;
@@ -769,6 +795,10 @@ async fn a_superseded_claims_ingest_record_names_no_ingest_on_its_successor(pool
         (vec![], None),
         "the successor is no ingest's creation (record now on {:?})",
         ends(&pool, &[record]).await
+    );
+    assert!(
+        !reads_as_literature(&pool, author, new).await,
+        "the successor's claim block is its filer's own"
     );
 }
 
