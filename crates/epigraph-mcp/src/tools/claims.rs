@@ -1328,7 +1328,7 @@ pub async fn update_with_evidence(
         // read is released before anything below takes a write transaction.
         let mut read = server.read_as(viewer, "update_with_evidence").await?;
         let resolved = epigraph_db::WorkflowRepository::resolve_step_claim_conn(
-            &mut *read, viewer, name, idx, true,
+            &mut read, viewer, name, idx, true,
         )
         .await
         // `InvalidData` (every head of the step's lineage is retired) is
