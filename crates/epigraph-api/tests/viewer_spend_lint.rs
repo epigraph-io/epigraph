@@ -1236,9 +1236,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // author decl, migration 206's team list) for the AUTHOR, before the
     // transaction; `Viewer::resolve` re-resolves the CALLER's own viewer once
     // when that resolution minted its home group mid-request;
-    // `write_tenancy_report` (on a `db_pool.acquire`) reads back the row this
-    // call wrote or found, and falls back to the declaration when the
-    // unstamped pool cannot see it. The structural edges now run on ONE loop
+    // `write_tenancy_report` reads back the row this call wrote or found on a
+    // `begin_claim_write` transaction stamped with this viewer (it takes the
+    // connection, not the viewer), and falls back to the declaration only when
+    // that read fails. The structural edges now run on ONE loop
     // site each way: `create_signed` on the raw pool for a public claim (as
     // before), `create_signed_conn` on a `begin_claim_write` transaction
     // stamped with this viewer for a group-visible one.
@@ -1257,7 +1258,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupKeyEpochRepository::get_current_epoch",
             "GroupMembershipRepository::is_member",
             "Viewer::resolve",
-            "db_pool.acquire",
             "db_pool.acquire",
             "provenance::record_provenance",
             "sqlx::query(UPDATE).execute",
