@@ -585,9 +585,13 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // Was `promote_if_pending`; the body moved into its connection form in the
+    // raw-pool residual review (the pool form now acquires and delegates), so
+    // the MCP promote can write the matcher edge on its author-stamped
+    // transaction. Same INSERT, same count.
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
-        "promote_if_pending",
+        "promote_if_pending_conn",
         1,
         Unsigned(REPO_INTERNAL),
     ),

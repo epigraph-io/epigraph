@@ -329,8 +329,36 @@ impl MatchCandidateRepo {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<DecideOutcome, DbError> {
-        use sqlx::Acquire;
         let mut conn = self.pool.acquire().await?;
+        Self::promote_if_pending_conn(&mut conn, id, by, read_verdict, relationship, properties)
+            .await
+    }
+
+    /// [`Self::promote_if_pending`] on a connection the caller owns, which may
+    /// already be inside a transaction (the flip and the edge then run in a
+    /// SAVEPOINT of it, and the caller's COMMIT is what lands them).
+    ///
+    /// # Why a connection form exists
+    ///
+    /// The matcher edge is a tenancy row: migration 070's trigger derives its
+    /// owner from the two claims it joins, so an edge touching a group-private
+    /// claim is owned by that group and `edges_tenancy`'s `WITH CHECK` admits it
+    /// only on a session stamped with a writer of that group. On the pool form's
+    /// plain checkout (an unstamped application session in production) that
+    /// promote is refused. A request path passes its author-stamped transaction
+    /// here instead (`epigraph-mcp` `tools/matching.rs::decide_match_candidate`).
+    ///
+    /// # Errors
+    /// As [`Self::promote_if_pending`].
+    pub async fn promote_if_pending_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        by: Option<Uuid>,
+        read_verdict: Option<&str>,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<DecideOutcome, DbError> {
+        use sqlx::Acquire;
         let mut tx = conn.begin().await?;
         let pair: Option<(Uuid, Uuid)> = sqlx::query_as(
             "UPDATE match_candidates
@@ -346,7 +374,7 @@ impl MatchCandidateRepo {
         .await?;
         let Some((claim_a, claim_b)) = pair else {
             drop(tx);
-            let (status, verdict) = current_decision(&mut conn, id).await?;
+            let (status, verdict) = current_decision(&mut *conn, id).await?;
             if status == "pending" {
                 return Ok(DecideOutcome::VerdictChanged { verdict });
             }
