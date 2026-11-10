@@ -42,6 +42,18 @@ use rmcp::RoleClient;
 /// gateway startup or a caller's request.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The largest single response event the gateway accepts from a downstream
+/// extension: 16 MiB, rmcp 3.9's default, set explicitly in [`connect`].
+///
+/// rmcp 2.2's streamable-HTTP client buffered a downstream response of any
+/// size (RUSTSEC-2026-0462), so one oversized or never-ending reply could
+/// exhaust the gateway's memory. rmcp 3.9 bounds each SSE event at
+/// `StreamableHttpClientTransportConfig::max_sse_event_size`, and a larger one
+/// fails the call instead of being buffered. Pinned by
+/// `tests/federation_gateway_test.rs`
+/// (`a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied`).
+pub const MAX_RESPONSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
 /// A live rmcp client session to one downstream extension. The `()` service
 /// handler is the no-op client handler (`impl ClientHandler for ()`), which is
 /// all we need: the gateway is a pure client of the downstream — it issues
@@ -157,6 +169,8 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
         // downstream receives `Authorization: Bearer <token>`.
         config.auth_header = Some(token.to_string());
     }
+    // Explicit rather than inherited, so a later rmcp default cannot move it.
+    config.max_sse_event_size = MAX_RESPONSE_EVENT_BYTES;
     // rmcp implements its client transport for the reqwest it links (0.13),
     // not this crate's reqwest; leaving the type parameter to inference keeps
     // that version choice inside rmcp instead of adding a second direct

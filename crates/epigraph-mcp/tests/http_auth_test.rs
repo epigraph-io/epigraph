@@ -390,6 +390,75 @@ async fn wrong_scope_yields_scope_error() {
     );
 }
 
+/// The same scope gate on rmcp 3.x's STATELESS path. A peer on protocol
+/// 2026-07-28 sends self-contained requests (`MCP-Protocol-Version` header
+/// plus per-request `_meta`) with no `initialize` and no session, and rmcp
+/// dispatches them on a separate code path. `call_tool` decides authority from
+/// the HTTP `Parts` rmcp attaches to the request: with none it would treat the
+/// call as stdio (no scope gate, signer-agent authority). So a read+write
+/// bearer must still be refused an admin-only tool here, exactly as on the
+/// session path above.
+///
+/// Mutation: make `call_tool` ignore `Parts`
+/// (`let http_parts: Option<&Parts> = None;`) -> no `claims:admin` refusal.
+#[tokio::test]
+async fn stateless_2026_07_28_call_keeps_the_scope_gate() {
+    let addr = spawn_server().await;
+    let url = format!("http://{addr}/mcp");
+    let token = mint_token(SECRET, &["claims:read", "claims:write"]);
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "delete_edge",
+            "arguments": {"edge_id": "00000000-0000-0000-0000-000000000001"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {"name": "stateless-test", "version": "0.1.0"}
+            }
+        }
+    });
+    let mut resp = client()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", ACCEPT)
+        .header("Content-Type", CONTENT_TYPE)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "delete_edge")
+        .json(&body)
+        .send()
+        .await
+        .expect("stateless tools/call POST failed");
+    let status = resp.status();
+    assert!(
+        resp.headers().get(SESSION_HEADER).is_none(),
+        "CALIBRATION: a 2026-07-28 request must be served without a session"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let text = if resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+    {
+        read_sse_data(&mut resp, deadline).await
+    } else {
+        resp.text().await.unwrap_or_default()
+    };
+    assert!(
+        status.is_success(),
+        "CALIBRATION: rmcp must accept the stateless request (status {status}): {text}"
+    );
+    assert!(
+        text.contains("claims:admin"),
+        "a read+write bearer must be refused delete_edge on the stateless path too; got: {text}"
+    );
+}
+
 // ─── Test 4: right scope passes auth ──────────────────────────────────────
 
 #[tokio::test]
@@ -1012,4 +1081,86 @@ async fn request_without_a_host_header_is_refused() {
         .body(axum::body::Body::from("{}"))
         .unwrap();
     assert_eq!(status_of(req).await, 403);
+}
+
+// ── Request-body cap ──────────────────────────────────────────────────────
+
+/// An `initialize` POST whose serialized body is exactly `len` bytes, padded
+/// in `clientInfo.name`.
+fn init_request_of_len(len: usize, bearer: &str) -> axum::http::Request<axum::body::Body> {
+    let body_with = |pad: usize| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "p".repeat(pad), "version": "0.1"}
+            }
+        })
+        .to_string()
+    };
+    let overhead = body_with(0).len();
+    let body = body_with(len - overhead);
+    assert_eq!(body.len(), len, "padding arithmetic");
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Host", PROXY_HOST)
+        .header("Accept", ACCEPT)
+        .header("Content-Type", CONTENT_TYPE)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+/// The MCP HTTP listener caps one request body at 4 MiB and answers a larger
+/// one with an explicit 413, through the same `mcp_http_listener` and
+/// session-status rewrite `main.rs` serves. rmcp 2.2 read any size; 3.x added
+/// the cap (`StreamableHttpServerConfig::max_request_body_bytes`), and
+/// `host_guard::streamable_http_server_config` now sets it from
+/// `http_listener::MAX_REQUEST_BODY_BYTES` so it is a recorded choice rather
+/// than whatever the next rmcp default is. Both edges are pinned: exactly the
+/// cap is served, one byte over is refused before rmcp parses it.
+///
+/// The literal `4 * 1024 * 1024` is deliberate: moving the cap must fail here
+/// and be decided, not follow the constant silently.
+///
+/// Mutation: in `streamable_http_server_config`, pass `usize::MAX` to
+/// `with_max_request_body_bytes` -> the over-cap arm gets 200 and this test
+/// fails.
+#[tokio::test]
+async fn request_body_over_4_mib_is_refused_with_413_and_at_the_cap_is_served() {
+    const CAP: usize = 4 * 1024 * 1024;
+    assert_eq!(epigraph_mcp::http_listener::MAX_REQUEST_BODY_BYTES, CAP);
+    let token = mint_token(SECRET, &["claims:read"]);
+
+    let (router, _) = listener_router(TCP_LISTEN);
+    let resp = router
+        .oneshot(init_request_of_len(CAP + 1, &token))
+        .await
+        .expect("router is infallible");
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        status, 413,
+        "one byte over the cap must be refused explicitly; body: {body}"
+    );
+    assert!(body.contains("Payload Too Large"), "{body}");
+
+    let (router, _) = listener_router(TCP_LISTEN);
+    let resp = router
+        .oneshot(init_request_of_len(CAP, &token))
+        .await
+        .expect("router is infallible");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a body of exactly the cap is served"
+    );
+    assert!(resp.headers().contains_key(SESSION_HEADER));
 }

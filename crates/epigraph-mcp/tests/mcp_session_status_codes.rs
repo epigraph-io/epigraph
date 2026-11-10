@@ -15,7 +15,11 @@
 //! The pool is lazy against an unreachable URL: nothing here reaches the DB.
 //!
 //! Load-bearing check: comment out the `.layer(...)` in `nest_mcp_service` and
-//! the integration tests below fail with the old 401 / 500 / 422.
+//! the terminated-session integration tests below fail with rmcp's 500. (rmcp
+//! now answers the other two cases itself: 404 for an unknown session since
+//! 0.17.0, and 400 for a no-session non-initialize POST since 3.6.0. The
+//! integration tests pin those upstream answers; the discriminator table still
+//! covers the 401 and 422 rewrites for a build that produces them.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +31,7 @@ use epigraph_auth::JwtConfig;
 use epigraph_mcp::auth::{bearer_auth_middleware, McpAuthState};
 use epigraph_mcp::session_status::{
     rewrite_rmcp_session_status, rmcp_session_status_rewrite, MAX_INSPECTED_BODY,
-    RMCP_EXPECT_INITIALIZE_BODY, RMCP_SESSION_NOT_FOUND_BODY,
+    RMCP_SESSION_NOT_FOUND_BODY,
 };
 use rmcp::transport::streamable_http_server::session::local::{
     create_local_session, LocalSessionManager, SessionConfig,
@@ -392,7 +396,13 @@ async fn non_initialize_post_without_session_gets_400() {
         StatusCode::BAD_REQUEST,
         "non-initialize POST without a session must be 400 (was rmcp's 422), body: {body}"
     );
-    assert_eq!(body, RMCP_EXPECT_INITIALIZE_BODY, "body text is kept");
+    // rmcp 3.6.0+ answers this case itself (`session_id_required_response`);
+    // before that it was a 422 with `RMCP_EXPECT_INITIALIZE_BODY`, which the
+    // layer rewrote to 400 keeping the body.
+    assert_eq!(
+        body, "Bad Request: Session ID is required",
+        "rmcp's own 400 body"
+    );
 }
 
 /// Our own authentication 401s are untouched and keep their RFC 9728

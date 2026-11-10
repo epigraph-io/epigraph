@@ -20,9 +20,11 @@
 //! reconnect after a restart.
 //!
 //! rmcp 0.17.0 fixed the first row upstream (unknown session → 404, body
-//! `Not Found: Session not found`); the 500 and 422 rows are still present in
-//! rmcp 2.2.0, the version the workspace now resolves. This layer rewrites
-//! those two and keeps the 401 row for any build that still produces it.
+//! `Not Found: Session not found`), and rmcp 3.6.0 fixed the third (a
+//! session-less non-initialize POST is now `400 Bad Request: Session ID is
+//! required`). The 500 row is still present in rmcp 3.9.0, the version the
+//! workspace now resolves. This layer rewrites it and keeps the 401 and 422
+//! rows for any build that still produces them.
 //!
 //! ## What it touches
 //!
@@ -61,16 +63,18 @@ pub type McpHttpService = StreamableHttpService<crate::EpiGraphMcpFull, LocalSes
 pub const MAX_INSPECTED_BODY: u64 = 4096;
 
 /// rmcp 0.15.0's body for an unknown `Mcp-Session-Id` (`tower.rs`, POST and
-/// GET). rmcp 2.2.0 answers that case upstream with `404 Not Found: Session not
+/// GET). rmcp 3.9.0 answers that case upstream with `404 Not Found: Session not
 /// found`, so this constant is kept only for a build that still produces the 401.
 pub const RMCP_SESSION_NOT_FOUND_BODY: &str = "Unauthorized: Session not found";
 
 /// Prefix of rmcp's `internal_error_response` bodies (`Encounter an error when
-/// {context}: {error}`), verified unchanged in rmcp 2.2.0.
+/// {context}: {error}`), verified unchanged in rmcp 3.9.0.
 pub const RMCP_INTERNAL_ERROR_PREFIX: &str = "Encounter an error when";
 
 /// rmcp's body for a non-initialize POST that carries no session id
-/// (`unexpected_message_response`), verified unchanged in rmcp 2.2.0.
+/// (`unexpected_message_response`) up to rmcp 3.5. rmcp 3.6.0 and later answer
+/// that case with `400 Bad Request: Session ID is required` themselves, so this
+/// constant is kept only for a build that still produces the 422.
 pub const RMCP_EXPECT_INITIALIZE_BODY: &str = "Unexpected message, expect initialize request";
 
 /// Would `status` ever be rewritten? Decides whether the body is buffered at
@@ -171,7 +175,7 @@ pub async fn rewrite_rmcp_session_status(req: Request, next: Next) -> Response {
 /// keep its own handle on the `LocalSessionManager` it passed in.
 pub fn nest_mcp_service<S>(service: StreamableHttpService<S, LocalSessionManager>) -> axum::Router
 where
-    S: rmcp::Service<rmcp::RoleServer> + Send + 'static,
+    S: rmcp::ServerHandler + Send + 'static,
 {
     axum::Router::new()
         .nest_service("/mcp", service)
