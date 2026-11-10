@@ -1661,6 +1661,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // admit no row, so every reporter sees an empty list.
     ("epigraph_submit_bug_report", 207),
     ("epigraph_my_bug_reports", 207),
+    // 207's caller gate (shared by the write and the preflight) fails OPEN
+    // on the limit under a non-member owner: its count of the FORCEd
+    // `security_events` admits no row, so every reporter reads as having
+    // filed nothing. The write's own inserts still fail loud (above); the
+    // preflight then passes every caller the write would refuse BUG08.
+    ("epigraph_bug_report_gate", 207),
+    ("epigraph_bug_report_preflight", 207),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2713,6 +2720,19 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_my_bug_reports",
             "public.epigraph_my_bug_reports(integer)",
             true,
+        ),
+        // 207: the preflight runs on the request DSN before the embedding
+        // call; the caller gate takes a principal as an argument, so the
+        // request DSN must never call it (an oracle for any agent).
+        (
+            "epigraph_bug_report_preflight",
+            "public.epigraph_bug_report_preflight()",
+            true,
+        ),
+        (
+            "epigraph_bug_report_gate",
+            "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
+            false,
         ),
         (
             "epigraph_confirm_admin_act",

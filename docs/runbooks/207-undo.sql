@@ -7,7 +7,8 @@
 -- left serving them answers every call with an error (42883).
 --
 -- WHAT IT DOES: drops the settings audit trigger and its function, both
--- definers, the `security_events_bug_report_privileged` policy and the
+-- definers, the preflight and its caller gate, the
+-- `security_events_bug_report_privileged` policy and the
 -- `bug_report_intake_settings` table (with its one row).
 --
 -- WHAT IT LEAVES: every claim, trace and evidence row written through the
@@ -24,6 +25,8 @@ DROP FUNCTION IF EXISTS public.epigraph_bug_report_intake_settings_audit();
 DROP FUNCTION IF EXISTS public.epigraph_submit_bug_report(text, text, text, text, text, text,
                                                           text, bytea, bytea, text);
 DROP FUNCTION IF EXISTS public.epigraph_my_bug_reports(integer);
+DROP FUNCTION IF EXISTS public.epigraph_bug_report_preflight();
+DROP FUNCTION IF EXISTS public.epigraph_bug_report_gate(uuid, integer, integer, boolean);
 DROP POLICY IF EXISTS security_events_bug_report_privileged ON public.security_events;
 DROP TABLE IF EXISTS public.bug_report_intake_settings;
 

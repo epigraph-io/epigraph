@@ -1,6 +1,6 @@
 //! The bug-report intake (migration 207).
 //!
-//! Two calls, each one definer:
+//! Three calls, each one definer:
 //!
 //! * [`BugReportRepository::submit_conn`] files a report through
 //!   `epigraph_submit_bug_report`, as the session principal, into the intake
@@ -9,6 +9,10 @@
 //!   the answer is a [`BugReportReceipt`] and nothing else.
 //! * [`BugReportRepository::list_mine_conn`] reads the caller's own intake
 //!   reports through `epigraph_my_bug_reports`.
+//! * [`BugReportRepository::preflight_conn`] asks
+//!   `epigraph_bug_report_preflight` whether the write would refuse the
+//!   caller (not configured, system agent, unbound, over its limit) before
+//!   the server spends an embedding call on the report.
 //!
 //! Both run on the caller's STAMPED connection (`ScopedPool::begin_as`): the
 //! definers read the principal from the session, never from an argument. The
@@ -214,6 +218,24 @@ impl BugReportRepository {
             claim_id,
             submitted_at,
         })
+    }
+
+    /// Raise the refusal [`submit_conn`](Self::submit_conn) would raise for
+    /// the stamped principal before it reads any report (BUG01-03 and
+    /// BUG06-08), or return `Ok(())`. Writes nothing. ADVISORY: the write
+    /// repeats every check, so a pass here admits nothing by itself; it lets
+    /// the caller skip work (the embedding call) for a report the write
+    /// would refuse.
+    ///
+    /// # Errors
+    /// [`DbError::Refused`] for each of those refusals;
+    /// `DbError::QueryFailed` otherwise.
+    pub async fn preflight_conn(conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
+        sqlx::query("SELECT public.epigraph_bug_report_preflight()")
+            .execute(&mut *conn)
+            .await
+            .map_err(map_refusal)?;
+        Ok(())
     }
 
     /// The stamped principal's own intake reports, newest first, at most

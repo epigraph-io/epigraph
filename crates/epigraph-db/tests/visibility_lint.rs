@@ -792,6 +792,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "bug_report.rs",
+        "preflight_conn",
+        "READ through migration 207's principal-bound app-callable definer \
+         `epigraph_bug_report_preflight` on the reporter's STAMPED connection: it takes no \
+         argument, reads the principal from the stamped session, writes nothing and answers \
+         nothing but the write's own refusal (or a pass) for that principal; the viewer is \
+         spent on the stamp.",
+    ),
+    (
+        "bug_report.rs",
         "submit_conn",
         "WRITE through migration 207's principal-bound app-callable definer \
          `epigraph_submit_bug_report` on the reporter's STAMPED connection: the definer takes the \

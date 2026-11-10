@@ -15,7 +15,10 @@
 //! * `list_my_bug_reports` lists only the caller's reports, and nothing on a
 //!   principal-less listener;
 //! * an unconfigured intake is refused by name, as the caller's error;
-//! * oversized input is refused before anything is written.
+//! * oversized input is refused before anything is written;
+//! * a call the intake refuses for who the caller is or for its limit
+//!   (unconfigured, system agent, unbound, over the limit) makes no
+//!   embedding-provider call; an admitted one makes exactly one.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -24,13 +27,17 @@ mod common;
 use common::*;
 
 use epigraph_auth::{AuthContext, ClientType};
+use epigraph_crypto::AgentSigner;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
+use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
 use epigraph_mcp::types::{ListMyBugReportsParams, SubmitBugReportParams};
 use rmcp::model::ErrorCode;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
 
 async fn app_role_server(pool: &PgPool) -> EpiGraphMcpFull {
@@ -106,6 +113,7 @@ async fn linked_agent(pool: &PgPool, human: Uuid, label: &str) -> Uuid {
 
 struct World {
     ops: Uuid,
+    intake: Uuid,
     reporter: Uuid,
     other: Uuid,
 }
@@ -132,6 +140,7 @@ async fn world(pool: &PgPool, configured: bool) -> World {
         .expect("arm");
     World {
         ops,
+        intake,
         reporter,
         other,
     }
@@ -428,4 +437,89 @@ async fn oversized_input_is_refused_before_anything_is_written(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(n, 0);
+}
+
+/// [`app_role_server`] whose embedder counts its calls and answers a fixed
+/// vector: no request leaves the process.
+async fn counting_server(pool: &PgPool) -> (EpiGraphMcpFull, Arc<AtomicUsize>) {
+    let url = fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let embedder = McpEmbedder::new(plain.clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(Arc::new(move |_text: &str| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0.01_f32; 1536])
+        }));
+    let server = EpiGraphMcpFull::new(
+        plain,
+        AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer"),
+        embedder,
+        false,
+    )
+    .with_scoped_pool(scoped);
+    (server, calls)
+}
+
+/// The rate limit caps provider spend: a call the intake refuses for who the
+/// caller is or for its limit makes no embedding call. The admitted call
+/// (CALIBRATION) makes exactly one, and its vector is stored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refused_report_costs_no_embedding_call(pool: PgPool) {
+    let w = world(&pool, false).await;
+    let (server, calls) = counting_server(&pool).await;
+    let calls_now = || calls.load(Ordering::SeqCst);
+
+    let e = submit(&pool, &server, w.reporter, params("unconfigured"))
+        .await
+        .expect_err("not configured");
+    assert!(e.message.contains("BUG03:"), "{}", e.message);
+    assert_eq!(calls_now(), 0, "BUG03 (unconfigured) embedded");
+
+    sqlx::query(
+        "INSERT INTO bug_report_intake_settings (intake_group_id, per_hour) VALUES ($1, 1)",
+    )
+    .bind(w.intake)
+    .execute(&pool)
+    .await
+    .expect("configure, one per hour");
+
+    let ok = submit(&pool, &server, w.reporter, params("admitted"))
+        .await
+        .expect("CALIBRATION: an admitted report");
+    assert_eq!(calls_now(), 1, "an admitted report embeds once");
+    let id: Uuid = ok["claim_id"].as_str().unwrap().parse().unwrap();
+    let stored: bool = sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("the report");
+    assert!(stored, "the counted vector reached the definer");
+
+    let e = submit(&pool, &server, w.reporter, params("over the limit"))
+        .await
+        .expect_err("over the limit");
+    assert!(e.message.contains("BUG08:"), "{}", e.message);
+    assert_eq!(calls_now(), 1, "BUG08 (over the limit) embedded");
+
+    let (h, _) = fixture::seed_human_operator(&pool, "brim-system-human").await;
+    let system = linked_agent(&pool, h, "brim-system").await;
+    assert!(fixture::register_system_agent(&pool, system).await);
+    let e = submit(&pool, &server, system, params("from a system agent"))
+        .await
+        .expect_err("a system agent");
+    assert!(e.message.contains("BUG06:"), "{}", e.message);
+    assert_eq!(calls_now(), 1, "BUG06 (system agent) embedded");
+
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "brim-unbound").await;
+    let e = submit(&pool, &server, unbound, params("from nobody's agent"))
+        .await
+        .expect_err("an unbound agent");
+    assert!(e.message.contains("BUG07:"), "{}", e.message);
+    assert_eq!(calls_now(), 1, "BUG07 (unbound) embedded");
 }

@@ -25,23 +25,30 @@
 --       `bug_report.submitted` row is the intake's marker: the rate limit
 --       counts it and `epigraph_my_bug_reports` reads it, so the application
 --       role must not be able to forge one.
+--   (c0) `public.epigraph_bug_report_gate(uuid, integer, integer, boolean)`:
+--       the caller checks (BUG06, BUG07, BUG08) and the home group, shared
+--       by (c) and (c2). Maintenance only.
 --   (c) `public.epigraph_submit_bug_report(...)`: the write definer.
+--   (c2) `public.epigraph_bug_report_preflight()`: the write's refusals that
+--       do not depend on the report, so the server can skip the embedding
+--       provider for a caller the write would refuse.
 --   (d) `public.epigraph_my_bug_reports(integer)`: the reporter's read of its
 --       own intake rows.
 --   (e) an audit trigger on (a).
 --
--- Both functions are SECURITY DEFINER, owned by `epigraph_maintenance`, with
--- `SET search_path = pg_catalog, pg_temp` and every `public` object named
--- qualified (172's form, `definer_search_path_ratchet.rs`). EXECUTE is revoked
--- from PUBLIC and granted to `epigraph_app`. Neither body creates, reads or
--- writes a session temporary object: a temporary relation belongs to the
--- calling session, so nothing a definer does may depend on one.
+-- (c0), (c), (c2) and (d) are SECURITY DEFINER, owned by
+-- `epigraph_maintenance`, with `SET search_path = pg_catalog, pg_temp` and
+-- every `public` object named qualified (172's form,
+-- `definer_search_path_ratchet.rs`). EXECUTE is revoked from PUBLIC; (c), (c2)
+-- and (d) are granted to `epigraph_app`, (c0) to no one. No body creates,
+-- reads or writes a session temporary object: a temporary relation belongs to
+-- the calling session, so nothing a definer does may depend on one.
 --
 -- WHO THE CALLER IS: `epigraph_principal_id()`, the session setting every 077
 -- policy keys on, which only `ScopedPool::begin_as` sets from a resolved
--- viewer (docs/tenancy.md). Neither function takes the actor, the intake
--- group or the home group as an argument: each is read in the body, so a
--- holder of the application DSN cannot point the write at another group.
+-- viewer (docs/tenancy.md). No app-callable function takes the actor, the
+-- intake group or the home group as an argument: each is read in the body, so
+-- a holder of the application DSN cannot point the write at another group.
 --
 -- ===================================================================
 -- 3. THE WRITE (epigraph_submit_bug_report)
@@ -61,9 +68,9 @@
 --   BUG06 the caller is a registered system agent (148);
 --   BUG07 the caller is not bound to a human operator (122's OPL01 rule,
 --         `epigraph_author_binding`), or its binding gives it no home group
---         (a human operator's own personal group, a linked agent's acting
---         operator group, an allowlisted agent's human's personal group; see
---         THE HOME below);
+--         (section (c0): a human operator's own personal group, a linked
+--         agent's acting operator group, an allowlisted agent's human's
+--         personal group);
 --   BUG08 the caller's per-hour or per-day limit is reached.
 -- Membership of the intake group is NOT required; that is the point.
 --
@@ -88,7 +95,7 @@
 -- trigger admits the caller's own write into: the operator's personal group
 -- for an agent on a live link, a human operator's own personal group, the
 -- allowlisted human's personal group for an agent on a 149 client allowance
--- (THE HOME, below). That insert meets every check the trigger makes (OPL01,
+-- (section (c0)). That insert meets every check the trigger makes (OPL01,
 -- OPL02, ROL01) exactly as an ordinary write by the caller would. The same statement sequence then re-owns the row to
 -- the intake group before anything else references it. The re-own is an
 -- `UPDATE OF owner_group_id`, which the binding trigger does not fire on, and
@@ -98,26 +105,6 @@
 -- 'public' at any point, so no widening or narrowing guard is involved, and
 -- the trace and evidence are inserted after the re-own, declared (intake,
 -- 'group'). No other session can see the staged state: it never commits.
---
--- THE HOME, per binding arm (`epigraph_author_binding`, 149):
---   'human_operator'   its own active personal group, where it holds a live
---                      writer/admin row;
---   'live_link'        107's `epigraph_operator_actor`: the operator's
---                      personal group, while the link is live AND the agent's
---                      own acting row there is live. Revoking that row is the
---                      deactivation lever for a linked agent, so a deactivated
---                      agent is refused here, not admitted on its link alone;
---   'client_allowlist' the allowlisted human's active personal group, where
---                      that human holds a live writer/admin row. The agent
---                      needs no membership of it: 122's writer scope for an
---                      allowlisted author asks only whether its human writes
---                      the group (`epigraph_require_writer_scope`), so the
---                      staged insert there meets OPL01, OPL02 and ROL01 as
---                      the agent's own write would. Revoking the allowance
---                      unbinds the agent, which is then refused BUG07.
--- In every arm the staged insert is checked by the claims trigger exactly as
--- an ordinary write by the caller into that group would be; the home rule
--- only chooses the group.
 --
 -- WHAT IT DOES NOT DO, deliberately:
 --   * no novelty gate, no content-hash dedup, no similarity search. A report
@@ -213,6 +200,113 @@ CREATE POLICY security_events_bug_report_privileged ON public.security_events
         OR (SELECT public.epigraph_definer_bypass()));
 
 -- ===================================================================
+-- (c0) THE CALLER GATE (maintenance only)
+-- ===================================================================
+-- BUG06, BUG07 and BUG08 for `p_principal`, against the limits the caller
+-- read from the settings row; returns the caller's home group (section 3).
+-- One body for the write (c) and the preflight (c2), so the two cannot
+-- disagree about who is admitted. It takes the principal as an ARGUMENT, so
+-- it answers for anyone: EXECUTE is revoked from PUBLIC and never granted to
+-- the application role (an app-callable copy would be an oracle for any
+-- agent's binding and filing counts). The callers pass
+-- `epigraph_principal_id()`.
+--
+-- THE HOME, per binding arm (`epigraph_author_binding`, 149):
+--   'human_operator'   its own active personal group, where it holds a live
+--                      writer/admin row;
+--   'live_link'        107's `epigraph_operator_actor`: the operator's
+--                      personal group, while the link is live AND the agent's
+--                      own acting row there is live. Revoking that row is the
+--                      deactivation lever for a linked agent, so a deactivated
+--                      agent is refused here, not admitted on its link alone;
+--   'client_allowlist' the allowlisted human's active personal group, where
+--                      that human holds a live writer/admin row. The agent
+--                      needs no membership of it: 122's writer scope for an
+--                      allowlisted author asks only whether its human writes
+--                      the group (`epigraph_require_writer_scope`), so the
+--                      staged insert there meets OPL01, OPL02 and ROL01 as
+--                      the agent's own write would. Revoking the allowance
+--                      unbinds the agent, which is then refused BUG07.
+-- In every arm the staged insert is checked by the claims trigger exactly as
+-- an ordinary write by the caller into that group would be; this function
+-- only chooses the group.
+--
+-- p_serialize: the write takes the reporter's transaction-scoped advisory
+-- lock before counting, so concurrent submissions by one reporter cannot
+-- both pass the limit. The preflight does not lock: it is advisory, and the
+-- write repeats the count under the lock.
+CREATE OR REPLACE FUNCTION public.epigraph_bug_report_gate(
+    p_principal uuid, p_per_hour integer, p_per_day integer, p_serialize boolean)
+RETURNS uuid
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_variable
+DECLARE
+    v_binding text;
+    v_human   uuid;
+    v_home    uuid;
+    v_hour    bigint;
+    v_day     bigint;
+BEGIN
+    IF EXISTS (SELECT 1 FROM public.system_agents sa WHERE sa.agent_id = p_principal) THEN
+        RAISE EXCEPTION 'BUG06: a system agent files no bug report; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+
+    v_binding := public.epigraph_author_binding(p_principal);
+    IF v_binding = 'human_operator' THEN
+        v_human := p_principal;
+    ELSIF v_binding = 'live_link' THEN
+        SELECT a.operator_group_id INTO v_home
+          FROM public.epigraph_operator_actor(p_principal) a;
+    ELSIF v_binding = 'client_allowlist' THEN
+        v_human := public.epigraph_allowlisted_operator(p_principal);
+    END IF;
+    IF v_home IS NULL AND v_human IS NOT NULL THEN
+        SELECT g.id INTO v_home
+          FROM public.groups g
+         WHERE g.kind = 'personal' AND g.created_by_agent_id = v_human
+           AND g.status = 'active'
+           AND public.epigraph_operator_writes_group(v_human, g.id)
+         ORDER BY g.created_at, g.id
+         LIMIT 1;
+    END IF;
+    IF v_home IS NULL THEN
+        RAISE EXCEPTION 'BUG07: agent % is not bound to a human operator with a home group (no '
+                        'live operator link it acts on, no live client allowance, and not a '
+                        'registered human operator with its own personal group); nothing was '
+                        'written', p_principal
+            USING ERRCODE = '42501',
+                  HINT = 'An operator links the agent: epigraph-operator link.';
+    END IF;
+
+    IF p_serialize THEN
+        PERFORM pg_catalog.pg_advisory_xact_lock(
+            pg_catalog.hashtextextended('epigraph.bug_report:' || p_principal::text, 0));
+    END IF;
+    SELECT count(*) FILTER (WHERE e.created_at > pg_catalog.now() - interval '1 hour'),
+           count(*)
+      INTO v_hour, v_day
+      FROM public.security_events e
+     WHERE e.agent_id = p_principal
+       AND e.event_type = 'bug_report.submitted'
+       AND e.created_at > pg_catalog.now() - interval '1 day';
+    IF v_hour >= p_per_hour OR v_day >= p_per_day THEN
+        RAISE EXCEPTION 'BUG08: this reporter has filed % bug reports in the last hour and % '
+                        'in the last day; the limits are % and %; nothing was written',
+                        v_hour, v_day, p_per_hour, p_per_day
+            USING ERRCODE = '54000';
+    END IF;
+    RETURN v_home;
+END $$;
+COMMENT ON FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, boolean) IS
+    'Migration 207: the bug-report intake''s caller checks (BUG06 system agent, BUG07 unbound '
+    'or homeless, BUG08 limit) for the given principal; returns its home group. Maintenance '
+    'only: called by epigraph_submit_bug_report and epigraph_bug_report_preflight.';
+REVOKE EXECUTE ON FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, boolean)
+    FROM PUBLIC;
+
+-- ===================================================================
 -- (c) THE WRITE
 -- ===================================================================
 CREATE OR REPLACE FUNCTION public.epigraph_submit_bug_report(
@@ -237,14 +331,10 @@ DECLARE
     v_per_hour  integer;
     v_per_day   integer;
     v_home      uuid;
-    v_binding   text;
-    v_human     uuid;
     v_repro     text;
     v_evidence  text;
     v_content   text;
     v_labels    text[];
-    v_hour      bigint;
-    v_day       bigint;
     v_claim     uuid := pg_catalog.gen_random_uuid();
     v_trace     uuid := pg_catalog.gen_random_uuid();
     v_ev        uuid := pg_catalog.gen_random_uuid();
@@ -343,55 +433,9 @@ BEGIN
                         'nothing was written' USING ERRCODE = '22023';
     END IF;
 
-    -- THE CALLER: bound, live, not a system agent.
-    IF EXISTS (SELECT 1 FROM public.system_agents sa WHERE sa.agent_id = v_principal) THEN
-        RAISE EXCEPTION 'BUG06: a system agent files no bug report; nothing was written'
-            USING ERRCODE = '42501';
-    END IF;
-    -- THE HOME, per binding arm (section 3).
-    v_binding := public.epigraph_author_binding(v_principal);
-    IF v_binding = 'human_operator' THEN
-        v_human := v_principal;
-    ELSIF v_binding = 'live_link' THEN
-        SELECT a.operator_group_id INTO v_home
-          FROM public.epigraph_operator_actor(v_principal) a;
-    ELSIF v_binding = 'client_allowlist' THEN
-        v_human := public.epigraph_allowlisted_operator(v_principal);
-    END IF;
-    IF v_home IS NULL AND v_human IS NOT NULL THEN
-        SELECT g.id INTO v_home
-          FROM public.groups g
-         WHERE g.kind = 'personal' AND g.created_by_agent_id = v_human
-           AND g.status = 'active'
-           AND public.epigraph_operator_writes_group(v_human, g.id)
-         ORDER BY g.created_at, g.id
-         LIMIT 1;
-    END IF;
-    IF v_home IS NULL THEN
-        RAISE EXCEPTION 'BUG07: agent % is not bound to a human operator with a home group (no '
-                        'live operator link it acts on, no live client allowance, and not a '
-                        'registered human operator with its own personal group); nothing was '
-                        'written', v_principal
-            USING ERRCODE = '42501',
-                  HINT = 'An operator links the agent: epigraph-operator link.';
-    END IF;
-
-    -- THE LIMIT, serialized per reporter.
-    PERFORM pg_catalog.pg_advisory_xact_lock(
-        pg_catalog.hashtextextended('epigraph.bug_report:' || v_principal::text, 0));
-    SELECT count(*) FILTER (WHERE e.created_at > v_now - interval '1 hour'),
-           count(*)
-      INTO v_hour, v_day
-      FROM public.security_events e
-     WHERE e.agent_id = v_principal
-       AND e.event_type = 'bug_report.submitted'
-       AND e.created_at > v_now - interval '1 day';
-    IF v_hour >= v_per_hour OR v_day >= v_per_day THEN
-        RAISE EXCEPTION 'BUG08: this reporter has filed % bug reports in the last hour and % '
-                        'in the last day; the limits are % and %; nothing was written',
-                        v_hour, v_day, v_per_hour, v_per_day
-            USING ERRCODE = '54000';
-    END IF;
+    -- THE CALLER (BUG06, BUG07) AND THE LIMIT (BUG08), serialized per
+    -- reporter: section (c0), the same gate the preflight (c2) runs.
+    v_home := public.epigraph_bug_report_gate(v_principal, v_per_hour, v_per_day, true);
 
     v_labels := ARRAY['backlog', 'bug-report', 'intake']::text[];
     IF p_severity IS NOT NULL THEN
@@ -448,6 +492,65 @@ COMMENT ON FUNCTION public.epigraph_submit_bug_report(text, text, text, text, te
 REVOKE EXECUTE ON FUNCTION public.epigraph_submit_bug_report(text, text, text, text, text, text,
                                                              text, bytea, bytea, text)
     FROM PUBLIC;
+
+-- ===================================================================
+-- (c2) THE PREFLIGHT
+-- ===================================================================
+-- What the write would refuse before it looks at the report: BUG01, BUG02,
+-- BUG03, then the gate (c0) without its lock (BUG06, BUG07, BUG08). Raises
+-- the write's own refusal, or returns nothing. It writes nothing.
+--
+-- WHY. The server computes the claim's embedding before the write (a
+-- provider round trip must not hold a transaction open), so without this a
+-- caller the write refuses (unconfigured, system, unbound, over its limit)
+-- still costs one provider call per attempt, and the rate limit would not
+-- cap provider spend. The MCP tool calls this first and embeds only when it
+-- passes. It is ADVISORY and racy (a limit can be reached, or a link
+-- retired, between the two calls), so the write keeps every check.
+--
+-- WHAT IT REVEALS: nothing the write's refusals do not. It answers for the
+-- session principal only (no argument names anyone), and a pass means only
+-- "the write would not refuse you for who you are", which the write's
+-- receipt says too.
+CREATE OR REPLACE FUNCTION public.epigraph_bug_report_preflight()
+RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_variable
+DECLARE
+    v_principal uuid := public.epigraph_principal_id();
+    v_group     uuid;
+    v_per_hour  integer;
+    v_per_day   integer;
+BEGIN
+    IF v_principal IS NULL THEN
+        RAISE EXCEPTION 'BUG01: submitting a bug report needs an authenticated principal; '
+                        'nothing was written' USING ERRCODE = '42501';
+    END IF;
+    IF public.epigraph_is_elevated() THEN
+        RAISE EXCEPTION 'BUG02: an elevated session files no bug report; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    SELECT s.intake_group_id, s.per_hour, s.per_day
+      INTO v_group, v_per_hour, v_per_day
+      FROM public.bug_report_intake_settings s
+     WHERE s.singleton;
+    IF v_group IS NULL
+       OR NOT EXISTS (SELECT 1 FROM public.groups g
+                       WHERE g.id = v_group AND g.status = 'active'
+                         AND g.kind IN ('team', 'community')) THEN
+        RAISE EXCEPTION 'BUG03: bug intake is not configured on this instance; nothing was '
+                        'written' USING ERRCODE = '55000',
+              HINT = 'An operator sets public.bug_report_intake_settings on a maintenance '
+                     'session.';
+    END IF;
+    PERFORM public.epigraph_bug_report_gate(v_principal, v_per_hour, v_per_day, false);
+END $$;
+COMMENT ON FUNCTION public.epigraph_bug_report_preflight() IS
+    'Migration 207: raise the refusal epigraph_submit_bug_report would raise for the session '
+    'principal before it reads the report (BUG01-03, BUG06-08), or return nothing. Advisory: '
+    'the write repeats every check.';
+REVOKE EXECUTE ON FUNCTION public.epigraph_bug_report_preflight() FROM PUBLIC;
 
 -- ===================================================================
 -- (d) THE READ
@@ -529,6 +632,10 @@ DO $$ BEGIN
                 'text, text, bytea, bytea, text) OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_my_bug_reports(integer) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, '
+                'boolean) OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_bug_report_preflight() '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_bug_report_intake_settings_audit() '
                 'OWNER TO epigraph_maintenance';
     END IF;
@@ -536,6 +643,9 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_submit_bug_report(text, text, text, '
                 'text, text, text, text, bytea, bytea, text) TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_my_bug_reports(integer) '
+                'TO epigraph_app';
+        -- The preflight only; the gate (c0) is never the application's.
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_bug_report_preflight() '
                 'TO epigraph_app';
     END IF;
 END $$;

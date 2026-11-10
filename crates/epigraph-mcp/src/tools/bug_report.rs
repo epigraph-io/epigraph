@@ -9,11 +9,13 @@
 //! similarity hint, and the same answer shape every time. The caller can list
 //! its own reports and their current labels, which is how it sees triage.
 //!
-//! The database does the deciding (`BugReportRepository`, the two definers):
-//! which group, whether the caller is bound, the limits. This module checks the
-//! sizes first so an oversized report is refused before the embedding provider
-//! is called, resolves the caller's write identity, and maps the definers'
-//! `BUGnn:` refusals to the caller's error.
+//! The database does the deciding (`BugReportRepository`, migration 207's
+//! definers): which group, whether the caller is bound, the limits. This
+//! module checks the input first, then asks the database's preflight whether
+//! the write would refuse the caller (not configured, system agent, unbound,
+//! over its limit), so a report that will be refused costs no embedding
+//! provider call; then it embeds and writes. It maps the definers' `BUGnn:`
+//! refusals to the caller's error.
 
 use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use std::borrow::Cow;
@@ -125,7 +127,8 @@ fn success_json(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
 /// for every other refusal: no write identity (an elevated or principal-less
 /// request), the intake not configured (BUG03), an unbound or system caller
 /// (BUG06, BUG07, OPL01), the rate limit (BUG08). Nothing is written on any
-/// of them.
+/// of them, and none but a race between the preflight and the write reaches
+/// the embedding provider.
 pub async fn submit_bug_report(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -134,6 +137,18 @@ pub async fn submit_bug_report(
 ) -> Result<CallToolResult, McpError> {
     check(&params)?;
     let author = server.write_identity(auth, viewer).await?;
+
+    // The write's own refusals that do not depend on the report, BEFORE the
+    // provider call: otherwise a caller the write refuses (and one over its
+    // limit) costs an embedding per attempt, and the limit would not cap
+    // provider spend. Its own short transaction, rolled back: the provider
+    // round trip below must not hold one open. Advisory and racy, so the
+    // write repeats every check.
+    let mut pre = crate::claim_helper::begin_author_stamped_tx(server, author, SUBMIT).await?;
+    BugReportRepository::preflight_conn(&mut pre)
+        .await
+        .map_err(intake_error)?;
+    pre.rollback().await.map_err(internal_error)?;
 
     let mut input = BugReportInput {
         title: params.title,

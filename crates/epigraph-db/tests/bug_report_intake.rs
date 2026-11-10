@@ -19,6 +19,9 @@
 //! * the per-hour and per-day limits, counted per reporter;
 //! * an agent bound by a client allowance (149) files, with no membership of
 //!   any group; a linked agent whose acting row was revoked is refused;
+//! * the preflight answers what the write answers for every caller state and
+//!   writes nothing; only it, not the gate it shares with the write, is
+//!   app-callable;
 //! * an unconfigured intake (or one whose group is suspended) refuses;
 //! * session temporary objects named like the definer's relations change
 //!   nothing;
@@ -717,6 +720,138 @@ async fn a_deactivated_linked_agent_is_refused(pool: PgPool) {
         .await
         .expect("the active sibling files");
     assert_eq!(claims_by(&pool, w.reporter).await, 1);
+}
+
+async fn preflight_as(pool: &PgPool, agent: Uuid) -> Result<(), DbError> {
+    let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
+    let scoped = app(pool).await;
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped transaction");
+    let out = BugReportRepository::preflight_conn(&mut tx).await;
+    tx.rollback().await.expect("rollback");
+    out
+}
+
+/// The refusal code (`BUGnn`) of a result, or `ok`.
+fn code<T: std::fmt::Debug>(r: Result<T, DbError>) -> String {
+    match r {
+        Ok(_) => "ok".to_string(),
+        Err(e) => refused::<T>(Err(e)).1[..5].to_string(),
+    }
+}
+
+/// The preflight answers, for every caller state, exactly what the write
+/// answers for a valid report (BUG03, BUG06, BUG07, BUG08, a pass), and
+/// writes nothing. A reporter at its limit does not fail another reporter's
+/// preflight.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_preflight_refuses_what_the_write_refuses_and_writes_nothing(pool: PgPool) {
+    let w = bare_world(&pool).await;
+    arm(&pool).await;
+    let (system, _) = fixture::seed_agent_with_group(&pool, "bri-pf-system").await;
+    assert!(fixture::register_system_agent(&pool, system).await);
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, system, w.human)
+            .await
+            .expect("the system agent's live link");
+    }
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "bri-pf-unbound").await;
+    let (other_human, _) = fixture::seed_human_operator(&pool, "bri-pf-b-human").await;
+    let b = linked_agent(&pool, other_human, "bri-pf-b").await;
+
+    let pf = code(preflight_as(&pool, w.reporter).await);
+    assert_eq!(pf, "BUG03");
+    assert_eq!(code(submit_as(&pool, w.reporter, &report("x")).await), pf);
+
+    configure(&pool, w.intake, 1, 200).await;
+    for _ in 0..2 {
+        assert_eq!(code(preflight_as(&pool, w.reporter).await), "ok");
+    }
+    assert_eq!(
+        claims_by(&pool, w.reporter).await,
+        0,
+        "a preflight writes no claim"
+    );
+    assert_eq!(markers_of(&pool, w.reporter).await, 0, "and no marker");
+    submit_as(&pool, w.reporter, &report("the one this hour"))
+        .await
+        .expect("filed");
+
+    for (who, agent, want) in [
+        ("over its limit", w.reporter, "BUG08"),
+        ("system agent", system, "BUG06"),
+        ("unbound", unbound, "BUG07"),
+        ("another reporter", b, "ok"),
+    ] {
+        assert_eq!(
+            code(preflight_as(&pool, agent).await),
+            want,
+            "preflight: {who}"
+        );
+    }
+    for (who, agent, want) in [
+        ("over its limit", w.reporter, "BUG08"),
+        ("system agent", system, "BUG06"),
+        ("unbound", unbound, "BUG07"),
+    ] {
+        assert_eq!(
+            code(submit_as(&pool, agent, &report("y")).await),
+            want,
+            "write: {who}"
+        );
+    }
+
+    let plain = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut conn = plain.acquire().await.expect("acquire");
+    let (_, msg) = refused(BugReportRepository::preflight_conn(&mut conn).await);
+    assert!(msg.starts_with("BUG01:"), "{msg}");
+}
+
+/// `(owner, security definer, app may execute, PUBLIC may execute)`.
+type FnCatalog = (String, bool, bool, bool);
+
+/// The preflight is the application's; the gate it shares with the write
+/// takes a principal as an argument and is NOT (it would answer any agent's
+/// binding and filing counts).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_preflight_is_app_callable(pool: PgPool) {
+    for (sig, app_may) in [
+        ("public.epigraph_bug_report_preflight()", true),
+        (
+            "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
+            false,
+        ),
+    ] {
+        let row: FnCatalog = sqlx::query_as(
+            "SELECT pg_get_userbyid(p.proowner)::text, p.prosecdef, \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
+                    EXISTS (SELECT 1 FROM aclexplode(COALESCE(p.proacl, \
+                                                acldefault('f', p.proowner))) a \
+                             WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') \
+               FROM pg_proc p WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(sig)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sig}: {e}"));
+        assert_eq!(
+            row,
+            ("epigraph_maintenance".to_string(), true, app_may, false),
+            "{sig}"
+        );
+    }
+    // Through the real role: the gate is refused to the application.
+    let plain = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let r = sqlx::query("SELECT public.epigraph_bug_report_gate($1, 100, 100, false)")
+        .bind(Uuid::new_v4())
+        .execute(&plain)
+        .await;
+    let e = r.expect_err("the gate is not the application's");
+    assert_eq!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("42501"),
+        "{e}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
