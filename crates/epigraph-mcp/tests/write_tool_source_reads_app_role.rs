@@ -39,7 +39,8 @@ use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::evolve_step::EvolveStepParams;
 use epigraph_mcp::types::{
-    ConsolidateClaimsParams, SubmitDsEvidenceParams, UpdateWithEvidenceParams,
+    ConsolidateClaimsParams, EvaluateWorkflowPromotionParams, SubmitDsEvidenceParams,
+    UpdateWithEvidenceParams,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -547,3 +548,89 @@ async fn evolve_step_by_name_resolves_the_members_private_step(pool: PgPool) {
     );
 }
 
+// ──────────────── evaluate / refresh_workflow_promotion ────────────────
+
+/// A member's group-private variant and parent, joined by a `variant_of` edge
+/// that is itself group-private. Returns `(variant, parent)`.
+async fn private_variant(pool: &PgPool, agent: Uuid, group: Uuid) -> (Uuid, Uuid) {
+    let parent = private_claim(pool, agent, group, "private workflow parent", 0.5).await;
+    let variant = private_claim(pool, agent, group, "private workflow variant", 0.5).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'variant_of')",
+    )
+    .bind(variant)
+    .bind(parent)
+    .execute(pool)
+    .await
+    .expect("variant_of edge");
+    let (vis, owner): (String, Uuid) = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id FROM edges \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'variant_of'",
+    )
+    .bind(variant)
+    .bind(parent)
+    .fetch_one(pool)
+    .await
+    .expect("edge tenancy read-back");
+    assert_eq!(
+        (vis.as_str(), owner),
+        ("group", group),
+        "fixture: the variant_of edge is private to the member's group"
+    );
+    (variant, parent)
+}
+
+fn promotion_params(variant: Uuid) -> EvaluateWorkflowPromotionParams {
+    EvaluateWorkflowPromotionParams {
+        workflow_id: variant.to_string(),
+        window: Some(50),
+    }
+}
+
+/// The variant-parent lookup behind `evaluate_workflow_promotion` (and
+/// `refresh_workflow_promotion`, which shares `assess_workflow_promotion`)
+/// runs as the caller: a member's own private variant reports its private
+/// parent. On the plain pool the edge read as missing and the member was told,
+/// with no error, that its variant is a lineage root with nothing to promote
+/// over. A stranger still gets no parent.
+///
+/// `refresh_workflow_promotion` is not called here: its `properties.promotion`
+/// write is still on the plain pool (registered in
+/// `residual_unstamped_writes.rs`), so on this server it fails at that write
+/// for a group-private variant, a defect this read conversion does not own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn promotion_reads_the_members_private_variant_edge(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (agent, _auth, viewer, group) = member(&pool).await;
+    let (_s, _stranger_auth, stranger) = seed_caller(&pool, &["claims:write"]).await;
+    let (variant, parent) = private_variant(&pool, agent, group).await;
+
+    let theirs = epigraph_mcp::tools::workflows::evaluate_workflow_promotion(
+        &server,
+        &stranger,
+        promotion_params(variant),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a stranger's evaluation answers: {}", e.message));
+    assert_eq!(
+        first_text(&theirs)["parent_id"],
+        serde_json::Value::Null,
+        "a stranger must not see another group's private variant edge"
+    );
+
+    let mine = epigraph_mcp::tools::workflows::evaluate_workflow_promotion(
+        &server,
+        &viewer,
+        promotion_params(variant),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a member evaluates its own private variant: {}", e.message));
+    assert_eq!(
+        first_text(&mine)["parent_id"],
+        serde_json::Value::String(parent.to_string()),
+        "the member's own private variant reports its private parent (null means the edge \
+         was read on an unstamped session and seen as missing): {}",
+        first_text(&mine)
+    );
+}

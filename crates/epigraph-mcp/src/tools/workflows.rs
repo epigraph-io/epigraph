@@ -152,9 +152,19 @@ async fn assess_workflow_promotion(
     };
     let config = WorkflowPromotionConfig::default();
 
-    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, viewer, variant_id)
+    // The variant_of / supersedes edge is a viewer-filtered content read, so it
+    // runs on the CALLER's stamped read. On the plain pool the application
+    // role's row security admits public edges only: a member's own
+    // group-private variant edge read as missing, the variant was reported as
+    // a lineage root ("nothing to promote over"), and refresh skipped its
+    // write, all without an error. The read is released before the
+    // `behavioral_executions` reads below (a table without row security) and
+    // before refresh's write, so the tool never holds two pooled connections.
+    let mut read = server.read_as(viewer, "assess_workflow_promotion").await?;
+    let parent_id = WorkflowRepository::immediate_variant_parent(&mut *read, viewer, variant_id)
         .await
         .map_err(|e| internal_error(e.to_string()))?;
+    drop(read);
 
     let variant = BehavioralExecutionRepository::success_stats(&server.pool, variant_id, window)
         .await
