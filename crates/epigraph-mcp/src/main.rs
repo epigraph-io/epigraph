@@ -1206,7 +1206,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
-        let service = server.serve(rmcp::transport::stdio()).await.map_err(|e| {
+        // Not `serve(rmcp::transport::stdio())`: that frames with rmcp 3.x's
+        // default 16 MiB line cap, which silently drops a larger request. See
+        // `epigraph_mcp::stdio_transport`.
+        let (stdin, stdout) = rmcp::transport::stdio();
+        let transport = epigraph_mcp::stdio_transport::stdio_server_transport(stdin, stdout);
+        let service = server.serve(transport).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e
         })?;

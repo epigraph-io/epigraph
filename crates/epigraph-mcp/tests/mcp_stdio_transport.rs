@@ -1,20 +1,23 @@
 //! The stdio transport, end to end through rmcp's framing.
 //!
-//! `main.rs` serves stdio with `server.serve(rmcp::transport::stdio())`, which
-//! is rmcp's `transport-io` codec over an `(AsyncRead, AsyncWrite)` pair. Local
-//! MCP clients (Claude Code, epiclaw's scheduled agents) use it. The suites
-//! with "stdio" in their names call tool handlers directly; this one sends
-//! JSON-RPC through the same codec instead, with an rmcp client on the other
-//! end of an in-memory duplex pipe split into the same reader/writer pair
-//! shape `stdio()` returns.
+//! `main.rs` serves stdio through
+//! `epigraph_mcp::stdio_transport::stdio_server_transport`, rmcp's
+//! `AsyncRwTransport` line codec over the `(AsyncRead, AsyncWrite)` pair of
+//! `rmcp::transport::stdio()`, with this server's line-length limit. Local MCP
+//! clients (Claude Code, epiclaw's scheduled agents) use it. The suites with
+//! "stdio" in their names call tool handlers directly; this one sends JSON-RPC
+//! through the same function, with a client on the other end of an in-memory
+//! duplex pipe split into the reader/writer pair shape `stdio()` returns.
 //!
-//! It is a characterization test written with the rmcp 0.15 -> 2.x bump, not
-//! a red-first one: it pins behaviour stdio clients already rely on, and fails
-//! if an rmcp change breaks the line framing, the handshake, the tool listing
-//! or a tool call over stdio.
+//! The first two tests are characterization tests written with the rmcp 0.15
+//! -> 2.x bump, not red-first ones: they pin behaviour stdio clients already
+//! rely on, and fail if an rmcp change breaks the line framing, the handshake,
+//! the tool listing or a tool call over stdio. The oversized-line test was
+//! written red-first with the rmcp 2.2 -> 3.9 bump (see its doc).
 
 use std::sync::Arc;
 
+use epigraph_mcp::stdio_transport::stdio_server_transport;
 use rmcp::model::CallToolRequestParams;
 use rmcp::ServiceExt;
 
@@ -35,8 +38,9 @@ async fn stdio_framing_serves_handshake_tool_list_and_a_tool_call() {
     let (server_end, client_end) = tokio::io::duplex(1 << 20);
 
     let served = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(server_end);
         let running = server()
-            .serve(tokio::io::split(server_end))
+            .serve(stdio_server_transport(read, write))
             .await
             .expect("server side of the stdio handshake");
         let _ = running.waiting().await;
@@ -131,8 +135,9 @@ async fn tools_list_is_marked_private_and_uncached_for_cache_hint_peers() {
 
     let (server_end, client_end) = tokio::io::duplex(1 << 20);
     let served = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(server_end);
         let running = server()
-            .serve(tokio::io::split(server_end))
+            .serve(stdio_server_transport(read, write))
             .await
             .expect("server side of the stdio handshake");
         let _ = running.waiting().await;
@@ -170,4 +175,136 @@ async fn tools_list_is_marked_private_and_uncached_for_cache_hint_peers() {
 
     client.cancel().await.expect("client shuts down cleanly");
     let _ = served.await;
+}
+
+/// A single stdio JSON-RPC line over 16 MiB gets an answer, as it did on rmcp
+/// 2.2.
+///
+/// rmcp 3.x's default stdio framing caps one line at 16 MiB
+/// (`rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH`) and DROPS a longer
+/// one: it logs, sends nothing back, and the client waits on that id until its
+/// own timeout. `stdio_server_transport` lifts the cap
+/// (`STDIO_MAX_LINE_LENGTH`), so the request is read and answered.
+///
+/// The client end is raw JSON-RPC lines, not an rmcp client: rmcp's client
+/// transport has the same 16 MiB read cap, so an rmcp client could not tell a
+/// dropped request from a dropped reply. The call names a tool that does not
+/// exist, so the answer is a small error that cannot echo the argument; ANY
+/// answer for id 2 proves the line was read rather than dropped. The ping
+/// after it (id 3) shows the connection is still serving.
+///
+/// Red (the transport without `.with_max_line_length(STDIO_MAX_LINE_LENGTH)`,
+/// i.e. rmcp's default): id 3 is answered and id 2 never is, so the read times
+/// out.
+#[tokio::test]
+async fn a_request_line_over_16_mib_is_answered_not_dropped() {
+    use std::collections::HashMap;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    const OVER_RMCP_DEFAULT_CAP: usize = 17 * 1024 * 1024;
+
+    let (server_end, client_end) = tokio::io::duplex(1 << 20);
+    let served = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(server_end);
+        let running = server()
+            .serve(stdio_server_transport(read, write))
+            .await
+            .expect("server side of the stdio handshake");
+        let _ = running.waiting().await;
+    });
+
+    let (client_read, mut client_write) = tokio::io::split(client_end);
+    let mut lines = BufReader::new(client_read);
+
+    // Reads lines until every wanted id has an answer, returning id -> line.
+    async fn answers_for(
+        lines: &mut BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+        wanted: &[i64],
+    ) -> HashMap<i64, String> {
+        let mut got = HashMap::new();
+        while wanted.iter().any(|id| !got.contains_key(id)) {
+            let mut line = String::new();
+            let n = lines.read_line(&mut line).await.expect("read a line");
+            assert!(n > 0, "server closed stdout; answered so far: {got:?}");
+            let msg: serde_json::Value =
+                serde_json::from_str(line.trim_end()).expect("every server line is JSON");
+            if let Some(id) = msg.get("id").and_then(serde_json::Value::as_i64) {
+                got.insert(id, line);
+            }
+        }
+        got
+    }
+
+    let init = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "stdio-oversize-test", "version": "0.1"}
+        }
+    });
+    client_write
+        .write_all(format!("{init}\n").as_bytes())
+        .await
+        .unwrap();
+    let init_answer = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        answers_for(&mut lines, &[1]),
+    )
+    .await
+    .expect("initialize is answered");
+    assert!(
+        init_answer[&1].contains("\"result\""),
+        "{}",
+        init_answer[&1]
+    );
+
+    let initialized = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let oversized = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {
+            "name": "no_such_tool_oversize_probe",
+            "arguments": {"pad": "x".repeat(OVER_RMCP_DEFAULT_CAP)}
+        }
+    })
+    .to_string();
+    assert!(oversized.len() > OVER_RMCP_DEFAULT_CAP);
+    let ping = serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"});
+
+    // Written from a task: the duplex buffer is 1 MiB, so a 17 MiB line only
+    // drains as the server reads it, while this task reads the answers.
+    let writer = tokio::spawn(async move {
+        client_write
+            .write_all(format!("{initialized}\n").as_bytes())
+            .await
+            .unwrap();
+        client_write.write_all(oversized.as_bytes()).await.unwrap();
+        client_write.write_all(b"\n").await.unwrap();
+        client_write
+            .write_all(format!("{ping}\n").as_bytes())
+            .await
+            .unwrap();
+        client_write
+    });
+
+    let answers = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        answers_for(&mut lines, &[2, 3]),
+    )
+    .await
+    .expect(
+        "the >16 MiB tools/call (id 2) and the ping after it (id 3) must both be answered; \
+         a timeout here means the oversized line was dropped without a reply",
+    );
+    // The answer's shape is not the point (an unknown tool may come back as a
+    // JSON-RPC error or as an `isError` result); that it exists is.
+    assert!(
+        answers[&2].contains("\"error\"") || answers[&2].contains("\"isError\":true"),
+        "the unknown tool must be refused, not run: {}",
+        answers[&2]
+    );
+    assert!(answers[&3].contains("\"result\""), "{}", answers[&3]);
+
+    drop(writer.await.expect("writer task"));
+    served.abort();
 }
