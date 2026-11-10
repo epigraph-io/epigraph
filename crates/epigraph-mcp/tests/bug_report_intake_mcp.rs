@@ -17,8 +17,9 @@
 //! * an unconfigured intake is refused by name, as the caller's error;
 //! * oversized input is refused before anything is written;
 //! * a call the intake refuses for who the caller is or for its limit
-//!   (unconfigured, system agent, unbound, over the limit) makes no
-//!   embedding-provider call; an admitted one makes exactly one.
+//!   (unconfigured, system agent, unbound, a role's agent its holder does not
+//!   cover, over the limit) makes no embedding-provider call; an admitted one
+//!   makes exactly one.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -522,4 +523,56 @@ async fn a_refused_report_costs_no_embedding_call(pool: PgPool) {
         .expect_err("an unbound agent");
     assert!(e.message.contains("BUG07:"), "{}", e.message);
     assert_eq!(calls_now(), 1, "BUG07 (unbound) embedded");
+
+    // A role's agent (166) whose role has no holder: the write refuses it
+    // ROL01, so the preflight does too, before the embed.
+    seed_role(&pool, "role:brim-curator").await;
+    attach(&pool, "role:brim-curator", w.other).await;
+    let e = submit(&pool, &server, w.other, params("from a role's agent"))
+        .await
+        .expect_err("a role's agent with no holder");
+    assert!(e.message.contains("ROL01"), "{}", e.message);
+    assert_eq!(calls_now(), 1, "ROL01 (role agent, no holder) embedded");
+}
+
+/// A synthetic catalog role, with the role node 123 requires for every role.
+async fn seed_role(pool: &PgPool, key: &str) {
+    let node = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $2, 'role', \
+                 'custom', ARRAY['role'])",
+    )
+    .bind(node)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ($1, false, false, $2, 'test role')",
+    )
+    .bind(key)
+    .bind(node)
+    .execute(pool)
+    .await
+    .expect("platform role");
+}
+
+/// Attach `agent` to `role` through the maintenance definer.
+async fn attach(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let _: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
 }

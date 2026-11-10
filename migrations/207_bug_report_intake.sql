@@ -26,8 +26,8 @@
 --       counts it and `epigraph_my_bug_reports` reads it, so the application
 --       role must not be able to forge one.
 --   (c0) `public.epigraph_bug_report_gate(uuid, integer, integer, boolean)`:
---       the caller checks (BUG06, BUG07, BUG08) and the home group, shared
---       by (c) and (c2). Maintenance only.
+--       the caller checks (BUG06, BUG07, BUG08, then 166's ROL01) and the
+--       home group, shared by (c) and (c2). Maintenance only.
 --   (c) `public.epigraph_submit_bug_report(...)`: the write definer.
 --   (c2) `public.epigraph_bug_report_preflight()`: the write's refusals that
 --       do not depend on the report, so the server can skip the embedding
@@ -71,7 +71,11 @@
 --         (section (c0): a human operator's own personal group, a linked
 --         agent's acting operator group, an allowlisted agent's human's
 --         personal group);
---   BUG08 the caller's per-hour or per-day limit is reached.
+--   BUG08 the caller's per-hour or per-day limit is reached;
+--   ROL01 (166's code, raised by 166's own check, unchanged) the caller is
+--         attached to a role that its own linked human does not hold now.
+--         The staged insert's statement trigger refuses it anyway; section
+--         (c0) asks the same check first so the preflight refuses it too.
 -- Membership of the intake group is NOT required; that is the point.
 --
 -- THE ROW. One claim authored by the caller (`claims.agent_id`), owned by the
@@ -203,7 +207,11 @@ CREATE POLICY security_events_bug_report_privileged ON public.security_events
 -- (c0) THE CALLER GATE (maintenance only)
 -- ===================================================================
 -- BUG06, BUG07 and BUG08 for `p_principal`, against the limits the caller
--- read from the settings row; returns the caller's home group (section 3).
+-- read from the settings row, then 166's ROL01 for it
+-- (`epigraph_require_role_holder`, the check the claims trigger runs on the
+-- staged insert, so the message and the rule are the trigger's own); returns
+-- the caller's home group (section 3). ROL01 is last so every caller keeps
+-- the refusal order the write had before the preflight existed.
 -- One body for the write (c) and the preflight (c2), so the two cannot
 -- disagree about who is admitted. It takes the principal as an ARGUMENT, so
 -- it answers for anyone: EXECUTE is revoked from PUBLIC and never granted to
@@ -297,12 +305,17 @@ BEGIN
                         v_hour, v_day, p_per_hour, p_per_day
             USING ERRCODE = '54000';
     END IF;
+    -- 166's ROL01: a role's agent writes only while its own linked human
+    -- holds the role. The reporter is the staged claim's writer and author,
+    -- the only acting agent of the write.
+    PERFORM public.epigraph_require_role_holder(p_principal);
     RETURN v_home;
 END $$;
 COMMENT ON FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, boolean) IS
     'Migration 207: the bug-report intake''s caller checks (BUG06 system agent, BUG07 unbound '
-    'or homeless, BUG08 limit) for the given principal; returns its home group. Maintenance '
-    'only: called by epigraph_submit_bug_report and epigraph_bug_report_preflight.';
+    'or homeless, BUG08 limit, then 166''s ROL01 role holder) for the given principal; returns '
+    'its home group. Maintenance only: called by epigraph_submit_bug_report and '
+    'epigraph_bug_report_preflight.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, boolean)
     FROM PUBLIC;
 
@@ -433,7 +446,7 @@ BEGIN
                         'nothing was written' USING ERRCODE = '22023';
     END IF;
 
-    -- THE CALLER (BUG06, BUG07) AND THE LIMIT (BUG08), serialized per
+    -- THE CALLER (BUG06, BUG07, ROL01) AND THE LIMIT (BUG08), serialized per
     -- reporter: section (c0), the same gate the preflight (c2) runs.
     v_home := public.epigraph_bug_report_gate(v_principal, v_per_hour, v_per_day, true);
 
@@ -497,16 +510,22 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_submit_bug_report(text, text, text, t
 -- (c2) THE PREFLIGHT
 -- ===================================================================
 -- What the write would refuse before it looks at the report: BUG01, BUG02,
--- BUG03, then the gate (c0) without its lock (BUG06, BUG07, BUG08). Raises
--- the write's own refusal, or returns nothing. It writes nothing.
+-- BUG03, then the gate (c0) without its lock (BUG06, BUG07, BUG08, ROL01).
+-- Raises the write's own refusal, or returns nothing. It writes nothing.
 --
 -- WHY. The server computes the claim's embedding before the write (a
 -- provider round trip must not hold a transaction open), so without this a
--- caller the write refuses (unconfigured, system, unbound, over its limit)
--- still costs one provider call per attempt, and the rate limit would not
--- cap provider spend. The MCP tool calls this first and embeds only when it
--- passes. It is ADVISORY and racy (a limit can be reached, or a link
--- retired, between the two calls), so the write keeps every check.
+-- caller the write refuses (unconfigured, system, unbound, a role's agent
+-- its holder does not cover, over its limit) still costs one provider call
+-- per attempt, and the rate limit would not cap provider spend (a refused
+-- write leaves no marker to count). The MCP tool calls this first and embeds
+-- only when it passes. It is ADVISORY and racy (a limit can be reached, a
+-- link retired or a role assignment ended between the two calls), so the
+-- write keeps every check. It does not repeat the staged insert's writer-
+-- scope checks (OPL01, OPL02): the gate chooses the home group by the rules
+-- those checks admit (section (c0)), so a caller it passes is not expected
+-- to fail them; the input checks (BUG04, BUG05) need the report, which the
+-- MCP tool checks itself before calling this.
 --
 -- WHAT IT REVEALS: nothing the write's refusals do not. It answers for the
 -- session principal only (no argument names anyone), and a pass means only
@@ -548,8 +567,8 @@ BEGIN
 END $$;
 COMMENT ON FUNCTION public.epigraph_bug_report_preflight() IS
     'Migration 207: raise the refusal epigraph_submit_bug_report would raise for the session '
-    'principal before it reads the report (BUG01-03, BUG06-08), or return nothing. Advisory: '
-    'the write repeats every check.';
+    'principal before it reads the report (BUG01-03, BUG06-08, ROL01), or return nothing. '
+    'Advisory: the write repeats every check.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_bug_report_preflight() FROM PUBLIC;
 
 -- ===================================================================

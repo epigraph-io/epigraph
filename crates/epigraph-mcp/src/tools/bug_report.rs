@@ -13,9 +13,10 @@
 //! definers): which group, whether the caller is bound, the limits. This
 //! module checks the input first, then asks the database's preflight whether
 //! the write would refuse the caller (not configured, system agent, unbound,
-//! over its limit), so a report that will be refused costs no embedding
-//! provider call; then it embeds and writes. It maps the definers' `BUGnn:`
-//! refusals to the caller's error.
+//! a role's agent its holder does not cover, over its limit), so a report
+//! that will be refused for those reasons costs no embedding provider call;
+//! then it embeds and writes. It maps the definers' `BUGnn:` refusals to the
+//! caller's error.
 
 use rmcp::model::{CallToolResult, ContentBlock, ErrorCode};
 use std::borrow::Cow;
@@ -126,9 +127,14 @@ fn success_json(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
 /// `INVALID_PARAMS` for input the intake refuses (BUG04); `INVALID_REQUEST`
 /// for every other refusal: no write identity (an elevated or principal-less
 /// request), the intake not configured (BUG03), an unbound or system caller
-/// (BUG06, BUG07, OPL01), the rate limit (BUG08). Nothing is written on any
-/// of them, and none but a race between the preflight and the write reaches
-/// the embedding provider.
+/// (BUG06, BUG07, OPL01), a role's agent whose role its own human does not
+/// hold now (ROL01), the rate limit (BUG08). Nothing is written on any of
+/// them. The input checks and the preflight (BUG01-03, BUG06-08, ROL01) run
+/// before the embedding provider is called; what reaches the provider and is
+/// then refused is a caller whose state changed between the preflight and
+/// the write (a race), or a refusal the preflight does not repeat (the
+/// staged insert's writer-scope checks, OPL01 and OPL02, which the gate's
+/// choice of home group is built to satisfy).
 pub async fn submit_bug_report(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -138,10 +144,10 @@ pub async fn submit_bug_report(
     check(&params)?;
     let author = server.write_identity(auth, viewer).await?;
 
-    // The write's own refusals that do not depend on the report, BEFORE the
-    // provider call: otherwise a caller the write refuses (and one over its
-    // limit) costs an embedding per attempt, and the limit would not cap
-    // provider spend. Its own short transaction, rolled back: the provider
+    // The write's own refusals that do not depend on the report (BUG01-03,
+    // BUG06-08 and 166's ROL01), BEFORE the provider call: otherwise a caller
+    // the write refuses (and one over its limit) costs an embedding per
+    // attempt, and the limit would not cap provider spend. Its own short transaction, rolled back: the provider
     // round trip below must not hold one open. Advisory and racy, so the
     // write repeats every check.
     let mut pre = crate::claim_helper::begin_author_stamped_tx(server, author, SUBMIT).await?;

@@ -22,6 +22,9 @@
 //! * the preflight answers what the write answers for every caller state and
 //!   writes nothing; only it, not the gate it shares with the write, is
 //!   app-callable;
+//! * a role-attached reporter (166) is refused ROL01 by the preflight and by
+//!   the write alike while its own human does not hold the role, and files
+//!   once it does;
 //! * an unconfigured intake (or one whose group is suspended) refuses;
 //! * session temporary objects named like the definer's relations change
 //!   nothing;
@@ -731,10 +734,14 @@ async fn preflight_as(pool: &PgPool, agent: Uuid) -> Result<(), DbError> {
     out
 }
 
-/// The refusal code (`BUGnn`) of a result, or `ok`.
+/// The refusal code (`BUGnn`, or 166's `ROL01`) of a result, or `ok`.
 fn code<T: std::fmt::Debug>(r: Result<T, DbError>) -> String {
     match r {
         Ok(_) => "ok".to_string(),
+        Err(DbError::RoleHolderRequired { message }) => {
+            assert!(message.starts_with("ROL01:"), "{message}");
+            "ROL01".to_string()
+        }
         Err(e) => refused::<T>(Err(e)).1[..5].to_string(),
     }
 }
@@ -805,6 +812,108 @@ async fn the_preflight_refuses_what_the_write_refuses_and_writes_nothing(pool: P
     let mut conn = plain.acquire().await.expect("acquire");
     let (_, msg) = refused(BugReportRepository::preflight_conn(&mut conn).await);
     assert!(msg.starts_with("BUG01:"), "{msg}");
+}
+
+// ─── a role-attached reporter (166) ─────────────────────────────────────
+
+const ROLE: &str = "role:bri-curator";
+
+/// A synthetic catalog role, with the role node 123 requires for every role.
+async fn seed_role(pool: &PgPool, key: &str) {
+    let node = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $2, 'role', \
+                 'custom', ARRAY['role'])",
+    )
+    .bind(node)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ($1, false, false, $2, 'test role')",
+    )
+    .bind(key)
+    .bind(node)
+    .execute(pool)
+    .await
+    .expect("platform role");
+}
+
+/// Grant `role` to `holder`, live from a few seconds ago, open-ended.
+async fn grant(pool: &PgPool, role: &str, holder: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', NULL, NULL, \
+                'test grant')",
+    )
+    .bind(role)
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .expect("grant role")
+}
+
+async fn end_assignment(pool: &PgPool, assignment: Uuid) {
+    let ended: bool = sqlx::query_scalar(
+        "SELECT public.epigraph_end_role_assignment($1, 'test handover', NULL::uuid)",
+    )
+    .bind(assignment)
+    .fetch_one(pool)
+    .await
+    .expect("end assignment");
+    assert!(ended);
+}
+
+/// Attach `agent` to `role` through the maintenance definer.
+async fn attach(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let _: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
+}
+
+/// A role-attached agent writes only while its own linked human holds the
+/// role (166's ROL01). The preflight refuses it exactly as the write does, so
+/// such a caller never reaches the embedding call, and neither writes
+/// anything: no holder, then a holder who is another human. CALIBRATION:
+/// once the reporter's own human holds the role, both pass and the report
+/// files.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_preflight_refuses_a_role_agent_its_holder_does_not_cover(pool: PgPool) {
+    let w = world(&pool).await;
+    seed_role(&pool, ROLE).await;
+    attach(&pool, ROLE, w.reporter).await;
+    let (stranger, _) = fixture::seed_human_operator(&pool, "bri-rol-stranger").await;
+
+    // No holder.
+    assert_eq!(code(preflight_as(&pool, w.reporter).await), "ROL01");
+    assert_eq!(code(submit_as(&pool, w.reporter, &report("x")).await), "ROL01");
+    // Held, by a human the reporter is not linked to.
+    let theirs = grant(&pool, ROLE, stranger).await;
+    assert_eq!(code(preflight_as(&pool, w.reporter).await), "ROL01");
+    assert_eq!(code(submit_as(&pool, w.reporter, &report("y")).await), "ROL01");
+    assert_eq!(claims_by(&pool, w.reporter).await, 0, "nothing was filed");
+    assert_eq!(markers_of(&pool, w.reporter).await, 0, "and no marker");
+
+    end_assignment(&pool, theirs).await;
+    grant(&pool, ROLE, w.human).await;
+    assert_eq!(code(preflight_as(&pool, w.reporter).await), "ok");
+    submit_as(&pool, w.reporter, &report("held by its own human"))
+        .await
+        .expect("CALIBRATION: the holder's own agent files");
+    assert_eq!(claims_by(&pool, w.reporter).await, 1);
 }
 
 /// `(owner, security definer, app may execute, PUBLIC may execute)`.

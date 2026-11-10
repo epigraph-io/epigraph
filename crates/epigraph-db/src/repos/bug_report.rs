@@ -11,8 +11,9 @@
 //!   reports through `epigraph_my_bug_reports`.
 //! * [`BugReportRepository::preflight_conn`] asks
 //!   `epigraph_bug_report_preflight` whether the write would refuse the
-//!   caller (not configured, system agent, unbound, over its limit) before
-//!   the server spends an embedding call on the report.
+//!   caller (not configured, system agent, unbound, a role's agent its
+//!   holder does not cover, over its limit) before the server spends an
+//!   embedding call on the report.
 //!
 //! Both run on the caller's STAMPED connection (`ScopedPool::begin_as`): the
 //! definers read the principal from the session, never from an argument. The
@@ -221,15 +222,16 @@ impl BugReportRepository {
     }
 
     /// Raise the refusal [`submit_conn`](Self::submit_conn) would raise for
-    /// the stamped principal before it reads any report (BUG01-03 and
-    /// BUG06-08), or return `Ok(())`. Writes nothing. ADVISORY: the write
+    /// the stamped principal before it reads any report (BUG01-03, BUG06-08
+    /// and 166's ROL01), or return `Ok(())`. Writes nothing. ADVISORY: the write
     /// repeats every check, so a pass here admits nothing by itself; it lets
     /// the caller skip work (the embedding call) for a report the write
     /// would refuse.
     ///
     /// # Errors
-    /// [`DbError::Refused`] for each of those refusals;
-    /// `DbError::QueryFailed` otherwise.
+    /// [`DbError::Refused`] for each `BUGnn:` refusal;
+    /// [`DbError::RoleHolderRequired`] for ROL01, as the write's trigger
+    /// raises it; `DbError::QueryFailed` otherwise.
     pub async fn preflight_conn(conn: &mut sqlx::PgConnection) -> Result<(), DbError> {
         sqlx::query("SELECT public.epigraph_bug_report_preflight()")
             .execute(&mut *conn)
