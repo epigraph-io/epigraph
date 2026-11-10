@@ -22,6 +22,8 @@ async fn submit_claim_attaches_labels_when_provided(pool: PgPool) {
             reasoning: None,
             labels: vec!["backlog".into(), "test-tag".into()],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

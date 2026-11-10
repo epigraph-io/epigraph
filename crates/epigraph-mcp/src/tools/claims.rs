@@ -237,8 +237,20 @@ pub(crate) async fn submit_claim_response(
         PreparedSubmission::Existing(response) => return Ok(*response),
         PreparedSubmission::Fresh(sub) => *sub,
     };
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, sub.author, "submit_claim").await?;
+    let mut tx = crate::claim_helper::begin_author_stamped_tx_for(
+        server,
+        sub.author,
+        "submit_claim",
+        sub.tenancy.operator_grant.as_ref(),
+    )
+    .await?;
+    // A team written through the author's human (D-V3) is read through too, for
+    // this write only: the DS wiring and the read-backs ask about the claim
+    // through the caller's viewer, and must see the row this call wrote.
+    let granted =
+        crate::claim_helper::write_viewer(server, viewer, sub.author.agent_id(), &sub.tenancy)
+            .await?;
+    let viewer = granted.as_ref().unwrap_or(viewer);
     let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
     // COMMIT. Everything after this line is post-commit and best-effort.
     tx.commit().await.map_err(internal_error)?;
@@ -341,6 +353,8 @@ struct Submission {
     methodology: Methodology,
     evidence_type: EvidenceType,
     pending_embedding: Option<String>,
+    /// The resolved `visibility` / `group_id` (docs/tenancy/claim-visibility-controls.md).
+    tenancy: epigraph_db::ResolvedWriteDecl,
 }
 
 /// What [`write_submission`] wrote.
@@ -348,6 +362,8 @@ struct WrittenSubmission {
     claim: Claim,
     was_created: bool,
     ds: Option<ds_auto::DsAutoResult>,
+    /// Where the claim actually is (an existing claim keeps its own, D-V4).
+    tenancy: epigraph_db::WriteTenancyReport,
 }
 
 /// Phase 1 of a submission: validation, the signed [`Claim`], and the write-side
@@ -398,6 +414,17 @@ async fn prepare_submission(
     // two are recorded apart (`claims.signer_id`, `evidence.signer_id`).
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
+    // Visibility BEFORE the novelty gate and before any transaction: a refused
+    // team (reader membership, not a member) costs no embedding call and writes
+    // nothing, and a team written through the author's human must be stamped
+    // into the transaction (`begin_author_stamped_tx_for`).
+    let tenancy = crate::claim_helper::resolve_claim_visibility(
+        server,
+        agent_id,
+        params.visibility.as_deref(),
+        params.group_id.as_deref(),
+    )
+    .await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let signer_agent_id = server.signer_agent_id().await?;
     let pub_key = server.signer.public_key();
@@ -503,6 +530,9 @@ async fn prepare_submission(
                         // The caller is TOLD this is not an insert, and that
                         // every input it sent was dropped (backlog a3e63a12).
                         deduplicated: Some(dedup_block(DedupBy::NoveltyGate, existing_id, &params)),
+                        visibility: None,
+                        owner_group_id: None,
+                        visibility_note: None,
                     },
                 )));
             }
@@ -538,6 +568,7 @@ async fn prepare_submission(
         methodology,
         evidence_type,
         pending_embedding,
+        tenancy,
     })))
 }
 
@@ -606,9 +637,17 @@ async fn write_submission(
         Some(signer_agent_id),
         tool_name,
         Some(edge_key),
+        sub.tenancy.decl,
     )
     .await?;
     let claim_uuid = claim.id.as_uuid();
+    let tenancy = crate::claim_helper::claim_tenancy_report(
+        &mut *conn,
+        claim_uuid,
+        &sub.tenancy,
+        was_created,
+    )
+    .await?;
 
     // Already validated above, before the claim write. This call can now only
     // fail for server-side reasons; `db_caller_error` keeps those
@@ -803,6 +842,7 @@ async fn write_submission(
         claim,
         was_created,
         ds,
+        tenancy,
     })
 }
 
@@ -827,6 +867,7 @@ async fn finish_submission(
         claim,
         was_created,
         ds,
+        tenancy,
     } = written;
     let claim_uuid = claim.id.as_uuid();
 
@@ -916,6 +957,9 @@ async fn finish_submission(
         // concurrent writer landing the same content between the two.
         deduplicated: (!was_created)
             .then(|| dedup_block(DedupBy::ContentHash, claim_uuid, &params)),
+        visibility: Some(tenancy.visibility.to_string()),
+        owner_group_id: Some(tenancy.owner_group_id.to_string()),
+        visibility_note: tenancy.note,
     })
 }
 
@@ -2159,6 +2203,29 @@ pub async fn resolve_backlog_item(
     let target_agent = original.agent_id.as_uuid();
     let mut grant = require_owner_or_admin(server, auth, caller, target_agent).await?;
 
+    // The resolution claim takes the ORIGINAL's visibility
+    // (docs/tenancy/claim-visibility-controls.md section 3.3), not the default
+    // team: a public backlog item resolved into a team would read as resolved
+    // to everyone, while only the team could read why. Read on this stamped
+    // transaction, so a group-private original is seen.
+    let (resolution_visibility, resolution_group) = {
+        let home = ClaimRepository::default_decl_for_author(&mut gate_tx, caller.agent_id())
+            .await
+            .map_err(db_caller_error)?
+            .owner_group_bind();
+        match ClaimRepository::tenancy_on_session_conn(&mut gate_tx, &[original_id])
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .next()
+        {
+            Some((_, v, _)) if v == "public" => (Some("public".to_string()), None),
+            Some((_, _, owner)) if Some(owner) == home => (Some("private".to_string()), None),
+            Some((_, _, owner)) => (Some("team".to_string()), Some(owner.to_string())),
+            None => (None, None),
+        }
+    };
+
     // Resolve the closure basis BEFORE anything is created.
     //
     // Ordering is the load-bearing decision here: a bad or unreadable basis id
@@ -2219,6 +2286,8 @@ pub async fn resolve_backlog_item(
         // epistemic content competing for novelty against the corpus —
         // never suppress or flag them via the semantic gate.
         novelty_threshold: Some(0.0),
+        visibility: resolution_visibility,
+        group_id: resolution_group,
     };
     let sub = match prepare_submission(server, viewer, submit_params, auth).await? {
         PreparedSubmission::Fresh(sub) => *sub,
@@ -2237,9 +2306,17 @@ pub async fn resolve_backlog_item(
 
     // THE ONE TRANSACTION. Resolution claim, `justifies` edges and the label
     // PATCH all run on it; see the function doc.
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, sub.author, "resolve_backlog_item")
+    let mut tx = crate::claim_helper::begin_author_stamped_tx_for(
+        server,
+        sub.author,
+        "resolve_backlog_item",
+        sub.tenancy.operator_grant.as_ref(),
+    )
+    .await?;
+    let granted =
+        crate::claim_helper::write_viewer(server, viewer, sub.author.agent_id(), &sub.tenancy)
             .await?;
+    let viewer = granted.as_ref().unwrap_or(viewer);
 
     // RE-DECIDE THE GATE ON THE WRITE TRANSACTION. The reads above ran on
     // `gate_tx`, which is gone, and `prepare_submission` may have spent a
@@ -2962,6 +3039,8 @@ mod tests {
                 reasoning: Some("r".into()),
                 labels: vec!["l".into()],
                 novelty_threshold: Some(0.1),
+                visibility: None,
+                group_id: None,
             }
         }
 

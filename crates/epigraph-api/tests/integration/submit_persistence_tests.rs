@@ -296,7 +296,18 @@ async fn submit_packet_request(pool: &PgPool, packet: &EpistemicPacket) -> (Stat
 /// Send a packet through an existing router (for idempotency/concurrency tests
 /// that need to share in-memory state across requests)
 async fn send_packet(router: &Router, packet: &EpistemicPacket) -> (StatusCode, String) {
-    let body = serde_json::to_string(packet).expect("Failed to serialize packet");
+    // These tests post as a token principal that is not the packet's author
+    // and read back with a public viewer, so they name `public` explicitly:
+    // the default is team, else the author's private home
+    // (docs/tenancy/claim-visibility-controls.md).
+    let mut value = serde_json::to_value(packet).expect("Failed to serialize packet");
+    if value
+        .get("visibility")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        value["visibility"] = serde_json::json!("public");
+    }
+    let body = value.to_string();
 
     let request = Request::builder()
         .method(Method::POST)

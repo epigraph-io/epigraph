@@ -46,6 +46,8 @@ pub mod belief;
 pub mod challenge;
 #[cfg(feature = "db")]
 pub mod claim_context;
+#[cfg(feature = "db")]
+pub mod claim_visibility;
 pub mod claims;
 #[cfg(feature = "db")]
 pub mod claims_batch_get;
@@ -537,6 +539,20 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/mass-functions/:id/unretract",
             post(bba_retract::unretract_bba),
+        )
+        // Claim visibility controls (migration 206,
+        // docs/tenancy/claim-visibility-controls.md).
+        .route(
+            "/api/v1/claims/publicize",
+            post(claim_visibility::publicize_claims),
+        )
+        .route(
+            "/api/v1/claims/share-with-team",
+            post(claim_visibility::share_claims_with_team),
+        )
+        .route(
+            "/api/v1/agents/me/default-group",
+            put(claim_visibility::set_default_group),
         )
         .route(
             "/api/v1/frames/:id/conflict-batch",

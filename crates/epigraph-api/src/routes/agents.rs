@@ -710,6 +710,9 @@ pub async fn agent_claims(
                 labels: Vec::new(),
                 was_created: false,
                 authored_by: None,
+                visibility: None,
+                owner_group_id: None,
+                visibility_note: None,
             };
             AttributedClaimResponse {
                 claim,
@@ -991,6 +994,9 @@ mod tests {
                 labels: Vec::new(),
                 was_created: false,
                 authored_by: None,
+                visibility: None,
+                owner_group_id: None,
+                visibility_note: None,
             },
             attribution: serde_json::json!({
                 "prov": "wasAttributedTo",

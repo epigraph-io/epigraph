@@ -137,6 +137,8 @@ fn submit(content: &str, labels: &[&str]) -> SubmitClaimParams {
         reasoning: None,
         labels: labels.iter().map(|s| (*s).to_string()).collect(),
         novelty_threshold: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -296,6 +298,8 @@ async fn memorize_keeps_every_run_of_a_status_tagged_memory(pool: PgPool) {
         confidence: Some(0.8),
         tags,
         novelty_threshold: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     };
 
     // Control: no tags.

@@ -143,6 +143,18 @@ pub struct SubmitClaimParams {
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
+
+    #[schemars(
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: your default team (set_default_group), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. The claim's evidence, trace and edges inherit it. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+    )]
+    #[serde(default)]
+    pub visibility: Option<String>,
+
+    #[schemars(
+        description = "Team group UUID for visibility \"team\" (naming it implies \"team\" when visibility is omitted). Refused beside \"private\" or \"public\"."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -533,6 +545,18 @@ pub struct MemorizeParams {
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
+
+    #[schemars(
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: your default team (set_default_group), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. The claim's evidence, trace and edges inherit it. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+    )]
+    #[serde(default)]
+    pub visibility: Option<String>,
+
+    #[schemars(
+        description = "Team group UUID for visibility \"team\" (naming it implies \"team\" when visibility is omitted). Refused beside \"private\" or \"public\"."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1364,6 +1388,17 @@ pub struct SubmitClaimResponse {
     /// already existed. Absent on a fresh insert. See [`Deduplicated`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deduplicated: Option<Deduplicated>,
+    /// Where the claim landed: `team`, `private` or `public`
+    /// (docs/tenancy/claim-visibility-controls.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// The claim's owner group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<String>,
+    /// How a default visibility was resolved (D-V1), or that an EXISTING claim
+    /// of another visibility was returned unchanged (D-V4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility_note: Option<String>,
 }
 
 /// Which dedup path answered a write with an EXISTING claim.
@@ -1651,6 +1686,17 @@ pub struct MemorizeResponse {
     /// already existed. Absent on a fresh insert. See [`Deduplicated`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deduplicated: Option<Deduplicated>,
+    /// Where the claim landed: `team`, `private` or `public`
+    /// (docs/tenancy/claim-visibility-controls.md).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// The claim's owner group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<String>,
+    /// How a default visibility was resolved (D-V1), or that an EXISTING claim
+    /// of another visibility was returned unchanged (D-V4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility_note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2085,6 +2131,18 @@ pub struct IngestDocumentParams {
     )]
     #[serde(default)]
     pub wait: Option<bool>,
+
+    #[schemars(
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: your default team (set_default_group), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates (the paper node is unchanged); their evidence, traces and edges inherit it. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+    )]
+    #[serde(default)]
+    pub visibility: Option<String>,
+
+    #[schemars(
+        description = "Team group UUID for visibility \"team\" (naming it implies \"team\" when visibility is omitted). Refused beside \"private\" or \"public\"."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 /// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
@@ -2105,6 +2163,18 @@ pub struct IngestDocumentInlineParams {
     )]
     #[serde(default)]
     pub wait: Option<bool>,
+
+    #[schemars(
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: your default team (set_default_group), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates (the paper node is unchanged); their evidence, traces and edges inherit it. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+    )]
+    #[serde(default)]
+    pub visibility: Option<String>,
+
+    #[schemars(
+        description = "Team group UUID for visibility \"team\" (naming it implies \"team\" when visibility is omitted). Refused beside \"private\" or \"public\"."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 /// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the
@@ -2118,6 +2188,18 @@ pub struct IngestDocumentSpineParams {
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+
+    #[schemars(
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: your default team (set_default_group), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates (the paper node is unchanged); their evidence, traces and edges inherit it. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+    )]
+    #[serde(default)]
+    pub visibility: Option<String>,
+
+    #[schemars(
+        description = "Team group UUID for visibility \"team\" (naming it implies \"team\" when visibility is omitted). Refused beside \"private\" or \"public\"."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3112,6 +3194,60 @@ pub struct PublishEventParams {
     pub payload: serde_json::Value,
 }
 
+// ── Claim visibility (docs/tenancy/claim-visibility-controls.md) ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PublicizeClaimsParams {
+    #[schemars(
+        description = "UUIDs of team or private claims to make PUBLIC (1 to 500). All or nothing: if any claim is not found, not readable, sealed, or owned by a group you are not a live ADMIN of, nothing changes and the error lists each refused claim. Already-public claims are reported as already_public. The owner group is unchanged. Unpinned evidence and traces follow the claim, and edges between claims that are now public become public."
+    )]
+    pub claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "Why these claims are being published. Required, and recorded in the claim.publicized audit event."
+    )]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ShareClaimsWithTeamParams {
+    #[schemars(
+        description = "UUIDs of PRIVATE claims (owned by your home group) to move into a team (1 to 500). You must have written each claim, or be an admin of your home group. All or nothing. Visibility stays group-only: the team's members can read them afterwards. Public and team claims are refused; publicize_claims publishes."
+    )]
+    pub claim_ids: Vec<String>,
+
+    #[schemars(
+        description = "UUID of the team to move the claims into. You (or your human operator) need a live writer or admin membership of it."
+    )]
+    pub group_id: String,
+
+    #[schemars(
+        description = "Why. Required, and recorded in the claim.shared_with_team audit event."
+    )]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetDefaultGroupParams {
+    #[schemars(
+        description = "UUID of the team your claim writes default to when they name no visibility (it must be a team you, or your human operator, may write). Omit or pass null to clear it. With no default, a write goes to your only team, else private."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VisibilityActResponse {
+    /// Per-claim outcome: `publicized` / `already_public`, or `shared`.
+    pub results: Vec<VisibilityActItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VisibilityActItem {
+    pub claim_id: String,
+    pub outcome: String,
+}
+
 // ── Batch / Staging / Stats ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3196,6 +3332,18 @@ pub struct BatchClaimEntry {
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
+
+    #[schemars(
+        description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: your default team (set_default_group), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. The claim's evidence, trace and edges inherit it. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
+    )]
+    #[serde(default)]
+    pub visibility: Option<String>,
+
+    #[schemars(
+        description = "Team group UUID for visibility \"team\" (naming it implies \"team\" when visibility is omitted). Refused beside \"private\" or \"public\"."
+    )]
+    #[serde(default)]
+    pub group_id: Option<String>,
 }
 
 /// The methodology a batch entry gets when it names none — the value every
@@ -3221,6 +3369,8 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             reasoning,
             labels,
             novelty_threshold,
+            visibility,
+            group_id,
         } = entry;
         Self {
             content,
@@ -3232,6 +3382,8 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             reasoning,
             labels,
             novelty_threshold,
+            visibility,
+            group_id,
         }
     }
 }

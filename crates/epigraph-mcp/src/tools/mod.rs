@@ -38,6 +38,7 @@ pub mod step_ops;
 pub mod supersede;
 pub mod themes;
 pub mod viewer;
+pub mod visibility;
 pub mod workflow_authority;
 pub mod workflow_hierarchical;
 pub mod workflow_ingest;

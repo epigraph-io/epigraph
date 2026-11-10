@@ -168,6 +168,9 @@ pub use repos::{
     Redemption, TicketMode, TicketPasskey,
 };
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
+pub use repos::{
+    ChoiceResolution, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome, WriteTenancyReport,
+};
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use repos::{

@@ -127,7 +127,11 @@ const UNSTAMPED: &[(&str, usize)] = &[
     ("assess.rs", 3),
     // `belief.rs` (6) is gone: `submit_evidence`'s WITHIN_FRAME, SCOPED_BY
     // and CONTRIBUTES_TO edges are written on its stamped transaction (fb9cff66).
-    ("claims.rs", 3),
+    // 3 before the claim visibility controls folded `create_claim_core`'s
+    // AUTHORED / HAS_TRACE / DERIVED_FROM writes into one loop: a group-visible
+    // claim's edges go on the caller's stamped transaction, and only the
+    // public claim's one pool call is left here.
+    ("claims.rs", 1),
     ("community.rs", 1),
     // 6 before the W12b revise, which stamped `share_skill`'s and
     // `forget_convention`'s in-scope edge statements.

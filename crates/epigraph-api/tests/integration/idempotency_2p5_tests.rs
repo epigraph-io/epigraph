@@ -236,6 +236,14 @@ async fn post_packet_with_token(
     packet: serde_json::Value,
     bearer: &str,
 ) -> (StatusCode, String) {
+    // Each post carries a fresh token principal, not the packet's author, so
+    // these idempotency tests name `public`: under the default (team, else the
+    // author's private home) a second caller could not see the first claim
+    // to dedup onto it (docs/tenancy/claim-visibility-controls.md).
+    let mut packet = packet;
+    if packet.get("visibility").is_none() {
+        packet["visibility"] = serde_json::json!("public");
+    }
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/submit/packet")

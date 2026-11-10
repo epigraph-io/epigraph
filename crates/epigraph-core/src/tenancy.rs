@@ -227,6 +227,90 @@ impl TenancyDecl {
     }
 }
 
+/// What a caller-facing claim write ASKED for: the user-level vocabulary of
+/// `docs/tenancy/claim-visibility-controls.md` (migration 206).
+///
+/// The database keeps two values (`'public' | 'group'`). Callers speak three,
+/// and this is where the third comes from:
+///
+/// | choice    | stored as                                         |
+/// |-----------|---------------------------------------------------|
+/// | `team`    | `('group', <a team group the author may write>)`  |
+/// | `private` | `('group', <the author's home group>)`            |
+/// | `public`  | `('public', <the author's home group>)`           |
+///
+/// "Home group" is what `ClaimRepository::default_decl_for_author` resolves:
+/// the author's personal group, or its operator's for an operated agent.
+///
+/// [`Self::Default`] is the choice of a caller that named nothing. It is
+/// resolved to a team, else private (owner decision D-V1), and **never** to
+/// public. That is what makes it safe to have a default at all: the D1 rule
+/// against a value nobody chose is about the DATABASE accepting an undeclared
+/// row. This is resolved by a named principal at the call site, and the
+/// response says what it resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibilityChoice {
+    /// Nothing named: the author's default team, else private.
+    Default,
+    /// A team: the named group, or the default team when `None`.
+    Team(Option<Uuid>),
+    /// Readable only by members of the author's home group.
+    Private,
+    /// Readable by every authenticated agent; owned by the home group.
+    Public,
+}
+
+impl VisibilityChoice {
+    /// Parse the two optional request parameters, `visibility` and `group_id`.
+    ///
+    /// * neither: [`Self::Default`]
+    /// * `group_id` alone, or `visibility = "team"`: [`Self::Team`]
+    /// * `"private"` / `"public"`: those, and a `group_id` beside them is
+    ///   refused (it would be silently ignored otherwise)
+    ///
+    /// Exact lowercase spellings only. `"group"` is refused with a pointer to
+    /// `"team"`, because it is the stored value and reads as if it were
+    /// accepted.
+    ///
+    /// # Errors
+    /// A caller-facing message for an unknown value or a contradictory pair.
+    pub fn parse(visibility: Option<&str>, group_id: Option<Uuid>) -> Result<Self, String> {
+        match (visibility.map(str::trim), group_id) {
+            (None | Some(""), None) => Ok(Self::Default),
+            (None | Some("") | Some("team"), g) => Ok(Self::Team(g)),
+            (Some("private"), None) => Ok(Self::Private),
+            (Some("public"), None) => Ok(Self::Public),
+            (Some(v @ ("private" | "public")), Some(_)) => Err(format!(
+                "visibility \"{v}\" takes no group_id: a {v} claim is owned by your home group. \
+                 Pass visibility \"team\" (or omit it) to write into the group you named"
+            )),
+            (Some("group"), _) => Err(
+                "visibility \"group\" is not a choice; use \"team\" (with an optional group_id), \
+                 \"private\" or \"public\""
+                    .to_string(),
+            ),
+            (Some(other), _) => Err(format!(
+                "unknown visibility {other:?}; use \"team\" (the default, with an optional \
+                 group_id), \"private\" or \"public\""
+            )),
+        }
+    }
+
+    /// Parse with `group_id` still a string, as both transports receive it.
+    ///
+    /// # Errors
+    /// As [`Self::parse`], plus a malformed uuid.
+    pub fn parse_str(visibility: Option<&str>, group_id: Option<&str>) -> Result<Self, String> {
+        let g = match group_id.map(str::trim) {
+            None | Some("") => None,
+            Some(s) => {
+                Some(Uuid::parse_str(s).map_err(|_| format!("group_id {s:?} is not a uuid"))?)
+            }
+        };
+        Self::parse(visibility, g)
+    }
+}
+
 /// The tenancy of a claim being merged, as read back inside `consolidate`'s
 /// transaction.
 pub type SourceTenancy = (Uuid, Visibility);
@@ -362,6 +446,42 @@ mod tests {
                  land on a value nobody chose"
             );
         }
+    }
+
+    #[test]
+    fn visibility_choice_parses_the_three_words_and_refuses_contradictions() {
+        assert_eq!(
+            VisibilityChoice::parse(None, None),
+            Ok(VisibilityChoice::Default)
+        );
+        assert_eq!(
+            VisibilityChoice::parse(Some(""), None),
+            Ok(VisibilityChoice::Default)
+        );
+        assert_eq!(
+            VisibilityChoice::parse(None, Some(g(1))),
+            Ok(VisibilityChoice::Team(Some(g(1))))
+        );
+        assert_eq!(
+            VisibilityChoice::parse(Some("team"), None),
+            Ok(VisibilityChoice::Team(None))
+        );
+        assert_eq!(
+            VisibilityChoice::parse(Some("private"), None),
+            Ok(VisibilityChoice::Private)
+        );
+        assert_eq!(
+            VisibilityChoice::parse(Some("public"), None),
+            Ok(VisibilityChoice::Public)
+        );
+        // A group beside private/public would be silently dropped; refuse it.
+        assert!(VisibilityChoice::parse(Some("public"), Some(g(1))).is_err());
+        assert!(VisibilityChoice::parse(Some("private"), Some(g(1))).is_err());
+        // The stored word is not a choice, and nothing else parses.
+        for bad in ["group", "Public", "world", "shared"] {
+            assert!(VisibilityChoice::parse(Some(bad), None).is_err(), "{bad}");
+        }
+        assert!(VisibilityChoice::parse_str(Some("team"), Some("not-a-uuid")).is_err());
     }
 
     #[test]

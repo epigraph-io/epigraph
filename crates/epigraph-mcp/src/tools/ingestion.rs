@@ -182,6 +182,7 @@ pub async fn ingest_document(
     ingest_claim_labels(&extraction, &doi)?;
     refuse_lineage_relationships(&extraction)?;
     refuse_bad_author_ids(&extraction)?;
+    let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -222,10 +223,11 @@ pub async fn ingest_document(
         auth,
         &extraction.source.authors,
         &doi,
+        choice,
     )
     .await?;
     if params.wait.unwrap_or(false) {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
@@ -246,7 +248,10 @@ pub async fn ingest_document(
     // request's token, not a borrow of it.
     let auth = auth.cloned();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref()).await {
+        if let Err(e) =
+            do_ingest_document_with_visibility(&bg, &viewer, &extraction, auth.as_ref(), choice)
+                .await
+        {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 doi = doi_log,
@@ -292,17 +297,20 @@ async fn preflight_write_authority(
     auth: Option<&epigraph_auth::AuthContext>,
     authors: &[epigraph_ingest::common::schema::AuthorEntry],
     doi: &str,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<(), McpError> {
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
-    let mut tx = begin_ingest_tx(server, author, tool_name).await?;
+    // The visibility too: a refused team is reported here, not after `queued`.
+    let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
+    let mut tx = begin_ingest_tx(server, author, tool_name, resolution.grant()).await?;
     // The OWNER group, not merely "some writable group": the same read-only
     // check the walk itself makes (`IngestTx::owner_decl`), so an author whose
     // owner-group membership is revoked or read-only, an unbound author once
     // armed (OPL01), and a linked agent whose link is not acting (OPL02) are
     // refused HERE, to the caller, instead of being told `queued` over a task
     // that writes nothing.
-    tx.owner_decl(agent_id, tool_name).await?;
+    tx.owner_decl(agent_id, tool_name, &resolution).await?;
     // Every explicit `source.authors[].agent_id` names an agent that may
     // author (backlog 94cc12db), on the same connection the walk will use, so
     // an unknown or system id is refused to the caller BEFORE the eager
@@ -338,6 +346,7 @@ pub async fn ingest_document_inline(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let wait = params.wait.unwrap_or(false);
+    let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
@@ -364,10 +373,11 @@ pub async fn ingest_document_inline(
         auth,
         &extraction.source.authors,
         &doi,
+        choice,
     )
     .await?;
     if wait {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
@@ -380,7 +390,10 @@ pub async fn ingest_document_inline(
     // request's token, not a borrow of it.
     let auth = auth.cloned();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref()).await {
+        if let Err(e) =
+            do_ingest_document_with_visibility(&bg, &viewer, &extraction, auth.as_ref(), choice)
+                .await
+        {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 doi = doi_log,
@@ -414,8 +427,9 @@ async fn ingest_in_request(
     extraction: &DocumentExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
     doi: &str,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_document(server, viewer, extraction, auth)
+    do_ingest_document_with_visibility(server, viewer, extraction, auth, choice)
         .await
         .map_err(|e| McpError {
             code: e.code,
@@ -610,7 +624,30 @@ pub async fn ingest_document_spine(
     params: IngestDocumentSpineParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_document_spine(server, viewer, &params.extraction, auth).await
+    let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
+    do_ingest_document_spine_with_visibility(server, viewer, &params.extraction, auth, choice).await
+}
+
+/// Parse an ingest's `visibility` / `group_id` (docs/tenancy/claim-visibility-controls.md).
+fn parse_ingest_visibility(
+    visibility: Option<&str>,
+    group_id: Option<&str>,
+) -> Result<epigraph_core::VisibilityChoice, McpError> {
+    epigraph_core::VisibilityChoice::parse_str(visibility, group_id).map_err(invalid_params)
+}
+
+/// Resolve an ingest's visibility for its author: whose the claims are, and
+/// the team-write grant to stamp (D-V3). Pure definer reads on the pool. The
+/// home group stays `IngestTx::owner_decl`'s read-only resolution.
+async fn resolve_ingest_visibility(
+    server: &EpiGraphMcpFull,
+    agent_id: Uuid,
+    choice: epigraph_core::VisibilityChoice,
+) -> Result<epigraph_db::ChoiceResolution, McpError> {
+    let mut conn = server.pool.acquire().await.map_err(internal_error)?;
+    ClaimRepository::resolve_visibility_choice(&mut conn, agent_id, choice)
+        .await
+        .map_err(crate::claim_helper::visibility_caller_error)
 }
 
 /// Core ingestion logic factored out so integration tests can drive a parsed
@@ -853,12 +890,20 @@ impl IngestTx<'_> {
         &mut self,
         agent_id: Uuid,
         tool_name: &'static str,
+        resolution: &epigraph_db::ChoiceResolution,
     ) -> Result<epigraph_core::TenancyDecl, McpError> {
         let tx = match self {
             Self::Privileged(tx) => {
-                return ClaimRepository::default_decl_for_author(tx, agent_id)
+                let home = ClaimRepository::default_decl_for_author(tx, agent_id)
                     .await
-                    .map_err(crate::errors::db_caller_error);
+                    .map_err(crate::errors::db_caller_error)?
+                    .owner_group_bind()
+                    .ok_or_else(|| {
+                        crate::errors::internal_error_text(format!(
+                            "{tool_name}: the author's home group did not resolve"
+                        ))
+                    })?;
+                return Ok(resolution.decl(home));
             }
             Self::Stamped(tx) => tx,
         };
@@ -952,7 +997,38 @@ impl IngestTx<'_> {
                  refused. Nothing was written"
             )));
         }
-        Ok(epigraph_core::TenancyDecl::public(group))
+        // 6. The caller's visibility (docs/tenancy/claim-visibility-controls.md).
+        //    The home group checked above owns a private or public ingest. A
+        //    TEAM ingest is owned by the team, so the trigger's writer scope and
+        //    077's WITH CHECK are asked again of the team, on this transaction
+        //    (begun with the D-V3 grant when the author writes it through its
+        //    human).
+        if let Some(team) = resolution.team() {
+            epigraph_db::AgentRepository::require_writer_authority(
+                tx,
+                agent_id,
+                Some(agent_id),
+                team,
+            )
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+            let team_writable =
+                epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, team)
+                    .await
+                    .map_err(|e| {
+                        crate::errors::internal_error_logged(
+                            format!("{tool_name}: team writable-group check"),
+                            e,
+                        )
+                    })?;
+            if !team_writable {
+                return Err(refuse(format!(
+                    "the ingesting agent ({agent_id}) cannot write team {team} on this \
+                     transaction. Nothing was written"
+                )));
+            }
+        }
+        Ok(resolution.decl(group))
     }
 }
 
@@ -960,6 +1036,7 @@ async fn begin_ingest_tx<'p>(
     server: &'p EpiGraphMcpFull,
     author: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
 ) -> Result<IngestTx<'p>, McpError> {
     if server.scoped.is_none() {
         if let Some(reason) = server.privileged_pool {
@@ -978,7 +1055,7 @@ async fn begin_ingest_tx<'p>(
         }
     }
     Ok(IngestTx::Stamped(
-        crate::claim_helper::begin_author_stamped_tx(server, author, tool_name).await?,
+        crate::claim_helper::begin_author_stamped_tx_for(server, author, tool_name, grant).await?,
     ))
 }
 
@@ -1020,6 +1097,31 @@ pub async fn do_ingest_document(
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
+) -> Result<CallToolResult, McpError> {
+    // PUBLIC, as this entry point has always written: it is the operator CLI's
+    // (`epigraph-cli` `ingest_document`, a system path that keeps its
+    // behaviour, docs/tenancy/claim-visibility-controls.md section 3.5) and the
+    // test harness's. The MCP tools pass the caller's choice, team by default,
+    // through [`do_ingest_document_with_visibility`].
+    do_ingest_document_with_visibility(
+        server,
+        viewer,
+        extraction,
+        auth,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+}
+
+/// [`do_ingest_document`] with the caller's visibility: every claim the ingest
+/// CREATES is written with it. Claims it converges onto keep their own.
+#[allow(clippy::too_many_lines)]
+pub async fn do_ingest_document_with_visibility(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<CallToolResult, McpError> {
     // D9 writer-side verbatim re-verification: when the extraction carries
     // `source_text`, every span-backed paragraph's stored `text` must equal the
@@ -1103,7 +1205,8 @@ pub async fn do_ingest_document(
     // `papers` stays on the pool: it has no row-level security, and
     // `ensure_paper_node` already created the row synchronously before this
     // task was spawned, so the call above is an idempotent read of it.
-    let mut tx = begin_ingest_tx(server, author, "ingest_document").await?;
+    let resolution = resolve_ingest_visibility(server, author.agent_id(), choice).await?;
+    let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
@@ -1250,7 +1353,9 @@ pub async fn do_ingest_document(
     // revoked in its personal one passed that check, and
     // `default_decl_for_author`'s mint path then revived the revoked admin
     // membership inside this transaction. See `owner_decl`.
-    let decl = tx.owner_decl(agent_id, "ingest_document").await?;
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document", &resolution)
+        .await?;
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
@@ -1576,57 +1681,58 @@ pub async fn do_ingest_document(
     //
     // On the unstamped pool this half was refused at `claim_frames` on BOTH
     // schema configurations, so `claims_ds_wired` was never non-zero there.
-    let (claims_ds_wired, ds_frame_id) = match begin_ingest_tx(server, author, "ingest_document_ds")
-        .await
-    {
-        Ok(mut ds_tx) => {
-            for e in &wired_edges {
-                ds_auto::auto_wire_edge_if_epistemic(
-                    &mut ds_tx,
-                    viewer,
-                    e.was_created,
-                    e.edge_id,
-                    e.source_id,
-                    &e.source_type,
-                    e.target_id,
-                    &e.target_type,
-                    &e.relationship,
-                    agent_id,
-                )
-                .await;
-            }
-            let wired = if ds_entries.is_empty() {
-                (None, None)
-            } else {
-                match ds_auto::auto_wire_ds_batch(&mut ds_tx, viewer, &ds_entries, agent_id).await {
-                    Ok((fid, count)) => (Some(count), Some(fid.to_string())),
+    let (claims_ds_wired, ds_frame_id) =
+        match begin_ingest_tx(server, author, "ingest_document_ds", resolution.grant()).await {
+            Ok(mut ds_tx) => {
+                for e in &wired_edges {
+                    ds_auto::auto_wire_edge_if_epistemic(
+                        &mut ds_tx,
+                        viewer,
+                        e.was_created,
+                        e.edge_id,
+                        e.source_id,
+                        &e.source_type,
+                        e.target_id,
+                        &e.target_type,
+                        &e.relationship,
+                        agent_id,
+                    )
+                    .await;
+                }
+                let wired = if ds_entries.is_empty() {
+                    (None, None)
+                } else {
+                    match ds_auto::auto_wire_ds_batch(&mut ds_tx, viewer, &ds_entries, agent_id)
+                        .await
+                    {
+                        Ok((fid, count)) => (Some(count), Some(fid.to_string())),
+                        Err(e) => {
+                            tracing::warn!("ds auto-wire batch failed: {e}");
+                            (None, None)
+                        }
+                    }
+                };
+                match ds_tx.commit().await {
+                    Ok(()) => wired,
                     Err(e) => {
-                        tracing::warn!("ds auto-wire batch failed: {e}");
+                        tracing::warn!(
+                            paper_id = %paper_id,
+                            "ingest_document ds wiring could not commit: {e}. The document is \
+                             stored; its atoms carry no BBA until a recompute reaches them"
+                        );
                         (None, None)
                     }
                 }
-            };
-            match ds_tx.commit().await {
-                Ok(()) => wired,
-                Err(e) => {
-                    tracing::warn!(
-                        paper_id = %paper_id,
-                        "ingest_document ds wiring could not commit: {e}. The document is \
-                         stored; its atoms carry no BBA until a recompute reaches them"
-                    );
-                    (None, None)
-                }
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                paper_id = %paper_id,
-                "ingest_document ds wiring skipped: {}. The document is stored and intact",
-                e.message
-            );
-            (None, None)
-        }
-    };
+            Err(e) => {
+                tracing::warn!(
+                    paper_id = %paper_id,
+                    "ingest_document ds wiring skipped: {}. The document is stored and intact",
+                    e.message
+                );
+                (None, None)
+            }
+        };
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
@@ -2073,6 +2179,26 @@ pub async fn do_ingest_document_spine(
     extraction: &DocumentExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    // PUBLIC, for the reason [`do_ingest_document`] gives.
+    do_ingest_document_spine_with_visibility(
+        server,
+        viewer,
+        extraction,
+        auth,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+}
+
+/// [`do_ingest_document_spine`] with the caller's visibility.
+#[allow(clippy::too_many_lines)]
+pub async fn do_ingest_document_spine_with_visibility(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    choice: epigraph_core::VisibilityChoice,
+) -> Result<CallToolResult, McpError> {
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
 
@@ -2148,7 +2274,9 @@ pub async fn do_ingest_document_spine(
     // edges had committed, and the owner-group read was blind and minted on
     // every call. This path is synchronous, so the refusal now reaches the
     // caller, and it leaves nothing behind.
-    let mut tx = begin_ingest_tx(server, author, "ingest_document_spine").await?;
+    let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
+    let mut tx =
+        begin_ingest_tx(server, author, "ingest_document_spine", resolution.grant()).await?;
 
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
@@ -2269,7 +2397,9 @@ pub async fn do_ingest_document_spine(
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
     // Hoisted, as above, and through the same never-minting helper.
-    let decl = tx.owner_decl(agent_id, "ingest_document_spine").await?;
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document_spine", &resolution)
+        .await?;
     for planned in &plan.claims {
         if planned.level == 3 {
             continue;

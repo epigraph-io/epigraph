@@ -232,6 +232,8 @@ async fn create_claim_attests_its_authored_edge() {
         serde_json::json!({
             "content": format!("R-50: an HTTP claim's AUTHORED edge is signed {}", Uuid::new_v4()),
             "agent_id": author,
+            // Read back below with the public viewer.
+            "visibility": "public",
         }),
     )
     .await;
@@ -597,6 +599,8 @@ async fn submit_packet_attests_its_structural_edges() {
                 "inputs": [{"type": "evidence", "index": 0}],
                 "confidence": 0.7, "explanation": "test", "signature": null
             },
+            // Read back below with the public viewer.
+            "visibility": "public",
             "signature": "0".repeat(128)
         }),
     )

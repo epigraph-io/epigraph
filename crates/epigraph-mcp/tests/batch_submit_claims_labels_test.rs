@@ -31,6 +31,8 @@ async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
                 evidence_type: "logical".into(),
                 confidence: Some(0.8),
                 labels: vec!["capability-registry".into()],
+                visibility: Some("public".to_string()),
+                group_id: None,
             }],
         },
         None,

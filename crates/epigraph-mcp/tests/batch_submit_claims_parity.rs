@@ -110,6 +110,7 @@ async fn batch_entries_pass_every_field_through_and_return_full_responses(pool: 
         batch_params(serde_json::json!({
             "claims": [{
                 "content": content,
+                "visibility": "public",
                 "methodology": "deductive_logic",
                 "evidence_data": "g15 parity evidence",
                 "evidence_type": "logical",
@@ -199,6 +200,7 @@ async fn a_batch_entry_without_methodology_keeps_the_old_default(pool: PgPool) {
         batch_params(serde_json::json!({
             "claims": [{
                 "content": content,
+                "visibility": "public",
                 "evidence_data": "ev",
                 "evidence_type": "logical",
             }]
@@ -235,11 +237,11 @@ async fn an_invalid_methodology_refuses_only_its_own_entry(pool: PgPool) {
         &viewer,
         batch_params(serde_json::json!({
             "claims": [
-                {"content": good_a, "evidence_data": "ev", "evidence_type": "logical",
+                {"content": good_a, "visibility": "public", "evidence_data": "ev", "evidence_type": "logical",
                  "methodology": "direct_observation"},
-                {"content": bad, "evidence_data": "ev", "evidence_type": "logical",
+                {"content": bad, "visibility": "public", "evidence_data": "ev", "evidence_type": "logical",
                  "methodology": "vibes_based_divination"},
-                {"content": good_b, "evidence_data": "ev", "evidence_type": "logical"},
+                {"content": good_b, "visibility": "public", "evidence_data": "ev", "evidence_type": "logical"},
             ]
         })),
         None,
