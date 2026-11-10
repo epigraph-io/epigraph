@@ -896,3 +896,84 @@ async fn the_legacy_principal_is_registered_once(pool: PgPool) {
     .expect("audit");
     assert_eq!(audited, 1);
 }
+
+/// The dry run the deploy waits on runs BEFORE this stack is deployed: on a
+/// database without the marker migrations (198, 199, 208) and with no
+/// `legacy-ingest` principal. It must still report the census, say what is
+/// missing, and refuse `--apply` with nothing written.
+#[sqlx::test(migrations = false)]
+async fn the_dry_run_works_before_the_marker_migrations_are_applied(pool: PgPool) {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    let dir = std::env::temp_dir().join(format!("backfill-premarker-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    for e in std::fs::read_dir(&src).expect("migrations") {
+        let p = e.expect("entry").path();
+        let n = p.file_name().expect("name").to_string_lossy().to_string();
+        if !n.ends_with(".sql") || ["198_", "199_", "208_"].iter().any(|v| n.starts_with(v)) {
+            continue;
+        }
+        std::fs::copy(&p, dir.join(&n)).expect("copy");
+    }
+    let mut m = sqlx::migrate::Migrator::new(dir.as_path())
+        .await
+        .expect("migrator");
+    m.set_ignore_missing(true);
+    // On a connection of its own: a migration's session settings must not
+    // stay on a pooled connection the fixture then writes through.
+    let mut conn =
+        <sqlx::PgConnection as sqlx::Connection>::connect(&fixture::database_url_for(&pool).await)
+            .await
+            .expect("migration connection");
+    m.run(&mut conn)
+        .await
+        .expect("every migration but 198, 199, 208");
+    sqlx::Connection::close(conn).await.expect("close");
+    let present: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version IN (198, 199, 208)")
+            .fetch_all(&pool)
+            .await
+            .expect("versions");
+    assert!(present.is_empty(), "CALIBRATION: {present:?}");
+
+    let fx = seed(&pool).await;
+    let before = edge_snapshot(&pool).await;
+    let dry = run_op(&pool, &["backfill-ingest-markers"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains("SCHEMA\tguard_208=MISSING\tlegacy_ingest=NOT-REGISTERED"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("TOTAL\tedges_to_stamp=14"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("CREATION-RECORDS\tprovable=1"),
+        "{}",
+        dry.show()
+    );
+
+    let m0 = scratch("premarker.jsonl");
+    let (s, attest) = (fx.s.to_string(), fx.attest.to_string());
+    let mut args = vec![
+        "backfill-ingest-markers",
+        "--apply",
+        "--confirm-count",
+        "14",
+        "--manifest-out",
+        m0.to_str().unwrap(),
+        "--ruling",
+        "test ruling",
+        "--reason",
+        "test",
+    ];
+    args.extend(classify(&fx, &s, &attest));
+    let r = run_op(&pool, &args).await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(r.stderr.contains("migration 208"), "{}", r.show());
+    assert_eq!(edge_snapshot(&pool).await, before, "nothing written");
+    assert!(!m0.exists(), "no manifest for a refused run");
+}
