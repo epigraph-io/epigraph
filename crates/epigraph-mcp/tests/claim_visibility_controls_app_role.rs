@@ -22,7 +22,9 @@
 //!   one audit row); a plain writer is refused; a non-member gets not-found; a
 //!   sealed claim is refused; a direct app-role UPDATE is still refused by 074;
 //! * `share_claims_with_team`: a private claim moves into a team the author
-//!   writes, and not into one it does not.
+//!   writes, and not into one it does not;
+//! * neither act can be steered by temporary tables the calling session
+//!   created first.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -786,4 +788,142 @@ async fn a_private_claim_is_shared_with_a_team_the_author_writes(pool: PgPool) {
     .await
     .expect("audit");
     assert_eq!(audited, 1);
+}
+
+/// A definer must not keep its working state in a relation the CALLING session
+/// can create first: a temporary table belongs to the session, not to the
+/// definer's owner. Here the caller plants same-named temporary tables, with
+/// rows of its own and a BEFORE INSERT trigger that would rewrite a
+/// classification, then calls both definers on that same session. Each answer
+/// is the definer's own refusal, neither claim moves, the trigger never runs,
+/// and the planted rows are left exactly as planted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_temp_table_planted_by_the_caller_cannot_steer_publicize_or_share(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let other = team(&pool, "not-mine").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "vis-alice").await;
+    add_member(&pool, t, alice, "writer").await;
+    let team_claim = claim_of(
+        &write_as(&pool, &s, alice, submit("team finding", None, None))
+            .await
+            .expect("team claim"),
+    );
+    let private_claim = claim_of(
+        &write_as(
+            &pool,
+            &s,
+            alice,
+            submit("private draft", Some("private"), None),
+        )
+        .await
+        .expect("private claim"),
+    );
+    let decoy = Uuid::new_v4();
+
+    let v = viewer(&pool, alice).await;
+    let mut tx = s.scoped.begin_as(&v).await.expect("stamped tx");
+    let ran_as: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("session user");
+    assert_eq!(ran_as, "epigraph_app", "the plant must run as the app role");
+    sqlx::raw_sql(&format!(
+        r#"
+        CREATE TEMP TABLE hijack_log (ran_as text, tbl text);
+        CREATE TEMP TABLE vis_publicize (
+            claim_id uuid PRIMARY KEY, outcome text NOT NULL, owner uuid);
+        CREATE TEMP TABLE vis_share (claim_id uuid PRIMARY KEY, outcome text NOT NULL);
+        INSERT INTO vis_publicize VALUES ('{decoy}', 'publicize', '{t}');
+        INSERT INTO vis_share VALUES ('{decoy}', 'share');
+        CREATE FUNCTION pg_temp.hijack() RETURNS trigger LANGUAGE plpgsql AS $h$
+        BEGIN
+            INSERT INTO pg_temp.hijack_log VALUES (current_user::text, TG_TABLE_NAME);
+            NEW.outcome := CASE TG_TABLE_NAME WHEN 'vis_publicize' THEN 'publicize'
+                                              ELSE 'share' END;
+            RETURN NEW;
+        END $h$;
+        CREATE TRIGGER hijack BEFORE INSERT ON vis_publicize
+            FOR EACH ROW EXECUTE FUNCTION pg_temp.hijack();
+        CREATE TRIGGER hijack BEFORE INSERT ON vis_share
+            FOR EACH ROW EXECUTE FUNCTION pg_temp.hijack();
+        GRANT ALL ON hijack_log, vis_publicize, vis_share TO epigraph_maintenance;
+        "#
+    ))
+    .execute(&mut *tx)
+    .await
+    .expect("the app role plants temporary tables");
+
+    let published: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT claim_id, outcome FROM public.epigraph_publicize_claims($1, 'planted')",
+    )
+    .bind(vec![team_claim])
+    .fetch_all(&mut *tx)
+    .await
+    .expect("publicize answers");
+    let shared: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT claim_id, outcome FROM public.epigraph_share_claims_with_team($1, $2, 'planted')",
+    )
+    .bind(vec![private_claim])
+    .bind(other)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("share answers");
+    let fired: Vec<(String, String)> = sqlx::query_as("SELECT ran_as, tbl FROM pg_temp.hijack_log")
+        .fetch_all(&mut *tx)
+        .await
+        .expect("trigger log");
+    let planted_p: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT claim_id, outcome FROM pg_temp.vis_publicize ORDER BY 1")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("planted publicize rows");
+    let planted_s: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT claim_id, outcome FROM pg_temp.vis_share ORDER BY 1")
+            .fetch_all(&mut *tx)
+            .await
+            .expect("planted share rows");
+    // The pooled session outlives the test's transaction: take the plant down
+    // with it.
+    sqlx::raw_sql(
+        "DROP TABLE pg_temp.vis_publicize, pg_temp.vis_share, pg_temp.hijack_log; \
+         DROP FUNCTION pg_temp.hijack()",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("drop the plant");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        published,
+        vec![(team_claim, "refused_not_admin".to_string())],
+        "a writer who is not an admin is refused, whatever the session planted"
+    );
+    assert_eq!(
+        shared,
+        vec![(private_claim, "refused_not_team_writer".to_string())],
+        "a team the author does not write is refused, whatever the session planted"
+    );
+    assert!(
+        fired.is_empty(),
+        "no definer statement touched the planted tables: {fired:?}"
+    );
+    assert_eq!(planted_p, vec![(decoy, "publicize".to_string())]);
+    assert_eq!(planted_s, vec![(decoy, "share".to_string())]);
+    assert_eq!(
+        tenancy(&pool, "claims", team_claim).await,
+        ("group".to_string(), t)
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", private_claim).await,
+        ("group".to_string(), home)
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type IN ('claim.publicized', 'claim.shared_with_team')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 0, "nothing was acted on, so nothing is audited");
 }

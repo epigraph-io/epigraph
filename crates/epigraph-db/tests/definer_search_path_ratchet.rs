@@ -31,6 +31,11 @@
 //!   path is only `pg_catalog, pg_temp` names every `public` relation, type and
 //!   function it uses schema-qualified, because on that path an unqualified
 //!   relation or type name is not looked up in `public`.
+//! * [`no_definer_keeps_state_in_a_session_temporary_relation`]: no definer
+//!   body creates a temporary relation or names a `pg_temp`-qualified one. A
+//!   temporary relation is the calling SESSION's, so the caller can create a
+//!   same-named one first and the body would use it with its owner's rights.
+//!   No allowlist.
 //! * [`the_refresh_and_revocation_family_resolves_in_pg_catalog_only`][]: the
 //!   OAuth refresh-token and access-token revocation definers (the family the
 //!   backlog item names first) are on 172's form, keep their owner and grants.
@@ -1113,5 +1118,136 @@ async fn a_path_without_pg_temp_searches_the_temporary_schema_first(pool: PgPool
         schema_order(&mut tx, "public, pg_temp").await,
         ["pg_catalog", "public", "pg_temp"],
         "pg_catalog unlisted: searched first; pg_temp listed last: searched last"
+    );
+}
+
+/// What a definer body does with the session's temporary schema, by form:
+/// creating a temporary relation, or naming a `pg_temp`-qualified one. Read on
+/// the RAW body, lowercased with whitespace collapsed, so a dynamic-SQL string
+/// (`EXECUTE 'CREATE TEMP TABLE ..'`) is seen too. A `search_path` value such
+/// as `'public, pg_temp'` names no relation (no dot) and is not reported.
+fn session_temp_uses(src: &str) -> BTreeSet<&'static str> {
+    let flat = src
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".")
+        .replace(". ", ".");
+    const FORMS: &[(&str, &str)] = &[
+        ("create temp ", "CREATE TEMP"),
+        ("create temporary ", "CREATE TEMP"),
+        ("create global temp", "CREATE TEMP"),
+        ("create local temp", "CREATE TEMP"),
+        ("create unlogged temp", "CREATE TEMP"),
+        ("into temp ", "SELECT INTO TEMP"),
+        ("into temporary ", "SELECT INTO TEMP"),
+        ("pg_temp.", "pg_temp-qualified relation"),
+        ("\"pg_temp\".", "pg_temp-qualified relation"),
+    ];
+    FORMS
+        .iter()
+        .filter(|(needle, _)| flat.contains(needle))
+        .map(|(_, form)| *form)
+        .collect()
+}
+
+/// Probe definers for [`no_definer_keeps_state_in_a_session_temporary_relation`]:
+/// each form it must report, and one it must not.
+const TEMP_PROBES: &str = r#"
+CREATE FUNCTION public.tmp_probe_static() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    CREATE TEMP TABLE IF NOT EXISTS pg_temp.tmp_probe (x integer) ON COMMIT DROP;
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_dynamic() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    EXECUTE 'CREATE   TEMPORARY TABLE tmp_probe (x integer)';
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_reads() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    PERFORM 1 FROM pg_temp . tmp_probe;
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_path_only() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);
+    RETURN 1;
+END $$;
+"#;
+
+/// No SECURITY DEFINER body keeps state in a session-temporary relation.
+///
+/// A temporary relation belongs to the SESSION, not to the definer's owner, so
+/// the caller can create one of the same name before the call (with its own
+/// triggers and rows), and `CREATE TEMP TABLE IF NOT EXISTS` then adopts it.
+/// The body would read and write the caller's relation with the owner's
+/// privileges. Classify into local variables, arrays or a CTE instead. 115's
+/// `epigraph_delete_mass_functions_scoped` and 206's visibility acts do. The
+/// behavioural pin for 206 is the app-role test
+/// `a_temp_table_planted_by_the_caller_cannot_steer_publicize_or_share`
+/// (epigraph-mcp). No allowlist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_definer_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
+    let scan = |defs: &BTreeMap<String, Definer>| -> BTreeMap<String, BTreeSet<&'static str>> {
+        defs.iter()
+            .map(|(sig, d)| (sig.clone(), session_temp_uses(&d.src)))
+            .filter(|(_, forms)| !forms.is_empty())
+            .collect()
+    };
+    let at_head_defs = definers(&pool).await;
+    assert!(
+        at_head_defs.len() > 100,
+        "CALIBRATION: the scan sees the schema's definers ({})",
+        at_head_defs.len()
+    );
+    let at_head = scan(&at_head_defs);
+
+    sqlx::raw_sql(TEMP_PROBES)
+        .execute(&pool)
+        .await
+        .expect("probes");
+    let with_probes = scan(&definers(&pool).await);
+    let probed: BTreeMap<&str, &BTreeSet<&str>> = with_probes
+        .iter()
+        .filter(|(k, _)| !at_head.contains_key(*k))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    assert_eq!(
+        probed,
+        BTreeMap::from([
+            (
+                "public.tmp_probe_dynamic()",
+                &BTreeSet::from(["CREATE TEMP"])
+            ),
+            (
+                "public.tmp_probe_reads()",
+                &BTreeSet::from(["pg_temp-qualified relation"])
+            ),
+            (
+                "public.tmp_probe_static()",
+                &BTreeSet::from(["CREATE TEMP", "pg_temp-qualified relation"])
+            ),
+        ]),
+        "CALIBRATION: the static, dynamic-SQL and qualified-read probes are reported, and a \
+         body that only sets a search_path naming pg_temp is not"
+    );
+
+    assert!(
+        at_head.is_empty(),
+        "{} SECURITY DEFINER function(s) create or name a session-temporary relation, which \
+         the caller's session can create first. Keep the state in local variables, arrays \
+         or a CTE:\n{}",
+        at_head.len(),
+        at_head
+            .iter()
+            .map(|(s, f)| format!("  {s}: {f:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

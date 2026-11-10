@@ -71,6 +71,14 @@
 -- bodies is still `public.`-qualified. The decisions are made before the
 -- window opens.
 --
+-- NO SESSION STATE. A body keeps its working set in local variables and
+-- arrays, never in a temporary relation. A temporary table belongs to the
+-- calling SESSION, not to the definer's owner, so the caller could create one
+-- of the same name first, with its own rows and triggers, and the body would
+-- then read and write the caller's relation with the owner's privileges.
+-- `definer_search_path_ratchet.rs` refuses any definer body that creates or
+-- names one.
+--
 -- MEMBERSHIP is always read live, through `epigraph_live_memberships` (own
 -- rows, 149's human-group filter, 165's role-derived rows). Nothing is cached.
 
@@ -220,6 +228,9 @@ DECLARE
     v_principal uuid := public.epigraph_principal_id();
     v_readable uuid[] := public.epigraph_session_groups();
     v_ids uuid[];
+    v_cls_ids uuid[];
+    v_cls_out text[];
+    v_cls_own uuid[];
     v_todo uuid[];
     v_meet_edges uuid[];
     v_bad boolean;
@@ -241,12 +252,10 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
 
-    CREATE TEMP TABLE IF NOT EXISTS pg_temp.vis_publicize (
-        claim_id uuid PRIMARY KEY, outcome text NOT NULL, owner uuid) ON COMMIT DROP;
-    TRUNCATE pg_temp.vis_publicize;
-    INSERT INTO pg_temp.vis_publicize (claim_id, outcome, owner)
-    SELECT i.id,
-           CASE
+    -- The classification, as three parallel arrays ordered by claim id (see
+    -- the header: no temporary relation).
+    SELECT array_agg(i.id ORDER BY i.id),
+           array_agg(CASE
              WHEN c.id IS NULL
                   OR NOT (c.visibility::text = 'public'
                           OR c.owner_group_id = ANY(COALESCE(v_readable, ARRAY[]::uuid[])))
@@ -258,18 +267,19 @@ BEGIN
              WHEN EXISTS (SELECT 1 FROM public.claim_encryption ce WHERE ce.claim_id = c.id)
                THEN 'refused_sealed'
              ELSE 'publicize'
-           END,
-           c.owner_group_id
+           END ORDER BY i.id),
+           array_agg(c.owner_group_id ORDER BY i.id)
+      INTO v_cls_ids, v_cls_out, v_cls_own
       FROM unnest(v_ids) AS i(id)
       LEFT JOIN public.claims c ON c.id = i.id;
 
-    SELECT EXISTS (SELECT 1 FROM pg_temp.vis_publicize v
-                    WHERE v.outcome NOT IN ('publicize', 'already_public'))
-      INTO v_bad;
-    SELECT array_agg(v.claim_id) INTO v_todo FROM pg_temp.vis_publicize v
-     WHERE v.outcome = 'publicize';
+    SELECT COALESCE(bool_or(u.o NOT IN ('publicize', 'already_public')), false),
+           array_agg(u.id ORDER BY u.id) FILTER (WHERE u.o = 'publicize'),
+           array_agg(DISTINCT u.g) FILTER (WHERE u.o = 'publicize')
+      INTO v_bad, v_todo, v_owners
+      FROM unnest(v_cls_ids, v_cls_out, v_cls_own) AS u(id, o, g);
     IF v_bad OR v_todo IS NULL THEN
-        RETURN QUERY SELECT v.claim_id, v.outcome FROM pg_temp.vis_publicize v ORDER BY v.claim_id;
+        RETURN QUERY SELECT u.id, u.o FROM unnest(v_cls_ids, v_cls_out) AS u(id, o) ORDER BY u.id;
         RETURN;
     END IF;
 
@@ -350,8 +360,6 @@ BEGIN
         GET DIAGNOSTICS v_edges = ROW_COUNT;
     END IF;
 
-    SELECT array_agg(DISTINCT v.owner) INTO v_owners FROM pg_temp.vis_publicize v
-     WHERE v.outcome = 'publicize';
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.publicized', v_principal, true,
             jsonb_build_object('claim_ids', to_jsonb(v_todo),
@@ -363,8 +371,9 @@ BEGIN
                                'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
 
-    UPDATE pg_temp.vis_publicize v SET outcome = 'publicized' WHERE v.outcome = 'publicize';
-    RETURN QUERY SELECT v.claim_id, v.outcome FROM pg_temp.vis_publicize v ORDER BY v.claim_id;
+    RETURN QUERY
+        SELECT u.id, CASE WHEN u.o = 'publicize' THEN 'publicized' ELSE u.o END
+          FROM unnest(v_cls_ids, v_cls_out) AS u(id, o) ORDER BY u.id;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_publicize_claims(uuid[], text) FROM PUBLIC;
 
@@ -402,7 +411,8 @@ DECLARE
     v_home_admin boolean;
     v_team_ok boolean;
     v_ids uuid[];
-    v_todo uuid[];
+    v_cls_ids uuid[];
+    v_cls_out text[];
     v_bad boolean;
 BEGIN
     IF v_principal IS NULL THEN
@@ -431,12 +441,10 @@ BEGIN
     v_team_ok := p_group_id IS DISTINCT FROM v_home AND EXISTS (
         SELECT 1 FROM public.epigraph_writable_teams(v_principal) t WHERE t.group_id = p_group_id);
 
-    CREATE TEMP TABLE IF NOT EXISTS pg_temp.vis_share (
-        claim_id uuid PRIMARY KEY, outcome text NOT NULL) ON COMMIT DROP;
-    TRUNCATE pg_temp.vis_share;
-    INSERT INTO pg_temp.vis_share (claim_id, outcome)
-    SELECT i.id,
-           CASE
+    -- The classification, as two parallel arrays ordered by claim id (see the
+    -- header: no temporary relation).
+    SELECT array_agg(i.id ORDER BY i.id),
+           array_agg(CASE
              WHEN c.id IS NULL
                   OR NOT (c.visibility::text = 'public'
                           OR c.owner_group_id = ANY(COALESCE(v_readable, ARRAY[]::uuid[])))
@@ -449,31 +457,30 @@ BEGIN
                THEN 'refused_sealed'
              WHEN NOT v_team_ok THEN 'refused_not_team_writer'
              ELSE 'share'
-           END
+           END ORDER BY i.id)
+      INTO v_cls_ids, v_cls_out
       FROM unnest(v_ids) AS i(id)
       LEFT JOIN public.claims c ON c.id = i.id;
 
-    SELECT EXISTS (SELECT 1 FROM pg_temp.vis_share v WHERE v.outcome <> 'share') INTO v_bad;
+    SELECT COALESCE(bool_or(u.o <> 'share'), false) INTO v_bad FROM unnest(v_cls_out) AS u(o);
     IF v_bad THEN
-        RETURN QUERY SELECT v.claim_id, v.outcome FROM pg_temp.vis_share v ORDER BY v.claim_id;
+        RETURN QUERY SELECT u.id, u.o FROM unnest(v_cls_ids, v_cls_out) AS u(id, o) ORDER BY u.id;
         RETURN;
     END IF;
-    SELECT array_agg(v.claim_id) INTO v_todo FROM pg_temp.vis_share v;
 
     PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);  -- see header
     UPDATE public.claims c
        SET owner_group_id = p_group_id, updated_at = now()
-     WHERE c.id = ANY(v_todo) AND c.owner_group_id = v_home AND c.visibility::text = 'group';
+     WHERE c.id = ANY(v_cls_ids) AND c.owner_group_id = v_home AND c.visibility::text = 'group';
 
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.shared_with_team', v_principal, true,
-            jsonb_build_object('claim_ids', to_jsonb(v_todo), 'from_group_id', v_home,
+            jsonb_build_object('claim_ids', to_jsonb(v_cls_ids), 'from_group_id', v_home,
                                'to_group_id', p_group_id, 'reason', p_reason,
                                'migration', 206, 'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
 
-    UPDATE pg_temp.vis_share v SET outcome = 'shared';
-    RETURN QUERY SELECT v.claim_id, v.outcome FROM pg_temp.vis_share v ORDER BY v.claim_id;
+    RETURN QUERY SELECT u.id, 'shared'::text FROM unnest(v_cls_ids) AS u(id) ORDER BY u.id;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_share_claims_with_team(uuid[], uuid, text) FROM PUBLIC;
 
