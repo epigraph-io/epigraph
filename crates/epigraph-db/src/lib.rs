@@ -169,6 +169,7 @@ pub use repos::{
 };
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+pub use repos::{CountersignDecision, CountersignRepository, CountersignedRow};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use repos::{
     IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperIngestPrincipal,
