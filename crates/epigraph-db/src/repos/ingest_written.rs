@@ -102,6 +102,13 @@
 //!   retraction of any principal's row of the fact.
 //! * Readers that do not deduplicate see one edge per principal: a paper's
 //!   author list and claim list must count each author and claim once.
+//! * The document ingest's record of each claim it asserted
+//!   (`paper -ingested_claim-> claim`, [`crate::ClaimIngestRepository`]) is
+//!   marked too, by its own writer: one record per (paper, claim, ingester),
+//!   so it cannot go through the create-if-absent writer here. The
+//!   supersede, dedup and merge cascades never re-point a marked edge (it
+//!   stays on the row the ingest created or found); any other re-point drops
+//!   the key, so the moved edge no longer counts.
 //! * The workflow executor's `agent -asserts-> claim` attributions are not
 //!   ingest-written edges: they name authors with no document behind them and
 //!   carry no countersign state.
@@ -180,6 +187,30 @@ pub fn without_ingest_marker(properties: serde_json::Value) -> serde_json::Value
         }
         other => other,
     }
+}
+
+/// The [`INGEST_WRITTEN_PROPERTY`] value an ingest by `by` through `tool`
+/// writes.
+#[must_use]
+pub fn ingest_written_marker(tool: &str, by: Uuid) -> serde_json::Value {
+    serde_json::json!({ "tool": tool, INGEST_WRITTEN_BY_FIELD: by.to_string() })
+}
+
+/// Declare [`INGEST_WRITTEN_SETTING`] on `conn`'s transaction (`on`) or clear
+/// it (`off`). Only this module's writers and the document ingest's own
+/// record (`ClaimIngestRepository::record_signed_conn`, the one marked edge
+/// that is not deduplicated on its endpoints) call it, each around a single
+/// INSERT inside a savepoint of its own.
+pub(crate) async fn declare_ingest_written(
+    conn: &mut sqlx::PgConnection,
+    on: bool,
+) -> Result<(), DbError> {
+    sqlx::query("SELECT pg_catalog.set_config($1, $2, true)")
+        .bind(INGEST_WRITTEN_SETTING)
+        .bind(if on { "on" } else { "" })
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Write one ingest edge, marked [`INGEST_WRITTEN_PROPERTY`] =

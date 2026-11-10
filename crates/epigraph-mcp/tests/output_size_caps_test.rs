@@ -586,6 +586,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
             doi: doi.to_string(),
             limit: None,
             offset: None,
+            ingested_by: None,
         },
     )
     .await
@@ -619,6 +620,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
                 doi: doi.to_string(),
                 limit: Some(100),
                 offset: None,
+                ingested_by: None,
             },
         )
         .await
@@ -655,6 +657,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
                     doi: doi.to_string(),
                     limit: Some(25),
                     offset: Some(offset),
+                    ingested_by: None,
                 },
             )
             .await
@@ -695,6 +698,7 @@ async fn query_paper_pages_instead_of_erroring(pool: PgPool) {
                 doi: doi.to_string(),
                 limit: Some(100_000),
                 offset: None,
+                ingested_by: None,
             },
         )
         .await
@@ -748,6 +752,7 @@ async fn has_more_terminates_when_claim_count_comes_from_the_doi_label_floor(poo
                 doi: doi.to_string(),
                 limit: None,
                 offset: None,
+                ingested_by: None,
             },
         )
         .await
@@ -897,14 +902,22 @@ async fn seed_paper(pool: &PgPool, doi: &str) -> Uuid {
     id
 }
 
+/// The paper's assertion as the document ingest writes it (ingest-written:
+/// `query_paper` reads no other).
 async fn seed_asserts_edge(pool: &PgPool, paper: Uuid, claim: Uuid) {
-    sqlx::query(
-        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        Uuid::nil(),
+        paper,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
     )
-    .bind(paper)
-    .bind(claim)
-    .execute(pool)
     .await
     .expect("seed asserts edge");
 }

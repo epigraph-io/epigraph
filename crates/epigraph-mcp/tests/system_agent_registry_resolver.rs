@@ -654,6 +654,7 @@ fn workflow_extraction(
                     name: (*n).to_string(),
                     affiliations: vec![],
                     roles: vec![],
+                    agent_id: None,
                 })
                 .collect(),
             expected_outcome: None,

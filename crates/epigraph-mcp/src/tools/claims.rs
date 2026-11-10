@@ -1089,6 +1089,30 @@ pub async fn get_claim(
         .remove(&id)
         .unwrap_or_default();
 
+    // Who filed it: the same block, from the same repo call, as
+    // `GET /api/v1/claims/:id`. It needs the caller's viewer-STAMPED
+    // connection (the prompt-snapshot gate reads the session principal), so
+    // a server built
+    // without a scoped pool omits the block rather than answer it unstamped.
+    let authored_by = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
+            let block = epigraph_db::AuthoredByRepository::for_claim(
+                &mut read,
+                viewer,
+                claim.id.as_uuid(),
+                claim.agent_id.as_uuid(),
+                claim.created_at,
+                epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
+            )
+            .await
+            .map_err(internal_error)?;
+            read.commit().await.map_err(internal_error)?;
+            Some(block)
+        }
+        None => None,
+    };
+
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
         #[serde(flatten)]
@@ -1097,6 +1121,8 @@ pub async fn get_claim(
         #[serde(skip_serializing_if = "Option::is_none")]
         lensed_belief: Option<LensedBelief>,
         source_urls: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authored_by: Option<epigraph_db::AuthoredBy>,
     }
 
     success_json(&GetClaimResponse {
@@ -1115,6 +1141,7 @@ pub async fn get_claim(
         classification,
         lensed_belief,
         source_urls,
+        authored_by,
     })
 }
 

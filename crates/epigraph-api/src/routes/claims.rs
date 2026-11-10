@@ -228,6 +228,270 @@ pub struct ClaimResponse {
     /// the create handler; omitted from non-create responses (GET/PATCH/list).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub was_created: bool,
+    /// Who wrote the claim, as the caller may see it. Present on
+    /// `GET /api/v1/claims/:id` only; omitted from every other claim response,
+    /// `POST /api/v1/claims/batch-get` items included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_by: Option<AuthoredByView>,
+}
+
+/// A claim's `authored_by` block (`epigraph_db::authored_by`), tagged by
+/// `source`. `agent`: no readable creation record names a document, so the
+/// filer is the author (a claim stated directly, or one a document later
+/// repeated). `literature`: the document ingest recorded, when the claim was
+/// created, that a document's ingest created it; that document's authors are
+/// the claim's primary authors and the filer (the creating ingest's agent)
+/// is shown apart as `ingested_by`. Never decided from a bare `asserts` edge
+/// or from content. Both carry `corroborated_by` (every other readable
+/// document whose ingest recorded the claim) and `ingesters` (every readable
+/// ingest, the creating one included). A part the caller may not see is
+/// `null`, exactly as a part that does not exist (no snapshot recorded).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum AuthoredByView {
+    /// The filer stated the claim.
+    Agent {
+        /// The agent that filed the claim (`agent_id`), for every reader.
+        agent: AuthorRefView,
+        /// The human the agent was bound to when it filed the claim, for
+        /// every reader: its operator link from creation until retirement,
+        /// else the client allowance in force then. Read from that binding
+        /// record only: never from an `OPERATED_BY` edge, and never from
+        /// client or registration status. `null` when the agent was bound to
+        /// no human then (a claim filed after its link was retired), and on a
+        /// registered human's own claim.
+        human: Option<AuthorRefView>,
+        /// The prompt snapshot the agent was running at the claim's
+        /// `created_at`, shown only to the agent's linked human and to admins
+        /// (the prompt-history gate); otherwise `null`.
+        prompt_snapshot: Option<PromptSnapshotView>,
+        /// Every readable document whose ingest recorded the claim (at most
+        /// 10, in record order); none is an author.
+        corroborated_by: Vec<PaperAuthorshipView>,
+        /// More than 10 such documents are readable.
+        corroborated_by_truncated: bool,
+        /// Every readable ingest of the claim, oldest first.
+        ingesters: Vec<IngesterView>,
+        /// More ingest records exist than are listed.
+        ingesters_truncated: bool,
+    },
+    /// A document's ingest created the claim.
+    Literature {
+        /// The creating document with its authors: the claim's primary
+        /// authors (pending authors are listed apart, never primary).
+        paper: PaperAuthorshipView,
+        /// The agent that ran the creating ingest (the claim's filer), with
+        /// its human and prompt snapshot under the same rules as the `agent`
+        /// block. Never an author.
+        ingested_by: FilerView,
+        /// Every other readable document whose ingest recorded the claim (at
+        /// most 10, in record order).
+        corroborated_by: Vec<PaperAuthorshipView>,
+        /// More than 10 such documents are readable.
+        corroborated_by_truncated: bool,
+        /// Every readable ingest of the claim, the creating one included,
+        /// oldest first.
+        ingesters: Vec<IngesterView>,
+        /// More ingest records exist than are listed.
+        ingesters_truncated: bool,
+    },
+}
+
+/// The agent that filed a claim row, with its human and prompt snapshot.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct FilerView {
+    pub agent: AuthorRefView,
+    pub human: Option<AuthorRefView>,
+    pub prompt_snapshot: Option<PromptSnapshotView>,
+}
+
+/// One ingest of the claim.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct IngesterView {
+    /// The ingesting agent.
+    pub agent: AuthorRefView,
+    /// The human that agent was bound to when it ingested, for every reader.
+    pub human: Option<AuthorRefView>,
+    /// The document it ingested.
+    pub paper_id: Uuid,
+    /// This ingest created the claim.
+    pub created_claim: bool,
+    /// When the ingest recorded the claim.
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A document and its authors.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperAuthorshipView {
+    pub paper: PaperRefView,
+    /// On the creating document, the claim's primary authors: those its
+    /// creating ingest recorded when it created the claim, whose readable,
+    /// in-force `authored` edge WRITTEN BY THAT SAME INGEST is not awaiting
+    /// countersignature, in position order. On a corroborating document, the
+    /// authors the ingests that recorded the claim through it named, not
+    /// awaiting countersignature. Only the ingests that recorded the claim
+    /// contribute authors, each author once.
+    pub authors: Vec<PaperAuthorView>,
+    /// Authors an ingester named without speaking for them, not yet
+    /// countersigned (`pending_countersign: true`, `named_by`). Never
+    /// primary.
+    pub pending_authors: Vec<PaperAuthorView>,
+    /// On the creating document only: authors its creating ingest did not
+    /// record (a later ingest of the same document key that also recorded
+    /// the claim added them), each with `added_by`. Never primary; empty on
+    /// a corroborating document.
+    pub added_authors: Vec<PaperAuthorView>,
+    /// More than 50 readable authors exist (the three lists together).
+    pub authors_truncated: bool,
+}
+
+/// A document node.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperRefView {
+    pub id: Uuid,
+    /// The document key (a DOI, or another document key).
+    pub doi: String,
+    pub title: Option<String>,
+}
+
+/// One author of a document, from its `authored` edge.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperAuthorView {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    /// The extraction's author index; positions are not unique.
+    pub position: Option<i64>,
+    /// The edge's `role` (`author` when absent).
+    pub role: String,
+    pub affiliations: Vec<String>,
+    /// The authorship awaits the person's countersignature.
+    pub pending_countersign: bool,
+    /// On a pending authorship, the ingester whose word it is.
+    pub named_by: Option<AuthorRefView>,
+    /// On an added author, the ingester whose ingest added the authorship.
+    pub added_by: Option<AuthorRefView>,
+}
+
+/// One agent: the two fields `GET /api/v1/agents/:id` names.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct AuthorRefView {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+}
+
+/// The prompt snapshot (design D4) an agent was running at an instant. No
+/// prompt text: that stays behind `GET /api/v1/agents/:id/prompt-history`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PromptSnapshotView {
+    /// The snapshot, as `GET /api/v1/agents/:id/prompt-history` lists it.
+    pub snapshot_id: Uuid,
+    pub model: String,
+    /// The identity prompt hash (64 hex digits); the same for every snapshot
+    /// of one agent.
+    pub prompt_hash: String,
+    /// The snapshot's latest recorded start at or before the claim's
+    /// `created_at`.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::AuthorRef> for AuthorRefView {
+    fn from(a: epigraph_db::AuthorRef) -> Self {
+        Self {
+            id: a.id,
+            display_name: a.display_name,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::Filer> for FilerView {
+    fn from(f: epigraph_db::Filer) -> Self {
+        Self {
+            agent: f.agent.into(),
+            human: f.human.map(Into::into),
+            prompt_snapshot: f.prompt_snapshot.map(|p| PromptSnapshotView {
+                snapshot_id: p.snapshot_id,
+                model: p.model,
+                prompt_hash: p.prompt_hash,
+                started_at: p.started_at,
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::PaperAuthorship> for PaperAuthorshipView {
+    fn from(p: epigraph_db::PaperAuthorship) -> Self {
+        let author = |a: epigraph_db::PaperAuthor| PaperAuthorView {
+            id: a.id,
+            display_name: a.display_name,
+            position: a.position,
+            role: a.role,
+            affiliations: a.affiliations,
+            pending_countersign: a.pending_countersign,
+            named_by: a.named_by.map(Into::into),
+            added_by: a.added_by.map(Into::into),
+        };
+        Self {
+            paper: PaperRefView {
+                id: p.paper.id,
+                doi: p.paper.doi,
+                title: p.paper.title,
+            },
+            authors: p.authors.into_iter().map(author).collect(),
+            pending_authors: p.pending_authors.into_iter().map(author).collect(),
+            added_authors: p.added_authors.into_iter().map(author).collect(),
+            authors_truncated: p.authors_truncated,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::Ingester> for IngesterView {
+    fn from(i: epigraph_db::Ingester) -> Self {
+        Self {
+            agent: i.agent.into(),
+            human: i.human.map(Into::into),
+            paper_id: i.paper_id,
+            created_claim: i.created_claim,
+            recorded_at: i.recorded_at,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::AuthoredBy> for AuthoredByView {
+    fn from(b: epigraph_db::AuthoredBy) -> Self {
+        let papers = |v: Vec<epigraph_db::PaperAuthorship>| v.into_iter().map(Into::into).collect();
+        let ingesters = |v: Vec<epigraph_db::Ingester>| v.into_iter().map(Into::into).collect();
+        match b {
+            epigraph_db::AuthoredBy::Agent(a) => {
+                let f = FilerView::from(a.filer);
+                let c = a.corroboration;
+                Self::Agent {
+                    agent: f.agent,
+                    human: f.human,
+                    prompt_snapshot: f.prompt_snapshot,
+                    corroborated_by: papers(c.corroborated_by),
+                    corroborated_by_truncated: c.corroborated_by_truncated,
+                    ingesters: ingesters(c.ingesters),
+                    ingesters_truncated: c.ingesters_truncated,
+                }
+            }
+            epigraph_db::AuthoredBy::Literature(l) => {
+                let c = l.corroboration;
+                Self::Literature {
+                    paper: l.paper.into(),
+                    ingested_by: l.ingested_by.into(),
+                    corroborated_by: papers(c.corroborated_by),
+                    corroborated_by_truncated: c.corroborated_by_truncated,
+                    ingesters: ingesters(c.ingesters),
+                    ingesters_truncated: c.ingesters_truncated,
+                }
+            }
+        }
+    }
 }
 
 impl From<Claim> for ClaimResponse {
@@ -246,6 +510,7 @@ impl From<Claim> for ClaimResponse {
             group_id: None,
             labels: Vec::new(),
             was_created: false,
+            authored_by: None,
         }
     }
 }
@@ -1147,6 +1412,7 @@ pub async fn create_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        authored_by: None,
     };
 
     Ok(Json(response))
@@ -1300,6 +1566,21 @@ pub async fn get_claim(
             message: format!("Failed to query claim encryption: {e}"),
         })?;
 
+    // Who wrote it, on the same stamped connection: the asserting documents'
+    // authors under this caller's edge visibility, the filer's human from its
+    // binding, the prompt snapshot through the audience
+    // `PROMPT_SNAPSHOT_AUDIENCE` names (ruled: the prompt-history gate).
+    // Only reached for a claim the caller has just read.
+    let authored_by = epigraph_db::AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim.id.as_uuid(),
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
+    )
+    .await?;
+
     drop(read);
 
     // `trace_readable = true` keeps GET's wire unchanged: it still names the
@@ -1307,7 +1588,10 @@ pub async fn get_claim(
     // /api/v1/claims/batch-get` checks the trace against the viewer
     // (`ReasoningTraceRepository::readable_ids`) and passes the answer here;
     // doing the same on GET is a separate, wire-changing follow-up.
-    let response = claim_response_for_read(claim, labels, encryption, true);
+    let mut response = claim_response_for_read(claim, labels, encryption, true);
+    // GET only: `POST /api/v1/claims/batch-get` shares the body above and
+    // carries no `authored_by` (the field is omitted there).
+    response.authored_by = Some(authored_by.into());
 
     // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
     // so reaching this line means the claim is readable; the post-pass that
@@ -1376,6 +1660,7 @@ pub async fn get_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        authored_by: None,
     };
 
     Ok(Json(response))

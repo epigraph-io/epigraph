@@ -17,7 +17,9 @@ use crate::routes::admin::{
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
 use crate::routes::claims::{
-    ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse,
+    AuthorRefView, AuthoredByView, ClaimResponse, FilerView, IngesterView, PaperAuthorView,
+    PaperAuthorshipView, PaperRefView, PatchClaimRequest, PromptSnapshotView, UpdateLabelsRequest,
+    UpdateLabelsResponse,
 };
 use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
@@ -92,6 +94,7 @@ use workflow_schema_stubs::{
         supersede_claim_doc,
         mark_duplicate_doc,
         unmark_duplicate_doc,
+        get_claim_doc,
         patch_claim_doc,
         update_labels_doc,
         evolve_step_doc,
@@ -134,6 +137,14 @@ use workflow_schema_stubs::{
             UndedupResponse,
             PatchClaimRequest,
             ClaimResponse,
+            AuthoredByView,
+            AuthorRefView,
+            PromptSnapshotView,
+            FilerView,
+            IngesterView,
+            PaperAuthorshipView,
+            PaperRefView,
+            PaperAuthorView,
             UpdateLabelsRequest,
             UpdateLabelsResponse,
             EvolveStepRequest,
@@ -394,6 +405,42 @@ async fn mark_duplicate_doc() {}
     security(("ed25519_signature" = []))
 )]
 async fn unmark_duplicate_doc() {}
+
+/// Read one claim (doc stub)
+///
+/// A claim the caller may not read is 404, exactly as an id with no claim.
+/// The response carries `authored_by`, tagged by `source`. `agent` (no
+/// readable creation record names a document): `agent` (the filer, the
+/// author), `human` (the human the agent was bound to when it filed the
+/// claim, read from the binding record, never from an `OPERATED_BY` edge)
+/// for every reader, and `prompt_snapshot` only for the agent's linked human
+/// and admins (the prompt-history gate). `literature` (the document ingest
+/// recorded at creation that a document's ingest created the claim):
+/// `paper` (that document and its authors: the claim's primary authors are
+/// the ones its creating ingest recorded at creation, each on that ingest's
+/// own authorship of the document; authors an ingester named without their
+/// countersignature are listed apart under `pending_authors`, and authors a
+/// later ingest of the same document that also recorded the claim added
+/// under `added_authors` with `added_by`, neither ever primary; only the
+/// ingests that recorded the claim contribute authors) and `ingested_by` (the
+/// filer, with the same three parts). Both carry `corroborated_by` (every
+/// other readable document whose ingest recorded the claim) and `ingesters`
+/// (every readable ingest, each with the human its agent was bound to then).
+/// A bare `asserts` edge no ingest recorded is not read. A part the caller
+/// may not see is `null`, exactly as a part that does not exist.
+#[utoipa::path(
+    get,
+    path = "/api/v1/claims/{id}",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim")),
+    responses(
+        (status = 200, body = ClaimResponse),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+    )
+)]
+async fn get_claim_doc() {}
 
 /// Find agents by name (doc stub)
 ///

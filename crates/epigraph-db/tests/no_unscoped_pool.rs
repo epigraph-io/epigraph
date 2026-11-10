@@ -340,7 +340,6 @@
 //!   recompute_claim_belief}`, `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
-//!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
 //!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
 //!   agent_is_not_operated, agent_may_receive, deliver_event}`,
 //!   `routes/workflows.rs::{get_or_create_system_agent,
@@ -757,7 +756,16 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `epigraph-api/tests/http_public_only_reads.rs`. The files are disjoint from
 /// the entry above, so the merged count is 221 - 10, confirmed by this test on
 /// the merged tree.
-const HIGH_WATER: usize = 211;
+/// 221 -> 220 on its own branch: `set_provenance` holds a `Viewer` and runs every read and
+/// write on the caller's stamped transaction, its organization helper on that
+/// connection; `routes/provenance.rs` reached zero and its key was DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+///
+/// Staging merge (integration/20261109) of both entries above: they are
+/// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
+/// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
+/// equal to the `UNCONVERTED` table this test sums.
+const HIGH_WATER: usize = 210;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -823,7 +831,9 @@ const HIGH_WATER: usize = 211;
 /// 42 -> 41 when `routes/challenge.rs` reached zero (backlog 2f2eeaea).
 /// 41 -> 40 when `routes/groups.rs` reached zero (backlog 323773fe).
 /// 40 -> 39 when `routes/graph_query.rs` reached zero (HTTP public-only reads).
-const HIGH_WATER_FILES: usize = 39;
+/// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
+/// caller's stamped transaction; merged with the line above on staging).
+const HIGH_WATER_FILES: usize = 38;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1075,7 +1085,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
     ("routes/political.rs", 5),
-    ("routes/provenance.rs", 1),
     ("routes/rag.rs", 2),
     // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
     // loader moved onto `AppState::read_as` and

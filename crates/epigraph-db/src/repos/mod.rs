@@ -16,6 +16,7 @@ pub mod alternative_set;
 pub mod analysis;
 pub mod atlas_layout;
 pub mod atom_axiom;
+pub mod authored_by;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
@@ -23,6 +24,7 @@ pub mod challenge;
 pub mod claim;
 pub mod claim_context;
 pub mod claim_encryption;
+pub mod claim_ingest;
 pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
@@ -103,6 +105,7 @@ pub use admin_scope_enforcement::{
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
+    SpeaksFor,
 };
 pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
@@ -113,7 +116,7 @@ pub use agent_identity::{
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use agent_lookup::{
     AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef, AgentSearchHit,
-    CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+    AuthorNode, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
 };
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
@@ -124,6 +127,11 @@ pub use atlas_layout::{
     PublicThemeCentroid, PublicThemeLinkCount, RegionDetail, ThemePageCursor, ThemePlacement,
     UnplacedCursor, UnplacedPage, VisibleRegionRow, VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS,
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
+};
+pub use authored_by::{
+    AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
+    PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
@@ -145,6 +153,14 @@ pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
+pub use claim_ingest::{
+    credited_agent_end, ingest_only_edge_refusal, is_agent_attribution,
+    staged_provenance_refusal_sql, ClaimIngestRecord, ClaimIngestRepository, ClaimIngests,
+    CreditedEnd, AGENT_ATTRIBUTION_REFUSAL, AGENT_SOURCE_AUTHORSHIP, AGENT_TARGET_AUTHORSHIP,
+    CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY, INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED,
+    INGEST_RECORD_RELATIONSHIP, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
+};
+pub use claim_ingest::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
     DistantClaimsRow, NeighbourhoodThemeCoverage, RecomputedThemeRow, SplitCandidateRow,
@@ -199,7 +215,12 @@ pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
-pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
+pub use paper::{
+    AssertedClaimRow, IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing,
+    PaperIngestPrincipal, PaperRepository, PaperRow, AUTHORED_EXPLICIT_KEY,
+    AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY, AUTHORED_REPLACES_KEY,
+    AUTHORED_REPLACES_KEY_RESERVED,
+};
 pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,

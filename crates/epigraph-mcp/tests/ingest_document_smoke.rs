@@ -1106,6 +1106,7 @@ async fn query_paper_json(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) ->
             doi: doi.to_string(),
             limit: None,
             offset: None,
+            ingested_by: None,
         },
     )
     .await

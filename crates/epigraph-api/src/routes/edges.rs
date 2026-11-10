@@ -685,6 +685,17 @@ pub struct NeighborhoodResponse {
 /// - source_type and target_type must be valid entity types
 /// - relationship must be from the allowed set; `supersedes`, in any
 ///   spelling, is refused by name ([`SUPERSEDES_ACT_ONLY`])
+/// - the document ingest's own provenance (a paper's `asserts` or
+///   `authored`, `authored` into a paper, `ingested_claim`), in any
+///   spelling, is refused by name (`epigraph_db::INGEST_ONLY_REFUSAL`, 400)
+/// - `OPERATED_BY`, in any spelling, is refused by name: only recording an
+///   operator link writes it (`epigraph_db::OPERATED_BY_REFUSAL`, 400)
+/// - an edge that credits an agent with content, in either direction
+///   (`epigraph_db::credited_agent_end`: `asserts` / `AUTHORED` /
+///   `generated` FROM an agent; `attributed_to` / `authored_by` /
+///   `ORIGINATED_BY` / `AMPLIFIED_BY` / `GENERATED_BY` / `interpreted_by`
+///   ONTO one) only from that agent or the human operating it through a live
+///   binding (403 otherwise)
 #[cfg(feature = "db")]
 pub async fn create_edge(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -750,6 +761,33 @@ pub async fn create_edge(
             reason: SUPERSEDES_ACT_ONLY.to_string(),
         });
     }
+    // The document ingest's own provenance, by name and in any spelling: a
+    // paper's `asserts` onto a claim, any `authored` edge into a paper, and
+    // the ingest record. Readers take these as what an ingest wrote (who the
+    // paper's authors are, which document created a claim), so a generic
+    // writer never writes them, whoever it is.
+    if let Some(reason) = epigraph_db::ingest_only_edge_refusal(
+        &request.source_type,
+        &request.target_type,
+        &request.relationship,
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: reason.to_string(),
+        });
+    }
+    // The operator link's own edge, in any spelling: who operates an agent is
+    // read from the link record, and a generic OPERATED_BY edge would only be
+    // a forgeable copy of it.
+    if request
+        .relationship
+        .eq_ignore_ascii_case(epigraph_db::OPERATED_BY_RELATIONSHIP)
+    {
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: epigraph_db::OPERATED_BY_REFUSAL.to_string(),
+        });
+    }
     if !is_valid_relationship(&request.relationship) {
         return Err(ApiError::ValidationError {
             field: "relationship".to_string(),
@@ -790,6 +828,35 @@ pub async fn create_edge(
             entity: request.target_type.clone(),
             id: request.target_id.to_string(),
         });
+    }
+
+    // An edge that credits an agent with content puts words in that agent's
+    // mouth, whichever way it points (`agent -asserts-> claim`, or
+    // `claim -attributed_to-> agent`), and an agent's edge lands world-owned,
+    // so neither the agent nor the writer could take it back. Only the agent
+    // itself, or the human operating it through a live binding, may write
+    // one: the rule the document ingest applies to its explicit authors
+    // (`AgentRepository::speaks_for`). No admin arm.
+    if let Some(end) = epigraph_db::credited_agent_end(
+        &request.source_type,
+        &request.target_type,
+        &request.relationship,
+    ) {
+        let credited = match end {
+            epigraph_db::CreditedEnd::Source => request.source_id,
+            epigraph_db::CreditedEnd::Target => request.target_id,
+        };
+        let speaks = match auth.agent_id {
+            Some(caller) => epigraph_db::AgentRepository::speaks_for(&mut *tx, caller, &[credited])
+                .await?
+                .contains_key(&credited),
+            None => false,
+        };
+        if !speaks {
+            return Err(ApiError::Forbidden {
+                reason: epigraph_db::AGENT_ATTRIBUTION_REFUSAL.to_string(),
+            });
+        }
     }
 
     // Branch on if_not_exists: drainer / outbox callers opt in to
@@ -2354,6 +2421,9 @@ pub async fn graph_full(
 pub struct EvidenceDetailResponse {
     pub id: Uuid,
     pub claim_id: Option<Uuid>,
+    /// The agent that signed the evidence when it was stored (its own
+    /// record, `evidence.signer_id`); `null` for unsigned evidence. Never
+    /// read from an `agent -> evidence` edge, which any caller can post.
     pub agent_id: Option<Uuid>,
     pub evidence_type: String,
     pub content: Option<String>,
@@ -2444,18 +2514,14 @@ pub async fn get_evidence(
 
     let props = &row.properties;
 
-    // Extract claim_id and agent_id from edges pointing to this evidence
+    // The claim from the edge pointing to this evidence. The AGENT is the
+    // row's own record (its signer, stored with its signature by the writer),
+    // never the source of an `agent -> evidence` edge: any edges:write caller
+    // may post `supports` / `derived_from` / `uses_evidence` / `relates_to`
+    // from any agent onto any evidence (none credits the agent), so an edge
+    // would let a stranger name a person as the evidence's agent.
     let claim_edge: Option<SourceIdRow> = sqlx::query_as(
         "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'claim' LIMIT 1"
-    )
-    .bind(evidence_id)
-    .fetch_optional(&mut *read)
-    .await
-    .ok()
-    .flatten();
-
-    let agent_edge: Option<SourceIdRow> = sqlx::query_as(
-        "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'agent' LIMIT 1"
     )
     .bind(evidence_id)
     .fetch_optional(&mut *read)
@@ -2485,7 +2551,7 @@ pub async fn get_evidence(
     let response = EvidenceDetailResponse {
         id: row.id,
         claim_id: claim_edge.map(|r| r.source_id),
-        agent_id: agent_edge.map(|r| r.source_id),
+        agent_id: row.signer_id,
         evidence_type: ev_type,
         content,
         content_hash: hex::encode(&row.content_hash),
@@ -2993,6 +3059,90 @@ mod tests {
     // db_tests `is_valid_entity_type_covers_all_seeded_types` (all 23 seeded
     // types incl. the 6 DB-only ones; rejects 'invalid'/''/'CLAIM'). A pure
     // no-DB unit test can no longer populate the cache.
+
+    /// Every relationship a caller may write, sorted into: credits an agent
+    /// with content (gated by `epigraph_db::credited_agent_end`), the
+    /// document ingest's or the operator link's own (refused by name), or
+    /// neither, with the reason. A relationship added to
+    /// [`VALID_RELATIONSHIPS`] fails this test until it is sorted.
+    #[test]
+    fn every_relationship_is_sorted_for_agent_credit() {
+        // Relations between claims, syntheses, traces, frames and other
+        // non-agent nodes: an agent endpoint is not what they mean, and no
+        // reader takes one as the agent's statement (the evidence detail's
+        // agent is the evidence row's signer, not an `agent -> evidence`
+        // edge).
+        const STRUCTURAL: &[&str] = &[
+            "supports",
+            "contradicts",
+            "corroborates",
+            "refutes",
+            "relates_to",
+            "generalizes",
+            "specializes",
+            "elaborates",
+            "derived_from",
+            "uses_evidence",
+            "challenges",
+            "WITHIN_FRAME",
+            "SCOPED_BY",
+            "PERSPECTIVE_OF",
+            "MEMBER_OF",
+            "CONTRIBUTES_TO",
+            "DERIVED_FROM",
+            "RELATES_TO",
+            "COORDINATED_WITH",
+            "USES_TECHNIQUE",
+            "MIRROR_NARRATIVE",
+            "alternative_of",
+            "same_source",
+            "decomposes_to",
+            "justifies",
+            "section_follows",
+            "continues_argument",
+            "same_as",
+            "refines",
+            "cites",
+            "qualifies",
+            "EQUIVALENT_TO",
+            "revises",
+            "enables",
+            "has_method_capability",
+            "concludes",
+            "HAS_TRACE",
+            "OBSERVED_DURING",
+            "INFORMS",
+            "BLOCKS",
+            "GOVERNS",
+            "FAILED_TO_COMPLETE",
+            "RESOLVED_BY",
+            "WAS_DERIVED_FROM",
+            "REFINES",
+            "COMPOSED_OF",
+            "METHODOLOGY",
+            "INSTANTIATES",
+        ];
+        // Relations between agents and organizations, or an activity's
+        // participants: they credit no agent with any claim's content.
+        const BETWEEN_AGENTS: &[&str] = &[
+            "AFFILIATED_WITH",
+            "EMPLOYED_BY",
+            "MANUFACTURED_BY",
+            "associated_with",
+        ];
+        for r in VALID_RELATIONSHIPS {
+            let credits = epigraph_db::credited_agent_end("agent", "claim", r).is_some()
+                || epigraph_db::credited_agent_end("claim", "agent", r).is_some();
+            let reserved = r.eq_ignore_ascii_case(epigraph_db::OPERATED_BY_RELATIONSHIP)
+                || epigraph_db::ingest_only_edge_refusal("paper", "claim", r).is_some();
+            let neither = STRUCTURAL.contains(r) || BETWEEN_AGENTS.contains(r);
+            assert_eq!(
+                u8::from(credits) + u8::from(reserved && !credits) + u8::from(neither),
+                1,
+                "{r}: sort it into exactly one of credited, reserved or neither"
+            );
+        }
+    }
 
     #[test]
     fn test_valid_relationships() {

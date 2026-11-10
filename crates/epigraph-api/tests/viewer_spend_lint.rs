@@ -489,11 +489,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write on a transaction stamped with the caller's viewer: the endpoint
     // existence checks run on it, and the edge trigger and WITH CHECK decide
-    // the write.
+    // the write. `AgentRepository::speaks_for` is an authority check, not a
+    // read of tenant content: is the caller the agent an asserts/AUTHORED
+    // edge comes from, or its human through a live binding (migration 149's
+    // binding records, identity data every session reads).
     (
         "edges.rs",
         "create_edge",
         &[
+            "AgentRepository::speaks_for",
             "EdgeRepository::create_if_not_exists_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_symmetric_if_absent_row_signed_conn",
@@ -526,15 +530,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "provenance::record_provenance",
         ],
     ),
-    // stamped: the edges naming an evidence row already read through the
-    // viewer (F-edges-unfiltered owns their predicate).
+    // stamped: the claim edge naming an evidence row already read through
+    // the viewer (F-edges-unfiltered owns its predicate). The agent is the
+    // row's own signer, read with the row, not from an edge.
     (
         "edges.rs",
         "get_evidence",
-        &[
-            "sqlx::query_as(SELECT).fetch_optional",
-            "sqlx::query_as(SELECT).fetch_optional",
-        ],
+        &["sqlx::query_as(SELECT).fetch_optional"],
     ),
     (
         "edges.rs",
@@ -1017,6 +1019,27 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "log_manifest_read",
             "maintenance",
             "require_plan_authority",
+        ],
+    ),
+    // write on a transaction stamped with the caller's viewer: the claim is
+    // read through the viewer; the rest is identity data every session reads
+    // (the agent a name or ORCID derives, the system-agent registry) and the
+    // authority check `AgentRepository::speaks_for` (is the caller the claim's
+    // filer, each author and the ingestion agent, or its human through a live
+    // binding), then the four edge writes and the organization agent, which
+    // the edge trigger and WITH CHECK decide.
+    (
+        "provenance.rs",
+        "set_provenance",
+        &[
+            "AgentRepository::get_by_public_key",
+            "AgentRepository::speaks_for",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "SystemAgentRepository::registered_agent_ids",
+            "find_or_create_org_agent",
         ],
     ),
     // no SQL: the query embedding.
