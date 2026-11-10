@@ -154,15 +154,17 @@ CREATE TABLE public.bug_report_intake_settings (
 COMMENT ON TABLE public.bug_report_intake_settings IS
     'Migration 207: the bug-report intake. One row (singleton = true): the group every report '
     'is owned by and the per-reporter limits. Absent means no intake (BUG03). Written on a '
-    'maintenance session only; the application role holds no privilege on it.';
+    'maintenance session only; the application role may only read it.';
 
 REVOKE ALL ON public.bug_report_intake_settings FROM PUBLIC;
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         -- 077's ALTER DEFAULT PRIVILEGES handed the app role DML on the new
-        -- table; take all of it back. The definers read the row in their own
-        -- frame.
+        -- table; take it back and leave SELECT (every relation is
+        -- app-readable; which group is the intake is not a secret, and reading
+        -- it admits nothing). The definers read the row in their own frame.
         EXECUTE 'REVOKE ALL ON public.bug_report_intake_settings FROM epigraph_app';
+        EXECUTE 'GRANT SELECT ON public.bug_report_intake_settings TO epigraph_app';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON public.bug_report_intake_settings '

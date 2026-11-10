@@ -235,6 +235,19 @@ fn unit_vector(at: usize) -> String {
 
 // ─── the write ──────────────────────────────────────────────────────────
 
+/// `(agent_id, owner_group_id, visibility, labels, content, content_hash,
+/// trace_id, is_current)` of one claim.
+type ClaimRow = (
+    Uuid,
+    Uuid,
+    String,
+    Vec<String>,
+    String,
+    Vec<u8>,
+    Option<Uuid>,
+    bool,
+);
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_files_into_the_intake_group_privately_as_itself(pool: PgPool) {
     let w = world(&pool).await;
@@ -248,16 +261,7 @@ async fn a_non_member_files_into_the_intake_group_privately_as_itself(pool: PgPo
         .await
         .expect("a bound non-member files a report");
 
-    let (agent, owner, vis, labels, content, hash, trace, current): (
-        Uuid,
-        Uuid,
-        String,
-        Vec<String>,
-        String,
-        Vec<u8>,
-        Option<Uuid>,
-        bool,
-    ) = sqlx::query_as(
+    let (agent, owner, vis, labels, content, hash, trace, current): ClaimRow = sqlx::query_as(
         "SELECT agent_id, owner_group_id, visibility::text, labels, content, content_hash, \
                 trace_id, is_current FROM claims WHERE id = $1",
     )
@@ -586,19 +590,12 @@ async fn session_temporary_relations_do_not_reach_the_definer(pool: PgPool) {
         .await
         .expect("grant log");
     for t in shadowed {
-        // The application role holds no privilege on the settings table, so
-        // its shadow is spelled out rather than copied.
-        let shape = if t == "bug_report_intake_settings" {
-            "(singleton boolean NOT NULL DEFAULT true, intake_group_id uuid, \
-              per_hour integer, per_day integer)"
-                .to_string()
-        } else {
-            format!("(LIKE public.{t} INCLUDING DEFAULTS)")
-        };
-        sqlx::query(&format!("CREATE TEMP TABLE {t} {shape}"))
-            .execute(&mut *tx)
-            .await
-            .unwrap_or_else(|e| panic!("shadow {t}: {e}"));
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE {t} (LIKE public.{t} INCLUDING DEFAULTS)"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap_or_else(|e| panic!("shadow {t}: {e}"));
         sqlx::query(&format!("GRANT ALL ON pg_temp.{t} TO epigraph_maintenance"))
             .execute(&mut *tx)
             .await
