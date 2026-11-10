@@ -305,7 +305,7 @@ async fn the_answer_is_a_receipt_and_the_reporter_reads_nothing_back(pool: PgPoo
     .expect("an ordinary claim with the same text");
     let text = first_text(&r).to_string();
     assert!(
-        !text.contains(&id.to_string()) && !text.contains(&again["claim_id"].as_str().unwrap()),
+        !text.contains(&id.to_string()) && !text.contains(again["claim_id"].as_str().unwrap()),
         "submit_claim must not hand back an intake report: {text}"
     );
 }
