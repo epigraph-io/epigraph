@@ -211,6 +211,33 @@ pub struct GetWorkflowPlanParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindAgentParams {
+    #[schemars(
+        description = "The name to look up (2 to 200 characters), or an ORCID / ROR id. Case-insensitive and accent-folded: 'jose nunez' finds 'José Núñez'."
+    )]
+    pub name: String,
+    #[schemars(
+        description = "Optional: keep only agents of this kind: human, llm_agent, system, role, ingest_author or unknown. Kind is derived from evidence you may see, never from the legacy agent_type column."
+    )]
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Optional: keep only agents holding this role ('role:<key>' or '<key>')."
+    )]
+    #[serde(default)]
+    pub role: Option<String>,
+    #[schemars(description = "Optional: at most this many results (default 10, at most 25).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetAgentParams {
+    #[schemars(description = "The UUID of the agent (for example a claim's agent_id).")]
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,

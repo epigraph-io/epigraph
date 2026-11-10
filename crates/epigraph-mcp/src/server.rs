@@ -1400,6 +1400,32 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Find a person, an LLM agent or a system identity by NAME (or by exact ORCID / ROR id). Case-, accent- and punctuation-folded (Jean-Pierre = jean pierre, O'Brien = OBrien); an ORCID matches with or without hyphens or the orcid.org prefix; ranked orcid/ror > exact > prefix (of the name or one of its words) > similar (trigram), then oldest first. Display names collide (many agents share a name), so each result carries what tells them apart: id, display_name, kind (human / llm_agent / system / role / ingest_author / unknown, derived from evidence you may see: a registered human (shown to that human, admins, and everyone when it holds a disclosed role), an LLM model on a visible profile, a binding to a human, the system registry, the document ingest's name-derived author key), kind_evidence, roles (open assignments of non-elevating, non-audit roles, plus your own), orcid / ror_id (when the profile is visible to you), operator_human (the human the agent is currently bound to, {id, display_name}, shown to every reader: its live operator link, else its unrevoked client allowance; null once the link is retired or the allowance revoked; never read from an OPERATED_BY edge; the agent's model and prompt are not on the card), created_at, and counts (authored_papers: papers it has an authorship of that is not awaiting its countersignature (a name-derived author is never countersigned and never pending); pending_authored_papers: papers an ingester named it on, awaiting its countersignature, where it has no other authorship; asserted_claims: claims it filed, plus each claim an ingest that named it as an author attributes to it, that ingest's authorship, paper assertion and attribution all written by ingests of the same principal, so another ingest of the same DOI that does not name it credits it with nothing; each paper and claim counted once; only in-force edges carrying the document ingest's ingest-written marker count, which no other writer can set, so an edge written by any other path never counts whatever its shape, and edges ingested before the marker existed do not count until backfilled; computed only over what you can read, capped at 10000 with capped=true), plus tier and score. kind and role filters apply before the limit; candidates_truncated=true means more than 200 agents matched, so narrow the name. Matches display_name as written (a display_name that is an email address matches like any name); never searches properties or contact fields (full_name, email, affiliations). Same rules as GET /api/v1/agents/search."
+    )]
+    async fn find_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::FindAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::find_agent(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Look up one agent by id (for example the agent_id of a claim, to name who filed it). Returns the same card as find_agent: id, display_name, kind and kind_evidence, roles, orcid / ror_id (visible profiles only), operator_human (the human it is currently bound to, shown to every reader; null once its link is retired), created_at and counts computed over what you can read. An id with no agent is an invalid_params error (agent <id> not found), as get_claim reports a missing claim."
+    )]
+    async fn get_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::GetAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::get_agent(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Retrieve a single epistemic claim by its UUID, including full epistemic state and `source_urls`: the URLs of the evidence attached to it (empty when none)."
     )]
     async fn get_claim(

@@ -1089,10 +1089,15 @@ pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
     "properties.supersede_act is reserved for the AUTHORED edge a supersession \
      writes (supersede_claim, custodial-supersede); nothing was written";
 
-/// The edge `properties` keys only an act writes:
-/// [`DUPLICATE_IDENTITY_PROPERTY`] and [`SUPERSEDE_ACT_PROPERTY`].
-pub const RESERVED_EDGE_PROPERTIES: &[&str] =
-    &[DUPLICATE_IDENTITY_PROPERTY, SUPERSEDE_ACT_PROPERTY];
+/// The edge `properties` keys only an act or the document ingest writes:
+/// [`DUPLICATE_IDENTITY_PROPERTY`], [`SUPERSEDE_ACT_PROPERTY`] and
+/// [`crate::INGEST_WRITTEN_PROPERTY`] (which migration 198's guard also
+/// refuses in the database, for every writer).
+pub const RESERVED_EDGE_PROPERTIES: &[&str] = &[
+    DUPLICATE_IDENTITY_PROPERTY,
+    SUPERSEDE_ACT_PROPERTY,
+    crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY,
+];
 
 /// The refusal for an application edge write whose `properties` carry a key
 /// of [`RESERVED_EDGE_PROPERTIES`], or `None` when it carries none.
@@ -1102,6 +1107,11 @@ pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<
         Some(DEDUP_IDENTITY_KEY_RESERVED)
     } else if properties.get(SUPERSEDE_ACT_PROPERTY).is_some() {
         Some(SUPERSEDE_ACT_KEY_RESERVED)
+    } else if properties
+        .get(crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY)
+        .is_some()
+    {
+        Some(crate::repos::ingest_written::INGEST_WRITTEN_KEY_RESERVED)
     } else {
         None
     }

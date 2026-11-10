@@ -272,3 +272,74 @@ async fn concurrent_writers_under_two_spellings_of_a_new_doi_converge(pool: PgPo
     );
     assert_eq!(id, held_id);
 }
+
+/// A paper's authors and asserted claims are listed and counted once each,
+/// however many edges state the same fact. Each principal whose ingest of a
+/// paper names an author (or asserts a claim) keeps an edge of its own, so a
+/// paper ingested by two principals carries two `authored` edges for one
+/// author and two `asserts` edges for one claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn parallel_edges_list_each_author_and_claim_once(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let paper_id =
+        PaperRepository::get_or_create(&pool, "10.1234/parallel-edges", Some("Parallel"), None)
+            .await
+            .expect("create paper");
+    let author = AgentRepository::create(&pool, &make_agent(Some("Ysolde Pemberton")))
+        .await
+        .expect("create author")
+        .id;
+    let claim = ClaimRepository::create(
+        &pool,
+        &make_claim(author, "a twice-asserted finding", 0.5),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create claim")
+    .id;
+    let author: uuid::Uuid = author.into();
+    for _ in 0..2 {
+        EdgeRepository::create(
+            &pool,
+            author,
+            "agent",
+            paper_id,
+            "paper",
+            "authored",
+            Some(serde_json::json!({"position": 0})),
+            None,
+            None,
+        )
+        .await
+        .expect("authored edge");
+        EdgeRepository::create(
+            &pool,
+            paper_id,
+            "paper",
+            claim.into(),
+            "claim",
+            "asserts",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("asserts edge");
+    }
+
+    let authors = PaperRepository::list_authors(&pool, &viewer, paper_id)
+        .await
+        .expect("list_authors");
+    assert_eq!(authors.len(), 1, "an author listed twice: {authors:?}");
+    assert_eq!(
+        PaperRepository::count_asserted_claims(&pool, &viewer, paper_id)
+            .await
+            .expect("count_asserted_claims"),
+        1,
+        "a claim counted twice"
+    );
+    let claims = PaperRepository::list_asserted_claims(&pool, &viewer, paper_id, 10, 0)
+        .await
+        .expect("list_asserted_claims");
+    assert_eq!(claims.len(), 1, "a claim listed twice");
+}

@@ -208,7 +208,10 @@ impl PaperRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
-    /// Count the claims this paper asserts (`paper -asserts-> claim` edges).
+    /// Count the claims this paper asserts (`paper -asserts-> claim` edges),
+    /// each claim once: every principal whose ingest of the paper asserts a
+    /// claim keeps an edge of its own (`crate::ingest_written`), so one claim
+    /// can carry several.
     ///
     /// This alone under-counts a partially-ingested paper: `do_ingest_document`
     /// / `do_ingest_document_spine` label every claim `doi:<doi>` *before*
@@ -234,7 +237,7 @@ impl PaperRepository {
         // MACRO SITE — static three-bind spelling.
         let row = sqlx::query!(
             r#"
-            SELECT COUNT(*) AS "count!"
+            SELECT COUNT(DISTINCT target_id) AS "count!"
             FROM edges
             WHERE source_id = $1
               AND source_type = 'paper'
@@ -295,7 +298,8 @@ impl PaperRepository {
     }
 
     /// List the authors of a paper as `(agent_id, display_name)` pairs,
-    /// resolved via `agent -authored-> paper` edges.
+    /// resolved via `agent -authored-> paper` edges, each author once (every
+    /// principal whose ingest names an author keeps an edge of its own).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -308,7 +312,7 @@ impl PaperRepository {
         // MACRO SITE — static three-bind spelling.
         let rows = sqlx::query!(
             r#"
-            SELECT a.id AS "id!", a.display_name
+            SELECT DISTINCT a.id AS "id!", a.display_name
             FROM edges e
             JOIN agents a ON a.id = e.source_id
             WHERE e.target_id = $1
@@ -354,6 +358,9 @@ impl PaperRepository {
     /// [`Self::count_asserted_claims`] so a caller can tell a full page from
     /// the end of the set.
     ///
+    /// Each claim once (`SELECT DISTINCT`): every principal whose ingest of
+    /// the paper asserts a claim keeps an edge of its own.
+    ///
     /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry),
     /// so adding `OFFSET` needs no `cargo sqlx prepare`.
     ///
@@ -381,7 +388,7 @@ impl PaperRepository {
 
         let rows: Vec<Row> = sqlx::query_as(
             r#"
-            SELECT
+            SELECT DISTINCT
                 c.id,
                 c.content,
                 c.truth_value,
