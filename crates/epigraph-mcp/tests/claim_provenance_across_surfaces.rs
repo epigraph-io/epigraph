@@ -113,6 +113,8 @@ async fn ingest_wait(server: &EpiGraphMcpFull, pool: &PgPool, extraction: Docume
         IngestDocumentInlineParams {
             extraction,
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -363,7 +365,11 @@ async fn spine_wait(server: &EpiGraphMcpFull, pool: &PgPool, extraction: Documen
     tools::ingestion::ingest_document_spine(
         server,
         &viewer,
-        IngestDocumentSpineParams { extraction },
+        IngestDocumentSpineParams {
+            extraction,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
         None,
     )
     .await
@@ -579,6 +585,8 @@ async fn a_document_repeating_a_directly_filed_claim_leaves_the_filer_its_author
             reasoning: None,
             labels: vec![],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

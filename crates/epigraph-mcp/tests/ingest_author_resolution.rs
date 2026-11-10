@@ -277,6 +277,8 @@ async fn ingest_wait(
         IngestDocumentInlineParams {
             extraction,
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -626,6 +628,8 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
             IngestDocumentInlineParams {
                 extraction: doc(&doi, authors),
                 wait: None,
+                visibility: Some("public".to_string()),
+                group_id: None,
             },
             None,
         )
@@ -663,6 +667,8 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
         IngestDocumentParams {
             file_path: path.display().to_string(),
             wait: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -687,6 +693,8 @@ async fn a_bad_agent_id_is_refused_before_the_paper_row_on_the_queued_path(pool:
                 json!([{"name": "A Person", "agent_id": real.to_string()}]),
             ),
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -723,7 +731,11 @@ async fn spine(server: &EpiGraphMcpFull, pool: &PgPool, extraction: DocumentExtr
     let r = tools::ingestion::ingest_document_spine(
         server,
         &viewer,
-        IngestDocumentSpineParams { extraction },
+        IngestDocumentSpineParams {
+            extraction,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
         None,
     )
     .await
@@ -930,6 +942,8 @@ async fn an_mcp_server_refuses_to_replace_a_name_derived_author_and_writes_nothi
             IngestDocumentInlineParams {
                 extraction: again(),
                 wait,
+                visibility: Some("public".to_string()),
+                group_id: None,
             },
             None,
         )
@@ -1206,6 +1220,8 @@ async fn an_explicit_id_equal_to_another_entrys_name_derived_node_is_refused(poo
                 json!([{"name": "Someone Else", "agent_id": key.to_string()}, {"name": name}]),
             ),
             wait: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -1668,6 +1684,8 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
             reasoning: None,
             labels: vec![],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
