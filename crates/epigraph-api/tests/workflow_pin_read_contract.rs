@@ -112,6 +112,14 @@ fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("the vectors file parses")
 }
 
+/// The extraction with the explicit public tenancy, owned by `group` (an
+/// undeclared ingest is private to the caller's owner group).
+fn public_in(extraction: Value, group: Uuid) -> Value {
+    let mut body = extraction;
+    body["tenancy"] = json!({"visibility": "public", "owner_group_id": group});
+    body
+}
+
 fn uuid_of(v: &Value) -> Uuid {
     v.as_str()
         .unwrap_or_else(|| panic!("expected a uuid string, got {v}"))
@@ -489,7 +497,8 @@ struct PrivateWorkflow {
 }
 
 async fn private_workflow(pool: &PgPool, extraction: Value) -> PrivateWorkflow {
-    let (curator, _) = fixture::seed_agent_with_group(pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(pool, "workflow-plan-curator").await;
     let (writer, _) = fixture::seed_agent_with_group(pool, "workflow-plan-writer").await;
     let (reader, _) = fixture::seed_agent_with_group(pool, "workflow-plan-reader").await;
     let (stranger, _) = fixture::seed_agent_with_group(pool, "workflow-plan-stranger").await;
@@ -499,7 +508,12 @@ async fn private_workflow(pool: &PgPool, extraction: Value) -> PrivateWorkflow {
         .as_str()
         .expect("name")
         .to_string();
-    let out = api.ingest(&token(curator, WRITE_SCOPES), &extraction).await;
+    let out = api
+        .ingest(
+            &token(curator, WRITE_SCOPES),
+            &public_in(extraction.clone(), curator_own),
+        )
+        .await;
     let workflow_id = uuid_of(&out["workflow_id"]);
     let claims = restrict_plan(pool, workflow_id, g).await;
     PrivateWorkflow {
@@ -636,11 +650,14 @@ async fn a_non_member_reads_no_executes_edge_and_gets_404_per_claim(pool: PgPool
 /// integer, contiguous from 0, in the frozen order, each with its `level`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_ingest_writes_the_frozen_ids_and_integer_contiguous_plan_indices(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
     let v = vectors();
-    let out = api.ingest(&t, &v["extraction"]).await;
+    let out = api
+        .ingest(&t, &public_in(v["extraction"].clone(), curator_own))
+        .await;
     assert_eq!(uuid_of(&out["workflow_id"]), uuid_of(&v["workflow_id"]));
 
     let expected = v["plan"].as_array().unwrap();
@@ -702,11 +719,15 @@ async fn an_ingest_writes_the_frozen_ids_and_integer_contiguous_plan_indices(poo
 /// unindexed edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_add_step_append_to_a_public_plan_carries_the_next_plan_index(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
     let name = "acme-add-step-plan";
-    let wf = uuid_of(&api.ingest(&t, &small_extraction(name, 2)).await["workflow_id"]);
+    let wf = uuid_of(
+        &api.ingest(&t, &public_in(small_extraction(name, 2), curator_own))
+            .await["workflow_id"],
+    );
     let before = api.executes_edges(&t, wf).await;
     assert!(before
         .iter()
@@ -756,13 +777,20 @@ async fn an_add_step_append_to_a_public_plan_carries_the_next_plan_index(pool: P
 /// the authenticated caller of the ingest.
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_workflow_returns_the_submitter(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
     let api = Api::prod_shaped(&pool).await;
     let mut e = small_extraction("acme-submitter-plan", 1);
     // A caller-supplied submitter is stripped.
     e["source"]["metadata"] = json!({"epigraph_submitted_by": other.to_string()});
-    let wf = uuid_of(&api.ingest(&token(curator, WRITE_SCOPES), &e).await["workflow_id"]);
+    let wf = uuid_of(
+        &api.ingest(
+            &token(curator, WRITE_SCOPES),
+            &public_in(e.clone(), curator_own),
+        )
+        .await["workflow_id"],
+    );
 
     let (status, body) = api
         .get(
@@ -1016,12 +1044,17 @@ fn assert_operated_refusal(status: StatusCode, body: &Value, what: &str) {
 async fn workflow_authority_keeps_the_first_operator_because_a_relink_is_refused(pool: PgPool) {
     let (o1, og1) = fixture::seed_human_operator(&pool, "workflow-plan-o1").await;
     let (o2, _og2) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let server = mcp_server(&pool, 0x5E).await;
     let name = "acme-handover-plan";
     let curator_t = token(curator, WRITE_SCOPES);
-    api.ingest(&curator_t, &small_extraction(name, 1)).await;
+    api.ingest(
+        &curator_t,
+        &public_in(small_extraction(name, 1), curator_own),
+    )
+    .await;
 
     link_as_maintenance(&pool, curator, o1)
         .await
@@ -1142,15 +1175,16 @@ async fn plan_owners(pool: &PgPool, name: &str) -> Vec<Uuid> {
 /// * NOT a curator linked to the first human over REST: the REST ingest
 ///   refuses an operated agent's token. Over stdio it publishes, into the
 ///   first human's group;
-/// * NOT a curator linked to a SECOND human, on either transport: the REST
-///   ingest refuses its token as an operated agent's, and over stdio the
-///   caller check refuses it `OPL02` (it must belong to the system agent's
-///   human); it writes nothing on either. This is the nearest shipped shape of "a
-///   curator re-linked to a second human": the re-link itself is refused.
+/// * a curator linked to a SECOND human: the REST ingest refuses its token as
+///   an operated agent's; over stdio it publishes AS ITSELF into the SECOND
+///   human's group, never the first's. (Workflow writes are made as the
+///   caller; this used to be an `OPL02` refusal, because every write went
+///   through the system agent linked to the first human.) The re-link of a
+///   curator to a second human is still refused.
 #[sqlx::test(migrations = "../../migrations")]
-async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
+async fn armed_publishing_is_bound_to_each_callers_own_human(pool: PgPool) {
     let (o1, og1) = fixture::seed_human_operator(&pool, "workflow-plan-o1").await;
-    let (o2, _) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
+    let (o2, og2) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
     let system = {
         let mut conn = pool.acquire().await.expect("acquire");
         epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
@@ -1222,7 +1256,7 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
     assert_relink_refused(&pool, first_curator, o2).await;
 
     // The second human's curator: refused by the REST ingest as an operated
-    // agent, OPL02 over stdio, nothing written on either.
+    // agent; over stdio it publishes as itself, into the second human's group.
     let (s, b) = api
         .post(
             "/api/v1/workflows/ingest",
@@ -1232,11 +1266,14 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
         .await;
     assert_operated_refusal(s, &b, "a curator of another human over REST");
     assert_eq!(workflows_named(&pool, "acme-armed-second-http").await, 0);
-    let refused = stdio_ingest(&second_server, &small_extraction("acme-armed-second", 1))
+    stdio_ingest(&second_server, &small_extraction("acme-armed-second", 1))
         .await
-        .expect_err("a curator of another human must not publish through the system agent");
-    assert!(refused.contains("OPL02"), "{refused}");
-    assert_eq!(workflows_named(&pool, "acme-armed-second").await, 0);
+        .expect("a curator of another human publishes as itself");
+    assert_eq!(
+        plan_owners(&pool, "acme-armed-second").await,
+        vec![og2],
+        "into its own human's group, never the first human's"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1296,18 +1333,23 @@ async fn an_app_role_session_that_sets_the_group_guc_reads_the_private_plan(pool
 
 /// (h) CHARACTERIZATION. `workflows`' row security (migration 183) admits an
 /// UPDATE of any row the session reads: the application role rewrites a
-/// public workflow's truth and its recorded submitter, and the
-/// workflow authority gate then honours the rewritten submitter (it reads the
-/// row) and refuses the original one.
+/// public workflow's truth and its recorded submitter, and the workflow
+/// authority gate then honours the rewritten submitter (it reads the row).
+/// The original submitter keeps its edit through the owner-group writer arm
+/// alone: it writes the row's owner group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
     let api = Api::prod_shaped(&pool).await;
     let name = "acme-rewritten-plan";
     let wf = uuid_of(
-        &api.ingest(&token(curator, WRITE_SCOPES), &small_extraction(name, 1))
-            .await["workflow_id"],
+        &api.ingest(
+            &token(curator, WRITE_SCOPES),
+            &public_in(small_extraction(name, 1), curator_own),
+        )
+        .await["workflow_id"],
     );
     let (s, b) = api
         .add_step(&token(other, WRITE_SCOPES), name, "other agent, before")
@@ -1362,9 +1404,20 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
         .await;
     assert_eq!(
         s,
-        StatusCode::FORBIDDEN,
-        "the original submitter is refused: {b}"
+        StatusCode::OK,
+        "the original submitter writes the row's owner group: {b}"
     );
+    let arm: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'arm' FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'workflow_id' = $1::text \
+            AND details->>'acting_agent' = $2::text",
+    )
+    .bind(wf)
+    .bind(curator)
+    .fetch_optional(&pool)
+    .await
+    .expect("the curator's provenance row");
+    assert_eq!(arm.as_deref(), Some("owner_group_writer"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

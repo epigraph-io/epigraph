@@ -108,6 +108,7 @@ async fn report_outcome_attributes_each_step_index_to_its_planned_step(pool: PgP
         &server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: Some(common::stdio_public_tenancy(&server).await),
             goal: "Plan order under one transaction".to_string(),
             steps: STEPS.iter().map(|s| (*s).to_string()).collect(),
             prerequisites: None,
@@ -192,6 +193,7 @@ async fn batched_head_resolution_assigns_step_index_in_plan_order(pool: PgPool) 
         &server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: Some(common::stdio_public_tenancy(&server).await),
             goal: "Plan order under one transaction".to_string(),
             steps: STEPS.iter().map(|s| (*s).to_string()).collect(),
             prerequisites: None,

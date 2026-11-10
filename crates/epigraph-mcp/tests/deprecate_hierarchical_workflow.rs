@@ -87,12 +87,19 @@ async fn ingest_extraction(
     extraction: WorkflowExtraction,
 ) -> Uuid {
     let canonical = extraction.source.canonical_name.clone();
+    // The explicit public tenancy in the writer's own group (the HTTP caller,
+    // or this server's agent on stdio): an undeclared ingest would be private
+    // to it, and these tests deprecate workflows other callers read.
+    let tenancy = match token {
+        Some(_) => common::public_tenancy_for(viewer),
+        None => common::stdio_public_tenancy(server).await,
+    };
     tools::workflow_ingest::ingest_workflow(
         server,
         viewer,
         IngestWorkflowParams {
             extraction,
-            tenancy: None,
+            tenancy: Some(tenancy),
             embed: None,
         },
         token,
@@ -632,11 +639,13 @@ async fn a_legacy_workflow_is_deprecated_only_through_the_audited_admin_arm(pool
         .expect("forget the submitter");
     let owned = executed(&pool, wf, &["0", "1", "2"]).await;
 
+    // A claims:write caller that does not write the row's owner group.
+    let (_stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let err = tools::workflows::deprecate_workflow(
         &server,
-        &owner_viewer,
+        &stranger_viewer,
         params(wf, false),
-        Some(&owner_token),
+        Some(&stranger_token),
     )
     .await
     .expect_err("claims:write alone may not deprecate a legacy workflow");
@@ -680,6 +689,39 @@ async fn a_legacy_workflow_is_deprecated_only_through_the_audited_admin_arm(pool
     .await
     .expect("audit row");
     assert_eq!(submitter_kind.as_deref(), Some("null"));
+
+    // A writer of the row's owner group (here the agent that ingested it) is
+    // admitted on a legacy row through the owner-group writer arm.
+    let own = ingest(
+        &pool,
+        &server,
+        &owner_viewer,
+        Some(&owner_token),
+        "u017-legacy-own",
+    )
+    .await;
+    sqlx::query("UPDATE workflows SET metadata = metadata - 'epigraph_submitted_by' WHERE id = $1")
+        .bind(own)
+        .execute(&pool)
+        .await
+        .expect("forget the submitter");
+    tools::workflows::deprecate_workflow(
+        &server,
+        &owner_viewer,
+        params(own, false),
+        Some(&owner_token),
+    )
+    .await
+    .expect("a writer of the owner group deprecates a legacy workflow");
+    let arm: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'arm' FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'workflow_id' = $1::text",
+    )
+    .bind(own)
+    .fetch_one(&pool)
+    .await
+    .expect("the provenance row");
+    assert_eq!(arm.as_deref(), Some("owner_group_writer"));
 }
 
 /// stdio is checked (backlog 222289f3, reversing the batch H-b bar): a stdio
@@ -769,6 +811,15 @@ async fn cascade_refuses_when_any_descendant_is_anothers(pool: PgPool) {
         "calibration: gen1 descends from gen0"
     );
     set_submitter(&pool, gen1, stranger).await;
+    // gen1's row is the stranger's too: owned by its group, so the owner of
+    // gen0 has neither the submitter nor the owner-group arm over it.
+    let stranger_group = common::personal_group_of(&pool, stranger).await;
+    sqlx::query("UPDATE workflows SET owner_group_id = $2 WHERE id = $1")
+        .bind(gen1)
+        .bind(stranger_group)
+        .execute(&pool)
+        .await
+        .expect("gen1 in the stranger's group");
     let gen0_claims = executed(&pool, gen0, &["0", "1", "2"]).await;
     assert!(
         !gen0_claims.is_empty(),
@@ -1198,9 +1249,10 @@ async fn an_unauthorized_deprecation_takes_no_lineage_lock(pool: PgPool) {
 ///
 /// The owner's call passes the pre-lock check, then waits on the target row,
 /// which another transaction holds while it re-records the submitter as a
-/// stranger. When that commits, the owner no longer has authority, and the
-/// call must refuse with nothing written. A fix that checks only before the
-/// lock deprecates on a stale grant.
+/// stranger and moves the row into the stranger's group. When that commits,
+/// the owner no longer has authority (neither the submitter nor a writer of
+/// the owner group), and the call must refuse with nothing written. A fix that
+/// checks only before the lock deprecates on a stale grant.
 #[sqlx::test(migrations = "../../migrations")]
 async fn authority_is_rechecked_under_the_lineage_lock(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
@@ -1220,17 +1272,20 @@ async fn authority_is_rechecked_under_the_lineage_lock(pool: PgPool) {
         "calibration: the workflow executes claims"
     );
 
+    let stranger_group = common::personal_group_of(&pool, stranger).await;
     let mut held = pool.begin().await.expect("begin the re-recording tx");
     sqlx::query(
         "UPDATE workflows \
-            SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($2::text)) \
+            SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($2::text)), \
+                owner_group_id = $3 \
           WHERE id = $1",
     )
     .bind(wf)
     .bind(stranger)
+    .bind(stranger_group)
     .execute(&mut *held)
     .await
-    .expect("re-record the submitter, uncommitted");
+    .expect("re-record the submitter and the owner group, uncommitted");
 
     let owner_call = tools::workflows::deprecate_workflow(
         &server,

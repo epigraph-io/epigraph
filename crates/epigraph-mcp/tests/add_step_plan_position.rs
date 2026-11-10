@@ -75,6 +75,7 @@ async fn an_inserted_step_is_at_its_position_for_every_plan_order_reader(pool: P
         &server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: Some(common::stdio_public_tenancy(&server).await),
             goal: goal.clone(),
             steps: STEPS.iter().map(|s| (*s).to_string()).collect(),
             prerequisites: None,

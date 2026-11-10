@@ -216,151 +216,44 @@ pub async fn begin_author_stamped_tx<'p>(
     })
 }
 
-/// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
-/// **workflow-ingest system agent's** viewer (the agent migration 148's
-/// `system_agents` registry names) — *not* from `server.agent_id()`.
+/// Begin the ONE transaction a WORKFLOW write runs in (`store_workflow`,
+/// `ingest_workflow`, `improve_workflow_hierarchy`, `add_step`, `delete_step`,
+/// `deprecate_workflow`, and the post-commit DS wiring of an ingest), stamped
+/// from the CALLER's own viewer: [`begin_author_stamped_tx`] for the request's
+/// write identity, exactly as every other writer tool.
 ///
-/// # Why this is a second entry point rather than a call to the one above
+/// # Why the caller and no longer the workflow-ingest system agent
 ///
-/// [`begin_author_stamped_tx`] resolves the author it is handed. The whole
-/// difficulty on this path is knowing WHICH author to hand it, and the answer is
-/// not the one every sibling tool uses. `store_workflow`, `ingest_workflow`,
-/// `improve_workflow_hierarchy`, `add_step` and `delete_step` all route through
-/// `epigraph-ingest-executor`, which authors every row as
-/// `get_or_create_system_agent` and owns it with
-/// `default_decl_for_author(system_agent)`. Migration 077's `WITH CHECK` asks
-/// about the ROW's owner group, so the caller's identity is the wrong question —
-/// MEASURED: stamping from the MCP server's own agent is refused exactly as
-/// being unstamped is. `epigraph_ingest_executor::system_agent_write_authority`
-/// carries that measurement and the bootstrap argument.
+/// These writes used to be authored by, and stamped from, ONE shared
+/// workflow-ingest system agent, and the caller was bound to that agent's
+/// human (`epigraph_ingest_executor::require_caller_write_authority`). Once
+/// the system agent was live-linked to one human operator, every OTHER human
+/// was refused `OPL02` ("holds no writer/admin membership in group <that
+/// operator's group>"), however fully it was onboarded into a team, and the
+/// rows of the one human it admitted landed in the operator's group under a
+/// shared identity. Now the executor authors every row as the caller
+/// (`epigraph_ingest_executor::execute_workflow_ingest_plan_in_group`,
+/// `epigraph_ingest_executor::add_step`) and owns it in a group the caller
+/// writes (`epigraph_ingest_executor::owner`), so the stamp is the caller's
+/// and the database's own checks (row security, migration 122's claims
+/// trigger) apply to the real writer. No caller can write into a group it
+/// does not write through any of these paths: the stamp is its own, and the
+/// executor re-checks a chosen group live on this transaction.
 ///
-/// It returns the system agent id alongside the transaction because callers need
-/// it for the post-commit embed: `embed_claim_author_stamped` must stamp from
-/// the SAME author that owns the row, and passing `server.agent_id()` there
-/// would render a `{WRITABLE:c}` predicate no row satisfies.
-///
-///
-/// # The caller's authority is checked at the call sites (batch H-b, H3)
-///
-/// This stamps the transaction with the SYSTEM agent's authority, which says
-/// nothing about the CALLER. Before batch H-b nothing on this path asked, so any
-/// `claims:write` caller could mutate any system-owned workflow (the harness's
-/// `delete_step` arm drove a step's truth to 0.05 with no relation between
-/// caller and workflow). The check now runs at every call site that mutates an
-/// EXISTING workflow, on this same transaction and before the plan walk:
-/// `add_step` / `delete_step` (MCP `tools::step_ops`, HTTP
-/// `/api/v1/workflows/steps` and `/steps/delete`) and a variant ingest
-/// (`improve_workflow_hierarchy`, or any extraction naming a parent). The rule,
-/// forward-only because `workflows` recorded no owner before, is
-/// `tools::workflow_authority`'s: a workflow created since H-b records its
-/// submitter, and only the submitter, its operator, or `claims:admin` may change
-/// it; a workflow with no record is platform corpus, mutable only through the audited `claims:admin` path
-/// (U005). The system-agent stamp is unchanged for the rows these writes make;
-/// the caller is recorded in a `security_events` provenance row on the same
-/// transaction (`tools::workflow_authority::record_workflow_write`).
-///
-/// # The CALLER is bound before anything is written (migration 122)
-///
-/// The claims trigger sees only the system agent, which is bound once it is
-/// live-linked, whoever called. So this binds `caller` itself, on the stamped
-/// transaction it returns
-/// ([`epigraph_ingest_executor::require_caller_write_authority`]): once the
-/// database is armed an unbound caller is refused (`OPL01`), and a caller whose
-/// human does not write the group the system agent's rows land in is refused
-/// (`OPL02`), so another human's caller cannot write into the linked human's
-/// group through the shared identity. Both map to `INVALID_REQUEST`.
+/// The authority over an EXISTING workflow (`tools::workflow_authority`: the
+/// submitter, its operator, or the audited admin arm) is unchanged and still
+/// checked at every call site on this transaction, before the write.
 ///
 /// # Errors
-/// * `McpError::internal_error` if the system agent has no write authority (see
-///   `system_agent_write_authority`) — a loud refusal, nothing written.
-/// * `INVALID_REQUEST` for the caller refusals above.
-/// * `McpError::internal_error` if this process was not built from a
-///   [`epigraph_db::ScopedPool`], or if `BEGIN` / the GUC stamp fails. Never a
-///   fallback to the unstamped pool.
-pub async fn begin_system_ingest_stamped_tx<'p>(
+/// As [`begin_author_stamped_tx`]: no `ScopedPool`, an unresolvable viewer, an
+/// author with no writable group, or a failed `BEGIN` / stamp. Never a
+/// fallback to the unstamped pool.
+pub async fn begin_caller_workflow_tx<'p>(
     server: &'p EpiGraphMcpFull,
+    caller: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
-    caller: uuid::Uuid,
-) -> Result<(uuid::Uuid, epigraph_db::ScopedTx<'p>), McpError> {
-    let scoped = server.scoped.as_ref().ok_or_else(|| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            "write refused: this MCP process was not built from a ScopedPool, so no connection \
-             can be stamped with the ingest system agent's tenancy context. Refusing rather than \
-             walking the plan on the unstamped pool, where a cleanly-migrated schema refuses the \
-             first claim INSERT and leaves the workflows row behind."
-        );
-        internal_error_text(format!(
-            "{tool_name}: this MCP server was not built from a ScopedPool, so the workflow \
-             ingest path cannot stamp a connection with the ingest system agent's tenancy \
-             context. Nothing was written. Construct the server with \
-             EpiGraphMcpFull::with_scoped_pool."
-        ))
-    })?;
-
-    let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "tenancy.scoped_write",
-                tool = tool_name,
-                error = %e,
-                "write refused: could not establish the workflow-ingest-system agent's write \
-                 authority. Nothing was written."
-            );
-            // Migration 148's refusal is the operator's remedy, with no driver
-            // error in it; every other failure here stays in the log above.
-            if matches!(
-                e,
-                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { .. }
-            ) {
-                internal_error_text(format!("{tool_name}: {e}"))
-            } else {
-                internal_error_text(format!(
-                    "{tool_name}: could not establish the workflow-ingest-system agent's write \
-                     authority. Nothing was written."
-                ))
-            }
-        })?;
-
-    let mut tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            author = %authority.agent_id,
-            error = %e,
-            "could not begin a system-agent-stamped transaction"
-        );
-        internal_error_text(format!(
-            "{tool_name}: could not begin a system-agent-stamped transaction"
-        ))
-    })?;
-
-    epigraph_ingest_executor::require_caller_write_authority(
-        &mut tx,
-        authority.agent_id,
-        Some(caller),
-    )
-    .await
-    .map_err(|e| {
-        tracing::warn!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            caller = %caller,
-            error = %e,
-            "workflow write refused: the caller may not write through the ingest system agent"
-        );
-        if e.is_write_authority_refusal() {
-            crate::errors::db_caller_error(e)
-        } else {
-            internal_error_text(format!(
-                "{tool_name}: could not check the caller's authority"
-            ))
-        }
-    })?;
-
-    Ok((authority.agent_id, tx))
+) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
+    begin_author_stamped_tx(server, caller, tool_name).await
 }
 
 /// Run `ds_auto::auto_wire_ds_for_claim` INSIDE the submission's own
