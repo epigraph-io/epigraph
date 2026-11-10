@@ -42,6 +42,12 @@
 //!         [--max-batches N] [--apply --confirm-count N --ruling TEXT --reason TEXT \
 //!         [--accept-unenforced]]
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
+//!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
+//!         [--ingest-signer <uuid>]... [--no-creation-records] [--batch-size N] \
+//!         [--apply --confirm-count N --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
+//!     epigraph-operator reverse-ingest-markers --manifest backfill-1.jsonl [--apply]
+//!     epigraph-operator register-system-agent --role legacy-ingest --create-agent \
+//!         --reason TEXT [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
@@ -98,9 +104,9 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, binding_client, client_scope, client_status, confirmations,
-    custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey,
-    reown, reown_linked, restrict, retire_link, reverse, system_agent, team_group,
+    self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
+    confirmations, custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy,
+    link, passkey, reown, reown_linked, restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -805,6 +811,73 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         sample: usize,
     },
+    /// Stamp the document ingest's marker (as migration 208's reserved
+    /// labels, outside the signed attestation) onto every pre-marker
+    /// ingest-shaped edge: `agent -authored-> paper`, `paper -asserts->
+    /// claim`, and an `agent -asserts-> claim` closing a legacy triangle.
+    /// `by` = the edge's signer when a real ingesting agent signed it, else
+    /// the registered `legacy-ingest` principal. Writes provable creation
+    /// records. Dry run (default) is read-only. Reversed by
+    /// `reverse-ingest-markers --manifest`.
+    BackfillIngestMarkers {
+        /// A bulk-attestation signer: its edges are stamped as `legacy-ingest`.
+        /// Repeat for each.
+        #[arg(long = "attestation-signer")]
+        attestation_signers: Vec<Uuid>,
+        /// A real ingesting agent: its signed edges keep it as `by`. Repeat for
+        /// each. `--apply` refuses while any signer is in neither list.
+        #[arg(long = "ingest-signer")]
+        ingest_signers: Vec<Uuid>,
+        /// Perform the writes. Without it, the census only (read-only).
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's TOTAL edges_to_stamp, repeated back.
+        #[arg(long)]
+        confirm_count: Option<u64>,
+        /// Where to write the undo manifest (must not exist). Required under
+        /// `--apply`; fsynced before each batch's write.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// The decision this act carries out (manifest and audit row).
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why (manifest and audit row).
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Do not write creation records for legacy literature claims.
+        #[arg(long)]
+        no_creation_records: bool,
+        /// Edges per transaction.
+        #[arg(long, default_value_t = 2000)]
+        batch_size: usize,
+        /// Stop after this many batches (a re-run with a new manifest picks up
+        /// the rest).
+        #[arg(long)]
+        max_batches: Option<usize>,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// `statement_timeout` for the read-only census.
+        #[arg(long, default_value = "10min")]
+        statement_timeout: String,
+    },
+    /// Reverse a `backfill-ingest-markers` run from its manifest: remove the
+    /// two labels each recorded edge was given (only while it still carries
+    /// them) and delete the creation records it wrote. Dry run rolls back.
+    ReverseIngestMarkers {
+        /// The run's manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Commit. Without it, every chunk is rolled back.
+        #[arg(long)]
+        apply: bool,
+        /// Edges per transaction.
+        #[arg(long, default_value_t = 2000)]
+        batch_size: usize,
+        /// `lock_timeout` for each chunk.
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
     /// Remove an explicit list of `frames` rows (test or probe frames), with
     /// the rows that cascade from them, refusing any frame a real claim or
     /// another row still depends on. Audited. Exit 3: at least one listed
@@ -1071,6 +1144,40 @@ async fn main_inner() -> anyhow::Result<i32> {
             sample: *sample,
         };
         restrict::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
+    let backfill_opts = if let Command::BackfillIngestMarkers {
+        attestation_signers,
+        ingest_signers,
+        apply,
+        confirm_count,
+        manifest_out,
+        ruling,
+        reason,
+        no_creation_records,
+        batch_size,
+        max_batches,
+        lock_timeout,
+        statement_timeout,
+    } = &cli.command
+    {
+        let o = backfill_markers::Options {
+            apply: *apply,
+            confirm_count: *confirm_count,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            manifest_out: manifest_out.clone(),
+            attestation_signers: attestation_signers.clone(),
+            ingest_signers: ingest_signers.clone(),
+            batch_size: *batch_size,
+            max_batches: *max_batches,
+            lock_timeout: lock_timeout.clone(),
+            statement_timeout: statement_timeout.clone(),
+            creation_records: !*no_creation_records,
+        };
+        backfill_markers::validate(&o)?;
         Some(o)
     } else {
         None
@@ -2062,6 +2169,36 @@ async fn main_inner() -> anyhow::Result<i32> {
             } else {
                 2
             })
+        }
+        Command::BackfillIngestMarkers { .. } => {
+            let opts = backfill_opts.expect("built above");
+            let report =
+                backfill_markers::run(&mut conn, &opts, &db.session_user, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
+        }
+        Command::ReverseIngestMarkers {
+            manifest,
+            apply,
+            batch_size,
+            lock_timeout,
+        } => {
+            if batch_size == 0 {
+                anyhow::bail!("--batch-size must be at least 1");
+            }
+            backfill_markers::reverse(
+                &mut conn,
+                &manifest,
+                apply,
+                batch_size,
+                &lock_timeout,
+                &mut stdout,
+            )
+            .await?;
+            Ok(0)
         }
         Command::RestrictClaims { claims_file, .. } => {
             let opts = restrict_opts.expect("built above");
