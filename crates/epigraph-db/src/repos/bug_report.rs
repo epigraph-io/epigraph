@@ -33,6 +33,51 @@ pub const MAX_EVIDENCE_BYTES: usize = 51_200;
 /// The severities the intake accepts.
 pub const SEVERITIES: &[&str] = &["blocker", "major", "minor"];
 
+/// The characters a reader cannot see, as inclusive code-point ranges: the
+/// Unicode White_Space characters, every Cc control (U+0000 cannot reach the
+/// database) and every Cf format character, of Unicode 15.0, adjacent ranges
+/// merged. A title or description made only of these is blank (BUG04).
+/// Migration 207's `c_invisible` bracket is the same list; the definer is the
+/// authority, and this copy lets the server refuse before the embedding call.
+pub const INVISIBLE: &[(u32, u32)] = &[
+    (0x0001, 0x0020),
+    (0x007F, 0x00A0),
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x1680, 0x1680),
+    (0x180E, 0x180E),
+    (0x2000, 0x200F),
+    (0x2028, 0x202F),
+    (0x205F, 0x2064),
+    (0x2066, 0x206F),
+    (0x3000, 0x3000),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+/// Whether `s` has nothing visible in it: every character is in
+/// [`INVISIBLE`] (or is whitespace by Rust's rule, which is the same
+/// White_Space set). The empty string is blank.
+#[must_use]
+pub fn is_blank(s: &str) -> bool {
+    s.chars().all(|c| {
+        let cp = u32::from(c);
+        c.is_whitespace() || INVISIBLE.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
+    })
+}
+
 /// One report, as the caller gave it.
 #[derive(Debug, Clone, Default)]
 pub struct BugReportInput {
@@ -236,6 +281,27 @@ mod tests {
         assert_eq!(r.evidence_text(), "D");
         r.evidence = Some("log".into());
         assert_eq!(r.evidence_text(), "log");
+    }
+
+    #[test]
+    fn blank_means_nothing_visible() {
+        for s in [
+            "",
+            " \t\n",
+            "\u{200B}",
+            "\u{2060}\u{FEFF}",
+            "\u{1C}",
+            "\u{AD}\u{3000}",
+        ] {
+            assert!(is_blank(s), "{s:?}");
+        }
+        for s in ["a", "a\u{200B}", "\u{FEFF}x", "\u{2065}", "\u{E0080}"] {
+            assert!(!is_blank(s), "{s:?}");
+        }
+        // The ranges are ordered, disjoint and not adjacent (merged).
+        for w in INVISIBLE.windows(2) {
+            assert!(w[0].0 <= w[0].1 && w[0].1 + 1 < w[1].0, "{w:?}");
+        }
     }
 
     #[test]

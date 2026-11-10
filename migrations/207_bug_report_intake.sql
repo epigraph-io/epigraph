@@ -52,7 +52,8 @@
 --   BUG02 an elevated session (the definer frame skips the application
 --         role's `*_elevated_no_insert` policies, so it refuses here);
 --   BUG03 the intake is not configured, or its group is not an active team;
---   BUG04 an empty or whitespace-only title or description, a title over 200
+--   BUG04 a title or description with nothing visible in it (empty, or only
+--         whitespace, format and control characters), a title over 200
 --         characters, a description or repro over 20480 bytes, evidence over
 --         51200 bytes, a severity outside blocker|major|minor, a component
 --         that is not a short lower-case slug;
@@ -222,6 +223,25 @@ DECLARE
     v_claim     uuid := pg_catalog.gen_random_uuid();
     v_trace     uuid := pg_catalog.gen_random_uuid();
     v_ev        uuid := pg_catalog.gen_random_uuid();
+    -- Every character a reader cannot see, as one bracket: `[[:space:]]`
+    -- (locale-dependent, so the Unicode White_Space characters are also
+    -- listed: U+0020, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029,
+    -- U+202F, U+205F, U+3000), every Cc control (U+0001-U+001F,
+    -- U+007F-U+009F; U+0000 cannot occur in `text`) and every Cf format
+    -- character of Unicode 15.0 (U+00AD, U+0600-U+0605, U+061C, U+06DD,
+    -- U+070F, U+0890-U+0891, U+08E2, U+180E, U+200B-U+200F, U+202A-U+202E,
+    -- U+2060-U+2064, U+2066-U+206F, U+FEFF, U+FFF9-U+FFFB, U+110BD, U+110CD,
+    -- U+13430-U+1343F, U+1BCA0-U+1BCA3, U+1D173-U+1D17A, U+E0001,
+    -- U+E0020-U+E007F). Adjacent ranges are merged. The MCP pre-check holds
+    -- the same list (`epigraph_db::repos::bug_report::INVISIBLE`), and
+    -- `malformed_input_is_refused_with_nothing_written` sends every endpoint
+    -- of that list through this check.
+    c_invisible constant text :=
+        '^[[:space:]\u0001-\u0020\u007F-\u00A0\u00AD\u0600-\u0605\u061C\u06DD\u070F'
+        '\u0890-\u0891\u08E2\u1680\u180E\u2000-\u200F\u2028-\u202F\u205F-\u2064'
+        '\u2066-\u206F\u3000\uFEFF\uFFF9-\uFFFB\U000110BD\U000110CD'
+        '\U00013430-\U0001343F\U0001BCA0-\U0001BCA3\U0001D173-\U0001D17A\U000E0001'
+        '\U000E0020-\U000E007F]*$';
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'BUG01: submitting a bug report needs an authenticated principal; '
@@ -246,10 +266,13 @@ BEGIN
                      'session.';
     END IF;
 
-    -- THE INPUT. Sizes in bytes except the title (characters). Blank means
-    -- whitespace of any kind (`[[:space:]]`), not just spaces: `btrim` strips
-    -- spaces only, and a title of a tab and a newline is as empty as ''.
-    IF p_title IS NULL OR p_title ~ '^[[:space:]]*$' THEN
+    -- THE INPUT. Sizes in bytes except the title (characters). A title or
+    -- description is blank when nothing VISIBLE is left once `c_invisible`'s
+    -- characters are taken out: whitespace of any kind, not just spaces
+    -- (`btrim` strips spaces only, and a title of a tab and a newline is as
+    -- empty as ''), and the zero-width, bidi, tag and other format (Cf) and
+    -- control (Cc) characters, which no reader sees either.
+    IF p_title IS NULL OR p_title ~ c_invisible THEN
         RAISE EXCEPTION 'BUG04: a bug report needs a non-empty title; nothing was written'
             USING ERRCODE = '22023';
     END IF;
@@ -257,7 +280,7 @@ BEGIN
         RAISE EXCEPTION 'BUG04: the title is % characters; the maximum is 200; nothing was '
                         'written', pg_catalog.char_length(p_title) USING ERRCODE = '22023';
     END IF;
-    IF p_description IS NULL OR p_description ~ '^[[:space:]]*$' THEN
+    IF p_description IS NULL OR p_description ~ c_invisible THEN
         RAISE EXCEPTION 'BUG04: a bug report needs a non-empty description; nothing was '
                         'written' USING ERRCODE = '22023';
     END IF;

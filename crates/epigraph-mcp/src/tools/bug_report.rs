@@ -46,8 +46,10 @@ fn intake_error(e: epigraph_db::DbError) -> McpError {
     }
 }
 
+/// Nothing visible: whitespace, format and control characters only (the
+/// definer's `c_invisible`; see [`epigraph_db::repos::bug_report::is_blank`]).
 fn blank(s: &str) -> bool {
-    s.trim().is_empty()
+    epigraph_db::repos::bug_report::is_blank(s)
 }
 
 /// Whether `s` is the slug the definer accepts: `^[a-z0-9][a-z0-9-]{0,47}$`.
@@ -286,5 +288,51 @@ mod tests {
         assert!(check(&p).is_err());
         p.component = Some("a".repeat(49));
         assert!(check(&p).is_err());
+    }
+
+    /// Both ends of every invisible range, by value (the DB test
+    /// `malformed_input_is_refused_with_nothing_written` sends the same list
+    /// through the definer).
+    const INVISIBLE_ENDPOINTS: &[u32] = &[
+        0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x600, 0x605, 0x61C, 0x6DD, 0x70F, 0x890,
+        0x891, 0x8E2, 0x1680, 0x180E, 0x2000, 0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A,
+        0x202E, 0x202F, 0x205F, 0x2060, 0x2064, 0x2066, 0x206F, 0x3000, 0xFEFF, 0xFFF9, 0xFFFB,
+        0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020,
+        0xE007F,
+    ];
+
+    #[test]
+    fn a_title_or_description_with_nothing_visible_is_refused() {
+        let endpoints: String = INVISIBLE_ENDPOINTS
+            .iter()
+            .map(|&c| char::from_u32(c).expect("a scalar value"))
+            .collect();
+        for text in [
+            "\u{200B}".to_string(),
+            "\u{200B}\u{200C}\u{200D}".to_string(),
+            "\u{2060}\u{FEFF}".to_string(),
+            "\u{1C}".to_string(),
+            "\u{202E}\u{2066}\u{200F}".to_string(),
+            "\u{E0001}\u{E0020}\u{E007F}".to_string(),
+            " \u{AD}\t\u{3000}".to_string(),
+            endpoints,
+        ] {
+            let mut p = params();
+            p.title.clone_from(&text);
+            assert!(check(&p).is_err(), "title {text:?} admitted");
+            let mut p = params();
+            p.description = text.clone();
+            assert!(check(&p).is_err(), "description {text:?} admitted");
+        }
+        // CALIBRATION: one visible character among invisible ones is text.
+        let mut p = params();
+        p.title = "a\u{200B}".into();
+        p.description = "\u{FEFF}x".into();
+        assert!(check(&p).is_ok());
+        for c in ['!', 'é', '\u{2065}', '\u{E0080}'] {
+            let mut p = params();
+            p.title = c.to_string();
+            assert!(check(&p).is_ok(), "{c:?} is not in an invisible range");
+        }
     }
 }

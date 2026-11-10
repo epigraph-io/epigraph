@@ -23,8 +23,8 @@
 //! * a system agent, an unbound agent and a session with no principal are
 //!   refused;
 //! * the application role cannot write a `bug_report.` audit row itself;
-//! * empty, whitespace-only and oversized input is refused with nothing
-//!   written.
+//! * empty, whitespace-only, invisible-only (format and control characters)
+//!   and oversized input is refused with nothing written.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -227,6 +227,17 @@ async fn is_member(pool: &PgPool, group: Uuid, agent: Uuid) -> bool {
     .await
     .expect("membership read")
 }
+
+/// Both ends of every range of characters the intake treats as invisible
+/// (Unicode 15.0: White_Space, Cc without U+0000, Cf). Listed here by value,
+/// independently of the definer's bracket and of the MCP pre-check's table,
+/// so a range dropped from either is caught.
+const INVISIBLE_ENDPOINTS: &[u32] = &[
+    0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x600, 0x605, 0x61C, 0x6DD, 0x70F, 0x890,
+    0x891, 0x8E2, 0x1680, 0x180E, 0x2000, 0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E,
+    0x202F, 0x205F, 0x2060, 0x2064, 0x2066, 0x206F, 0x3000, 0xFEFF, 0xFFF9, 0xFFFB, 0x110BD,
+    0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020, 0xE007F,
+];
 
 fn unit_vector(at: usize) -> String {
     let v: Vec<&str> = (0..1536).map(|i| if i == at { "1" } else { "0" }).collect();
@@ -758,6 +769,39 @@ async fn malformed_input_is_refused_with_nothing_written(pool: PgPool) {
             },
         ),
     ];
+    // Nothing visible: zero-width, joiner, BOM, separator and bidi
+    // characters alone, then every endpoint of the invisible ranges at once
+    // (any endpoint the check misses leaves a character, and is admitted).
+    let mut cases = cases;
+    let endpoints: String = INVISIBLE_ENDPOINTS
+        .iter()
+        .map(|&c| char::from_u32(c).expect("a scalar value"))
+        .collect();
+    for (what, text) in [
+        ("zero-width space", "\u{200B}".to_string()),
+        ("zero-width joiners", "\u{200B}\u{200C}\u{200D}".to_string()),
+        ("word joiner and BOM", "\u{2060}\u{FEFF}".to_string()),
+        ("information separator", "\u{1C}".to_string()),
+        ("bidi controls", "\u{202E}\u{2066}\u{200F}".to_string()),
+        ("tag characters", "\u{E0001}\u{E0020}\u{E007F}".to_string()),
+        ("soft hyphen among spaces", " \u{AD}\t\u{3000}".to_string()),
+        ("every range endpoint", endpoints),
+    ] {
+        cases.push((
+            what,
+            BugReportInput {
+                title: text.clone(),
+                ..base.clone()
+            },
+        ));
+        cases.push((
+            what,
+            BugReportInput {
+                description: text,
+                ..base.clone()
+            },
+        ));
+    }
     for (what, input) in cases {
         let r = submit_as(&pool, w.reporter, &input).await;
         assert!(r.is_err(), "{what}: admitted {r:?}");
@@ -778,8 +822,21 @@ async fn malformed_input_is_refused_with_nothing_written(pool: PgPool) {
     )
     .await
     .expect("at the limits");
-    assert_eq!(claims_by(&pool, w.reporter).await, 1);
-    assert_eq!(markers_of(&pool, w.reporter).await, 1);
+    // A visible character next to invisible ones is a title (CALIBRATION for
+    // the invisible-only refusals above).
+    submit_as(
+        &pool,
+        w.reporter,
+        &BugReportInput {
+            title: "a\u{200B}".into(),
+            description: "\u{FEFF}x".into(),
+            ..base.clone()
+        },
+    )
+    .await
+    .expect("a visible character among invisible ones");
+    assert_eq!(claims_by(&pool, w.reporter).await, 2);
+    assert_eq!(markers_of(&pool, w.reporter).await, 2);
 
     // Content that is not the composition of the fields: BUG05.
     let viewer = Viewer::resolve(&pool, w.reporter).await.expect("resolve");
