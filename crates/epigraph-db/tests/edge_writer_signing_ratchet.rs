@@ -268,7 +268,7 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // (`ClaimIngestRepository::record_signed_conn`), registered PRIMITIVE like the
 // `EdgeRepository` twins: unsigned only when a caller passes no key, and both
 // of its callers pass the walk's key.
-const UNSIGNED_SITES_HIGH_WATER: usize = 48;
+const UNSIGNED_SITES_HIGH_WATER: usize = 49;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -443,6 +443,16 @@ const REGISTER: &[Site] = &[
         "persist_packet",
         5,
         Signed,
+    ),
+    // The legacy ingest-marker backfill's creation records: written on the
+    // maintenance DSN on behalf of a past ingest whose key this operator
+    // does not hold, so unsigned (the reader trusts the guarded marker, not
+    // a signature).
+    site(
+        "crates/epigraph-cli/src/operator/backfill_markers.rs",
+        "write_records",
+        1,
+        Unsigned(NO_KEY_CLI),
     ),
     site(
         "crates/epigraph-cli/src/decompose.rs",

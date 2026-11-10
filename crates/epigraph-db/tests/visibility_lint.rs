@@ -2303,6 +2303,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorised by edges_tenancy's WITH CHECK.",
     ),
     (
+        "countersign.rs",
+        "countersign_conn",
+        "WRITE. Calls migration 208's epigraph_countersign_authorship definer on the CALLER's \
+         stamped transaction; the definer reads the caller from the session principal and acts \
+         only on authorship rows naming the caller (or an agent it is the live operator of), \
+         returning only those rows' ids. It reads nothing for display.",
+    ),
+    (
         "claim_ingest.rs",
         "record_signed_conn",
         "WRITE. The document walk's paper -ingested_claim-> claim record (which ingest created \

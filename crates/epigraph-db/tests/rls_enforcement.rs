@@ -1577,6 +1577,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              the `operator_links_audit` trigger.",
         ),
         (
+            "security_events_countersign_privileged",
+            "authorship.countersign",
+            "208's RESTRICTIVE insert policy: its row-only arm (the event type does not start \
+             `authorship.countersign`) says WHICH rows the restriction applies to, and grants \
+             nothing. A restrictive policy is AND-ed with the permissive `security_events_append`, \
+             so every other row still needs 077's attribution arms; a countersign audit row \
+             needs one of the two session arms beside it (`epigraph_bypass()` / \
+             `epigraph_definer_bypass()`), i.e. the maintenance session or the \
+             `epigraph_countersign_authorship` definer.",
+        ),
+        (
             "challenges_claim_readable",
             "challenges.claim_id",
             "168's RESTRICTIVE read policy (ruling R-CH1b): its arm `EXISTS (SELECT 1 FROM \

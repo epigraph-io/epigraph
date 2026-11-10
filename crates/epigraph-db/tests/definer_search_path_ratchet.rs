@@ -112,6 +112,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
     "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
     "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+    "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
     "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
     "public.epigraph_create_passkey_enrollment(uuid, text, text)",
     "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
@@ -279,7 +280,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 /// [`PUBLIC_PATH_REGISTER`]'s length, which must equal it. Raising it is a
 /// visible decision to add a definer that resolves through `public`; it falls
 /// by one each time a registered definer moves to 172's form.
-const HIGH_WATER: usize = 197;
+const HIGH_WATER: usize = 198;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.
