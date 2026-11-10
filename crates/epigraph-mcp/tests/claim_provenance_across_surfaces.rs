@@ -1234,3 +1234,191 @@ async fn a_strangers_earlier_pending_naming_never_demotes_the_authors_own_claim(
         "{by_c}"
     );
 }
+
+/// `countersign_authorship` as `caller`.
+async fn countersign_as(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    caller: Uuid,
+    paper: Uuid,
+    decision: &str,
+    agent: Option<Uuid>,
+) -> Result<Value, String> {
+    let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
+    tools::agent_lookup::countersign_authorship(
+        server,
+        &viewer,
+        epigraph_mcp::types::CountersignAuthorshipParams {
+            paper_id: paper.to_string(),
+            decision: decision.to_string(),
+            agent_id: agent.map(|a| a.to_string()),
+            ingested_by: None,
+        },
+    )
+    .await
+    .map(|r| text(&r))
+    .map_err(|e| e.message.to_string())
+}
+
+/// A stranger's ingest names a registered person pending. Only that person
+/// (or its live operator) may countersign: a third party and the naming
+/// ingester are refused with nothing written. The person's confirmation
+/// flips the naming from pending to primary on every surface (get_claim,
+/// the card, query_paper), a repeat is a no-op with a message, and every act
+/// is audited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_named_person_confirms_and_every_surface_flips_to_primary(pool: PgPool) {
+    let s = app_role_server(&pool).await;
+    let s_id = s.server_agent_id().await.expect("s");
+    let h = human_named(&pool, "Hesper Quill").await;
+    let (third, _) = fixture::seed_agent_with_group(&pool, "countersign-third").await;
+    let d = "10.9999/countersign-confirm";
+    let atom = "An atom the stranger's ingest states.";
+    ingest_wait(
+        &s,
+        &pool,
+        doc_with_atoms(
+            d,
+            json!([{"name": "Hesper Quill", "agent_id": h.to_string()}]),
+            &[atom],
+        ),
+    )
+    .await;
+    let y = claim_of(&pool, d, atom).await;
+    let p = paper_id(&pool, d).await;
+    let block = get_claim_as(&s, &pool, third, y).await;
+    assert_eq!(
+        ids(&block["paper"]["pending_authors"]),
+        vec![json!(h)],
+        "CALIBRATION: {block}"
+    );
+    assert_eq!(
+        ids(&block["paper"]["authors"]),
+        Vec::<Value>::new(),
+        "CALIBRATION: {block}"
+    );
+    let rows_before = authored_rows(&pool, d).await;
+
+    for who in [third, s_id] {
+        let r = countersign_as(&s, &pool, who, p, "confirm", Some(h)).await;
+        assert!(
+            matches!(&r, Err(m) if m.contains("CSG02")),
+            "{who} must be refused: {r:?}"
+        );
+    }
+    assert_eq!(
+        authored_rows(&pool, d).await,
+        rows_before,
+        "a refusal writes nothing"
+    );
+
+    let out = countersign_as(&s, &pool, h, p, "confirm", None)
+        .await
+        .expect("the named person confirms");
+    assert_eq!(out["changed"].as_array().map(Vec::len), Some(1), "{out}");
+    assert_eq!(out["changed"][0]["ingested_by"], json!(s_id), "{out}");
+
+    for caller in [third, h, s_id] {
+        let block = get_claim_as(&s, &pool, caller, y).await;
+        assert_eq!(ids(&block["paper"]["authors"]), vec![json!(h)], "{block}");
+        assert_eq!(block["paper"]["pending_authors"], json!([]), "{block}");
+    }
+    let counts = card_as(&s, &pool, third, h).await["counts"].clone();
+    assert_eq!(counts["authored_papers"], json!(1), "{counts}");
+    assert_eq!(counts["pending_authored_papers"], json!(0), "{counts}");
+    let by_s = query_paper_by(&s, &pool, d, Some(s_id)).await;
+    assert_eq!(
+        listed_authors(&by_s),
+        vec![(json!(h), json!(false), Value::Null)],
+        "{by_s}"
+    );
+
+    let again = countersign_as(&s, &pool, h, p, "confirm", None)
+        .await
+        .expect("a repeat is a no-op");
+    assert_eq!(again["changed"], json!([]), "{again}");
+    assert!(
+        again["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("nothing pending"),
+        "{again}"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'authorship.countersigned' \
+            AND agent_id = $1",
+    )
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1);
+}
+
+/// A live operator declines its agent's pending naming: the naming is
+/// retracted and disappears from every surface, the row stays (retracted),
+/// and the act is audited as the operator's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_live_operator_declines_and_the_naming_disappears(pool: PgPool) {
+    let s = app_role_server(&pool).await;
+    let s_id = s.server_agent_id().await.expect("s");
+    let operator = human_named(&pool, "Orla Vance").await;
+    let (g, _) = fixture::seed_agent_with_group(&pool, "countersign-operated").await;
+    named(&pool, g, "Gale Ferro").await;
+    link(&pool, g, operator).await;
+    let (third, _) = fixture::seed_agent_with_group(&pool, "countersign-third").await;
+    let d = "10.9999/countersign-decline";
+    let atom = "Another atom the stranger's ingest states.";
+    ingest_wait(
+        &s,
+        &pool,
+        doc_with_atoms(
+            d,
+            json!([{"name": "Gale Ferro", "agent_id": g.to_string()}]),
+            &[atom],
+        ),
+    )
+    .await;
+    let y = claim_of(&pool, d, atom).await;
+    let p = paper_id(&pool, d).await;
+    assert_eq!(
+        card_as(&s, &pool, third, g).await["counts"]["pending_authored_papers"],
+        json!(1),
+        "CALIBRATION"
+    );
+    let r = countersign_as(&s, &pool, third, p, "decline", Some(g)).await;
+    assert!(matches!(&r, Err(m) if m.contains("CSG02")), "{r:?}");
+
+    let out = countersign_as(&s, &pool, operator, p, "decline", Some(g))
+        .await
+        .expect("the live operator declines for its agent");
+    assert_eq!(out["changed"][0]["outcome"], json!("declined"), "{out}");
+
+    let block = get_claim_as(&s, &pool, third, y).await;
+    assert_eq!(block["paper"]["pending_authors"], json!([]), "{block}");
+    assert_eq!(block["paper"]["authors"], json!([]), "{block}");
+    let counts = card_as(&s, &pool, third, g).await["counts"].clone();
+    assert_eq!(counts["pending_authored_papers"], json!(0), "{counts}");
+    assert_eq!(counts["authored_papers"], json!(0), "{counts}");
+    let by_s = query_paper_by(&s, &pool, d, Some(s_id)).await;
+    assert_eq!(listed_authors(&by_s), Vec::new(), "{by_s}");
+    let retracted: bool = sqlx::query_scalar(
+        "SELECT e.valid_to IS NOT NULL FROM edges e JOIN papers pp ON pp.id = e.target_id \
+          WHERE pp.doi = $1 AND e.relationship = 'authored' AND e.source_id = $2",
+    )
+    .bind(d)
+    .bind(g)
+    .fetch_one(&pool)
+    .await
+    .expect("the row stays");
+    assert!(retracted);
+    let acting: String = sqlx::query_scalar(
+        "SELECT details ->> 'acting_as' FROM security_events \
+          WHERE event_type = 'authorship.countersign_declined' AND agent_id = $1",
+    )
+    .bind(operator)
+    .fetch_one(&pool)
+    .await
+    .expect("audited");
+    assert_eq!(acting, "operator");
+}
