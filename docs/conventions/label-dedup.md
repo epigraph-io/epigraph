@@ -118,8 +118,9 @@ its losers onto its survivor, so:
 
 - **Every member of a cluster unit, and every target of any other unit, must
   be the write identity's own.** That means its author, an agent of the
-  author's operator, or, over HTTP, a `claims:admin` caller (the same decided
-  grants as `require_owner_or_admin`).
+  author's operator, an agent live-linked to the author itself (its delegate,
+  operator ruling R-183), or, over HTTP, a `claims:admin` caller (the same
+  decided grants as `require_owner_or_admin`).
   - A stdio server with no declared signer cannot decide this for another
     agent's claim, and undecided is not owned.
   - A member not owned fails the unit with `CROSS_OWNER_MEMBER`; any other
