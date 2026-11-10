@@ -182,9 +182,18 @@ other path, so none is relaxed:
    `recompute_boundary_meet_conn` on a maintenance connection, which request processes do not
    hold (D9).
 
-So migration **206** adds two `SECURITY DEFINER` functions owned by `epigraph_maintenance`,
-`SET search_path = pg_catalog, pg_temp` with every public object schema-qualified (migration
-190's ratchet), EXECUTE revoked from PUBLIC and granted to `epigraph_app`. Their `UPDATE`s open
+So migration **206** adds five `SECURITY DEFINER` functions, all owned by
+`epigraph_maintenance`, `SET search_path = pg_catalog, pg_temp` with every public object
+schema-qualified (migration 190's ratchet), EXECUTE revoked from PUBLIC and granted to
+`epigraph_app`:
+
+* two reads, `epigraph_writable_teams(agent)` and `epigraph_default_group(agent)`, which must
+  answer the same on an unstamped `epigraph_app` connection, where the membership and group
+  policies hide every row;
+* three writes, `epigraph_set_default_group(group)`, `epigraph_publicize_claims` (§4.2) and
+  `epigraph_share_claims_with_team` (§4.3).
+
+The three writes' `UPDATE`s open
 a transaction-local "write window" (`search_path = public, pg_temp`) and close it straight
 after, because the legacy invoker triggers they fire (`trigger_validate_edge_refs` →
 `validate_edge_reference`) call unqualified functions and inherit the caller's path.
@@ -194,16 +203,30 @@ an interlock and not an authorization. **The authorization is the function body.
 the session principal (`epigraph_principal_id()`), reads live memberships through
 `epigraph_live_memberships`, and does not trust a caller-supplied identity.
 
+The bodies keep their working set (the per-claim classification) in local variables and arrays,
+never in a temporary table. A temporary table belongs to the calling session, not to the
+function's owner, so a caller could create one of the same name first and have the body use it
+with the owner's privileges. `definer_search_path_ratchet.rs`
+(`no_definer_keeps_state_in_a_session_temporary_relation`) refuses any definer body that creates
+or names a temporary relation.
+
 ### 4.2 `epigraph_publicize_claims(p_claim_ids uuid[], p_reason text)`
 
 For each claim, in one transaction and all-or-nothing:
 
-1. The row must exist and be readable by the session. Otherwise it is answered as not found;
+Every id is classified first, in this order, and nothing changes unless every id comes out
+`publicize` or `already_public`:
+
+1. The row must exist and be readable by the session. Otherwise it is answered as `not_found`;
    existence of an unreadable claim is never disclosed.
-2. It must be `visibility = 'group'`. An already-public claim is a no-op, reported as such.
-3. It must not be sealed (`claim_encryption` row). Such a claim is refused with `42501` before
-   anything changes. The 074 trigger is the backstop.
-4. The caller must be authorized under **D-V2**.
+2. It must be `visibility = 'group'`. An already-public claim is a no-op, `already_public`.
+3. The caller must be authorized under **D-V2**, else `refused_not_admin`.
+4. It must not be sealed (`claim_encryption` row), else `refused_sealed`. This is a returned
+   outcome, not a raised error, and it is checked before anything changes. The 074 trigger is
+   the backstop.
+
+Then, for the `publicize` claims:
+
 5. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
    visibility='public'` with the owner unchanged, then reset the GUC to `''` in the same body.
    Propagation copies `public` onto the 17 derived tables. Pinned evidence stays `group`, and
@@ -216,18 +239,36 @@ For each claim, in one transaction and all-or-nothing:
    whose current owner equals the meet that the old tenancy produces get rewritten. Anything
    else was a declaration and is left alone.
 7. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
-   the principal and details `{claim_ids, owner_group_id, reason, evidence_kept_private,
-   edges_widened}`.
+   the principal and details `{claim_ids, owner_group_ids, reason, edges_widened,
+   evidence_kept_private, migration, session_user}`.
 
 It returns per-claim `(claim_id, outcome)` where outcome is `publicized | already_public |
-refused_sealed | refused_not_authorized | not_found`. Any refusal rolls the whole call back.
+not_found | refused_not_admin | refused_sealed`. If any id is `not_found` or `refused_*`,
+nothing is changed and the classification is returned as it stands. The repo wrapper
+(`ClaimRepository::publicize_conn`) answers `not_found` as a missing claim and any refusal as a
+designed refusal, so a caller never sees a partial act.
 
 ### 4.3 `epigraph_share_claims_with_team(p_claim_ids uuid[], p_group_id uuid, p_reason text)`
 
 This handles `private → team`. Each claim must be `('group', H)`, where `H` is the caller's home
-group (its own personal group, or its operator's for an operated caller), and the claim's author
-must be the caller. `p_group_id` must be in the caller's live writable set and must not be `H`.
-The function then runs `UPDATE claims SET owner_group_id = p_group_id`. Visibility stays
+group (its own personal group, or its operator's for an operated caller). The caller must be the
+claim's author (`claims.agent_id`), **or** a live admin of `H`. The second arm lets the human
+whose personal group it is share what its agents wrote there; it is the share-side counterpart
+of D-V2's note that the human is admin of its own personal group. `p_group_id` must be in
+`epigraph_writable_teams(caller)` and must not be `H`.
+
+Every id is classified first, in this order, all or nothing as in §4.2:
+
+| Outcome | When |
+|---|---|
+| `not_found` | no such claim, or the session cannot read it |
+| `refused_not_private` | the claim is public, or owned by a group other than `H` |
+| `refused_not_author` | the caller neither wrote it nor is a live admin of `H` |
+| `refused_sealed` | it has a `claim_encryption` row (its key material is bound to its group) |
+| `refused_not_team_writer` | the target group is not writable by the caller, or is `H` |
+| `share` | to be moved; returned as `shared` once moved |
+
+If every id is `share`, the function runs `UPDATE claims SET owner_group_id = p_group_id`. Visibility stays
 `group`, so this is not a widening and the GUC is not armed. Propagation re-owns the derived
 rows. Pinned evidence keeps its pin owner. Edges take the meet as usual, since narrowing and
 group-to-group moves are not blocked. One `security_events` row, `claim.shared_with_team`, is
@@ -250,7 +291,7 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 
 ## 5. Tests (app role, `ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 
-`crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (9 tests):
+`crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (10 tests):
 
 * A member writes with no `visibility`. The claim lands `('group', team)`. Another team member
   reads it, and a non-member gets not-found. Derived evidence and trace rows match the claim.
@@ -269,9 +310,18 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 * A sealed claim is refused by `publicize_claims`, and a direct `UPDATE` by the app role is still
   refused by 074.
 * `share_claims_with_team` moves a private claim to the team, after which the teammate reads it.
+* A caller session that plants same-named temporary tables (with rows and a trigger that would
+  rewrite a classification) before calling either act changes nothing: both answer with their
+  own refusal, no claim moves, the trigger never runs and the planted rows stay as planted.
 
-`crates/epigraph-api/tests/claim_visibility_http.rs` (2 tests): the REST write surfaces
-(`/claims`, `/submit/packet`) honour `visibility`, and the three REST acts answer as MCP does.
+`crates/epigraph-api/tests/claim_visibility_http.rs` (3 tests): the REST write surfaces
+(`/claims`, `/submit/packet`) honour `visibility`, the three REST acts answer as MCP does, and a
+REST resubmit that matches the caller's existing private claim reports its stored tenancy and
+the "NOT re-scoped" note.
+
+`crates/epigraph-db/tests/definer_search_path_ratchet.rs`
+(`no_definer_keeps_state_in_a_session_temporary_relation`): no definer body anywhere creates or
+names a temporary relation.
 
 `crates/epigraph-core/src/tenancy.rs`: `VisibilityChoice::parse` unit tests (bad pairs refused).
 
