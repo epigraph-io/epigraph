@@ -90,8 +90,9 @@
 -- by the caller would. The same statement sequence then re-owns the row to
 -- the intake group before anything else references it. The re-own is an
 -- `UPDATE OF owner_group_id`, which the binding trigger does not fire on, and
--- which 115's owner-immutable guard admits in a definer frame (206's
--- `epigraph_share_claims_with_team` makes the same move). The claim is never
+-- which 115's owner-immutable guard admits in a definer frame
+-- (`epigraph_session_is_privileged_writer` reads `current_user`, which is the
+-- maintenance owner here). The claim is never
 -- 'public' at any point, so no widening or narrowing guard is involved, and
 -- the trace and evidence are inserted after the re-own, declared (intake,
 -- 'group'). No other session can see the staged state: it never commits.
