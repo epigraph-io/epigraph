@@ -66,11 +66,14 @@ async fn app_role_server_in(pool: &PgPool, mode: SessionGucMode) -> EpiGraphMcpF
         "epigraph_app holds BYPASSRLS: every assertion here would be vacuous"
     );
     let url = fixture::database_url_for(pool).await;
-    let scoped =
-        ScopedPool::connect_downgraded_for_tests(&url, mode, "epigraph_app")
-            .await
-            .expect("app-role ScopedPool");
-    assert_eq!(scoped.mode(), mode, "PREMISE: the ScopedPool runs in the requested mode");
+    let scoped = ScopedPool::connect_downgraded_for_tests(&url, mode, "epigraph_app")
+        .await
+        .expect("app-role ScopedPool");
+    assert_eq!(
+        scoped.mode(),
+        mode,
+        "PREMISE: the ScopedPool runs in the requested mode"
+    );
     let plain = scoped.inner().clone();
     let who: String = sqlx::query_scalar("SELECT session_user::text")
         .fetch_one(&plain)
