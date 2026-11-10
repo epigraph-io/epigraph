@@ -48,6 +48,13 @@ use uuid::Uuid;
 /// vacuously: the role must not bypass row security, and the plain pool must
 /// really be `epigraph_app`.
 async fn app_role_server(pool: &PgPool) -> EpiGraphMcpFull {
+    app_role_server_in(pool, SessionGucMode::Session).await
+}
+
+/// [`app_role_server`] in a chosen [`SessionGucMode`]. `Transaction` is the
+/// mode a deployment behind a transaction-mode pooler runs, where every
+/// stamped read is one transaction and one SQL error aborts the rest of it.
+async fn app_role_server_in(pool: &PgPool, mode: SessionGucMode) -> EpiGraphMcpFull {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
             .fetch_one(pool)
@@ -59,9 +66,10 @@ async fn app_role_server(pool: &PgPool) -> EpiGraphMcpFull {
     );
     let url = fixture::database_url_for(pool).await;
     let scoped =
-        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+        ScopedPool::connect_downgraded_for_tests(&url, mode, "epigraph_app")
             .await
             .expect("app-role ScopedPool");
+    assert_eq!(scoped.mode(), mode, "PREMISE: the ScopedPool runs in the requested mode");
     let plain = scoped.inner().clone();
     let who: String = sqlx::query_scalar("SELECT session_user::text")
         .fetch_one(&plain)
@@ -147,6 +155,105 @@ async fn consolidate_default_confidence_reads_the_members_private_sources(pool: 
          own private sources; got {truth} (0 means the sources were read on an unstamped \
          session and seen as missing)"
     );
+}
+
+/// Fault injection for one source's read: a RESTRICTIVE select policy on
+/// `claims` for `epigraph_app` that raises when the statement being run is
+/// `ClaimRepository::get_by_id` (the only claims read selecting
+/// `signer_public_key`) and the row is `target`. Every other statement and row
+/// passes it, so the merge's own write transaction is untouched and only the
+/// default-confidence read of `target` fails. Created on the superuser pool in
+/// this test's own throwaway database.
+async fn fail_source_read_of(pool: &PgPool, target: Uuid) {
+    sqlx::query(&format!(
+        "CREATE FUNCTION public.test_fail_source_read(p_id uuid) RETURNS boolean \
+         LANGUAGE plpgsql VOLATILE AS $f$ \
+         BEGIN \
+           IF p_id = '{target}'::uuid AND current_query() LIKE '%signer_public_key%' THEN \
+             RAISE EXCEPTION 'injected fault: read of source %', p_id; \
+           END IF; \
+           RETURN true; \
+         END $f$"
+    ))
+    .execute(pool)
+    .await
+    .expect("fault function");
+    sqlx::query(
+        "CREATE POLICY test_fail_source_read ON public.claims AS RESTRICTIVE FOR SELECT \
+         TO epigraph_app USING (public.test_fail_source_read(id))",
+    )
+    .execute(pool)
+    .await
+    .expect("fault policy");
+}
+
+/// Transaction GUC mode: the default-confidence reads share ONE transaction,
+/// so a failed read of one source aborts it and every later read in the loop
+/// fails too. Swallowing those errors wrote the merge at a confidence drawn
+/// from nothing (here 0 where 0.76 is due), without a word. The tool must
+/// refuse instead, name the source, and write nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_default_confidence_refuses_when_a_source_read_fails_in_transaction_mode(
+    pool: PgPool,
+) {
+    let server = app_role_server_in(&pool, SessionGucMode::Transaction).await;
+    let (agent, auth, viewer, group) = member(&pool).await;
+    let faulty = private_claim(&pool, agent, group, "consolidate source, read fails", 0.8).await;
+    let good = private_claim(&pool, agent, group, "consolidate source, read ok", 0.8).await;
+    fail_source_read_of(&pool, faulty).await;
+
+    let merged_content = "the two private sources, merged after a failed read";
+    let res = epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &viewer,
+        ConsolidateClaimsParams {
+            // The failing source FIRST: in one transaction its error aborts the
+            // read of the good source after it.
+            source_claim_ids: vec![faulty.to_string(), good.to_string()],
+            merged_content: merged_content.to_string(),
+            mode: "merge".to_string(),
+            reason: "transaction-mode failed-read probe".to_string(),
+            confidence: None,
+        },
+        Some(&auth),
+    )
+    .await;
+
+    let written: Option<f64> =
+        sqlx::query_scalar("SELECT truth_value FROM claims WHERE content = $1")
+            .bind(merged_content)
+            .fetch_optional(&pool)
+            .await
+            .expect("look for the merged claim");
+    let err = match res {
+        Err(e) => e,
+        Ok(r) => panic!(
+            "a failed source read must refuse the merge, not write it at a deflated \
+             default confidence; it answered {} and wrote truth_value {written:?}",
+            first_text(&r)
+        ),
+    };
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        "{}",
+        err.message
+    );
+    assert!(
+        err.message.contains(&format!(
+            "consolidate_claims: could not read source claim {faulty}"
+        )) && err.message.contains("nothing was written"),
+        "the refusal names the source whose read failed: {}",
+        err.message
+    );
+    assert_eq!(written, None, "no merged claim was written");
+    let current: Vec<bool> =
+        sqlx::query_scalar("SELECT COALESCE(is_current, true) FROM claims WHERE id = ANY($1)")
+            .bind(vec![faulty, good])
+            .fetch_all(&pool)
+            .await
+            .expect("sources' is_current");
+    assert_eq!(current, vec![true, true], "neither source was retired");
 }
 
 // ───────────────────────────── submit_ds_evidence ─────────────────────────────
@@ -439,3 +546,4 @@ async fn evolve_step_by_name_resolves_the_members_private_step(pool: PgPool) {
         wf.steps[0]
     );
 }
+
