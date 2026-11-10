@@ -16,7 +16,7 @@
 //!   predicate of the nearest-neighbour read the novelty gate uses);
 //! * the reporter's list holds only its own intake reports, not a claim it
 //!   authored in the intake group by another path;
-//! * the per-hour and per-day limits;
+//! * the per-hour and per-day limits, counted per reporter;
 //! * an unconfigured intake (or one whose group is suspended) refuses;
 //! * session temporary objects named like the definer's relations change
 //!   nothing;
@@ -534,6 +534,42 @@ async fn the_rate_limits_hold(pool: PgPool) {
     let (_, msg) = refused(submit_as(&pool, w.reporter, &report("fourth today")).await);
     assert!(msg.starts_with("BUG08:"), "{msg}");
     assert_eq!(claims_by(&pool, w.reporter).await, 3);
+}
+
+/// The limit is the REPORTER's: one reporter at its limit leaves another free
+/// to file, and each one's BUG08 counts only its own filings.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rate_limit_is_per_reporter(pool: PgPool) {
+    let w = world(&pool).await;
+    let (other_human, _) = fixture::seed_human_operator(&pool, "bri-b-human").await;
+    let b = linked_agent(&pool, other_human, "bri-b").await;
+    configure(&pool, w.intake, 2, 200).await;
+
+    for i in 0..2 {
+        submit_as(&pool, w.reporter, &report(&format!("a {i}")))
+            .await
+            .expect("A under its limit");
+    }
+    let (_, msg) = refused(submit_as(&pool, w.reporter, &report("a over")).await);
+    assert!(
+        msg.starts_with("BUG08:")
+            && msg.contains("filed 2 bug reports in the last hour and 2 in the last day"),
+        "{msg}"
+    );
+
+    for i in 0..2 {
+        submit_as(&pool, b, &report(&format!("b {i}")))
+            .await
+            .expect("B files while A is at its limit");
+    }
+    let (_, msg) = refused(submit_as(&pool, b, &report("b over")).await);
+    assert!(
+        msg.starts_with("BUG08:")
+            && msg.contains("filed 2 bug reports in the last hour and 2 in the last day"),
+        "B's refusal counts B's filings only: {msg}"
+    );
+    assert_eq!(claims_by(&pool, w.reporter).await, 2);
+    assert_eq!(claims_by(&pool, b).await, 2);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

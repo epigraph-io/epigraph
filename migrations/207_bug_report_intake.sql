@@ -111,7 +111,9 @@
 --
 -- RATE LIMIT. A transaction-scoped advisory lock on the reporter serializes
 -- its concurrent submissions, then its `bug_report.submitted` rows of the
--- last hour and the last day are counted against the settings' limits.
+-- last hour and the last day are counted against the settings' limits. The
+-- count is the REPORTER's own: another reporter's filings neither count
+-- against it nor appear in its BUG08 message.
 --
 -- ===================================================================
 -- 4. THE READ (epigraph_my_bug_reports)
