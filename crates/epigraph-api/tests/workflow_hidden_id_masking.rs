@@ -19,9 +19,12 @@
 //!
 //! Now a row the caller cannot read gets the call site's own not-found answer
 //! (byte-identical to an unknown name / missing parent, after replacing the
-//! caller-sent name or id), or, for a re-ingest, the answer without
-//! `workflow_id`. A member still gets the id and the arms. A GROUP row with no
-//! recorded submitter is no longer called a "legacy platform workflow".
+//! caller-sent name or id), or, for an ingest of its lineage, a refusal
+//! without `workflow_id`. Since workflow writes are made as the caller (on its
+//! own stamp), a lineage with rows the caller cannot read is not written at
+//! all (migration 202), so a re-ingest is refused rather than answered. A
+//! member still gets the id and the arms. A GROUP row with no recorded
+//! submitter is no longer called a "legacy platform workflow".
 //!
 //! Production pool shape: the router and the MCP server run on an
 //! `epigraph_app` `ScopedPool`; the harness superuser only seeds and inspects.
@@ -359,7 +362,10 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
         "MCP add_step on a hidden workflow answers exactly as on an unknown name"
     );
 
-    // A re-ingest of the hidden (name, generation): already ingested, no id.
+    // A re-ingest of the hidden (name, generation): workflow writes run on
+    // the caller's own stamp, and a lineage with rows the caller cannot read
+    // is not written (migration 202): refused (409 / MCP INVALID_REQUEST),
+    // with no id and nothing hidden named.
     let (s, out) = w
         .api
         .post(
@@ -368,22 +374,18 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
             &extraction(&w.name, 0),
         )
         .await;
-    assert_eq!(s, StatusCode::OK, "{out}");
-    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    assert_eq!(s, StatusCode::CONFLICT, "{out}");
     assert!(
         out.get("workflow_id").is_none(),
-        "REST re-ingest by a non-member leaves the id out: {out}"
+        "REST re-ingest by a non-member carries no id: {out}"
     );
     assert_names_nothing_hidden(&w, "REST re-ingest", &out.to_string());
-    let out = mcp_ingest(&w, w.outsider, extraction(&w.name, 0))
-        .await
-        .expect("the MCP re-ingest succeeds");
-    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    let m = mcp_ingest(&w, w.outsider, extraction(&w.name, 0)).await;
     assert!(
-        out.get("workflow_id").is_none(),
-        "MCP re-ingest by a non-member leaves the id out: {out}"
+        m.is_err(),
+        "the MCP re-ingest by a non-member is refused: {m:?}"
     );
-    assert_names_nothing_hidden(&w, "MCP re-ingest", &out.to_string());
+    assert_names_nothing_hidden(&w, "MCP re-ingest", &text_of(&m));
 
     // A new generation of the hidden lineage: refused, naming nothing hidden.
     let (s, out) = w
@@ -394,7 +396,7 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
             &extraction(&w.name, 1),
         )
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "{out}");
+    assert_eq!(s, StatusCode::CONFLICT, "{out}");
     assert_names_nothing_hidden(&w, "REST new generation", &out.to_string());
     let m = mcp_ingest(&w, w.outsider, extraction(&w.name, 1)).await;
     assert!(
@@ -545,6 +547,24 @@ async fn evolve_of_a_step_a_hidden_workflow_executes_answers_as_a_missing_parent
         .execute(&pool)
         .await
         .expect("drop the submitter record");
+    // A WRITER of the row's owner group is admitted on it (the owner-group
+    // writer arm), recorded or not.
+    let admitted = mcp_evolve(&w, w.member, step, "a member writer's MCP revision").await;
+    assert!(
+        admitted.is_ok(),
+        "a writer of the owner group: {admitted:?}"
+    );
+    // A member that only READS the group is refused, and told why.
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' \
+          WHERE agent_id = $1 \
+            AND group_id = (SELECT owner_group_id FROM workflows WHERE id = $2)",
+    )
+    .bind(w.member)
+    .bind(w.workflow)
+    .execute(&pool)
+    .await
+    .expect("make the member a reader");
     let (s, out) = w
         .api
         .post(
@@ -577,8 +597,8 @@ async fn evolve_of_a_step_a_hidden_workflow_executes_answers_as_a_missing_parent
 
 /// `store_workflow` (REST `POST /api/v1/workflows` and the MCP tool) is idempotent
 /// on `(slugify(goal), 0)`, so a goal whose slug is the hidden plan's
-/// `canonical_name` is a re-ingest of the hidden row. The non-member's answer,
-/// and the REST `workflow.created` event it emits, leave the id out; the
+/// `canonical_name` is a re-ingest of the hidden row. The non-member is
+/// refused without the id (and emits no `workflow.created` event); the
 /// member's answer carries it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool) {
@@ -586,15 +606,18 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
     // `w.name` is already a slug, so it slugifies to itself.
     let body = json!({"goal": w.name, "steps": ["a stored step"]});
 
+    // Workflow writes run on the caller's own stamp, and a lineage with rows
+    // the caller cannot read is not written (migration 202): the non-member's
+    // store is refused (409 / MCP INVALID_REQUEST), with no id, nothing
+    // hidden named, and no `workflow.created` event.
     let (s, out) = w
         .api
         .post("/api/v1/workflows", &token(w.outsider), &body)
         .await;
-    assert_eq!(s, StatusCode::OK, "{out}");
-    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    assert_eq!(s, StatusCode::CONFLICT, "{out}");
     assert!(
         out.get("workflow_id").is_none(),
-        "REST store_workflow by a non-member leaves the id out: {out}"
+        "REST store_workflow by a non-member carries no id: {out}"
     );
     assert_names_nothing_hidden(&w, "REST store_workflow", &out.to_string());
     let events: Vec<Value> = sqlx::query_scalar(
@@ -605,8 +628,10 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
     .fetch_all(&pool)
     .await
     .expect("events");
-    assert_eq!(events.len(), 1, "one event for the re-ingest: {events:?}");
-    assert_names_nothing_hidden(&w, "REST workflow.created event", &events[0].to_string());
+    assert!(
+        events.is_empty(),
+        "a refused store emits no event: {events:?}"
+    );
 
     let auth = auth_for(w.outsider);
     let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(&auth))
@@ -614,17 +639,15 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
         .expect("viewer");
     let params: epigraph_mcp::types::StoreWorkflowParams =
         serde_json::from_value(body.clone()).expect("params");
-    let out = tool_answer(
+    let m = tool_answer(
         epigraph_mcp::tools::workflows::store_workflow(&w.server, &viewer, params, Some(&auth))
             .await,
-    )
-    .expect("the MCP store_workflow re-ingest succeeds");
-    assert_eq!(out["already_ingested"], json!(true), "{out}");
-    assert!(
-        out.get("workflow_id").is_none(),
-        "MCP store_workflow by a non-member leaves the id out: {out}"
     );
-    assert_names_nothing_hidden(&w, "MCP store_workflow", &out.to_string());
+    assert!(
+        m.is_err(),
+        "the MCP store_workflow by a non-member is refused: {m:?}"
+    );
+    assert_names_nothing_hidden(&w, "MCP store_workflow", &text_of(&m));
 
     // The member's answers carry the id.
     let (s, out) = w
@@ -738,14 +761,15 @@ async fn delete_admin_rows(pool: &PgPool) -> Vec<(Option<Uuid>, Value)> {
 /// * A non-member, and a `claims:admin` token whose client record grants
 ///   nothing (ADM02), are refused exactly as for an unknown name, naming
 ///   nothing hidden, with the step untouched.
-/// * The masking changes ANSWERS only (ruling R-100), never who is admitted: a
-///   live `claims:admin` holder outside the group, who cannot read the row
-///   either (the grantless call above proves its view: it got the unknown-name
-///   answer, not ADM02), is still admitted through the audited admin arm and
-///   recorded as `workflows.admin_write`, exactly as before the masking.
+/// * A live `claims:admin` holder OUTSIDE the group is now refused the same
+///   way, with nothing written and no `workflows.admin_write` row: workflow
+///   writes run on the caller's own stamp, and no caller writes a group it
+///   does not write through any path, the audited admin arm included. (It was
+///   admitted through the shared system agent's stamp before.) The masking
+///   still changes no arm: an admin who writes the group is admitted by it.
 /// * The member (the submitter) is admitted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn delete_step_over_a_hidden_workflow_is_masked_for_refusals_and_admits_as_before(
+async fn delete_step_over_a_hidden_workflow_is_masked_and_admits_only_writers_of_its_group(
     pool: PgPool,
 ) {
     let w = world(&pool).await;
@@ -844,10 +868,13 @@ async fn delete_step_over_a_hidden_workflow_is_masked_for_refusals_and_admits_as
         );
     }
 
-    // A live claims:admin holder outside the group: admitted and audited, on
-    // REST and on MCP, exactly as the admin arm admitted it before.
+    // A live claims:admin holder OUTSIDE the group: refused on REST and on
+    // MCP as for an unknown name, nothing written, nothing audited (workflow
+    // writes are made as the caller, and the admin does not write the group).
     let client = Uuid::new_v4();
     grant_admin(&pool, client, admin).await;
+    let truths_first = lineage_truths(&pool, first).await;
+    let truths_added = lineage_truths(&pool, added[0]).await;
     let (s, out) = w
         .api
         .post(
@@ -858,31 +885,22 @@ async fn delete_step_over_a_hidden_workflow_is_masked_for_refusals_and_admits_as
         .await;
     assert_eq!(
         s,
-        StatusCode::OK,
-        "the audited admin arm admits REST delete_step: {out}"
+        StatusCode::NOT_FOUND,
+        "an admin outside the group cannot delete its step: {out}"
     );
-    mcp_delete_step(&w, &admin_auth(client, admin), &w.name, added[0])
-        .await
-        .expect("the audited admin arm admits MCP delete_step");
-    for lineage in [first, added[0]] {
-        assert!(
-            lineage_truths(&pool, lineage)
-                .await
-                .iter()
-                .any(|t| (t - 0.05).abs() < 1e-9),
-            "the admin's delete drove the head to 0.05"
-        );
-    }
-    let rows = delete_admin_rows(&pool).await;
-    assert_eq!(
-        rows.len(),
-        2,
-        "one admin_write row per admitted delete: {rows:?}"
+    assert_names_nothing_hidden(&w, "REST delete_step (live admin)", &out.to_string());
+    let m = mcp_delete_step(&w, &admin_auth(client, admin), &w.name, added[0]).await;
+    assert!(
+        m.is_err(),
+        "an admin outside the group is refused over MCP: {m:?}"
     );
-    for (agent, d) in &rows {
-        assert_eq!(*agent, Some(admin), "the audit row names the admin: {d}");
-        assert_eq!(d["workflow_id"], json!(w.workflow.to_string()), "{d}");
-    }
+    assert_names_nothing_hidden(&w, "MCP delete_step (live admin)", &text_of(&m));
+    assert_eq!(lineage_truths(&pool, first).await, truths_first);
+    assert_eq!(lineage_truths(&pool, added[0]).await, truths_added);
+    assert!(
+        delete_admin_rows(&pool).await.is_empty(),
+        "a refused admin call is not audited as an admin write"
+    );
 
     // The member (the submitter): admitted on both transports, not audited
     // as an admin.
@@ -898,9 +916,8 @@ async fn delete_step_over_a_hidden_workflow_is_masked_for_refusals_and_admits_as
     mcp_delete_step(&w, &auth_for(w.member), &w.name, added[2])
         .await
         .expect("the member deletes over MCP");
-    assert_eq!(
-        delete_admin_rows(&pool).await.len(),
-        2,
+    assert!(
+        delete_admin_rows(&pool).await.is_empty(),
         "the member is no admin write"
     );
 }

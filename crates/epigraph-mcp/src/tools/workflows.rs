@@ -371,27 +371,28 @@ pub async fn store_workflow(
             viewer,
             &extraction,
             auth,
-            None,
+            params.tenancy.map(|t| t.decl()),
         )
         .await?;
+    let caller = server.write_identity(auth, viewer).await?;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Mirrors `do_ingest_workflow` —
     // without this, step claims created via `store_workflow` land without
-    // embeddings and break semantic search.
-    // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
-    for (claim_id, content) in &inserted {
-        let _ = server.embedder.embed_and_store(*claim_id, content).await;
-    }
+    // embeddings and break semantic search. Stored through the caller, which
+    // authored them (an undeclared store is private to its owner group).
+    crate::tools::workflow_ingest::embed_created_workflow_claims(server, caller, &inserted).await;
 
     // Also embed the workflow goal into workflows.goal_embedding for
     // embedding-first find_workflow_hierarchical. Omitted from the original
     // store_workflow; do_ingest_workflow embeds it correctly.
-    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+    if let Some(wf_id) = crate::tools::workflow_ingest::goal_embedding_target(&response) {
         match server.embedder.generate(&params.goal).await {
             Ok(qvec) => {
-                crate::tools::workflow_ingest::store_workflow_goal_embedding(server, wf_id, &qvec)
-                    .await;
+                crate::tools::workflow_ingest::store_workflow_goal_embedding(
+                    server, caller, wf_id, &qvec,
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
@@ -1394,7 +1395,7 @@ pub async fn deprecate_workflow(
     // this same path: `deprecate_claim` matched zero rows, the thesis, phase and
     // step claims stayed current, and the id was reported as deprecated anyway.
     // It now takes `deprecate_hierarchical_workflow` below (U017; backlog
-    // fe874d2a), on the ingest system agent's stamp, behind the workflow
+    // fe874d2a), on the caller's own stamp, behind the workflow
     // authority rule. The dispatch is by what the id IS: a claim this caller
     // can read takes this path (flat first, so an id that is both keeps
     // today's behaviour), else a `workflows` row takes the hierarchical one,
@@ -1609,10 +1610,10 @@ fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
 /// `deprecate_workflow` for a HIERARCHICAL workflow id (a `workflows` row):
 /// retire the workflow as a unit (U017; backlog fe874d2a).
 ///
-/// * ONE transaction on the ingest system agent's stamp
-///   (`begin_system_ingest_stamped_tx`, as `step_ops::delete_step`): the
-///   thesis, phase and step claims are that agent's, and the server agent's
-///   stamp that the flat path uses is USING-filtered to zero rows on them.
+/// * ONE transaction on the CALLER's own stamp (`begin_caller_workflow_tx`,
+///   as `step_ops::delete_step`): the caller retires only rows of groups it
+///   writes (row security refuses the rest), including a plan the shared
+///   system agent wrote before workflow writes moved to the caller.
 /// * The target set is the row plus, with `cascade`, every row descended from
 ///   it through `workflows.parent_id` (the lineage the `workflow -variant_of->
 ///   workflow` edges describe).
@@ -1656,9 +1657,7 @@ async fn deprecate_hierarchical_workflow(
     params: DeprecateWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     const TOOL: &str = "deprecate_workflow";
-    let (_system_agent_id, mut tx) =
-        crate::claim_helper::begin_system_ingest_stamped_tx(server, TOOL, caller.agent_id())
-            .await?;
+    let mut tx = crate::claim_helper::begin_caller_workflow_tx(server, caller, TOOL).await?;
 
     let mut targets = vec![workflow_id];
     if cascade {
@@ -1687,6 +1686,35 @@ async fn deprecate_hierarchical_workflow(
             server, &mut tx, auth, caller, row, TOOL, &not_found,
         )
         .await?;
+    }
+    if cascade {
+        // 1b. The descendants are read on the CALLER's stamp, where a generation
+        // private to a group the caller is not in is invisible: the cascade
+        // would deprecate the part it sees and report success. Refused
+        // instead, nothing written, when any generation of a target's name is
+        // hidden from the caller (migration 202's check, as every workflow
+        // write asks it). A wholly hidden fork under another name (a private
+        // variant of a visible parent, named differently) is not seen by this
+        // check and is not part of the cascade: it belongs to a group the
+        // caller cannot read, whose members deprecate it. Asked after the
+        // authority check, so a caller with no authority over the part it
+        // sees is refused by the gate and learns nothing about hidden rows.
+        let names = WorkflowRepository::canonical_names_of(&mut *tx, &targets)
+            .await
+            .map_err(internal_error)?;
+        for name in &names {
+            if WorkflowRepository::name_has_hidden_rows_conn(&mut tx, name)
+                .await
+                .map_err(internal_error)?
+            {
+                return Err(invalid_params(format!(
+                    "{TOOL}: cascade refused: the lineage '{name}' has generations this caller \
+                     cannot read, so a cascade would deprecate only part of it. Deprecate the \
+                     rows you can read without cascade, or ask a member of the group that owns \
+                     the rest. Nothing was written."
+                )));
+            }
+        }
     }
 
     // 2. Serialize against any other deprecation that could share a claim with

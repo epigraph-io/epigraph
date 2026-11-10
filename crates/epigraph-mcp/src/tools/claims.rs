@@ -1827,8 +1827,24 @@ pub async fn update_with_evidence(
 ///   acting directly is admitted.
 ///
 /// A retired identity is never an actor, so it owns nothing through this arm
-/// (its key may be exposed). An operator's OWN directly authored claims are
-/// not reachable from its agents here: `author_op(operator)` is `None`.
+/// (its key may be exposed).
+///
+/// ## The delegate arm (operator ruling R-183)
+///
+/// "Agents acting for me should inherit my authority": `actor_op(caller) ==
+/// target` — an agent whose ACTING link names the claim's author owns the
+/// author's own claims, exactly where the author itself would be admitted by
+/// authorship. It is the third arm stage-2 brief A1 had left out (an
+/// operator's directly authored claims were not reachable from its agents,
+/// since `author_op(operator)` is `None`). It reads the same caller-side
+/// definer as the actor arm, so it is one hop (the read names the caller's
+/// direct operator only), a retired link grants nothing, and a revoked
+/// membership ends it; and it runs where the actor arm runs: always on stdio,
+/// over HTTP only for a delegated run token whose delegation is live NOW.
+/// Recorded as [`OwnershipGrant::Delegate`]. Tenancy is unchanged: the write
+/// that follows runs on the caller's own stamp, so it lands only where the
+/// caller writes (a live link makes it a writer of the operator's personal
+/// group, and of nothing else).
 ///
 /// ### What this arm does NOT reach: claims written through a shared HTTP signer
 ///
@@ -1892,13 +1908,17 @@ pub(crate) async fn require_owner_or_admin(
         if operator_arm_allows(server, caller_agent, target_agent_id, allow_actor).await? {
             return Ok(OwnershipGrant::Operator);
         }
+        if allow_actor && delegate_arm_allows(server, caller_agent, target_agent_id).await? {
+            return Ok(OwnershipGrant::Delegate);
+        }
         return Err(McpError {
             code: rmcp::model::ErrorCode::INVALID_PARAMS,
             message: format!(
                 "claim is owned by agent {target_agent_id}; \
                  caller agent {caller_agent} (principal {principal}) cannot retire it \
-                 (requires claims:admin scope or ownership: authorship, or being the \
-                 author's operator)"
+                 (requires claims:admin scope or ownership: authorship, being the author's \
+                 operator, or, through a live delegated run token, acting for the author or \
+                 its operator through a live operator link)"
             )
             .into(),
             data: None,
@@ -1935,6 +1955,9 @@ pub(crate) async fn require_owner_or_admin(
     if operator_arm_allows(server, caller_agent, target_agent_id, true).await? {
         return Ok(OwnershipGrant::Operator);
     }
+    if delegate_arm_allows(server, caller_agent, target_agent_id).await? {
+        return Ok(OwnershipGrant::Delegate);
+    }
 
     Err(McpError {
         code: rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -1943,7 +1966,8 @@ pub(crate) async fn require_owner_or_admin(
              caller agent {caller_agent} cannot retire it. This transport carries no \
              AuthContext, and {caller_agent} is this server's declared signer identity \
              (--agent-key / --agent-model), so ownership is enforced against it: only the \
-             author, or an agent acting for the author's operator, may. Use an \
+             author, the author's operator, or an agent acting for the author or for the \
+             author's operator through a live operator link, may. Use an \
              authenticated HTTP listener with a claims:admin token, or run this server \
              under the owning agent's key."
         )
@@ -1966,6 +1990,9 @@ pub(crate) enum OwnershipGrant {
     Author,
     /// The caller is (or acts for) the operator of the claim's author (#503).
     Operator,
+    /// The caller acts for the claim's author itself: its live operator link
+    /// names the author (operator ruling R-183, one hop).
+    Delegate,
     /// stdio, with a per-process random signer: undecidable, allowed.
     UndeclaredSigner,
     /// An authenticated `claims:admin` caller.
@@ -2019,6 +2046,33 @@ pub(crate) async fn operator_arm_allows(
         operator = %target_op,
         reason,
         "claim ownership granted through an operator link"
+    );
+    Ok(true)
+}
+
+/// The delegate arm of [`require_owner_or_admin`] (operator ruling R-183; see
+/// its doc): `true` when the caller's ACTING operator link
+/// (`AgentRepository::operator_actor`, the caller-side definer read) names
+/// `target`, the claim's author. Never the author read on the caller side: a
+/// retired identity's key may be exposed. A lookup failure is an error, not a
+/// `false`.
+pub(crate) async fn delegate_arm_allows(
+    server: &EpiGraphMcpFull,
+    caller: uuid::Uuid,
+    target: uuid::Uuid,
+) -> Result<bool, McpError> {
+    let acting = epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+        .await
+        .map_err(internal_error)?;
+    if !acting.is_some_and(|l| l.operator_id == target) {
+        return Ok(false);
+    }
+    tracing::info!(
+        caller = %caller,
+        target_agent = %target,
+        operator = %target,
+        reason = "caller acts for the claim's author through a live operator link",
+        "claim ownership granted through a delegate link"
     );
     Ok(true)
 }

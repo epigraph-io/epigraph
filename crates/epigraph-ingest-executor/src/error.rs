@@ -61,20 +61,28 @@ pub enum IngestExecutorError {
         group: uuid::Uuid,
     },
 
-    /// A declared-tenancy ingest names a group the workflow-ingest system
-    /// agent does not write, so its stamp could not satisfy the row-security
-    /// `WITH CHECK` on the claims and edges it would create. Raised on the
-    /// stamped transaction before anything is written.
+    /// A declared PUBLIC tenancy on a new generation of a group-private
+    /// lineage: it would publish the lineage. Raised before anything is
+    /// written; the generation inherits the lineage's group when it declares
+    /// none, or moves to another group the caller writes when it declares
+    /// that group.
     #[error(
-        "the workflow-ingest system agent {system_agent} holds no live writer or admin \
-         membership of group {group}, so no claim of this ingest could be owned by it: a \
-         maintenance session must grant that agent a writer row in the group first. Nothing \
-         was written"
+        "canonical_name '{canonical_name}' is a lineage private to group {group}; a new \
+         generation of it cannot be declared public. Omit tenancy (the generation stays in the \
+         lineage's group) or declare a group you write. Nothing was written"
     )]
-    DeclaredGroupNotWritable {
+    DeclaredPublicOverGroupLineage {
+        canonical_name: String,
         group: uuid::Uuid,
-        system_agent: uuid::Uuid,
     },
+
+    /// A caller-authored workflow write was handed a viewer with no
+    /// principal: there is no agent to author the rows as.
+    #[error(
+        "a workflow write needs an authenticated agent principal to write as; this request \
+         names none. Nothing was written"
+    )]
+    CallerUnidentified,
 
     /// A declared-tenancy ingest's plan names a claim that already exists and
     /// that is private to a group the CALLING agent does not write (or that the
@@ -111,7 +119,38 @@ pub enum IngestExecutorError {
         generation: i32,
     },
 
+    /// A caller-authored ingest's row insert did nothing: a row with the
+    /// plan's `(canonical_name, generation)` already exists (read before the
+    /// walk, or committed by another caller while the insert waited on the
+    /// unique index), the ingest's stamp reads it, and it shows no plan. The
+    /// walk would attach the caller's claims and edges to a row it did not
+    /// create, so it stops here, before writing anything under the row, and
+    /// rolls back to where it began. The entry point must check its lineage
+    /// authority over `workflow_id` on the same transaction and, when it is
+    /// admitted, run the walk again with that row admitted. Never shown to a
+    /// caller as is: an entry point that does not handle it maps it to a
+    /// refusal that does not name the row.
+    #[error(
+        "workflow {canonical_name:?} generation {generation} already exists; writing under it \
+         needs authority over it. Nothing was written"
+    )]
+    ExistingWorkflowNeedsAuthority {
+        workflow_id: uuid::Uuid,
+        canonical_name: String,
+        generation: i32,
+    },
+
     /// Plan structure violated an executor invariant.
+    /// A caller-authored workflow write names a lineage (its own
+    /// `canonical_name`, or the `parent_canonical_name` it extends) that has
+    /// rows the caller cannot read (migration 202). Extending it would mint a
+    /// generation every member would then resolve as the lineage's head.
+    #[error(
+        "workflow lineage {canonical_name:?} has generations this caller cannot read, so it may \
+         not write to it. Nothing was written"
+    )]
+    LineageOutsideView { canonical_name: String },
+
     #[error("plan inconsistency: {0}")]
     PlanInconsistency(String),
 
@@ -144,8 +183,10 @@ pub enum IngestExecutorError {
 
 impl IngestExecutorError {
     /// Whether this is one of the declared-tenancy refusals
-    /// ([`Self::CallerNotGroupWriter`], [`Self::DeclaredGroupNotWritable`],
-    /// [`Self::ReusedClaimOutsideCallerGroups`]): a denial the caller can act
+    /// ([`Self::CallerNotGroupWriter`], [`Self::InheritedGroupNotWritable`],
+    /// [`Self::DeclaredPublicOverGroupLineage`],
+    /// [`Self::ReusedClaimOutsideCallerGroups`], [`Self::CallerUnidentified`]):
+    /// a denial the caller can act
     /// on (403 / `INVALID_REQUEST`), not a fault.
     #[must_use]
     pub const fn is_declared_tenancy_refusal(&self) -> bool {
@@ -153,8 +194,9 @@ impl IngestExecutorError {
             self,
             Self::CallerNotGroupWriter { .. }
                 | Self::InheritedGroupNotWritable { .. }
-                | Self::DeclaredGroupNotWritable { .. }
+                | Self::DeclaredPublicOverGroupLineage { .. }
                 | Self::ReusedClaimOutsideCallerGroups { .. }
+                | Self::CallerUnidentified
         )
     }
 }
