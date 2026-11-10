@@ -197,8 +197,12 @@ The three writes' `UPDATE`s open
 a transaction-local "write window" (`search_path = public, pg_temp`) and close it straight
 after, because the legacy invoker triggers they fire (`trigger_validate_edge_refs` →
 `validate_edge_reference`) call unqualified functions and inherit the caller's path.
-The pattern is the same as the existing definers (`epigraph_record_cascade_deferral`,
-`epigraph_team_group_add_member`). Per `docs/tenancy.md#epigraph.allow_declassify`, the GUC is
+The window puts `public` on the path the way the 117, 120 and 164 definers (for example
+`epigraph_record_cascade_deferral` and `epigraph_team_group_add_member`) do, but those pin it
+function-wide (`SET search_path = pg_catalog, public` in 117 and 120, with `pg_temp` appended
+last by 190; `public, pg_temp` in 164). Here it is switched on at runtime with a
+transaction-local `set_config(.., true)`, only around the write statements, and switched back;
+206 is the only migration whose definers do this. Per `docs/tenancy.md#epigraph.allow_declassify`, the GUC is
 an interlock and not an authorization. **The authorization is the function body.** It runs as
 the session principal (`epigraph_principal_id()`), reads live memberships through
 `epigraph_live_memberships`, and does not trust a caller-supplied identity.
@@ -248,8 +252,8 @@ Then, for the `publicize` claims:
    `('public', writer_group_id)`, otherwise world. One endpoint still private → the private
    side's group. An edge explicitly declared `('group', G)` between public endpoints is kept,
    as 120 does on INSERT. That declaration is not recorded, so the rule is narrowed: only edges
-   whose current owner equals the meet that the old tenancy produces get rewritten. Anything
-   else was a declaration and is left alone.
+   whose whole `(visibility, owner_group_id, co_owner_group_id)` tuple equals the meet that the
+   old tenancy produces get rewritten. Anything else was a declaration and is left alone.
 7. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
    the principal and details `{claim_ids, owner_group_ids, reason, edges_widened,
    evidence_kept_private, migration, session_user}`.
