@@ -77,8 +77,10 @@ pub struct ThemeOverviewRow {
     pub id: Uuid,
     /// Stored label. NOT viewer-derived: for a theme with members the viewer
     /// cannot read it may summarise their text (`scripts/label_themes_llm.py`
-    /// samples members with no visibility predicate; the label residual on
-    /// `D-PR16-theme-cluster-viewer-scope`). Cut to 200 characters.
+    /// samples members with no visibility predicate, except claims the
+    /// bug-report intake group owns, which it never samples; the label
+    /// residual on `D-PR16-theme-cluster-viewer-scope`). Cut to 200
+    /// characters.
     pub label: String,
     /// Current claims assigned to this theme that the viewer can read. `>= 1`.
     pub member_count: i64,

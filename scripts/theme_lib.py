@@ -42,6 +42,32 @@ def maintenance_dsn(default=DEFAULT_DATABASE_URL):
     return _maintenance_dsn(default)
 
 
+def not_intake_owned(alias="c"):
+    """SQL predicate: claim `alias` is NOT owned by the bug-report intake group.
+
+    Migration 207's intake files private bug reports, written by agents that
+    are not members of the group that triages them, as claims owned by the
+    group `bug_report_intake_settings` names. They carry an embedding, so they
+    join clustering and theme assignment like any claim. A stored label
+    (`cluster_labels.label`, which project_to_themes copies onto a theme, and
+    `claim_themes.label` / `description` from label_themes_llm) is shown to
+    every viewer who can read one member of the theme, so a label built from a
+    report's text would publish wording only the intake group may read.
+
+    Every query that turns member CONTENT into a stored label applies this
+    predicate: label_themes_llm.load_themes_with_samples,
+    cluster_claims.label_clusters and evidential_clustering.store_results.
+    It is keyed on the CURRENTLY configured intake group: a report triage
+    moves out of that group (or every report, once the operator names another
+    group) is sampled again, under the same rule as any other claim of its new
+    owner. With no settings row it excludes nothing.
+    """
+    return (
+        "NOT EXISTS (SELECT 1 FROM bug_report_intake_settings bri "
+        f"WHERE bri.intake_group_id = {alias}.owner_group_id)"
+    )
+
+
 def connect(database_url=None):
     """Open a psycopg2 connection (admin role by default)."""
     url = database_url or maintenance_dsn()
