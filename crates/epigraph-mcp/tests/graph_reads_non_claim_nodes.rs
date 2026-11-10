@@ -153,6 +153,7 @@ async fn a_workflow_nodes_executes_edge_is_visible_with_direction_both(pool: PgP
             &server,
             &viewer,
             StoreWorkflowParams {
+                tenancy: Some(common::stdio_public_tenancy(&server).await),
                 goal: format!("g9 workflow neighborhood probe {}", Uuid::new_v4()),
                 steps: vec!["first g9 step".into(), "second g9 step".into()],
                 prerequisites: None,

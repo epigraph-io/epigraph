@@ -141,6 +141,12 @@ pub struct StoreWorkflowRequest {
     /// same goal is a no-op that keeps the original tags. Not added as claim
     /// labels.
     pub tags: Option<Vec<String>>,
+    /// Optional declared tenancy, as for `POST /api/v1/workflows/ingest`
+    /// ([`IngestWorkflowRequest::tenancy`]): `{"visibility": "group" |
+    /// "public", "owner_group_id": G}`. Absent: private to the caller's owner
+    /// group.
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
 }
 
 #[cfg(feature = "db")]
@@ -297,8 +303,13 @@ fn slugify_goal(s: &str) -> String {
 ///
 /// Input shape stays simple (`goal` + `steps[]`); internally constructs a
 /// `WorkflowExtraction` (single `"Body"` phase, thesis = goal) and runs
-/// `execute_workflow_ingest_plan`. Each step becomes a first-class claim.
-/// Idempotent on `(slugify(goal), generation=0)`.
+/// `execute_workflow_ingest_plan_in_group` AS THE CALLER (the request's
+/// principal authors every claim). Without `tenancy` the workflow is private
+/// to its owner group: the caller's one team group, else its default group;
+/// `tenancy` declares a group or, explicitly, public (see
+/// [`IngestWorkflowRequest`]). Each step becomes a first-class claim.
+/// Idempotent on `(slugify(goal), generation=0)`: a re-store writes nothing,
+/// and emits no event.
 #[cfg(feature = "db")]
 pub async fn store_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -321,6 +332,15 @@ pub async fn store_workflow(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let canonical_name = slugify_goal(&request.goal);
+    let declared = request.tenancy.map(|t| t.decl());
+    if let Some(group) = declared.and_then(|d| d.owner_group_bind()) {
+        let caller = viewer.principal().ok_or_else(|| ApiError::Forbidden {
+            reason: "store_workflow: a declared tenancy needs an authenticated agent principal"
+                .to_string(),
+        })?;
+        epigraph_ingest_executor::require_caller_writes_group(&viewer, caller, group)
+            .map_err(workflow_ingest_error)?;
+    }
     let prereqs = request.prerequisites.unwrap_or_default();
     let tags = request.tags.unwrap_or_default();
     let confidence = request.confidence.unwrap_or(0.8).clamp(0.0, 1.0);
@@ -368,13 +388,18 @@ pub async fn store_workflow(
     };
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
-    let mut tx =
-        begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
-    let decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
-    let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
-            .await
-            .map_err(workflow_ingest_error)?;
+    let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows").await?;
+    let mut decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
+    let (mut tx, result) = execute_admitted_ingest(
+        tx,
+        None,
+        &viewer,
+        &plan,
+        &extraction,
+        declared,
+        &mut decision,
+    )
+    .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
@@ -391,20 +416,37 @@ pub async fn store_workflow(
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
 
-    auto_wire_inserted_edges(&state, &viewer, &result).await;
+    // A short-circuited re-ingest wrote nothing, and nothing follows it: no
+    // DS wiring, no embedding, above all no goal embedding on a row the caller
+    // may have no authority over.
+    if !result.already_ingested {
+        auto_wire_inserted_edges(&state, &viewer, &result).await;
+    }
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
-    if let Some(embedder) = state.embedding_service() {
+    let embedder = if result.already_ingested {
+        None
+    } else {
+        state.embedding_service()
+    };
+    if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
-        embed_inserted_workflow_claims(&state, embedder.as_ref(), "workflows", &result.inserted)
-            .await;
+        embed_inserted_workflow_claims(
+            &state,
+            &viewer,
+            embedder.as_ref(),
+            "workflows",
+            &result.inserted,
+        )
+        .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
-        // never into a row the caller cannot read (backlog c831df4a).
-        if caller_reads_row {
+        // only on a row this call's insert CREATED: an existing row (one the
+        // walk was admitted under) keeps the goal embedding of its own goal.
+        if result.row_created {
             match embedder.generate(&request.goal).await {
                 Ok(qvec) => {
-                    store_workflow_goal_embedding(&state, "workflows", wf_id, &qvec).await;
+                    store_workflow_goal_embedding(&state, &viewer, "workflows", wf_id, &qvec).await;
                 }
                 Err(e) => {
                     tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
@@ -434,16 +476,26 @@ pub async fn store_workflow(
         omit_workflow_id(&mut event);
         omit_workflow_id(&mut body);
     }
-    let _ = epigraph_db::EventRepository::insert(&state.db_pool, "workflow.created", None, &event)
-        .await;
+    // `events` has no row security: every reader of the event stream sees a
+    // row's payload. So the event announces only a workflow this call CREATED
+    // as PUBLIC; a group-private plan's goal and id stay with its group.
+    let created_public = result.row_created
+        && result
+            .decl
+            .is_some_and(|d| d.visibility_bind() == Some("public"));
+    if created_public {
+        let _ =
+            epigraph_db::EventRepository::insert(&state.db_pool, "workflow.created", None, &event)
+                .await;
+    }
 
     Ok(Json(body))
 }
 
 /// Whether the caller reads the row an ingest reports (backlog c831df4a). A
 /// fresh ingest created it for the caller. A re-ingest reports the EXISTING
-/// row, which the ingest system agent's stamp found and the caller may not
-/// read (a group plan outside its groups); then the answer leaves its id out,
+/// row, which the ingest's stamp found and the caller's viewer may not read;
+/// then the answer leaves its id out,
 /// as the MCP twin does (`tools/workflow_ingest.rs`). Read with the caller's
 /// viewer on the ingest's own transaction, before it commits.
 #[cfg(feature = "db")]
@@ -1732,8 +1784,9 @@ pub struct EvolveStepResponse {
 /// parent or any claim sharing its `step_lineage_id`, retracted `executes`
 /// edges included), the caller needs workflow authority over EVERY such
 /// workflow, as `add_step` / `delete_step` need over theirs: its recorded
-/// submitter, the submitter's operator, or the audited `claims:admin` path (a
-/// workflow with no recorded submitter admits only that path). Anyone else is
+/// submitter, the submitter's operator, a writer of its owner group, or the
+/// audited `claims:admin` path (a workflow with no recorded submitter admits
+/// a writer of its owner group or that path). Anyone else is
 /// refused 403 with nothing written. Each admitted write records one
 /// `workflows.caller_write` (or `workflows.admin_write`) row per workflow. A
 /// claim no workflow executes is unaffected.
@@ -2240,7 +2293,12 @@ pub async fn record_behavioral_execution(
 /// two optional keys beside its own.
 ///
 /// * `tenancy`: `{"visibility": "group", "owner_group_id": G}` declares
-///   `('group', G)` for every claim the ingest creates (absent: public).
+///   `('group', G)` for the `workflows` row and every claim the ingest
+///   creates; `{"visibility": "public", "owner_group_id": G}` declares
+///   `('public', G)`, the only way to publish a new workflow. The caller must
+///   write G either way. Absent: a new workflow is private to the caller's
+///   owner group (its one team group, else its default group), and a new
+///   generation keeps its lineage's visibility.
 /// * `embed`: `false` embeds nothing (default `true`).
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
@@ -2265,20 +2323,31 @@ pub struct IngestWorkflowRequest {
 /// # A declared tenancy
 ///
 /// With `tenancy` (see [`IngestWorkflowRequest`]) every claim the ingest
-/// creates is `('group', G)`. The REQUEST's principal itself must hold a live
+/// creates takes the declared `(visibility, G)`; declaring public on a new
+/// generation of a group-private lineage is refused (403), since it would
+/// publish the lineage. The REQUEST's principal itself must hold a live
 /// writer or admin membership of G (checked on its own viewer before any
 /// transaction, so a refusal writes nothing; its operator's membership does
-/// not count), and so must the workflow-ingest system agent (checked by the
-/// executor on the stamped transaction). Both refusals are 403. The response
+/// not count), and the executor re-checks it LIVE on the caller-stamped
+/// transaction. Both refusals are 403. The response
 /// then carries `reused_items`: every planned claim the call did not create
-/// whose tenancy is not `('group', G)`, with its tenancy (`null` when the
+/// whose tenancy is not the declared one, with its tenancy (`null` when the
 /// caller cannot read it, which only a re-ingest can report). Nothing
 /// re-tenants a reused claim, and a plan that reuses a claim private to a group
 /// the caller does not write is refused (403) before any edge is written.
 ///
-/// The `workflows` row itself has no row security: its `canonical_name`,
-/// `goal`, `metadata` and (unless `embed` is `false`) `goal_embedding` stay
-/// instance-readable whatever the tenancy, so a caller must keep them neutral.
+/// The `workflows` row takes the same tenancy as its plan (migration 183).
+/// A re-ingest of an existing `(canonical_name, generation)` writes nothing,
+/// not even the goal embedding.
+///
+/// # Written as the caller
+///
+/// Every claim, edge and the `workflows` row are authored by the request's
+/// principal and stamped from its viewer. Without `tenancy` the tenancy is
+/// `epigraph_ingest_executor::owner`'s order: a new generation of a public
+/// lineage stays public (in the lineage's group when the caller writes it,
+/// else in the caller's own); a new workflow is private to the caller's one
+/// live team group, else to its default group.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -2288,7 +2357,7 @@ pub struct IngestWorkflowRequest {
         (status = 200, body = serde_json::Value),
         (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
         (status = 401, description = "no authenticated caller"),
-        (status = 403, description = "the token lacks claims:write, or a declared group the caller or the ingest system agent does not write"),
+        (status = 403, description = "the token lacks claims:write, or a declared or inherited group the caller does not write, or no principal to write as"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2320,11 +2389,11 @@ pub async fn ingest_workflow(
             field: "relationships".to_string(),
             reason,
         })?;
-    let declared_group = tenancy.map(|t| t.owner_group_id);
+    let declared = tenancy.map(|t| t.decl());
     // The caller's OWN membership of a declared group, before anything is
     // begun (`require_caller_writes_group`). A viewer with no principal names
     // no caller and is refused.
-    if let Some(group) = declared_group {
+    if let Some(group) = declared.and_then(|d| d.owner_group_bind()) {
         let caller = viewer.principal().ok_or_else(|| ApiError::Forbidden {
             reason: "workflow ingest: a declared tenancy needs an authenticated agent principal"
                 .to_string(),
@@ -2338,19 +2407,19 @@ pub async fn ingest_workflow(
         obj.remove(epigraph_db::WorkflowRepository::SUBMITTER_KEY);
     }
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
-    let mut tx =
-        begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
+    let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows/ingest").await?;
     let auth = Some(auth);
-    let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-        &mut tx,
+    let mut decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
+    let (mut tx, result) = execute_admitted_ingest(
+        tx,
+        auth,
+        &viewer,
         &plan,
         &extraction,
-        &viewer,
-        declared_group,
+        declared,
+        &mut decision,
     )
-    .await
-    .map_err(workflow_ingest_error)?;
+    .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
@@ -2367,12 +2436,17 @@ pub async fn ingest_workflow(
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
 
-    auto_wire_inserted_edges(&state, &viewer, &result).await;
+    // A short-circuited re-ingest wrote nothing, and nothing follows it: no
+    // DS wiring, no embedding, above all no goal embedding on a row the caller
+    // may have no authority over.
+    if !result.already_ingested {
+        auto_wire_inserted_edges(&state, &viewer, &result).await;
+    }
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     // `embed: false` (OD-6) sends no text to the embedder at all.
-    let embedder = if embed.unwrap_or(true) {
+    let embedder = if embed.unwrap_or(true) && !result.already_ingested {
         state.embedding_service()
     } else {
         None
@@ -2381,17 +2455,26 @@ pub async fn ingest_workflow(
         let wf_id = result.workflow_id;
         embed_inserted_workflow_claims(
             &state,
+            &viewer,
             embedder.as_ref(),
             "workflows/ingest",
             &result.inserted,
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
-        // never into a row the caller cannot read (backlog c831df4a).
-        if caller_reads_row {
+        // only on a row this call's insert CREATED: an existing row (one the
+        // walk was admitted under) keeps the goal embedding of its own goal.
+        if result.row_created {
             match embedder.generate(&extraction.source.goal).await {
                 Ok(qvec) => {
-                    store_workflow_goal_embedding(&state, "workflows/ingest", wf_id, &qvec).await;
+                    store_workflow_goal_embedding(
+                        &state,
+                        &viewer,
+                        "workflows/ingest",
+                        wf_id,
+                        &qvec,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
@@ -2413,7 +2496,7 @@ pub async fn ingest_workflow(
     if !caller_reads_row {
         omit_workflow_id(&mut body);
     }
-    if declared_group.is_some() {
+    if declared.is_some() {
         body["reused_items"] = result
             .reused_items
             .iter()
@@ -2431,125 +2514,56 @@ pub async fn ingest_workflow(
 
 // ── Internal helpers ──
 
-/// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
-/// **workflow-ingest system agent's** viewer (the agent migration 148's
-/// `system_agents` registry names; see `get_or_create_system_agent`).
+/// Begin the ONE transaction a WORKFLOW write runs in (`POST /workflows`,
+/// `/workflows/ingest`, `/workflows/steps`, `/workflows/steps/delete`, and the
+/// post-commit DS wiring and embeds of an ingest), stamped from the CALLER's
+/// own viewer: the request's.
 ///
-/// The HTTP twin of `epigraph-mcp`'s
-/// `claim_helper::begin_system_ingest_stamped_tx`, and identical in substance:
-/// `epigraph_ingest_executor` authors every row as
-/// `get_or_create_system_agent` and owns it with that agent's personal group, so
-/// migration 077's `WITH CHECK` on `claims` refuses the walk on an unstamped
-/// connection and refuses it just as firmly when stamped from the HTTP
-/// PRINCIPAL. The principal's viewer is the wrong answer here for exactly the
-/// reason `server.agent_id()` is on the MCP side — see
-/// `epigraph_ingest_executor::system_agent_write_authority` for the measurement.
+/// The HTTP twin of `epigraph-mcp`'s `claim_helper::begin_caller_workflow_tx`.
+/// These writes used to be authored by, and stamped from, ONE shared
+/// workflow-ingest system agent, with the caller bound to that agent's human
+/// (`epigraph_ingest_executor::require_caller_write_authority`): once the
+/// system agent was live-linked to one human operator, every other human was
+/// refused `OPL02` here, however fully it was onboarded into a team. Now the
+/// executor authors every row as the caller and owns it in a group the caller
+/// writes (`epigraph_ingest_executor::owner`), so the stamp is the caller's,
+/// row security and migration 122's claims trigger see the real writer, and no
+/// caller writes into a group it does not write through any of these routes.
 ///
-///
-/// # RESIDUAL, stated so the R3 policy drop is not read as closing it
-///
-/// This stamps the transaction with the SYSTEM agent's authority, and nothing on
-/// this path asks whether the CALLER has any authority over the workflow it
-/// names. `add_step`, `delete_step`, `ingest_workflow` and
-/// `improve_workflow_hierarchy` (MCP), and `POST /api/v1/workflows/steps` and
-/// `/steps/delete` (HTTP, gated only by the `claims:write` scope) reach this on
-/// caller-supplied input (`canonical_name`, `step_lineage_id`). So any
-/// `claims:write` caller can mutate any system-owned workflow — the harness's
-/// `delete_step` arm drives a step's truth to 0.05 with no ownership relation
-/// between caller and workflow. Same residual as `epigraph_mcp::claim_helper::begin_system_ingest_stamped_tx`,
-/// which carries the MCP half. MEASURED by review; not a regression: config B
-/// (production today) admits the same writes through the orphan `*_privacy`
-/// policies, and main behaves the same there.
-///
-/// What it means for R3: dropping the orphan policies does NOT tighten workflow
-/// mutation at all, because these writes no longer depend on them. Tightening
-/// needs a caller-side check against the TARGET workflow before the stamp, and
-/// a decision about who "owns" a workflow the system agent authored — neither
-/// of which is a mechanical conversion. Tracked as open work, not fixed here.
-///
-/// # The CALLER is bound before anything is written (migration 122)
-///
-/// As on the MCP side: the claims trigger sees only the shared system agent,
-/// so this binds `caller` (the request's principal; `None` is unbound) on the
-/// stamped transaction, through
-/// `epigraph_ingest_executor::require_caller_write_authority`. Once the
-/// database is armed an unbound caller is refused (`OPL01`) and a caller whose
-/// human does not write the system agent's owner group is refused (`OPL02`),
-/// both as 403.
+/// The authority over an EXISTING workflow (the submitter, its operator, a
+/// writer of its owner group, or the audited admin arm;
+/// [`workflow_authority`]) is checked by every route on this transaction,
+/// before the write.
 ///
 /// # Errors
-/// `ApiError::InternalError` if the system agent has no write authority, if the
-/// process was not built through `AppState::with_scoped_pool`, or if the stamp
-/// fails. Never a fallback to `state.db_pool`. A 403 for the caller refusals.
+/// 403 for a viewer with no principal (no agent to write as) or with no live
+/// writable group (every row would be refused); `ApiError::InternalError` if
+/// the process was not built through `AppState::with_scoped_pool` or the stamp
+/// fails; the elevated-read-only refusal for an elevated viewer. Never a
+/// fallback to `state.db_pool`.
 #[cfg(feature = "db")]
-pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
+pub(crate) async fn begin_caller_workflow_tx<'s>(
     state: &'s AppState,
+    viewer: &epigraph_db::Viewer,
     route: &'static str,
-    caller: Option<Uuid>,
 ) -> Result<epigraph_db::ScopedTx<'s>, ApiError> {
-    let scoped = state.scoped.as_ref().ok_or_else(|| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            route = route,
-            "write refused: this process was not built from a ScopedPool, so no connection can \
-             be stamped with the ingest system agent's tenancy context."
-        );
-        ApiError::InternalError {
-            message: format!(
-                "{route}: this server was not built from a ScopedPool, so the workflow ingest \
-                 path cannot stamp a connection. Nothing was written."
+    if viewer.principal().is_none() {
+        return Err(ApiError::Forbidden {
+            reason: format!(
+                "{route}: a workflow write is made as the caller, and this request names no \
+                 agent principal to write as. Nothing was written."
             ),
-        }
-    })?;
-
-    let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "tenancy.scoped_write",
-                route = route,
-                error = %e,
-                "write refused: could not establish the workflow-ingest-system agent's write \
-                 authority. Nothing was written."
-            );
-            match e {
-                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
-                    system_agent_unregistered(role)
-                }
-                e => ApiError::InternalError {
-                    message: format!(
-                        "{route}: could not establish the workflow-ingest-system agent's write \
-                         authority: {e}. Nothing was written."
-                    ),
-                },
-            }
-        })?;
-
-    let mut tx = scoped
-        .begin_as(&authority.viewer)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("{route}: could not begin a system-agent-stamped transaction: {e}"),
-        })?;
-    epigraph_ingest_executor::require_caller_write_authority(&mut tx, authority.agent_id, caller)
-        .await
-        .map_err(|e| {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                route = route,
-                caller = ?caller,
-                error = %e,
-                "workflow write refused: the caller may not write through the ingest system agent"
-            );
-            if e.is_write_authority_refusal() {
-                ApiError::from(e)
-            } else {
-                ApiError::InternalError {
-                    message: format!("{route}: could not check the caller's authority: {e}"),
-                }
-            }
-        })?;
-    Ok(tx)
+        });
+    }
+    if viewer.writable_groups().is_empty() {
+        return Err(ApiError::Forbidden {
+            reason: format!(
+                "{route}: the caller holds no live writable group membership, so no row of \
+                 this workflow write could be owned by a group it writes. Nothing was written."
+            ),
+        });
+    }
+    state.write_as(viewer, route).await
 }
 
 /// The workflow-ingest system agent, for `routes/policies.rs::create_challenge`.
@@ -2600,21 +2614,18 @@ pub(crate) fn system_agent_unregistered(role: &'static str) -> ApiError {
 }
 
 /// Embed the claims a workflow ingest just committed. This runs post-commit and
-/// best-effort, on a transaction stamped from the **workflow-ingest system
-/// agent's** viewer: the same authority [`begin_system_ingest_stamped_tx`] wrote
-/// the claims with.
+/// best-effort, on a transaction stamped from the CALLER's viewer: the same
+/// authority [`begin_caller_workflow_tx`] wrote the claims with (they are the
+/// caller's, in a group it writes).
 ///
 /// # Why not `state.db_pool`
 ///
-/// The claims are authored by the system agent and owned by its personal
-/// group. An `UPDATE claims SET embedding` on the unstamped pool carries no
-/// viewer, so row security on `claims` refuses it. Before this helper existed,
-/// both `store_workflow` and `ingest_workflow` did exactly that and only
+/// An `UPDATE claims SET embedding` on the unstamped pool carries no viewer,
+/// so row security on `claims` refuses it. Before this helper existed, both
+/// `store_workflow` and `ingest_workflow` did exactly that and only
 /// WARN-logged the refusal. The route answered 200 and every claim it had
 /// written was left without a vector (backlog 5ce88457), invisible to dense
-/// recall against CLAUDE.md's "Embedding policy". The CALLER's viewer is wrong
-/// too: the `{WRITABLE:c}` splice in `store_embedding_if_unsealed` would render
-/// the caller's groups, and no system-owned row satisfies them.
+/// recall against CLAUDE.md's "Embedding policy".
 ///
 /// No caller re-binding is needed. Migration 122's claims trigger fires on
 /// `UPDATE OF agent_id, supersedes, is_current`, not on `embedding`.
@@ -2635,6 +2646,7 @@ pub(crate) fn system_agent_unregistered(role: &'static str) -> ApiError {
 #[cfg(feature = "db")]
 async fn embed_inserted_workflow_claims(
     state: &AppState,
+    viewer: &epigraph_db::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     route: &'static str,
     inserted: &[(Uuid, String)],
@@ -2656,36 +2668,17 @@ async fn embed_inserted_workflow_claims(
         return;
     }
 
-    let Some(scoped) = state.scoped.as_ref() else {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            route = route,
-            claims = vectors.len(),
-            "workflow claim embeddings not stored: this process was not built from a \
-             ScopedPool, so no connection can be stamped with the ingest system agent's \
-             authority. The claims are stored but carry no vector."
-        );
-        return;
-    };
-    let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped).await {
-        Ok(a) => a,
+    let mut tx = match begin_caller_workflow_tx(state, viewer, route).await {
+        Ok(tx) => tx,
         Err(e) => {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 route = route,
                 claims = vectors.len(),
                 error = %e,
-                "workflow claim embeddings not stored: could not establish the \
-                 workflow-ingest-system agent's write authority. The claims are stored but \
-                 carry no vector."
+                "workflow claim embeddings not stored: could not begin a caller-stamped \
+                 transaction. The claims are stored but carry no vector."
             );
-            return;
-        }
-    };
-    let mut tx = match scoped.begin_as(&authority.viewer).await {
-        Ok(tx) => tx,
-        Err(e) => {
-            tracing::warn!(route = route, claims = vectors.len(), error = %e, "workflow claim embeddings not stored: could not begin a system-agent-stamped transaction");
             return;
         }
     };
@@ -2693,16 +2686,13 @@ async fn embed_inserted_workflow_claims(
     let mut stored = 0usize;
     for (claim_id, pgvec) in &vectors {
         match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
-            &mut tx,
-            &authority.viewer,
-            *claim_id,
-            pgvec,
+            &mut tx, viewer, *claim_id, pgvec,
         )
         .await
         {
             Ok(true) => stored += 1,
             Ok(false) => {
-                tracing::warn!(claim_id = %claim_id, route = route, "workflow claim embedding matched no row (claim missing, sealed, superseded, or not writable by the system agent)");
+                tracing::warn!(claim_id = %claim_id, route = route, "workflow claim embedding matched no row (claim missing, sealed, superseded, or not writable by the caller)");
             }
             Err(e) => {
                 tracing::warn!(claim_id = %claim_id, route = route, error = %e, "Failed to store embedding for ingested workflow claim");
@@ -2715,44 +2705,29 @@ async fn embed_inserted_workflow_claims(
 }
 
 /// Store a workflow's goal embedding on a transaction stamped from the
-/// workflow-ingest system agent, as [`embed_inserted_workflow_claims`] stores
-/// the claims'. Since migration 183 a `workflows` row carries its plan's
-/// tenancy, so an unstamped session cannot see (and so cannot update) a row
-/// declared into a group; the system agent wrote the row and reads its group.
-/// Best-effort: a failure is logged and the row stays findable by text.
+/// CALLER, as [`embed_inserted_workflow_claims`] stores the claims'. Since
+/// migration 183 a `workflows` row carries its plan's tenancy, so an unstamped
+/// session cannot see (and so cannot update) a row declared into a group; the
+/// caller wrote the row, in a group it writes. Best-effort: a failure is
+/// logged and the row stays findable by text.
 #[cfg(feature = "db")]
 async fn store_workflow_goal_embedding(
     state: &AppState,
+    viewer: &epigraph_db::Viewer,
     route: &'static str,
     workflow_id: Uuid,
     embedding: &[f32],
 ) {
-    let Some(scoped) = state.scoped.as_ref() else {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            route = route,
-            workflow_id = %workflow_id,
-            "workflow goal embedding not stored: this process was not built from a ScopedPool"
-        );
-        return;
-    };
-    let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped).await {
-        Ok(a) => a,
+    let mut tx = match begin_caller_workflow_tx(state, viewer, route).await {
+        Ok(tx) => tx,
         Err(e) => {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 route = route,
                 workflow_id = %workflow_id,
                 error = %e,
-                "workflow goal embedding not stored: no system-agent write authority"
+                "workflow goal embedding not stored: could not begin a caller-stamped transaction"
             );
-            return;
-        }
-    };
-    let mut tx = match scoped.begin_as(&authority.viewer).await {
-        Ok(tx) => tx,
-        Err(e) => {
-            tracing::warn!(route = route, workflow_id = %workflow_id, error = %e, "workflow goal embedding not stored: could not begin a system-agent-stamped transaction");
             return;
         }
     };
@@ -2788,11 +2763,11 @@ fn format_embedding(embedding: &[f32]) -> String {
 /// Fire `auto_wire_edge_if_epistemic` for each plan edge the executor newly
 /// inserted. Best-effort (the helper logs and swallows individual failures).
 /// Source-claim agent attribution is handled by the engine helper via
-/// `system_agent_id` from the executor result.
-/// Stamped from the workflow-ingest system agent's viewer, like the plan walk
-/// it follows: the `claim_frames` / `mass_functions` / cached-belief rows it
-/// writes are claim-derived, so migrations 074/070 fill their tenancy from the
-/// ingest's own claims and the `WITH CHECK` asks about the SYSTEM agent's group.
+/// `author_id` from the executor result (the caller).
+/// Stamped from the caller's viewer, like the plan walk it follows: the
+/// `claim_frames` / `mass_functions` / cached-belief rows it writes are
+/// claim-derived, so migrations 074/070 fill their tenancy from the ingest's
+/// own claims and the `WITH CHECK` asks about the caller's group.
 /// On the unstamped pool these were refused on BOTH schema configurations —
 /// `claim_frames` carries no orphan `*_privacy` policy.
 ///
@@ -2805,16 +2780,10 @@ async fn auto_wire_inserted_edges(
     viewer: &epigraph_db::visibility::Viewer,
     result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
 ) {
-    let Some(agent_id) = result.system_agent_id else {
+    let Some(agent_id) = result.author_id else {
         return;
     };
-    let mut tx = match begin_system_ingest_stamped_tx(
-        state,
-        "workflows/ingest:ds",
-        viewer.principal(),
-    )
-    .await
-    {
+    let mut tx = match begin_caller_workflow_tx(state, viewer, "workflows/ingest:ds").await {
         Ok(tx) => tx,
         Err(e) => {
             tracing::warn!(
@@ -2894,9 +2863,9 @@ pub struct DeleteStepRequest {
 /// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
 /// the caller's payload errors: 400. Everything else stays a 500.
 ///
-/// On these routes `system_agent_write_authority` refuses a revoked system
-/// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
-/// this arm is what a revocation racing that preflight would surface.
+/// These routes write as the caller: the personal-group refusals are the
+/// caller's own default declaration's (its personal group, or its
+/// operator's).
 #[cfg(feature = "db")]
 fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> ApiError {
     match e {
@@ -2920,19 +2889,28 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
                 message: format!("workflow ingest: {e}"),
             }
         }
-        // A declared group the caller, or the system agent, does not write.
+        // A declared or inherited group the caller does not write, or no
+        // principal to write as.
         e if e.is_declared_tenancy_refusal() => ApiError::Forbidden {
             reason: format!("workflow ingest: {e}"),
         },
         // The plan's (canonical_name, generation) is held by a `workflows` row
-        // the ingest cannot read (migration 183): the payload conflicts with a
-        // row outside the caller's view. 409, not a 500 that reads as
-        // transient and invites a retry.
-        e @ epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. } => {
-            ApiError::Conflict {
-                reason: format!("workflow ingest: {e}"),
-            }
-        }
+        // the ingest cannot read (migration 183), or the lineage it writes has
+        // generations the caller cannot read (migration 202): the payload
+        // conflicts with rows outside the caller's view. 409, not a 500 that
+        // reads as transient and invites a retry.
+        //
+        // A walk stopped at an existing row it was not admitted over
+        // (`ExistingWorkflowNeedsAuthority`): `execute_admitted_ingest`
+        // checks the authority and retries, so it reaches here only
+        // unhandled. Its text names the workflow by name and generation only.
+        e @ (epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+            ..
+        }) => ApiError::Conflict {
+            reason: format!("workflow ingest: {e}"),
+        },
         epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
             system_agent_unregistered(role)
         }
@@ -2997,6 +2975,12 @@ enum ApiWorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
+    /// The caller acts for principal `0` through its live operator link
+    /// (operator ruling R-183, one hop): `0` is the submitter itself, or the
+    /// submitter's operator (the principal the upward arm would admit).
+    Delegate(Uuid),
+    /// The caller writes the workflow's owner group `0`, live.
+    OwnerGroupWriter(Uuid),
     /// The AUDITED admin arm.
     Admin,
 }
@@ -3023,18 +3007,47 @@ impl ApiWorkflowGrant {
 /// H3 (batch H-b; the MCP twin is `epigraph-mcp/src/tools/workflow_authority.rs`,
 /// whose module doc records the measurements and the rule). Refuse unless the
 /// caller has authority over workflow `workflow_id`: when a submitter is
-/// recorded, in this order, the submitter, its operator, or the AUDITED admin
-/// arm — `claims:admin` in the token AND a live grant on the token's client
-/// record (migration 111's predicate), never the scope alone. A workflow with
-/// no record (written before batch H-b) is platform corpus (U005, default
-/// decision A): only the audited admin arm admits it, and a caller with no
-/// token is refused.
+/// recorded, in this order, the submitter, its operator, a DELEGATE of the
+/// submitter, a WRITER OF THE WORKFLOW'S OWNER GROUP, or the AUDITED admin
+/// arm — `claims:admin` in the
+/// token AND a live grant on the token's client record (migration 111's
+/// predicate), never the scope alone. A workflow with no record (written
+/// before batch H-b) admits a writer of its owner group or the audited admin
+/// arm; a caller with neither is refused. The delegate arm (below) admits
+/// nothing there: with no submitter, no principal is admitted by identity.
+///
+/// The owner-group writer arm: the caller reads the row and holds a live
+/// writer or admin membership of its owner group NOW (direct or through a
+/// role binding), checked on `conn`, the write's own caller-stamped
+/// transaction (`epigraph_ingest_executor::caller_writes_group_now`, which
+/// also asks the stamp). An author binding is not a membership: the
+/// allowlisted agent's OWN token gains nothing over the human's workflows
+/// through the binding (operator ruling 2026-10-13). A delegated run token
+/// for one of the human's live-linked agents is different: it carries that
+/// agent's delegate authority (below, operator ruling R-183).
+///
+/// The delegate arm (operator ruling R-183: agents acting for a principal
+/// inherit its authority, wherever the principal itself is admitted by
+/// identity): the caller's ACTING operator link names a principal `P`
+/// (`AgentRepository::operator_actor` on `conn`: a not-retired link record
+/// AND a live writer membership of `P`'s own personal group), and `P` is the
+/// submitter, or the submitter's operator (the upward arm's own read,
+/// retired links of the submitter included, as for `P` itself). One hop on
+/// the caller's side: the read returns the caller's direct operator only, and
+/// a retired link is never acting. An operated caller holds a REST viewer
+/// only through a delegated run token whose delegation the bearer middleware
+/// found live for this request, so a token-carrying route admits the arm only
+/// for a token that carries `dlg`. Recorded as `"arm": "delegate"` with
+/// `operator` = `P`, the principal it acted for. It runs before the
+/// owner-group arm, so a delegate that also writes the owner group (`P`'s own
+/// group, which the link makes it a writer of) is recorded as the delegation
+/// it is.
 ///
 /// Every REFUSAL to a caller whose `viewer` cannot READ the row is
 /// `not_found()`, the call site's answer for a workflow that does not exist,
 /// never text naming the row or its submitter (backlog c831df4a, ruling
-/// R-100). `conn` is often the ingest system agent's stamp, which reads groups
-/// the caller does not, so the caller's own view decides what it is told. It
+/// R-100). `conn` is the caller's own stamp on the workflow write routes; the
+/// caller's own VIEW (its viewer) decides what it is told either way. It
 /// does not decide who is admitted: the ruling masks answers and changes no
 /// authority, so the arms run exactly as before.
 #[cfg(feature = "db")]
@@ -3074,6 +3087,12 @@ async fn workflow_authority(
     // A GROUP row with no record (a plan migration 183 backfilled into its
     // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
+        if let Some(group) = api_owner_group_arm(conn, caller, view.as_ref()).await? {
+            return Ok(ApiWorkflowGrant {
+                owner: None,
+                arm: ApiWorkflowArm::OwnerGroupWriter(group),
+            });
+        }
         let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
         let subject = if group_row {
             format!(
@@ -3093,8 +3112,8 @@ async fn workflow_authority(
             });
         }
         return Err(refuse(format!(
-            "{subject}; it is mutable only through the audited claims:admin path, and the caller \
-             holds no claims:admin. Nothing was written."
+            "{subject}; it is mutable only by a writer of its owner group or through the audited \
+             claims:admin path, and the caller is neither. Nothing was written."
         )));
     };
     let allowed = |arm| ApiWorkflowGrant {
@@ -3111,9 +3130,32 @@ async fn workflow_authority(
             .map_err(|e| ApiError::InternalError {
                 message: format!("could not read the submitter's operator: {e}"),
             })?;
-        if op.is_some_and(|l| l.operator_id == caller) {
+        if op.as_ref().is_some_and(|l| l.operator_id == caller) {
             return Ok(allowed(ApiWorkflowArm::Operator));
         }
+        // The delegate arm (R-183), after the upward arm: the caller's ACTING
+        // link names the principal `P` it acts for, and `P` is admitted here
+        // by identity, as the submitter itself or as the submitter's operator
+        // (#503, the `op` read above). A route that names its caller through
+        // the viewer alone (no token) reached it through the viewer
+        // extractor, which admits an operated caller only through a live
+        // delegation.
+        let actor = epigraph_db::AgentRepository::operator_actor(&mut *conn, caller)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("could not read the caller's operator link: {e}"),
+            })?;
+        if let Some(principal) = actor
+            .map(|l| l.operator_id)
+            .filter(|p| *p == owner || op.as_ref().is_some_and(|l| l.operator_id == *p))
+        {
+            if auth.is_none_or(|a| a.delegated_by.is_some()) {
+                return Ok(allowed(ApiWorkflowArm::Delegate(principal)));
+            }
+        }
+    }
+    if let Some(group) = api_owner_group_arm(conn, caller, view.as_ref()).await? {
+        return Ok(allowed(ApiWorkflowArm::OwnerGroupWriter(group)));
     }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     if api_admin_arm(conn, auth, caller, &subject, &refuse).await? {
@@ -3121,11 +3163,33 @@ async fn workflow_authority(
     }
     Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
-         submitter, its submitter's operator, nor a live claims:admin holder. Nothing was written."
+         submitter, its submitter's operator, an agent acting for its submitter or for its \
+         submitter's operator through a live operator link, a writer of its owner group, nor a \
+         live claims:admin holder. Nothing was written."
     )))
 }
 
-/// The PROVENANCE of a write admitted through the submitter or operator arm
+/// The owner-group writer arm of [`workflow_authority`]: `Some(group)` when
+/// the caller reads the row (`view`) and writes its owner group NOW, on `conn`.
+#[cfg(feature = "db")]
+async fn api_owner_group_arm(
+    conn: &mut sqlx::PgConnection,
+    caller: Option<Uuid>,
+    view: Option<&(String, Uuid)>,
+) -> Result<Option<Uuid>, ApiError> {
+    let (Some(caller), Some((_, group))) = (caller, view) else {
+        return Ok(None);
+    };
+    let writes = epigraph_ingest_executor::caller_writes_group_now(conn, caller, *group)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("could not check the caller's owner-group membership: {e}"),
+        })?;
+    Ok(writes.then_some(*group))
+}
+
+/// The PROVENANCE of a write admitted through the submitter, operator,
+/// delegate or owner-group writer arm
 /// (the MCP twin's `record_caller_workflow_write`, the same
 /// `workflows.caller_write` row and fields), on the write's own transaction.
 /// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
@@ -3142,10 +3206,12 @@ async fn record_api_caller_workflow_write(
     grant: ApiWorkflowGrant,
     details: serde_json::Value,
 ) -> Result<(), ApiError> {
-    let (arm, operator) = match grant.arm {
+    let (arm, operator, owner_group) = match grant.arm {
         ApiWorkflowArm::Admin => return Ok(()),
-        ApiWorkflowArm::Submitter => ("submitter", None),
-        ApiWorkflowArm::Operator => ("operator", Some(acting)),
+        ApiWorkflowArm::Submitter => ("submitter", None, None),
+        ApiWorkflowArm::Operator => ("operator", Some(acting), None),
+        ApiWorkflowArm::Delegate(operator) => ("delegate", Some(operator), None),
+        ApiWorkflowArm::OwnerGroupWriter(group) => ("owner_group_writer", None, Some(group)),
     };
     let record = serde_json::json!({
         "action": action,
@@ -3154,6 +3220,7 @@ async fn record_api_caller_workflow_write(
         "arm": arm,
         "acting_agent": acting,
         "operator": operator,
+        "owner_group": owner_group,
         "client_id": auth.map(|a| a.client_id),
         "token_jti": auth.map(|a| a.jti),
         "write": details,
@@ -3388,7 +3455,7 @@ async fn record_api_lineage_writes(
 /// AUTHORSHIP (operator rulings, 2026-10-13; the MCP twin's
 /// `epigraph_ingest_executor::record_caller_authorship` call): one `AUTHORED`
 /// edge from the acting principal to each claim this request CREATED, on its
-/// own (system-stamped) transaction. The claims stay the system agent's. A
+/// own (caller-stamped) transaction; the claims are the caller's too. A
 /// request with no principal records nothing (it names no agent).
 #[cfg(feature = "db")]
 async fn record_api_authorship(
@@ -3412,7 +3479,10 @@ async fn record_api_authorship(
 /// transaction (see [`workflow_ingest_submitter`]).
 #[cfg(feature = "db")]
 struct ApiIngestDecision {
-    /// Whether this call creates the row (only then is a submitter recorded).
+    /// Whether this call created the row (only then is a submitter
+    /// recorded). Set from the row insert's own answer by
+    /// [`execute_admitted_ingest`]; before the walk it is only what the
+    /// pre-walk read saw.
     creating: bool,
     /// The submitter to record when creating, if any.
     submitter: Option<Uuid>,
@@ -3428,7 +3498,9 @@ struct ApiIngestDecision {
 /// The submitter an ingest should record, and the authority it needs, decided
 /// BEFORE the plan walk on the same transaction. The rule is the MCP twin's
 /// (`execute_workflow_ingest_with_inserted`): a re-ingest of an existing row
-/// records nothing and needs nothing (the executor writes nothing); a NEW
+/// records nothing and needs nothing here (the executor writes nothing, or
+/// stops before writing under a row with no plan, which
+/// [`execute_admitted_ingest`] then gates); a NEW
 /// generation of a canonical name that already has rows needs authority over
 /// that lineage's head and inherits its submitter, parent or no parent (the
 /// review's takeover: `generation + 1` with no parent recorded the attacker);
@@ -3491,6 +3563,88 @@ async fn workflow_ingest_submitter(
     })
 }
 
+/// Run the plan walk AS THE CALLER, checking its lineage authority over any
+/// row the walk would write under that this call did not create.
+///
+/// The executor decides whether the row is new from its row insert's own
+/// answer. A row that already exists and shows the caller no plan (one the
+/// pre-walk read saw, e.g. a row the pre-transaction ingest left behind, or
+/// one ANOTHER caller committed while this call's insert waited on it, which
+/// no read made before the walk can see) stops the walk before anything is
+/// written under it (`ExistingWorkflowNeedsAuthority`). The caller must then
+/// pass the same gate as any other write to an existing workflow, on the same
+/// transaction; only if it is admitted does the walk run again with that row
+/// admitted. The grant joins `decision`, whose provenance rows record it, and
+/// `decision.creating` becomes the insert's answer.
+///
+/// Takes the route's caller-stamped transaction and hands it back, so the
+/// walk and the check run on it and the route goes on to record and commit.
+#[cfg(feature = "db")]
+async fn execute_admitted_ingest<'s>(
+    mut tx: epigraph_db::ScopedTx<'s>,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    viewer: &epigraph_db::Viewer,
+    plan: &epigraph_ingest::common::plan::IngestPlan,
+    extraction: &epigraph_ingest::workflow::WorkflowExtraction,
+    declared: Option<epigraph_core::TenancyDecl>,
+    decision: &mut ApiIngestDecision,
+) -> Result<
+    (
+        epigraph_db::ScopedTx<'s>,
+        epigraph_ingest_executor::WorkflowIngestExecutionResult,
+    ),
+    ApiError,
+> {
+    let mut admitted: Option<Uuid> = None;
+    let result = loop {
+        match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+            &mut tx, plan, extraction, viewer, declared, admitted,
+        )
+        .await
+        {
+            Err(
+                epigraph_ingest_executor::IngestExecutorError::ExistingWorkflowNeedsAuthority {
+                    workflow_id: existing,
+                    ..
+                },
+            ) if admitted.is_none() => {
+                if !decision.grants.iter().any(|(a, _)| *a == existing) {
+                    let not_found = || ApiError::Forbidden {
+                        reason: format!(
+                            "workflow_ingest: canonical_name '{}' (generation {}) names a \
+                             workflow this caller cannot read. Nothing was written.",
+                            extraction.source.canonical_name, extraction.source.generation
+                        ),
+                    };
+                    let grant = workflow_authority(
+                        &mut tx,
+                        auth,
+                        viewer,
+                        viewer.principal(),
+                        existing,
+                        &not_found,
+                    )
+                    .await?;
+                    decision.admin |= grant.is_admin();
+                    decision.grants.push((existing, grant));
+                }
+                admitted = Some(existing);
+            }
+            other => break other.map_err(workflow_ingest_error)?,
+        }
+    };
+    decision.creating = result.row_created;
+    // For a row this call did NOT create, the submitter the audit trail
+    // names is the row's own (the grant over the admitted row read it), never
+    // the caller's: no provenance row may read as if the caller created it.
+    if !result.row_created {
+        decision.submitter = admitted
+            .and_then(|row| decision.grants.iter().find(|(a, _)| *a == row))
+            .and_then(|(_, grant)| grant.owner);
+    }
+    Ok((tx, result))
+}
+
 /// Record the submitter [`workflow_ingest_submitter`] decided, once, and the
 /// admin audit row when the ingest was admitted through the admin arm.
 #[cfg(feature = "db")]
@@ -3529,7 +3683,11 @@ async fn record_workflow_submitter(
                     "parent_canonical_name": extraction.source.parent_canonical_name,
                     "lineage_head_before": decision.anchors.lineage_head,
                     "linked_parent": decision.anchors.linked_parent,
-                    "recorded_submitter": decision.submitter,
+                    "recorded_submitter": if decision.creating {
+                        decision.submitter
+                    } else {
+                        None
+                    },
                 }),
             )
             .await?;
@@ -3559,6 +3717,28 @@ async fn record_workflow_submitter(
 }
 
 /// POST /api/v1/workflows/steps - add a step to a hierarchical workflow.
+/// The ONE principal a step route checks and writes as: the workflow
+/// authority gate reads the token's `agent_id`, and the write is stamped from
+/// (and the step authored by) the request viewer's principal. They are the
+/// same agent for every ordinary token; a request where they differ is
+/// refused rather than letting the gate admit one agent while another writes.
+#[cfg(feature = "db")]
+fn same_step_principal(
+    auth: &crate::middleware::bearer::AuthContext,
+    viewer: &epigraph_db::Viewer,
+    route: &'static str,
+) -> Result<Uuid, ApiError> {
+    match (auth.agent_id, viewer.principal()) {
+        (Some(token), Some(principal)) if token == principal => Ok(principal),
+        _ => Err(ApiError::Forbidden {
+            reason: format!(
+                "{route}: the token's agent and the request's principal must be one agent to \
+                 write a workflow step. Nothing was written."
+            ),
+        }),
+    }
+}
+
 #[cfg(feature = "db")]
 pub async fn add_step(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -3571,12 +3751,13 @@ pub async fn add_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps", auth.agent_id).await?;
+    let author = same_step_principal(&auth, &viewer, "add_step")?;
+    let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows/steps").await?;
     let authority =
         require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
-        auth.agent_id,
+        author,
         &req.canonical_name,
         &req.step_text,
         req.position,
@@ -3645,8 +3826,8 @@ pub async fn delete_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    let mut tx =
-        begin_system_ingest_stamped_tx(&state, "workflows/steps/delete", auth.agent_id).await?;
+    same_step_principal(&auth, &viewer, "delete_step")?;
+    let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows/steps/delete").await?;
     let authority =
         require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r =
@@ -4017,14 +4198,26 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        provision_personal_group(pool, auth.agent_id.expect("a principal")).await;
         auth
     }
 
+    /// Provision `agent`'s personal group through the real definer, as every
+    /// production agent has one (the MCP server's own agent at boot, an OAuth
+    /// agent at provisioning). Workflow writes are made as the caller, and a
+    /// caller with no live writable group is refused before anything is
+    /// written, so a fixture writer needs one.
+    async fn provision_personal_group(pool: &PgPool, agent: Uuid) {
+        let mut conn = pool.acquire().await.unwrap();
+        epigraph_db::AgentRepository::ensure_personal_group(&mut conn, agent)
+            .await
+            .expect("provision the fixture agent's personal group");
+    }
+
     /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
-    /// `state.db_pool`: the rows the executor writes are owned by the
-    /// `workflow-ingest-system` agent's personal group, and a connection that
-    /// cannot be stamped with that group's write authority is not one this
-    /// handler will write on. So the router needs a state carrying a
+    /// `state.db_pool`: the rows the executor writes are the CALLER's, owned by
+    /// a group it writes, and a connection that cannot be stamped with the
+    /// caller's write authority is not one this handler will write on. So the router needs a state carrying a
     /// `ScopedPool`; `AppState::with_db` leaves `scoped: None` and the handler
     /// answers 500 with "this server was not built from a ScopedPool", which is
     /// the conversion working rather than an inconvenience to route around.
@@ -4041,6 +4234,23 @@ mod tests {
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
             .layer(axum::Extension(auth))
             .with_state(state)
+    }
+
+    /// [`ingest_payload`] with the explicit PUBLIC tenancy, owned by `agent`'s
+    /// personal group: an undeclared ingest is private to its owner group,
+    /// and these fixtures are read by other callers.
+    async fn public_payload(pool: &PgPool, agent: Uuid, canonical_name: &str) -> serde_json::Value {
+        provision_personal_group(pool, agent).await;
+        let group: Uuid = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("the fixture agent's personal group");
+        let mut body = ingest_payload(canonical_name);
+        body["tenancy"] = serde_json::json!({"visibility": "public", "owner_group_id": group});
+        body
     }
 
     fn ingest_payload(canonical_name: &str) -> serde_json::Value {
@@ -4977,7 +5187,7 @@ mod tests {
         let resp = router_as(owner.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
-                ingest_payload("h3-http-lineage"),
+                public_payload(&pool, owner.agent_id.unwrap(), "h3-http-lineage").await,
             ))
             .await
             .unwrap();
@@ -5046,6 +5256,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        provision_personal_group(&pool, admin_agent).await;
         sqlx::query(
             "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
                                         granted_scopes, status, agent_id) \
@@ -5074,20 +5285,25 @@ mod tests {
         assert_eq!(audits, 1, "and the admin write is audited");
     }
 
-    /// U005 (backlog 84b2a98d), default decision A, the HTTP twin of
+    /// U005 (backlog 84b2a98d), the HTTP twin of
     /// `epigraph-mcp/tests/workflow_caller_authority.rs`: a workflow with no
-    /// recorded submitter (every workflow written before batch H-b) is
-    /// platform corpus. A `claims:write` stranger — and the agent that happened
-    /// to ingest it, since nothing records that — is refused on the step route
-    /// and on a new generation (403, nothing written); a live `claims:admin`
-    /// grant is admitted and audited with `"submitter": null`. Before U005 the
-    /// stranger's step and generation landed behind a WARN.
+    /// recorded submitter (every workflow written before batch H-b) has no
+    /// submitter arm. A `claims:write` stranger, which does not write the
+    /// row's owner group, is refused on the step routes and on a new
+    /// generation (403, nothing written); a live `claims:admin` grant is
+    /// admitted and audited with `"submitter": null`; the agent that ingested
+    /// it, which writes the row's owner group, is admitted through the
+    /// owner-group writer arm. Before U005 the stranger's step and generation
+    /// landed behind a WARN.
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_legacy_workflow_is_refused_to_a_stranger_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
         let ingester = registered_auth(&pool).await;
-        let stranger = test_auth();
+        // A registered agent with its own group: the step routes write as the
+        // caller, so a principal with no writable group at all is refused
+        // before the gate; this one reaches the gate, which is what is pinned.
+        let stranger = registered_auth(&pool).await;
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
                 .route("/api/v1/workflows/ingest", post(ingest_workflow))
@@ -5107,7 +5323,7 @@ mod tests {
         let resp = router_as(ingester.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
-                ingest_payload("h3-http-legacy"),
+                public_payload(&pool, ingester.agent_id.unwrap(), "h3-http-legacy").await,
             ))
             .await
             .unwrap();
@@ -5127,7 +5343,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        for (who, auth) in [("a stranger", stranger.clone()), ("the ingester", ingester)] {
+        for (who, auth) in [("a stranger", stranger.clone())] {
             let resp = router_as(auth)
                 .oneshot(post_json(
                     "/api/v1/workflows/steps",
@@ -5224,6 +5440,18 @@ mod tests {
         let mut admin = test_auth();
         admin.scopes.push(CLAIMS_ADMIN.to_string());
         let admin_agent = admin.agent_id.unwrap();
+        // A registered agent with its own group from the start, so the
+        // grantless call below reaches the gate (the step routes write as the
+        // caller and refuse a principal with no writable group first).
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'u005 http admin')",
+        )
+        .bind(admin_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+        provision_personal_group(&pool, admin_agent).await;
         let audits_sql = "SELECT count(*) FROM security_events \
                           WHERE event_type = 'workflows.admin_write' AND agent_id = $1";
 
@@ -5262,14 +5490,6 @@ mod tests {
         assert_eq!(audits, 0, "grantless admin: nothing audited");
 
         sqlx::query(
-            "INSERT INTO agents (id, public_key, display_name) \
-             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'u005 http admin')",
-        )
-        .bind(admin_agent)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
             "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
                                         granted_scopes, status, agent_id) \
              VALUES ($1, $2, 'u005 http admin', 'human', ARRAY['claims:admin'], \
@@ -5307,6 +5527,25 @@ mod tests {
             vec![Some("null".to_string())],
             "one audit row, \"submitter\": null"
         );
+
+        // The ingester writes the row's owner group: admitted through the
+        // owner-group writer arm, recorded as such.
+        let resp = router_as(ingester)
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_text": "the ingester's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a writer of the owner group");
+        let arm: Option<String> = sqlx::query_scalar(
+            "SELECT details->>'arm' FROM security_events \
+              WHERE event_type = 'workflows.caller_write' AND details->>'action' = 'add_step'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(arm.as_deref(), Some("owner_group_writer"));
     }
 
     /// An agent row, and (when `client_type` is given) an ACTIVE OAuth client
@@ -5333,6 +5572,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        provision_personal_group(pool, agent).await;
         (agent, client)
     }
 
@@ -5420,7 +5660,7 @@ mod tests {
         let resp = router_as(ingester.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
-                ingest_payload("h3-http-linked"),
+                public_payload(&pool, ingester.agent_id.unwrap(), "h3-http-linked").await,
             ))
             .await
             .unwrap();
@@ -5521,7 +5761,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_ne!(stamp, h, "the system agent still authors the step");
+        assert_eq!(
+            stamp, h,
+            "the step is authored by the caller (workflow writes are made as the caller)"
+        );
         let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
             .bind(Uuid::parse_str(&step).unwrap())
             .fetch_all(&pool)

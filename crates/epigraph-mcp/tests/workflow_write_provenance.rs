@@ -5,13 +5,17 @@
 //! # The rule is NOT widened
 //!
 //! Over HTTP a workflow with a recorded submitter stays mutable only by the
-//! submitter, the submitter's operator, or the audited `claims:admin` arm. An
-//! agent bound to the submitting human — an allowlisted service client (the
-//! shape a host's shared credential takes) or a live-linked agent — is refused,
-//! with nothing written: the operator ruled that the shared host credential
-//! must not gain edit rights over the human's workflows. (A live-linked agent
-//! is refused its HTTP viewer before any tool runs; it is driven at the gate
-//! directly here so the gate's own answer is pinned too.)
+//! submitter, the submitter's operator, a delegate of either (operator ruling
+//! R-183: a live-linked agent holding a LIVE delegated run token; pinned in
+//! `epigraph-api/tests/workflow_delegate_authority.rs`), a writer of its owner
+//! group, or the audited `claims:admin` arm. An agent bound to the submitting
+//! human — an allowlisted service client (the shape a host's shared credential
+//! takes) with its own token, or a live-linked agent WITHOUT a delegated run
+//! token — is refused, with nothing written: the operator ruled that the
+//! shared host credential must not gain edit rights over the human's
+//! workflows through the binding. (A live-linked agent is refused its HTTP
+//! viewer before any tool runs; it is driven at the gate directly here, with
+//! a plain context, so the gate's own answer is pinned too.)
 //!
 //! # Provenance
 //!
@@ -182,9 +186,10 @@ async fn direct_viewer(pool: &PgPool, agent: Uuid) -> epigraph_db::visibility::V
         .expect("viewer")
 }
 
-/// Ingest `canonical` (generation 0) through an unrelated HTTP caller, then
-/// record `submitter` as its submitter, as the audited backfill of legacy
-/// workflows did. Returns the workflow id.
+/// Ingest `canonical` (generation 0) through an unrelated HTTP caller, public
+/// in that caller's own group (the explicit public tenancy: an undeclared
+/// ingest would be private to it), then record `submitter` as its submitter,
+/// as the audited backfill of legacy workflows did. Returns the workflow id.
 async fn workflow_submitted_by(
     pool: &PgPool,
     server: &EpiGraphMcpFull,
@@ -197,7 +202,7 @@ async fn workflow_submitted_by(
         &ingester_viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, 0, "gen0"),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&ingester_viewer)),
             embed: None,
         },
         Some(&ingester_token),
@@ -258,8 +263,9 @@ async fn provenance_total(pool: &PgPool) -> i64 {
         .expect("count provenance")
 }
 
-/// The author (the stamp) of a claim the tool wrote: the workflow-ingest
-/// system agent.
+/// The author (the stamp) of a claim the tool wrote: the caller (workflow
+/// writes are made as the caller; it used to be the shared workflow-ingest
+/// system agent).
 async fn author_of(pool: &PgPool, claim: &str) -> Uuid {
     sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1::uuid")
         .bind(claim)
@@ -289,7 +295,7 @@ fn assert_provenance(
     assert_eq!(
         *agent_id,
         Some(stamp),
-        "the row is attributed to the session that wrote it, the system stamp: {d}"
+        "the row is attributed to the session that wrote it, the caller's own stamp: {d}"
     );
     assert_eq!(d["action"], action, "{d}");
     assert_eq!(d["workflow_id"], workflow.to_string(), "{d}");
@@ -346,7 +352,9 @@ async fn assert_refused(
 
 /// The operator ruling: on a workflow whose recorded submitter is the human
 /// H, agents bound to H are refused (allowlisted, through the real HTTP viewer;
-/// live-linked, at the gate), with nothing written, while H itself is admitted.
+/// live-linked with a plain, undelegated context, at the gate), with nothing
+/// written, while H itself is admitted. (With a live delegated run token the
+/// live-linked agent is H's delegate, R-183.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn agents_bound_to_the_submitting_human_are_refused(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
@@ -424,7 +432,7 @@ async fn the_submitter_adds_a_step_with_provenance(pool: PgPool) {
         .expect("step id")
         .to_string();
     let stamp = author_of(&pool, &step).await;
-    assert_ne!(stamp, h, "the system agent still authors the step");
+    assert_eq!(stamp, h, "the caller authors the step");
     let rows = provenance(&pool, wf).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_provenance(
@@ -475,9 +483,11 @@ async fn the_operator_deletes_a_step_with_provenance(pool: PgPool) {
         .to_string();
     let rows = provenance(&pool, wf).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
+    // The session that wrote the soft delete is the acting operator's own
+    // stamp (workflow writes are made as the caller).
     assert_provenance(
         &rows[0],
-        author_of(&pool, &step).await,
+        h,
         "delete_step",
         wf,
         s,
@@ -487,6 +497,7 @@ async fn the_operator_deletes_a_step_with_provenance(pool: PgPool) {
         &auth,
     );
     assert_eq!(rows[0].1["write"]["step_lineage_id"], lineage.to_string());
+    assert_eq!(rows[0].1["write"]["step_claim_id"], step.as_str());
 }
 
 /// A NEW GENERATION by the submitter: the new row inherits the submitter, and

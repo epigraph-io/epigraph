@@ -169,8 +169,9 @@ pub async fn set_source_reliability(
             .map_err(|e| {
                 invalid_params(format!(
                     "perspective {id} is owned by agent {owner}; setting its source \
-                     reliability over HTTP requires that owner, its operator, or claims:admin \
-                     ({}). Nothing was written.",
+                     reliability over HTTP requires that owner, its operator, an agent acting \
+                     for it through a live delegated run token, or claims:admin ({}). Nothing \
+                     was written.",
                     e.message
                 ))
             })?;

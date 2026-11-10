@@ -42,6 +42,11 @@
 //!         [--max-batches N] [--apply --confirm-count N --ruling TEXT --reason TEXT \
 //!         [--accept-unenforced]]
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
+//!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
+//!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
+//!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
+//!         --reason TEXT]
+//!     epigraph-operator reown-reverse --manifest reown-wf-1.jsonl [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
@@ -100,7 +105,7 @@ use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, client_status, confirmations,
     custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey,
-    reown, reown_linked, restrict, retire_link, reverse, system_agent, team_group,
+    reown, reown_linked, reown_workflows, restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -795,6 +800,92 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         sample: usize,
     },
+    /// Move listed workflow LINEAGES (every generation, the plan claims they
+    /// execute, the rows those carry, and their plan edges) out of the source
+    /// group into a TEAM group, keeping every row's visibility
+    /// (`--visibility keep`) or narrowing it to the team (`--visibility
+    /// group`); or, with `--target-group` equal to the source and
+    /// `--visibility group`, narrow them IN PLACE within the source group.
+    /// Only `('public', source)` rows change. Reversed exactly by
+    /// `reown-reverse --manifest`.
+    ReownWorkflows {
+        /// One `workflows.canonical_name` per line (`#` comments and blank
+        /// lines ignored); only these lineages are ever touched.
+        #[arg(long)]
+        canonical_names_file: PathBuf,
+        /// The team group the lineages move into: active, `kind = 'team'`, and
+        /// `--operator` is a live admin of it. Or the source group itself, for
+        /// an in-place narrowing (needs `--visibility group`).
+        #[arg(long)]
+        target_group: Uuid,
+        /// `keep`: every moved row stays public. `group`: every moved row
+        /// becomes group-visible to the target (an audited narrowing that
+        /// bumps the atlas layout epoch; re-run `atlas_layout --apply` after).
+        #[arg(long, default_value = "keep")]
+        visibility: String,
+        /// With `--visibility group`: catch a lineage up to a narrowing that
+        /// already ran. Takes only a lineage with a generation already in the
+        /// target state (recorded as seen, never written); its other
+        /// generations are STRAY (the source's public state, or in a move the
+        /// source's private state). A lineage with none in the target state is
+        /// the main act's: skipped, or held. Only the stray generations' own
+        /// rows (their workflow rows, the private plan claims only they
+        /// execute, and those claims' plan edges) may pass into the target
+        /// state; every other row keeps the hand-off rule, so a private
+        /// derived row or an edge to a row outside the plans holds the lineage
+        /// (exit 3 under `--apply`). Audited and reversed like the main act.
+        /// In a move the act must be on record: see `--after-manifest`. In
+        /// place no act need be: a plain `--catch-up` narrows the source's
+        /// public generations of any lineage with a generation in its private
+        /// state.
+        #[arg(long)]
+        catch_up: bool,
+        /// With `--catch-up`, repeatable: the manifest of the act the catch-up
+        /// follows (and of any earlier catch-up of it), from the same source
+        /// and target. A move's catch-up takes a lineage only when one of its
+        /// target-state generations is a row such a manifest moved into the
+        /// target state; any other lineage with a target-state generation (one
+        /// the target may own natively) is held by design and reported, and
+        /// no act of this tool takes it. Without it, a move's catch-up holds
+        /// every such lineage. In place it is checked but not needed. A held
+        /// lineage is not a hand-off: an `--apply` that holds only such
+        /// lineages exits 0.
+        #[arg(long = "after-manifest")]
+        after_manifest: Vec<PathBuf>,
+        /// The operator (a person's agent id) the act is attributed to.
+        #[arg(long)]
+        operator: Uuid,
+        /// The group rows are taken from. Default: the operator's personal
+        /// group. Otherwise a group `--operator` is a live admin of.
+        #[arg(long)]
+        from_group: Option<Uuid>,
+        /// Where to write the undo manifest. Must not exist. Written and
+        /// fsynced before any write under `--apply`.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back, and no manifest or audit row is
+        /// written.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's ELIGIBLE-WORKFLOW-ROWS, repeated back.
+        #[arg(long)]
+        confirm_count: Option<usize>,
+        /// The decision this act carries out (manifest and audit row).
+        /// Required under `--apply`.
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why (manifest and audit row). Required under `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Lineages per transaction (lineages that share a plan row are never
+        /// split across two).
+        #[arg(long, default_value_t = 25)]
+        batch_size: usize,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
     /// Remove an explicit list of `frames` rows (test or probe frames), with
     /// the rows that cascade from them, refusing any frame a real claim or
     /// another row still depends on. Audited. Exit 3: at least one listed
@@ -1025,6 +1116,46 @@ async fn main_inner() -> anyhow::Result<i32> {
             anyhow::bail!("--batch-size must be at least 1");
         }
     }
+    // reown-workflows' options, likewise refused before any connection.
+    let reown_wf_opts = if let Command::ReownWorkflows {
+        canonical_names_file,
+        target_group,
+        visibility,
+        catch_up,
+        after_manifest,
+        operator: op,
+        from_group,
+        manifest_out,
+        apply,
+        confirm_count,
+        ruling,
+        reason,
+        batch_size,
+        lock_timeout,
+    } = &cli.command
+    {
+        let o = reown_workflows::Options {
+            names_file: canonical_names_file.clone(),
+            target: *target_group,
+            operator: *op,
+            from_group: *from_group,
+            manifest_out: manifest_out.clone(),
+            apply: *apply,
+            confirm_count: *confirm_count,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            visibility: reown_workflows::Visibility::parse(visibility)?,
+            catch_up: *catch_up,
+            after_manifests: after_manifest.clone(),
+            batch_size: *batch_size,
+            lock_timeout: lock_timeout.clone(),
+        };
+        reown_workflows::validate(&o)?;
+        let names = reown_workflows::read_names_file(canonical_names_file)?;
+        Some((o, names))
+    } else {
+        None
+    };
     // restrict-claims' options, refused before any connection when they cannot
     // describe a valid run (no ruling, reason or confirmed count under --apply).
     let restrict_opts = if let Command::RestrictClaims {
@@ -2022,6 +2153,11 @@ async fn main_inner() -> anyhow::Result<i32> {
             } else {
                 2
             })
+        }
+        Command::ReownWorkflows { .. } => {
+            let (opts, names) = reown_wf_opts.expect("built above");
+            let report = reown_workflows::run(&mut conn, &opts, &names, &mut stdout).await?;
+            Ok(reown_workflows::exit_code(&report, &opts))
         }
         Command::RestrictClaims { claims_file, .. } => {
             let opts = restrict_opts.expect("built above");

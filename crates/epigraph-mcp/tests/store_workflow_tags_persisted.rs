@@ -51,6 +51,7 @@ async fn store_workflow_persists_tags(pool: PgPool) {
         &server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: None,
             goal: goal.clone(),
             steps: vec![format!("tags probe step {}", Uuid::new_v4())],
             prerequisites: Some(vec!["cargo installed".into()]),
@@ -93,6 +94,7 @@ async fn store_workflow_without_tags_writes_no_tags_key(pool: PgPool) {
         &server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: None,
             goal: goal.clone(),
             steps: vec![format!("tagless probe step {}", Uuid::new_v4())],
             prerequisites: None,
