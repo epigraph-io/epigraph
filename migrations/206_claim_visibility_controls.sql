@@ -79,6 +79,15 @@
 -- `definer_search_path_ratchet.rs` refuses any definer body that creates or
 -- names one.
 --
+-- DECIDED ON THE ROWS IT WRITES. Each widening act first locks the claims it
+-- may act on (`FOR NO KEY UPDATE`, in id order: the group-visible rows the
+-- session reads), then classifies them, so an owner or visibility change
+-- committed by another session before the call either finishes first (and is
+-- what gets classified) or waits for this one. Its UPDATE re-checks the
+-- classified owner as well, and if fewer rows move than were classified (a
+-- row that was not locked, because it became readable only after the lock)
+-- the call raises `VIS04` (40001) and nothing is changed.
+--
 -- MEMBERSHIP is always read live, through `epigraph_live_memberships` (own
 -- rows, 149's human-group filter, 165's role-derived rows). Nothing is cached.
 
@@ -202,7 +211,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_set_default_group(uuid) FROM PUBLIC;
 --   publicize         -- to be changed.
 -- If any id is not_found or refused_*, NOTHING is changed and the
 -- classification is returned. Otherwise every `publicize` row becomes
--- `publicized`.
+-- `publicized`. The rows are locked before they are classified, and the
+-- UPDATE moves only a row whose owner is still the one classified; a short
+-- count raises `VIS04` (section 0, DECIDED ON THE ROWS IT WRITES).
 --
 -- WHAT MOVES. The claim's visibility, with its owner unchanged: the team stays
 -- the owner of record, and a later privatization acts on it. Arm (d) then
@@ -237,6 +248,7 @@ DECLARE
     v_edges bigint := 0;
     v_pinned bigint := 0;
     v_owners uuid[];
+    v_moved bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'VIS01: publicize needs an authenticated principal; nothing was changed'
@@ -251,6 +263,14 @@ BEGIN
         RAISE EXCEPTION 'VIS03: publicize takes 1 to 500 claim ids; nothing was changed'
             USING ERRCODE = '22023';
     END IF;
+
+    -- Lock what may be acted on before classifying it (header: DECIDED ON THE
+    -- ROWS IT WRITES). A row a concurrent session holds is waited for, and the
+    -- classification below, a new statement, then reads what it committed.
+    PERFORM 1 FROM public.claims c
+      WHERE c.id = ANY(v_ids) AND c.visibility::text = 'group'
+        AND c.owner_group_id = ANY(COALESCE(v_readable, ARRAY[]::uuid[]))
+      ORDER BY c.id FOR NO KEY UPDATE;
 
     -- The classification, as three parallel arrays ordered by claim id (see
     -- the header: no temporary relation).
@@ -319,8 +339,16 @@ BEGIN
     PERFORM set_config('epigraph.allow_declassify', 'yes', true);
     UPDATE public.claims c
        SET visibility = 'public', updated_at = now()
-     WHERE c.id = ANY(v_todo) AND c.visibility::text = 'group';
+      FROM unnest(v_cls_ids, v_cls_out, v_cls_own) AS u(id, o, g)
+     WHERE c.id = u.id AND u.o = 'publicize'
+       AND c.visibility::text = 'group' AND c.owner_group_id = u.g;
+    GET DIAGNOSTICS v_moved = ROW_COUNT;
     PERFORM set_config('epigraph.allow_declassify', '', true);
+    IF v_moved <> cardinality(v_todo) THEN
+        RAISE EXCEPTION 'VIS04: % of % claim(s) changed owner or visibility while publicize ran; '
+                        'nothing was changed, retry', cardinality(v_todo) - v_moved,
+                        cardinality(v_todo) USING ERRCODE = '40001';
+    END IF;
 
     IF v_meet_edges IS NOT NULL THEN
         WITH ep AS (
@@ -398,7 +426,8 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_publicize_claims(uuid[], text) FROM P
 --   to its group), refused_not_team_writer (the target is not writable), share.
 -- Arm (d) re-owns the derived rows. Pinned evidence keeps its pin owner, and
 -- edges take the meet; arm (d) handles group -> group without widening. One
--- `claim.shared_with_team` row is written.
+-- `claim.shared_with_team` row is written. Locked before classified, and a
+-- short UPDATE raises `VIS04`, as section 4.
 CREATE OR REPLACE FUNCTION public.epigraph_share_claims_with_team(
     p_claim_ids uuid[], p_group_id uuid, p_reason text)
 RETURNS TABLE (claim_id uuid, outcome text)
@@ -414,6 +443,7 @@ DECLARE
     v_cls_ids uuid[];
     v_cls_out text[];
     v_bad boolean;
+    v_moved bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'VIS01: sharing with a team needs an authenticated principal; '
@@ -440,6 +470,12 @@ BEGIN
          WHERE m.group_id = v_home AND m.role = 'admin');
     v_team_ok := p_group_id IS DISTINCT FROM v_home AND EXISTS (
         SELECT 1 FROM public.epigraph_writable_teams(v_principal) t WHERE t.group_id = p_group_id);
+
+    -- Lock, then classify (section 4, and the header).
+    PERFORM 1 FROM public.claims c
+      WHERE c.id = ANY(v_ids) AND c.visibility::text = 'group'
+        AND c.owner_group_id = ANY(COALESCE(v_readable, ARRAY[]::uuid[]))
+      ORDER BY c.id FOR NO KEY UPDATE;
 
     -- The classification, as two parallel arrays ordered by claim id (see the
     -- header: no temporary relation).
@@ -472,6 +508,13 @@ BEGIN
     UPDATE public.claims c
        SET owner_group_id = p_group_id, updated_at = now()
      WHERE c.id = ANY(v_cls_ids) AND c.owner_group_id = v_home AND c.visibility::text = 'group';
+    GET DIAGNOSTICS v_moved = ROW_COUNT;
+    IF v_moved <> cardinality(v_cls_ids) THEN
+        RAISE EXCEPTION 'VIS04: % of % claim(s) changed owner or visibility while '
+                        'share_claims_with_team ran; nothing was changed, retry',
+                        cardinality(v_cls_ids) - v_moved, cardinality(v_cls_ids)
+            USING ERRCODE = '40001';
+    END IF;
 
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.shared_with_team', v_principal, true,

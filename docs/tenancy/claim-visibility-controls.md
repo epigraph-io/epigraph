@@ -214,6 +214,11 @@ or names a temporary relation.
 
 For each claim, in one transaction and all-or-nothing:
 
+The claims it may act on (the group-visible rows the session reads) are locked first, `FOR NO
+KEY UPDATE` in id order. A row another session is changing is waited for, and the
+classification then reads what that session committed, so an owner or visibility change cannot
+slip in between the decision and the write.
+
 Every id is classified first, in this order, and nothing changes unless every id comes out
 `publicize` or `already_public`:
 
@@ -229,8 +234,12 @@ Then, for the `publicize` claims:
 
 5. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
    visibility='public'` with the owner unchanged, then reset the GUC to `''` in the same body.
-   Propagation copies `public` onto the 17 derived tables. Pinned evidence stays `group`, and
-   its owner never moves.
+   The UPDATE moves a claim only while it is still `group` and still owned by the group it was
+   classified under. If fewer claims move than were classified (a claim that was not locked
+   because it became readable only after the lock, then changed), the call raises `VIS04`
+   (SQLSTATE 40001) and nothing is changed; the repo maps it to a `State` refusal (409 over
+   REST), and a retry classifies the new state. Propagation copies `public` onto the 17 derived
+   tables. Pinned evidence stays `group`, and its owner never moves.
 6. Recompute the edge meet for every edge incident to the claims, **widening allowed**. This is
    the same CASE as `recompute_boundary_meet_conn`: both endpoints public and in writer scope →
    `('public', writer_group_id)`, otherwise world. One endpoint still private → the private
@@ -268,7 +277,10 @@ Every id is classified first, in this order, all or nothing as in §4.2:
 | `refused_not_team_writer` | the target group is not writable by the caller, or is `H` |
 | `share` | to be moved; returned as `shared` once moved |
 
-If every id is `share`, the function runs `UPDATE claims SET owner_group_id = p_group_id`. Visibility stays
+The rows are locked before they are classified, as in §4.2. If every id is `share`, the
+function runs `UPDATE claims SET owner_group_id = p_group_id` on the claims still owned by `H`
+and still `group`, and raises `VIS04` (nothing changed) if fewer move than were classified, so
+it never answers `shared` or writes the audit row for a claim it did not move. Visibility stays
 `group`, so this is not a widening and the GUC is not armed. Propagation re-owns the derived
 rows. Pinned evidence keeps its pin owner. Edges take the meet as usual, since narrowing and
 group-to-group moves are not blocked. One `security_events` row, `claim.shared_with_team`, is
@@ -291,7 +303,7 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 
 ## 5. Tests (app role, `ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 
-`crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (10 tests):
+`crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (12 tests):
 
 * A member writes with no `visibility`. The claim lands `('group', team)`. Another team member
   reads it, and a non-member gets not-found. Derived evidence and trace rows match the claim.
@@ -313,6 +325,11 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 * A caller session that plants same-named temporary tables (with rows and a trigger that would
   rewrite a classification) before calling either act changes nothing: both answer with their
   own refusal, no claim moves, the trigger never runs and the planted rows stay as planted.
+* A privileged session changes a claim's owner and has not committed when `publicize_claims`
+  (or `share_claims_with_team`) is called on it. The call waits, then decides against the
+  committed owner: the admin of the old owner is refused as a non-admin of the new one (the
+  author's no-longer-private claim is refused as not private), the claim stays where the other
+  session put it, and nothing is audited.
 
 `crates/epigraph-api/tests/claim_visibility_http.rs` (3 tests): the REST write surfaces
 (`/claims`, `/submit/packet`) honour `visibility`, the three REST acts answer as MCP does, and a

@@ -172,7 +172,7 @@ fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
     }
 }
 
-/// Map a migration-206 refusal (`VIS01`..`VIS03`) to a designed refusal, and
+/// Map a migration-206 refusal (`VIS01`..`VIS04`) to a designed refusal, and
 /// anything else to the ordinary conversion.
 fn map_vis_error(e: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(db) = &e {
@@ -186,6 +186,15 @@ fn map_vis_error(e: sqlx::Error) -> DbError {
         if msg.starts_with("VIS03") {
             return DbError::Refused {
                 kind: RefusalKind::Input,
+                message: msg.to_string(),
+            };
+        }
+        // A claim changed under the act after it was classified (migration
+        // 206, "DECIDED ON THE ROWS IT WRITES"); nothing was changed and a
+        // retry classifies the new state.
+        if msg.starts_with("VIS04") {
+            return DbError::Refused {
+                kind: RefusalKind::State,
                 message: msg.to_string(),
             };
         }
@@ -508,7 +517,9 @@ impl ClaimRepository {
     /// # Errors
     /// `DbError::NotFound` for a claim the session cannot read (or that does
     /// not exist); `DbError::Refused` (`Authority` for a non-admin, `State` for
-    /// a sealed claim, `Input` for a bad request) with nothing changed;
+    /// a sealed claim or for one that changed under the act after it was
+    /// classified (`VIS04`; retry), `Input` for a bad request) with nothing
+    /// changed;
     /// `DbError::QueryFailed` for faults.
     pub async fn publicize_conn(
         conn: &mut PgConnection,
