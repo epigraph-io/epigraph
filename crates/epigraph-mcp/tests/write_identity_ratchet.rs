@@ -331,6 +331,14 @@ const WRITE_BODIES_WITHOUT_AUTH: &[(&str, &str)] = &[
          body runs; writes no authored row",
     ),
     (
+        "countersign_authorship",
+        "acts as the caller's stamped VIEWER, not a write identity: it begins a transaction \
+         stamped with that viewer (`begin_as`), whose `epigraph.principal_id` is the caller \
+         migration 208's definer authorizes against (the named agent itself, or its live \
+         operator). It authors no row: it adds a decision label to an existing authorship and \
+         writes one audit row",
+    ),
+    (
         "create_frame",
         "frames are an instance-wide registry with no author column; R3 checklist",
     ),
