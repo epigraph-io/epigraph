@@ -17,6 +17,8 @@
 //! * the reporter's list holds only its own intake reports, not a claim it
 //!   authored in the intake group by another path;
 //! * the per-hour and per-day limits, counted per reporter;
+//! * an agent bound by a client allowance (149) files, with no membership of
+//!   any group; a linked agent whose acting row was revoked is refused;
 //! * an unconfigured intake (or one whose group is suspended) refuses;
 //! * session temporary objects named like the definer's relations change
 //!   nothing;
@@ -570,6 +572,151 @@ async fn the_rate_limit_is_per_reporter(pool: PgPool) {
     );
     assert_eq!(claims_by(&pool, w.reporter).await, 2);
     assert_eq!(claims_by(&pool, b).await, 2);
+}
+
+/// On a maintenance session: allow `agent`'s only OAuth client (a service
+/// client) for the human `operator` (149's client allowance).
+async fn allow_client(pool: &PgPool, agent: Uuid, operator: Uuid) -> Uuid {
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'bug intake allowance fixture', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("bug-intake-allowance-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("service client");
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let now: bool = sqlx::query_scalar(
+            "SELECT allowed_now FROM public.epigraph_allow_author_binding_client($1, $2, $3)",
+        )
+        .bind(client)
+        .bind(operator)
+        .bind("bug intake test")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("allow the client for the operator");
+        (conn, now)
+    })
+    .await;
+    client
+}
+
+async fn binding_of(pool: &PgPool, agent: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("binding")
+}
+
+/// An agent bound by a client ALLOWANCE (149), with no membership of any
+/// group its human writes, files a report: it is staged in its human's
+/// personal group (the claims trigger admits the agent's own write there) and
+/// lands in the intake group, authored by the agent. Revoking the allowance
+/// unbinds it, and it is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_allowlisted_agent_files_a_report(pool: PgPool) {
+    let w = world(&pool).await;
+    let (agent, own) = fixture::seed_agent_with_group(&pool, "bri-allowlisted").await;
+    let client = allow_client(&pool, agent, w.human).await;
+    assert_eq!(
+        binding_of(&pool, agent).await.as_deref(),
+        Some("client_allowlist"),
+        "PREMISE: bound by the allowance alone"
+    );
+    assert!(
+        !is_member(&pool, w.home, agent).await && !is_member(&pool, w.intake, agent).await,
+        "PREMISE: no membership of its human's group or of the intake group"
+    );
+
+    let r = submit_as(&pool, agent, &report("from an allowlisted agent"))
+        .await
+        .expect("an allowlisted agent files");
+    let (author, owner, vis): (Uuid, Uuid, String) = sqlx::query_as(
+        "SELECT agent_id, owner_group_id, visibility::text FROM claims WHERE id = $1",
+    )
+    .bind(r.claim_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the report");
+    assert_eq!((author, owner, vis.as_str()), (agent, w.intake, "group"));
+    let listed: Vec<Uuid> = list_as(&pool, agent)
+        .await
+        .expect("list")
+        .iter()
+        .map(|r| r.claim_id)
+        .collect();
+    assert_eq!(listed, vec![r.claim_id]);
+    let staged_elsewhere: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE agent_id = $1 AND owner_group_id IN ($2, $3)",
+    )
+    .bind(agent)
+    .bind(w.home)
+    .bind(own)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(staged_elsewhere, 0, "nothing is left in a staging group");
+
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, $2)",
+        )
+        .bind(client)
+        .bind("bug intake test")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke the allowance");
+        (conn, r)
+    })
+    .await;
+    let (_, msg) = refused(submit_as(&pool, agent, &report("after the revoke")).await);
+    assert!(msg.starts_with("BUG07:"), "{msg}");
+    assert_eq!(claims_by(&pool, agent).await, 1);
+}
+
+/// A linked agent whose acting row in its operator's group was revoked (the
+/// deactivation lever: a live link is never retired in place) is refused,
+/// although its link is live. Its sibling on the same link files.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deactivated_linked_agent_is_refused(pool: PgPool) {
+    let w = world(&pool).await;
+    let sibling = linked_agent(&pool, w.human, "bri-sibling").await;
+    submit_as(&pool, w.reporter, &report("before"))
+        .await
+        .expect("CALIBRATION: the reporter files while active");
+
+    let (home, reporter) = (w.home, w.reporter);
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let n = sqlx::query(
+            "UPDATE group_memberships SET revoked_at = now() \
+              WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(home)
+        .bind(reporter)
+        .execute(&mut *conn)
+        .await
+        .expect("revoke the acting row")
+        .rows_affected();
+        assert_eq!(n, 1, "PREMISE: one acting row");
+        (conn, ())
+    })
+    .await;
+    assert_eq!(
+        binding_of(&pool, w.reporter).await.as_deref(),
+        Some("live_link"),
+        "PREMISE: the link is still live"
+    );
+
+    let (_, msg) = refused(submit_as(&pool, w.reporter, &report("after")).await);
+    assert!(msg.starts_with("BUG07:"), "{msg}");
+    submit_as(&pool, sibling, &report("the sibling"))
+        .await
+        .expect("the active sibling files");
+    assert_eq!(claims_by(&pool, w.reporter).await, 1);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

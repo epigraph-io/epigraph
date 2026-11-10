@@ -60,10 +60,10 @@
 --   BUG05 the composed content or a digest the caller sent is malformed;
 --   BUG06 the caller is a registered system agent (148);
 --   BUG07 the caller is not bound to a human operator (122's OPL01 rule,
---         `epigraph_author_binding`), or it has no home group: it is neither a
---         registered human operator holding a live writer/admin membership of
---         its own personal group nor an agent acting on a live operator link
---         (107's `epigraph_operator_actor`);
+--         `epigraph_author_binding`), or its binding gives it no home group
+--         (a human operator's own personal group, a linked agent's acting
+--         operator group, an allowlisted agent's human's personal group; see
+--         THE HOME below);
 --   BUG08 the caller's per-hour or per-day limit is reached.
 -- Membership of the intake group is NOT required; that is the point.
 --
@@ -84,11 +84,12 @@
 -- trigger (122, 165, 166) checks every INSERT's writer scope, and its only
 -- relief is a privileged SESSION (`epigraph_bypass()`, which reads
 -- `session_user`); a definer frame does not change `session_user`. So the
--- INSERT is declared ('group', home), where home is the group the caller's
--- own writes already land in: the operator's personal group for an agent on
--- a live link, a human operator's own personal group. That insert meets every
--- check the trigger makes (OPL01, OPL02, ROL01) exactly as an ordinary write
--- by the caller would. The same statement sequence then re-owns the row to
+-- INSERT is declared ('group', home), where home is a group the claims
+-- trigger admits the caller's own write into: the operator's personal group
+-- for an agent on a live link, a human operator's own personal group, the
+-- allowlisted human's personal group for an agent on a 149 client allowance
+-- (THE HOME, below). That insert meets every check the trigger makes (OPL01,
+-- OPL02, ROL01) exactly as an ordinary write by the caller would. The same statement sequence then re-owns the row to
 -- the intake group before anything else references it. The re-own is an
 -- `UPDATE OF owner_group_id`, which the binding trigger does not fire on, and
 -- which 115's owner-immutable guard admits in a definer frame
@@ -97,6 +98,26 @@
 -- 'public' at any point, so no widening or narrowing guard is involved, and
 -- the trace and evidence are inserted after the re-own, declared (intake,
 -- 'group'). No other session can see the staged state: it never commits.
+--
+-- THE HOME, per binding arm (`epigraph_author_binding`, 149):
+--   'human_operator'   its own active personal group, where it holds a live
+--                      writer/admin row;
+--   'live_link'        107's `epigraph_operator_actor`: the operator's
+--                      personal group, while the link is live AND the agent's
+--                      own acting row there is live. Revoking that row is the
+--                      deactivation lever for a linked agent, so a deactivated
+--                      agent is refused here, not admitted on its link alone;
+--   'client_allowlist' the allowlisted human's active personal group, where
+--                      that human holds a live writer/admin row. The agent
+--                      needs no membership of it: 122's writer scope for an
+--                      allowlisted author asks only whether its human writes
+--                      the group (`epigraph_require_writer_scope`), so the
+--                      staged insert there meets OPL01, OPL02 and ROL01 as
+--                      the agent's own write would. Revoking the allowance
+--                      unbinds the agent, which is then refused BUG07.
+-- In every arm the staged insert is checked by the claims trigger exactly as
+-- an ordinary write by the caller into that group would be; the home rule
+-- only chooses the group.
 --
 -- WHAT IT DOES NOT DO, deliberately:
 --   * no novelty gate, no content-hash dedup, no similarity search. A report
@@ -216,6 +237,8 @@ DECLARE
     v_per_hour  integer;
     v_per_day   integer;
     v_home      uuid;
+    v_binding   text;
+    v_human     uuid;
     v_repro     text;
     v_evidence  text;
     v_content   text;
@@ -325,25 +348,30 @@ BEGIN
         RAISE EXCEPTION 'BUG06: a system agent files no bug report; nothing was written'
             USING ERRCODE = '42501';
     END IF;
-    IF public.epigraph_author_binding(v_principal) IS NOT NULL THEN
+    -- THE HOME, per binding arm (section 3).
+    v_binding := public.epigraph_author_binding(v_principal);
+    IF v_binding = 'human_operator' THEN
+        v_human := v_principal;
+    ELSIF v_binding = 'live_link' THEN
         SELECT a.operator_group_id INTO v_home
           FROM public.epigraph_operator_actor(v_principal) a;
-        IF v_home IS NULL AND public.epigraph_is_human_operator(v_principal) THEN
-            SELECT g.id INTO v_home
-              FROM public.groups g
-              JOIN public.group_memberships m
-                ON m.group_id = g.id AND m.agent_id = v_principal
-               AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')
-             WHERE g.kind = 'personal' AND g.created_by_agent_id = v_principal
-               AND g.status = 'active'
-             ORDER BY g.created_at, g.id
-             LIMIT 1;
-        END IF;
+    ELSIF v_binding = 'client_allowlist' THEN
+        v_human := public.epigraph_allowlisted_operator(v_principal);
+    END IF;
+    IF v_home IS NULL AND v_human IS NOT NULL THEN
+        SELECT g.id INTO v_home
+          FROM public.groups g
+         WHERE g.kind = 'personal' AND g.created_by_agent_id = v_human
+           AND g.status = 'active'
+           AND public.epigraph_operator_writes_group(v_human, g.id)
+         ORDER BY g.created_at, g.id
+         LIMIT 1;
     END IF;
     IF v_home IS NULL THEN
-        RAISE EXCEPTION 'BUG07: agent % is not bound to a human operator (no live operator '
-                        'link it acts on, and not a registered human operator with its own '
-                        'personal group); nothing was written', v_principal
+        RAISE EXCEPTION 'BUG07: agent % is not bound to a human operator with a home group (no '
+                        'live operator link it acts on, no live client allowance, and not a '
+                        'registered human operator with its own personal group); nothing was '
+                        'written', v_principal
             USING ERRCODE = '42501',
                   HINT = 'An operator links the agent: epigraph-operator link.';
     END IF;
