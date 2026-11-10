@@ -1066,13 +1066,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
         // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and the
-        // factory closure runs once PER SESSION. Every session is a clone of
+        // factory closure runs once PER SESSION, or once per REQUEST on rmcp
+        // 3.x's stateless 2026-07-28 path. Every session is a clone of
         // the one template above: it carries the template's `ScopedPool` (an
         // attachment on the stdio path alone would leave every real caller on
         // a server whose `scoped` is `None`, turning the 42501 into a total
         // `submit_claim` / `memorize` refusal) and SHARES its `agent_db_id`
-        // cell, so the server agent is resolved — and its personal group
-        // provisioned — once per process, not once per session. See
+        // cell and its OPERATED_BY memo, so the server agent is resolved — and
+        // its personal group provisioned — once per process, not once per
+        // session or request. See
         // `SessionFactory` for the measurement.
         //
         // `mcp_http_listener` also picks the rmcp config and the session

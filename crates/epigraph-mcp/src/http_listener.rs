@@ -88,7 +88,10 @@ pub struct McpHttpListener<S> {
 /// Build the rmcp streamable-HTTP service for the `--listen` address `listen`,
 /// with the operator's `--allowed-host` entries `allowed_hosts`.
 ///
-/// `factory` runs once per MCP session and returns that session's handler.
+/// `factory` runs once per MCP session and returns that session's handler. On
+/// rmcp 3.x's stateless 2026-07-28 path there is no session, and it runs once
+/// per REQUEST, so anything a handler memoizes for speed belongs in state the
+/// factory shares (see [`crate::SessionFactory`]).
 #[must_use]
 pub fn mcp_http_listener<S, F>(
     listen: &str,

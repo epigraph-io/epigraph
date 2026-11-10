@@ -97,10 +97,17 @@ pub struct EpiGraphMcpFull {
     /// [`Self::with_generated_signer_identity`] on rung 4. Defaulting strict
     /// means no embedding caller can widen the gate by omission.
     pub(crate) signer_identity_declared: bool,
-    /// Per-session memoization of auth-lineage principals already linked via an
-    /// `OPERATED_BY` edge, so `call_tool` writes that edge at most once per
-    /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
-    /// DB `create_if_not_exists` is the actual dedup authority). Empty at boot.
+    /// Memo of auth-lineage principals already linked via an `OPERATED_BY`
+    /// edge, so `call_tool` writes that edge at most once per distinct
+    /// `auth.agent_id` (a fast in-memory short-circuit; the DB
+    /// `create_if_not_exists` is the actual dedup authority). Empty at boot.
+    ///
+    /// Per PROCESS on the HTTP listener: [`SessionFactory::session`] shares it
+    /// with every session, because rmcp 3.x runs the factory once per REQUEST
+    /// on the stateless 2026-07-28 path, where a per-session memo would be
+    /// empty on every call. A principal is inserted only after its edge
+    /// write succeeds, so a failed write is retried on the next call; an edge
+    /// deleted after a success is not rewritten until the process restarts.
     pub(crate) seen_auth_lineage: Arc<Mutex<HashSet<uuid::Uuid>>>,
     /// Write-authorization gate — the MCP twin of `epigraph_api::AppState`'s
     /// `policy_gate` field, and injected for the same reason.
@@ -336,8 +343,9 @@ impl EpiGraphMcpFull {
 ///
 /// # Why this exists (backlog F1, `da432f25`)
 ///
-/// rmcp's streamable-HTTP transport calls its factory closure once per SESSION,
-/// and `main` used to build each session's server with
+/// rmcp's streamable-HTTP transport calls its factory closure once per SESSION
+/// (and, since rmcp 3.x, once per REQUEST on the stateless 2026-07-28 path,
+/// which makes the sharing below matter more), and `main` used to build each session's server with
 /// [`EpiGraphMcpFull::new_shared_with_federation`], which gives every server a
 /// fresh, EMPTY `agent_db_id` cell. So [`EpiGraphMcpFull::agent_id`]'s
 /// resolution — which ends in PR-09's `ensure_personal_group` call on the
@@ -366,12 +374,17 @@ impl EpiGraphMcpFull {
 /// a revocation made before the process started either: since migration 105
 /// the provisioning function refuses a revoked row instead of restoring it.
 ///
-/// # What is per-session, and stays so
+/// # What is shared besides the cell
 ///
-/// Only `seen_auth_lineage`, the `OPERATED_BY` memo, whose doc makes it
-/// per-session; [`Self::session`] resets it. Everything else a session server
-/// holds is either immutable configuration or an `Arc` the old constructor
-/// already shared (`signer`, `embedder`, `federation`, the `ScopedPool`).
+/// `seen_auth_lineage`, the `OPERATED_BY` memo, is shared too. It used to be
+/// reset per session, which on rmcp 2.x meant one edge round trip per
+/// principal per session. rmcp 3.x builds a fresh server for EVERY stateless
+/// 2026-07-28 request, so a per-session memo would be empty on every call and
+/// each tool call would first await the signer lookup, a pool connection and
+/// the `OPERATED_BY` upsert. Shared, that happens once per principal per
+/// process. Everything else a session server holds is either immutable
+/// configuration or an `Arc` the old constructor already shared (`signer`,
+/// `embedder`, `federation`, the `ScopedPool`).
 ///
 /// # A cost, stated
 ///
@@ -393,13 +406,12 @@ impl SessionFactory {
         Self { template }
     }
 
-    /// A server for one new session: a clone of the template that SHARES its
-    /// `agent_db_id` cell and starts with an empty `OPERATED_BY` memo.
+    /// A server for one new session (or, on rmcp 3.x's stateless 2026-07-28
+    /// path, one request): a clone of the template that SHARES its
+    /// `agent_db_id` cell and its `OPERATED_BY` memo.
     #[must_use]
     pub fn session(&self) -> EpiGraphMcpFull {
-        let mut srv = self.template.clone();
-        srv.seen_auth_lineage = Arc::new(Mutex::new(HashSet::new()));
-        srv
+        self.template.clone()
     }
 }
 
@@ -599,8 +611,9 @@ impl EpiGraphMcpFull {
     ///
     /// Semantics:
     /// - `principal == None` -> no-op (nothing to attribute).
-    /// - Memoized per session via `seen_auth_lineage`: a principal already linked
-    ///   in this session short-circuits before touching the DB. The DB
+    /// - Memoized via `seen_auth_lineage` (per process on the HTTP listener, see
+    ///   its field doc): a principal already linked short-circuits before
+    ///   touching the DB. The DB
     ///   `create_if_not_exists` is the true idempotency authority (exactly one
     ///   edge across processes); the set is only a fast in-memory guard.
     /// - **Best-effort**: any failure (e.g. a stale `principal` that no longer
@@ -616,7 +629,7 @@ impl EpiGraphMcpFull {
         let Some(principal) = principal else {
             return;
         };
-        // Fast per-session short-circuit (lock released before any await on the DB).
+        // Fast in-memory short-circuit (lock released before any await on the DB).
         let already_seen = { self.seen_auth_lineage.lock().await.contains(&principal) };
         if already_seen {
             return;
@@ -3421,9 +3434,70 @@ mod session_factory_tests {
             "every session must share the template's agent_db_id cell"
         );
         assert!(
-            !Arc::ptr_eq(&a.seen_auth_lineage, &b.seen_auth_lineage),
-            "the OPERATED_BY memo is per-session by contract"
+            Arc::ptr_eq(&a.seen_auth_lineage, &b.seen_auth_lineage),
+            "every session must share the template's OPERATED_BY memo: on rmcp 3.x's \
+             stateless 2026-07-28 path the factory runs once per REQUEST"
         );
+    }
+
+    /// Behavioural: a principal one session has linked is NOT re-linked by a
+    /// new session. rmcp 3.x runs the factory once per request on the
+    /// stateless 2026-07-28 path, so a per-session memo would put
+    /// `record_auth_lineage`'s database round trip (the signer lookup, a pool
+    /// connection and the `OPERATED_BY` upsert) in front of every such tool
+    /// call.
+    ///
+    /// The pool points at a listener that accepts and never answers, so any
+    /// database access hangs until the 30 s acquire timeout; the memo hit
+    /// must return well inside 5 s.
+    ///
+    /// Mutation: make `SessionFactory::session` give each session a fresh
+    /// `seen_auth_lineage` -> the second call goes to the database and this
+    /// test times out.
+    #[tokio::test]
+    async fn a_principal_linked_in_one_session_is_not_relinked_by_the_next() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent listener");
+        let addr = silent.local_addr().expect("local addr");
+        let accepted = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = silent.accept().await {
+                held.push(conn);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_lazy(&format!("postgres://nobody:nothing@{addr}/none"))
+            .expect("a lazy pool never connects at construction");
+        let signer = Arc::new(AgentSigner::from_bytes(&[0x5Eu8; 32]).expect("signer"));
+        let embedder = Arc::new(McpEmbedder::new(pool.clone(), None));
+        let sessions = SessionFactory::new(EpiGraphMcpFull::new_shared_with_federation(
+            pool,
+            signer,
+            embedder,
+            false,
+            crate::federation::SharedFederation::empty(),
+            None,
+        ));
+
+        let principal = uuid::Uuid::new_v4();
+        // What a successful `record_auth_lineage` leaves behind in session one.
+        sessions
+            .session()
+            .seen_auth_lineage
+            .lock()
+            .await
+            .insert(principal);
+
+        let next = sessions.session();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next.record_auth_lineage(Some(principal)),
+        )
+        .await
+        .expect("an already-linked principal must short-circuit, not reach the database");
+        accepted.abort();
     }
 
     /// Behavioural: once one session has resolved the agent, a NEW session
