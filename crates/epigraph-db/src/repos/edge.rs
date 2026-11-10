@@ -811,14 +811,24 @@ impl EdgeRepository {
             DedupProbe::IngestPrincipal(_) => {
                 let by = crate::repos::ingest_written::ingest_written_by_sql("e");
                 let marked = crate::repos::ingest_written::ingest_written_edge_sql("e");
+                // A row its named person DECLINED (migration 208) is retracted
+                // but stops no other principal: it was a third party's naming,
+                // withdrawn by the person named, and must never keep that
+                // person's own later ingest from writing its own row.
+                let declined = crate::repos::ingest_written::countersign_label_sql(
+                    "e",
+                    crate::repos::ingest_written::COUNTERSIGN_DECLINED_LABEL_PREFIX,
+                );
                 format!(
                     "-- VISIBILITY-EXEMPT: dedup probe inside a WRITE path (one row of the \
-                     fact per ingest principal; retracted and unmarked rows stop it).\n\
+                     fact per ingest principal; retracted and unmarked rows stop it, a \
+                     declined naming does not).\n\
                      SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
                             e.relationship, e.properties, e.valid_from, e.valid_to \
                        FROM edges e \
                       WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
-                        AND ({by} = $4 OR NOT {marked} OR NOT {EDGE_IN_FORCE}) \
+                        AND ({by} = $4 OR NOT {marked} \
+                             OR (NOT {EDGE_IN_FORCE} AND NOT {declined})) \
                       ORDER BY COALESCE({by} = $4, false) DESC, {EDGE_IN_FORCE} DESC, \
                                e.created_at, e.id \
                       LIMIT 1"

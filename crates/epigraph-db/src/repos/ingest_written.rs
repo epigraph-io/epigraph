@@ -143,20 +143,74 @@ pub const INGEST_WRITTEN_SHAPES: &[(&str, &str, &str)] = &[
     ("agent", "asserts", "claim"),
 ];
 
-/// SQL: true when the edge aliased `alias` was written by the document
-/// ingest. The single trust predicate for provenance reads; see the module
-/// docs. The guard refuses the key itself, so anything this accepts was
-/// written under the walk's declaration.
+/// The reserved edge-label prefix (migration 208): every label starting with
+/// it is written only under [`INGEST_WRITTEN_SETTING`], like the property.
+pub const RESERVED_EDGE_LABEL_PREFIX: &str = "epigraph:";
+
+/// The label a BACKFILLED legacy ingest edge carries in place of
+/// [`INGEST_WRITTEN_PROPERTY`] (migration 208): the backfill cannot edit
+/// `properties` on a signed row without the row reading "changed since it
+/// was signed" (the edge attestation covers `properties`, not `labels`).
+/// The sentinel the marker predicate tests (the GIN index on `labels` serves
+/// `labels @> ARRAY[..]`).
+pub const INGEST_WRITTEN_LABEL: &str = "epigraph:ingest_written";
+
+/// The prefix of the label naming a backfilled edge's principal:
+/// `epigraph:ingest_written_by:<uuid>`, the label form of the marker's `by`.
+pub const INGEST_WRITTEN_BY_LABEL_PREFIX: &str = "epigraph:ingest_written_by:";
+
+/// The label form of the marker for a backfilled edge written by `by`.
 #[must_use]
-pub fn ingest_written_edge_sql(alias: &str) -> String {
-    format!("(({alias}.properties ->> '{INGEST_WRITTEN_PROPERTY}') IS NOT NULL)")
+pub fn ingest_written_labels(by: Uuid) -> [String; 2] {
+    [
+        INGEST_WRITTEN_LABEL.to_string(),
+        format!("{INGEST_WRITTEN_BY_LABEL_PREFIX}{by}"),
+    ]
 }
 
-/// SQL: the principal whose ingest wrote the edge aliased `alias`, as text;
-/// NULL for an unmarked edge (or a marker without one).
+/// SQL: true when the edge aliased `alias` was written by the document
+/// ingest: it carries [`INGEST_WRITTEN_PROPERTY`] (written by the walk) or
+/// [`INGEST_WRITTEN_LABEL`] (stamped by the legacy backfill). The single
+/// trust predicate for provenance reads; see the module docs. The guard
+/// refuses both forms to every undeclared writer, so anything this accepts
+/// was written under the walk's or the backfill's declaration.
+#[must_use]
+pub fn ingest_written_edge_sql(alias: &str) -> String {
+    format!(
+        "(({alias}.properties ->> '{INGEST_WRITTEN_PROPERTY}') IS NOT NULL \
+          OR {alias}.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[])"
+    )
+}
+
+/// SQL: the principal whose ingest wrote the edge aliased `alias`, as text:
+/// the property marker's `by`, else the backfill label's; NULL for an
+/// unmarked edge (or a marker without one).
 #[must_use]
 pub fn ingest_written_by_sql(alias: &str) -> String {
-    format!("({alias}.properties -> '{INGEST_WRITTEN_PROPERTY}' ->> '{INGEST_WRITTEN_BY_FIELD}')")
+    let n = INGEST_WRITTEN_BY_LABEL_PREFIX.len() + 1;
+    format!(
+        "COALESCE({alias}.properties -> '{INGEST_WRITTEN_PROPERTY}' ->> '{INGEST_WRITTEN_BY_FIELD}', \
+                  (SELECT min(substr(l, {n})) FROM unnest({alias}.labels) l \
+                    WHERE l LIKE '{INGEST_WRITTEN_BY_LABEL_PREFIX}%'))"
+    )
+}
+
+/// The label the countersign route adds to a pending authorship its named
+/// person (or that person's live operator) CONFIRMED: prefix of
+/// `epigraph:countersigned_by:<uuid>` (migration 208's definer).
+pub const COUNTERSIGNED_BY_LABEL_PREFIX: &str = "epigraph:countersigned_by:";
+
+/// The label the countersign route adds to a pending authorship its named
+/// person DECLINED (the row is also retracted): prefix of
+/// `epigraph:countersign_declined_by:<uuid>`.
+pub const COUNTERSIGN_DECLINED_LABEL_PREFIX: &str = "epigraph:countersign_declined_by:";
+
+/// SQL: true when the edge aliased `alias` carries a countersign decision
+/// of `prefix` ([`COUNTERSIGNED_BY_LABEL_PREFIX`] or
+/// [`COUNTERSIGN_DECLINED_LABEL_PREFIX`]).
+#[must_use]
+pub fn countersign_label_sql(alias: &str, prefix: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM unnest({alias}.labels) l WHERE l LIKE '{prefix}%')")
 }
 
 /// SQL: true when the marked edges aliased `a` and `b` were written by
@@ -297,19 +351,49 @@ mod tests {
 
     #[test]
     fn the_predicate_reads_the_reserved_key() {
-        assert_eq!(
-            ingest_written_edge_sql("e2"),
-            "((e2.properties ->> 'ingest_written') IS NOT NULL)"
+        let s = ingest_written_edge_sql("e2");
+        assert!(
+            s.contains("(e2.properties ->> 'ingest_written') IS NOT NULL"),
+            "{s}"
+        );
+        assert!(
+            s.contains("e2.labels @> ARRAY['epigraph:ingest_written']::text[]"),
+            "{s}"
         );
     }
 
     #[test]
     fn the_chain_predicate_compares_the_writing_principal() {
-        assert_eq!(
-            same_ingest_sql("pa", "ea"),
-            "((pa.properties -> 'ingest_written' ->> 'by') = \
-             (ea.properties -> 'ingest_written' ->> 'by'))"
+        let s = same_ingest_sql("pa", "ea");
+        assert!(
+            s.contains("pa.properties -> 'ingest_written' ->> 'by'"),
+            "{s}"
         );
+        assert!(
+            s.contains("ea.properties -> 'ingest_written' ->> 'by'"),
+            "{s}"
+        );
+        assert!(
+            s.contains("unnest(pa.labels)") && s.contains("unnest(ea.labels)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn the_backfill_labels_are_reserved_and_name_the_principal() {
+        let by = Uuid::nil();
+        let [sentinel, named] = ingest_written_labels(by);
+        assert_eq!(sentinel, INGEST_WRITTEN_LABEL);
+        assert!(named.starts_with(INGEST_WRITTEN_BY_LABEL_PREFIX));
+        assert!(named.ends_with(&by.to_string()));
+        for l in [
+            INGEST_WRITTEN_LABEL,
+            INGEST_WRITTEN_BY_LABEL_PREFIX,
+            COUNTERSIGNED_BY_LABEL_PREFIX,
+            COUNTERSIGN_DECLINED_LABEL_PREFIX,
+        ] {
+            assert!(l.starts_with(RESERVED_EDGE_LABEL_PREFIX), "{l}");
+        }
     }
 
     #[test]
