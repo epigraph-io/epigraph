@@ -1082,3 +1082,85 @@ async fn request_without_a_host_header_is_refused() {
         .unwrap();
     assert_eq!(status_of(req).await, 403);
 }
+
+// ── Request-body cap ──────────────────────────────────────────────────────
+
+/// An `initialize` POST whose serialized body is exactly `len` bytes, padded
+/// in `clientInfo.name`.
+fn init_request_of_len(len: usize, bearer: &str) -> axum::http::Request<axum::body::Body> {
+    let body_with = |pad: usize| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "p".repeat(pad), "version": "0.1"}
+            }
+        })
+        .to_string()
+    };
+    let overhead = body_with(0).len();
+    let body = body_with(len - overhead);
+    assert_eq!(body.len(), len, "padding arithmetic");
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("Host", PROXY_HOST)
+        .header("Accept", ACCEPT)
+        .header("Content-Type", CONTENT_TYPE)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+/// The MCP HTTP listener caps one request body at 4 MiB and answers a larger
+/// one with an explicit 413, through the same `mcp_http_listener` and
+/// session-status rewrite `main.rs` serves. rmcp 2.2 read any size; 3.x added
+/// the cap (`StreamableHttpServerConfig::max_request_body_bytes`), and
+/// `host_guard::streamable_http_server_config` now sets it from
+/// `http_listener::MAX_REQUEST_BODY_BYTES` so it is a recorded choice rather
+/// than whatever the next rmcp default is. Both edges are pinned: exactly the
+/// cap is served, one byte over is refused before rmcp parses it.
+///
+/// The literal `4 * 1024 * 1024` is deliberate: moving the cap must fail here
+/// and be decided, not follow the constant silently.
+///
+/// Mutation: in `streamable_http_server_config`, pass `usize::MAX` to
+/// `with_max_request_body_bytes` -> the over-cap arm gets 200 and this test
+/// fails.
+#[tokio::test]
+async fn request_body_over_4_mib_is_refused_with_413_and_at_the_cap_is_served() {
+    const CAP: usize = 4 * 1024 * 1024;
+    assert_eq!(epigraph_mcp::http_listener::MAX_REQUEST_BODY_BYTES, CAP);
+    let token = mint_token(SECRET, &["claims:read"]);
+
+    let (router, _) = listener_router(TCP_LISTEN);
+    let resp = router
+        .oneshot(init_request_of_len(CAP + 1, &token))
+        .await
+        .expect("router is infallible");
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        status, 413,
+        "one byte over the cap must be refused explicitly; body: {body}"
+    );
+    assert!(body.contains("Payload Too Large"), "{body}");
+
+    let (router, _) = listener_router(TCP_LISTEN);
+    let resp = router
+        .oneshot(init_request_of_len(CAP, &token))
+        .await
+        .expect("router is infallible");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a body of exactly the cap is served"
+    );
+    assert!(resp.headers().contains_key(SESSION_HEADER));
+}

@@ -24,8 +24,9 @@
 //! server and owns both of its pipes; it can already stop or starve the
 //! process, so the cap buys no isolation from it.
 //!
-//! The HTTP listener keeps rmcp's request-body cap, which answers an over-cap
-//! request with an explicit 413 rather than dropping it.
+//! The HTTP listener keeps a request-body cap, which answers an over-cap
+//! request with an explicit 413 rather than dropping it (see
+//! [`crate::http_listener::MAX_REQUEST_BODY_BYTES`]).
 
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::RoleServer;

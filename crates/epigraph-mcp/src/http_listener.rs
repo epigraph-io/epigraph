@@ -44,6 +44,24 @@ use crate::host_guard::{streamable_http_server_config, HostAllowlist};
 /// (rmcp's default, 60 s) still bounds sessions that never initialize.
 pub const SESSION_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// The largest MCP HTTP request body the listener reads: 4 MiB, rmcp 3.x's
+/// default, set explicitly in
+/// [`crate::host_guard::streamable_http_server_config`].
+///
+/// rmcp 2.2 read a body of any size; 3.x reads at most
+/// `max_request_body_bytes` and answers a larger one with
+/// `413 Payload Too Large` before parsing it. That is an explicit refusal the
+/// client sees, unlike the stdio framing's silent drop (see
+/// [`crate::stdio_transport`]), so the cap is kept. It sits inside the auth
+/// layer, so only an authenticated caller reaches it, and it bounds the memory
+/// one request can pin. 4 MiB is far above what a model-generated tool call
+/// carries (a claim's content is capped at 64 KiB). A client that needs a
+/// larger single call, such as a very large `ingest_document_inline`, can use
+/// stdio, which has no cap. Raising it is a one-line change here, pinned by
+/// `tests/http_auth_test.rs`
+/// (`request_body_over_4_mib_is_refused_with_413_and_at_the_cap_is_served`).
+pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 /// The session manager every MCP HTTP listener uses: rmcp's defaults, except
 /// `keep_alive` = [`SESSION_KEEP_ALIVE`].
 #[must_use]
