@@ -206,9 +206,12 @@ the session principal (`epigraph_principal_id()`), reads live memberships throug
 The bodies keep their working set (the per-claim classification) in local variables and arrays,
 never in a temporary table. A temporary table belongs to the calling session, not to the
 function's owner, so a caller could create one of the same name first and have the body use it
-with the owner's privileges. `definer_search_path_ratchet.rs`
-(`no_definer_keeps_state_in_a_session_temporary_relation`) refuses any definer body that creates
-or names a temporary relation.
+with the owner's privileges. The same holds for an INVOKER function or trigger a definer runs,
+since it runs as the definer's owner (the write window's `trigger_validate_edge_refs` →
+`validate_edge_reference`). `definer_search_path_ratchet.rs`
+(`no_function_keeps_state_in_a_session_temporary_relation`) refuses any such body that creates
+or names a temporary relation: it scans every function outside the system schemas and
+extensions, definer or not.
 
 ### 4.2 `epigraph_publicize_claims(p_claim_ids uuid[], p_reason text)`
 
@@ -337,8 +340,8 @@ REST resubmit that matches the caller's existing private claim reports its store
 the "NOT re-scoped" note.
 
 `crates/epigraph-db/tests/definer_search_path_ratchet.rs`
-(`no_definer_keeps_state_in_a_session_temporary_relation`): no definer body anywhere creates or
-names a temporary relation.
+(`no_function_keeps_state_in_a_session_temporary_relation`): no function body a definer can run
+(definer or INVOKER, so its helpers and triggers too) creates or names a temporary relation.
 
 `crates/epigraph-core/src/tenancy.rs`: `VisibilityChoice::parse` unit tests (bad pairs refused).
 

@@ -76,8 +76,9 @@
 -- calling SESSION, not to the definer's owner, so the caller could create one
 -- of the same name first, with its own rows and triggers, and the body would
 -- then read and write the caller's relation with the owner's privileges.
--- `definer_search_path_ratchet.rs` refuses any definer body that creates or
--- names one.
+-- `definer_search_path_ratchet.rs` refuses any function body a definer can
+-- run (the definers, and the INVOKER helpers and triggers they run as their
+-- owner, such as the write window's) that creates or names one.
 --
 -- DECIDED ON THE ROWS IT WRITES. Each widening act first locks the claims it
 -- may act on (`FOR NO KEY UPDATE`, in id order: the group-visible rows the
