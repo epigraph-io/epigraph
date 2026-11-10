@@ -2562,6 +2562,39 @@ restart.
   local worktree carries a `195`. **Deploy order:** after 179 and 180; no
   binary depends on it; before attaching any further identity to a role.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **206**: public `claim_visibility_controls`
+  (`docs/tenancy/claim-visibility-controls.md`). Five SECURITY DEFINER
+  functions on 172's form (`pg_catalog, pg_temp`, every name qualified),
+  owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
+  `epigraph_app`: the reads `epigraph_writable_teams(uuid)` (the team groups
+  an agent writes, its own writer/admin membership or its live human's) and
+  `epigraph_default_group(uuid)`, which answer the same on an unstamped
+  connection; and the writes `epigraph_set_default_group(uuid)`,
+  `epigraph_publicize_claims(uuid[], text)` (group -> public, a live admin of
+  the owning group only, sealed claims refused, incident edges re-met with
+  widening allowed) and `epigraph_share_claims_with_team(uuid[], uuid, text)`
+  (private -> a team the caller writes). Each write is all or nothing: it
+  locks the claims it may act on, classifies them, changes nothing unless
+  every id passes, raises `VIS04` (40001) if a claim changed under it, and
+  writes one `security_events` row. The writes switch to `public, pg_temp`
+  only around their write statements (the legacy invoker triggers they fire
+  name helpers unqualified) and keep no state in a temporary relation.
+  Registered in `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS` and the
+  grant register). Pinned by
+  `epigraph-mcp/tests/claim_visibility_controls_app_role.rs` and
+  `epigraph-api/tests/claim_visibility_http.rs` (on the application role),
+  `epigraph-db/tests/definer_search_path_ratchet.rs` and
+  `epigraph-db/tests/claim_visibility_controls_undo.rs`. No table, column,
+  trigger, policy or index; no earlier body re-stated. Undo:
+  `docs/runbooks/206-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 206); it leaves the claims as they stand, the
+  `agents.default_group_id` values, the audit rows and the
+  `_sqlx_migrations` row. Checked before claiming: no migration on main or
+  on an open PR carries a `206`. **Deploy order:** migrate before rolling
+  out a binary with the visibility controls (it calls the two reads on every
+  claim write that names no visibility); undo only after rolling every such
+  binary back. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 
