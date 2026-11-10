@@ -52,12 +52,15 @@ pub const SESSION_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_se
 /// `max_request_body_bytes` and answers a larger one with
 /// `413 Payload Too Large` before parsing it. That is an explicit refusal the
 /// client sees, unlike the stdio framing's silent drop (see
-/// [`crate::stdio_transport`]), so the cap is kept. It sits inside the auth
-/// layer, so only an authenticated caller reaches it, and it bounds the memory
-/// one request can pin. 4 MiB is far above what a model-generated tool call
-/// carries (a claim's content is capped at 64 KiB). A client that needs a
-/// larger single call, such as a very large `ingest_document_inline`, can use
-/// stdio, which has no cap. Raising it is a one-line change here, pinned by
+/// [`crate::stdio_transport`]), so the cap is kept. It bounds the memory one
+/// request can pin. On a `--jwt-secret` listener (every TCP listener) it sits
+/// inside the bearer layer, so only an authenticated caller reaches it. A
+/// unix-socket listener started with `--allow-unauthenticated-http` has no
+/// bearer layer; there the socket's filesystem permissions stand in front of
+/// it, and the cap applies the same way. 4 MiB is far above what a
+/// model-generated tool call carries (a claim's content is capped at 64 KiB).
+/// A client that needs a larger single call, such as a very large
+/// `ingest_document_inline`, can use stdio, which has no cap. Raising it is a one-line change here, pinned by
 /// `tests/http_auth_test.rs`
 /// (`request_body_over_4_mib_is_refused_with_413_and_at_the_cap_is_served`).
 pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
