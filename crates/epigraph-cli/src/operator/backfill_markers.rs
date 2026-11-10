@@ -239,6 +239,13 @@ pub struct Signer {
     pub key_kind: Option<String>,
     pub system_role: Option<String>,
     pub count: i64,
+    /// Of its candidate `paper -asserts-> claim` edges: how many there are,
+    /// and how many target a claim this same signer filed. A server key that
+    /// signed for many ingesting callers files few of the claims it signed
+    /// assertions of; an agent that ingested as itself files most of them.
+    /// Evidence for the operator's classification, nothing more.
+    pub paper_asserts: i64,
+    pub paper_asserts_self_filed: i64,
 }
 
 /// What the database holds before a run.
@@ -341,7 +348,15 @@ const PROVABLE_FROM: &str = "FROM edges pa \
       JOIN reasoning_traces t ON t.id = c.trace_id";
 
 /// A signer row: id, display name, agent type, key kind, edge count.
-type SignerRow = (Uuid, Option<String>, Option<String>, Option<String>, i64);
+type SignerRow = (
+    Uuid,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+);
 
 /// The read-only census.
 ///
@@ -389,7 +404,11 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
     }
     let preds: Vec<String> = Kind::ALL.iter().map(|k| k.candidate_sql()).collect();
     let rows: Vec<SignerRow> = sqlx::query_as(&format!(
-        "SELECT e.signer_id, a.display_name, a.agent_type::text, a.key_kind::text, count(*) \
+        "SELECT e.signer_id, a.display_name, a.agent_type::text, a.key_kind::text, count(*), \
+                count(*) FILTER (WHERE e.source_type = 'paper'), \
+                count(*) FILTER (WHERE e.source_type = 'paper' AND EXISTS ( \
+                    SELECT 1 FROM claims c WHERE c.id = e.target_id \
+                                             AND c.agent_id = e.signer_id)) \
                FROM edges e LEFT JOIN agents a ON a.id = e.signer_id \
               WHERE e.signer_id IS NOT NULL AND (({}) OR ({}) OR ({})) \
               GROUP BY 1, 2, 3, 4 ORDER BY count(*) DESC, 1",
@@ -410,14 +429,18 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
         };
     c.signers = rows
         .into_iter()
-        .map(|(id, display_name, agent_type, key_kind, count)| Signer {
-            id,
-            display_name,
-            agent_type,
-            key_kind,
-            system_role: roles.iter().find(|(a, _)| *a == id).map(|(_, r)| r.clone()),
-            count,
-        })
+        .map(
+            |(id, display_name, agent_type, key_kind, count, pa, pa_self)| Signer {
+                id,
+                display_name,
+                agent_type,
+                key_kind,
+                system_role: roles.iter().find(|(a, _)| *a == id).map(|(_, r)| r.clone()),
+                count,
+                paper_asserts: pa,
+                paper_asserts_self_filed: pa_self,
+            },
+        )
         .collect();
     let legacy = c.legacy_principal.unwrap_or(Uuid::nil());
     let by_e = by_sql("$1", "$2");
@@ -495,13 +518,16 @@ pub fn describe(c: &Census, o: &Options) -> Vec<String> {
             "UNCLASSIFIED"
         };
         out.push(format!(
-            "SIGNER\t{}\tname={}\tagent_type={}\tkey_kind={}\tsystem_role={}\tedges={}\t{class}",
+            "SIGNER\t{}\tname={}\tagent_type={}\tkey_kind={}\tsystem_role={}\tedges={}\t\
+             paper_asserts_onto_claims_it_filed={}/{}\t{class}",
             s.id,
             s.display_name.as_deref().unwrap_or(""),
             s.agent_type.as_deref().unwrap_or(""),
             s.key_kind.as_deref().unwrap_or(""),
             s.system_role.as_deref().unwrap_or(""),
-            s.count
+            s.count,
+            s.paper_asserts_self_filed,
+            s.paper_asserts
         ));
     }
     out.push(format!(

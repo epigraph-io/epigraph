@@ -569,6 +569,25 @@ async fn a_backfill_makes_legacy_edges_read_as_before_the_marker_and_reverses_ex
         dry.show()
     );
     assert!(dry.stdout.contains("UNCLASSIFIED"), "{}", dry.show());
+    // The classification evidence: S's paper assertions target claims S
+    // filed; the attestation identity's do not.
+    let signer_line = |id: Uuid| {
+        dry.stdout
+            .lines()
+            .find(|l| l.starts_with(&format!("SIGNER\t{id}")))
+            .unwrap_or_else(|| panic!("no SIGNER line for {id}: {}", dry.show()))
+            .to_string()
+    };
+    assert!(
+        signer_line(fx.s).contains("paper_asserts_onto_claims_it_filed=2/2"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        signer_line(fx.attest).contains("paper_asserts_onto_claims_it_filed=0/1"),
+        "{}",
+        dry.show()
+    );
     assert_eq!(
         edge_snapshot(&pool).await,
         before,
