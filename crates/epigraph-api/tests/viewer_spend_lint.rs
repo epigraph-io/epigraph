@@ -1350,10 +1350,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     //   write would touch so each is authority-checked (an unreadable one is
     //   then refused by the viewed read);
     // * the gate's own arms, which run only on a row the caller reads: the
-    //   recorded submitter, the submitter's operator, the caller's live
-    //   membership of the row's owner group (`api_owner_group_arm`, given the
-    //   viewed read's owner group; asked of the live-membership definer and
-    //   the caller-stamped session, not of a viewer) and the admin grant.
+    //   recorded submitter, the submitter's operator, the caller's own acting
+    //   operator link (the delegate arm, operator ruling R-183: migration
+    //   107's caller-side definer, keyed on the caller, not on a row), the
+    //   caller's live membership of the row's owner group
+    //   (`api_owner_group_arm`, given the viewed read's owner group; asked of
+    //   the live-membership definer and the caller-stamped session, not of a
+    //   viewer) and the admin grant.
     (
         "workflows.rs",
         "add_step",
@@ -1387,6 +1390,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "workflows.rs",
         "workflow_authority",
         &[
+            "AgentRepository::operator_actor",
             "AgentRepository::operator_of_author",
             "WorkflowRepository::submitter_of",
             "api_admin_arm",

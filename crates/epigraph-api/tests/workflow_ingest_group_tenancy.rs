@@ -3474,10 +3474,12 @@ async fn over_mcp_deprecating_a_declared_generation_is_its_groups_alone(pool: Pg
 /// operator reaches the walk (any other is refused OPL02 first, writing
 /// nothing), and each descendant then needs the caller's workflow authority.
 /// Since backlog 222289f3 the stdio transport checks workflow authority too,
-/// against every target of the cascade: a fleet agent of that operator is
-/// refused on W1 (its human submitted W1, and a bound agent is not admitted),
-/// and even as W1's recorded submitter it is refused on W2, a descendant it
-/// cannot read, without W2 being named. All-or-nothing: neither row moves.
+/// against every target of the cascade. A fleet agent LIVE-linked to W1's
+/// submitter (its human) is admitted on W1 as that human's delegate (operator
+/// ruling R-183; it used to be refused there), so the cascade reaches the
+/// hidden-lineage guard and is refused for W2, a descendant it cannot read,
+/// without W2 being named; and so it is as W1's recorded submitter.
+/// All-or-nothing: neither row moves.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_stdio_cascade_into_a_descendant_the_agent_cannot_read_is_refused(pool: PgPool) {
     let w = world(&pool).await;
@@ -3511,10 +3513,11 @@ async fn a_stdio_cascade_into_a_descendant_the_agent_cannot_read_is_refused(pool
     let err =
         epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params(), None)
             .await
-            .expect_err("the fleet agent did not submit W1");
+            .expect_err("W2 is a descendant the delegate cannot read");
     assert!(
-        err.message.contains("submitted by agent"),
-        "{}",
+        err.message
+            .contains("has generations this caller cannot read"),
+        "the delegate passes W1's gate and the hidden-lineage guard refuses: {}",
         err.message
     );
     assert!(!err.message.contains(&w2.to_string()), "{}", err.message);

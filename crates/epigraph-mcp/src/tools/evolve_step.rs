@@ -264,8 +264,10 @@ pub async fn evolve_step(
 }
 
 /// Lineage-wide authority: refuse the caller unless it has workflow authority
-/// ([`require_workflow_authority`]: the submitter, its operator, a writer of
-/// the workflow's owner group, or the audited admin arm) over EVERY workflow that executes the parent's step
+/// ([`require_workflow_authority`]: the submitter, its operator, an agent
+/// acting for the submitter or for the submitter's operator through a live
+/// operator link (R-183), a writer of the workflow's owner group, or the
+/// audited admin arm) over EVERY workflow that executes the parent's step
 /// lineage (`WorkflowRepository::workflows_executing_step_lineage`: the
 /// parent and every claim sharing its `step_lineage_id`, retracted `executes`
 /// edges included). Evolving a step changes the heads of a lineage those
