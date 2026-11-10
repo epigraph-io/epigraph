@@ -180,15 +180,31 @@ pub async fn submit_bug_report(
 /// submitted_at, the claim's current labels (triage's status), whether it is
 /// resolved, and whether it is current.
 ///
+/// A principal-less HTTP context (`--allow-unauthenticated-http`) is refused:
+/// it reads as the listener's own agent, and a shared listener credential is
+/// not a reporter. The labels triage puts on a report are the intake group's
+/// information, shown only to the agent that filed it.
+///
 /// # Errors
-/// `INVALID_REQUEST` when the intake is not configured (BUG03) or the request
-/// has no principal (BUG01); `INTERNAL_ERROR` when this process has no
-/// tenancy-aware pool.
+/// `INVALID_REQUEST` for a principal-less context, when the intake is not
+/// configured (BUG03) or the request has no principal (BUG01);
+/// `INTERNAL_ERROR` when this process has no tenancy-aware pool.
 pub async fn list_my_bug_reports(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: ListMyBugReportsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    if auth.is_some_and(crate::auth::is_principal_less) {
+        return Err(McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::Borrowed(
+                "list_my_bug_reports needs an authenticated principal; a principal-less \
+                 listener lists no reports",
+            ),
+            data: None,
+        });
+    }
     let limit = i32::try_from(params.limit.unwrap_or(50).clamp(1, 200)).unwrap_or(50);
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         crate::errors::internal_error_text(

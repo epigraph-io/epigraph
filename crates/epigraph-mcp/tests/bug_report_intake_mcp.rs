@@ -12,7 +12,8 @@
 //!   hands back the report's id; a member of the intake group reads it
 //!   through the same tools (calibration, on a superuser server where only
 //!   the tools' own viewer predicate filters);
-//! * `list_my_bug_reports` lists only the caller's reports;
+//! * `list_my_bug_reports` lists only the caller's reports, and nothing on a
+//!   principal-less listener;
 //! * an unconfigured intake is refused by name, as the caller's error;
 //! * oversized input is refused before anything is written.
 
@@ -171,6 +172,7 @@ async fn list(
         server,
         &viewer(pool, agent).await,
         ListMyBugReportsParams { limit: None },
+        Some(&token(agent, &["claims:read"])),
     )
     .await
     .map(|r| first_text(&r))
@@ -340,6 +342,36 @@ async fn the_list_is_the_callers_own_reports(pool: PgPool) {
     assert!(!listed
         .to_string()
         .contains(theirs["claim_id"].as_str().unwrap()));
+
+    // A principal-less listener reads as its own agent; it lists nothing,
+    // even when that agent has filed a report itself.
+    let listener = server.server_agent_id().await.expect("server agent");
+    let (h, _) = fixture::seed_human_operator(&pool, "brim-listener-human").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, listener, h)
+        .await
+        .expect("the listener's agent is bound");
+    drop(conn);
+    submit(&pool, &server, listener, params("the listener's own"))
+        .await
+        .expect("the listener's agent files one");
+    let anon = epigraph_mcp::auth::unauthenticated_context(
+        Some(listener),
+        epigraph_mcp::auth::UnauthenticatedWrites::Refused,
+    );
+    let e = tools::bug_report::list_my_bug_reports(
+        &server,
+        &viewer(&pool, listener).await,
+        ListMyBugReportsParams { limit: None },
+        Some(&anon),
+    )
+    .await
+    .expect_err("a principal-less listener lists nothing");
+    assert_eq!(e.code, ErrorCode::INVALID_REQUEST);
+    assert!(e.message.contains("principal-less"), "{}", e.message);
+    // CALIBRATION: the same agent with a real token does see its report.
+    let own = list(&pool, &server, listener).await.expect("its own list");
+    assert_eq!(own["count"], 1, "{own}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
