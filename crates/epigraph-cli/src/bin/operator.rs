@@ -458,12 +458,22 @@ enum Command {
     /// workflow-ingest system agent. IMMUTABLE once applied: no revoke, no
     /// re-point. Register BEFORE rotating the agent's key and BEFORE arming.
     RegisterSystemAgent {
-        /// The role (`workflow-ingest`).
+        /// The role (`workflow-ingest` or `legacy-ingest`).
         #[arg(long)]
         role: String,
-        /// The agent id that is that role's system agent.
+        /// The agent id that is that role's system agent. Exactly one of
+        /// this and `--create-agent`.
         #[arg(long)]
-        agent: Uuid,
+        agent: Option<Uuid>,
+        /// Create a NEW agent for the role (a random public key whose secret
+        /// never existed: nobody can sign as it) and register it, in one
+        /// transaction. For a principal that writes and signs nothing
+        /// (`legacy-ingest`, the legacy ingest-marker backfill's `by`).
+        #[arg(long, conflicts_with = "agent")]
+        create_agent: bool,
+        /// With `--create-agent`: the new agent's display name.
+        #[arg(long, default_value = "legacy ingest")]
+        display_name: String,
         /// Recorded on the registry row and in the audit row.
         #[arg(long)]
         reason: String,
@@ -1708,11 +1718,41 @@ async fn main_inner() -> anyhow::Result<i32> {
         Command::RegisterSystemAgent {
             role: _,
             agent,
+            create_agent,
+            display_name,
             reason,
             apply,
             key_not_legacy_ok,
         } => {
             let role = system_role.expect("parsed above for this command");
+            if create_agent {
+                let (id, outcome) = system_agent::create_and_register(
+                    &mut conn,
+                    role,
+                    &display_name,
+                    &reason,
+                    apply,
+                )
+                .await?;
+                println!(
+                    "{}{}\trole={role}\tagent={id}",
+                    if apply { "" } else { "WOULD BE " },
+                    match outcome {
+                        system_agent::Outcome::Registered => "CREATED-AND-REGISTERED",
+                        system_agent::Outcome::AlreadyRegistered => "ALREADY-REGISTERED",
+                    }
+                );
+                if !apply {
+                    println!(
+                        "DRY RUN: the new agent, its registration and the audit row were rolled \
+                         back (an --apply run creates a different id)."
+                    );
+                }
+                return Ok(0);
+            }
+            let Some(agent) = agent else {
+                anyhow::bail!("give --agent <uuid> or --create-agent; nothing was registered");
+            };
             let Some(identity) = system_agent::identity(&mut conn, role, agent).await? else {
                 anyhow::bail!("agent {agent} does not exist; nothing was registered");
             };

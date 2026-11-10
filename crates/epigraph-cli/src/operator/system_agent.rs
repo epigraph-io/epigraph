@@ -210,3 +210,69 @@ pub async fn register(
         Outcome::AlreadyRegistered
     })
 }
+
+/// A fresh agent for a role no existing agent has ever been, created and
+/// registered in ONE transaction (committed under `apply`, rolled back
+/// otherwise, the agent and the audit row with it), for a principal that
+/// writes and signs nothing (`legacy-ingest`).
+///
+/// Its public key is 32 random bytes: no secret key was ever generated for
+/// it, so nobody can sign as it. It never held the role's legacy
+/// public-constant key, so the legacy-key refusal does not apply.
+///
+/// # Errors
+/// The role is already registered (to another agent: a registration is
+/// immutable), the definer refused, or a statement failed.
+pub async fn create_and_register(
+    conn: &mut PgConnection,
+    role: SystemAgentRole,
+    display_name: &str,
+    reason: &str,
+    apply: bool,
+) -> anyhow::Result<(Uuid, Outcome)> {
+    if display_name.trim().is_empty() {
+        bail!("--display-name must not be blank; nothing was created");
+    }
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let existing: Option<Uuid> =
+        sqlx::query_scalar("SELECT s.agent_id FROM public.system_agents s WHERE s.role = $1")
+            .bind(role.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(existing) = existing {
+        tx.rollback().await?;
+        return Ok((existing, Outcome::AlreadyRegistered));
+    }
+    let id = Uuid::new_v4();
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(Uuid::new_v4().as_bytes());
+    key.extend_from_slice(Uuid::new_v4().as_bytes());
+    sqlx::query(
+        "INSERT INTO public.agents (id, public_key, display_name, labels) \
+         VALUES ($1, $2, $3, ARRAY['system']::text[])",
+    )
+    .bind(id)
+    .bind(&key)
+    .bind(display_name)
+    .execute(&mut *tx)
+    .await?;
+    let (now, registered): (bool, Uuid) = sqlx::query_as(
+        "SELECT registered_now, registered_agent \
+           FROM public.epigraph_register_system_agent($1, $2, $3)",
+    )
+    .bind(role.as_str())
+    .bind(id)
+    .bind(reason)
+    .fetch_one(&mut *tx)
+    .await?;
+    if registered != id || !now {
+        tx.rollback().await?;
+        bail!("the {role} role is registered to {registered}; nothing was created");
+    }
+    if apply {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok((id, Outcome::Registered))
+}
