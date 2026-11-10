@@ -49,8 +49,9 @@ fn intake_error(e: epigraph_db::DbError) -> McpError {
     }
 }
 
-/// Nothing visible: whitespace, format and control characters only (the
-/// definer's `c_invisible`; see [`epigraph_db::repos::bug_report::is_blank`]).
+/// Nothing visible: whitespace, format, control and blank filler characters
+/// only (the definer's `c_invisible`; see
+/// [`epigraph_db::repos::bug_report::is_blank`]).
 fn blank(s: &str) -> bool {
     epigraph_db::repos::bug_report::is_blank(s)
 }
@@ -315,11 +316,12 @@ mod tests {
     /// `malformed_input_is_refused_with_nothing_written` sends the same list
     /// through the definer).
     const INVISIBLE_ENDPOINTS: &[u32] = &[
-        0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x600, 0x605, 0x61C, 0x6DD, 0x70F, 0x890,
-        0x891, 0x8E2, 0x1680, 0x180E, 0x2000, 0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A,
-        0x202E, 0x202F, 0x205F, 0x2060, 0x2064, 0x2066, 0x206F, 0x3000, 0xFEFF, 0xFFF9, 0xFFFB,
-        0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020,
-        0xE007F,
+        0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x34F, 0x600, 0x605, 0x61C, 0x6DD, 0x70F,
+        0x890, 0x891, 0x8E2, 0x115F, 0x1160, 0x1680, 0x17B4, 0x17B5, 0x180B, 0x180E, 0x180F,
+        0x2000, 0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E, 0x202F, 0x205F, 0x2060,
+        0x2064, 0x2066, 0x206F, 0x2800, 0x3000, 0x3164, 0xFE00, 0xFE0F, 0xFEFF, 0xFFA0, 0xFFF9,
+        0xFFFB, 0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001,
+        0xE0020, 0xE007F, 0xE0100, 0xE01EF,
     ];
 
     #[test]
@@ -336,6 +338,8 @@ mod tests {
             "\u{202E}\u{2066}\u{200F}".to_string(),
             "\u{E0001}\u{E0020}\u{E007F}".to_string(),
             " \u{AD}\t\u{3000}".to_string(),
+            "\u{3164}\u{115F}\u{1160}\u{FFA0}".to_string(),
+            "\u{2800}\u{34F}\u{FE0F}\u{E0100}".to_string(),
             endpoints,
         ] {
             let mut p = params();
@@ -350,7 +354,11 @@ mod tests {
         p.title = "a\u{200B}".into();
         p.description = "\u{FEFF}x".into();
         assert!(check(&p).is_ok());
-        for c in ['!', 'é', '\u{2065}', '\u{E0080}'] {
+        for c in [
+            '!', 'é', '\u{2065}', '\u{E0080}', '\u{34E}', '\u{350}', '\u{115E}', '\u{1161}',
+            '\u{17B3}', '\u{17B6}', '\u{180A}', '\u{1810}', '\u{27FF}', '\u{2801}', '\u{3163}',
+            '\u{3165}', '\u{FDFF}', '\u{FE10}', '\u{FF9F}', '\u{FFA1}', '\u{E00FF}', '\u{E01F0}',
+        ] {
             let mut p = params();
             p.title = c.to_string();
             assert!(check(&p).is_ok(), "{c:?} is not in an invisible range");

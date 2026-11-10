@@ -60,7 +60,8 @@
 --         role's `*_elevated_no_insert` policies, so it refuses here);
 --   BUG03 the intake is not configured, or its group is not an active team;
 --   BUG04 a title or description with nothing visible in it (empty, or only
---         whitespace, format and control characters), a title over 200
+--         whitespace, format, control and blank filler characters: the
+--         `c_invisible` list in (c)), a title over 200
 --         characters, a description or repro over 20480 bytes, evidence over
 --         51200 bytes, a severity outside blocker|major|minor, a component
 --         that is not a short lower-case slug;
@@ -360,16 +361,23 @@ DECLARE
     -- U+070F, U+0890-U+0891, U+08E2, U+180E, U+200B-U+200F, U+202A-U+202E,
     -- U+2060-U+2064, U+2066-U+206F, U+FEFF, U+FFF9-U+FFFB, U+110BD, U+110CD,
     -- U+13430-U+1343F, U+1BCA0-U+1BCA3, U+1D173-U+1D17A, U+E0001,
-    -- U+E0020-U+E007F). Adjacent ranges are merged. The MCP pre-check holds
+    -- U+E0020-U+E007F), and the characters that render as nothing although
+    -- Unicode classes them as letters, marks or symbols: the Hangul fillers
+    -- (U+115F, U+1160, U+3164, U+FFA0), U+2800 BRAILLE PATTERN BLANK, the
+    -- combining grapheme joiner U+034F, the Khmer inherent vowels
+    -- U+17B4-U+17B5, the Mongolian free variation selectors U+180B-U+180D and
+    -- U+180F, and the variation selectors U+FE00-U+FE0F and
+    -- U+E0100-U+E01EF. Adjacent ranges are merged. The MCP pre-check holds
     -- the same list (`epigraph_db::repos::bug_report::INVISIBLE`), and
     -- `malformed_input_is_refused_with_nothing_written` sends every endpoint
     -- of that list through this check.
     c_invisible constant text :=
-        '^[[:space:]\u0001-\u0020\u007F-\u00A0\u00AD\u0600-\u0605\u061C\u06DD\u070F'
-        '\u0890-\u0891\u08E2\u1680\u180E\u2000-\u200F\u2028-\u202F\u205F-\u2064'
-        '\u2066-\u206F\u3000\uFEFF\uFFF9-\uFFFB\U000110BD\U000110CD'
+        '^[[:space:]\u0001-\u0020\u007F-\u00A0\u00AD\u034F\u0600-\u0605\u061C\u06DD'
+        '\u070F\u0890-\u0891\u08E2\u115F-\u1160\u1680\u17B4-\u17B5\u180B-\u180F'
+        '\u2000-\u200F\u2028-\u202F\u205F-\u2064\u2066-\u206F\u2800\u3000\u3164'
+        '\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB\U000110BD\U000110CD'
         '\U00013430-\U0001343F\U0001BCA0-\U0001BCA3\U0001D173-\U0001D17A\U000E0001'
-        '\U000E0020-\U000E007F]*$';
+        '\U000E0020-\U000E007F\U000E0100-\U000E01EF]*$';
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'BUG01: submitting a bug report needs an authenticated principal; '
@@ -398,8 +406,9 @@ BEGIN
     -- description is blank when nothing VISIBLE is left once `c_invisible`'s
     -- characters are taken out: whitespace of any kind, not just spaces
     -- (`btrim` strips spaces only, and a title of a tab and a newline is as
-    -- empty as ''), and the zero-width, bidi, tag and other format (Cf) and
-    -- control (Cc) characters, which no reader sees either.
+    -- empty as ''), the zero-width, bidi, tag and other format (Cf) and
+    -- control (Cc) characters, and the blank fillers and selectors listed
+    -- with `c_invisible`, which no reader sees either.
     IF p_title IS NULL OR p_title ~ c_invisible THEN
         RAISE EXCEPTION 'BUG04: a bug report needs a non-empty title; nothing was written'
             USING ERRCODE = '22023';

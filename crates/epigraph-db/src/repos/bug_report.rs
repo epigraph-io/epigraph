@@ -40,28 +40,41 @@ pub const SEVERITIES: &[&str] = &["blocker", "major", "minor"];
 
 /// The characters a reader cannot see, as inclusive code-point ranges: the
 /// Unicode White_Space characters, every Cc control (U+0000 cannot reach the
-/// database) and every Cf format character, of Unicode 15.0, adjacent ranges
-/// merged. A title or description made only of these is blank (BUG04).
+/// database) and every Cf format character, of Unicode 15.0; and the
+/// characters that render as nothing although Unicode classes them as
+/// letters, marks or symbols: the Hangul fillers (U+115F, U+1160, U+3164,
+/// U+FFA0), U+2800 BRAILLE PATTERN BLANK, the combining grapheme joiner
+/// U+034F, the Khmer inherent vowels U+17B4-U+17B5, the Mongolian free
+/// variation selectors U+180B-U+180D and U+180F, and the variation selectors
+/// U+FE00-U+FE0F and U+E0100-U+E01EF. Adjacent ranges merged. A title or
+/// description made only of these is blank (BUG04).
 /// Migration 207's `c_invisible` bracket is the same list; the definer is the
 /// authority, and this copy lets the server refuse before the embedding call.
 pub const INVISIBLE: &[(u32, u32)] = &[
     (0x0001, 0x0020),
     (0x007F, 0x00A0),
     (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
     (0x0600, 0x0605),
     (0x061C, 0x061C),
     (0x06DD, 0x06DD),
     (0x070F, 0x070F),
     (0x0890, 0x0891),
     (0x08E2, 0x08E2),
+    (0x115F, 0x1160),
     (0x1680, 0x1680),
-    (0x180E, 0x180E),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
     (0x2000, 0x200F),
     (0x2028, 0x202F),
     (0x205F, 0x2064),
     (0x2066, 0x206F),
+    (0x2800, 0x2800),
     (0x3000, 0x3000),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
     (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
     (0xFFF9, 0xFFFB),
     (0x110BD, 0x110BD),
     (0x110CD, 0x110CD),
@@ -70,6 +83,7 @@ pub const INVISIBLE: &[(u32, u32)] = &[
     (0x1D173, 0x1D17A),
     (0xE0001, 0xE0001),
     (0xE0020, 0xE007F),
+    (0xE0100, 0xE01EF),
 ];
 
 /// Whether `s` has nothing visible in it: every character is in
@@ -316,10 +330,21 @@ mod tests {
             "\u{2060}\u{FEFF}",
             "\u{1C}",
             "\u{AD}\u{3000}",
+            "\u{3164}\u{115F}\u{1160}\u{FFA0}",
+            "\u{2800}\u{34F}\u{FE0F}\u{E0100}",
         ] {
             assert!(is_blank(s), "{s:?}");
         }
-        for s in ["a", "a\u{200B}", "\u{FEFF}x", "\u{2065}", "\u{E0080}"] {
+        for s in [
+            "a",
+            "a\u{200B}",
+            "\u{FEFF}x",
+            "\u{2065}",
+            "\u{E0080}",
+            "\u{2801}",
+            "\u{3165}",
+            "\u{2764}\u{FE0F}",
+        ] {
             assert!(!is_blank(s), "{s:?}");
         }
         // The ranges are ordered, disjoint and not adjacent (merged).

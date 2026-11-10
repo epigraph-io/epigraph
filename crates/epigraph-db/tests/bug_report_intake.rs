@@ -237,14 +237,25 @@ async fn is_member(pool: &PgPool, group: Uuid, agent: Uuid) -> bool {
 }
 
 /// Both ends of every range of characters the intake treats as invisible
-/// (Unicode 15.0: White_Space, Cc without U+0000, Cf). Listed here by value,
+/// (Unicode 15.0: White_Space, Cc without U+0000, Cf, and the blank fillers
+/// and selectors `c_invisible` lists). Listed here by value,
 /// independently of the definer's bracket and of the MCP pre-check's table,
 /// so a range dropped from either is caught.
 const INVISIBLE_ENDPOINTS: &[u32] = &[
-    0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x600, 0x605, 0x61C, 0x6DD, 0x70F, 0x890,
-    0x891, 0x8E2, 0x1680, 0x180E, 0x2000, 0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E,
-    0x202F, 0x205F, 0x2060, 0x2064, 0x2066, 0x206F, 0x3000, 0xFEFF, 0xFFF9, 0xFFFB, 0x110BD,
-    0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020, 0xE007F,
+    0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x34F, 0x600, 0x605, 0x61C, 0x6DD, 0x70F,
+    0x890, 0x891, 0x8E2, 0x115F, 0x1160, 0x1680, 0x17B4, 0x17B5, 0x180B, 0x180E, 0x180F, 0x2000,
+    0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E, 0x202F, 0x205F, 0x2060, 0x2064,
+    0x2066, 0x206F, 0x2800, 0x3000, 0x3164, 0xFE00, 0xFE0F, 0xFEFF, 0xFFA0, 0xFFF9, 0xFFFB,
+    0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020,
+    0xE007F, 0xE0100, 0xE01EF,
+];
+
+/// The neighbour just outside each range of the filler and selector
+/// characters, each a visible character (or one Unicode leaves unassigned)
+/// the intake must still admit as a title.
+const JUST_OUTSIDE: &[u32] = &[
+    0x34E, 0x350, 0x115E, 0x1161, 0x17B3, 0x17B6, 0x180A, 0x1810, 0x27FF, 0x2801, 0x3163, 0x3165,
+    0xFDFF, 0xFE10, 0xFF9F, 0xFFA1, 0xE00FF, 0xE01F0,
 ];
 
 fn unit_vector(at: usize) -> String {
@@ -1212,6 +1223,14 @@ async fn malformed_input_is_refused_with_nothing_written(pool: PgPool) {
         ("bidi controls", "\u{202E}\u{2066}\u{200F}".to_string()),
         ("tag characters", "\u{E0001}\u{E0020}\u{E007F}".to_string()),
         ("soft hyphen among spaces", " \u{AD}\t\u{3000}".to_string()),
+        (
+            "Hangul fillers",
+            "\u{3164}\u{115F}\u{1160}\u{FFA0}".to_string(),
+        ),
+        (
+            "braille blank, joiner and selectors",
+            "\u{2800}\u{34F}\u{FE0F}\u{E0100}".to_string(),
+        ),
         ("every range endpoint", endpoints),
     ] {
         cases.push((
@@ -1264,6 +1283,24 @@ async fn malformed_input_is_refused_with_nothing_written(pool: PgPool) {
     .expect("a visible character among invisible ones");
     assert_eq!(claims_by(&pool, w.reporter).await, 2);
     assert_eq!(markers_of(&pool, w.reporter).await, 2);
+    // CALIBRATION for the filler ranges: the character just outside each is
+    // a title on its own.
+    configure(&pool, w.intake, 1000, 10_000).await;
+    for &cp in JUST_OUTSIDE {
+        let c = char::from_u32(cp).expect("a scalar value");
+        submit_as(
+            &pool,
+            w.reporter,
+            &BugReportInput {
+                title: c.to_string(),
+                ..base.clone()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("U+{cp:04X} refused: {e:?}"));
+    }
+    let filed = 2 + i64::try_from(JUST_OUTSIDE.len()).expect("small");
+    assert_eq!(claims_by(&pool, w.reporter).await, filed);
 
     // Content that is not the composition of the fields: BUG05.
     let viewer = Viewer::resolve(&pool, w.reporter).await.expect("resolve");
