@@ -782,6 +782,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          maintenance role (ADS02) and the table's own trigger audits the change.",
     ),
     (
+        "bug_report.rs",
+        "list_mine_conn",
+        "READ through migration 207's principal-bound app-callable definer \
+         `epigraph_my_bug_reports` on the requester's STAMPED connection: only the stamped \
+         principal's own intake reports (no caller-supplied id or group), filtered in the \
+         definer by the unforgeable `bug_report.submitted` marker, the claim's author and the \
+         configured intake group; the viewer is spent on the stamp.",
+    ),
+    (
+        "bug_report.rs",
+        "submit_conn",
+        "WRITE through migration 207's principal-bound app-callable definer \
+         `epigraph_submit_bug_report` on the reporter's STAMPED connection: the definer takes the \
+         author from the stamped session and the owner group from the instance's settings row, \
+         never from an argument, and answers only the new row's id and timestamp. Nothing is \
+         read back to the caller; the viewer is spent on the stamp.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \
