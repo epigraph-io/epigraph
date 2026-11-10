@@ -54,9 +54,31 @@ def not_intake_owned(alias="c"):
     every viewer who can read one member of the theme, so a label built from a
     report's text would publish wording only the intake group may read.
 
-    Every query that turns member CONTENT into a stored label applies this
-    predicate: label_themes_llm.load_themes_with_samples,
-    cluster_claims.label_clusters and evidential_clustering.store_results.
+    Every path that turns member CONTENT into a stored label applies it, to
+    the label samples only (membership, sizes and centroids are unchanged):
+      * label_themes_llm.load_themes_with_samples (claim_themes.label and
+        description, LLM);
+      * cluster_claims.label_clusters and evidential_clustering.store_results
+        (cluster_labels, member-text excerpts);
+      * refine_clusters.auto_refine (cluster_labels, LLM), the split step of
+        theme_pipeline's grow loop: a sub-cluster with no other member keeps
+        its `cluster-<id>` placeholder;
+      * refine_clusters.interactive_label (cluster_labels via
+        train_and_apply): the operator who types the sub-label names is shown
+        no intake member's text.
+    Checked and NOT routed through it, each for its stated reason:
+      * seed_themes_from_textbooks and anchor_papers_to_themes read only
+        claims whose properties carry source_type 'Textbook' or 'Paper' or a
+        decomposition `level`, none of which the intake definer writes (a
+        report's properties hold only `bug_report`);
+      * project_to_themes copies cluster_labels (filtered above);
+        split_theme, maintain_themes.auto_split_theme and the
+        create-with-centroid route write placeholder or derived labels;
+      * split_theme --dry-run and subcluster_outliers only print member text
+        to the maintenance operator running them, and store no label;
+      * the API's experiment `centroid_summary` is computed per request from
+        a viewer-scoped neighborhood, so it shows only claims the caller can
+        already read.
     It is keyed on the CURRENTLY configured intake group: a report triage
     moves out of that group (or every report, once the operator names another
     group) is sampled again, under the same rule as any other claim of its new
