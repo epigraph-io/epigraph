@@ -449,7 +449,7 @@ async fn only_the_named_person_or_its_live_operator_countersigns(pool: PgPool) {
         .await
         .expect("no-op");
     assert!(again.is_empty());
-    assert_eq!(edge_state(&pool, e).await.1, true, "nothing was declined");
+    assert!(edge_state(&pool, e).await.1, "nothing was declined");
 
     let audit: Vec<(String, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
         "SELECT event_type::text, agent_id, details FROM security_events \

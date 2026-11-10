@@ -340,6 +340,9 @@ const PROVABLE_FROM: &str = "FROM edges pa \
       JOIN papers p ON p.id = pa.source_id \
       JOIN reasoning_traces t ON t.id = c.trace_id";
 
+/// A signer row: id, display name, agent type, key kind, edge count.
+type SignerRow = (Uuid, Option<String>, Option<String>, Option<String>, i64);
+
 /// The read-only census.
 ///
 /// # Errors
@@ -385,16 +388,15 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
             .insert(kind, [row.0, row.1, row.2, row.3, row.4, row.5]);
     }
     let preds: Vec<String> = Kind::ALL.iter().map(|k| k.candidate_sql()).collect();
-    let rows: Vec<(Uuid, Option<String>, Option<String>, Option<String>, i64)> =
-        sqlx::query_as(&format!(
-            "SELECT e.signer_id, a.display_name, a.agent_type::text, a.key_kind::text, count(*) \
+    let rows: Vec<SignerRow> = sqlx::query_as(&format!(
+        "SELECT e.signer_id, a.display_name, a.agent_type::text, a.key_kind::text, count(*) \
                FROM edges e LEFT JOIN agents a ON a.id = e.signer_id \
               WHERE e.signer_id IS NOT NULL AND (({}) OR ({}) OR ({})) \
               GROUP BY 1, 2, 3, 4 ORDER BY count(*) DESC, 1",
-            preds[0], preds[1], preds[2]
-        ))
-        .fetch_all(&mut *tx)
-        .await?;
+        preds[0], preds[1], preds[2]
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
     let roles: Vec<(Uuid, String)> =
         if sqlx::query_scalar::<_, bool>("SELECT to_regclass('public.system_agents') IS NOT NULL")
             .fetch_one(&mut *tx)
