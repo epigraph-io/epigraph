@@ -61,6 +61,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // caller (a stale scheduled prompt included) see WHY, rather than a 403.
     ("theme_cluster", "claims:read"),
     ("consolidate_claims", "claims:write"),
+    ("countersign_authorship", "claims:write"),
     ("get_workflow_executions", "claims:read"),
     ("get_workflow_plan", "claims:read"),
     ("list_challenges", "claims:read"),

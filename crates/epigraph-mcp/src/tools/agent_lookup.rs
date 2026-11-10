@@ -86,3 +86,60 @@ pub async fn get_agent(
         serde_json::to_string_pretty(&card).map_err(internal_error)?,
     )]))
 }
+
+/// MCP `countersign_authorship`: the named person (or its live operator)
+/// confirms or declines a pending authorship (`epigraph_db::countersign`).
+pub async fn countersign_authorship(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: crate::types::CountersignAuthorshipParams,
+) -> Result<CallToolResult, McpError> {
+    let paper = parse_uuid(&params.paper_id)?;
+    let agent = params.agent_id.as_deref().map(parse_uuid).transpose()?;
+    let ingested_by = params.ingested_by.as_deref().map(parse_uuid).transpose()?;
+    let decision =
+        epigraph_db::CountersignDecision::parse(&params.decision).map_err(db_param_error)?;
+    let mut tx = scoped(server, "countersign_authorship")?
+        .begin_as(viewer)
+        .await
+        .map_err(crate::errors::db_caller_error)?;
+    let rows = match epigraph_db::CountersignRepository::countersign_conn(
+        &mut tx,
+        paper,
+        agent,
+        decision,
+        ingested_by,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(epigraph_db::DbError::Refused { message, .. }) => {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::from(message),
+                data: None,
+            });
+        }
+        Err(e) => return Err(crate::errors::db_caller_error(e)),
+    };
+    tx.commit().await.map_err(internal_error)?;
+    let body = if rows.is_empty() {
+        serde_json::json!({
+            "paper_id": paper,
+            "decision": decision.as_str(),
+            "changed": [],
+            "message": "nothing pending: no in-force authorship of this agent on this paper \
+                        awaits a countersignature (it was never pending, or was already \
+                        confirmed or declined); nothing was written",
+        })
+    } else {
+        serde_json::json!({
+            "paper_id": paper,
+            "decision": decision.as_str(),
+            "changed": rows,
+        })
+    };
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&body).map_err(internal_error)?,
+    )]))
+}
