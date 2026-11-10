@@ -10,3 +10,7 @@ chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# tests/sqlite_never_compiled.rs parses the workspace manifests.
+toml = { workspace = true }
