@@ -1067,7 +1067,10 @@ async fn share_decides_on_the_owner_a_concurrent_change_commits(pool: PgPool) {
     );
 
     let err = answer.expect_err("the claim is no longer private to the author's home");
-    assert!(err.message.contains("not private to your home group"), "{err:?}");
+    assert!(
+        err.message.contains("not private to your home group"),
+        "{err:?}"
+    );
     assert_eq!(
         tenancy(&pool, "claims", c).await,
         ("group".to_string(), other),

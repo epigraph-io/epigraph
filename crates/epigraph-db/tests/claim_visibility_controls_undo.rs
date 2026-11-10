@@ -73,8 +73,12 @@ async fn catalog(pool: &PgPool) -> BTreeSet<String> {
 }
 
 fn repo_file(rel: &str) -> String {
-    std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel))
-        .unwrap_or_else(|e| panic!("{rel}: {e}"))
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel),
+    )
+    .unwrap_or_else(|e| panic!("{rel}: {e}"))
 }
 
 /// The undo returns the catalog to what it was below 206, and is idempotent.
@@ -136,7 +140,9 @@ fn the_206_undo_drops_every_function_206_creates() {
         created.insert(sig);
         rest = &after[end..];
     }
-    let names = migration.matches("CREATE OR REPLACE FUNCTION public.").count();
+    let names = migration
+        .matches("CREATE OR REPLACE FUNCTION public.")
+        .count();
     assert_eq!(
         (created.len(), names),
         (5, 5),

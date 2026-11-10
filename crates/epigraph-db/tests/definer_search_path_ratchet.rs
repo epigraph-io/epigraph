@@ -1240,12 +1240,13 @@ END $$;
 /// (epigraph-mcp). No allowlist.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_function_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
-    let scan = |fns: &BTreeMap<String, (bool, String)>| -> BTreeMap<String, BTreeSet<&'static str>> {
-        fns.iter()
-            .map(|(sig, (_, src))| (sig.clone(), session_temp_uses(src)))
-            .filter(|(_, forms)| !forms.is_empty())
-            .collect()
-    };
+    let scan =
+        |fns: &BTreeMap<String, (bool, String)>| -> BTreeMap<String, BTreeSet<&'static str>> {
+            fns.iter()
+                .map(|(sig, (_, src))| (sig.clone(), session_temp_uses(src)))
+                .filter(|(_, forms)| !forms.is_empty())
+                .collect()
+        };
     let at_head_fns = function_bodies(&pool).await;
     let definer_count = at_head_fns.values().filter(|(secdef, _)| *secdef).count();
     assert!(
