@@ -80,6 +80,10 @@ impl ServerHandler for StubServer {
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // A reply of a chosen size, for the response-cap test.
+        if let Some(len) = reply_len_for(&request.name) {
+            return Ok(CallToolResult::success(vec![ContentBlock::text("r".repeat(len))]).into());
+        }
         // Echo the tool name so the gateway test can confirm the DOWNSTREAM
         // (un-prefixed) name arrived, proving prefix stripping on the proxy path.
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -87,6 +91,17 @@ impl ServerHandler for StubServer {
             request.name
         ))])
         .into())
+    }
+}
+
+/// The stub's sized replies: a tool named `oversized_reply` answers with 17 MiB
+/// of text, `large_reply` with 15 MiB, either side of the gateway's 16 MiB
+/// response cap. Any other tool echoes its name.
+fn reply_len_for(tool: &str) -> Option<usize> {
+    match tool {
+        "oversized_reply" => Some(17 * 1024 * 1024),
+        "large_reply" => Some(15 * 1024 * 1024),
+        _ => None,
     }
 }
 
@@ -594,4 +609,54 @@ fn unknown_tool_error_names_the_unreachable_extension() {
         msg.contains("unreachable"),
         "must say WHY it is being named, not just drop a bare name: {msg}"
     );
+}
+
+/// The gateway refuses a downstream reply over 16 MiB instead of buffering it,
+/// and still proxies one under the cap.
+///
+/// This is the behaviour RUSTSEC-2026-0462 is about: rmcp 2.2's client
+/// buffered a downstream response of any size. rmcp 3.9 bounds one SSE event
+/// at `max_sse_event_size`, which `federation::client::connect` sets from
+/// `MAX_RESPONSE_EVENT_BYTES`. The literal 16 MiB is deliberate: moving the cap
+/// must fail here and be decided.
+///
+/// Mutation: in `connect`, set `config.max_sse_event_size = usize::MAX` -> the
+/// 17 MiB reply is proxied and this test fails.
+#[tokio::test]
+async fn a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied() {
+    assert_eq!(
+        epigraph_mcp::federation::client::MAX_RESPONSE_EVENT_BYTES,
+        16 * 1024 * 1024
+    );
+    let deadline = std::time::Duration::from_secs(60);
+
+    let (addr, _slot) = spawn_stub("oversized_reply").await;
+    let registry = FederationRegistry::build(vec![cfg("big", &addr, None)], "discovery-tok")
+        .await
+        .expect("build should succeed against a reachable stub");
+    let outcome = tokio::time::timeout(deadline, registry.invoke("oversized_reply", "tok", None))
+        .await
+        .expect("an oversized reply must fail the call, not hang it");
+    // Matched rather than `expect_err`, which would print all 17 MiB.
+    match outcome {
+        Err(err) => eprintln!("oversized downstream reply refused: {err}"),
+        Ok(result) => panic!(
+            "a 17 MiB downstream reply must not be proxied; it was ({} bytes of text)",
+            result.content[0].as_text().map_or(0, |t| t.text.len())
+        ),
+    }
+
+    let (addr, _slot) = spawn_stub("large_reply").await;
+    let registry = FederationRegistry::build(vec![cfg("big", &addr, None)], "discovery-tok")
+        .await
+        .expect("build should succeed against a reachable stub");
+    let result = tokio::time::timeout(deadline, registry.invoke("large_reply", "tok", None))
+        .await
+        .expect("a reply under the cap is proxied in time")
+        .expect("a 15 MiB downstream reply is under the cap and proxied");
+    let text = &result.content[0]
+        .as_text()
+        .expect("stub returns text content")
+        .text;
+    assert_eq!(text.len(), 15 * 1024 * 1024);
 }
