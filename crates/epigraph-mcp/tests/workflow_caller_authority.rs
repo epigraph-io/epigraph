@@ -149,7 +149,7 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-owned", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
@@ -215,9 +215,9 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
     assert_eq!(steps(&pool, "h3-owned").await, before + 2);
 }
 
-/// Ingest `canonical` as `owner`, then strip the recorded submitter: the shape
-/// of every workflow written before batch H-b (nothing recorded who created
-/// them). Returns the lineage of its one step.
+/// Ingest `canonical` as `owner`, public in its own group, then strip the
+/// recorded submitter: the shape of every workflow written before batch H-b
+/// (nothing recorded who created them). Returns the lineage of its one step.
 async fn legacy_workflow(
     pool: &PgPool,
     server: &epigraph_mcp::EpiGraphMcpFull,
@@ -230,7 +230,7 @@ async fn legacy_workflow(
         owner_viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(owner_viewer)),
             embed: None,
         },
         Some(owner_token),
@@ -266,14 +266,15 @@ async fn lineage_truths(pool: &PgPool, lineage: Uuid) -> Vec<f64> {
         .expect("lineage truths")
 }
 
-/// U005 (backlog 84b2a98d), default decision A: a workflow with no recorded
-/// submitter is PLATFORM corpus. Over the authenticated transport a
-/// `claims:write` caller may not mutate it — not a stranger, and not the agent
-/// that happened to ingest it, since nothing records that it did. Before this
-/// change every arm below was admitted with a WARN (`delete_step` drove the
-/// step's truth to 0.05).
+/// U005 (backlog 84b2a98d): a workflow with no recorded submitter has no
+/// submitter arm. Over the authenticated transport a `claims:write` caller
+/// that does not write its owner group may not mutate it. Before batch H-b
+/// every arm below was admitted with a WARN (`delete_step` drove the step's
+/// truth to 0.05). A writer of the row's owner group (here the agent that
+/// ingested it, whose own group owns it) IS admitted: the owner-group writer
+/// arm, recorded as such.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(pool: PgPool) {
+async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_writer_http_caller(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let (_stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
@@ -297,22 +298,6 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
     assert!(
         err.message.contains("audited claims:admin path"),
         "the refusal names the one arm that admits: {}",
-        err.message
-    );
-    assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
-
-    // The ORIGINAL ingester is refused too: no record says it submitted it.
-    let err = tools::step_ops::add_step(
-        &server,
-        &owner_viewer,
-        add("h3-legacy", "the ingester's step"),
-        Some(&owner_token),
-    )
-    .await
-    .expect_err("no record means no submitter arm");
-    assert!(
-        err.message.contains("no recorded submitter"),
-        "{}",
         err.message
     );
     assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
@@ -365,12 +350,10 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
         "no generation-1 row"
     );
 
-    // CALIBRATION: the lineage the stranger was refused on IS deletable — a
-    // stdio delete_step (the legacy stdio arm: the server agent reads the
-    // public row) drives its head to 0.05 — so the refusal above was the
-    // authority gate, not an unknown lineage.
+    // stdio has no audited admin path, and the server's own agent reads the
+    // public row but does not write its owner group: refused the same way.
     let public = fixture::public_viewer(&pool).await;
-    tools::step_ops::delete_step(
+    let err = tools::step_ops::delete_step(
         &server,
         &public,
         DeleteStepParams {
@@ -380,13 +363,60 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
         None,
     )
     .await
-    .expect("stdio soft-deletes the same step");
+    .expect_err("stdio may not soft-delete a step of a legacy row it only reads");
+    assert!(
+        err.message.contains("no recorded submitter"),
+        "refused by the legacy rule on stdio too: {}",
+        err.message
+    );
+    assert_eq!(lineage_truths(&pool, lineage).await, truths);
+
+    // CALIBRATION: the lineage the stranger was refused on IS deletable — the
+    // original ingester, a writer of the row's owner group, drives its head to
+    // 0.05 — so the refusals above were the authority gate, not an unknown
+    // lineage.
+    tools::step_ops::delete_step(
+        &server,
+        &owner_viewer,
+        DeleteStepParams {
+            canonical_name: "h3-legacy".to_string(),
+            step_lineage_id: lineage.to_string(),
+        },
+        Some(&owner_token),
+    )
+    .await
+    .expect("a writer of the owner group soft-deletes the same step");
     let after = lineage_truths(&pool, lineage).await;
-    assert_ne!(after, truths, "the stdio delete changed the lineage");
+    assert_ne!(
+        after, truths,
+        "the owner-group writer's delete changed the lineage"
+    );
     assert!(
         after.iter().any(|t| (t - 0.05).abs() < 1e-9),
         "its head is driven to 0.05: {after:?}"
     );
+
+    // The ORIGINAL ingester writes the row's owner group: admitted through
+    // the owner-group writer arm (no record says it submitted it).
+    let before = steps(&pool, "h3-legacy").await;
+    tools::step_ops::add_step(
+        &server,
+        &owner_viewer,
+        add("h3-legacy", "the ingester's step"),
+        Some(&owner_token),
+    )
+    .await
+    .expect("a writer of the owner group is admitted on a legacy row");
+    assert_eq!(steps(&pool, "h3-legacy").await, before + 1);
+    let arm: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'arm' FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'action' = 'add_step' \
+            AND details->>'transport' = 'http'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the ingester's provenance row");
+    assert_eq!(arm.as_deref(), Some("owner_group_writer"));
 }
 
 /// The arm that DOES admit a legacy workflow over the authenticated transport:
@@ -493,12 +523,16 @@ async fn a_legacy_workflow_is_mutable_only_through_the_audited_admin_arm(pool: P
     assert_eq!(workflow_admin_audits(&pool, admin).await, 2);
 }
 
-/// A stdio caller that reads a legacy (unrecorded) workflow and writes its
-/// owner group is admitted (the stdio legacy arm, backlog 222289f3: stdio has
-/// no audited admin path to send it to), and the write is recorded as a
-/// `workflows.caller_write` row with `arm = "legacy"` and no token.
+/// On stdio a legacy (unrecorded) workflow admits exactly what it admits over
+/// HTTP without a token: a live writer of its owner group. A stdio caller that
+/// only READS the public row is refused, with a refusal naming the rule and
+/// nothing written; once it holds a writer membership of the row's owner
+/// group it is admitted, and the write is recorded as a
+/// `workflows.caller_write` row with `arm = "owner_group_writer"`, transport
+/// stdio and no token. (Before, any stdio caller that could read the row was
+/// admitted through a stdio-only legacy arm.)
 #[sqlx::test(migrations = "../../migrations")]
-async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
+async fn stdio_mutates_a_legacy_workflow_only_as_a_writer_of_its_owner_group(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let public = fixture::public_viewer(&pool).await;
     let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
@@ -511,6 +545,42 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
     )
     .await;
     let before = steps(&pool, "h3-legacy-stdio").await;
+    let err = tools::step_ops::add_step(
+        &server,
+        &public,
+        add("h3-legacy-stdio", "a stdio step"),
+        None,
+    )
+    .await
+    .expect_err("a stdio caller that only reads a public legacy row is refused");
+    assert!(
+        err.message.contains("no recorded submitter") && err.message.contains("owner group"),
+        "the refusal names the rule: {}",
+        err.message
+    );
+    assert_eq!(
+        steps(&pool, "h3-legacy-stdio").await,
+        before,
+        "nothing written"
+    );
+
+    // The server's own agent becomes a writer of the row's owner group.
+    let agent = server.server_agent_id().await.expect("the server's agent");
+    let group: Uuid =
+        sqlx::query_scalar("SELECT owner_group_id FROM workflows WHERE canonical_name = $1")
+            .bind("h3-legacy-stdio")
+            .fetch_one(&pool)
+            .await
+            .expect("the row's owner group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("writer membership");
     tools::step_ops::add_step(
         &server,
         &public,
@@ -518,7 +588,7 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
         None,
     )
     .await
-    .expect("the stdio legacy arm admits a readable public legacy row");
+    .expect("a writer of the row's owner group is admitted on stdio");
     assert_eq!(steps(&pool, "h3-legacy-stdio").await, before + 1);
     let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT details->>'arm', details->>'transport', details->>'client_id' \
@@ -530,8 +600,12 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
     .expect("one stdio provenance row");
     assert_eq!(
         row,
-        (Some("legacy".into()), Some("stdio".into()), None),
-        "recorded as the stdio legacy arm, with no token"
+        (
+            Some("owner_group_writer".into()),
+            Some("stdio".into()),
+            None
+        ),
+        "recorded as the owner-group writer arm on stdio, with no token"
     );
 }
 
@@ -681,7 +755,7 @@ async fn stdio_is_checked_and_a_stdio_ingest_is_still_owned(pool: PgPool) {
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-http-owned-stdio", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
@@ -783,7 +857,7 @@ async fn a_new_generation_cannot_take_a_lineage_over_without_naming_a_parent(poo
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-lineage", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
@@ -923,7 +997,7 @@ async fn a_workflow_admin_write_is_audited_and_a_grantless_admin_is_refused(pool
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-admin", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
