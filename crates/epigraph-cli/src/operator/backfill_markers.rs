@@ -130,8 +130,8 @@
 //! `BATCH-FAILED` ends with `NEXT` lines: resume (or undo with the reversal),
 //! and for a lock timeout, stop the concurrent writer or raise
 //! `--lock-timeout`. A batch that committed but whose `committed_batch` line
-//! failed to write is reported as `BATCH-FAILED` with the line to append to
-//! the manifest by hand. A run that died between a COMMIT and its
+//! failed to write gets a `NEXT first:` line naming the line to append to the
+//! manifest before anything else. A run that died between a COMMIT and its
 //! line (no summary) leaves that batch's lines uncommitted in the manifest;
 //! the reversal reports it as `UNCOMMITTED-BATCH`, and its edges are checked
 //! by hand (the stamps and records of that batch are all there or none are).
@@ -1117,6 +1117,8 @@ pub async fn run(
         audited: false,
     };
     let mut lock_timed_out = false;
+    // A batch that COMMITTED but whose `committed_batch` line was not written.
+    let mut committed_line_missing: Option<usize> = None;
     'kinds: for kind in Kind::ALL {
         let mut last = Uuid::nil();
         loop {
@@ -1245,6 +1247,7 @@ pub async fn run(
                     report.records += done.created;
                     report.non_creation_records += done.other;
                     if let Err(e) = manifest.committed(batch) {
+                        committed_line_missing = Some(batch);
                         report.batch_failures.push(format!(
                             "{} batch {batch} COMMITTED, but its committed_batch line was not \
                              written ({e:#}): append the line {{\"committed_batch\": {batch}}} \
@@ -1287,7 +1290,7 @@ pub async fn run(
         path.display(),
         path.display()
     )?;
-    for line in next_steps(&report, lock_timed_out, path) {
+    for line in next_steps(&report, committed_line_missing, lock_timed_out, path) {
         writeln!(out, "NEXT\t{line}")?;
     }
     Ok(report)
@@ -1296,8 +1299,14 @@ pub async fn run(
 /// What the operator does after a run that reported a `BATCH-FAILED`: the
 /// `NEXT` lines. Nothing after a clean run. Every batch a run committed
 /// carries its ingest records, so the run can always be resumed as it is or
-/// undone.
-fn next_steps(report: &Report, lock_timed_out: bool, manifest: &Path) -> Vec<String> {
+/// undone; a batch that committed without its `committed_batch` line must get
+/// that line FIRST, or the reversal leaves it in place.
+fn next_steps(
+    report: &Report,
+    committed_line_missing: Option<usize>,
+    lock_timed_out: bool,
+    manifest: &Path,
+) -> Vec<String> {
     if report.batch_failures.is_empty() {
         return Vec::new();
     }
@@ -1309,6 +1318,13 @@ fn next_steps(report: &Report, lock_timed_out: bool, manifest: &Path) -> Vec<Str
                   --ingest-signer / --attestation-signer lists, then --apply with its TOTAL \
                   as --confirm-count and a NEW --manifest-out";
     let mut next = Vec::new();
+    if let Some(batch) = committed_line_missing {
+        next.push(format!(
+            "first: append the line {{\"committed_batch\": {batch}}} to {} (batch {batch} \
+             committed; without that line the reversal below leaves its stamps and records)",
+            manifest.display()
+        ));
+    }
     next.push(format!(
         "resume: every batch this run committed carries its ingest records, so query_paper and \
          get_claim's ingesters agree; {resume}. Or undo this run: {reverse}"
@@ -1696,4 +1712,55 @@ pub async fn reverse(
         writeln!(out, "DRY RUN: the reversal was rolled back.")?;
     }
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed() -> Report {
+        Report {
+            batch_failures: vec!["paper-asserts-claim batch 7 COMMITTED, but ...".into()],
+            ..Report::default()
+        }
+    }
+
+    /// A batch that committed without its `committed_batch` line: the FIRST
+    /// `NEXT` line names the line to append to this manifest, before the
+    /// resume / reverse line (whose reversal would otherwise leave that
+    /// batch's stamps and records in place).
+    #[test]
+    fn a_missing_commit_line_is_the_first_next_step() {
+        let m = Path::new("/tmp/run-1.jsonl");
+        let next = next_steps(&failed(), Some(7), false, m);
+        assert_eq!(
+            next.first().map(String::as_str),
+            Some(
+                "first: append the line {\"committed_batch\": 7} to /tmp/run-1.jsonl (batch 7 \
+                 committed; without that line the reversal below leaves its stamps and records)"
+            ),
+            "{next:#?}"
+        );
+        assert!(next[1].starts_with("resume: "), "{next:#?}");
+        assert!(
+            next[1].ends_with(
+                "Or undo this run: epigraph-operator reverse-ingest-markers --manifest \
+                 /tmp/run-1.jsonl --apply"
+            ),
+            "{next:#?}"
+        );
+        assert_eq!(next.len(), 2, "{next:#?}");
+    }
+
+    /// Without a missing line there is no `first:` step, and a clean run has
+    /// no `NEXT` line at all.
+    #[test]
+    fn no_first_step_without_a_missing_commit_line() {
+        let m = Path::new("/tmp/run-1.jsonl");
+        let next = next_steps(&failed(), None, true, m);
+        assert!(next[0].starts_with("resume: "), "{next:#?}");
+        assert!(next.iter().all(|l| !l.starts_with("first:")), "{next:#?}");
+        assert!(next[1].contains("--lock-timeout"), "{next:#?}");
+        assert!(next_steps(&Report::default(), Some(7), false, m).is_empty());
+    }
 }
