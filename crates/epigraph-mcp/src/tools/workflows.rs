@@ -29,7 +29,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// proposing a variant; an invalid `workflow_id` errors rather than returning
 /// an empty set (which would read as "no runs" and mislead the proposer).
 ///
-/// Read as the CALLER (`read_as`). `behavioral_executions` has no row
+/// Read as the CALLER (`server.read_as`). `behavioral_executions` has no row
 /// security of its own, so the repo admits a run only when its workflow (a
 /// `workflows` row or a flat workflow claim) is one `viewer` reads: a workflow
 /// private to a group the caller is not in answers exactly like an unknown id,
@@ -152,11 +152,7 @@ impl PromotionAssessment {
 /// over the SAME window (mixing windows would be apples-to-oranges), and apply
 /// the Wilson gate. A lineage root yields `verdict: None`.
 ///
-/// Every read runs as the CALLER (`read_as`). On the plain application
-/// pool row security admits public edges only, so a group's own private
-/// variant looked like a lineage root to its members; and the run counts come
-/// from `behavioral_executions`, which has no row security, so they are
-/// counted only for a workflow `viewer` reads.
+/// Every read runs as the CALLER, on one stamped read (`server.read_as`).
 async fn assess_workflow_promotion(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -173,10 +169,14 @@ async fn assess_workflow_promotion(
     // role's row security admits public edges only: a member's own
     // group-private variant edge read as missing, the variant was reported as
     // a lineage root ("nothing to promote over"), and refresh skipped its
-    // write, all without an error. The `behavioral_executions` counts below
-    // stay on the same read: that table has no row security, and the repo
-    // admits a run only for a workflow this stamped session reads. The read is
-    // committed before refresh's write, so the tool never holds two pooled
+    // write, all without an error.
+    //
+    // The run counts come from `behavioral_executions`, which has no row
+    // security of its own (and `epigraph_app` keeps SELECT on it), so
+    // `success_stats` counts only the runs of a workflow `viewer` reads: a
+    // public `variant_of` edge to a private parent no longer discloses that
+    // parent's success record. All three reads share this one stamped read,
+    // released before refresh's write, so the tool never holds two pooled
     // connections.
     let mut read = server.read_as(viewer, "assess_workflow_promotion").await?;
     let parent_id = WorkflowRepository::immediate_variant_parent(&mut *read, viewer, variant_id)
