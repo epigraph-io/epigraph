@@ -1260,6 +1260,13 @@ pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asser
 pub(crate) const INGEST_WRITTEN_FROZEN: &str =
     crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY;
 
+/// The label form of [`INGEST_WRITTEN_FROZEN`]: a legacy ingest edge the
+/// backfill marked carries [`crate::repos::ingest_written::INGEST_WRITTEN_LABEL`]
+/// instead of the property (migration 208), and stays on its row the same way.
+/// The cascades bind it and test `labels @> ARRAY[$n]`.
+pub(crate) const INGEST_WRITTEN_FROZEN_LABEL: &str =
+    crate::repos::ingest_written::INGEST_WRITTEN_LABEL;
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -1409,7 +1416,7 @@ async fn migrate_superseded_edges(
            AND NOT COALESCE(properties->>$7 = ANY($6), false) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
-           AND NOT (properties ? $8) \
+           AND NOT (properties ? $8 OR labels @> ARRAY[$9]::text[]) \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -1420,6 +1427,7 @@ async fn migrate_superseded_edges(
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
     .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -12124,7 +12132,7 @@ async fn migrate_consolidated_edges(
           AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT (e.source_type = 'agent' AND e.relationship = ANY($3))
           AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
-          AND NOT (e.properties ? $6)
+          AND NOT (e.properties ? $6 OR e.labels @> ARRAY[$7]::text[])
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -12140,6 +12148,7 @@ async fn migrate_consolidated_edges(
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
     .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -13036,7 +13045,7 @@ async fn repair_marked_duplicate(
            AND NOT COALESCE(properties->>$6 = ANY($5), false) \
            -- The document ingest's own edges stay on the row its ingest
            -- created or found (`INGEST_WRITTEN_FROZEN`).
-           AND NOT (properties ? $7) \
+           AND NOT (properties ? $7 OR labels @> ARRAY[$8]::text[]) \
          RETURNING id",
     )
     .bind(canon_uuid)
@@ -13046,6 +13055,7 @@ async fn repair_marked_duplicate(
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
     .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *conn)
     .await?;
 

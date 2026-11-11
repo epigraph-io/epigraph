@@ -138,9 +138,16 @@ fn refused(r: &Result<impl std::fmt::Debug, sqlx::Error>) -> bool {
 fn the_strings_here_are_the_crates() {
     assert_eq!(epigraph_db::INGEST_WRITTEN_PROPERTY, KEY);
     assert_eq!(epigraph_db::INGEST_WRITTEN_SETTING, SETTING);
-    assert_eq!(
-        epigraph_db::ingest_written_edge_sql("pa"),
-        "((pa.properties ->> 'ingest_written') IS NOT NULL)"
+    let marked = epigraph_db::ingest_written_edge_sql("pa");
+    assert!(
+        marked.starts_with("((pa.properties ->> 'ingest_written') IS NOT NULL"),
+        "{marked}"
+    );
+    // Migration 208: a backfilled legacy edge carries the marker as a
+    // reserved label, which the same predicate reads.
+    assert!(
+        marked.contains("pa.labels @> ARRAY['epigraph:ingest_written']::text[]"),
+        "{marked}"
     );
     assert_eq!(epigraph_db::INGEST_WRITTEN_BY_FIELD, "by");
 }

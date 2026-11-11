@@ -54,8 +54,10 @@
 //! principal keeps an `authored` row of its own, so only THIS ingester's
 //! stored authorship of the agent on the paper bears on what it writes
 //! ([`effective_attribution`]): its own pending row stays pending (no
-//! application session can rewrite an agent's edge, and no countersign route
-//! exists yet), while another principal's row, pending or confirmed, neither
+//! application session can rewrite an agent's edge; only the named agent or
+//! its live operator clears it, through `countersign_authorship`, which
+//! labels the row rather than editing it), while another principal's row,
+//! pending or confirmed, neither
 //! confirms this ingester's naming nor blocks the person's own.
 //!
 //! # Replacing the name-derived author on a re-ingest

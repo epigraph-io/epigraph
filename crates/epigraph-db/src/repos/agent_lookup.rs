@@ -225,12 +225,22 @@ pub const AUTHORSHIP_PENDING_PROPERTY: &str = "pending_countersign";
 pub const AUTHORSHIP_INGESTED_BY_PROPERTY: &str = "ingested_by";
 
 /// SQL: true when the `authored` edge aliased `alias` awaits its author's
-/// countersignature ([`AUTHORSHIP_PENDING_PROPERTY`] is JSON `true`). An edge
-/// without the property (every name-derived author, every legacy edge) is
-/// not pending.
+/// countersignature: [`AUTHORSHIP_PENDING_PROPERTY`] is JSON `true` and the
+/// row carries no countersign decision (migration 208's
+/// `epigraph_countersign_authorship` adds a reserved label instead of editing
+/// the signed `properties`). An edge without the property (every
+/// name-derived author, every legacy edge) is not pending. A confirmed row is
+/// not pending; a declined row is retracted, so no in-force reader sees it.
 #[must_use]
 pub fn authorship_pending_sql(alias: &str) -> String {
-    format!("COALESCE({alias}.properties ->> '{AUTHORSHIP_PENDING_PROPERTY}', 'false') = 'true'")
+    format!(
+        "(COALESCE({alias}.properties ->> '{AUTHORSHIP_PENDING_PROPERTY}', 'false') = 'true' \
+          AND NOT {countersigned})",
+        countersigned = crate::repos::ingest_written::countersign_label_sql(
+            alias,
+            crate::repos::ingest_written::COUNTERSIGNED_BY_LABEL_PREFIX
+        ),
+    )
 }
 
 /// How a name matched.
@@ -1292,10 +1302,12 @@ mod tests {
     fn the_pending_authorship_contract_is_pinned() {
         assert_eq!(AUTHORSHIP_PENDING_PROPERTY, "pending_countersign");
         assert_eq!(AUTHORSHIP_INGESTED_BY_PROPERTY, "ingested_by");
-        assert_eq!(
-            authorship_pending_sql("ea"),
-            "COALESCE(ea.properties ->> 'pending_countersign', 'false') = 'true'"
+        let s = authorship_pending_sql("ea");
+        assert!(
+            s.contains("COALESCE(ea.properties ->> 'pending_countersign', 'false') = 'true'"),
+            "{s}"
         );
+        assert!(s.contains("epigraph:countersigned_by:"), "{s}");
     }
 
     #[test]

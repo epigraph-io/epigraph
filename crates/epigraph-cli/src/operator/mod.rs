@@ -159,6 +159,7 @@
 
 pub mod admin_scopes;
 pub mod arm;
+pub mod backfill_markers;
 pub mod bind;
 pub mod binding_client;
 pub mod client_scope;

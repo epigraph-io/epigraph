@@ -250,6 +250,33 @@ pub struct GetAgentParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct CountersignAuthorshipParams {
+    #[schemars(
+        description = "The UUID of the paper (query_paper's paper id) on which you were \
+                              named as an author, pending your countersignature."
+    )]
+    pub paper_id: String,
+    #[schemars(
+        description = "confirm (you are an author of this document: the naming stops \
+                              being pending) or decline (you are not: the naming is retracted)."
+    )]
+    pub decision: String,
+    #[schemars(
+        description = "Optional. The agent named, when you act as its live human \
+                              operator; default: yourself."
+    )]
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[schemars(
+        description = "Optional. Only the naming by this ingester (query_paper's \
+                              ingested_by on the pending author); default: every pending naming \
+                              of the agent on this paper."
+    )]
+    #[serde(default)]
+    pub ingested_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,
@@ -2055,8 +2082,9 @@ pub struct IngestAuthorReport {
     /// `asserts`), or `pending_countersign` (the authorship is this
     /// ingester's word, see `pending_ingested_by`; the agent is listed as a
     /// pending author in this ingester's listing of the paper and asserts
-    /// none of its claims; no countersign route exists yet, so only an
-    /// operator clears the mark). Another ingester's row, pending or not,
+    /// none of its claims; the named agent, or its live operator, confirms
+    /// or declines it with `countersign_authorship`). Another ingester's
+    /// row, pending or not,
     /// never decides this one.
     pub attribution: &'static str,
     /// True when this agent's `asserts` edges onto the document's claims were

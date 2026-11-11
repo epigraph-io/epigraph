@@ -1704,6 +1704,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // `claims_owner_immutable` refuses outside a privileged frame: every share
     // fails LOUD (42501) with nothing moved.
     ("epigraph_share_claims_with_team", 206),
+    // 208, the authorship countersign route (MCP `countersign_authorship`).
+    // Its read and UPDATE of the FORCEd `operator_links` and of `edges` are
+    // admitted by `epigraph_definer_bypass()` (the owner). Under a non-member
+    // owner it fails CLOSED and loud for an operator acting for its agent
+    // (the link read is filtered, so CSG02), and for the agent itself the
+    // UPDATE of a world-owned authorship row is refused by 117's restrictive
+    // update policy (42501): nothing is ever confirmed or declined that the
+    // owner could not see.
+    ("epigraph_countersign_authorship", 208),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3015,6 +3024,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_operator_bound_at",
             "public.epigraph_operator_bound_at(uuid, timestamptz)",
+            true,
+        ),
+        // 208: MCP `countersign_authorship` calls it on the request DSN as
+        // the caller; without the grant every countersign is 42501.
+        (
+            "epigraph_countersign_authorship",
+            "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
             true,
         ),
     ];
