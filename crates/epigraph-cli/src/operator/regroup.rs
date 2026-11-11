@@ -26,6 +26,9 @@
 //!   narrow it into the target; this tool does not touch public rows.
 //! * `third-group`: a row owned by a group that is neither the source nor the
 //!   target (another writer's row: the cascade would carry it into the target).
+//! * `sealed-evidence`: evidence with an `evidence_encryption` row. Its
+//!   ciphertext is keyed to the group that sealed it; moved, the row would sit
+//!   in the target where no target member can decrypt it.
 //! * `pinned`: pinned evidence (migration 110). The cascade never changes its
 //!   owner, so it would stay in the source while its claim moved.
 //! * `edge-would-widen`: an edge whose new meet would drop a group its current
@@ -114,7 +117,7 @@
 //! the state this run left it; a recorded row that is in neither its prior nor
 //! its post state (nor the meet a partial reversal leaves an edge on), a row
 //! written after the act (the cascade would carry it into the source), a
-//! neighbour that moved since, or an edge whose
+//! neighbour that moved since, evidence sealed since, or an edge whose
 //! recorded tuple would be WIDER than the exact meet of its endpoints after
 //! the restore (an endpoint the neighbour watch does not cover moved: a
 //! foreign claim's evidence, a node), HOLDS the claim. An edge is put back on
@@ -223,6 +226,9 @@ pub enum Hold {
         visibility: String,
     },
     Sealed,
+    SealedEvidence {
+        id: String,
+    },
     PublicRow {
         table: String,
         id: String,
@@ -256,6 +262,7 @@ impl Hold {
             Self::PublicClaim { .. } => "public-claim",
             Self::NotInSource { .. } => "not-in-source",
             Self::Sealed => "sealed",
+            Self::SealedEvidence { .. } => "sealed-evidence",
             Self::PublicRow { .. } => "public-row",
             Self::ThirdGroup { .. } => "third-group",
             Self::Pinned { .. } => "pinned",
@@ -281,6 +288,11 @@ impl fmt::Display for Hold {
             Self::Sealed => write!(
                 f,
                 "the claim is sealed (claim_encryption): its ciphertext is the source group's"
+            ),
+            Self::SealedEvidence { id } => write!(
+                f,
+                "evidence {id} is sealed (evidence_encryption): its ciphertext is keyed to the \
+                 source group, so the row would move where no target member can decrypt it"
             ),
             Self::PublicRow { table, id, state } => write!(
                 f,
@@ -589,6 +601,25 @@ impl Classified {
     }
 }
 
+/// The evidence rows among `ids` that are sealed (an `evidence_encryption`
+/// row): their ciphertext is keyed to the group that sealed them.
+async fn sealed_evidence_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeSet<String>> {
+    if ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let v: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT evidence_id FROM evidence_encryption WHERE evidence_id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await
+    .context("reading evidence_encryption")?;
+    Ok(v.into_iter().map(|u| u.to_string()).collect())
+}
+
 /// Read every row the candidates carry and decide, per row, whether it
 /// follows cleanly; a row that does not holds every candidate it hangs off.
 async fn classify_rows(
@@ -600,6 +631,7 @@ async fn classify_rows(
     let cand_ids: Vec<Uuid> = cands.iter().copied().collect();
     let mut attached = fetch_attached(conn, ctx.specs, &cand_ids).await?;
     let pinned = pinned_of(conn, &evidence_ids(&attached)).await?;
+    let sealed_ev = sealed_evidence_of(conn, &evidence_ids(&attached)).await?;
     let ev_claim: BTreeMap<Uuid, Uuid> = attached
         .iter()
         .filter(|(k, _)| k.0 == "evidence" && !pinned.contains(&k.1))
@@ -685,6 +717,9 @@ async fn classify_rows(
                         ),
                     }),
                 }
+            }
+            _ if k.0 == "evidence" && sealed_ev.contains(&k.1) => {
+                Some(Hold::SealedEvidence { id: k.1.clone() })
             }
             _ if k.0 == "evidence" && cl.pinned.contains(&k.1) => {
                 Some(Hold::Pinned { id: k.1.clone() })
@@ -1418,7 +1453,7 @@ pub async fn run(
          target); an edge takes the exact meet of its endpoints (an end that stays in the source, \
          a claim or evidence (CO-OWNED-EDGE) or a group-private node such as a workflow or frame \
          (SOURCE-NODE-EDGE), makes it co-owned); a shared fragment and an outsider's challenge \
-         stay as they are; a claim with a public, pinned or third-group row is \
+         stay as they are; a claim with a public, pinned, sealed-evidence or third-group row is \
          HELD whole; nothing becomes public"
     )?;
 
@@ -1866,6 +1901,23 @@ async fn reverse_batch(
                     }
                 }
             }
+        }
+    }
+    // ---- sealed evidence: its ciphertext is keyed to the group that sealed
+    // it, so restoring the row would leave it where its readers cannot
+    // decrypt it ----
+    let sealed_ev = sealed_evidence_of(conn, &evidence_ids(&attached)).await?;
+    for (k, a) in attached
+        .iter()
+        .filter(|(k, _)| k.0 == "evidence" && sealed_ev.contains(&k.1))
+    {
+        let why = format!(
+            "evidence {} has been sealed since the run (evidence_encryption); its ciphertext is \
+             not the source group's, so restoring it would leave it undecryptable; not reversing",
+            k.1
+        );
+        for cl in a.claims.intersection(&cand_ids) {
+            drift.entry(*cl).or_insert_with(|| why.clone());
         }
     }
     // ---- an edge put back on its recorded tuple must be at least as narrow

@@ -1796,6 +1796,97 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
 // Sealed evidence, a moved evidence endpoint, a concurrent edge insert
 // ─────────────────────────────────────────────────────────────────────────────
 
+async fn seal_evidence(pool: &PgPool, ev: Uuid, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO evidence_encryption (evidence_id, group_id, epoch, privacy_tier, \
+                                          encrypted_content) \
+         VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+        &[ev, group],
+    )
+    .await;
+}
+
+/// Evidence sealed under the source group holds its claim WHOLE (the plan
+/// excludes it, the apply exits 3); evidence sealed after the act holds the
+/// claim in the reversal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sealed_evidence_holds_its_claim_in_the_move_and_in_the_reversal(pool: PgPool) {
+    let fx = seed(&pool).await;
+    seal_evidence(&pool, fx.ev_a, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a, fx.b]);
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains("PLAN: 2 requested, 1 eligible, 1 held, 0 already ('group', target)"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        has_line(
+            &dry.stdout,
+            "HELD\t",
+            &[&fx.a.to_string(), "sealed-evidence", &fx.ev_a.to_string()]
+        ),
+        "{}",
+        dry.show()
+    );
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(fx.src));
+    assert_eq!(row(&pool, "evidence", fx.ev_a).await, grp(fx.src));
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.dst));
+
+    // B's evidence is sealed under DST after the act: the reversal holds B.
+    exec(
+        &pool,
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active')",
+        &[fx.dst],
+    )
+    .await;
+    seal_evidence(&pool, fx.ev_b, fx.dst).await;
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&fx.b.to_string(), &fx.ev_b.to_string(), "sealed since"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.dst));
+    assert_eq!(row(&pool, "evidence", fx.ev_b).await, grp(fx.dst));
+}
+
 /// An evidence edge from B's evidence to the evidence of a claim S2 that is
 /// not in the manifest: the neighbour watch sees only claim endpoints, so S2
 /// moving on to H after the act is invisible to it, and the edge itself is
