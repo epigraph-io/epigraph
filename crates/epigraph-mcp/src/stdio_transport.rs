@@ -4,6 +4,8 @@
 //! `main.rs` serves stdio through [`stdio_server_transport`], and
 //! `tests/mcp_stdio_transport.rs` builds its server end through the same
 //! function, so the line-length decision below is what both of them run.
+//! `tests/stdio_transport_wired_into_main.rs` fails if `main.rs` stops serving
+//! through it.
 //!
 //! # The line-length cap
 //!

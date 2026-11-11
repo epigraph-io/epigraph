@@ -3187,8 +3187,9 @@ impl ServerHandler for EpiGraphMcpFull {
         // THIS MCP agent acted on behalf of that principal
         // (`mcp_agent --OPERATED_BY--> auth.agent_id`, prov:actedOnBehalfOf).
         // `auth.agent_id == None`, or stdio (no `Parts` -> `auth_owned == None`),
-        // writes NO edge. Best-effort + per-session memoized inside the helper;
-        // borrow `auth_owned` here (it is MOVED just below into `context`).
+        // writes NO edge. Best-effort + memoized inside the helper (per process
+        // on the HTTP listener; see `seen_auth_lineage`); borrow `auth_owned`
+        // here (it is MOVED just below into `context`).
         self.record_auth_lineage(auth_owned.as_ref().and_then(|a| a.agent_id))
             .await;
 
