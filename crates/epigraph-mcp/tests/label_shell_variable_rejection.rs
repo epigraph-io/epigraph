@@ -383,10 +383,15 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
     let extraction: epigraph_ingest::schema::DocumentExtraction =
         serde_json::from_str(fixture).expect("fixture parses");
 
-    let err =
-        epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
-            .await
-            .expect_err("an unexpandable DOI must be refused");
+    let err = epigraph_mcp::tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect_err("an unexpandable DOI must be refused");
 
     // Nothing may have landed: no paper row, no claims.
     let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers")

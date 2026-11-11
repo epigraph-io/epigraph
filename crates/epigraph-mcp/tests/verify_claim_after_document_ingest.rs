@@ -99,9 +99,15 @@ fn extraction() -> DocumentExtraction {
 async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document(&server, &viewer, &extraction(), None)
-        .await
-        .expect("document ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("document ingests");
 
     for (label, content) in [
         ("thesis (level 0)", THESIS),
@@ -150,6 +156,7 @@ async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction(),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingests");
@@ -187,6 +194,7 @@ async fn a_tampered_spine_row_is_reported_undecided_not_clean(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction(),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingests");

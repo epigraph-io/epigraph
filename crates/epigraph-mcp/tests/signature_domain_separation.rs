@@ -363,6 +363,7 @@ async fn ingest_document_signs_its_evidence_under_v1(pool: PgPool) {
         &viewer,
         &ingest_extraction("document"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("document ingests");
@@ -380,6 +381,7 @@ async fn ingest_document_spine_signs_its_evidence_under_v1(pool: PgPool) {
         &viewer,
         &ingest_extraction("spine"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingests");

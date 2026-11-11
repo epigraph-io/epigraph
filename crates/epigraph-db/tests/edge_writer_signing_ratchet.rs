@@ -631,13 +631,13 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_with_visibility",
+        "do_ingest_document",
         5,
         Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine_with_visibility",
+        "do_ingest_document_spine",
         5,
         Signed,
     ),

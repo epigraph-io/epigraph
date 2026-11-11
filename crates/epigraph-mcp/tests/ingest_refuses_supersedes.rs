@@ -270,9 +270,15 @@ async fn the_document_core_refuses_a_supersedes_relationship_and_writes_nothing(
 
     for (i, spelling) in SPELLINGS.iter().enumerate() {
         let tag = format!("core-{i}");
-        let err = do_ingest_document(&server, &viewer, &document(&tag, spelling), None)
-            .await
-            .expect_err("the core refuses a supersedes relationship");
+        let err = do_ingest_document(
+            &server,
+            &viewer,
+            &document(&tag, spelling),
+            None,
+            epigraph_core::VisibilityChoice::Public,
+        )
+        .await
+        .expect_err("the core refuses a supersedes relationship");
         assert_refused(&err, spelling, spelling);
         assert_document_wrote_nothing(&pool, &tag, spelling).await;
     }
@@ -282,6 +288,7 @@ async fn the_document_core_refuses_a_supersedes_relationship_and_writes_nothing(
         &viewer,
         &document("core-control", "supports"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("CONTROL: the same document with supports ingests");
@@ -299,9 +306,15 @@ async fn the_spine_refuses_a_supersedes_relationship_and_writes_nothing(pool: Pg
 
     for (i, spelling) in SPELLINGS.iter().enumerate() {
         let tag = format!("spine-{i}");
-        let err = do_ingest_document_spine(&server, &viewer, &document(&tag, spelling), None)
-            .await
-            .expect_err("the spine refuses a supersedes relationship");
+        let err = do_ingest_document_spine(
+            &server,
+            &viewer,
+            &document(&tag, spelling),
+            None,
+            epigraph_core::VisibilityChoice::Public,
+        )
+        .await
+        .expect_err("the spine refuses a supersedes relationship");
         assert_refused(&err, spelling, spelling);
         assert_document_wrote_nothing(&pool, &tag, spelling).await;
     }
@@ -311,6 +324,7 @@ async fn the_spine_refuses_a_supersedes_relationship_and_writes_nothing(pool: Pg
         &viewer,
         &document("spine-control", "supports"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("CONTROL: the same spine with supports ingests");

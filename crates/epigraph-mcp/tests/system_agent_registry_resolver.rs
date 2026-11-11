@@ -746,8 +746,14 @@ async fn ingest_document_authors(
     let extraction = document(authors, text);
     let r = match path {
         DocPath::Full => {
-            epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
-                .await
+            epigraph_mcp::tools::ingestion::do_ingest_document(
+                &server,
+                &viewer,
+                &extraction,
+                None,
+                epigraph_core::VisibilityChoice::Public,
+            )
+            .await
         }
         DocPath::Spine => {
             epigraph_mcp::tools::ingestion::do_ingest_document_spine(
@@ -755,6 +761,7 @@ async fn ingest_document_authors(
                 &viewer,
                 &extraction,
                 None,
+                epigraph_core::VisibilityChoice::Public,
             )
             .await
         }
@@ -921,6 +928,7 @@ async fn an_author_resolving_to_a_registered_agent_is_never_adopted(pool: PgPool
         &viewer,
         &document(&["Ada Lovelace", "Some Name"], None),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .map_err(|e| e.message.to_string())
@@ -1034,6 +1042,7 @@ async fn registry_absent_fails_closed(pool: PgPool, armed: bool) {
         &viewer,
         &document(&["Ada Lovelace"], None),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .map_err(|e| e.message.to_string());

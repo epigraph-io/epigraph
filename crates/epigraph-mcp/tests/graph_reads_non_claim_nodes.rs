@@ -98,9 +98,15 @@ async fn a_paper_node_has_a_neighborhood_and_a_walk(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let extraction: DocumentExtraction = serde_json::from_str(PAPER).unwrap();
-    let out = tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest");
+    let out = tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest");
     let paper: Uuid = first_text(&out)["paper_id"]
         .as_str()
         .unwrap()
@@ -217,9 +223,15 @@ async fn a_private_edge_is_not_returned_to_a_stranger(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let public = fixture::public_viewer(&pool).await;
     let extraction: DocumentExtraction = serde_json::from_str(PAPER).unwrap();
-    let out = tools::ingestion::do_ingest_document(&server, &public, &extraction, None)
-        .await
-        .expect("ingest");
+    let out = tools::ingestion::do_ingest_document(
+        &server,
+        &public,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest");
     let paper: Uuid = first_text(&out)["paper_id"]
         .as_str()
         .unwrap()
@@ -301,9 +313,15 @@ async fn ingest_high_degree_paper(
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Uuid {
     let extraction: DocumentExtraction = serde_json::from_str(HIGH_DEGREE_PAPER).unwrap();
-    let out = tools::ingestion::do_ingest_document(server, viewer, &extraction, None)
-        .await
-        .expect("ingest");
+    let out = tools::ingestion::do_ingest_document(
+        server,
+        viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest");
     first_text(&out)["paper_id"]
         .as_str()
         .unwrap()

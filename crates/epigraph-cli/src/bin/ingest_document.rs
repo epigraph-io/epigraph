@@ -106,9 +106,15 @@ async fn run(
         "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
     );
 
-    let result = do_ingest_document(&server, viewer, &extraction, None)
-        .await
-        .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
+    let result = do_ingest_document(
+        &server,
+        viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
     let text = result
         .content
         .first()

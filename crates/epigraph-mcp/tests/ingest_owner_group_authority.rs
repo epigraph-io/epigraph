@@ -119,9 +119,15 @@ async fn control_live_personal_membership_ingests(pool: PgPool) {
     let (_agent, _personal) = agent_with_team_writer(&pool, &server).await;
 
     let doi = "10.9999/owner-authority-control";
-    do_ingest_document(&server, &viewer, &doc(doi), None)
-        .await
-        .expect("a live personal membership must ingest");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &doc(doi),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("a live personal membership must ingest");
     assert!(doc_claims(&pool, doi).await > 0, "control wrote nothing");
 }
 
@@ -142,9 +148,15 @@ async fn revoked_personal_membership_refuses_the_walk(pool: PgPool) {
     .unwrap();
 
     let doi = "10.9999/owner-authority-revoked";
-    let err = do_ingest_document(&server, &viewer, &doc(doi), None)
-        .await
-        .expect_err("an author revoked in its personal group must be refused");
+    let err = do_ingest_document(
+        &server,
+        &viewer,
+        &doc(doi),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect_err("an author revoked in its personal group must be refused");
     assert!(
         err.message.contains("personal group"),
         "refusal must name the cause, got: {}",
@@ -221,9 +233,15 @@ async fn reader_personal_membership_refuses_the_walk(pool: PgPool) {
     .unwrap();
 
     let doi = "10.9999/owner-authority-reader";
-    do_ingest_document(&server, &viewer, &doc(doi), None)
-        .await
-        .expect_err("a read-only personal membership must be refused");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &doc(doi),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect_err("a read-only personal membership must be refused");
     assert_eq!(doc_claims(&pool, doi).await, 0);
     assert_eq!(
         personal_state(&pool, agent, personal).await,
