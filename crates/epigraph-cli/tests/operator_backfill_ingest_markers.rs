@@ -1311,9 +1311,16 @@ async fn a_record_phase_failure_is_reported_and_never_adopted(pool: PgPool) {
         "BATCH-FAILED\t",
         "test: ingest records refused",
         "MANIFEST\t",
+        "NEXT\treverse first:",
+        "NEXT\tthen resume:",
     ] {
         assert!(r1.stdout.contains(want), "{want}: {}", r1.show());
     }
+    assert!(
+        !r1.stdout.contains("NEXT\tresume:"),
+        "a run whose stamps lack records must not be told to resume before reversing: {}",
+        r1.show()
+    );
     assert_eq!(
         stamped_count(&pool).await,
         24,
@@ -1410,9 +1417,16 @@ async fn an_edge_batch_failure_still_writes_the_committed_stamps_records(pool: P
         "test: agent assertions refused",
         "\nCREATION-RECORDS-WRITTEN\t1",
         "NON-CREATION-RECORDS-WRITTEN\t6",
+        "NEXT\tresume:",
     ] {
         assert!(r1.stdout.contains(want), "{want}: {}", r1.show());
     }
+    assert!(!r1.stdout.contains("NEXT\treverse first:"), "{}", r1.show());
+    assert!(
+        !r1.stdout.contains("lock timeout"),
+        "a trigger refusal is no lock timeout: {}",
+        r1.show()
+    );
     assert!(
         !r1.stdout.contains("STAMPED\tagent-asserts-claim"),
         "{}",
@@ -1447,6 +1461,117 @@ async fn an_edge_batch_failure_still_writes_the_committed_stamps_records(pool: P
         "{}",
         rev.show()
     );
+    assert_eq!(edge_snapshot(&pool).await, before);
+}
+
+/// A lock timeout against a concurrent writer, the realistic way a run stops,
+/// takes the caught path too. A second connection holds a row lock on every
+/// agent assertion, so the third kind's locked candidate SELECT times out
+/// under `--lock-timeout` after the authorships and paper assertions
+/// committed. The run still writes those assertions' records, prints its
+/// summary and a NEXT line naming the resume (or the reversal), and exits 2;
+/// `query_paper` and `get_claim`'s `ingesters` agree. Following the NEXT line
+/// (a fresh dry run's total, a new manifest) finishes the backfill, and the
+/// two manifests reverse it exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lock_timeout_on_the_candidate_select_still_writes_the_committed_stamps_records(
+    pool: PgPool,
+) {
+    let fx = seed(&pool).await;
+    let scoped = app_pool(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+
+    let mut holder = pool.begin().await.expect("holder");
+    let held: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM edges \
+          WHERE source_type = 'agent' AND relationship = 'asserts' AND target_type = 'claim' \
+          FOR UPDATE",
+    )
+    .fetch_all(&mut *holder)
+    .await
+    .expect("hold the agent assertions");
+    assert!(!held.is_empty(), "CALIBRATION: agent assertions to hold");
+
+    let m1 = scratch("lock-timeout.jsonl");
+    let r1 = apply(&pool, &fx, 24, &m1, &["--lock-timeout", "300ms"]).await;
+    holder.rollback().await.expect("release");
+    assert_eq!(r1.code, 2, "{}", r1.show());
+    for want in [
+        "STAMPED\tagent-authored-paper\t10",
+        "STAMPED\tpaper-asserts-claim\t7",
+        "BATCH-FAILED\tagent-asserts-claim",
+        "lock timeout",
+        "\nCREATION-RECORDS-WRITTEN\t1",
+        "NON-CREATION-RECORDS-WRITTEN\t6",
+        "MANIFEST\t",
+        "NEXT\tresume:",
+        "--lock-timeout",
+    ] {
+        assert!(r1.stdout.contains(want), "{want}: {}", r1.show());
+    }
+    assert!(
+        !r1.stdout.contains("STAMPED\tagent-asserts-claim"),
+        "{}",
+        r1.show()
+    );
+    assert_eq!(stamped_count(&pool).await, 17, "CALIBRATION");
+    assert_eq!(records_in(&m1), 7);
+    assert_eq!(record_count(&pool).await, 7);
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(by_paper.len(), 7, "{by_paper:?}");
+    assert_eq!(
+        by_claim, by_paper,
+        "after a lock timeout on the candidate SELECT, get_claim's ingesters disagree with \
+         query_paper"
+    );
+
+    // The NEXT line's resume: a fresh dry run under the same cutoff and
+    // classification, then --apply with its total and a new manifest.
+    let mut dry: Vec<String> = vec![
+        "backfill-ingest-markers".into(),
+        "--written-before".into(),
+        fx.t.clone(),
+    ];
+    dry.extend(classify(&fx));
+    let dry: Vec<&str> = dry.iter().map(String::as_str).collect();
+    let d = run_op(&pool, &dry).await;
+    assert_eq!(d.code, 0, "{}", d.show());
+    assert!(d.stdout.contains("TOTAL\tedges_to_stamp=7"), "{}", d.show());
+    let m2 = scratch("lock-timeout-resume.jsonl");
+    let r2 = apply(&pool, &fx, 7, &m2, &[]).await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    assert!(!r2.stdout.contains("NEXT\t"), "{}", r2.show());
+    assert_eq!(stamped_count(&pool).await, 24);
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(by_paper.len(), 7, "{by_paper:?}");
+    assert_eq!(by_claim, by_paper);
+
+    for (m, want) in [
+        (
+            &m2,
+            "REVERSED\tedges_restored=7\tedges_held=0\trecords_deleted=0",
+        ),
+        (
+            &m1,
+            "REVERSED\tedges_restored=17\tedges_held=0\trecords_deleted=7",
+        ),
+    ] {
+        let rev = run_op(
+            &pool,
+            &[
+                "reverse-ingest-markers",
+                "--manifest",
+                m.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(rev.code, 0, "{}", rev.show());
+        assert!(rev.stdout.contains(want), "{want}: {}", rev.show());
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+        assert_eq!(by_claim, by_paper);
+    }
     assert_eq!(edge_snapshot(&pool).await, before);
 }
 
