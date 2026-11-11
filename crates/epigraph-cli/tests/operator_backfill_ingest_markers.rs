@@ -2478,3 +2478,91 @@ async fn a_reversal_refuses_while_a_newer_runs_stamp_rests_on_its_records(pool: 
     assert_eq!(edge_snapshot(&pool).await, before);
     assert_eq!(record_count(&pool).await, 0);
 }
+
+/// The manifest format is version 3: a batch's record lines carry its
+/// stamps' batch number. A version 2 manifest (its records in separate
+/// batches numbered after every edge batch) is still reversed, exactly, with
+/// a `LEGACY-MANIFEST` line saying it is not batch-atomic; any other version
+/// is refused with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_version_2_manifest_is_reversed_with_a_legacy_line(pool: PgPool) {
+    let fx = seed(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+    let m = scratch("v3.jsonl");
+    let r = apply(&pool, &fx, 24, &m, &[]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let text = std::fs::read_to_string(&m).expect("manifest");
+    let mut lines = text.lines();
+    let mut header: serde_json::Value =
+        serde_json::from_str(lines.next().expect("header")).expect("header json");
+    assert_eq!(header["version"], 3, "a run writes a version 3 manifest");
+
+    // The version 2 shape: every record line in its own committed batch,
+    // numbered after every edge batch.
+    let mut body = String::new();
+    let mut record_batches = BTreeSet::new();
+    for line in lines {
+        let mut v: serde_json::Value = serde_json::from_str(line).expect("line");
+        if v.get("record").is_some() {
+            let b = v["batch"].as_i64().expect("batch") + 1000;
+            v["batch"] = serde_json::json!(b);
+            record_batches.insert(b);
+        }
+        body.push_str(&v.to_string());
+        body.push('\n');
+    }
+    assert!(!record_batches.is_empty(), "CALIBRATION: records written");
+    for b in &record_batches {
+        body.push_str(&serde_json::json!({ "committed_batch": b }).to_string());
+        body.push('\n');
+    }
+    let stamped = edge_snapshot(&pool).await;
+    let records = record_count(&pool).await;
+    let mut with_version = |n: i64| {
+        header["version"] = serde_json::json!(n);
+        let p = scratch(&format!("v{n}.jsonl"));
+        std::fs::write(&p, format!("{header}\n{body}")).expect("write");
+        p
+    };
+
+    let v1 = with_version(1);
+    let rev = run_op(
+        &pool,
+        &[
+            "reverse-ingest-markers",
+            "--manifest",
+            v1.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(
+        rev.code,
+        0,
+        "a version 1 manifest is refused: {}",
+        rev.show()
+    );
+    assert_eq!(edge_snapshot(&pool).await, stamped);
+    assert_eq!(record_count(&pool).await, records);
+
+    let v2 = with_version(2);
+    let rev = run_op(
+        &pool,
+        &[
+            "reverse-ingest-markers",
+            "--manifest",
+            v2.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert!(
+        rev.stdout.contains("LEGACY-MANIFEST\t"),
+        "a version 2 manifest is reversed with its LEGACY-MANIFEST line: {}",
+        rev.show()
+    );
+    assert_eq!(edge_snapshot(&pool).await, before);
+    assert_eq!(record_count(&pool).await, 0);
+}

@@ -157,6 +157,11 @@
 //! stamped paper assertion OUTSIDE its manifest matches (paper, claim, `by`)
 //! a record its committed batches wrote, naming those edges: reverse the
 //! newer manifest first.
+//!
+//! A version 2 manifest (written before a batch's records shared its
+//! stamps' transaction) is still reversed, with a `LEGACY-MANIFEST` line: its
+//! records are in their own batches, so a reversal of it stopped part way may
+//! leave stamps without their records until it is re-run to finish.
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -189,9 +194,14 @@ pub const PIPELINE: &str = "legacy-backfill";
 /// prove the claim was created by that extraction (the walk writes both in
 /// one transaction; a document's planning and persistence fit well inside).
 pub const CREATION_WINDOW: &str = "10 minutes";
-/// The manifest format version: every line carries its batch, and each
-/// committed batch has a `committed_batch` line.
-pub const VERSION: i64 = 2;
+/// The manifest format version: every line carries its batch, each
+/// committed batch has a `committed_batch` line, and a batch's record lines
+/// carry its stamps' batch number (one transaction).
+pub const VERSION: i64 = 3;
+/// The older format the reversal still reads: its record lines were written
+/// in record-only batches numbered after every edge batch, so reversing it
+/// is not batch-atomic (it deletes the records before it removes the stamps).
+pub const LEGACY_VERSION: i64 = 2;
 /// Most conflicting papers the dry run lists by id.
 pub const CONFLICTS_LISTED: i64 = 20;
 
@@ -1533,10 +1543,11 @@ pub struct ReverseReport {
 /// Reverse a backfill run from its manifest (dry run: rolled back).
 ///
 /// # Errors
-/// The manifest is not a backfill manifest of this version; a currently
-/// stamped paper assertion outside this manifest rests on a record this
-/// manifest's committed batches wrote (a newer run's stamp: reverse that run
-/// first; nothing is written); or a statement failed.
+/// The manifest is not a backfill manifest of version [`VERSION`] or
+/// [`LEGACY_VERSION`]; a currently stamped paper assertion outside this
+/// manifest rests on a record this manifest's committed batches wrote (a
+/// newer run's stamp: reverse that run first; nothing is written); or a
+/// statement failed.
 #[allow(clippy::too_many_lines)]
 pub async fn reverse(
     conn: &mut PgConnection,
@@ -1558,10 +1569,11 @@ pub async fn reverse(
             manifest.display()
         );
     }
-    if header.get("version").and_then(Value::as_i64) != Some(VERSION) {
+    let version = header.get("version").and_then(Value::as_i64);
+    if version != Some(VERSION) && version != Some(LEGACY_VERSION) {
         bail!(
-            "{} is a version {} manifest; this binary reverses version {VERSION} only. Nothing \
-             was done",
+            "{} is a version {} manifest; this binary reverses versions {VERSION} and \
+             {LEGACY_VERSION} only. Nothing was done",
             manifest.display(),
             header.get("version").unwrap_or(&Value::Null)
         );
@@ -1669,6 +1681,14 @@ pub async fn reverse(
                 named.join("; ")
             );
         }
+    }
+    if version == Some(LEGACY_VERSION) {
+        writeln!(
+            out,
+            "LEGACY-MANIFEST\tversion {LEGACY_VERSION}: its records are in their own batches, \
+             not their stamps', so this reversal is not batch-atomic: if it stops part way, \
+             stamps may be left without their records until it is re-run to finish"
+        )?;
     }
     // Only what the run committed, per batch: each committed batch is
     // reversed in ONE transaction (its records and its labels together), so
