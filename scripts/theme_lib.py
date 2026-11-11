@@ -74,8 +74,13 @@ def not_intake_owned(alias="c"):
       * project_to_themes copies cluster_labels (filtered above);
         split_theme, maintain_themes.auto_split_theme and the
         create-with-centroid route write placeholder or derived labels;
-      * split_theme --dry-run and subcluster_outliers only print member text
-        to the maintenance operator running them, and store no label;
+      * split_theme --dry-run and subcluster_outliers are read-only reports
+        that print member text to the maintenance operator running them and
+        store nothing. A theme an operator later creates from what they read
+        (create-with-centroid) carries a label that operator writes through a
+        separate route, as after any maintenance read; interactive_label is
+        filtered because it is itself the tool that stores what the operator
+        types;
       * the API's experiment `centroid_summary` is computed per request from
         a viewer-scoped neighborhood, so it shows only claims the caller can
         already read.
