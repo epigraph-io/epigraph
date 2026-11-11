@@ -8,7 +8,11 @@
 //! The claims it creates take `--visibility` / `--group-id` exactly as the MCP
 //! tools take `visibility` / `group_id`, resolved for the acting agent (the
 //! `--agent-key` signer). Omitted, they resolve D-V1 (team, else private), so
-//! an operator ingest is never public unless `--visibility public` says so.
+//! an operator ingest's claims are never public unless `--visibility public`
+//! says so. Where they landed is printed on stderr. The setting scopes the
+//! CLAIMS only: the `papers` row (title, DOI, journal), the author agents and
+//! the `processed_by` stamp stay world-readable whatever it is, so do not
+//! ingest a confidential document (docs/tenancy/papers-tenancy-followup.md).
 
 use std::path::PathBuf;
 
@@ -17,7 +21,7 @@ use clap::Parser;
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
-use epigraph_mcp::tools::ingestion::do_ingest_document;
+use epigraph_mcp::tools::ingestion::{do_ingest_document_reporting, IngestTenancy};
 use epigraph_mcp::EpiGraphMcpFull;
 
 #[derive(Parser, Debug)]
@@ -46,8 +50,11 @@ struct Cli {
 
     /// Who reads the claims this ingest creates: `team`, `private` or
     /// `public`. Omitted, the acting agent's D-V1 default applies: its default
-    /// team, else its human's, else its only writable team, else private.
-    /// Never public unless asked (operator ruling, 2026-11-10).
+    /// team if still writable, else its human's under the same condition, else
+    /// its only writable team, else private. Never public unless asked
+    /// (operator ruling, 2026-11-10). Claims only: the paper's own record
+    /// (title, DOI), its author agents and its processed-by stamp stay
+    /// world-readable. The outcome is printed on stderr.
     #[arg(long)]
     visibility: Option<String>,
 
@@ -133,9 +140,10 @@ async fn run(
     // The acting agent is this server's signer (no `auth`), so `choice`
     // resolves against IT: an omitted `--visibility` is D-V1 for that agent,
     // never public.
-    let result = do_ingest_document(&server, viewer, &extraction, None, choice)
-        .await
-        .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
+    let (result, tenancy) =
+        do_ingest_document_reporting(&server, viewer, &extraction, None, choice)
+            .await
+            .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
     let text = result
         .content
         .first()
@@ -143,8 +151,27 @@ async fn run(
         .map(|t| t.text.as_str())
         .ok_or_else(|| anyhow!("ingest_document returned no text content"))?;
 
+    // stdout stays the ingest's JSON; where the claims landed goes to stderr,
+    // because a default ingest by a teamless agent (the built-in signer with no
+    // `--agent-key`) lands PRIVATE, and an operator must not have to guess.
+    eprintln!("{}", tenancy_line(&tenancy));
     println!("{text}");
     Ok(())
+}
+
+/// The one stderr line that says where this run's new claims landed.
+fn tenancy_line(t: &IngestTenancy) -> String {
+    let mut line = format!(
+        "ingest-document: new claims written {} (owner group {}); claims it converged onto \
+         keep their own visibility; the paper record itself is not tenanted",
+        t.visibility.to_uppercase(),
+        t.owner_group_id
+    );
+    if let Some(note) = &t.note {
+        line.push_str("; ");
+        line.push_str(note);
+    }
+    line
 }
 
 fn signer_from_cli(agent_key: Option<&str>) -> anyhow::Result<AgentSigner> {

@@ -21,6 +21,8 @@
 //! * no `--visibility`, the agent writes no team: every claim is `group` over
 //!   its own personal group (private), none public;
 //! * `--visibility public`: public, so a caller can still ask for it;
+//! * no `--agent-key` (the built-in teamless signer): private, and the stderr
+//!   line says so; the only-team and public cases check that line too;
 //! * `--visibility public --group-id <uuid>`: refused before any connection,
 //!   as the MCP tools refuse it.
 
@@ -156,13 +158,20 @@ async fn assert_all_in(pool: &PgPool, agent: Uuid, team: Uuid, run: &Run, why: &
 }
 
 async fn ingest(pool: &PgPool, agent_key: &str, extra: &[&str]) -> Run {
+    run_cli(pool, Some(agent_key), extra).await
+}
+
+/// Run the binary; `agent_key: None` omits `--agent-key`, so the CLI acts as
+/// its built-in `document-ingest-cli` signer.
+async fn run_cli(pool: &PgPool, agent_key: Option<&str>, extra: &[&str]) -> Run {
     let url = fixture::database_url_for(pool).await;
     let file = extraction_file();
-    let out = Command::new(BIN)
-        .arg("--file")
-        .arg(&file)
-        .arg("--agent-key")
-        .arg(agent_key)
+    let mut cmd = Command::new(BIN);
+    cmd.arg("--file").arg(&file);
+    if let Some(key) = agent_key {
+        cmd.arg("--agent-key").arg(key);
+    }
+    let out = cmd
         .args(extra)
         .env("DATABASE_URL", &url)
         .env("MAINTENANCE_DATABASE_URL", &url)
@@ -212,6 +221,7 @@ async fn a_default_cli_ingest_lands_in_the_acting_agents_only_team(pool: PgPool)
             "a default CLI ingest goes to the acting agent's only team, never public: {rows:?}"
         );
     }
+    assert_tenancy_line(&run, "TEAM", team, None);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -262,6 +272,7 @@ async fn an_explicit_public_cli_ingest_lands_public(pool: PgPool) {
         rows.iter().all(|(v, _, _)| v == "public"),
         "an explicit --visibility public still writes public: {rows:?}"
     );
+    assert_tenancy_line(&run, "PUBLIC", rows[0].1, None);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -410,4 +421,70 @@ async fn a_writable_own_default_beats_the_humans_default_team(pool: PgPool) {
         "the agent's own writable default team comes before its human's",
     )
     .await;
+}
+
+/// The stderr line the CLI prints after a successful ingest: the visibility,
+/// the owner group and, when given, a fragment of D-V1's note. stdout stays the
+/// ingest's JSON.
+fn assert_tenancy_line(run: &Run, visibility: &str, owner: Uuid, note: Option<&str>) {
+    let line = run
+        .stderr
+        .lines()
+        .find(|l| l.starts_with("ingest-document: new claims written "))
+        .unwrap_or_else(|| panic!("no tenancy line on stderr:\n{}", run.show()));
+    assert!(
+        line.contains(&format!("written {visibility} (owner group {owner})")),
+        "the line names where the claims landed ({visibility}, {owner}): {line}"
+    );
+    if let Some(note) = note {
+        assert!(line.contains(note), "the line carries D-V1's note: {line}");
+    }
+    assert!(
+        !run.stdout.contains("ingest-document: new claims written"),
+        "the tenancy line is on stderr, not in the JSON on stdout:\n{}",
+        run.show()
+    );
+}
+
+/// The most common invocation: no `--agent-key`, so the CLI acts as its
+/// built-in `document-ingest-cli` agent, which writes no team. The paper's
+/// claims land PRIVATE in that agent's personal group, and the CLI says so
+/// on stderr rather than leave the operator to assume a team.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_default_cli_ingest_without_an_agent_key_lands_private_and_says_so(pool: PgPool) {
+    let run = run_cli(&pool, None, &[]).await;
+    assert_eq!(run.code, Some(0), "{}", run.show());
+
+    let pk = epigraph_crypto::did_key::keypair_from_name("document-ingest-cli").public_key();
+    let agent: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind(pk.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("the built-in signer was registered by the run");
+    let rows = authored(&pool, agent).await;
+    assert!(
+        rows.len() >= 3,
+        "claims were created: {rows:?}\n{}",
+        run.show()
+    );
+    let personal: Uuid = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("the built-in agent's personal group");
+    for (visibility, owner, kind) in &rows {
+        assert_eq!(
+            (visibility.as_str(), *owner, kind.as_str()),
+            ("group", personal, "personal"),
+            "the teamless built-in agent's default ingest is private, never public: {rows:?}"
+        );
+    }
+    assert_tenancy_line(
+        &run,
+        "PRIVATE",
+        personal,
+        Some("no visibility was named and you may write no team, so this is PRIVATE"),
+    );
 }

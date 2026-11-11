@@ -1030,15 +1030,20 @@ struct PlanEdgeForDs {
 /// `choice`; claims it converges onto keep their own tenancy.
 ///
 /// `choice` is required, with no defaulted wrapper (operator ruling,
-/// 2026-11-10: a paper an agent ingests goes to its team, never silently
-/// public). The MCP tools pass what the caller named, and
+/// 2026-11-10: the claims of a paper an agent ingests go to its team, never
+/// silently public). The MCP tools pass what the caller named, and
 /// [`epigraph_core::VisibilityChoice::Default`] when it named nothing, which
-/// resolves D-V1: the author's default team, else its human's, else its only
-/// writable team, else private. The operator `ingest-document` CLI does the
-/// same from its `--visibility` / `--group-id` flags. A test harness that
-/// needs a public paper passes [`epigraph_core::VisibilityChoice::Public`].
-/// See docs/tenancy/claim-visibility-controls.md section 3.1.
-#[allow(clippy::too_many_lines)]
+/// resolves D-V1: the author's default team if still writable, else its
+/// human's under the same condition, else its only writable team, else
+/// private. The operator `ingest-document` CLI does the same from its
+/// `--visibility` / `--group-id` flags. A test harness that needs a public
+/// paper passes [`epigraph_core::VisibilityChoice::Public`].
+///
+/// `choice` scopes the CLAIMS only. The `papers` row (title, DOI, journal),
+/// the author agents and the `processed_by` stamp carry no tenancy and stay
+/// world-readable whatever `choice` is. See
+/// docs/tenancy/claim-visibility-controls.md section 3.1 and
+/// docs/tenancy/papers-tenancy-followup.md.
 pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1046,6 +1051,38 @@ pub async fn do_ingest_document(
     auth: Option<&epigraph_auth::AuthContext>,
     choice: epigraph_core::VisibilityChoice,
 ) -> Result<CallToolResult, McpError> {
+    do_ingest_document_reporting(server, viewer, extraction, auth, choice)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Where an ingest put the claims it created: what
+/// [`do_ingest_document_reporting`] actually resolved and wrote with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestTenancy {
+    /// `"team"`, `"private"` or `"public"`.
+    pub visibility: &'static str,
+    /// The owning group of every claim the ingest created.
+    pub owner_group_id: Uuid,
+    /// D-V1's note when a default fell back to private.
+    pub note: Option<String>,
+}
+
+/// [`do_ingest_document`], also returning the [`IngestTenancy`] its new claims
+/// were written with, so a synchronous caller (the operator `ingest-document`
+/// CLI) can tell its operator where the paper's claims landed. The response
+/// itself is unchanged (spec section 3.1).
+///
+/// # Errors
+/// Every error of [`do_ingest_document`].
+#[allow(clippy::too_many_lines)]
+pub async fn do_ingest_document_reporting(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    choice: epigraph_core::VisibilityChoice,
+) -> Result<(CallToolResult, IngestTenancy), McpError> {
     // D9 writer-side verbatim re-verification: when the extraction carries
     // `source_text`, every span-backed paragraph's stored `text` must equal the
     // bytes its span points at. Fail closed before any DB write so paraphrase
@@ -1665,7 +1702,16 @@ pub async fn do_ingest_document(
         });
     }
 
-    success_json(&IngestDocumentResponse {
+    let tenancy = IngestTenancy {
+        visibility: resolution.label(),
+        owner_group_id: decl.owner_group_bind().ok_or_else(|| {
+            crate::errors::internal_error_text(
+                "ingest_document: the claims' owner group did not resolve",
+            )
+        })?,
+        note: resolution.note(),
+    };
+    let result = success_json(&IngestDocumentResponse {
         paper_id: paper_id.to_string(),
         paper_title,
         synthesized_key: is_synthetic_key(&doi),
@@ -1680,7 +1726,8 @@ pub async fn do_ingest_document(
         converged_claims_unlabelled: converged_unlabelled,
         converged_claims_caller_labels_withheld: caller_labels_withheld,
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
-    })
+    })?;
+    Ok((result, tenancy))
 }
 
 /// Convert a DOI into a slug form safe for use as a URL path segment or
