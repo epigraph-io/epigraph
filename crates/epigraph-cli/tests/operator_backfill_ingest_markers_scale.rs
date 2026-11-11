@@ -643,13 +643,16 @@ fn self_join_chains(cut: &str) -> String {
 }
 
 /// The one-pass chain census counts exactly what the self-join counted, on
-/// a sampled production-shaped corpus (a tenth: every paper size, heavy and
-/// shared-claim chains, conflicting and retracted legs) where agent
-/// assertions close chains of two principals. Not gated: it runs in CI.
+/// a sampled production-shaped corpus (a quarter: every paper size, heavy
+/// and shared-claim chains, conflicting and retracted legs) where agent
+/// assertions close chains of two principals, some through three or more
+/// papers (more chains on another principal than multi-principal
+/// assertions: which chain is chosen moves the count). Not gated: it runs
+/// in CI.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_one_pass_chain_census_counts_what_the_self_join_counted(pool: PgPool) {
     use epigraph_cli::operator::backfill_markers::{census, parse_written_before, Options};
-    let cutoff = seed(&pool, "0.1").await;
+    let cutoff = seed(&pool, "0.25").await;
     let (ingest, attest) = signers(&pool).await;
     let url = fixture::database_url_for(&pool).await;
     let mut conn = sqlx::PgConnection::connect(&url).await.expect("connect");
@@ -688,8 +691,9 @@ async fn the_one_pass_chain_census_counts_what_the_self_join_counted(pool: PgPoo
         c.chains, c.chains_on_another_principal, c.agent_asserts_multi_principal
     );
     assert!(
-        oracle.0 > 10_000 && oracle.1 > 0 && oracle.2 > 0,
-        "the sample must hold chains on another principal: {oracle:?}"
+        oracle.0 > 10_000 && oracle.2 > 0 && oracle.1 > oracle.2,
+        "the sample must hold agent assertions with two or more chains on another \
+         principal: {oracle:?}"
     );
     assert_eq!(
         (
