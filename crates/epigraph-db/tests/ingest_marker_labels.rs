@@ -12,8 +12,11 @@
 //! * the countersign definer: no principal and a stranger are refused with
 //!   nothing written; the named person confirms (the card stops counting the
 //!   paper as pending), a non-pending row is a no-op, the agent's live
-//!   operator may act, every act is audited, and a DECLINED naming never
-//!   stops the person's own later ingest of the same fact.
+//!   operator may act (its link while not retired, else its unrevoked client
+//!   allowance), a retired link's former operator and a revoked allowance's
+//!   operator may not (a retired link never falls back to an allowance), every
+//!   act is audited, and a DECLINED naming never stops the person's own later
+//!   ingest of the same fact.
 //!
 //! The application-path cases run on an `epigraph_app` `ScopedPool`
 //! transaction stamped from the caller's viewer, as a request would.
@@ -533,4 +536,191 @@ async fn a_declined_naming_never_stops_the_persons_own_row(pool: PgPool) {
         !created && row.id == e,
         "the naming ingest's re-run dedups onto its declined row"
     );
+}
+
+/// Retire `agent`'s live link through migration 191's maintenance verb.
+async fn retire_link(pool: &PgPool, agent: Uuid) {
+    let outcome: String = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: String = sqlx::query_scalar(
+            "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'countersign test', \
+                                                                     true)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("retire the link");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(outcome, "retired", "CALIBRATION: the link was live");
+}
+
+/// A fresh agent bound to `operator` by a migration-149 client allowance (a
+/// service client on the maintenance-only registry). Returns
+/// `(agent, client)`.
+async fn allowance_bound(pool: &PgPool, operator: Uuid, name: &str) -> (Uuid, Uuid) {
+    let (agent, _) = fixture::seed_agent_with_group(pool, name).await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'countersign allowance fixture', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("countersign-allowance-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("service client");
+    let allowed: bool = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT allowed_now FROM public.epigraph_allow_author_binding_client($1, $2, $3)",
+        )
+        .bind(client)
+        .bind(operator)
+        .bind("countersign test")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("allow the client for the operator");
+        (conn, r)
+    })
+    .await;
+    assert!(allowed, "CALIBRATION: the allowance is in force");
+    (agent, client)
+}
+
+async fn countersign_audit_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type LIKE 'authorship.countersign%'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("audit")
+}
+
+/// A retired link's former operator may no longer act for the agent, and
+/// a retired link never falls back to the operator's still-unrevoked client
+/// allowance for the same agent: CSG02, nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_links_former_operator_cannot_countersign(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "cs-retired-ingester").await;
+    let (h, _) = fixture::seed_human_operator(&pool, "cs-retired-operator").await;
+    // An allowance first (its client revoked, as 149 requires before a
+    // link), then the link: the allowance row stays unrevoked.
+    let (g, client) = allowance_bound(&pool, h, "cs-retired-agent").await;
+    sqlx::query("UPDATE oauth_clients SET status = 'revoked' WHERE id = $1")
+        .bind(client)
+        .execute(&pool)
+        .await
+        .expect("client revoked");
+    let link = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_operator(&mut conn, g, h).await;
+        (conn, r)
+    })
+    .await
+    .expect("link");
+    assert!(link.link_live, "CALIBRATION: live link");
+
+    // While the link is live, the operator acts.
+    let p0 = paper(&pool, "10.9999/countersign.retired-live").await;
+    pending_naming(&pool, s, g, p0).await;
+    let rows = countersign(&pool, &scoped, h, p0, Some(g), CountersignDecision::Confirm)
+        .await
+        .expect("CALIBRATION: the live operator confirms");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(countersign_audit_rows(&pool).await, 1);
+
+    retire_link(&pool, g).await;
+    let unrevoked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM author_binding_clients WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(g)
+    .fetch_one(&pool)
+    .await
+    .expect("allowance rows");
+    assert_eq!(unrevoked, 1, "CALIBRATION: the allowance row is unrevoked");
+
+    let p = paper(&pool, "10.9999/countersign.retired").await;
+    let e = pending_naming(&pool, s, g, p).await;
+    let state0 = edge_state(&pool, e).await;
+    for decision in [CountersignDecision::Confirm, CountersignDecision::Decline] {
+        let r = countersign(&pool, &scoped, h, p, Some(g), decision).await;
+        assert!(
+            refused(&r, "CSG02"),
+            "a retired link's former operator acted: {r:?}"
+        );
+    }
+    assert_eq!(edge_state(&pool, e).await, state0, "nothing written");
+    assert_eq!(countersign_audit_rows(&pool).await, 1, "no audit row");
+    assert_eq!(card(&pool, &scoped, s, g).await, (1, 1), "still pending");
+}
+
+/// An agent with no operator link is acted for by the operator its
+/// unrevoked client allowance names; once that allowance is revoked, the
+/// operator is refused CSG02 with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_allowance_bound_operator_countersigns_until_the_allowance_is_revoked(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (s, _) = fixture::seed_agent_with_group(&pool, "cs-allow-ingester").await;
+    let (h, _) = fixture::seed_human_operator(&pool, "cs-allow-operator").await;
+    let (t, _) = fixture::seed_agent_with_group(&pool, "cs-allow-stranger").await;
+    let (k, client) = allowance_bound(&pool, h, "cs-allow-agent").await;
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM operator_links WHERE agent_id = $1")
+        .bind(k)
+        .fetch_one(&pool)
+        .await
+        .expect("links");
+    assert_eq!(linked, 0, "CALIBRATION: bound by the allowance alone");
+
+    let p = paper(&pool, "10.9999/countersign.allowance").await;
+    let e = pending_naming(&pool, s, k, p).await;
+    let r = countersign(&pool, &scoped, t, p, Some(k), CountersignDecision::Confirm).await;
+    assert!(refused(&r, "CSG02"), "a stranger acted: {r:?}");
+    let rows = countersign(&pool, &scoped, h, p, Some(k), CountersignDecision::Confirm)
+        .await
+        .expect("the allowance's operator confirms for its agent");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].edge_id, rows[0].outcome.as_str()),
+        (e, "confirmed")
+    );
+    let (labels, in_force, _) = edge_state(&pool, e).await;
+    assert!(
+        labels.contains(&format!("epigraph:countersigned_by:{h}")),
+        "{labels:?}"
+    );
+    assert!(in_force);
+    let acting: serde_json::Value = sqlx::query_scalar(
+        "SELECT details -> 'acting_as' FROM security_events \
+          WHERE event_type = 'authorship.countersigned'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(acting, "operator");
+    assert_eq!(card(&pool, &scoped, t, k).await, (1, 0), "the card flips");
+
+    let revoked: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, \
+                                                                              'countersign test')",
+        )
+        .bind(client)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke the allowance");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the allowance was live");
+    let p2 = paper(&pool, "10.9999/countersign.allowance-revoked").await;
+    let e2 = pending_naming(&pool, s, k, p2).await;
+    let state0 = edge_state(&pool, e2).await;
+    let r = countersign(&pool, &scoped, h, p2, Some(k), CountersignDecision::Decline).await;
+    assert!(
+        refused(&r, "CSG02"),
+        "a revoked allowance's operator acted: {r:?}"
+    );
+    assert_eq!(edge_state(&pool, e2).await, state0, "nothing written");
+    assert_eq!(countersign_audit_rows(&pool).await, 1, "no audit row");
 }
