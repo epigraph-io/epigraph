@@ -108,9 +108,15 @@ async fn a_registered_author_key_reaches_ingest_document_as_agk01(pool: PgPool) 
 
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    let e = do_ingest_document(&server, &viewer, &extraction(), None)
-        .await
-        .expect_err("an author holding a registered system key is refused");
+    let e = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect_err("an author holding a registered system key is refused");
     assert_coded(
         &e,
         "AGK01",

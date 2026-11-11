@@ -55,10 +55,40 @@ Added to:
 * MCP `submit_claim`, `memorize`, and `batch_submit_claims`. For the batch it is per entry:
   `tests/batch_submit_claims_parity.rs` requires an entry to accept every `submit_claim` field.
 * MCP `ingest_document`, `ingest_document_inline` and `ingest_document_spine`. The setting applies
-  to every claim the ingest creates. Claims it converges onto keep their own tenancy.
-  `do_ingest_document` / `do_ingest_document_spine` keep writing public. They are the operator
-  CLI's and the test harness's entry points (section 3.5). The tools call the
-  `*_with_visibility` variants.
+  to every claim the ingest creates, with their evidence, traces and `asserts` edges. Claims it
+  converges onto keep their own tenancy.
+
+  **An ingest's visibility scopes its CLAIMS only.** The rest of what an ingest writes stays
+  world-readable whatever `visibility` says, because it has no row security:
+
+  * the `papers` row: title, DOI (or synthesized document key) and journal. `papers` has no
+    row-level security in any migration (127: "papers and workflows carry no tenancy"), and
+    `ensure_paper_node` writes it on the pool before the walk, with no `VisibilityChoice`;
+  * the author agents (`agents` rows named after the paper's authors) and their `authored`
+    edges to the paper;
+  * the paper's `processed_by` edge, which is what `check_already_ingested` reports;
+  * the `asserts` edge from the paper to every claim the ingest converged onto that is already
+    **public** (an existing atom with the same content). Both endpoints are public, so the edge
+    is public, and anyone can see which public statements the document contains. A converged
+    public claim the agent may write also gets the document's `doi:<doi>` label.
+
+  The paper-to-agent edges have a paper or agent endpoint, and the converged `asserts` edges
+  two public endpoints, so 120's `epigraph_edges_tenancy` keeps them all public. So for a
+  `team` or `private` ingest, the new claims are scoped, but anyone can learn that the
+  document exists, its title and DOI, who wrote it, that it was ingested, and which
+  already-public statements it asserts. **Do not ingest a confidential document until a follow-up adds tenancy to these
+  rows** (operator ruling, 2026-11-11). The follow-up's design is
+  [papers-tenancy-followup.md](papers-tenancy-followup.md).
+* The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting
+  agent (the `--agent-key` signer). Omitted, it is D-V1 like every other surface, so an operator
+  ingest's claims land in that agent's team, else private, and are never public unless
+  `--visibility public` says so (operator ruling, 2026-11-10: papers go to the ingester's team,
+  not public). As above, that covers the claims, not the paper's own record. The CLI prints
+  where the claims landed on stderr: the visibility, the owner group and, when the default fell
+  back to private, D-V1's note.
+  `do_ingest_document` / `do_ingest_document_spine`, the core the tools and the CLI share, take the
+  choice as a required argument and have no defaulted wrapper. A test harness that needs a public
+  paper passes `VisibilityChoice::Public` explicitly.
 * REST `POST /api/v1/submit`, as top-level `visibility` / `group_id` packet fields. They are
   **outside** `signable_bytes`: a routing choice of the authenticated caller, so existing
   signatures still verify. A team must also be writable by the caller's own stamp.
@@ -70,7 +100,9 @@ Added to:
 `submit_claim`, `memorize`, the batch entries, `POST /submit` and `POST /claims` responses gain
 `visibility` (`team` / `private` / `public`), `owner_group_id`, and `visibility_note`. The note is
 set when a default was resolved in a way the caller should know about (D-V1), or when an existing
-claim was returned (D-V4). Ingest responses are unchanged.
+claim was returned (D-V4). Ingest responses are unchanged. The operator `ingest-document` CLI,
+the one synchronous ingest caller, prints the resolved visibility, owner group and note on stderr
+instead (`do_ingest_document_reporting`).
 
 ### 3.2 Resolution (one function, every surface)
 
@@ -88,8 +120,11 @@ unstamped connection. The document ingest calls it directly, because its `owner_
 * `Team(Some(g))` → `g` must be one of `epigraph_writable_teams(author)`. Then the result is
   `TenancyDecl::group(g)`. Otherwise the call is refused (`Authority`) with nothing written. The
   refusal says a reader membership does not admit writes, and does not say whether `g` exists.
-* `Team(None)` / `Default` → D-V1. An explicit `Team(None)` that finds no single team is refused
-  (`Input`), because the caller asked for a team. `Default` falls back to private, with a note.
+* `Team(None)` / `Default` → D-V1. The agent's own default team if it is still writable, else its
+  live human's default team under the same condition (each checked on its own:
+  `default_group_of`, then `human_default_group_of`), else the single writable team. An explicit
+  `Team(None)` that finds no single team is refused (`Input`), because the caller asked for a
+  team. `Default` falls back to private, with a note.
 
 Resolution runs **before** the author-stamped transaction opens. When the author writes the team
 only through its human (`via = 'operator'`, D-V3), the result carries a `TeamWriteGrant`. Only
@@ -130,8 +165,8 @@ declaration into `create_claim_idempotent`.
 These keep `default_decl_for_author` (public over the home group):
 
 * the system-agent and registry writers: workflow ingest, which already has its own `tenancy`
-  parameter; conventions; policies and challenges; hypothesis; and the CLI binaries, including
-  the operator `ingest_document` CLI through `do_ingest_document`;
+  parameter; conventions; policies and challenges; hypothesis; and the CLI binaries other than
+  the operator `ingest-document` CLI (section 3.1);
 * `TenancyDecl` and the `Visibility` vocabulary;
 * the database's widening, sealed and owner-immutability guards.
 
@@ -156,6 +191,19 @@ team-or-private, where it used to write public:
   `public`.
 * The `ingest_git` / `ingest_literature` CLIs post to `/submit`, so they now default to
   team/private too.
+* **The operator `ingest-document` CLI** now defaults to team/private for its acting agent, the
+  `--agent-key` signer. Run with no `--agent-key`, that is the deterministic ingest-cli agent,
+  which belongs to no team, so its papers' claims land private in that agent's own personal
+  group, readable by no team member. The CLI says so on stderr (`... written PRIVATE (owner
+  group <id>) ...` with D-V1's note), so an operator is not left to assume a team. To put a
+  paper's claims in a team, run it with the key of an agent that writes the team (its own
+  membership, its human's, or its default team), or pass `--visibility team --group-id <team>`
+  for a team that agent writes. A human's default team reaches CLI ingests only through an
+  agent linked to that human. A paper that must be public takes `--visibility public`.
+  Whatever the flags, the paper's own record (title, DOI, journal), its author agents and its
+  `processed_by` stamp stay world-readable (section 3.1); a confidential document should not
+  be ingested until the follow-up in [papers-tenancy-followup.md](papers-tenancy-followup.md)
+  lands.
 * **`create_claim_core`'s structural edges** (AUTHORED, HAS_TRACE, DERIVED_FROM) used to be
   written after the commit on the unstamped pool, best-effort. A group-visible claim is
   invisible there, so the edge's reference check refused them silently. For a group-visible
@@ -197,8 +245,12 @@ The three writes' `UPDATE`s open
 a transaction-local "write window" (`search_path = public, pg_temp`) and close it straight
 after, because the legacy invoker triggers they fire (`trigger_validate_edge_refs` →
 `validate_edge_reference`) call unqualified functions and inherit the caller's path.
-The pattern is the same as the existing definers (`epigraph_record_cascade_deferral`,
-`epigraph_team_group_add_member`). Per `docs/tenancy.md#epigraph.allow_declassify`, the GUC is
+The window puts `public` on the path the way the 117, 120 and 164 definers (for example
+`epigraph_record_cascade_deferral` and `epigraph_team_group_add_member`) do, but those pin it
+function-wide (`SET search_path = pg_catalog, public` in 117 and 120, with `pg_temp` appended
+last by 190; `public, pg_temp` in 164). Here it is switched on at runtime with a
+transaction-local `set_config(.., true)`, only around the write statements, and switched back;
+206 is the only migration whose definers do this. Per `docs/tenancy.md#epigraph.allow_declassify`, the GUC is
 an interlock and not an authorization. **The authorization is the function body.** It runs as
 the session principal (`epigraph_principal_id()`), reads live memberships through
 `epigraph_live_memberships`, and does not trust a caller-supplied identity.
@@ -206,13 +258,21 @@ the session principal (`epigraph_principal_id()`), reads live memberships throug
 The bodies keep their working set (the per-claim classification) in local variables and arrays,
 never in a temporary table. A temporary table belongs to the calling session, not to the
 function's owner, so a caller could create one of the same name first and have the body use it
-with the owner's privileges. `definer_search_path_ratchet.rs`
-(`no_definer_keeps_state_in_a_session_temporary_relation`) refuses any definer body that creates
-or names a temporary relation.
+with the owner's privileges. The same holds for an INVOKER function or trigger a definer runs,
+since it runs as the definer's owner (the write window's `trigger_validate_edge_refs` →
+`validate_edge_reference`). `definer_search_path_ratchet.rs`
+(`no_function_keeps_state_in_a_session_temporary_relation`) refuses any such body that creates
+or names a temporary relation: it scans every function outside the system schemas and
+extensions, definer or not.
 
 ### 4.2 `epigraph_publicize_claims(p_claim_ids uuid[], p_reason text)`
 
 For each claim, in one transaction and all-or-nothing:
+
+The claims it may act on (the group-visible rows the session reads) are locked first, `FOR NO
+KEY UPDATE` in id order. A row another session is changing is waited for, and the
+classification then reads what that session committed, so an owner or visibility change cannot
+slip in between the decision and the write.
 
 Every id is classified first, in this order, and nothing changes unless every id comes out
 `publicize` or `already_public`:
@@ -229,15 +289,19 @@ Then, for the `publicize` claims:
 
 5. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
    visibility='public'` with the owner unchanged, then reset the GUC to `''` in the same body.
-   Propagation copies `public` onto the 17 derived tables. Pinned evidence stays `group`, and
-   its owner never moves.
+   The UPDATE moves a claim only while it is still `group` and still owned by the group it was
+   classified under. If fewer claims move than were classified (a claim that was not locked
+   because it became readable only after the lock, then changed), the call raises `VIS04`
+   (SQLSTATE 40001) and nothing is changed; the repo maps it to a `State` refusal (409 over
+   REST), and a retry classifies the new state. Propagation copies `public` onto the 17 derived
+   tables. Pinned evidence stays `group`, and its owner never moves.
 6. Recompute the edge meet for every edge incident to the claims, **widening allowed**. This is
    the same CASE as `recompute_boundary_meet_conn`: both endpoints public and in writer scope →
    `('public', writer_group_id)`, otherwise world. One endpoint still private → the private
    side's group. An edge explicitly declared `('group', G)` between public endpoints is kept,
    as 120 does on INSERT. That declaration is not recorded, so the rule is narrowed: only edges
-   whose current owner equals the meet that the old tenancy produces get rewritten. Anything
-   else was a declaration and is left alone.
+   whose whole `(visibility, owner_group_id, co_owner_group_id)` tuple equals the meet that the
+   old tenancy produces get rewritten. Anything else was a declaration and is left alone.
 7. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
    the principal and details `{claim_ids, owner_group_ids, reason, edges_widened,
    evidence_kept_private, migration, session_user}`.
@@ -268,7 +332,10 @@ Every id is classified first, in this order, all or nothing as in §4.2:
 | `refused_not_team_writer` | the target group is not writable by the caller, or is `H` |
 | `share` | to be moved; returned as `shared` once moved |
 
-If every id is `share`, the function runs `UPDATE claims SET owner_group_id = p_group_id`. Visibility stays
+The rows are locked before they are classified, as in §4.2. If every id is `share`, the
+function runs `UPDATE claims SET owner_group_id = p_group_id` on the claims still owned by `H`
+and still `group`, and raises `VIS04` (nothing changed) if fewer move than were classified, so
+it never answers `shared` or writes the audit row for a claim it did not move. Visibility stays
 `group`, so this is not a widening and the GUC is not armed. Propagation re-owns the derived
 rows. Pinned evidence keeps its pin owner. Edges take the meet as usual, since narrowing and
 group-to-group moves are not blocked. One `security_events` row, `claim.shared_with_team`, is
@@ -291,7 +358,7 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 
 ## 5. Tests (app role, `ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 
-`crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (10 tests):
+`crates/epigraph-mcp/tests/claim_visibility_controls_app_role.rs` (12 tests):
 
 * A member writes with no `visibility`. The claim lands `('group', team)`. Another team member
   reads it, and a non-member gets not-found. Derived evidence and trace rows match the claim.
@@ -313,6 +380,11 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 * A caller session that plants same-named temporary tables (with rows and a trigger that would
   rewrite a classification) before calling either act changes nothing: both answer with their
   own refusal, no claim moves, the trigger never runs and the planted rows stay as planted.
+* A privileged session changes a claim's owner and has not committed when `publicize_claims`
+  (or `share_claims_with_team`) is called on it. The call waits, then decides against the
+  committed owner: the admin of the old owner is refused as a non-admin of the new one (the
+  author's no-longer-private claim is refused as not private), the claim stays where the other
+  session put it, and nothing is audited.
 
 `crates/epigraph-api/tests/claim_visibility_http.rs` (3 tests): the REST write surfaces
 (`/claims`, `/submit/packet`) honour `visibility`, the three REST acts answer as MCP does, and a
@@ -320,8 +392,8 @@ REST resubmit that matches the caller's existing private claim reports its store
 the "NOT re-scoped" note.
 
 `crates/epigraph-db/tests/definer_search_path_ratchet.rs`
-(`no_definer_keeps_state_in_a_session_temporary_relation`): no definer body anywhere creates or
-names a temporary relation.
+(`no_function_keeps_state_in_a_session_temporary_relation`): no function body a definer can run
+(definer or INVOKER, so its helpers and triggers too) creates or names a temporary relation.
 
 `crates/epigraph-core/src/tenancy.rs`: `VisibilityChoice::parse` unit tests (bad pairs refused).
 
@@ -333,7 +405,8 @@ now measures the stamped structural edges), and the explicit-`public` fixtures.
 
 * **D-V1 default team.** If `agents.default_group_id` is set and still a team the author may
   write, it is used. Otherwise the author's own human's `default_group_id` is used under the
-  same condition. Otherwise the single team the author may write. Otherwise the write is
+  same condition, checked on its own, so a stale default of the agent's never hides a valid one
+  of its human's. Otherwise the single team the author may write. Otherwise the write is
   **private**, and the response carries a `visibility_note` saying why: no team, or several and
   no default. A default write **never** falls back to public. `default_group_id` (062) was
   unused. Migration 206 adds `epigraph_set_default_group`, served as MCP `set_default_group`

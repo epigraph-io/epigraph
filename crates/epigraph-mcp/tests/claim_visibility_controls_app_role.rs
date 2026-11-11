@@ -24,7 +24,9 @@
 //! * `share_claims_with_team`: a private claim moves into a team the author
 //!   writes, and not into one it does not;
 //! * neither act can be steered by temporary tables the calling session
-//!   created first.
+//!   created first;
+//! * both acts decide against the owner a concurrent session commits while
+//!   they wait for its row lock, never against the version they read first.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -926,4 +928,159 @@ async fn a_temp_table_planted_by_the_caller_cannot_steer_publicize_or_share(pool
     .await
     .expect("audit");
     assert_eq!(audited, 0, "nothing was acted on, so nothing is audited");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Part C: a concurrent owner change between the classification and the write
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Waits until some backend is blocked by `holder` (the test's own open
+/// transaction, so nothing else can match), or panics.
+async fn wait_until_blocked_by(pool: &PgPool, holder: i32) {
+    for _ in 0..400 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if blocked > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("no backend ever waited on the concurrent owner change (pid {holder})");
+}
+
+/// Changes `claim`'s owner to `to` in an open transaction on the superuser
+/// pool (a privileged session, as a maintenance privatization is) and returns
+/// it, uncommitted, with its backend pid.
+async fn hold_owner_change(
+    pool: &PgPool,
+    claim: Uuid,
+    to: Uuid,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = pool.begin().await.expect("begin the concurrent change");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pid");
+    let moved = sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(to)
+        .execute(&mut *tx)
+        .await
+        .expect("the concurrent owner change")
+        .rows_affected();
+    assert_eq!(moved, 1, "CALIBRATION: the concurrent change holds the row");
+    (tx, pid)
+}
+
+/// Publicize decides against the claim's CURRENT owner. A privileged session
+/// moves a team claim to another group (one where the publishing admin is only
+/// a writer) and has not committed when the admin calls publicize, which waits
+/// for it. Once it commits, the admin is refused as a non-admin of the new
+/// owner and the claim stays group-only, with no audit row. Before the rows
+/// were locked ahead of the classification, the call classified the old row
+/// version, waited only at its UPDATE, and then published a claim of a group
+/// the caller does not administer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_decides_on_the_owner_a_concurrent_change_commits(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let other = team(&pool, "elsewhere").await;
+    let (alice, _) = fixture::seed_agent_with_group(&pool, "vis-writer").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "vis-admin").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, eve, "admin").await;
+    add_member(&pool, other, eve, "writer").await;
+    let c = claim_of(
+        &write_as(&pool, &s, alice, submit("a contested finding", None, None))
+            .await
+            .expect("team claim"),
+    );
+    assert_eq!(tenancy(&pool, "claims", c).await, ("group".to_string(), t));
+
+    let (held, holder) = hold_owner_change(&pool, c, other).await;
+    let watcher = pool.clone();
+    let ids = [c];
+    let (answer, ()) = tokio::join!(publicize(&pool, &s, eve, &ids), async move {
+        wait_until_blocked_by(&watcher, holder).await;
+        held.commit().await.expect("commit the concurrent change");
+    });
+
+    let err = answer.expect_err("the admin of the OLD owner is not an admin of the new one");
+    assert!(err.message.contains("only a live admin"), "{err:?}");
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        ("group".to_string(), other),
+        "the concurrent change stands and nothing was published"
+    );
+    assert!(publicized_events(&pool).await.is_empty(), "nothing audited");
+}
+
+/// Share decides against the claim's CURRENT owner too. A privileged session
+/// moves the author's private claim out of its home group and has not
+/// committed when the author shares it; once it commits, the share is refused
+/// (no longer private) and nothing is audited. Before the rows were locked,
+/// the share's guarded UPDATE matched no row, and the call still answered
+/// `shared` and wrote an audit row naming the claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_decides_on_the_owner_a_concurrent_change_commits(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let other = team(&pool, "elsewhere").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "vis-alice").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, other, alice, "reader").await;
+    let c = claim_of(
+        &write_as(
+            &pool,
+            &s,
+            alice,
+            submit("a contested draft", Some("private"), None),
+        )
+        .await
+        .expect("private claim"),
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        ("group".to_string(), home)
+    );
+
+    let (held, holder) = hold_owner_change(&pool, c, other).await;
+    let watcher = pool.clone();
+    let av = viewer(&pool, alice).await;
+    let params = ShareClaimsWithTeamParams {
+        claim_ids: vec![c.to_string()],
+        group_id: t.to_string(),
+        reason: "share the draft".to_string(),
+    };
+    let bearer = token(alice);
+    let (answer, ()) = tokio::join!(
+        share_claims_with_team(&s.server, &av, params, Some(&bearer)),
+        async move {
+            wait_until_blocked_by(&watcher, holder).await;
+            held.commit().await.expect("commit the concurrent change");
+        }
+    );
+
+    let err = answer.expect_err("the claim is no longer private to the author's home");
+    assert!(
+        err.message.contains("not private to your home group"),
+        "{err:?}"
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        ("group".to_string(), other),
+        "the concurrent change stands and nothing was shared"
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'claim.shared_with_team'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 0, "nothing was shared, so nothing is audited");
 }

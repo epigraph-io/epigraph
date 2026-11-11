@@ -151,9 +151,15 @@ async fn assert_carries_caller_labels(pool: &PgPool, what: &str, content: &str, 
 async fn caller_labels_land_on_every_claim_the_document_ingest_writes(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document(&server, &viewer, &extraction(Some(&[STAGE, DATE])), None)
-        .await
-        .expect("document ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction(Some(&[STAGE, DATE])),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("document ingests");
 
     for (what, content) in [
         ("thesis (level 0)", THESIS),
@@ -172,9 +178,15 @@ async fn caller_labels_land_on_every_claim_the_document_ingest_writes(pool: PgPo
 async fn caller_labels_land_on_every_spine_node(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document_spine(&server, &viewer, &extraction(Some(&[STAGE, DATE])), None)
-        .await
-        .expect("spine ingests");
+    do_ingest_document_spine(
+        &server,
+        &viewer,
+        &extraction(Some(&[STAGE, DATE])),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("spine ingests");
 
     for (what, content) in [
         ("thesis (level 0)", THESIS),
@@ -383,6 +395,7 @@ async fn spine_refuses_an_unexpanded_caller_label_and_writes_nothing(pool: PgPoo
         &viewer,
         &extraction(Some(&[STAGE, "stage:$STAGE"])),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect_err("an unexpanded caller label must be refused");
@@ -406,9 +419,15 @@ async fn spine_refuses_an_unexpanded_caller_label_and_writes_nothing(pool: PgPoo
 async fn empty_caller_labels_change_nothing(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document(&server, &viewer, &extraction(None), None)
-        .await
-        .expect("document ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction(None),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("document ingests");
 
     let expected = vec![format!("doi:{DOI}")];
     for content in [THESIS, SECTION, PARAGRAPH, ATOM] {
@@ -444,6 +463,7 @@ async fn caller_labels_reach_a_converged_atom(pool: PgPool) {
             Some(&["stage:a"]),
         ),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("paper A ingests");
@@ -460,6 +480,7 @@ async fn caller_labels_reach_a_converged_atom(pool: PgPool) {
             Some(&["stage:b"]),
         ),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("paper B ingests");
@@ -488,12 +509,24 @@ async fn caller_labels_reach_a_converged_atom(pool: PgPool) {
 async fn caller_labels_reach_spine_nodes_a_rerun_resolves_to(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
-    do_ingest_document_spine(&server, &viewer, &extraction(Some(&["stage:a"])), None)
-        .await
-        .expect("first spine run");
-    do_ingest_document_spine(&server, &viewer, &extraction(Some(&["stage:b"])), None)
-        .await
-        .expect("second spine run");
+    do_ingest_document_spine(
+        &server,
+        &viewer,
+        &extraction(Some(&["stage:a"])),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("first spine run");
+    do_ingest_document_spine(
+        &server,
+        &viewer,
+        &extraction(Some(&["stage:b"])),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("second spine run");
 
     for (what, content) in [
         ("thesis (level 0)", THESIS),
@@ -534,12 +567,24 @@ async fn caller_labels_stay_off_spine_nodes_another_agent_wrote(pool: PgPool) {
         second.server_agent_id().await.expect("second agent"),
         "the two servers must be two agents, or this test proves nothing"
     );
-    do_ingest_document_spine(&first, &viewer, &extraction(Some(&["stage:a"])), None)
-        .await
-        .expect("first agent's spine");
-    let result = do_ingest_document_spine(&second, &viewer, &extraction(Some(&["stage:b"])), None)
-        .await
-        .expect("second agent's spine");
+    do_ingest_document_spine(
+        &first,
+        &viewer,
+        &extraction(Some(&["stage:a"])),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("first agent's spine");
+    let result = do_ingest_document_spine(
+        &second,
+        &viewer,
+        &extraction(Some(&["stage:b"])),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("second agent's spine");
 
     for (what, content) in [
         ("thesis (level 0)", THESIS),

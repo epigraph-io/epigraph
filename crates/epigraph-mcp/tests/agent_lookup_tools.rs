@@ -332,6 +332,7 @@ async fn each_ingest_credits_the_authors_it_names_and_no_other(pool: PgPool) {
         &v,
         &authors_extraction(doi, &[first_author], "first"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("the first principal's ingest");
@@ -354,6 +355,7 @@ async fn each_ingest_credits_the_authors_it_names_and_no_other(pool: PgPool) {
         &v,
         &authors_extraction(doi, &[first_author], "second"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("the second principal's document ingest");
@@ -362,6 +364,7 @@ async fn each_ingest_credits_the_authors_it_names_and_no_other(pool: PgPool) {
         &v,
         &authors_extraction(doi, &[first_author, added], "second-spine"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("the second principal's spine ingest");
@@ -394,6 +397,7 @@ async fn each_ingest_credits_the_authors_it_names_and_no_other(pool: PgPool) {
         &v,
         &authors_extraction(doi, &[unrelated], "third"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("the third principal's ingest");
@@ -461,13 +465,25 @@ async fn the_card_counts_every_attribution_the_real_ingest_writes(pool: PgPool) 
     ] {
         let x = one_author_extraction(doi, author, walk);
         if walk == "document" {
-            tools::ingestion::do_ingest_document(&ingester, &v, &x, None)
-                .await
-                .expect("document ingest");
+            tools::ingestion::do_ingest_document(
+                &ingester,
+                &v,
+                &x,
+                None,
+                epigraph_core::VisibilityChoice::Public,
+            )
+            .await
+            .expect("document ingest");
         } else {
-            tools::ingestion::do_ingest_document_spine(&ingester, &v, &x, None)
-                .await
-                .expect("spine ingest");
+            tools::ingestion::do_ingest_document_spine(
+                &ingester,
+                &v,
+                &x,
+                None,
+                epigraph_core::VisibilityChoice::Public,
+            )
+            .await
+            .expect("spine ingest");
         }
         let node: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE display_name = $1")
             .bind(author)

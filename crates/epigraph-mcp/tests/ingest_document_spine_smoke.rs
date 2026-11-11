@@ -101,6 +101,7 @@ async fn spine_fresh_paper_returns_new_paragraph_paths(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingest succeeds");
@@ -142,6 +143,7 @@ async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &abstract_extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("abstract spine ingest succeeds");
@@ -157,6 +159,7 @@ async fn abstract_then_full_paper_abstract_paras_deduped(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &full_extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("full spine ingest succeeds");
@@ -198,6 +201,7 @@ async fn full_reingest_returns_already_ingested(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("first spine ingest");
@@ -206,6 +210,7 @@ async fn full_reingest_returns_already_ingested(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("second spine ingest");
@@ -246,6 +251,7 @@ async fn spine_rejects_placeholder_author(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingest succeeds — a bad author name is dropped, not fatal");
@@ -329,6 +335,7 @@ async fn spine_placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingest succeeds");
@@ -401,6 +408,7 @@ async fn spine_existing_placeholder_agent_is_not_reused(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &extraction,
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingest succeeds");

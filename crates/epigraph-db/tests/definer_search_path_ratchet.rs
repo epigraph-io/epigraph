@@ -31,11 +31,12 @@
 //!   path is only `pg_catalog, pg_temp` names every `public` relation, type and
 //!   function it uses schema-qualified, because on that path an unqualified
 //!   relation or type name is not looked up in `public`.
-//! * [`no_definer_keeps_state_in_a_session_temporary_relation`]: no definer
-//!   body creates a temporary relation or names a `pg_temp`-qualified one. A
-//!   temporary relation is the calling SESSION's, so the caller can create a
-//!   same-named one first and the body would use it with its owner's rights.
-//!   No allowlist.
+//! * [`no_function_keeps_state_in_a_session_temporary_relation`]: no function
+//!   body a definer can run (the definers themselves, and the INVOKER helpers
+//!   and triggers they run as their owner) creates a temporary relation or
+//!   names a `pg_temp`-qualified one. A temporary relation is the calling
+//!   SESSION's, so the caller can create a same-named one first and the body
+//!   would use it with the owner's rights. No allowlist.
 //! * [`the_refresh_and_revocation_family_resolves_in_pg_catalog_only`][]: the
 //!   OAuth refresh-token and access-token revocation definers (the family the
 //!   backlog item names first) are on 172's form, keep their owner and grants.
@@ -1153,7 +1154,44 @@ fn session_temp_uses(src: &str) -> BTreeSet<&'static str> {
         .collect()
 }
 
-/// Probe definers for [`no_definer_keeps_state_in_a_session_temporary_relation`]:
+/// Every function body a definer can run, by `schema.name(argument types)`:
+/// every function and procedure outside the system schemas and outside any
+/// extension, SECURITY DEFINER or not, except those whose body is a C symbol
+/// (`c`, `internal`), with `prosecdef`.
+///
+/// Not only the definers: an INVOKER function a definer calls, and an INVOKER
+/// trigger a definer's statement fires, run with `current_user` = the
+/// definer's owner, so a temporary relation one of them creates or names is
+/// the caller's to plant exactly as if the definer named it. 206's write
+/// window fires 001's invoker `trigger_validate_edge_refs` ->
+/// `validate_edge_reference`, for one. The set is wider than what a definer
+/// can reach (an invoker function the caller runs directly gains nothing), and
+/// deliberately so: walking calls, dynamic SQL and the triggers each statement
+/// fires is a fragile analysis, and the superset costs nothing at head.
+async fn function_bodies(pool: &PgPool) -> BTreeMap<String, (bool, String)> {
+    let rows: Vec<(String, bool, String)> = sqlx::query_as(
+        "SELECT format('%s.%s(%s)', n.nspname, p.proname, \
+                           pg_catalog.oidvectortypes(p.proargtypes)), \
+                    p.prosecdef, p.prosrc \
+               FROM pg_catalog.pg_proc p \
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+              WHERE l.lanname NOT IN ('c', 'internal') \
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                AND n.nspname !~ '^pg_(toast|temp)' \
+                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                 WHERE d.classid = 'pg_catalog.pg_proc'::regclass \
+                                   AND d.objid = p.oid AND d.deptype = 'e')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the function bodies");
+    rows.into_iter()
+        .map(|(sig, secdef, src)| (sig, (secdef, src)))
+        .collect()
+}
+
+/// Probe functions for [`no_function_keeps_state_in_a_session_temporary_relation`]:
 /// each form it must report, and one it must not.
 const TEMP_PROBES: &str = r#"
 CREATE FUNCTION public.tmp_probe_static() RETURNS integer
@@ -1180,9 +1218,17 @@ BEGIN
     PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);
     RETURN 1;
 END $$;
+CREATE FUNCTION public.tmp_probe_invoker_trigger() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    CREATE TEMP TABLE IF NOT EXISTS tmp_probe_seen (x integer);
+    RETURN NEW;
+END $$;
 "#;
 
-/// No SECURITY DEFINER body keeps state in a session-temporary relation.
+/// No function a SECURITY DEFINER body can run keeps state in a
+/// session-temporary relation: not the definers, and not the INVOKER helpers
+/// and triggers they run as their owner ([`function_bodies`]).
 ///
 /// A temporary relation belongs to the SESSION, not to the definer's owner, so
 /// the caller can create one of the same name before the call (with its own
@@ -1194,26 +1240,38 @@ END $$;
 /// `a_temp_table_planted_by_the_caller_cannot_steer_publicize_or_share`
 /// (epigraph-mcp). No allowlist.
 #[sqlx::test(migrations = "../../migrations")]
-async fn no_definer_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
-    let scan = |defs: &BTreeMap<String, Definer>| -> BTreeMap<String, BTreeSet<&'static str>> {
-        defs.iter()
-            .map(|(sig, d)| (sig.clone(), session_temp_uses(&d.src)))
-            .filter(|(_, forms)| !forms.is_empty())
-            .collect()
-    };
-    let at_head_defs = definers(&pool).await;
+async fn no_function_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
+    let scan =
+        |fns: &BTreeMap<String, (bool, String)>| -> BTreeMap<String, BTreeSet<&'static str>> {
+            fns.iter()
+                .map(|(sig, (_, src))| (sig.clone(), session_temp_uses(src)))
+                .filter(|(_, forms)| !forms.is_empty())
+                .collect()
+        };
+    let at_head_fns = function_bodies(&pool).await;
+    let definer_count = at_head_fns.values().filter(|(secdef, _)| *secdef).count();
     assert!(
-        at_head_defs.len() > 100,
-        "CALIBRATION: the scan sees the schema's definers ({})",
-        at_head_defs.len()
+        definer_count > 100 && at_head_fns.len() > definer_count,
+        "CALIBRATION: the scan sees the schema's definers ({definer_count}) and more \
+         ({} functions)",
+        at_head_fns.len()
     );
-    let at_head = scan(&at_head_defs);
+    for invoker in [
+        "public.trigger_validate_edge_refs()",
+        "public.validate_edge_reference(uuid, character varying)",
+    ] {
+        assert!(
+            at_head_fns.get(invoker).is_some_and(|(secdef, _)| !secdef),
+            "CALIBRATION: the scan sees {invoker}, an INVOKER function 206's write window runs"
+        );
+    }
+    let at_head = scan(&at_head_fns);
 
     sqlx::raw_sql(TEMP_PROBES)
         .execute(&pool)
         .await
         .expect("probes");
-    let with_probes = scan(&definers(&pool).await);
+    let with_probes = scan(&function_bodies(&pool).await);
     let probed: BTreeMap<&str, &BTreeSet<&str>> = with_probes
         .iter()
         .filter(|(k, _)| !at_head.contains_key(*k))
@@ -1227,6 +1285,10 @@ async fn no_definer_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
                 &BTreeSet::from(["CREATE TEMP"])
             ),
             (
+                "public.tmp_probe_invoker_trigger()",
+                &BTreeSet::from(["CREATE TEMP"])
+            ),
+            (
                 "public.tmp_probe_reads()",
                 &BTreeSet::from(["pg_temp-qualified relation"])
             ),
@@ -1235,15 +1297,15 @@ async fn no_definer_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
                 &BTreeSet::from(["CREATE TEMP", "pg_temp-qualified relation"])
             ),
         ]),
-        "CALIBRATION: the static, dynamic-SQL and qualified-read probes are reported, and a \
-         body that only sets a search_path naming pg_temp is not"
+        "CALIBRATION: the static, dynamic-SQL, qualified-read and INVOKER-trigger probes are \
+         reported, and a body that only sets a search_path naming pg_temp is not"
     );
 
     assert!(
         at_head.is_empty(),
-        "{} SECURITY DEFINER function(s) create or name a session-temporary relation, which \
-         the caller's session can create first. Keep the state in local variables, arrays \
-         or a CTE:\n{}",
+        "{} function(s) a SECURITY DEFINER body can run create or name a session-temporary \
+         relation, which the caller's session can create first. Keep the state in local \
+         variables, arrays or a CTE:\n{}",
         at_head.len(),
         at_head
             .iter()

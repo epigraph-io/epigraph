@@ -172,7 +172,7 @@ fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
     }
 }
 
-/// Map a migration-206 refusal (`VIS01`..`VIS03`) to a designed refusal, and
+/// Map a migration-206 refusal (`VIS01`..`VIS04`) to a designed refusal, and
 /// anything else to the ordinary conversion.
 fn map_vis_error(e: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(db) = &e {
@@ -186,6 +186,15 @@ fn map_vis_error(e: sqlx::Error) -> DbError {
         if msg.starts_with("VIS03") {
             return DbError::Refused {
                 kind: RefusalKind::Input,
+                message: msg.to_string(),
+            };
+        }
+        // A claim changed under the act after it was classified (migration
+        // 206, "DECIDED ON THE ROWS IT WRITES"); nothing was changed and a
+        // retry classifies the new state.
+        if msg.starts_with("VIS04") {
+            return DbError::Refused {
+                kind: RefusalKind::State,
                 message: msg.to_string(),
             };
         }
@@ -292,6 +301,30 @@ impl ClaimRepository {
         )
     }
 
+    /// `agents.default_group_id` of `agent`'s live human
+    /// (`epigraph_human_of(agent, true)`), read through the same definer. For
+    /// an agent with no live human it is `None`; for a human it is the human's
+    /// own default, i.e. [`Self::default_group_of`]'s answer again. Not
+    /// validated: [`Self::resolve_visibility_choice`] asks for it only when
+    /// [`Self::default_group_of`] gave no writable team (the case that matters:
+    /// the agent's own default is set but no longer writable, which hides the
+    /// human's), and uses it only while it is one of [`Self::writable_teams`]
+    /// (D-V1).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails or migration 206 is absent.
+    pub async fn human_default_group_of(
+        conn: &mut PgConnection,
+        agent: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT public.epigraph_default_group(public.epigraph_human_of($1, true))",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     /// Resolve a caller-facing write's [`VisibilityChoice`] for `agent`.
     ///
     /// * `Public`: `('public', home)`, today's answer, byte for byte.
@@ -300,8 +333,9 @@ impl ClaimRepository {
     ///   [`Self::writable_teams`]. Otherwise a refusal (`Authority`) that says a
     ///   reader membership does not admit writes, and does not say whether `g`
     ///   exists. `g == home` is refused (`Input`): that is `private`.
-    /// * `Team(None)` / `Default`: owner decision D-V1. The default group if it
-    ///   is still writable, else the only writable team. Otherwise `Default`
+    /// * `Team(None)` / `Default`: owner decision D-V1. The agent's own default
+    ///   team if it is still writable, else its live human's default team under
+    ///   the same condition, else the only writable team. Otherwise `Default`
     ///   lands PRIVATE with a note, and an explicit `Team(None)` is refused,
     ///   because the caller asked for a team and no single team is implied.
     ///   Never public.
@@ -381,10 +415,18 @@ impl ClaimRepository {
             }
             VisibilityChoice::Team(None) | VisibilityChoice::Default => {
                 let teams = Self::writable_teams(&mut *conn, agent).await?;
-                let default = Self::default_group_of(&mut *conn, agent).await?;
-                let picked = default
-                    .and_then(|d| teams.iter().find(|(t, _)| *t == d))
-                    .or_else(|| (teams.len() == 1).then(|| &teams[0]));
+                let writable =
+                    |d: Option<Uuid>| d.and_then(|d| teams.iter().find(|(t, _)| *t == d));
+                // D-V1's chain, each default checked on its own: the agent's
+                // default (`epigraph_default_group` answers the human's when the
+                // agent's is unset), and only when that one is set but no longer
+                // writable, the human's. Coalescing the two before the check
+                // would let a stale own default hide a valid human default.
+                let mut picked = writable(Self::default_group_of(&mut *conn, agent).await?);
+                if picked.is_none() {
+                    picked = writable(Self::human_default_group_of(&mut *conn, agent).await?);
+                }
+                let picked = picked.or_else(|| (teams.len() == 1).then(|| &teams[0]));
                 if let Some((g, via)) = picked {
                     return Ok(team_of(*g, via));
                 }
@@ -508,7 +550,9 @@ impl ClaimRepository {
     /// # Errors
     /// `DbError::NotFound` for a claim the session cannot read (or that does
     /// not exist); `DbError::Refused` (`Authority` for a non-admin, `State` for
-    /// a sealed claim, `Input` for a bad request) with nothing changed;
+    /// a sealed claim or for one that changed under the act after it was
+    /// classified (`VIS04`; retry), `Input` for a bad request) with nothing
+    /// changed;
     /// `DbError::QueryFailed` for faults.
     pub async fn publicize_conn(
         conn: &mut PgConnection,

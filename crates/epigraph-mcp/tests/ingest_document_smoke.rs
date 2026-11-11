@@ -68,9 +68,15 @@ async fn happy_path_ingests_full_hierarchy(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    let result = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest_document succeeds");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest_document succeeds");
 
     // Pull the paper_id out of the structured response.
     let payload = result_text(&result);
@@ -176,9 +182,15 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest_document succeeds");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest_document succeeds");
 
     let doi_label = "doi:10.1234/hierarchy-smoke";
     let labeled_count: (i64,) =
@@ -227,12 +239,24 @@ async fn re_ingest_same_paper_dedup_detected(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    let _first = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("first ingest");
-    let second = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("second ingest");
+    let _first = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("first ingest");
+    let second = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("second ingest");
 
     let payload = result_text(&second);
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap();
@@ -280,16 +304,28 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
         serde_json::from_str(&json).expect("fixture parses")
     };
 
-    let ch1 = do_ingest_document(&server, &viewer, &make_chapter(1), None)
-        .await
-        .expect("ch1 ingest");
+    let ch1 = do_ingest_document(
+        &server,
+        &viewer,
+        &make_chapter(1),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ch1 ingest");
     let ch1_json: serde_json::Value = serde_json::from_str(&result_text(&ch1)).unwrap();
     assert_eq!(ch1_json["already_ingested"], serde_json::json!(false));
     let paper_id = uuid::Uuid::parse_str(ch1_json["paper_id"].as_str().unwrap()).unwrap();
 
-    let ch2 = do_ingest_document(&server, &viewer, &make_chapter(2), None)
-        .await
-        .expect("ch2 ingest");
+    let ch2 = do_ingest_document(
+        &server,
+        &viewer,
+        &make_chapter(2),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ch2 ingest");
     let ch2_json: serde_json::Value = serde_json::from_str(&result_text(&ch2)).unwrap();
     assert_eq!(
         ch2_json["already_ingested"],
@@ -301,9 +337,15 @@ async fn per_chapter_version_gate_isolates_chunks(pool: PgPool) {
         "same paper row reused"
     );
 
-    let ch2_repeat = do_ingest_document(&server, &viewer, &make_chapter(2), None)
-        .await
-        .expect("ch2 re-ingest");
+    let ch2_repeat = do_ingest_document(
+        &server,
+        &viewer,
+        &make_chapter(2),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ch2 re-ingest");
     let repeat_json: serde_json::Value = serde_json::from_str(&result_text(&ch2_repeat)).unwrap();
     assert_eq!(
         repeat_json["already_ingested"],
@@ -367,12 +409,24 @@ async fn cross_paper_atom_and_author_converge(pool: PgPool) {
     let first: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     let second: DocumentExtraction = serde_json::from_str(FIXTURE_OVERLAP).expect("fixture parses");
 
-    let _ = do_ingest_document(&server, &viewer, &first, None)
-        .await
-        .expect("first ingest");
-    let res = do_ingest_document(&server, &viewer, &second, None)
-        .await
-        .expect("second ingest");
+    let _ = do_ingest_document(
+        &server,
+        &viewer,
+        &first,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("first ingest");
+    let res = do_ingest_document(
+        &server,
+        &viewer,
+        &second,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("second ingest");
 
     let payload = result_text(&res);
     let json: serde_json::Value = serde_json::from_str(&payload).unwrap();
@@ -437,9 +491,15 @@ async fn ingest_document_persists_planned_properties(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
 
-    do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest succeeds");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest succeeds");
 
     let count_with_props: i64 =
         sqlx::query_scalar("SELECT count(*) FROM claims WHERE properties::text != '{}'")
@@ -499,7 +559,14 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
         serde_json::from_value(extraction_json).expect("fixture parses");
 
     // Must not panic and must not return Err with a CHECK violation.
-    let result = do_ingest_document(&server, &viewer, &extraction, None).await;
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await;
     assert!(
         result.is_ok(),
         "expected ingest to succeed, got: {result:?}"
@@ -554,9 +621,15 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
     let extraction: epigraph_ingest::schema::DocumentExtraction =
         serde_json::from_value(extraction_json).expect("fixture parses");
 
-    do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest succeeds");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest succeeds");
 
     // Atom BBAs carry the normalized canonical tag.
     let empirical_bbas: i64 =
@@ -1136,9 +1209,15 @@ async fn query_paper_finds_url_form_ingest_by_bare_doi(pool: PgPool) {
     let mut extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
     extraction.source.doi = Some(format!("https://doi.org/{SMOKE_DOI}"));
 
-    do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest succeeds");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest succeeds");
 
     let paper = query_paper_json(&server, &pool, SMOKE_DOI).await;
     assert_eq!(paper["title"], "Test Hierarchical Paper", "{paper}");
@@ -1274,7 +1353,14 @@ async fn writer_rejects_span_text_drift(pool: PgPool) {
     }))
     .unwrap();
 
-    let err = do_ingest_document(&server, &viewer, &extraction, None).await;
+    let err = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await;
     let err = err.expect_err("drift between span and source_text must be rejected");
     assert!(
         err.message.contains("verbatim guard"),
@@ -1432,9 +1518,15 @@ async fn placeholder_author_name_mints_no_author_agent(pool: PgPool) {
         None,
     );
 
-    let result = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest_document succeeds — a bad author name is dropped, not fatal");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest_document succeeds — a bad author name is dropped, not fatal");
     let paper_id = paper_id_of(&result);
 
     assert_eq!(
@@ -1481,9 +1573,15 @@ async fn placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
         Some(byline_text),
     );
 
-    let result = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest_document succeeds");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest_document succeeds");
     let paper_id = paper_id_of(&result);
 
     assert_eq!(authored_by(&pool, paper_id, "Alice Smith").await, 1);
@@ -1519,9 +1617,15 @@ async fn mixed_real_and_placeholder_authors_keep_index_alignment(pool: PgPool) {
         None,
     );
 
-    let result = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest_document succeeds");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest_document succeeds");
     let paper_id = paper_id_of(&result);
 
     assert_eq!(
@@ -1572,9 +1676,15 @@ async fn existing_placeholder_agent_is_not_reused(pool: PgPool) {
         None,
     );
 
-    let result = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("ingest_document succeeds");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("ingest_document succeeds");
     let paper_id = paper_id_of(&result);
 
     assert_eq!(

@@ -718,6 +718,7 @@ async fn the_core_refuses_an_unknown_agent_id_and_writes_no_claim(pool: PgPool) 
             json!([{"name": "A Person", "agent_id": Uuid::new_v4().to_string()}]),
         ),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect_err("refused");
@@ -957,9 +958,15 @@ async fn an_mcp_server_refuses_to_replace_a_name_derived_author_and_writes_nothi
             );
         }
     }
-    let err = tools::ingestion::do_ingest_document(&server, &viewer, &again(), None)
-        .await
-        .expect_err("the walk refuses it too");
+    let err = tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &again(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect_err("the walk refuses it too");
     assert!(err.message.contains("REPLACE"), "{}", err.message);
 
     assert_eq!(
@@ -1000,9 +1007,15 @@ async fn the_operator_cli_replaces_the_name_derived_author_and_a_name_only_reing
         let (server, viewer) = (&server, &viewer);
         async move {
             text(
-                &tools::ingestion::do_ingest_document(server, viewer, &extraction, None)
-                    .await
-                    .expect("the core ingests"),
+                &tools::ingestion::do_ingest_document(
+                    server,
+                    viewer,
+                    &extraction,
+                    None,
+                    epigraph_core::VisibilityChoice::Public,
+                )
+                .await
+                .expect("the core ingests"),
             )
         }
     };
@@ -1499,9 +1512,15 @@ async fn query_paper_lists_only_in_force_authors_in_position_order_and_marks_the
         let (server, viewer) = (&server, &viewer);
         async move {
             text(
-                &tools::ingestion::do_ingest_document(server, viewer, &extraction, None)
-                    .await
-                    .expect("the core ingests"),
+                &tools::ingestion::do_ingest_document(
+                    server,
+                    viewer,
+                    &extraction,
+                    None,
+                    epigraph_core::VisibilityChoice::Public,
+                )
+                .await
+                .expect("the core ingests"),
             )
         }
     };
@@ -1648,9 +1667,15 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
     );
 
     // The same document, re-ingested by another ingester.
-    tools::ingestion::do_ingest_document(&b, &viewer, &doc1(), None)
-        .await
-        .expect("b re-ingests the first document");
+    tools::ingestion::do_ingest_document(
+        &b,
+        &viewer,
+        &doc1(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("b re-ingests the first document");
     assert_eq!(
         ingest_records(&pool, only1).await,
         sorted(vec![
@@ -1660,9 +1685,15 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         "every later ingester of the same document is recorded"
     );
     // A re-run by the same ingester adds nothing.
-    tools::ingestion::do_ingest_document(&a, &viewer, &doc1(), None)
-        .await
-        .expect("a re-runs");
+    tools::ingestion::do_ingest_document(
+        &a,
+        &viewer,
+        &doc1(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("a re-runs");
     assert_eq!(
         ingest_records(&pool, x).await.len(),
         3,
@@ -1747,6 +1778,7 @@ async fn a_strangers_pending_naming_is_not_kept_for_a_later_ingester(pool: PgPoo
             &viewer,
             &doc(doi, json!([{"name": name}])),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the honest re-ingest"),
@@ -1776,6 +1808,7 @@ async fn a_strangers_pending_naming_is_not_kept_for_a_later_ingester(pool: PgPoo
             &viewer,
             &doc(doi, json!([{"name": name}])),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the squatter re-runs"),
@@ -1842,6 +1875,7 @@ async fn a_person_attaching_themselves_after_a_strangers_pending_naming_asserts_
                 json!([{"name": "Me Myself", "agent_id": me.to_string()}]),
             ),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the person re-attaches"),
@@ -1906,6 +1940,7 @@ async fn a_strangers_naming_of_an_existing_author_is_its_own_pending_row(pool: P
                 &["A finding only the stranger states."],
             ),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the stranger's ingest"),
@@ -2100,6 +2135,7 @@ async fn an_explicit_attachment_is_kept_only_for_the_ingester_that_made_it(pool:
             &viewer,
             &doc(d, json!([{"name": name}])),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the honest re-ingest"),
@@ -2129,6 +2165,7 @@ async fn an_explicit_attachment_is_kept_only_for_the_ingester_that_made_it(pool:
             &viewer,
             &doc(d, json!([{"name": name}])),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the squatter re-runs"),
@@ -2236,6 +2273,7 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
         &viewer,
         &doc_with_atoms(d, json!([{"name": name}]), &atoms),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("the name-only ingest");
@@ -2250,6 +2288,7 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
                 &atoms,
             ),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the operator replacement"),
@@ -2279,6 +2318,7 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
                 ],
             ),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("another ingester's name-only re-ingest"),
@@ -2349,6 +2389,7 @@ async fn an_operator_replacement_closes_every_principals_rows_of_the_removed_aut
                 &["A finding both ingests state."],
             ),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("the operator replacement"),
@@ -2431,6 +2472,7 @@ async fn only_the_operator_replacement_withholds_a_name_derived_authors_credit(p
                 &["A later ingest's atom."],
             ),
             None,
+            epigraph_core::VisibilityChoice::Public,
         )
         .await
         .expect("a later name-only ingest"),

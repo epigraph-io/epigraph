@@ -142,9 +142,15 @@ async fn caller_labels_do_not_reach_a_colleagues_converged_claim(pool: PgPool) {
     let colleague = colleague_backlog_claim(&pool, agent_a, team).await;
     let viewer = fixture::public_viewer(&pool).await;
 
-    let result = do_ingest_document(&server, &viewer, &doc_b(&["resolved", "stage:b"]), None)
-        .await
-        .expect("paper B ingests");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &doc_b(&["resolved", "stage:b"]),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("paper B ingests");
 
     // Exactly one row: B converged onto A's claim rather than inserting its own.
     let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM claims WHERE content = $1")

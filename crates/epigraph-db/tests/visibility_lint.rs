@@ -1833,8 +1833,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_visibility.rs",
+        "human_default_group_of",
+        "READ through 206's definer `epigraph_default_group` applied to 149's app-callable \
+         definer `epigraph_human_of(agent, true)`: one group id, the live human's \
+         `agents.default_group_id`. A preference about the agent's human, not a corpus row; \
+         validated by the caller against `writable_teams` (D-V1's second link).",
+    ),
+    (
+        "claim_visibility.rs",
         "resolve_visibility_choice",
-        "Composes `writable_teams` and `default_group_of` (both definers) into the write-time \
+        "Composes `writable_teams`, `default_group_of` and `human_default_group_of` (all \
+         definers) into the write-time \
          visibility decision for one author. Reads no corpus row; the decision is enforced by \
          the claims trigger and policies on the WRITE's stamped transaction.",
     ),
