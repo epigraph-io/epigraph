@@ -60,8 +60,8 @@ pub const SESSION_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_se
 /// it, and the cap applies the same way. 4 MiB is far above what a
 /// model-generated tool call carries (a claim's content is capped at 64 KiB).
 /// A client that needs a larger single call, such as a very large
-/// `ingest_document_inline`, can use stdio, which has no cap. Raising it is a one-line change here, pinned by
-/// `tests/http_auth_test.rs`
+/// `ingest_document_inline`, can use stdio, which has no cap. Raising it is a
+/// one-line change here, pinned by `tests/http_auth_test.rs`
 /// (`request_body_over_4_mib_is_refused_with_413_and_at_the_cap_is_served`).
 pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 
