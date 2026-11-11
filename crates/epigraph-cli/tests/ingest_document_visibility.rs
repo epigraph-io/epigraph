@@ -15,6 +15,9 @@
 //! * no `--visibility`, two writable teams and a default team: the default;
 //! * no `--visibility`, an agent in no team, operated by a human with two teams
 //!   and a default team: the human's default (the agent's own default unset);
+//! * the same, with the agent's own default set but stale (membership revoked):
+//!   still the human's default, because each default is checked on its own;
+//! * an agent whose own default is writable: its own, not its human's;
 //! * no `--visibility`, the agent writes no team: every claim is `group` over
 //!   its own personal group (private), none public;
 //! * `--visibility public`: public, so a caller can still ask for it;
@@ -327,6 +330,84 @@ async fn a_default_cli_ingest_by_an_operated_agent_uses_its_humans_default_team(
         chosen,
         &run,
         "an operated agent with no default of its own takes its human's default team",
+    )
+    .await;
+}
+
+/// An operated agent linked to a fresh human operator.
+async fn operated_by_human(pool: &PgPool, agent: Uuid, name: &str) -> Uuid {
+    let (human, _) = fixture::seed_human_operator(pool, name).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+        .await
+        .expect("live link");
+    human
+}
+
+async fn revoke_membership(pool: &PgPool, group: Uuid, agent: Uuid) {
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+         WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("revoke the membership");
+}
+
+/// D-V1 checks each default on its own: the agent's default team is set but
+/// stale (its membership was revoked after it was set), so its human's
+/// default team decides. The human writes TWO teams, so the only-team arm
+/// cannot pick the right answer by accident; before the fix the stale own
+/// default hid the human's and the paper landed private.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stale_own_default_falls_through_to_the_humans_default_team(pool: PgPool) {
+    let (agent, key) = cli_agent(&pool, 0x37).await;
+    let human = operated_by_human(&pool, agent, "cli-visibility-stale").await;
+    let stale = team_with_writer(&pool, agent).await;
+    set_default_team(&pool, agent, stale).await;
+    revoke_membership(&pool, stale, agent).await;
+    let other = team(&pool).await;
+    add_writer(&pool, other, human).await;
+    let chosen = team(&pool).await;
+    add_writer(&pool, chosen, human).await;
+    set_default_team(&pool, human, chosen).await;
+
+    let run = ingest(&pool, &key, &[]).await;
+    assert_eq!(run.code, Some(0), "{}", run.show());
+    assert_all_in(
+        &pool,
+        agent,
+        chosen,
+        &run,
+        "the agent's own default is no longer writable, so its human's default team decides",
+    )
+    .await;
+}
+
+/// The other half of the chain's order: an agent's own default that IS still
+/// writable beats a different, also writable, default of its human.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writable_own_default_beats_the_humans_default_team(pool: PgPool) {
+    let (agent, key) = cli_agent(&pool, 0x38).await;
+    let human = operated_by_human(&pool, agent, "cli-visibility-precedence").await;
+    let own = team_with_writer(&pool, agent).await;
+    set_default_team(&pool, agent, own).await;
+    let humans = team(&pool).await;
+    add_writer(&pool, humans, human).await;
+    let other = team(&pool).await;
+    add_writer(&pool, other, human).await;
+    set_default_team(&pool, human, humans).await;
+
+    let run = ingest(&pool, &key, &[]).await;
+    assert_eq!(run.code, Some(0), "{}", run.show());
+    assert_all_in(
+        &pool,
+        agent,
+        own,
+        &run,
+        "the agent's own writable default team comes before its human's",
     )
     .await;
 }
