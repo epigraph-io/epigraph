@@ -4,6 +4,11 @@
 //! `epigraph_mcp::tools::ingestion::do_ingest_document`: it gives operators a
 //! per-invocation database target without forking the ingestion logic away from
 //! the MCP tool.
+//!
+//! The claims it creates take `--visibility` / `--group-id` exactly as the MCP
+//! tools take `visibility` / `group_id`, resolved for the acting agent (the
+//! `--agent-key` signer). Omitted, they resolve D-V1 (team, else private), so
+//! an operator ingest is never public unless `--visibility public` says so.
 
 use std::path::PathBuf;
 
@@ -38,6 +43,18 @@ struct Cli {
     /// MCP embedder's mock/no-provider behavior.
     #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     openai_api_key: Option<String>,
+
+    /// Who reads the claims this ingest creates: `team`, `private` or
+    /// `public`. Omitted, the acting agent's D-V1 default applies: its default
+    /// team, else its human's, else its only writable team, else private.
+    /// Never public unless asked (operator ruling, 2026-11-10).
+    #[arg(long)]
+    visibility: Option<String>,
+
+    /// The team to write into, with `--visibility team` or no `--visibility`.
+    /// The acting agent (or its human) must hold a writer membership in it.
+    #[arg(long)]
+    group_id: Option<String>,
 }
 
 #[tokio::main]
@@ -52,6 +69,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    // Refused before any connection, with the MCP tools' own wording.
+    let choice = epigraph_core::VisibilityChoice::parse_str(
+        cli.visibility.as_deref(),
+        cli.group_id.as_deref(),
+    )
+    .map_err(|e| anyhow!("invalid --visibility / --group-id: {e}"))?;
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool`.
@@ -70,11 +93,12 @@ async fn main() -> anyhow::Result<()> {
         .context("mint maintenance viewer")?;
     let viewer = session.viewer();
 
-    run(cli, maint.pool().clone(), viewer).await
+    run(cli, choice, maint.pool().clone(), viewer).await
 }
 
 async fn run(
     cli: Cli,
+    choice: epigraph_core::VisibilityChoice,
     pool: sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> anyhow::Result<()> {
@@ -106,15 +130,12 @@ async fn run(
         "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
     );
 
-    let result = do_ingest_document(
-        &server,
-        viewer,
-        &extraction,
-        None,
-        epigraph_core::VisibilityChoice::Public,
-    )
-    .await
-    .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
+    // The acting agent is this server's signer (no `auth`), so `choice`
+    // resolves against IT: an omitted `--visibility` is D-V1 for that agent,
+    // never public.
+    let result = do_ingest_document(&server, viewer, &extraction, None, choice)
+        .await
+        .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
     let text = result
         .content
         .first()
