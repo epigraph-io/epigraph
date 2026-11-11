@@ -201,14 +201,14 @@ async fn no_undeclared_write_can_touch_a_reserved_label(pool: PgPool) {
 }
 
 /// A legacy unmarked `paper -asserts-> claim` row stops another principal's
-/// ingest writing its own row (the H3 regression); once the backfill labels
+/// ingest writing its own row (the ingest-record regression); once the backfill labels
 /// it, it reads as the legacy principal's, and the other principal writes
 /// its own.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_backfilled_legacy_row_stops_withholding_another_principals_row(pool: PgPool) {
     let (legacy, _) = fixture::seed_agent_with_group(&pool, "label-legacy").await;
     let (newcomer, _) = fixture::seed_agent_with_group(&pool, "label-newcomer").await;
-    let p = paper(&pool, "10.9999/labels.h3").await;
+    let p = paper(&pool, "10.9999/labels.legacy-withholds").await;
     let c = fixture::seed_public_claim(&pool, newcomer, "a legacy finding").await;
     let e = legacy_edge(&pool, (p, "paper"), (c, "claim"), "asserts").await;
 
