@@ -20,6 +20,65 @@
 //!   "claim_type": "factual"
 //! }
 //! ```
+//!
+//! # Theme pin, theme-core ranking and paging
+//!
+//! ```json
+//! POST /api/v1/search/semantic
+//! { "query": "gold electrode capacitance", "limit": 50,
+//!   "theme_id": "3b2f6a0e-9c1d-4c8e-9a51-2f0c9b7d1e44", "cursor": "o:50" }
+//!
+//! POST /api/v1/search/semantic
+//! { "theme_id": "3b2f6a0e-9c1d-4c8e-9a51-2f0c9b7d1e44", "rank_by": "theme_core",
+//!   "limit": 100, "cursor": "o:100" }
+//! ```
+//!
+//! * **`theme_id`** confines every hit to `claims.theme_id = <theme>`, in SQL,
+//!   above each cut (the semantics MCP recall's theme pin has). A malformed id
+//!   is a 400 on `theme_id`. An unknown theme and a theme in which the viewer
+//!   can read no member are the same 404 (`NotFound`, entity `Theme`). The
+//!   response echoes `theme_scope: {theme_id, member_count, rank_by}`, where
+//!   `member_count` is the viewer's count. **No theme label is ever
+//!   returned**: labels are generated from member content with no visibility
+//!   filter. This 404 is not a confidentiality guarantee for theme existence;
+//!   other routes list every theme row.
+//! * **`rank_by`** is `"query"` (default) or `"theme_core"`. `theme_core`
+//!   needs `theme_id`, takes no `query` and no `diverse`, makes no embedding
+//!   call, and ranks the theme's members by cosine similarity to the theme
+//!   core: the mean embedding of its PUBLIC members, else (a theme with no
+//!   public embedded member) the mean of the members this viewer can read.
+//!   It is computed in SQL per request and is never the stored
+//!   `claim_themes.centroid`, which averages private members too.
+//!   `similarity` then means similarity to that core, and an absent
+//!   `min_similarity` is -1 so a walk enumerates every embedded visible member.
+//! * **`cursor`** is opaque: pass back a previous `next_cursor` unchanged. It
+//!   is a position (`o:<offset>`), never an id, inside a 1,000-row window.
+//!   `next_cursor` is emitted only on the flat path and only when the request
+//!   carried `theme_id` or `cursor`; send `"o:0"` to page an unpinned search.
+//! * **Pinned diverse** (`theme_id` with `diverse=true`) skips the theme
+//!   shortlist and the coverage guard, draws exact candidates from the pinned
+//!   theme with `created_after` and `min_similarity` applied in SQL, refuses
+//!   `created_before`, `claim_type`, `agent_id` and `cursor`, and falls
+//!   through to the pinned flat path when the theme has no candidate at the
+//!   chosen dimension.
+//! * **Byte budget**: every response is cut to about 2 MB. A paged flat
+//!   response resumes the cut at `next_cursor`; any other cut response says
+//!   `truncated: true`.
+//! * **Embedder down**: with no embedding service configured, the
+//!   deterministic mock vector goes through the same pinned read, so the pin
+//!   holds while the order is meaningless. A configured service that FAILS on
+//!   a request that can carry a cursor (`theme_id` or `cursor`, not
+//!   `diverse`) is 503 `ServiceUnavailable`: a mock-ranked page inside a walk
+//!   of the real ranking would skip and repeat rows unseen. Unpaged requests
+//!   keep the old mock fallback.
+//!
+//! # Caching
+//!
+//! Every response is viewer-scoped: the route sets `Cache-Control: private,
+//! no-store` and `Vary: Authorization` (`routes/mod.rs`), and any cache in
+//! front of it must key on viewer identity plus theme, rank mode, query and
+//! cursor. `next_cursor` is bound to no viewer and grants nothing: replayed by
+//! another viewer it pages that viewer's own filtered ranking.
 
 use axum::{extract::State, Json};
 use chrono::{DateTime, Utc};
@@ -83,9 +142,18 @@ use crate::{errors::ApiError, state::AppState};
 /// - `created_after`: Filter claims created after this timestamp
 /// - `created_before`: Filter claims created before this timestamp
 /// - `agent_id`: Filter by the agent who made the claim
-#[derive(Debug, Deserialize)]
+/// - `theme_id`: Confine every hit to one theme (see the module docs)
+/// - `rank_by`: `"query"` (default) or `"theme_core"`
+/// - `cursor`: Opaque page position from a previous `next_cursor`
+#[derive(Debug, Default, Deserialize)]
 pub struct SemanticSearchRequest {
-    /// The query string to search for semantically similar claims
+    /// The query string to search for semantically similar claims.
+    ///
+    /// Required (non-blank) when `rank_by` is `"query"`; must be absent or
+    /// blank with `rank_by = "theme_core"`. A missing key deserializes to the
+    /// empty string so both cases answer a 400 `ValidationError` on `query`
+    /// rather than a JSON rejection.
+    #[serde(default)]
     pub query: String,
 
     /// Maximum number of results to return (default: 10, max: 100)
@@ -155,6 +223,29 @@ pub struct SemanticSearchRequest {
     /// `diverse=false`.
     #[serde(default)]
     pub candidate_pool: Option<u32>,
+
+    /// UUID of a `claim_themes` row. Every hit is confined to
+    /// `claims.theme_id = <theme>`, in SQL, above every cut. Blank counts as
+    /// absent; a malformed value is a 400 on `theme_id`; an unknown theme, and
+    /// a theme in which the viewer can read no member, are the same 404.
+    /// Parsed by hand (a `String`, not a `Uuid`) so the malformed case is a
+    /// `ValidationError` with a field rather than a JSON rejection.
+    #[serde(default)]
+    pub theme_id: Option<String>,
+
+    /// `"query"` (default) or `"theme_core"`. `theme_core` needs `theme_id`,
+    /// takes no `query` and no `diverse`, makes no embedding call, and ranks
+    /// the theme's members by similarity to the theme core (the mean of its
+    /// public members, else of the members the viewer can read).
+    #[serde(default)]
+    pub rank_by: Option<String>,
+
+    /// Opaque page position: pass back a previous `next_cursor` unchanged.
+    /// The format is `o:<offset>`, a position and never an id. Blank counts
+    /// as absent. Send `"o:0"` on the first page to page an unpinned search.
+    /// Not accepted with `diverse=true`.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// CDST belief interval for a claim — more informative than a single truth value
@@ -269,6 +360,40 @@ pub struct SemanticSearchResponse {
     /// queried.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub centroid_dim_used: Option<u32>,
+
+    /// The resolved theme pin. Present exactly when the request carried a
+    /// `theme_id`. Carries no label: theme labels are generated from member
+    /// content with no visibility filter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme_scope: Option<SearchThemeScope>,
+
+    /// Opaque position of the next page (`o:<offset>`), flat path only, and
+    /// only when the request carried `theme_id` or `cursor`. Absent at the end
+    /// of the ranking and at the 1,000-row window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+
+    /// `true` when the response byte budget dropped hits and no `next_cursor`
+    /// carries them (any diverse response, or an unpaged flat one). Omitted
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// The theme a pinned search was confined to, as this viewer sees it.
+///
+/// Deliberately has no `label`: `claim_themes.label` is written from the
+/// content of the members nearest the stored centroid with no visibility
+/// filter, so it can summarise text this viewer may not read.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchThemeScope {
+    /// The `claim_themes` id the request pinned.
+    pub theme_id: Uuid,
+    /// The viewer's count of current members (viewer-filtered; never the
+    /// stored `claim_count`). At least the number of hits a full walk returns.
+    pub member_count: i64,
+    /// `"query"` or `"theme_core"`.
+    pub rank_by: &'static str,
 }
 
 // ============================================================================
@@ -301,6 +426,168 @@ const MAX_QUERY_LENGTH: usize = 10_240;
 /// Maximum claim_type filter length in bytes.
 /// Prevents buffer overflow or injection attempts via oversized filter values.
 const MAX_CLAIM_TYPE_LENGTH: usize = 64;
+
+/// The flat ranking pages inside this many rows: a `cursor` offset must be
+/// below it, and a page is cut so that `offset + limit` never passes it.
+const MAX_SEARCH_WINDOW: i64 = 1000;
+
+/// Upper bound on a response body. Claim content can reach 64 KiB, so 100
+/// hits could otherwise approach 7 MB.
+const MAX_RESPONSE_BYTES: usize = 2_000_000;
+
+/// Bytes reserved for the response envelope (`total`, `query_time_ms`,
+/// `centroid_dim_used`, `theme_scope`, `next_cursor`, `truncated`) out of
+/// [`MAX_RESPONSE_BYTES`]; the hits share the rest.
+const RESPONSE_ENVELOPE_BYTES: usize = 1_024;
+
+/// Bound on the serialised bytes of one hit outside its strings: keys,
+/// punctuation, five UUIDs, five floats and a timestamp come to about 560.
+const HIT_OVERHEAD_BYTES: usize = 700;
+
+/// The same bound for one graph neighbour outside its strings: keys,
+/// punctuation, one UUID and five floats come to about 300.
+const NEIGHBOR_OVERHEAD_BYTES: usize = 400;
+
+/// The cursor prefix: a position, never an id (as `privatization.rs`'s
+/// `CURSOR_PREFIX`).
+const SEARCH_CURSOR_PREFIX: &str = "o:";
+
+// ============================================================================
+// Theme pin, ranking, cursor and byte budget
+// ============================================================================
+
+/// What the flat path ranks by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RankBy {
+    /// Similarity to the embedded `query` (the default).
+    Query,
+    /// Similarity to the pinned theme's core.
+    ThemeCore,
+}
+
+impl RankBy {
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    fn as_str(self) -> &'static str {
+        match self {
+            RankBy::Query => "query",
+            RankBy::ThemeCore => "theme_core",
+        }
+    }
+}
+
+/// `theme_id`: trimmed; blank is absent; otherwise a UUID or a 400. Mirrors
+/// MCP recall's selector, which rejects rather than drops a bad pin: a scope
+/// filter that failed open would widen the result set while the caller
+/// believes it is scoped.
+fn parse_theme_filter(raw: Option<&str>) -> Result<Option<Uuid>, ApiError> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    Uuid::parse_str(s)
+        .map(Some)
+        .map_err(|_| ApiError::ValidationError {
+            field: "theme_id".to_string(),
+            reason: "theme_id must be a UUID".to_string(),
+        })
+}
+
+/// `rank_by`: absent or blank is `query`.
+fn parse_rank_by(raw: Option<&str>) -> Result<RankBy, ApiError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("query") => Ok(RankBy::Query),
+        Some("theme_core") => Ok(RankBy::ThemeCore),
+        Some(_) => Err(ApiError::ValidationError {
+            field: "rank_by".to_string(),
+            reason: "rank_by must be \"query\" or \"theme_core\"".to_string(),
+        }),
+    }
+}
+
+/// `cursor`: `None` when absent or blank, so the handler can tell a supplied
+/// cursor (a paged request) from none. Otherwise `o:` plus a non-negative
+/// integer below [`MAX_SEARCH_WINDOW`].
+fn parse_search_cursor(raw: Option<&str>) -> Result<Option<i64>, ApiError> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let bad = |reason: &str| ApiError::ValidationError {
+        field: "cursor".to_string(),
+        reason: reason.to_string(),
+    };
+    let digits = s
+        .strip_prefix(SEARCH_CURSOR_PREFIX)
+        .ok_or_else(|| bad("cursor must be a next_cursor value from a previous page"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad(
+            "cursor must be a next_cursor value from a previous page",
+        ));
+    }
+    let offset: i64 = digits
+        .parse()
+        .map_err(|_| bad("cursor is beyond the search window"))?;
+    if offset >= MAX_SEARCH_WINDOW {
+        return Err(bad("cursor is beyond the search window"));
+    }
+    Ok(Some(offset))
+}
+
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn encode_search_cursor(offset: i64) -> String {
+    format!("{SEARCH_CURSOR_PREFIX}{offset}")
+}
+
+/// The exact length of `s` as a serde_json string body (without the quotes):
+/// `"` and `\` and the five short-form controls take 2 bytes, every other
+/// control character 6 (`\u00XX`), everything else its UTF-8 length.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn json_escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
+/// An upper bound on the serialised size of one hit, neighbours included.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn hit_cost(hit: &SemanticSearchResult) -> usize {
+    let own = HIT_OVERHEAD_BYTES
+        + json_escaped_len(&hit.statement)
+        + hit.claim_type.as_deref().map_or(0, json_escaped_len);
+    let neighbours: usize = hit.graph_neighbors.as_ref().map_or(0, |ns| {
+        ns.iter()
+            .map(|n| {
+                NEIGHBOR_OVERHEAD_BYTES
+                    + json_escaped_len(&n.statement)
+                    + json_escaped_len(&n.edge_type)
+                    + json_escaped_len(&n.direction)
+            })
+            .sum()
+    });
+    own + neighbours
+}
+
+/// Keep hits, in order, while their summed [`hit_cost`] fits the budget;
+/// always keep the first. Returns the kept hits and whether any were dropped.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn apply_byte_budget(results: Vec<SemanticSearchResult>) -> (Vec<SemanticSearchResult>, bool) {
+    let budget = MAX_RESPONSE_BYTES - RESPONSE_ENVELOPE_BYTES;
+    let total = results.len();
+    let mut used = 0usize;
+    let mut kept = Vec::with_capacity(total);
+    for hit in results {
+        let cost = hit_cost(&hit);
+        if !kept.is_empty() && used + cost > budget {
+            break;
+        }
+        used += cost;
+        kept.push(hit);
+    }
+    let cut = kept.len() < total;
+    (kept, cut)
+}
 
 // ============================================================================
 // Embedding Generation
@@ -416,6 +703,34 @@ async fn generate_query_embedding_with_dim(
     generate_mock_embedding_with_dim(text, target_dim)
 }
 
+/// The 1536-d query embedding for a flat request that can carry a cursor.
+///
+/// Same as [`generate_query_embedding`] except in one case: a configured
+/// service whose dimension matches and whose call FAILS is a 503, not the mock
+/// fallback. A cursor is an offset into the real ranking; serving one page of
+/// a walk from the mock vector would rank that page by an unrelated order
+/// while its `next_cursor` continued the real one, so the walk would skip and
+/// repeat rows with nothing in the response to say so. The other mock cases
+/// (no service configured, or a service at another dimension) are the same on
+/// every page, so a walk over them stays consistent and they are unchanged.
+#[cfg(feature = "db")]
+async fn generate_walk_query_embedding(state: &AppState, text: &str) -> Result<Vec<f32>, ApiError> {
+    if let Some(ref embedding_service) = state.embedding_service {
+        if embedding_service.dimension() == EMBEDDING_DIM {
+            return embedding_service.generate_query(text).await.map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Embedding service failed on a pageable search; refusing the mock fallback"
+                );
+                ApiError::ServiceUnavailable {
+                    service: "embedding".to_string(),
+                }
+            });
+        }
+    }
+    Ok(generate_query_embedding(state, text).await)
+}
+
 /// Format embedding vector as pgvector string literal
 ///
 /// Converts a Vec<f32> to the format "[0.1,0.2,0.3,...]" expected by pgvector.
@@ -527,11 +842,24 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 ///
 /// # Validation
 ///
-/// - Query cannot be empty or whitespace-only
-/// - Limit must be > 0 (capped at 100)
+/// - Query cannot be empty or whitespace-only (with `rank_by=query`), and
+///   must be absent or blank with `rank_by=theme_core`
+/// - Limit must be > 0 (capped at 100, and at the 1,000-row window)
 /// - min_similarity must be in [0.0, 1.0]
 /// - claim_type must be one of: factual, hypothesis, opinion
 /// - created_after must be <= created_before if both provided
+/// - theme_id must be a UUID; rank_by must be `query` or `theme_core`;
+///   `theme_core` needs theme_id and excludes diverse
+/// - cursor must be `o:<n>` with `n < 1000`, and excludes diverse
+/// - with theme_id and diverse, created_before / claim_type / agent_id are
+///   refused (the diverse path does not apply them)
+///
+/// # Theme pin
+///
+/// Resolved on the viewer-stamped connection before any embedding call: an
+/// unknown theme and one with no member the viewer can read are one 404. See
+/// the module docs for the theme core, the cursor, the byte budget and the
+/// caching contract.
 ///
 /// # Security
 ///
@@ -544,13 +872,77 @@ pub async fn semantic_search(
 ) -> Result<Json<SemanticSearchResponse>, ApiError> {
     let start_time = std::time::Instant::now();
 
-    // Validate query is not empty
+    // The theme pin, the ranking and the cursor are parsed before anything
+    // else, and none of it touches the database: a 400 holds no connection.
+    #[allow(unused_variables)]
+    let theme_filter = parse_theme_filter(request.theme_id.as_deref())?;
+    let rank_by = parse_rank_by(request.rank_by.as_deref())?;
+    let cursor = parse_search_cursor(request.cursor.as_deref())?;
+    let offset = cursor.unwrap_or(0);
+    // `next_cursor` is emitted only to a caller that pinned a theme or sent a
+    // cursor, so an unpinned, unpaged response keeps its old shape.
+    #[allow(unused_variables)]
+    let paged = theme_filter.is_some() || cursor.is_some();
+    let diverse = request.diverse.unwrap_or(false);
+
+    // Validate the query against the ranking: required for `query`, refused
+    // for `theme_core` (which ranks a theme's members, not a query's
+    // neighbours, and makes no embedding call).
     let query = request.query.trim();
-    if query.is_empty() {
+    match rank_by {
+        RankBy::ThemeCore => {
+            if theme_filter.is_none() {
+                return Err(ApiError::ValidationError {
+                    field: "rank_by".to_string(),
+                    reason: "theme_core ranks a theme's members; supply theme_id".to_string(),
+                });
+            }
+            if diverse {
+                return Err(ApiError::ValidationError {
+                    field: "rank_by".to_string(),
+                    reason: "theme_core is not available with diverse=true".to_string(),
+                });
+            }
+            if !query.is_empty() {
+                return Err(ApiError::ValidationError {
+                    field: "query".to_string(),
+                    reason: "query is not used with rank_by=theme_core; omit it".to_string(),
+                });
+            }
+        }
+        RankBy::Query => {
+            if query.is_empty() {
+                return Err(ApiError::ValidationError {
+                    field: "query".to_string(),
+                    reason: "Query cannot be empty".to_string(),
+                });
+            }
+        }
+    }
+
+    // Diverse mode selects a set, not a ranking, so it has no pages.
+    if diverse && cursor.is_some() {
         return Err(ApiError::ValidationError {
-            field: "query".to_string(),
-            reason: "Query cannot be empty".to_string(),
+            field: "cursor".to_string(),
+            reason: "cursor is not available with diverse=true".to_string(),
         });
+    }
+
+    // A pinned diverse request applies `created_after` and `min_similarity`
+    // in SQL. The other three filters the diverse path has never applied are
+    // refused rather than silently ignored under a pin.
+    if diverse && theme_filter.is_some() {
+        let unsupported = [
+            ("created_before", request.created_before.is_some()),
+            ("claim_type", request.claim_type.is_some()),
+            ("agent_id", request.agent_id.is_some()),
+        ];
+        if let Some((field, _)) = unsupported.iter().find(|(_, set)| *set) {
+            return Err(ApiError::ValidationError {
+                field: (*field).to_string(),
+                reason: format!("{field} is not applied by diverse=true with theme_id; omit it"),
+            });
+        }
     }
 
     // Validate query length (DoS prevention)
@@ -573,18 +965,34 @@ pub async fn semantic_search(
             reason: "Limit must be greater than 0".to_string(),
         });
     }
+    // Capped at MAX_LIMIT, and cut so a page never passes the search window
+    // (`offset < MAX_SEARCH_WINDOW`, so this is at least 1). `page_limit` is
+    // the size before the window cut: the flat read asks SQL for that many
+    // rows and drops the ones past the window in Rust, so the HNSW scan's
+    // `ef_search` (derived from the SQL limit) stays the same on the last
+    // page of a walk as on every page before it.
     #[allow(unused_variables)]
-    let limit = limit.min(MAX_LIMIT) as usize;
+    let page_limit = limit.min(MAX_LIMIT) as usize;
+    #[allow(unused_variables)]
+    let limit = page_limit.min((MAX_SEARCH_WINDOW - offset) as usize);
 
-    // Validate min_similarity
-    #[allow(unused_variables)]
-    let min_similarity = request.min_similarity.unwrap_or(0.0);
-    if !(0.0..=1.0).contains(&min_similarity) {
-        return Err(ApiError::ValidationError {
-            field: "min_similarity".to_string(),
-            reason: "min_similarity must be between 0.0 and 1.0".to_string(),
-        });
+    // Validate min_similarity. An explicit value must lie in [0, 1]. Absent,
+    // it is 0.0, except under `theme_core`, where it is -1.0 (cosine's lower
+    // bound, the floor `voids.rs` passes) so a full walk enumerates every
+    // embedded member the viewer can read.
+    if let Some(m) = request.min_similarity {
+        if !(0.0..=1.0).contains(&m) {
+            return Err(ApiError::ValidationError {
+                field: "min_similarity".to_string(),
+                reason: "min_similarity must be between 0.0 and 1.0".to_string(),
+            });
+        }
     }
+    #[allow(unused_variables)]
+    let min_similarity = match (rank_by, request.min_similarity) {
+        (RankBy::ThemeCore, None) => -1.0,
+        (_, v) => v.unwrap_or(0.0),
+    };
 
     // Validate claim_type if provided
     if let Some(ref claim_type) = request.claim_type {
@@ -710,6 +1118,38 @@ pub async fn semantic_search(
             }
         })?;
 
+        // ---- Theme pin: resolved first, before any embedding call ----
+        //
+        // `get_summary` counts only the members this viewer can read. An
+        // unknown theme and a theme with no member the viewer can read get the
+        // same 404, so "gone" and "not yours" look alike from this route.
+        // `s.label` is never read: it is generated from member content with no
+        // visibility filter. Returning drops `read`, which rolls back.
+        let theme_scope: Option<SearchThemeScope> = match theme_filter {
+            None => None,
+            Some(id) => {
+                let summary =
+                    epigraph_db::ClaimThemeRepository::get_summary(&mut *read, &viewer, id)
+                        .await
+                        .map_err(|e| ApiError::InternalError {
+                            message: format!("Theme lookup failed: {e}"),
+                        })?;
+                match summary {
+                    Some(s) if s.member_count > 0 => Some(SearchThemeScope {
+                        theme_id: s.id,
+                        member_count: s.member_count,
+                        rank_by: rank_by.as_str(),
+                    }),
+                    _ => {
+                        return Err(ApiError::NotFound {
+                            entity: "Theme".to_string(),
+                            id: id.to_string(),
+                        })
+                    }
+                }
+            }
+        };
+
         // Step 2a: Diverse hierarchical retrieval path (theme-based + coverage selection)
         // When `diverse=true`, navigate themes first, then apply submodular selection.
         // Falls through to flat search if no themes exist yet (clustering hasn't run)
@@ -721,7 +1161,9 @@ pub async fn semantic_search(
         // not embed the same text twice.
         let mut flat_query_vec: Option<String> = None;
 
-        if request.diverse.unwrap_or(false) {
+        // `rank_by=theme_core` with `diverse=true` was refused above, so this
+        // branch always ranks by the query.
+        if diverse {
             let max_themes = request.max_themes.unwrap_or(5) as i32;
             let alpha = request.diversity_weight.unwrap_or(0.5);
 
@@ -805,94 +1247,133 @@ pub async fn semantic_search(
                 "embedding"
             };
 
-            // Pre-flight: cheap theme lookup ONLY to determine whether
-            // the corpus has themes at all. If empty, fall through to
-            // flat ANN (matching pre-helper behaviour); otherwise run
-            // the shared pipeline.
-            let themes = epigraph_db::ClaimThemeRepository::find_similar_themes_at_dim(
-                &mut *read,
-                &embedding_str,
-                max_themes,
-                centroid_dim_used,
-            )
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Theme search failed: {e}"),
-            })?;
-
-            // Theme-coverage guard (same rule and verdict function as
-            // `epigraph_engine::diverse_retrieval::run_diverse_pipeline`, which
-            // this route does not call — see the import note at the top of
-            // this file). The theme lookup above is nearest-first with no
-            // relevance floor, so any non-empty theme set wins the shortlist;
-            // a small stale one would answer every query from its few members.
-            // Enter diverse mode only when most of the query's own nearest
-            // neighbourhood — REST's candidate space: all levels, no window —
-            // is reachable through the shortlist.
-            //
-            // The neighbourhood is ordered by the 1536-d column at EVERY
-            // `centroid_dim`: that column carries the ANN index (the 3072-d one
-            // has none, so ordering by it would scan every row that has one),
-            // and it is also what the flat tail this guard falls back to
-            // searches. Reachability is still checked at `centroid_dim_used`.
-            // A probe failure falls back to flat rather than failing the
-            // request; see `probe_theme_coverage_isolated`.
-            let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
-            let covered = if themes.is_empty() {
-                false
+            // A PINNED request skips the shortlist and the coverage guard: the
+            // caller named the one theme to draw from, so there is no
+            // shortlist that could be stale and nothing to cover.
+            let (theme_ids, covered): (Vec<Uuid>, bool) = if let Some(pin) = theme_filter {
+                (vec![pin], true)
             } else {
-                let probe_vec = match &flat_query_vec {
-                    Some(v) => v.clone(),
-                    None => {
-                        let v = format_embedding_for_pgvector(
-                            &generate_query_embedding(&state, query).await,
-                        );
-                        flat_query_vec = Some(v.clone());
-                        v
-                    }
+                // Pre-flight: cheap theme lookup ONLY to determine whether
+                // the corpus has themes at all. If empty, fall through to
+                // flat ANN (matching pre-helper behaviour); otherwise run
+                // the shared pipeline.
+                let themes = epigraph_db::ClaimThemeRepository::find_similar_themes_at_dim(
+                    &mut *read,
+                    &embedding_str,
+                    max_themes,
+                    centroid_dim_used,
+                )
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Theme search failed: {e}"),
+                })?;
+
+                // Theme-coverage guard (same rule and verdict function as
+                // `epigraph_engine::diverse_retrieval::run_diverse_pipeline`, which
+                // this route does not call — see the import note at the top of
+                // this file). The theme lookup above is nearest-first with no
+                // relevance floor, so any non-empty theme set wins the shortlist;
+                // a small stale one would answer every query from its few members.
+                // Enter diverse mode only when most of the query's own nearest
+                // neighbourhood — REST's candidate space: all levels, no window —
+                // is reachable through the shortlist.
+                //
+                // The neighbourhood is ordered by the 1536-d column at EVERY
+                // `centroid_dim`: that column carries the ANN index (the 3072-d one
+                // has none, so ordering by it would scan every row that has one),
+                // and it is also what the flat tail this guard falls back to
+                // searches. Reachability is still checked at `centroid_dim_used`.
+                // A probe failure falls back to flat rather than failing the
+                // request; see `probe_theme_coverage_isolated`.
+                let theme_ids: Vec<Uuid> = themes.iter().map(|(id, _, _)| *id).collect();
+                let covered = if themes.is_empty() {
+                    false
+                } else {
+                    let probe_vec = match &flat_query_vec {
+                        Some(v) => v.clone(),
+                        None => {
+                            let v = format_embedding_for_pgvector(
+                                &generate_query_embedding(&state, query).await,
+                            );
+                            flat_query_vec = Some(v.clone());
+                            v
+                        }
+                    };
+                    let probe = probe_theme_coverage_isolated(
+                        &mut read,
+                        &viewer,
+                        &probe_vec,
+                        &theme_ids,
+                        centroid_dim_used,
+                    )
+                    .await?;
+                    epigraph_engine::diverse_retrieval::theme_coverage_allows_diverse(
+                        probe,
+                        "semantic_search",
+                        centroid_dim_used,
+                    )
                 };
-                let probe = probe_theme_coverage_isolated(
-                    &mut read,
-                    &viewer,
-                    &probe_vec,
-                    &theme_ids,
-                    centroid_dim_used,
-                )
-                .await?;
-                epigraph_engine::diverse_retrieval::theme_coverage_allows_diverse(
-                    probe,
-                    "semantic_search",
-                    centroid_dim_used,
-                )
+                (theme_ids, covered)
             };
 
-            // Only enter diverse mode if themes exist AND cover this query.
-            if covered {
-                // Retrieve candidate claims via the shared helper — same
-                // SQL shape as before, plus the level-filter knob for
-                // MCP. REST passes `paragraph_only=false` to preserve
-                // pre-helper behaviour.
-                //
-                // `claims_in_themes_at_dim_since(.., since = None)` is exactly
-                // what the `candidates_in_themes_at_dim` wrapper this file used
-                // to call delegates to — the wrapper's whole body is that call
-                // with `None`. Calling it directly removes a hop rather than
-                // changing behaviour.
-                let candidates = epigraph_db::ClaimThemeRepository::claims_in_themes_at_dim_since(
+            // Candidate claims, from one of two viewer-filtered sources.
+            //
+            // - PINNED: `claims_in_theme_exact_at_dim`, the theme's members
+            //   ranked by exact distance (no HNSW under-fill for a large
+            //   theme), with `created_after` and `min_similarity` applied in
+            //   SQL above the pool cut.
+            // - UNPINNED: `claims_in_themes_at_dim_since(.., since = None)`
+            //   over the shortlist, unchanged. Same SQL shape as before, plus
+            //   the level-filter knob for MCP; REST passes
+            //   `paragraph_only=false` to preserve pre-helper behaviour. It is
+            //   exactly what the `candidates_in_themes_at_dim` wrapper this file
+            //   used to call delegates to.
+            //
+            // `None` when diverse mode does not apply: no themes, themes that
+            // do not cover the query, or a pin with no candidate at this
+            // dimension (for example 3072-d with no `embedding_3072` member).
+            // The last falls through to the flat tail, which is pinned too, the
+            // rule MCP recall applies to an empty pinned diverse pool.
+            let candidates = if !covered {
+                None
+            } else if let Some(pin) = theme_filter {
+                let pinned = epigraph_db::ClaimThemeRepository::claims_in_theme_exact_at_dim(
                     &mut *read,
                     &viewer,
-                    &theme_ids,
+                    pin,
                     &embedding_str,
                     candidate_pool,
                     centroid_dim_used,
-                    /*paragraph_only=*/ false,
-                    /*since=*/ None,
+                    request.created_after,
+                    min_similarity,
                 )
                 .await
                 .map_err(|e| ApiError::InternalError {
                     message: format!("Candidate retrieval failed: {e}"),
                 })?;
+                (!pinned.is_empty()).then_some(pinned)
+            } else {
+                Some(
+                    epigraph_db::ClaimThemeRepository::claims_in_themes_at_dim_since(
+                        &mut *read,
+                        &viewer,
+                        &theme_ids,
+                        &embedding_str,
+                        candidate_pool,
+                        centroid_dim_used,
+                        /*paragraph_only=*/ false,
+                        /*since=*/ None,
+                    )
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("Candidate retrieval failed: {e}"),
+                    })?,
+                )
+            };
 
+            // Only enter diverse mode if themes exist AND cover this query
+            // (or the request pinned a theme that has candidates).
+            if let Some(candidates) = candidates {
                 // Build proximity graph + run greedy submodular selection.
                 // Helper centralises this (k=5, alpha=user-supplied) so MCP
                 // and REST agree.
@@ -918,18 +1399,23 @@ pub async fn semantic_search(
                 // NOTE (PR-07): this statement is deliberately NOT viewer-
                 // spliced, and that is safe by derivation rather than by
                 // oversight. It is bounded by `WHERE c.id = ANY($2)` over
-                // `selected_claim_ids`, every element of which came out of
-                // `ClaimThemeRepository::claims_in_themes_at_dim_since` —
-                // which IS viewer-filtered, splicing `{VISIBILITY:c}` onto the
-                // joined `claims`. (PR-29 re-pointed this call off the
+                // `selected_claim_ids`, every element of which came out of ONE
+                // of exactly two viewer-filtered sources:
+                //
+                // - `ClaimThemeRepository::claims_in_themes_at_dim_since`
+                //   (unpinned), and
+                // - `ClaimThemeRepository::claims_in_theme_exact_at_dim`
+                //   (pinned, `theme_id`).
+                //
+                // Both splice `{VISIBILITY:c}` onto every `claims` alias they
+                // read. (PR-29 re-pointed the first off the
                 // `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`
-                // wrapper it used to name here; the wrapper's whole body was
-                // that same call with `since = None`, so the derivation is
-                // unchanged — only the callee's name is.) A
-                // second predicate here would be redundant. Do not "harden" it
-                // by adding a marker without also re-checking that derivation:
-                // if the source of `selected_claim_ids` ever changes, this
-                // needs a real predicate, not a marker.
+                // wrapper; the wrapper's whole body was that same call with
+                // `since = None`.) A second predicate here would be redundant.
+                // Do not "harden" it by adding a marker without also
+                // re-checking that derivation: if a THIRD source of
+                // `selected_claim_ids` is ever added, or either of these stops
+                // filtering, this needs a real predicate, not a marker.
                 //
                 // Fetch full claim data for the selected IDs (including CDST
                 // columns + theme_id and the latest cluster_id from
@@ -1043,6 +1529,10 @@ pub async fn semantic_search(
                     .collect();
                 results.sort_by_key(|r| id_order.get(&r.claim_id).copied().unwrap_or(usize::MAX));
 
+                // Diverse mode has no pages, so anything the byte budget drops
+                // is reported as `truncated` rather than carried by a cursor.
+                let (results, truncated) = apply_byte_budget(results);
+
                 let total = results.len() as u64;
                 let query_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -1053,6 +1543,9 @@ pub async fn semantic_search(
                     total,
                     query_time_ms,
                     centroid_dim_used: Some(centroid_dim_used),
+                    theme_scope,
+                    next_cursor: None,
+                    truncated,
                 }));
             }
             // No themes yet, or themes that do not cover this query — fall
@@ -1065,9 +1558,31 @@ pub async fn semantic_search(
         // so it needs the query embedding at that dim. A diverse request that
         // fell through may already have computed it (see `flat_query_vec`);
         // otherwise generate it here.
-        let embedding_str = match flat_query_vec {
-            Some(v) => v,
-            None => format_embedding_for_pgvector(&generate_query_embedding(&state, query).await),
+        //
+        // `rank_by=theme_core` embeds nothing: it ranks by the theme core,
+        // which the repo computes in SQL, so no embedding call is made.
+        //
+        // A request that can carry a cursor (`paged && !diverse`) must not be
+        // ranked by the mock when a configured service fails: its offset
+        // belongs to the real ranking, so a mock-ranked page would silently
+        // skip and repeat rows of the walk. It gets 503 instead (see
+        // `generate_walk_query_embedding`).
+        let embedding_str: Option<String> = match rank_by {
+            RankBy::ThemeCore => None,
+            RankBy::Query => Some(match flat_query_vec {
+                Some(v) => v,
+                None if paged && !diverse => format_embedding_for_pgvector(
+                    &generate_walk_query_embedding(&state, query).await?,
+                ),
+                None => {
+                    format_embedding_for_pgvector(&generate_query_embedding(&state, query).await)
+                }
+            }),
+        };
+        let ranking = match embedding_str.as_deref() {
+            Some(v) => epigraph_db::FlatRanking::Query(v),
+            // Validation guarantees a theme pin here.
+            None => epigraph_db::FlatRanking::ThemeCore,
         };
 
         // Step 2b: Flat pgvector similarity search (DEFAULT path)
@@ -1080,23 +1595,37 @@ pub async fn semantic_search(
         // could submit an arbitrary probe vector and get other tenants' claim
         // text back, ranked by relevance. The statement now lives in
         // `ClaimRepository::semantic_search_flat` with the predicate spliced in.
-        let rows = epigraph_db::ClaimRepository::semantic_search_flat(
+        //
+        // With a theme pin the statement is the exact pinned form (the theme
+        // predicate above every cut). With no embedding service this is the
+        // deterministic mock vector through the same pinned read, so the pin
+        // holds even when the ranking is meaningless.
+        //
+        // SQL is asked for `page_limit` rows, not the window-cut `limit`, so
+        // the last page of a walk runs the same HNSW scan as the pages before
+        // it; the rows past the window are dropped here.
+        let mut rows = epigraph_db::ClaimRepository::semantic_search_flat(
             &mut *read,
             &viewer,
-            &embedding_str,
+            ranking,
             min_similarity,
             request.claim_type.as_deref(),
             request.created_after,
             request.created_before,
             request.agent_id,
-            limit as i64,
+            page_limit as i64,
+            theme_filter,
+            offset,
         )
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {e}"),
         })?;
+        let full_page = rows.len() == page_limit;
+        rows.truncate(limit);
 
-        // Step 3: Convert rows to response DTOs
+        // Step 3: Convert rows to response DTOs. Every pinned hit is in the
+        // pinned theme by construction, so it says so.
         let results: Vec<SemanticSearchResult> = rows
             .into_iter()
             .map(|row| SemanticSearchResult {
@@ -1109,10 +1638,20 @@ pub async fn semantic_search(
                 claim_type: row.claim_type,
                 created_at: row.created_at,
                 graph_neighbors: None,
-                theme_id: None,
+                theme_id: theme_filter,
                 cluster_id: None,
             })
             .collect();
+
+        // The byte budget, then the cursor. A page the budget cut resumes at
+        // the first dropped hit; a full SQL page may have more behind it. The
+        // cursor stops at the window, and only a paged request gets one.
+        let (results, cut) = apply_byte_budget(results);
+        let kept = results.len() as i64;
+        let next_cursor =
+            (paged && !diverse && (cut || full_page) && offset + kept < MAX_SEARCH_WINDOW)
+                .then(|| encode_search_cursor(offset + kept));
+        let truncated = cut && next_cursor.is_none();
 
         let total = results.len() as u64;
         let query_time_ms = start_time.elapsed().as_millis() as u64;
@@ -1124,6 +1663,9 @@ pub async fn semantic_search(
             total,
             query_time_ms,
             centroid_dim_used: None,
+            theme_scope,
+            next_cursor,
+            truncated,
         }))
     }
 
@@ -1139,6 +1681,9 @@ pub async fn semantic_search(
             total,
             query_time_ms,
             centroid_dim_used: None,
+            theme_scope: None,
+            next_cursor: None,
+            truncated: false,
         }))
     }
 }
@@ -1221,6 +1766,9 @@ mod tests {
             total: 1,
             query_time_ms: 15,
             centroid_dim_used: None,
+            theme_scope: None,
+            next_cursor: None,
+            truncated: false,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1333,6 +1881,9 @@ mod tests {
             total: 0,
             query_time_ms: 1,
             centroid_dim_used: Some(3072),
+            theme_scope: None,
+            next_cursor: None,
+            truncated: false,
         };
         let json = serde_json::to_string(&resp_with).unwrap();
         assert!(json.contains("\"centroid_dim_used\":3072"));
@@ -1343,9 +1894,272 @@ mod tests {
             total: 0,
             query_time_ms: 1,
             centroid_dim_used: None,
+            theme_scope: None,
+            next_cursor: None,
+            truncated: false,
         };
         let json2 = serde_json::to_string(&resp_without).unwrap();
         assert!(!json2.contains("centroid_dim_used"));
+    }
+
+    // ---- theme_id / rank_by / cursor (request and response shape) ----
+
+    fn field_of(e: ApiError) -> String {
+        match e {
+            ApiError::ValidationError { field, .. } => field,
+            other => panic!("expected a ValidationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_deserializes_theme_id_rank_by_and_cursor() {
+        let theme = Uuid::new_v4();
+        let json = format!(
+            r#"{{"query": "q", "theme_id": "{theme}", "rank_by": "theme_core", "cursor": "o:50"}}"#
+        );
+        let r: SemanticSearchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.theme_id.as_deref(), Some(theme.to_string().as_str()));
+        assert_eq!(r.rank_by.as_deref(), Some("theme_core"));
+        assert_eq!(r.cursor.as_deref(), Some("o:50"));
+
+        // A malformed theme id still deserializes, so the handler can answer a
+        // 400 on the field instead of a JSON rejection.
+        let r: SemanticSearchRequest =
+            serde_json::from_str(r#"{"query": "q", "theme_id": "not-a-uuid"}"#).unwrap();
+        assert_eq!(r.theme_id.as_deref(), Some("not-a-uuid"));
+    }
+
+    #[test]
+    fn request_without_query_deserializes_to_blank() {
+        let theme = Uuid::new_v4();
+        let json = format!(r#"{{"theme_id": "{theme}", "rank_by": "theme_core"}}"#);
+        let r: SemanticSearchRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(r.query, "");
+        let r: SemanticSearchRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(r.query, "");
+        assert!(r.theme_id.is_none() && r.rank_by.is_none() && r.cursor.is_none());
+    }
+
+    #[test]
+    fn parse_search_cursor_absent_and_blank_are_none() {
+        assert_eq!(parse_search_cursor(None).unwrap(), None);
+        assert_eq!(parse_search_cursor(Some("")).unwrap(), None);
+        assert_eq!(parse_search_cursor(Some("   ")).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_search_cursor_round_trips() {
+        for n in [0_i64, 1, 50, 999] {
+            assert_eq!(
+                parse_search_cursor(Some(&encode_search_cursor(n))).unwrap(),
+                Some(n)
+            );
+        }
+        assert_eq!(encode_search_cursor(100), "o:100");
+    }
+
+    #[test]
+    fn parse_search_cursor_rejects_negative_prefixless_and_garbage() {
+        for bad in ["o:-1", "x:1", "1", "o:", "o:abc", "o:1.5", "o:+3", "O:1"] {
+            assert_eq!(
+                field_of(parse_search_cursor(Some(bad)).unwrap_err()),
+                "cursor",
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_search_cursor_rejects_beyond_the_window() {
+        for bad in ["o:1000", "o:5000", "o:99999999999999999999999"] {
+            assert_eq!(
+                field_of(parse_search_cursor(Some(bad)).unwrap_err()),
+                "cursor",
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_theme_filter_treats_blank_as_absent_and_rejects_garbage() {
+        assert_eq!(parse_theme_filter(None).unwrap(), None);
+        assert_eq!(parse_theme_filter(Some("")).unwrap(), None);
+        assert_eq!(parse_theme_filter(Some("  ")).unwrap(), None);
+        let id = Uuid::new_v4();
+        assert_eq!(
+            parse_theme_filter(Some(&format!(" {id} "))).unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            field_of(parse_theme_filter(Some("not-a-uuid")).unwrap_err()),
+            "theme_id"
+        );
+    }
+
+    #[test]
+    fn parse_rank_by_defaults_to_query_and_rejects_unknown() {
+        assert_eq!(parse_rank_by(None).unwrap(), RankBy::Query);
+        assert_eq!(parse_rank_by(Some("")).unwrap(), RankBy::Query);
+        assert_eq!(parse_rank_by(Some("query")).unwrap(), RankBy::Query);
+        assert_eq!(
+            parse_rank_by(Some("theme_core")).unwrap(),
+            RankBy::ThemeCore
+        );
+        assert_eq!(
+            field_of(parse_rank_by(Some("centroid")).unwrap_err()),
+            "rank_by"
+        );
+        assert_eq!(RankBy::Query.as_str(), "query");
+        assert_eq!(RankBy::ThemeCore.as_str(), "theme_core");
+    }
+
+    #[test]
+    fn response_skips_theme_scope_next_cursor_and_truncated_when_unset() {
+        let resp = SemanticSearchResponse {
+            results: vec![],
+            total: 0,
+            query_time_ms: 1,
+            centroid_dim_used: None,
+            theme_scope: None,
+            next_cursor: None,
+            truncated: false,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in ["theme_scope", "next_cursor", "truncated"] {
+            assert!(!obj.contains_key(key), "{key} must be omitted when unset");
+        }
+
+        let resp = SemanticSearchResponse {
+            results: vec![],
+            total: 0,
+            query_time_ms: 1,
+            centroid_dim_used: None,
+            theme_scope: None,
+            next_cursor: Some("o:10".to_string()),
+            truncated: true,
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["next_cursor"], "o:10");
+        assert_eq!(v["truncated"], true);
+    }
+
+    #[test]
+    fn theme_scope_serialises_without_a_label() {
+        let theme = Uuid::new_v4();
+        let scope = SearchThemeScope {
+            theme_id: theme,
+            member_count: 412,
+            rank_by: "theme_core",
+        };
+        let v = serde_json::to_value(&scope).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["member_count", "rank_by", "theme_id"]);
+        assert_eq!(v["theme_id"], theme.to_string());
+        assert_eq!(v["member_count"], 412);
+        assert_eq!(v["rank_by"], "theme_core");
+    }
+
+    /// The worst case the overhead constants must cover: every optional field
+    /// set, floats with the longest shortest-round-trip spelling.
+    fn heavy_hit(statement: String, neighbours: usize) -> SemanticSearchResult {
+        let worst = -2.225_073_858_507_201_4e-308_f64;
+        let ep = || EpistemicState {
+            belief: Some(worst),
+            plausibility: Some(worst),
+            ignorance: Some(worst),
+            truth_value: worst,
+        };
+        SemanticSearchResult {
+            claim_id: Uuid::new_v4(),
+            statement: statement.clone(),
+            similarity: worst,
+            epistemic: ep(),
+            agent_id: Uuid::new_v4(),
+            trace_id: Some(Uuid::new_v4()),
+            claim_type: Some("hypothesis\u{1}\"".to_string()),
+            created_at: Some(Utc::now()),
+            graph_neighbors: Some(
+                (0..neighbours)
+                    .map(|_| GraphNeighbor {
+                        claim_id: Uuid::new_v4(),
+                        statement: statement.clone(),
+                        similarity: worst,
+                        epistemic: ep(),
+                        edge_type: "CORROBORATES\u{2}".to_string(),
+                        direction: "outbound\\".to_string(),
+                    })
+                    .collect(),
+            ),
+            theme_id: Some(Uuid::new_v4()),
+            cluster_id: Some(Uuid::new_v4()),
+        }
+    }
+
+    #[test]
+    fn hit_cost_is_an_upper_bound_on_serialised_size() {
+        let statements = [
+            String::new(),
+            "plain text".to_string(),
+            // Control characters escape to six bytes each, quotes and
+            // backslashes to two.
+            "\u{1}\u{2}\u{1f}\"\\\n\t\r\u{8}\u{c}".repeat(200),
+            "multi-byte: \u{e9}\u{4e2d}\u{1f600}".repeat(50),
+            "x".repeat(65_536),
+        ];
+        for s in statements {
+            for n in [0, 1, 5] {
+                let hit = heavy_hit(s.clone(), n);
+                let real = serde_json::to_vec(&hit).unwrap().len() + 1; // array comma
+                assert!(
+                    hit_cost(&hit) >= real,
+                    "hit_cost {} must bound the serialised size {real} (statement len {}, {n} \
+                     neighbours)",
+                    hit_cost(&hit),
+                    s.len()
+                );
+            }
+        }
+        assert_eq!(json_escaped_len("\u{1}"), 6);
+        assert_eq!(json_escaped_len("\"\\\n"), 6);
+        assert_eq!(json_escaped_len("\u{e9}"), 2);
+    }
+
+    #[test]
+    fn byte_budget_keeps_the_first_hit_and_cuts_in_order() {
+        let big = "y".repeat(60 * 1024);
+        let hits: Vec<SemanticSearchResult> = (0..40).map(|_| heavy_hit(big.clone(), 0)).collect();
+        let ids: Vec<Uuid> = hits.iter().map(|h| h.claim_id).collect();
+        let (kept, cut) = apply_byte_budget(hits);
+        assert!(cut, "40 hits of 60 KiB exceed the budget");
+        assert!(!kept.is_empty() && kept.len() < 40);
+        let kept_ids: Vec<Uuid> = kept.iter().map(|h| h.claim_id).collect();
+        assert_eq!(
+            kept_ids,
+            ids[..kept.len()].to_vec(),
+            "the budget keeps a prefix"
+        );
+        let resp = SemanticSearchResponse {
+            results: kept,
+            total: 0,
+            query_time_ms: u64::MAX,
+            centroid_dim_used: Some(3072),
+            theme_scope: Some(SearchThemeScope {
+                theme_id: Uuid::new_v4(),
+                member_count: i64::MAX,
+                rank_by: "theme_core",
+            }),
+            next_cursor: Some("o:999".to_string()),
+            truncated: true,
+        };
+        assert!(serde_json::to_vec(&resp).unwrap().len() <= MAX_RESPONSE_BYTES);
+
+        // One oversized hit is still served: the first is always kept.
+        let huge = vec![heavy_hit("z".repeat(MAX_RESPONSE_BYTES), 0)];
+        let (kept, cut) = apply_byte_budget(huge);
+        assert_eq!(kept.len(), 1);
+        assert!(!cut);
     }
 }
 
@@ -1636,6 +2450,9 @@ mod db_integration_tests {
             diversity_weight: Some(0.5),
             centroid_dim,
             candidate_pool: None,
+            theme_id: None,
+            rank_by: None,
+            cursor: None,
         };
         let response = semantic_search(
             crate::middleware::bearer::ViewerExtractor(viewer),

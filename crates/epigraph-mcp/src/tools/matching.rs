@@ -73,10 +73,12 @@ pub async fn find_cross_source_matches(
     params: FindCrossSourceMatchesParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
-    let repo = MatchCandidateRepo::new(server.pool.clone());
+    // All three reads on ONE connection stamped with the caller's viewer:
+    // each joins `claims` / `edges`, whose row security on the plain pool's
+    // session admits public rows only.
+    let mut read = server.read_as(viewer, "find_cross_source_matches").await?;
 
-    let candidates = repo
-        .list_for_claim(viewer, claim_id)
+    let candidates = MatchCandidateRepo::list_for_claim_conn(&mut read, viewer, claim_id)
         .await
         .map_err(internal_error)?;
     let candidates_out: Vec<CandidateOut> = candidates.into_iter().map(row_to_out).collect();
@@ -89,8 +91,7 @@ pub async fn find_cross_source_matches(
     // apart. The SQL moved to `MatchCandidateRepo::corroborates_edges_for_claim`
     // (PR-09): it was inline here and byte-identical inline in
     // `routes/cross_source.rs`, and neither copy filtered.
-    let edges = repo
-        .corroborates_edges_for_claim(viewer, claim_id)
+    let edges = MatchCandidateRepo::corroborates_edges_for_claim_conn(&mut read, viewer, claim_id)
         .await
         .map_err(internal_error)?;
 
@@ -123,11 +124,11 @@ pub async fn find_cross_source_matches(
         "candidates":   candidates_out,
         "corroborates": corroborates,
     });
-    match repo
-        .last_match_scan_at(viewer, claim_id)
+    let last_scan = MatchCandidateRepo::last_match_scan_at_conn(&mut read, viewer, claim_id)
         .await
-        .map_err(internal_error)?
-    {
+        .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
+    match last_scan {
         Some(Some(ts)) => {
             out["last_swept_at"] = serde_json::json!(ts.to_rfc3339());
             out["never_swept"] = serde_json::json!(false);
@@ -159,11 +160,11 @@ pub async fn list_match_candidates(
         None => None,
     };
 
-    let repo = MatchCandidateRepo::new(server.pool.clone());
-    let rows = repo
-        .list(viewer, status_ref, limit)
+    let mut read = server.read_as(viewer, "list_match_candidates").await?;
+    let rows = MatchCandidateRepo::list_conn(&mut read, viewer, status_ref, limit)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
     let out: Vec<CandidateOut> = rows.into_iter().map(row_to_out).collect();
     success_json(&out)
 }

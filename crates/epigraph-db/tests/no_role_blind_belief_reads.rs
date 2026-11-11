@@ -214,7 +214,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_embedding_scored", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_text", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
     // --- epigraph-engine ----------------------------------------------------
-    ("crates/epigraph-engine/src/belief_query.rs", "get_belief", Tag::Todo { pr: "PR-R1a", why: "the get_belief choke point serves the cache columns; SPEC §7.2 dispatches on role" }),
+    ("crates/epigraph-engine/src/belief_query.rs", "get_belief_conn", Tag::Todo { pr: "PR-R1a", why: "the get_belief choke point (body in get_belief_conn; the pool forms delegate) serves the cache columns; SPEC §7.2 dispatches on role" }),
     ("crates/epigraph-engine/src/edge_factor.rs", "auto_wire_ds_for_edge", Tag::Todo { pr: "PR-F2", why: "builds an edge BBA from the source's cached Bel/Pl, compound sources included; SPEC §4.1 W8" }),
     ("crates/epigraph-engine/src/supersede_delta.rs", "delta_block", Tag::Todo { pr: "unassigned", why: "the supersede dry-run delta (supersede SPEC §11 K0) reads the raw cache that the supersede cascade's repair recomputes, compounds included, to report old beside new; role-aware when that repair is" }),
     // --- epigraph-jobs ------------------------------------------------------
@@ -726,7 +726,10 @@ fn the_spec_named_readers_are_measured() {
             "crates/epigraph-db/src/repos/method.rs",
             "get_evidence_strength",
         ),
-        ("crates/epigraph-engine/src/belief_query.rs", "get_belief"),
+        (
+            "crates/epigraph-engine/src/belief_query.rs",
+            "get_belief_conn",
+        ),
         (
             "crates/epigraph-jobs/src/cluster_graph/runner.rs",
             "run_clustering",

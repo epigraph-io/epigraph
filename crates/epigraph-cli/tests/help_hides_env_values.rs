@@ -41,6 +41,11 @@ const CROSS_SOURCE_SWEEP: Option<&str> = None;
 /// relative to the crate root)`.
 const BINS: &[(&str, Option<&str>, &str)] = &[
     (
+        "atlas_layout",
+        Some(env!("CARGO_BIN_EXE_atlas_layout")),
+        "src/bin/atlas_layout.rs",
+    ),
+    (
         "backfill_dedup_identity_edges",
         Some(env!("CARGO_BIN_EXE_backfill_dedup_identity_edges")),
         "src/bin/backfill_dedup_identity_edges.rs",
@@ -105,6 +110,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "sweep_semantic_duplicates",
         Some(env!("CARGO_BIN_EXE_sweep_semantic_duplicates")),
         "src/bin/sweep_semantic_duplicates.rs",
+    ),
+    (
+        "sweep_retired_source_bbas",
+        Some(env!("CARGO_BIN_EXE_sweep_retired_source_bbas")),
+        "src/bin/sweep_retired_source_bbas.rs",
     ),
     (
         "unmark_duplicate",

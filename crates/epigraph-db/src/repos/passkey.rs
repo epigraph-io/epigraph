@@ -5,7 +5,9 @@
 //!
 //! Every write goes through a migration-124 definer, never a raw statement
 //! here: `epigraph_create_passkey_enrollment` opens a ticket and
-//! `epigraph_revoke_passkey` revokes a passkey, and the tables' own triggers
+//! `epigraph_revoke_passkey` revokes a passkey (200's
+//! `epigraph_revoke_passkey_compromised` revokes it with every passkey
+//! enrolled through it), and the tables' own triggers
 //! enforce the rules (ELV01 a passkey belongs only to a registered human that
 //! is no other human's agent, ELV03 append-only, ELV04 a ticket that is not
 //! live) and write the `platform.passkey_*` audit rows. A caller of this
@@ -69,6 +71,18 @@ pub struct PasskeyRow {
 const PASSKEY_COLUMNS: &str = "id, person_agent_id, credential_id, aaguid, attestation_format, \
      user_verified, backup_eligible, label, enrollment_id, sign_count, created_at, \
      last_used_at, revoked_at, revoked_by, revoked_reason";
+
+/// One passkey a COMPROMISED revoke reached
+/// ([`PasskeyRepository::revoke_compromised`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompromisedRevoke {
+    /// The passkey.
+    pub passkey: Uuid,
+    /// 0 for the passkey named; n for one enrolled n acts below it.
+    pub lineage_depth: i32,
+    /// Whether this call revoked it (false: it was already revoked).
+    pub revoked_now: bool,
+}
 
 /// Repository for passkeys and their enrollment tickets.
 pub struct PasskeyRepository;
@@ -163,6 +177,41 @@ impl PasskeyRepository {
             .fetch_one(&mut *conn)
             .await?;
         Ok(revoked)
+    }
+
+    /// Revoke a passkey as COMPROMISED (migration 200's
+    /// `epigraph_revoke_passkey_compromised`): the passkey and every passkey
+    /// whose anchor lineage passes through it (each enrolled on an act it, or
+    /// one of them, confirmed), attested ones included, the same person's
+    /// only, in one statement; already revoked ones are walked through, not
+    /// revoked again. Every revoke is audited `mode = compromised`. One entry
+    /// per passkey reached, nearest first.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`: `ELV04` for an unknown passkey, `22004` for a
+    /// blank reason, `42501` on a non-maintenance connection.
+    #[instrument(skip(conn, reason))]
+    pub async fn revoke_compromised(
+        conn: &mut sqlx::PgConnection,
+        passkey: Uuid,
+        reason: &str,
+    ) -> Result<Vec<CompromisedRevoke>, DbError> {
+        let rows: Vec<(Uuid, i32, bool)> = sqlx::query_as(
+            "SELECT revoked_id, lineage_depth, revoked_now \
+               FROM public.epigraph_revoke_passkey_compromised($1, $2)",
+        )
+        .bind(passkey)
+        .bind(reason)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(passkey, lineage_depth, revoked_now)| CompromisedRevoke {
+                passkey,
+                lineage_depth,
+                revoked_now,
+            })
+            .collect())
     }
 
     /// One passkey by id (a maintenance read).

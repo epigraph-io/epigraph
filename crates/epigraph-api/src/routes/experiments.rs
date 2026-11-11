@@ -153,13 +153,15 @@ pub async fn hypothesize(
     let similar = epigraph_db::ClaimRepository::semantic_search_flat(
         &state.db_pool,
         &viewer,
-        &format_embedding(&embedding),
+        epigraph_db::FlatRanking::Query(&format_embedding(&embedding)),
         search_radius,
         None,
         None,
         None,
         None,
         50,
+        None,
+        0,
     )
     .await
     .map_err(|e| ApiError::InternalError {

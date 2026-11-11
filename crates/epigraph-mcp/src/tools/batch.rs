@@ -190,10 +190,15 @@ pub async fn system_stats(
 ) -> Result<CallToolResult, McpError> {
     let detailed = params.detailed.unwrap_or(false);
 
-    let counts = epigraph_db::CorpusStatsRepository::tenant_counts(&server.pool, viewer, detailed)
-        .await
-        .map_err(internal_error)?;
-    let agent_count = epigraph_db::CorpusStatsRepository::agent_count(&server.pool, viewer)
+    // Every count on ONE connection stamped with the caller's viewer: on the
+    // plain pool, row security admits public rows only, so a member's own
+    // group-private rows would be missing from its counts.
+    let mut read = server.read_as(viewer, "system_stats").await?;
+    let counts =
+        epigraph_db::CorpusStatsRepository::tenant_counts_conn(&mut read, viewer, detailed)
+            .await
+            .map_err(internal_error)?;
+    let agent_count = epigraph_db::CorpusStatsRepository::agent_count(&mut *read, viewer)
         .await
         .map_err(internal_error)?;
 
@@ -215,7 +220,7 @@ pub async fn system_stats(
         // unpopulated RDF layer is observable, rather than silently reported as
         // count=0 / entity-not-found by query_triples/search_triples/
         // entity_neighborhood (backlog ae2784a9).
-        let index = epigraph_db::TripleRepository::index_counts(&server.pool, viewer)
+        let index = epigraph_db::TripleRepository::index_counts(&mut *read, viewer)
             .await
             .map_err(internal_error)?;
 
@@ -229,14 +234,14 @@ pub async fn system_stats(
         // The unsigned-edge metric (backlog dae795f8): how many readable edges
         // carry an attestation, so the edge-signing gap is visible, not tacit.
         let edge_signing = epigraph_db::repos::edge_signature::EdgeSignatureRepository::coverage(
-            &server.pool,
-            viewer,
+            &mut *read, viewer,
         )
         .await
         .map_err(internal_error)?;
         stats["edges_signed"] = serde_json::json!(edge_signing.signed);
         stats["edges_unsigned"] = serde_json::json!(edge_signing.unsigned);
     }
+    read.commit().await.map_err(internal_error)?;
 
     Ok(CallToolResult::success(vec![ContentBlock::text(
         stats.to_string(),

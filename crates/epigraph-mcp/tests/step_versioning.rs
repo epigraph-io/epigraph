@@ -26,7 +26,36 @@ use uuid::Uuid;
 fn build_server(pool: PgPool) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None); // mock — no API key
-    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
+    {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false).with_scoped_pool(scoped)
+    }
+}
+
+/// Record `server`'s own agent as the submitter of the workflow rows named
+/// `canonical_name`, so its stdio `evolve_step` passes the lineage gate
+/// through the submitter arm. A row with NO recorded submitter admits on
+/// stdio only a writer of its owner group, as over HTTP; these tests pin step
+/// addressing and head selection, not that gate.
+async fn submitted_by_server(pool: &PgPool, server: &EpiGraphMcpFull, canonical_name: &str) {
+    let agent = server.server_agent_id().await.expect("the server's agent");
+    let rows = sqlx::query(
+        "UPDATE workflows SET metadata = metadata || jsonb_build_object('epigraph_submitted_by', \
+                $2::text) WHERE canonical_name = $1",
+    )
+    .bind(canonical_name)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("record the submitter")
+    .rows_affected();
+    assert!(rows > 0, "fixture: a workflow named {canonical_name}");
 }
 
 /// Insert a freestanding agent for seeded parent claims. The server will
@@ -153,6 +182,7 @@ async fn evolve_step_addresses_by_canonical_name_and_index(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
+    submitted_by_server(&pool, &server, "name-mode-wf").await;
     for (i, s) in [step0, step1].iter().enumerate() {
         sqlx::query(
             "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, created_at) \
@@ -963,6 +993,7 @@ async fn retired_step_head_is_flagged_and_evolve_step_names_the_retirement(pool:
     let server = build_server(pool.clone());
     let (healthy, retired, branch_current, branch_retired) =
         seed_retired_step_workflow(&pool).await;
+    submitted_by_server(&pool, &server, "retired-step-wf").await;
 
     let body = search(&server, &viewer, "retired step probe", Some(true), None).await;
     let steps = body["workflows"][0]["resolved_steps"]
@@ -1086,6 +1117,7 @@ async fn find_workflow_evolved_steps_name_the_current_head_and_flag_retirement(p
     let server = build_server(pool.clone());
     let (_healthy, _retired, branch_current, branch_retired) =
         seed_retired_step_workflow(&pool).await;
+    submitted_by_server(&pool, &server, "retired-step-wf").await;
     let (wf,): (Uuid,) =
         sqlx::query_as("SELECT id FROM workflows WHERE canonical_name = 'retired-step-wf'")
             .fetch_one(&pool)

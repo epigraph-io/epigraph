@@ -1664,7 +1664,8 @@ restart.
   row (`role_attachments_withheld`). The cost: the reverted identity then
   holds no attachment, so 166's restriction (ROL01, may-run) no longer
   applies to it; attach the running identity by name after a revert if it
-  must hold. Adds
+  must hold. (Amended by **195**: the reverse-pair guard is dropped, the
+  chain guard kept, so a revert onto a predecessor restricts again.) Adds
   `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
   maintenance-session only and audited (`agent.identity_succession_recorded`):
   for a child the host registered parentless in that folder, with no
@@ -1698,8 +1699,9 @@ restart.
   by a maintenance session (`epigraph_attach_agent_to_role` /
   `epigraph_detach_agent_from_role`) or a maintenance-owned definer frame,
   each attach and detach audited `platform.role_agent_*`. An attachment
-  follows the identity's registered lineage forward (`agent_succession`),
-  and 161's registration copies a parent's live attachments to a new child
+  follows the identity's registered lineage forward (`agent_succession`;
+  amended by **195**: each successor's copy names its predecessor's row,
+  not the new attachment), and 161's registration copies a parent's live attachments to a new child
   over every gap the child's own rows leave (re-stated with one marked step,
   5b). A SHARED successor (one that runs in another group folder) is copied
   too, fail closed, and flagged (`role_attachments_shared` on the
@@ -2041,6 +2043,11 @@ restart.
   RAISEs `55000` (changing nothing) over any other body; a LATER re-statement
   of the derivation must start from 179's body (the head pin fails
   otherwise). Slot: 170-178 are carried or reserved by other in-flight work.
+  Amended by **195** (a detach is sticky per identity and cuts off the
+  lineage below it: no copy admits an identity holding a detached row for
+  the role, or descending from one through identities with no live
+  attachment made by name, nor anything copied through a copy such an
+  identity holds).
   **Deploy order:** after 165 and 166; before any operator CLI call with
   `--agent-mode attached_agents` (the other modes work without it).
 - **181**: public `group_admin_reseal_mark` (backlog 323773fe, ruling
@@ -2367,6 +2374,193 @@ restart.
   **Predeploy check:** `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid
   = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[],
   text)')` must print 117's md5 and one of the two paths.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **196**: public `idx_claims_theme_current_tenancy` (backlog 57917c13,
+  Atlas P3a). A `-- no-transaction` covering partial index, one `CREATE
+  INDEX CONCURRENTLY IF NOT EXISTS` statement: `claims (theme_id) INCLUDE
+  (visibility, owner_group_id) WHERE theme_id IS NOT NULL AND is_current`.
+  It serves `ClaimThemeRepository::overview_page`, the one `GROUP BY
+  theme_id` pass behind `GET /api/v1/graph/themes/overview`'s live,
+  viewer-scoped member counts: every column any qual on that pass reads is
+  in the index, so it can be an index-only scan on all-visible pages. The
+  predicate is the bare `is_current` (the column is NOT NULL) because
+  partial-index implication is proved syntactically. Registered in
+  `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked). No
+  function, policy, grant or data change. Undo: `DROP INDEX CONCURRENTLY IF
+  EXISTS public.idx_claims_theme_current_tenancy` (nothing names it). A
+  failed build leaves an INVALID index; drop it and re-run (see "Recovery"
+  below). Checked before claiming: `195` is held by an origin branch
+  (`195_role_detach_sticky_and_revert_restricts.sql`), `197` by a sibling
+  Atlas P3a unit; no migration on main or on any fetched origin branch
+  carries a `196` (`git log --all -- 'migrations/196*'` is empty). **Deploy order:** any; an older binary ignores the index. Build it
+  in a quiet window (see "Production window" below). **Applied to throwaway
+  databases only, NOT to any deployed database.**
+- **197**: public `atlas_theme_layout` (Atlas P3a; backlog f9b4a488,
+  2b5bd83e, 4321ae80; owner ruling A1). A shared theme and region layout,
+  computed only from public current claims and public in-force edges by the
+  operator CLI `atlas_layout` on the maintenance DSN. Four untenanted derived
+  tables: `atlas_layout_runs` (one row per build: algo, params, the build's
+  visibility epoch, counts, a SHA-256 digest of the placed theme ids),
+  `atlas_layout_regions` (ordinal, label, `x`/`y`/`r`, and a `vector(1536)`
+  centroid that is the normalised mean of public theme centroids),
+  `atlas_layout_themes` (one position per placed theme, FK to
+  `claim_themes` ON DELETE CASCADE, and a shared `rank_in_region`) and
+  `atlas_layout_theme_links` (public link counts per theme pair and
+  lower-cased relationship). None has a `claim_id` column or an FK to
+  `claims`. Adds the one-row `atlas_layout_epoch` and the definer
+  `epigraph_atlas_layout_narrowed()` (172's `pg_catalog, pg_temp` form, owned
+  by `epigraph_maintenance`, EXECUTE revoked from PUBLIC), fired by the row
+  triggers `claims_atlas_layout_narrowed` and `edges_atlas_layout_narrowed`
+  (AFTER UPDATE, no column list, `WHEN OLD.visibility = 'public' AND
+  NEW.visibility IS DISTINCT FROM 'public'`): any narrowing of a public row,
+  whatever the write path, bumps the epoch in its own transaction (once per
+  transaction, through a transaction-local guard, so a bulk narrowing does not
+  stack one epoch row version per row), and a run is served only while its
+  recorded epoch equals the current one. The
+  application role keeps SELECT only on all five tables; the maintenance role
+  gets SELECT, INSERT, DELETE on the four layout tables and SELECT, UPDATE on
+  the epoch. Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/atlas_layout_repo.rs` (the epoch triggers, the catalog
+  shape of the definer, the role grants), `epigraph-cli/tests/atlas_layout_bin.rs`
+  and `epigraph-api/tests/graph_layout_route_test.rs`; registered in
+  `tenancy_backfill.rs` `DEFERRED_DEFINER_FUNCTIONS`. Undo in the file
+  header. Checked before claiming: 194 is the head on main; 195 is held by an
+  origin branch and 196 by sibling Atlas unit U1. **Deploy order:** apply
+  before a binary that serves `GET /api/v1/graph/themes/layout`; an older
+  binary ignores the tables. Narrowing transactions serialise on the epoch
+  row. **Applied to throwaway databases only, NOT to any deployed database.**
+
+- **195**: public `role_detach_sticky_and_revert_restricts`. Four measured
+  gaps in 166/179/180's handling of role attachments.
+  (1) A detach was per ROW, so an identity the operator detached was
+  admitted again in 179's attached mode by a later copy whose chain did not
+  pass through its detached row: a multi-hop revert after the documented
+  restore (attach A; B, C succeed it; detach A; restore C by name; the job
+  reverts to A, parent C), 166's attach-time follow onto a reverted identity
+  (attach A; B succeeds it; detach A; revert to A; restore B by name), and
+  any successor registered from such a copy. (2) 166's attach-time follow
+  flattened its copies (every successor's copy named the new attachment,
+  however deep), so the chain walk never saw the identities in between: a
+  successor of a detached identity was admitted once an ancestor was
+  attached by name, and detaching an identity after an ancestor's attach
+  revoked nothing the follow copied below it, while the same lineage built
+  by the registration answered the other way. (3) 180's reverse-pair guard
+  withheld the registration's copy from an identity that was never
+  detached, so after the operator attached B by name a revert to A left A
+  outside 166's restriction (ROL01, may-run) while B was held. (4) A
+  detach of the identity a job runs did not cut off the job: a copy's chain
+  names rows, not the identities an agent was registered from, so when the
+  job reverted to an earlier identity that still held a live copy (Q
+  attached by name; P, A succeed it; detach A; the job reverts to P, parent
+  A) that identity kept the group, read and write, and a successor
+  registered from a detached and a clean parent was admitted or not by
+  which parent its copy chained through (order-dependent). Re-states
+  `epigraph_role_derived_memberships` from 179's body: a succession copy
+  (`inherited_from` set) admits nothing to an agent that is CUT OFF from
+  the role, nor through a copy such an agent holds. An agent is cut off
+  when it holds ANY detached `role_agents` row for the role, or when a
+  parent recorded in `agent_succession` (a revert's included) is cut off
+  and holds no live DIRECT row for the role at the instant asked. So a
+  detach cuts off every identity registered below the detached one, in
+  either direction of a revert and however many registrations later, up
+  to the first identity on the way that the operator attached by name. Up
+  to that identity the answer does not depend on the order the lineage was
+  built in or on which parent a copy chains through; below it (for example
+  a successor of a detached identity that was then attached by name again,
+  the documented restore) the identity's own copy chain decides: out when
+  it runs through the old, detached copy (registered before the detach),
+  in when it names the row made by name (registered after the restore) or
+  chains through a clean parent. The walk sees only recorded successions:
+  a revert counts only when it is registered (the earlier identity's key
+  again, naming the one it reverts from as parent), and a job's next
+  identity is below the one that ran only when registered with that one
+  as its parent; a job that goes back to an identity without that
+  registration records no edge, and that identity keeps the group through
+  a clean old copy, as does an edit or revert registered with another
+  parent than the identity the group's lane ran last (a host that keys
+  the parent per model). So a detach of the identity a job runs reaches
+  the job's later edits and reverts only from a host that keys succession
+  on the group's lane (the lane's newest identity, any model, is the
+  parent of every edit or revert), and even then never an identity that
+  holds a live row made by name: that row is never judged and ends the
+  walk, so a job keeps the group by going back to ANY identity it can run
+  that holds one, its revert registered or not (after a documented
+  restore, a revert to an older identity attached by name, registered
+  with the detached, restored one as parent, stays in, and so does the
+  next edit from it). That is permanent, whatever the host records. What
+  cuts a job off under any host, for EVERY role the group is bound to in
+  attached_agents mode: list every identity the host may run for the
+  group (any model, any kind of run) and the identity at the root of
+  every un-detached copy they hold, and call 166's detach verb on each
+  that holds an UN-DETACHED row made by name in ANY window (a
+  future-dated row is not live yet, but opens with no operator act); the
+  verb detaches every un-detached row the identity holds for the role.
+  List on a maintenance session (`role_agents` is FORCE RLS, so an app or
+  read-only session reads no row of it; an empty answer anywhere else
+  means nothing). A copy
+  counts only through a live row made by name at its chain's root, so
+  none of them is admitted again, nor anything registered from them
+  later, until the operator attaches one by name. A binding in
+  registered_agents mode admits the job through its operator's role
+  assignment, which no detach reaches. A lane-keyed host adds only that
+  a detach of an identity the job ran also takes every identity it
+  registers below that one afterwards that holds no live row made by
+  name; never pick for this an identity the host also runs for another
+  kind of run or another group, since the detach takes it out there too.
+  A detach also reaches the
+  identity that runs now when the operator detaches an OLD identity it
+  descends from (a registered revert records a succession too), and the
+  walk ignores when a succession or a detach was recorded, so an answer
+  for a past instant can change after a later revert or detach. A DIRECT
+  attachment counts
+  as before wherever it sits (so attaching an identity by name re-admits
+  it, a revert to an identity attached by name keeps the group through
+  that row, and the documented restore still restores the running
+  identity and its later successors). A copy written by hand for an agent
+  with no recorded succession is judged by its chain alone. Re-states
+  `epigraph_register_agent_identity` from 180's body:
+  step 5b keeps 180's chain guard and drops the reverse-pair guard, so a
+  revert onto a predecessor is copied and restricts like any succession
+  (`role_attachments_withheld` now counts chain-guard rows only).
+  Re-states `epigraph_role_agents_follow_lineage` from 166's body: the walk
+  goes breadth first along `agent_succession`, and each piece of a
+  successor's gap names the row of the identity it succeeded that covers it
+  (the copy this walk writes for that predecessor, or the predecessor's own
+  un-detached row), as step 5b does; a successor with two parents on one
+  level runs through one that holds a detached row (or was reached through
+  one) first, then the lowest id. Every gap of every successor is still
+  copied, a detached one included, so the restriction stays (skipping a
+  detached successor would leave it and its later successors
+  unrestricted); the copies are one INSERT in walk order, with 166's reason
+  text and shared-successor flag. Signatures, owners, ACLs and
+  `search_path` unchanged; no grant. A precondition checks the md5 of
+  179's derivation (`65bd0fc12e34b4172607dd2864fb7f66`), 180's registration
+  (`c31ae71f307a0573716e51fe17aa5dc8`) and 166's follow
+  (`f273e115ab880c9ff2cf7e2bab2f6060`) and RAISEs `55000` (changing
+  nothing) over any other body; a later re-statement of any of them starts
+  from 195's (derivation `1c5c6925547d6aa0d0a54e718ce6bd47`, registration
+  `a792b630dd34b1ab8c36218b5cb698d1`, follow
+  `f60c55756be189b751565de942d63a0a`). Rows already written are left as
+  they are (the table is append-only): a copy the 166 follow flattened
+  keeps naming the attachment it came from, and a detach of an identity
+  in between still reaches it through the lineage walk, up to the first
+  identity holding a live row made by name (below that row its chain
+  decides). Pinned by
+  `epigraph-db/tests/group_role_membership.rs` (the 195 sections),
+  `role_attached_agents.rs::attaching_an_identity_attaches_a_shared_successor_and_flags_it_once`,
+  `legacy_fleet_parent.rs` (`a_copy_onto_the_parents_own_predecessor_restricts`,
+  `a_copy_whose_chain_reaches_the_child_is_withheld`, the precondition with
+  the three md5s, and the undo) and
+  `schema_contract.rs::migration_179_attached_arm_survives_at_head` /
+  `::migration_195_registration_restricts_a_revert_at_head` /
+  `::migration_195_follow_chains_its_copies_at_head`. Undo:
+  `docs/runbooks/195-undo.sql` (tested: it returns the `public` catalog to
+  below 195 and refuses `55000` over any body but 195's or the one it
+  restores, for each of the three); run it BEFORE `180-undo.sql`, which
+  refuses a 195 registration.
+  Checked before claiming: no migration on main, open PR, origin branch or
+  local worktree carries a `195`. **Deploy order:** after 179 and 180; no
+  binary depends on it; before attaching any further identity to a role.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

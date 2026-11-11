@@ -13,16 +13,19 @@ pub mod agent_identity;
 pub mod agent_key;
 pub mod alternative_set;
 pub mod analysis;
+pub mod atlas_layout;
 pub mod atom_axiom;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
+pub mod claim_context;
 pub mod claim_encryption;
 pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
+pub mod cluster_run;
 pub mod community;
 pub mod compound_valuation;
 pub mod conflict_density;
@@ -35,6 +38,7 @@ pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
 pub mod edge_signature;
+pub mod ego;
 pub mod elevated_access;
 pub mod elevation_ceremony;
 pub mod entity;
@@ -107,6 +111,14 @@ pub use agent_identity::{
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
+pub use atlas_layout::{
+    AtlasLayoutRepository, DetailPart, LayoutBuild, LayoutLinkCursor, LayoutLinkOut, LayoutLinkRow,
+    LayoutOverview, LayoutRegionOut, LayoutRunRow, LayoutThemeOut, LinkPage, LinkPairCursor,
+    LinkPairRow, LinkSide, LinkSideKind, PlacementLayoutRow, PublicLayoutInputs,
+    PublicThemeCentroid, PublicThemeLinkCount, RegionDetail, ThemePageCursor, ThemePlacement,
+    UnplacedCursor, UnplacedPage, VisibleRegionRow, VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS,
+    ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
+};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
@@ -114,8 +126,8 @@ pub use claim::{
     ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
     ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
     DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
-    EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
-    LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
+    EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
+    HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
     MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
     SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
     CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
@@ -123,12 +135,18 @@ pub use claim::{
     RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
     SUPERSEDE_ACT_TOOLS,
 };
+pub use claim_context::{
+    ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
+    ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
     DistantClaimsRow, NeighbourhoodThemeCoverage, RecomputedThemeRow, SplitCandidateRow,
-    ThemeMemberRow, ThemeSummaryRow,
+    ThemeMemberRow, ThemeOverviewCursor, ThemeOverviewPage, ThemeOverviewRow, ThemeSummaryRow,
+    THEME_OVERVIEW_PAGE_MAX,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
+pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
 pub use community::{CommunityRepository, MembershipOutcome};
 pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use context::ContextRepository;
@@ -136,6 +154,7 @@ pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
+pub use ego::{EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository};
 pub use elevated_access::ElevatedAccess;
 pub use elevation_ceremony::{
     AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
@@ -210,8 +229,10 @@ pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
 pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
-pub use passkey::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
-pub use passkey_ceremony::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
+pub use passkey::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
+pub use passkey_ceremony::{
+    CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey,
+};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
 pub use refresh_token::{

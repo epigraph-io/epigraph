@@ -1903,3 +1903,1301 @@ fn every_131_object_is_registered() {
         "the reader is missing from tenancy_backfill.rs's grant register"
     );
 }
+
+// =====================================================================
+// 200: THE ENROLLMENT ANCHOR (the anchored passkey path's reader)
+// =====================================================================
+
+/// The anchor row, as the API reads it (the JSON columns as presence flags).
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct AnchorRow {
+    act_id: Uuid,
+    act_kind: String,
+    act_outcome: Option<String>,
+    args_digest: Vec<u8>,
+    has_state: bool,
+    has_evidence: bool,
+    enrollment_person: Uuid,
+    anchor_id: Uuid,
+    anchor_person: Uuid,
+    anchor_credential_id: Vec<u8>,
+    anchor_attestation_format: String,
+    anchor_backup_eligible: bool,
+    anchor_revoked: bool,
+}
+
+/// `epigraph_enrollment_anchor(enrollment)` on an UNSTAMPED application
+/// session, as the anonymous enrollment page calls it.
+async fn anchor_of(pool: &PgPool, enrollment: Uuid) -> Vec<AnchorRow> {
+    as_app(pool, None, "", "", |mut conn| async move {
+        let rows = sqlx::query_as::<_, AnchorRow>(
+            "SELECT act_id, act_kind, act_outcome, args_digest, \
+                    act_challenge_state IS NOT NULL AS has_state, \
+                    assertion_evidence IS NOT NULL AS has_evidence, enrollment_person, anchor_id, \
+                    anchor_person, \
+                    anchor_credential_id, anchor_attestation_format, anchor_backup_eligible, \
+                    anchor_revoked \
+               FROM public.epigraph_enrollment_anchor($1)",
+        )
+        .bind(enrollment)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("the anchor reader");
+        (conn, rows)
+    })
+    .await
+}
+
+/// A LATER passkey's enrollment, opened on `p`'s confirmed `passkey.register`
+/// act; `(act, enrollment)`.
+async fn anchored_enrollment(pool: &PgPool, p: &Elevated) -> (Uuid, Uuid) {
+    let act = confirmed(
+        pool,
+        p,
+        "passkey.register",
+        &format!(
+            "{{\"person\": \"{}\", \"label\": \"key 2\", \"reason\": \"a second key\"}}",
+            p.person
+        ),
+    )
+    .await;
+    let person = p.person;
+    let enrollment: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'a second key', 'key 2', $2)",
+        )
+        .bind(person)
+        .bind(act)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the act's enrollment");
+        (conn, e)
+    })
+    .await;
+    (act, enrollment)
+}
+
+/// The application role reads, for a live enrollment opened on an act, that
+/// act (a confirmed `passkey.register` act, its digest, ceremony state and
+/// evidence) and the passkey that confirmed it (the proposer's: its
+/// credential, recorded format and flags), and sees a later revocation of
+/// that passkey. Mutation: the reader joining the person's FIRST passkey
+/// instead of the act's confirming one (`k.person_agent_id =
+/// en.person_agent_id`) -> two rows once a second passkey exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_anchor_is_the_act_and_the_passkey_that_confirmed_it(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (act, enrollment) = anchored_enrollment(&pool, &p).await;
+    let digest: Vec<u8> =
+        sqlx::query_scalar("SELECT args_digest FROM pending_admin_acts WHERE id = $1")
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("the digest");
+    let rows = anchor_of(&pool, enrollment).await;
+    assert_eq!(
+        rows,
+        vec![AnchorRow {
+            act_id: act,
+            act_kind: "passkey.register".to_string(),
+            act_outcome: Some("confirmed".to_string()),
+            args_digest: digest,
+            has_state: true,
+            has_evidence: true,
+            enrollment_person: p.person,
+            anchor_id: p.passkey,
+            anchor_person: p.person,
+            anchor_credential_id: p.cred.clone(),
+            anchor_attestation_format: "none".to_string(),
+            anchor_backup_eligible: false,
+            anchor_revoked: false,
+        }]
+    );
+
+    // A second passkey registered on that enrollment consumes it (no row),
+    // and a further act, confirmed by that SECOND passkey, anchors its
+    // enrollment on the second, not on the person's first.
+    let second_key = complete_enrollment(&pool, enrollment, 2).await;
+    assert!(anchor_of(&pool, enrollment).await.is_empty(), "consumed");
+    let second = Elevated {
+        passkey: second_key,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, later) = anchored_enrollment(&pool, &second).await;
+    let rows = anchor_of(&pool, later).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].anchor_id, second_key,
+        "the act's confirming passkey"
+    );
+    assert!(!rows[0].anchor_revoked, "live");
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost')",
+        &[Some(second_key)],
+    )
+    .await
+    .expect("revoke the second passkey");
+    assert!(
+        anchor_of(&pool, later).await[0].anchor_revoked,
+        "revoked is reported"
+    );
+}
+
+/// A first passkey's MAINTENANCE enrollment has no anchor, and neither has an
+/// unknown, consumed or expired one: the API then runs the attested ceremony.
+/// (The consumed case is pinned above.) Mutation: the expiry filter removed
+/// -> the expired enrollment answers a row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_live_act_enrollment_has_an_anchor(pool: PgPool) {
+    let (person, _) = human(&pool, "first").await;
+    let first: Uuid = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'first key', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("enroll");
+        (conn, e)
+    })
+    .await;
+    assert!(anchor_of(&pool, first).await.is_empty(), "maintenance");
+    assert!(anchor_of(&pool, Uuid::new_v4()).await.is_empty(), "unknown");
+
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (_, live) = anchored_enrollment(&pool, &p).await;
+    assert_eq!(anchor_of(&pool, live).await.len(), 1, "CALIBRATION: live");
+    without_triggers(
+        &pool,
+        "UPDATE passkey_enrollments SET created_at = now() - interval '10 minutes', \
+                expires_at = now() - interval '1 second' WHERE id = $1",
+        live,
+    )
+    .await;
+    assert!(anchor_of(&pool, live).await.is_empty(), "expired");
+}
+
+/// The reader's catalog contract: SECURITY DEFINER owned by
+/// `epigraph_maintenance`, STABLE, path `pg_catalog, pg_temp`, EXECUTE-able by
+/// `epigraph_app` and not by PUBLIC. Mutation: the role-guarded GRANT to
+/// `epigraph_app` removed -> the app role cannot call it (and the anchored
+/// page 42501s).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_anchor_reader_is_a_maintenance_owned_app_callable_definer(pool: PgPool) {
+    let (definer, volatile, owner, config): (bool, String, String, Vec<String>) = sqlx::query_as(
+        "SELECT p.prosecdef, p.provolatile::text, p.proowner::regrole::text, \
+                coalesce(p.proconfig, '{}') \
+           FROM pg_proc p WHERE p.oid = 'public.epigraph_enrollment_anchor(uuid)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the function");
+    assert!(definer);
+    assert_eq!(volatile, "s");
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
+    let (app, public): (bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('epigraph_app', \
+                    'public.epigraph_enrollment_anchor(uuid)', 'EXECUTE'), \
+                EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a \
+                         WHERE p.oid = 'public.epigraph_enrollment_anchor(uuid)'::regprocedure \
+                           AND a.grantee = 0 AND a.privilege_type = 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("privileges");
+    assert_eq!((app, public), (true, false));
+}
+
+fn undo_200() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/200-undo.sql"),
+    )
+    .expect("200-undo.sql")
+}
+
+/// `docs/runbooks/200-undo.sql` returns the catalog to 199's (the reader, the
+/// compromised revoke, both triggers and their functions gone, 124's audit
+/// body restored byte for byte, no table touched; `catalog` includes
+/// triggers and each function's body md5); a second run changes nothing. Mutation: either
+/// trigger's DROP removed -> the trigger is left behind.
+#[sqlx::test(migrations = false)]
+async fn the_200_rollback_drops_only_what_200_created(pool: PgPool) {
+    migrate(&pool, &up_to(199)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(200)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 200 changed the catalog"
+    );
+    sqlx::raw_sql(&undo_200())
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+    let after = catalog(&pool).await;
+    assert_eq!(after, before, "the catalog is 199's after the undo");
+    sqlx::raw_sql(&undo_200())
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(catalog(&pool).await, before, "idempotent");
+}
+
+/// Migration 200's four NEW SECURITY DEFINERs are on `epigraph-tenancy-backfill
+/// verify`'s ownership list at 200, the reader (app-callable) and the
+/// compromised revoke (not) on its grant register, and
+/// `docs/runbooks/200-undo.sql` drops them and both triggers; the one 124 body
+/// 200 re-states (the passkey audit) stays on the list at 124 and the undo
+/// restores it. Mutation: the `("epigraph_person_authenticators_revoke_anchored",
+/// 200)` entry removed -> named here.
+#[test]
+fn every_200_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/200_enrollment_anchor.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = undo_200();
+    let (definers, all) = functions_of(&migration);
+    let restated = "epigraph_person_authenticators_audit";
+    let expected: Vec<String> = [
+        "epigraph_enrollment_anchor",
+        "epigraph_person_authenticators_guard_act_confirmer",
+        "epigraph_person_authenticators_revoke_anchored",
+        "epigraph_revoke_passkey_compromised",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let mut every = expected.clone();
+    every.push(restated.to_string());
+    every.sort();
+    assert_eq!(
+        (definers.as_slice(), all.as_slice()),
+        (every.as_slice(), every.as_slice()),
+        "CALIBRATION: 200 creates four functions and re-states one 124 body, each a SECURITY \
+         DEFINER"
+    );
+    assert!(
+        backfill.contains(&format!("(\"{restated}\", 124)")),
+        "{restated} stays on tenancy_backfill.rs's ownership list at 124"
+    );
+    assert!(
+        undo.contains(&format!("CREATE OR REPLACE FUNCTION public.{restated}()"))
+            && !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{restated}(")),
+        "200-undo.sql restores {restated}, never drops it"
+    );
+    for name in &expected {
+        assert!(
+            backfill.contains(&format!("(\"{name}\", 200)")),
+            "{name} is missing from tenancy_backfill.rs's ownership list at 200"
+        );
+        assert!(
+            undo.contains(&format!("DROP FUNCTION IF EXISTS public.{name}(")),
+            "200-undo.sql does not drop {name}"
+        );
+    }
+    for trigger in [
+        "person_authenticators_guard_insert_act_confirmer",
+        "person_authenticators_revoke_anchored",
+    ] {
+        assert!(
+            undo.contains(&format!("DROP TRIGGER IF EXISTS {trigger}")),
+            "200-undo.sql does not drop the trigger {trigger}"
+        );
+    }
+    for signature in [
+        "public.epigraph_enrollment_anchor(uuid)",
+        "public.epigraph_revoke_passkey_compromised(uuid, text)",
+    ] {
+        assert!(
+            backfill.contains(&format!("\"{signature}\"")),
+            "{signature} is missing from tenancy_backfill.rs's grant register"
+        );
+    }
+    assert!(
+        undo.contains("DROP FUNCTION IF EXISTS public.epigraph_enrollment_anchor(uuid);"),
+        "200-undo.sql does not drop it"
+    );
+}
+
+// =====================================================================
+// 200: THE LINEAGE, THE ACT-CONFIRMER LOCK AND THE ANCHORED-REVOKE CASCADE
+// =====================================================================
+
+/// `(anchor_id, lineage passkey ids nearest first, complete)` of an
+/// enrollment, through the app-callable reader.
+async fn lineage_of(pool: &PgPool, enrollment: Uuid) -> Option<(Uuid, Vec<Uuid>, bool)> {
+    as_app(pool, None, "", "", |mut conn| async move {
+        let row: Option<(Uuid, serde_json::Value, bool)> = sqlx::query_as(
+            "SELECT anchor_id, anchor_lineage, anchor_lineage_complete \
+               FROM public.epigraph_enrollment_anchor($1)",
+        )
+        .bind(enrollment)
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("the anchor reader");
+        let out = row.map(|(anchor, lineage, complete)| {
+            let ids = lineage
+                .as_array()
+                .expect("a JSON array")
+                .iter()
+                .map(|e| {
+                    assert!(e.get("passkey").is_some_and(serde_json::Value::is_object));
+                    assert!(e.get("attestation_format").is_some());
+                    e["passkey_id"].as_str().unwrap().parse().unwrap()
+                })
+                .collect();
+            (anchor, ids, complete)
+        });
+        (conn, out)
+    })
+    .await
+}
+
+/// The anchor's lineage is the chain of passkeys that authorized it, nearest
+/// first, up to the person's maintenance-enrolled first passkey, and it is
+/// complete: the first passkey's own act enrollment has an empty lineage;
+/// one registered on it has the first; one registered on THAT has both, in
+/// order. Mutations: the recursion's step joining the act's PROPOSER's first
+/// passkey instead of its confirmer -> the third lineage is `[first]`;
+/// `ORDER BY up.depth` dropped from the aggregate -> (may) reorder;
+/// `complete` read from the anchor's own enrollment only -> false for the
+/// second and third.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_anchor_reports_its_lineage_up_to_the_first_passkey(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (_, e1) = anchored_enrollment(&pool, &p).await;
+    assert_eq!(
+        lineage_of(&pool, e1).await,
+        Some((p.passkey, vec![], true)),
+        "the first passkey anchors with an empty, complete lineage"
+    );
+    let second = complete_enrollment(&pool, e1, 2).await;
+    let p2 = Elevated {
+        passkey: second,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, e2) = anchored_enrollment(&pool, &p2).await;
+    assert_eq!(
+        lineage_of(&pool, e2).await,
+        Some((second, vec![p.passkey], true))
+    );
+    let third = complete_enrollment(&pool, e2, 3).await;
+    let p3 = Elevated {
+        passkey: third,
+        cred: credential(3),
+        ..p.clone()
+    };
+    let (_, e3) = anchored_enrollment(&pool, &p3).await;
+    assert_eq!(
+        lineage_of(&pool, e3).await,
+        Some((third, vec![second, p.passkey], true))
+    );
+}
+
+/// Each lineage entry carries `confirmed_at_unix`: the `asserted_at` (whole
+/// Unix seconds) of the act ITS SUCCESSOR was enrolled on, the moment it
+/// confirmed that act (the API holds its certificates to their validity
+/// then). For the third passkey's enrollment the lineage is [second, first]:
+/// second's time is the act third was enrolled on (confirmed by second),
+/// first's the act second was enrolled on (confirmed by first). The two acts
+/// are backdated a day apart (triggers off: an asserted act never changes) so
+/// a shifted pairing cannot pass. Red line (df4c5cdf's reader): no
+/// `confirmed_at_unix` key. Mutation: the recursive step taking the entry's
+/// OWN enrollment act's `asserted_at` (`pa.asserted_at` for `confirmed_at`)
+/// -> second carries first's act time, and first none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_lineage_entry_carries_when_it_confirmed_its_successors_act(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (a1, e1) = anchored_enrollment(&pool, &p).await;
+    let second = complete_enrollment(&pool, e1, 2).await;
+    let p2 = Elevated {
+        passkey: second,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (a2, e2) = anchored_enrollment(&pool, &p2).await;
+    let third = complete_enrollment(&pool, e2, 3).await;
+    let p3 = Elevated {
+        passkey: third,
+        cred: credential(3),
+        ..p.clone()
+    };
+    let (_, e3) = anchored_enrollment(&pool, &p3).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    for (act, days) in [(a1, 2), (a2, 1)] {
+        sqlx::query(
+            "UPDATE public.pending_admin_acts \
+                SET asserted_at = now() - make_interval(days => $2) WHERE id = $1",
+        )
+        .bind(act)
+        .bind(days)
+        .execute(&mut *tx)
+        .await
+        .expect("backdate the act's assertion");
+    }
+    tx.commit().await.expect("commit");
+    let epoch = |act: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT floor(extract(epoch FROM asserted_at))::bigint \
+                   FROM public.pending_admin_acts WHERE id = $1",
+            )
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("asserted_at")
+        }
+    };
+    let (t1, t2) = (epoch(a1).await, epoch(a2).await);
+    assert!(t2 - t1 >= 86_000, "CALIBRATION: the acts are a day apart");
+
+    let lineage: serde_json::Value = as_app(&pool, None, "", "", |mut conn| async move {
+        let l =
+            sqlx::query_scalar("SELECT anchor_lineage FROM public.epigraph_enrollment_anchor($1)")
+                .bind(e3)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("the anchor reader");
+        (conn, l)
+    })
+    .await;
+    let entries: Vec<(Uuid, Option<i64>)> = lineage
+        .as_array()
+        .expect("a JSON array")
+        .iter()
+        .map(|e| {
+            (
+                e["passkey_id"].as_str().unwrap().parse().unwrap(),
+                e.get("confirmed_at_unix")
+                    .and_then(serde_json::Value::as_i64),
+            )
+        })
+        .collect();
+    assert_eq!(entries, vec![(second, Some(t2)), (p.passkey, Some(t1))]);
+}
+
+/// `complete_enrollment` with the attestation format `format`, returning the
+/// refusal instead of panicking.
+async fn try_complete(
+    pool: &PgPool,
+    enrollment: Uuid,
+    n: u8,
+    format: &'static str,
+) -> Result<Uuid, sqlx::Error> {
+    as_app(pool, None, "", "", |mut conn| async move {
+        sqlx::query(
+            "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+        )
+        .bind(enrollment)
+        .execute(&mut *conn)
+        .await
+        .expect("enrollment challenge");
+        let aaguid = if format == "none" {
+            Uuid::nil()
+        } else {
+            Uuid::from_u128(0x2fc0_579f_8113_47ea_b116_bb5a_8db9_202a)
+        };
+        let r = sqlx::query_scalar(
+            "SELECT public.epigraph_complete_passkey_enrollment($1, $2, '{\"cred\": 1}'::jsonb, \
+                    $3, $4, true, $5)",
+        )
+        .bind(enrollment)
+        .bind(credential(n))
+        .bind(aaguid)
+        .bind(format)
+        .bind(format == "none")
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+async fn revoked(pool: &PgPool, passkey: Uuid) -> Option<(String, String)> {
+    let row: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT revoked_by, revoked_reason FROM person_authenticators WHERE id = $1",
+    )
+    .bind(passkey)
+    .fetch_one(pool)
+    .await
+    .expect("the passkey");
+    row.0.zip(row.1)
+}
+
+/// A passkey enrolled on an act is recorded only while the passkey that
+/// confirmed the act is live: revoked between the enrollment's opening (and
+/// the API's anchor check) and the completion, the completion is refused
+/// ELV04 and nothing is recorded. CALIBRATION: unrevoked, the same shape
+/// completes. Mutation: the insert guard's trigger dropped -> the completion
+/// records a passkey on a revoked anchor (the PR head's behaviour).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_enrollment_completes_only_while_its_confirmer_is_live(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (_, doomed) = anchored_enrollment(&pool, &p).await;
+    // The cascade has nothing to revoke yet: neither is completed.
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost')",
+        &[Some(p.passkey)],
+    )
+    .await
+    .expect("revoke the confirming passkey");
+    let r = try_complete(&pool, doomed, 2, "none").await;
+    assert_code(&r, "ELV04", "a completion on a revoked confirmer");
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM person_authenticators WHERE enrollment_id = $1")
+            .bind(doomed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0, "nothing recorded");
+
+    let q = elevated_custodian(&pool, "other", 3).await;
+    let (_, fine) = anchored_enrollment(&pool, &q).await;
+    try_complete(&pool, fine, 4, "none")
+        .await
+        .expect("CALIBRATION: a live confirmer completes");
+}
+
+/// An elevation of `person` confirmed by the passkey with credential `cred`,
+/// on a fresh refresh family; its session id.
+async fn elevate_with(pool: &PgPool, person: Uuid, cred: Vec<u8>) -> Uuid {
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client");
+    let fam = family(pool, client).await;
+    let ticket: Uuid = as_app(pool, Some(person), "", "", |mut conn| async move {
+        let t: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_create_elevation_ticket($1, $2, 'connector', 'cascade', \
+                                                           NULL)",
+        )
+        .bind(client)
+        .bind(fam)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a ticket");
+        sqlx::query(
+            "SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"st\": 1}'::jsonb)",
+        )
+        .bind(t)
+        .execute(&mut *conn)
+        .await
+        .expect("the ticket's challenge");
+        (conn, t)
+    })
+    .await;
+    as_app(pool, None, "", "", |mut conn| async move {
+        let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT outcome, session_id FROM public.epigraph_confirm_elevation($1, $2, 0, \
+                    false, '{\"ev\": 1}'::jsonb)",
+        )
+        .bind(ticket)
+        .bind(cred)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("confirm the elevation");
+        assert_eq!(outcome, "confirmed", "CALIBRATION: the elevation confirms");
+        (conn, session.expect("a session"))
+    })
+    .await
+}
+
+/// Revoking a passkey revokes, in the same transaction, every live `none`
+/// passkey enrolled on an act it confirmed (the passkeys it anchored), with
+/// the revoke's login and a reason naming the anchor, and so ends the
+/// elevations the anchored passkey confirmed (`passkey_revoked`, through
+/// 125's end trigger on the cascaded row); an ATTESTED passkey enrolled on
+/// another of its acts, and another person's passkey, stay live.
+/// Mutation: the cascade trigger dropped -> the anchored passkey stays live
+/// and its session elevated (the PR head's behaviour, P779-5).
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_an_anchor_revokes_the_unattested_passkeys_it_anchored(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (_, e_synced) = anchored_enrollment(&pool, &p).await;
+    let (_, e_hardware) = anchored_enrollment(&pool, &p).await;
+    let synced = try_complete(&pool, e_synced, 2, "none").await.unwrap();
+    let hardware = try_complete(&pool, e_hardware, 3, "packed").await.unwrap();
+    let q = elevated_custodian(&pool, "bystander", 4).await;
+    let synced_session = elevate_with(&pool, p.person, credential(2)).await;
+
+    assert_eq!(
+        maint(
+            &pool,
+            "SELECT public.epigraph_revoke_passkey($1, 'phone lost')",
+            &[Some(p.passkey)],
+        )
+        .await
+        .expect("revoke the anchor"),
+        1
+    );
+    let (by, reason) = revoked(&pool, synced)
+        .await
+        .expect("the anchored passkey is revoked with its anchor");
+    assert_eq!(by, "epigraph_maintenance");
+    assert_eq!(reason, format!("anchor {} revoked: phone lost", p.passkey));
+    assert!(
+        revoked(&pool, hardware).await.is_none(),
+        "an attested passkey stands on its own attestation"
+    );
+    assert!(
+        revoked(&pool, q.passkey).await.is_none(),
+        "another person's"
+    );
+    let ended: Option<String> =
+        sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+            .bind(synced_session)
+            .fetch_one(&pool)
+            .await
+            .expect("the session");
+    assert_eq!(
+        ended.as_deref(),
+        Some("passkey_revoked"),
+        "the anchored passkey's elevation ends with it"
+    );
+}
+
+/// An app session stamped like `as_app`'s, held open by the caller (for
+/// interleaving). `release` undoes it.
+async fn app_session(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("as app");
+    conn.execute(
+        "SELECT set_config('epigraph.principal_id', '', false), \
+                set_config('epigraph.group_ids', '', false), \
+                set_config('epigraph.writable_group_ids', '', false), \
+                set_config('epigraph.elevation_id', '', false), \
+                set_config('epigraph.family_id', '', false), \
+                set_config('epigraph.access_recorder', 'on', false)",
+    )
+    .await
+    .expect("stamp");
+    conn
+}
+
+async fn release(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    use sqlx::Executor;
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+}
+
+/// The insert guard's share lock closes the check-then-insert window, in
+/// both orders. (1) A completion in flight (uncommitted) holds the confirming
+/// passkey: a revoke WAITS for it, then revokes the new passkey too (the
+/// cascade sees it). (2) A revoke in flight holds the passkey: the
+/// completion WAITS, then is refused ELV04. Mutation: `FOR SHARE` dropped
+/// from the guard -> in (2) the completion does not wait and records a
+/// passkey on the revoked confirmer; in (1) the revoke does not wait.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoke_and_a_completion_serialize_on_the_confirming_passkey(pool: PgPool) {
+    use sqlx::Executor;
+    let wait = std::time::Duration::from_millis(700);
+
+    // (1) The completion first.
+    let p = elevated_custodian(&pool, "first", 1).await;
+    let (_, e) = anchored_enrollment(&pool, &p).await;
+    let mut a = app_session(&pool).await;
+    a.execute("BEGIN").await.unwrap();
+    sqlx::query(
+        "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+    )
+    .bind(e)
+    .execute(&mut *a)
+    .await
+    .unwrap();
+    let new: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_complete_passkey_enrollment($1, $2, '{\"cred\": 1}'::jsonb, \
+                '00000000-0000-0000-0000-000000000000'::uuid, 'none', true, true)",
+    )
+    .bind(e)
+    .bind(credential(2))
+    .fetch_one(&mut *a)
+    .await
+    .expect("the completion, uncommitted");
+    let pool2 = pool.clone();
+    let anchor = p.passkey;
+    let revoke = tokio::spawn(async move {
+        maint(
+            &pool2,
+            "SELECT public.epigraph_revoke_passkey($1, 'lost')",
+            &[Some(anchor)],
+        )
+        .await
+    });
+    tokio::time::sleep(wait).await;
+    assert!(!revoke.is_finished(), "the revoke waits for the completion");
+    a.execute("COMMIT").await.unwrap();
+    release(a).await;
+    revoke.await.unwrap().expect("the revoke");
+    assert!(
+        revoked(&pool, new).await.is_some(),
+        "the passkey that completed under the lock is revoked with its anchor"
+    );
+
+    // (2) The revoke first.
+    let q = elevated_custodian(&pool, "second", 3).await;
+    let (_, e) = anchored_enrollment(&pool, &q).await;
+    let mut m = pool.acquire().await.unwrap();
+    m.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .unwrap();
+    m.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT public.epigraph_revoke_passkey($1, 'lost')")
+        .bind(q.passkey)
+        .execute(&mut *m)
+        .await
+        .expect("the revoke, uncommitted");
+    let pool3 = pool.clone();
+    let complete = tokio::spawn(async move { try_complete(&pool3, e, 4, "none").await });
+    tokio::time::sleep(wait).await;
+    assert!(
+        !complete.is_finished(),
+        "the completion waits for the revoke"
+    );
+    m.execute("COMMIT").await.unwrap();
+    m.execute("RESET SESSION AUTHORIZATION").await.unwrap();
+    drop(m);
+    let r = complete.await.unwrap();
+    assert_code(&r, "ELV04", "the completion after the revoke committed");
+}
+
+/// The two trigger functions' catalog contract: SECURITY DEFINER owned by
+/// `epigraph_maintenance`, path `pg_catalog, pg_temp`, EXECUTE-able by
+/// neither PUBLIC nor `epigraph_app`; the insert guard fires AFTER 124's
+/// enrollment-locking guard (name order). Mutation: the trigger renamed to
+/// sort before 124's -> the order assertion fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_200_triggers_are_maintenance_owned_definers(pool: PgPool) {
+    for f in [
+        "public.epigraph_person_authenticators_guard_act_confirmer()",
+        "public.epigraph_person_authenticators_revoke_anchored()",
+    ] {
+        let (definer, owner, config, app, public): (bool, String, Vec<String>, bool, bool) =
+            sqlx::query_as(
+                "SELECT p.prosecdef, p.proowner::regrole::text, coalesce(p.proconfig, '{}'), \
+                        has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
+                        EXISTS (SELECT 1 FROM aclexplode(p.proacl) a \
+                                 WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') \
+                   FROM pg_proc p WHERE p.oid = $1::regprocedure",
+            )
+            .bind(f)
+            .fetch_one(&pool)
+            .await
+            .expect("the function");
+        assert!(definer, "{f}");
+        assert_eq!(owner, "epigraph_maintenance", "{f}");
+        assert_eq!(
+            config,
+            vec!["search_path=pg_catalog, pg_temp".to_string()],
+            "{f}"
+        );
+        assert_eq!((app, public), (false, false), "{f}");
+    }
+    let order: Vec<String> = sqlx::query_scalar(
+        "SELECT t.tgname::text FROM pg_trigger t \
+          WHERE t.tgrelid = 'public.person_authenticators'::regclass AND NOT t.tgisinternal \
+            AND t.tgname LIKE 'person_authenticators_guard_insert%' ORDER BY t.tgname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        order,
+        vec![
+            "person_authenticators_guard_insert".to_string(),
+            "person_authenticators_guard_insert_act_confirmer".to_string()
+        ]
+    );
+}
+
+// =====================================================================
+// 200: THE COMPROMISED REVOKE (P779M-5)
+// =====================================================================
+
+/// `epigraph_revoke_passkey_compromised(passkey, reason)` on a maintenance
+/// session: `(passkey, lineage depth, revoked by this call)` for the passkey
+/// and every passkey whose anchor lineage passes through it.
+async fn revoke_compromised(
+    pool: &PgPool,
+    passkey: Uuid,
+    reason: &'static str,
+) -> Result<Vec<(Uuid, i32, bool)>, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT revoked_id, lineage_depth, revoked_now \
+               FROM public.epigraph_revoke_passkey_compromised($1, $2)",
+        )
+        .bind(passkey)
+        .bind(reason)
+        .fetch_all(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The `mode` of each passkey's `platform.passkey_revoked` audit row (`None`
+/// when it has none; absent when it was never revoked). Rows written in one
+/// statement share `created_at`, so compare them as a set.
+async fn revoke_modes(pool: &PgPool, ids: &[Uuid]) -> Vec<(Uuid, Option<String>)> {
+    sqlx::query_as(
+        "SELECT (details->>'authenticator_id')::uuid, details->>'mode' FROM security_events \
+          WHERE event_type = 'platform.passkey_revoked' \
+            AND (details->>'authenticator_id')::uuid = ANY($1) \
+          ORDER BY created_at, id",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .expect("the revoke audit rows")
+}
+
+async fn session_end(pool: &PgPool, session: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .expect("the session")
+}
+
+/// A phone, the passkeys enrolled through it, and a bystander:
+/// * `phone`: the person's first passkey;
+/// * `backup`: ATTESTED (`packed`), enrolled on an act the phone confirmed;
+/// * `synced`: `none`, enrolled on another act the phone confirmed;
+/// * `grandchild`: attested, enrolled on an act the BACKUP confirmed;
+/// * `great`: attested, enrolled on an act the grandchild confirmed;
+/// * `bystander` and `bystander_backup`: another person's first passkey and
+///   its attested backup;
+/// * `planted`: a third person's ATTESTED passkey whose enrollment was
+///   rewritten (every trigger off) onto an act the PHONE confirmed. The
+///   guards make that impossible (an act enrollment is the act proposer's own,
+///   and a proposer's act is confirmed only by the proposer's passkey); it
+///   stands for "another person's passkey under the phone's acts".
+struct Family {
+    p: Elevated,
+    backup: Uuid,
+    synced: Uuid,
+    grandchild: Uuid,
+    great: Uuid,
+    bystander: Uuid,
+    bystander_backup: Uuid,
+    planted: Uuid,
+}
+
+async fn phone_family(pool: &PgPool) -> Family {
+    let p = elevated_custodian(pool, "phone owner", 1).await;
+    let (_, e_backup) = anchored_enrollment(pool, &p).await;
+    let backup = try_complete(pool, e_backup, 2, "packed").await.unwrap();
+    let (_, e_synced) = anchored_enrollment(pool, &p).await;
+    let synced = try_complete(pool, e_synced, 3, "none").await.unwrap();
+    let via_backup = Elevated {
+        passkey: backup,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, e_grand) = anchored_enrollment(pool, &via_backup).await;
+    let grandchild = try_complete(pool, e_grand, 4, "packed").await.unwrap();
+    let via_grand = Elevated {
+        passkey: grandchild,
+        cred: credential(4),
+        ..p.clone()
+    };
+    let (_, e_great) = anchored_enrollment(pool, &via_grand).await;
+    let great = try_complete(pool, e_great, 5, "packed").await.unwrap();
+
+    let q = elevated_custodian(pool, "bystander", 6).await;
+    let (_, e_q) = anchored_enrollment(pool, &q).await;
+    let bystander_backup = try_complete(pool, e_q, 7, "packed").await.unwrap();
+
+    let r = elevated_custodian(pool, "planted", 8).await;
+    let (phone_act, _) = anchored_enrollment(pool, &p).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "UPDATE public.passkey_enrollments en SET created_via = 'confirmed_act', act_id = $2 \
+           FROM public.person_authenticators k WHERE k.id = $1 AND en.id = k.enrollment_id",
+    )
+    .bind(r.passkey)
+    .bind(phone_act)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the enrollment on the phone's act");
+    sqlx::query(
+        "UPDATE public.person_authenticators SET attestation_format = 'packed', \
+                aaguid = '2fc0579f-8113-47ea-b116-bb5a8db9202a' WHERE id = $1",
+    )
+    .bind(r.passkey)
+    .execute(&mut *tx)
+    .await
+    .expect("record it attested");
+    tx.commit().await.expect("commit");
+    let under_phone: Option<Uuid> = sqlx::query_scalar(
+        "SELECT a.authenticator_id FROM person_authenticators k \
+           JOIN passkey_enrollments en ON en.id = k.enrollment_id \
+           JOIN pending_admin_acts a ON a.id = en.act_id WHERE k.id = $1",
+    )
+    .bind(r.passkey)
+    .fetch_one(pool)
+    .await
+    .expect("the planted row");
+    assert_eq!(
+        under_phone,
+        Some(p.passkey),
+        "CALIBRATION: the planted passkey hangs off an act the phone confirmed"
+    );
+    Family {
+        p,
+        backup,
+        synced,
+        grandchild,
+        great,
+        bystander: q.passkey,
+        bystander_backup,
+        planted: r.passkey,
+    }
+}
+
+/// A COMPROMISED revoke of the phone revokes the phone AND every passkey whose
+/// anchor lineage passes through it, attested ones included (the backup, its
+/// grandchild, the synced passkey and the great-grandchild), in one call, each
+/// audited `mode = compromised`, and ends their elevations. It never touches
+/// another person's passkeys: the bystander and its backup stay live, and so
+/// does the planted third person's passkey hanging off the phone's act.
+/// Red line (3ad5ff92): the function does not exist (42883). Mutations: the
+/// recursion's person filter dropped -> the planted passkey is revoked; the
+/// recursion stopped at depth 1 -> the grandchild and great-grandchild stay
+/// live; the audit's mode read dropped -> mode is `lost`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compromised_revoke_takes_out_every_passkey_on_the_phones_lineage(pool: PgPool) {
+    let f = phone_family(&pool).await;
+    let backup_session = elevate_with(&pool, f.p.person, credential(2)).await;
+    let bystander_person: Uuid =
+        sqlx::query_scalar("SELECT person_agent_id FROM person_authenticators WHERE id = $1")
+            .bind(f.bystander)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let bystander_session = elevate_with(&pool, bystander_person, credential(6)).await;
+
+    let mut got = revoke_compromised(&pool, f.p.passkey, "phone stolen")
+        .await
+        .expect("the compromised revoke");
+    got.sort();
+    let mut want = vec![
+        (f.p.passkey, 0, true),
+        (f.backup, 1, true),
+        (f.synced, 1, true),
+        (f.grandchild, 2, true),
+        (f.great, 3, true),
+    ];
+    want.sort();
+    assert_eq!(got, want, "the phone and every passkey on its lineage");
+
+    let (by, reason) = revoked(&pool, f.p.passkey).await.expect("the phone");
+    assert_eq!(
+        (by.as_str(), reason.as_str()),
+        ("epigraph_maintenance", "phone stolen")
+    );
+    for d in [f.backup, f.synced, f.grandchild, f.great] {
+        let (_, reason) = revoked(&pool, d)
+            .await
+            .unwrap_or_else(|| panic!("{d} is revoked"));
+        assert_eq!(
+            reason,
+            format!("compromised anchor {} (lineage): phone stolen", f.p.passkey),
+            "{d}"
+        );
+    }
+    for live in [f.bystander, f.bystander_backup, f.planted] {
+        assert!(
+            revoked(&pool, live).await.is_none(),
+            "another person's passkey {live} stays live"
+        );
+    }
+    let modes = revoke_modes(
+        &pool,
+        &[f.p.passkey, f.backup, f.synced, f.grandchild, f.great],
+    )
+    .await;
+    assert_eq!(modes.len(), 5, "one audit row each: {modes:?}");
+    assert!(
+        modes
+            .iter()
+            .all(|(_, m)| m.as_deref() == Some("compromised")),
+        "{modes:?}"
+    );
+    assert_eq!(
+        session_end(&pool, backup_session).await.as_deref(),
+        Some("passkey_revoked"),
+        "the attested backup's elevation ends with it"
+    );
+    assert_eq!(
+        session_end(&pool, bystander_session).await,
+        None,
+        "the bystander's elevation is untouched"
+    );
+}
+
+/// The default (LOST) revoke keeps its behaviour: the phone and the `none`
+/// passkey it anchored go, audited `mode = lost`; the attested backup and
+/// everything enrolled through it stay live. The grandchild is then revoked
+/// as lost too (the great-grandchild, attested, stays live). If the phone
+/// later turns out to be stolen, a COMPROMISED revoke of the already-revoked
+/// phone sweeps what is left on its lineage, walking THROUGH the revoked
+/// grandchild to the great-grandchild; revoked passkeys are not revoked
+/// again (a revoke is final). Audited `compromised`. CALIBRATION: the lost
+/// revokes left the backup and the great-grandchild live. Mutations: the
+/// recursion seeded only by a live passkey -> nothing is swept; the
+/// recursion's step taking only live passkeys -> the great-grandchild stays
+/// live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lost_revoke_keeps_the_backup_and_a_later_compromised_revoke_sweeps_it(pool: PgPool) {
+    let f = phone_family(&pool).await;
+    assert_eq!(
+        maint(
+            &pool,
+            "SELECT public.epigraph_revoke_passkey($1, 'phone lost')",
+            &[Some(f.p.passkey)],
+        )
+        .await
+        .expect("the lost revoke"),
+        1
+    );
+    assert!(revoked(&pool, f.synced).await.is_some(), "the cascade");
+    for live in [f.backup, f.grandchild, f.great, f.bystander, f.planted] {
+        assert!(
+            revoked(&pool, live).await.is_none(),
+            "CALIBRATION: a lost revoke leaves {live} live"
+        );
+    }
+    let mut modes = revoke_modes(&pool, &[f.p.passkey, f.synced]).await;
+    modes.sort();
+    let mut want = vec![
+        (f.p.passkey, Some("lost".to_string())),
+        (f.synced, Some("lost".to_string())),
+    ];
+    want.sort();
+    assert_eq!(
+        modes, want,
+        "the lost revoke and its cascade are audited `lost`"
+    );
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost too')",
+        &[Some(f.grandchild)],
+    )
+    .await
+    .expect("the grandchild's lost revoke");
+    assert!(
+        revoked(&pool, f.great).await.is_none(),
+        "CALIBRATION: an attested great-grandchild outlives a lost revoke"
+    );
+
+    let mut got = revoke_compromised(&pool, f.p.passkey, "it was stolen after all")
+        .await
+        .expect("a compromised revoke of a revoked passkey");
+    got.sort();
+    let mut want = vec![
+        (f.p.passkey, 0, false),
+        (f.backup, 1, true),
+        (f.synced, 1, false),
+        (f.grandchild, 2, false),
+        (f.great, 3, true),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+    for d in [f.backup, f.great] {
+        assert!(revoked(&pool, d).await.is_some(), "{d} swept");
+    }
+    for live in [f.bystander, f.bystander_backup, f.planted] {
+        assert!(revoked(&pool, live).await.is_none(), "{live} stays live");
+    }
+    let (_, reason) = revoked(&pool, f.p.passkey).await.unwrap();
+    assert_eq!(reason, "phone lost", "a revoked passkey is final");
+    assert_eq!(
+        revoke_modes(&pool, &[f.backup, f.great])
+            .await
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect::<Vec<_>>(),
+        vec![Some("compromised".to_string()); 2]
+    );
+}
+
+/// The compromised revoke is a maintenance act: the application role cannot
+/// call it (42501), an unknown passkey or an empty reason is refused with
+/// nothing revoked, and its catalog contract is 200's (a definer owned by
+/// `epigraph_maintenance` on `pg_catalog, pg_temp`, EXECUTE-able by neither
+/// PUBLIC nor `epigraph_app`). Mutation: the REVOKE from `epigraph_app`
+/// dropped -> the app call succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compromised_revoke_is_a_maintenance_only_definer(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let id = p.passkey;
+    let r: Result<Vec<(Uuid,)>, sqlx::Error> = as_app(&pool, None, "", "", |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT revoked_id FROM public.epigraph_revoke_passkey_compromised($1, 'x')",
+        )
+        .bind(id)
+        .fetch_all(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_code(&r, "42501", "the application role");
+    assert_code(
+        &revoke_compromised(&pool, Uuid::new_v4(), "x").await,
+        "ELV04",
+        "an unknown passkey",
+    );
+    assert_code(
+        &revoke_compromised(&pool, id, "  ").await,
+        "22004",
+        "an empty reason",
+    );
+    assert!(revoked(&pool, id).await.is_none(), "nothing revoked");
+
+    let (definer, owner, config, app, public): (bool, String, Vec<String>, bool, bool) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, p.proowner::regrole::text, coalesce(p.proconfig, '{}'), \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
+                    EXISTS (SELECT 1 FROM aclexplode(p.proacl) a \
+                             WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') \
+               FROM pg_proc p \
+              WHERE p.oid = 'public.epigraph_revoke_passkey_compromised(uuid, text)'::regprocedure",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the function");
+    assert!(definer);
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
+    assert_eq!((app, public), (false, false));
+}
+
+/// A completion in flight (uncommitted) on an act the BACKUP confirmed holds
+/// the backup under the insert guard's share lock. A compromised revoke of
+/// the phone started meanwhile WAITS for it, then takes out the ATTESTED
+/// passkey that completed (the lost cascade would leave an attested one
+/// live, so only the compromised walk can reach it): it appears in the
+/// returned rows and is revoked. Then the reverse order: a completion on an
+/// act confirmed by a passkey the compromised revoke has locked waits, and is
+/// refused ELV04 once the revoke commits. CALIBRATION: each side waits.
+/// Red line (the walk computed before any lock): the attested child stays
+/// live and is not in the returned rows. Mutation: the person-wide
+/// `FOR NO KEY UPDATE` dropped -> the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compromised_revoke_waits_for_and_sweeps_a_completion_in_flight(pool: PgPool) {
+    use sqlx::Executor;
+    let wait = std::time::Duration::from_millis(700);
+    let p = elevated_custodian(&pool, "phone owner", 1).await;
+    let (_, e_backup) = anchored_enrollment(&pool, &p).await;
+    let backup = try_complete(&pool, e_backup, 2, "packed").await.unwrap();
+    let via_backup = Elevated {
+        passkey: backup,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, e_child) = anchored_enrollment(&pool, &via_backup).await;
+    let (_, e_late) = anchored_enrollment(&pool, &via_backup).await;
+
+    // (1) The completion first: uncommitted, holding the backup.
+    let mut a = app_session(&pool).await;
+    a.execute("BEGIN").await.unwrap();
+    sqlx::query(
+        "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+    )
+    .bind(e_child)
+    .execute(&mut *a)
+    .await
+    .unwrap();
+    let child: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_complete_passkey_enrollment($1, $2, '{\"cred\": 1}'::jsonb, \
+                '2fc0579f-8113-47ea-b116-bb5a8db9202a'::uuid, 'packed', true, false)",
+    )
+    .bind(e_child)
+    .bind(credential(3))
+    .fetch_one(&mut *a)
+    .await
+    .expect("the attested completion, uncommitted");
+    let pool2 = pool.clone();
+    let phone = p.passkey;
+    let revoke =
+        tokio::spawn(async move { revoke_compromised(&pool2, phone, "phone stolen").await });
+    tokio::time::sleep(wait).await;
+    assert!(
+        !revoke.is_finished(),
+        "CALIBRATION: the compromised revoke waits for the completion"
+    );
+    a.execute("COMMIT").await.unwrap();
+    release(a).await;
+    let got = revoke.await.unwrap().expect("the compromised revoke");
+    assert!(
+        got.iter()
+            .any(|(id, depth, now)| *id == child && *depth == 2 && *now),
+        "the passkey that completed under the lock is reached: {got:?}"
+    );
+    assert!(
+        revoked(&pool, child).await.is_some(),
+        "the attested passkey that completed meanwhile is revoked"
+    );
+
+    // (2) The revoke first: a later completion on the backup's act waits,
+    // then is refused.
+    let q = elevated_custodian(&pool, "second owner", 4).await;
+    let (_, e_q) = anchored_enrollment(&pool, &q).await;
+    let mut m = pool.acquire().await.unwrap();
+    m.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .unwrap();
+    m.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT * FROM public.epigraph_revoke_passkey_compromised($1, 'suspect')")
+        .bind(q.passkey)
+        .execute(&mut *m)
+        .await
+        .expect("the compromised revoke, uncommitted");
+    let pool3 = pool.clone();
+    let complete = tokio::spawn(async move { try_complete(&pool3, e_q, 5, "packed").await });
+    tokio::time::sleep(wait).await;
+    assert!(
+        !complete.is_finished(),
+        "CALIBRATION: the completion waits for the revoke"
+    );
+    m.execute("COMMIT").await.unwrap();
+    m.execute("RESET SESSION AUTHORIZATION").await.unwrap();
+    drop(m);
+    assert_code(
+        &complete.await.unwrap(),
+        "ELV04",
+        "the completion after the compromised revoke committed",
+    );
+    // The phone's revoked backup refuses its own later enrollment too.
+    assert_code(
+        &try_complete(&pool, e_late, 6, "packed").await,
+        "ELV04",
+        "a completion on a revoked backup's act",
+    );
+}

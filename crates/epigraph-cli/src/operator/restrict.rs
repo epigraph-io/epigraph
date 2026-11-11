@@ -250,14 +250,14 @@ pub struct RowState {
 }
 
 impl RowState {
-    fn of(a: &Attached) -> Self {
+    pub(super) fn of(a: &Attached) -> Self {
         Self {
             tenancy: a.tenancy.clone(),
             writer_owned: a.writer_owned,
         }
     }
 
-    fn of_record(r: &Record) -> Self {
+    pub(super) fn of_record(r: &Record) -> Self {
         Self {
             tenancy: Tenancy {
                 owner: r.owner_group_id,
@@ -512,7 +512,10 @@ fn describe_unenforced(r: &BTreeMap<String, Vec<String>>) -> String {
 }
 
 /// Pinned evidence among `ids` (migration 110).
-async fn pinned_of(conn: &mut PgConnection, ids: &[Uuid]) -> anyhow::Result<BTreeSet<String>> {
+pub(super) async fn pinned_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeSet<String>> {
     if ids.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -816,7 +819,7 @@ fn spec_of<'a>(specs: &'a [TableSpec], table: &str) -> &'a TableSpec {
 /// Write each row's full recorded tuple (owner, visibility, co-owner on edges,
 /// and `writer_owned` where the table has it). Only rows that differ are
 /// touched, so the count is exactly the rows changed.
-async fn write_rows(
+pub(super) async fn write_rows(
     conn: &mut PgConnection,
     spec: &TableSpec,
     claims: &[Uuid],
@@ -864,7 +867,7 @@ async fn write_rows(
 /// The readability check, per table: `lost` must equal `expect_lost` on an
 /// enforced table and be a subset of it on an unenforced one; `gained` the same
 /// against `expect_gained`. Returns one message per violation.
-fn readability_violations(
+pub(super) fn readability_violations(
     before: &BTreeSet<RowKey>,
     after: &BTreeSet<RowKey>,
     expect_lost: &BTreeSet<RowKey>,
@@ -1039,7 +1042,7 @@ pub struct BatchOutcome {
 /// READABILITY does follow the claim (168's `challenges_claim_readable`,
 /// ruling R-CH1b), so the readability invariant expects it lost on apply and
 /// regained on reverse.
-fn is_outsider_challenge(table: &str, writer_owned: Option<bool>) -> bool {
+pub(super) fn is_outsider_challenge(table: &str, writer_owned: Option<bool>) -> bool {
     table == "challenges" && writer_owned == Some(true)
 }
 
@@ -1238,6 +1241,9 @@ async fn run_batch(
 
     let readable_before = app_readable(conn, ctx.specs, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Narrowing a public claim bumps the Atlas layout epoch once per
+    // transaction (migration 197); whether this batch is that first narrowing.
+    let epoch_bump_due = tables::layout_epoch_bump_due(conn).await?;
 
     let moved = sqlx::query(
         "UPDATE claims SET visibility = 'group', owner_group_id = $2 \
@@ -1427,6 +1433,11 @@ async fn run_batch(
     }
     for (t, n) in &planned {
         expect_counts.entry(t.clone()).or_default().1 += i64::try_from(*n).unwrap_or(i64::MAX);
+    }
+    if moved > 0 && epoch_bump_due {
+        // Migration 197's trigger: one bump for the transaction's first
+        // public-to-non-public narrowing, however many rows narrowed.
+        expect_counts.insert("atlas_layout_epoch".into(), (0, 1, 0));
     }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),

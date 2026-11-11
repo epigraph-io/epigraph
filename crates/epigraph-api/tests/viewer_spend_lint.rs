@@ -110,7 +110,9 @@ use std::path::Path;
 /// * **untenanted** — the table has no tenancy columns (`agents`, `methods`,
 ///   `experiments`, `experiment_results`, `behavioral_executions`,
 ///   `match_candidates`, `entities`, `claim_themes`, `graph_cluster_runs`,
-///   `claim_encryption`), or the read is the caller's own membership.
+///   `claim_encryption`, `atlas_layout_runs`, `atlas_layout_regions`,
+///   `atlas_layout_themes`, `atlas_layout_theme_links`, `atlas_layout_epoch`),
+///   or the read is the caller's own membership.
 ///   `workflows` left this list with migration 183 (ruling R-74): a row
 ///   carries its plan's tenancy under forced row security, so a `workflows`
 ///   read is **stamped**, never untenanted.
@@ -679,15 +681,36 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "gap_analysis",
         &["GapRepository::store_gap_analysis"],
     ),
-    // stamped: cluster-run metadata (untenanted) and the edges among nodes the
-    // viewer already read (F-edges-unfiltered owns their predicate).
+    // stamped: cluster-run metadata (untenanted; the latest run now comes from
+    // `ClusterRunRepository::latest`, the lookup `/claims/:id/placement` shares)
+    // and the edges among nodes the viewer already read (F-edges-unfiltered owns
+    // their predicate).
     (
         "graph.rs",
         "expand",
         &[
+            "ClusterRunRepository::latest",
             "fetch_subgraph_edges",
             "sqlx::query_as(SELECT).fetch_optional",
-            "sqlx::query_as(SELECT).fetch_optional",
+        ],
+    ),
+    // untenanted: the Atlas layout run and its epoch flag (migration 197); the
+    // run's contents are read through the viewer (`overview`, `region_detail`,
+    // `unplaced_themes`).
+    (
+        "graph_layout.rs",
+        "themes_layout",
+        &["AtlasLayoutRepository::run"],
+    ),
+    // untenanted: the run, and both drill-down ids resolved to theme ids in
+    // one statement (`claim_themes`, `atlas_layout_themes`); each side is then
+    // refused unless `any_visible_member` (viewed) finds a readable member.
+    (
+        "graph_layout.rs",
+        "graph_links",
+        &[
+            "AtlasLayoutRepository::resolve_sides",
+            "AtlasLayoutRepository::run",
         ],
     ),
     // open finding: F-aggregate-existence-oracles (the two decomposes_to
@@ -700,11 +723,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // untenanted: the neighborhood id in the latest run.
+    // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
+    // with `/claims/:id/placement`) and the neighborhood id in that run.
     (
         "graph_neighborhood.rs",
         "expand",
-        &["sqlx::query_as(SELECT).fetch_optional"],
+        &[
+            "ClusterRunRepository::latest",
+            "sqlx::query_as(SELECT).fetch_optional",
+        ],
     ),
     // stamped: `groups`, `group_memberships` and `group_key_epochs` have row
     // security (077), and each route runs on ONE connection stamped with the
@@ -1002,8 +1029,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // no SQL: the query embedding.
     ("rag.rs", "rag_context", &["generate_query_embedding"]),
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),
-    // no SQL (embeddings), untenanted (claim_themes, the centroid-dimension
-    // probe), and the content read registered in viewer_route_table_lint.rs's
+    // no SQL (embeddings, including `generate_walk_query_embedding`, the
+    // pageable request's variant that answers 503 instead of the mock when the
+    // service fails), untenanted (claim_themes, the centroid-dimension probe),
+    // and the content read registered in viewer_route_table_lint.rs's
     // UNCOMPENSATED_INLINE_READS (ids from a viewer-spliced theme read).
     (
         "search.rs",
@@ -1013,6 +1042,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "generate_query_embedding",
             "generate_query_embedding",
             "generate_query_embedding_with_dim",
+            "generate_walk_query_embedding",
             "sqlx::query(SELECT).fetch_all",
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
@@ -1095,21 +1125,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::search_hierarchical_by_text",
         ],
     ),
-    // write: the ingest transaction is stamped with the system agent and binds
-    // the caller's principal for the database's write-authority check
-    // (`begin_system_ingest_stamped_tx`); the authorship edges name that
-    // principal; embeddings for the rows this request just ingested (the
-    // claims', and the workflow row's goal embedding, each on a transaction
-    // stamped from the workflow-ingest system agent).
+    // write: the ingest runs AS THE CALLER, on a transaction stamped from the
+    // handler's viewer (`begin_caller_workflow_tx`, viewed), as do the
+    // post-commit embeds; the authorship edges name that principal.
     (
         "workflows.rs",
         "ingest_workflow",
-        &[
-            "begin_system_ingest_stamped_tx",
-            "embed_inserted_workflow_claims",
-            "record_api_authorship",
-            "store_workflow_goal_embedding",
-        ],
+        &["record_api_authorship"],
     ),
     // stamped: the `workflows` row is locked (SELECT .. FOR UPDATE) and its
     // counters updated on the caller's stamped write transaction, where row
@@ -1146,20 +1168,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "BehavioralExecutionRepository::rolling_success_rate",
         ],
     ),
-    // write: as ingest_workflow (stamped system ingest binding the caller's
-    // principal, authorship edges), the ingest and the embeddings of the rows it
-    // inserted.
+    // write: as ingest_workflow (the caller's own stamp, viewed; authorship
+    // edges), plus the `workflow.created` event.
     (
         "workflows.rs",
         "store_workflow",
-        &[
-            "EventRepository::insert",
-            "begin_system_ingest_stamped_tx",
-            "embed_inserted_workflow_claims",
-            "epigraph_ingest_executor::execute_workflow_ingest_plan",
-            "record_api_authorship",
-            "store_workflow_goal_embedding",
-        ],
+        &["EventRepository::insert", "record_api_authorship"],
     ),
     // ── route helpers a handler hands its viewer to ──────────────────────
     //
@@ -1298,16 +1312,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query(UPDATE).execute",
         ],
     ),
-    // write: workflows.rs's ingest helpers run on the system-ingest transaction
-    // that binds the caller's principal for the database's write-authority
-    // check; the lineage anchors are workflows rows, read under row security
-    // on that stamped transaction (migration 183, ruling R-74), the
+    // write: workflows.rs's ingest helpers run on the caller-stamped
+    // transaction; the lineage anchors are workflows rows, read under row
+    // security on that stamped transaction (migration 183, ruling R-74), the
     // authority check is for the caller's principal over each anchor, and the
     // rest record the submitter, the per-anchor provenance and the admin audit.
+    // The post-commit goal embedding updates the row the caller just wrote,
+    // on a transaction stamped from its viewer (row security decides).
     (
         "workflows.rs",
-        "auto_wire_inserted_edges",
-        &["begin_system_ingest_stamped_tx"],
+        "store_workflow_goal_embedding",
+        &["WorkflowRepository::set_goal_embedding"],
     ),
     (
         "workflows.rs",
@@ -1327,21 +1342,26 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // viewer to `workflow_authority`, which reads the target row through it
     // (`WorkflowRepository::tenancy_as_viewer`, viewed) before any answer names
     // the row. Unviewed, by design:
-    // * the step routes' system-ingest transaction and the executor's step
-    //   write on it (the rows are the system agent's; the caller's authority
-    //   is the gate), the AUTHORED edges and the per-write provenance / admin
-    //   audit rows;
+    // * the executor's step write on the caller-stamped transaction
+    //   (`begin_caller_workflow_tx`, viewed; row security decides the rows,
+    //   the caller's authority over the workflow is the gate), the AUTHORED
+    //   edges and the per-write provenance / admin audit rows;
     // * the head / lineage resolution, which must see every workflow the
     //   write would touch so each is authority-checked (an unreadable one is
     //   then refused by the viewed read);
     // * the gate's own arms, which run only on a row the caller reads: the
-    //   recorded submitter, the submitter's operator and the admin grant.
+    //   recorded submitter, the submitter's operator, the caller's own acting
+    //   operator link (the delegate arm, operator ruling R-183: migration
+    //   107's caller-side definer, keyed on the caller, not on a row), the
+    //   caller's live membership of the row's owner group
+    //   (`api_owner_group_arm`, given the viewed read's owner group; asked of
+    //   the live-membership definer and the caller-stamped session, not of a
+    //   viewer) and the admin grant.
     (
         "workflows.rs",
         "add_step",
         &[
             "audit_api_admin_workflow_write",
-            "begin_system_ingest_stamped_tx",
             "epigraph_ingest_executor::add_step",
             "record_api_authorship",
             "record_api_caller_workflow_write",
@@ -1352,7 +1372,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "delete_step",
         &[
             "audit_api_admin_workflow_write",
-            "begin_system_ingest_stamped_tx",
             "epigraph_ingest_executor::delete_step",
             "record_api_caller_workflow_write",
         ],
@@ -1371,10 +1390,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "workflows.rs",
         "workflow_authority",
         &[
+            "AgentRepository::operator_actor",
             "AgentRepository::operator_of_author",
             "WorkflowRepository::submitter_of",
             "api_admin_arm",
             "api_admin_arm",
+            "api_owner_group_arm",
+            "api_owner_group_arm",
         ],
     ),
 ];

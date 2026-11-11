@@ -950,8 +950,9 @@ pub async fn query_claims(
     // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
     // most of the page (backlog 31e7b727). Off unless the caller asks.
     let exclude_spine = params.exclude_spine.unwrap_or(false);
+    let mut read = server.read_as(viewer, "query_claims").await?;
     let claims = ClaimRepository::list_by_belief_range(
-        &server.pool,
+        &mut *read,
         viewer,
         min,
         max,
@@ -975,9 +976,10 @@ pub async fn query_claims(
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
     // is_current, so an explicit `is_current=false` request keeps its labels,
     // matching get_labels' label source. A missing id → no labels.
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     let results: Vec<ClaimResponse> = claims
         .into_iter()
@@ -1019,12 +1021,16 @@ pub async fn get_claim(
         params.frame_id.as_deref(),
         params.perspective_id.as_deref(),
     )?;
+    // The claim's own reads on ONE connection stamped with the caller's
+    // viewer: on the plain pool row security admits public rows only, so a
+    // member's own group-private claim would read as not found.
+    let mut read = server.read_as(viewer, "get_claim").await?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
             .await?;
     }
 
-    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, viewer, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -1037,19 +1043,27 @@ pub async fn get_claim(
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
-    let classification = ClaimRepository::get_classification(&server.pool, viewer, id)
+    let classification = ClaimRepository::get_classification(&mut *read, viewer, id)
         .await
         .map_err(internal_error)?;
+
+    // The URLs of the claim's evidence, always (possibly empty): one
+    // single-id call to the batched, per-evidence-row-filtered read, so a
+    // consumer needs no `get_provenance` to find them (backlog 43ab8c73).
+    let source_urls = EvidenceRepository::source_urls_by_claim_ids(&mut *read, viewer, &[id])
+        .await
+        .map_err(internal_error)?
+        .remove(&id)
+        .unwrap_or_default();
 
     // Additive lensed belief: compute the claim's belief under the chosen lens.
     // Frame/perspective existence is already validated, so a compute failure
     // here is a genuine internal error (single-claim tool → propagate, no
-    // page-degrade semantics).
+    // page-degrade semantics). On the same stamped read.
     let lensed_belief = match lens {
         Some((frame_id, perspective_id)) => {
-            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
-                &server.pool,
-                server.scoped.as_ref(),
+            let interval = epigraph_engine::belief_query::get_perspective_belief_conn(
+                &mut read,
                 viewer,
                 id,
                 frame_id,
@@ -1079,15 +1093,7 @@ pub async fn get_claim(
         }
         None => None,
     };
-
-    // The URLs of the claim's evidence, always (possibly empty): one
-    // single-id call to the batched, per-evidence-row-filtered read, so a
-    // consumer needs no `get_provenance` to find them (backlog 43ab8c73).
-    let source_urls = EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &[id])
-        .await
-        .map_err(internal_error)?
-        .remove(&id)
-        .unwrap_or_default();
+    read.commit().await.map_err(internal_error)?;
 
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
@@ -1156,7 +1162,10 @@ pub async fn verify_claim(
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, claim_id)
+    // Every read below on ONE connection stamped with the caller's viewer
+    // (the plain pool's session sees public rows only).
+    let mut read = server.read_as(viewer, "verify_claim").await?;
+    let claim = ClaimRepository::get_by_id(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -1178,7 +1187,7 @@ pub async fn verify_claim(
         //
         // Second query, on this branch only: the matching case needs no
         // `properties` read at all, so the common path is unchanged.
-        let properties = ClaimRepository::get_properties(&server.pool, viewer, claim_id)
+        let properties = ClaimRepository::get_properties(&mut *read, viewer, claim_id)
             .await
             .map_err(internal_error)?
             .unwrap_or(serde_json::Value::Null);
@@ -1187,12 +1196,10 @@ pub async fn verify_claim(
             // workflow that executes it — recovered from the edge, not guessed.
             // On the caller's read: the executing `workflows` rows carry
             // their plan's tenancy (migration 183, ruling R-74).
-            let mut read = super::workflows::CallerRead::open(server, viewer).await?;
             let names =
-                epigraph_db::WorkflowRepository::executing_canonical_names(read.conn(), viewer, id)
+                epigraph_db::WorkflowRepository::executing_canonical_names(&mut *read, viewer, id)
                     .await
                     .map_err(internal_error)?;
-            read.close().await?;
             match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
                 &claim.content,
                 &claim.content_hash,
@@ -1223,12 +1230,13 @@ pub async fn verify_claim(
     // present and rejected" — both of which report `signature_valid = false`.
     let signed = claim.signature.is_some();
     let keys = if signed {
-        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&server.pool, viewer, id)
+        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&mut *read, viewer, id)
             .await
             .map_err(internal_error)?
     } else {
         Vec::new()
     };
+    read.commit().await.map_err(internal_error)?;
     let binding = crate::signing_identity::bind_signature(
         &claim.content_hash,
         claim.signature.as_ref(),
@@ -1313,16 +1321,25 @@ pub async fn update_with_evidence(
         }
         parse_uuid(params.claim_id.trim())?
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
-        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
-            .await
-            // `InvalidData` (every head of the step's lineage is retired) is
-            // the caller's to fix, not an internal error.
-            .map_err(crate::errors::db_caller_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
-                ))
-            })?
+        // On the caller's stamped read, not the plain pool: the step walk's
+        // claims and `executes` edges are tenancy-filtered, and an unstamped
+        // application session admits public rows only, so a group-private
+        // workflow's steps answered "no step" to the group's own members. The
+        // read is released before anything below takes a write transaction.
+        let mut read = server.read_as(viewer, "update_with_evidence").await?;
+        let resolved = epigraph_db::WorkflowRepository::resolve_step_claim_conn(
+            &mut read, viewer, name, idx, true,
+        )
+        .await
+        // `InvalidData` (every head of the step's lineage is retired) is
+        // the caller's to fix, not an internal error.
+        .map_err(crate::errors::db_caller_error)?;
+        drop(read);
+        resolved.ok_or_else(|| {
+            invalid_params(format!(
+                "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
+            ))
+        })?
     } else {
         return Err(invalid_params(
             "provide a claim to update: either `claim_id`, or both `canonical_name` and `step_index`",
@@ -1810,8 +1827,24 @@ pub async fn update_with_evidence(
 ///   acting directly is admitted.
 ///
 /// A retired identity is never an actor, so it owns nothing through this arm
-/// (its key may be exposed). An operator's OWN directly authored claims are
-/// not reachable from its agents here: `author_op(operator)` is `None`.
+/// (its key may be exposed).
+///
+/// ## The delegate arm (operator ruling R-183)
+///
+/// "Agents acting for me should inherit my authority": `actor_op(caller) ==
+/// target` — an agent whose ACTING link names the claim's author owns the
+/// author's own claims, exactly where the author itself would be admitted by
+/// authorship. It is the third arm stage-2 brief A1 had left out (an
+/// operator's directly authored claims were not reachable from its agents,
+/// since `author_op(operator)` is `None`). It reads the same caller-side
+/// definer as the actor arm, so it is one hop (the read names the caller's
+/// direct operator only), a retired link grants nothing, and a revoked
+/// membership ends it; and it runs where the actor arm runs: always on stdio,
+/// over HTTP only for a delegated run token whose delegation is live NOW.
+/// Recorded as [`OwnershipGrant::Delegate`]. Tenancy is unchanged: the write
+/// that follows runs on the caller's own stamp, so it lands only where the
+/// caller writes (a live link makes it a writer of the operator's personal
+/// group, and of nothing else).
 ///
 /// ### What this arm does NOT reach: claims written through a shared HTTP signer
 ///
@@ -1875,13 +1908,17 @@ pub(crate) async fn require_owner_or_admin(
         if operator_arm_allows(server, caller_agent, target_agent_id, allow_actor).await? {
             return Ok(OwnershipGrant::Operator);
         }
+        if allow_actor && delegate_arm_allows(server, caller_agent, target_agent_id).await? {
+            return Ok(OwnershipGrant::Delegate);
+        }
         return Err(McpError {
             code: rmcp::model::ErrorCode::INVALID_PARAMS,
             message: format!(
                 "claim is owned by agent {target_agent_id}; \
                  caller agent {caller_agent} (principal {principal}) cannot retire it \
-                 (requires claims:admin scope or ownership: authorship, or being the \
-                 author's operator)"
+                 (requires claims:admin scope or ownership: authorship, being the author's \
+                 operator, or, through a live delegated run token, acting for the author or \
+                 its operator through a live operator link)"
             )
             .into(),
             data: None,
@@ -1918,6 +1955,9 @@ pub(crate) async fn require_owner_or_admin(
     if operator_arm_allows(server, caller_agent, target_agent_id, true).await? {
         return Ok(OwnershipGrant::Operator);
     }
+    if delegate_arm_allows(server, caller_agent, target_agent_id).await? {
+        return Ok(OwnershipGrant::Delegate);
+    }
 
     Err(McpError {
         code: rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -1926,7 +1966,8 @@ pub(crate) async fn require_owner_or_admin(
              caller agent {caller_agent} cannot retire it. This transport carries no \
              AuthContext, and {caller_agent} is this server's declared signer identity \
              (--agent-key / --agent-model), so ownership is enforced against it: only the \
-             author, or an agent acting for the author's operator, may. Use an \
+             author, the author's operator, or an agent acting for the author or for the \
+             author's operator through a live operator link, may. Use an \
              authenticated HTTP listener with a claims:admin token, or run this server \
              under the owning agent's key."
         )
@@ -1949,6 +1990,9 @@ pub(crate) enum OwnershipGrant {
     Author,
     /// The caller is (or acts for) the operator of the claim's author (#503).
     Operator,
+    /// The caller acts for the claim's author itself: its live operator link
+    /// names the author (operator ruling R-183, one hop).
+    Delegate,
     /// stdio, with a per-process random signer: undecidable, allowed.
     UndeclaredSigner,
     /// An authenticated `claims:admin` caller.
@@ -2002,6 +2046,33 @@ pub(crate) async fn operator_arm_allows(
         operator = %target_op,
         reason,
         "claim ownership granted through an operator link"
+    );
+    Ok(true)
+}
+
+/// The delegate arm of [`require_owner_or_admin`] (operator ruling R-183; see
+/// its doc): `true` when the caller's ACTING operator link
+/// (`AgentRepository::operator_actor`, the caller-side definer read) names
+/// `target`, the claim's author. Never the author read on the caller side: a
+/// retired identity's key may be exposed. A lookup failure is an error, not a
+/// `false`.
+pub(crate) async fn delegate_arm_allows(
+    server: &EpiGraphMcpFull,
+    caller: uuid::Uuid,
+    target: uuid::Uuid,
+) -> Result<bool, McpError> {
+    let acting = epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+        .await
+        .map_err(internal_error)?;
+    if !acting.is_some_and(|l| l.operator_id == target) {
+        return Ok(false);
+    }
+    tracing::info!(
+        caller = %caller,
+        target_agent = %target,
+        operator = %target,
+        reason = "caller acts for the claim's author through a live operator link",
+        "claim ownership granted through a delegate link"
     );
     Ok(true)
 }
@@ -2805,7 +2876,8 @@ pub async fn query_undecomposed_claims(
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let claims = ClaimRepository::list_undecomposed(&server.pool, viewer, limit, offset)
+    let mut read = server.read_as(viewer, "query_undecomposed_claims").await?;
+    let claims = ClaimRepository::list_undecomposed(&mut *read, viewer, limit, offset)
         .await
         .map_err(internal_error)?;
 
@@ -2818,9 +2890,10 @@ pub async fn query_undecomposed_claims(
     // does — not a hardcoded `[]` (drain unit U008, backlog `1e6efd2d`
     // residual).
     let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     // `looks_atomic`: the same heuristic `decompose_claims` skips on, so an
     // agent can tell the terminal-by-policy rows (U073, backlog `5e1debbc`)

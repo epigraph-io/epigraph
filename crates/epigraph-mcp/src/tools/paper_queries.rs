@@ -28,18 +28,21 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// and deliberately not `is_current`-filtered; an id it does not return gets `[]`.
 ///
 /// NOT ONE SNAPSHOT. The caller's row read and this label read are two
-/// statements on `server.pool`, so a concurrent `update_labels` between them can
+/// statements on the caller's stamped read (`conn`, from
+/// `EpiGraphMcpFull::read_as`). That is a bare connection in `Session` mode and a
+/// READ COMMITTED transaction otherwise, so each statement takes its own
+/// snapshot either way, and a concurrent `update_labels` between them can
 /// pair a row with its newer labels. That is the same accepted shape as
 /// `query_claims` (backlog `babd5904`); both errors propagate, so nothing is
 /// silently defaulted. `query_paper` and `query_undecomposed_claims` read the
 /// same way. Only REST `get_claim` reads row and labels in one statement.
 async fn claim_responses(
-    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claims: Vec<epigraph_core::Claim>,
 ) -> Result<Vec<ClaimResponse>, McpError> {
     let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(conn, viewer, &ids)
         .await
         .map_err(internal_error)?;
     Ok(claims
@@ -123,6 +126,9 @@ pub async fn query_paper(
 
     // Canonical key first (a `https://doi.org/` spelling finds the bare-DOI
     // row), then the key as given; see `find_paper_by_document_key`.
+    // `papers` carries no row security (it is a registry keyed on the
+    // document), so the lookup takes no stamp; every claim-derived read below
+    // runs on the caller's stamped read.
     let paper =
         crate::tools::ingestion::find_paper_by_document_key(&server.pool, &params.doi).await?;
 
@@ -140,19 +146,19 @@ pub async fn query_paper(
         });
     };
 
-    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, viewer, paper.id)
+    let mut read = server.read_as(viewer, "query_paper").await?;
+    let asserted_count = PaperRepository::count_asserted_claims(&mut *read, viewer, paper.id)
         .await
         .map_err(internal_error)?;
     // Node-existence probe, independent of the `asserts` edge: catches claims
     // a partial/crashed ingestion already labelled `doi:<doi>` but never got
     // to link, which `asserted_count` alone would silently report as zero.
-    let labeled_count =
-        PaperRepository::count_claims_by_doi_label(&server.pool, viewer, &paper.doi)
-            .await
-            .map_err(internal_error)?;
+    let labeled_count = PaperRepository::count_claims_by_doi_label(&mut *read, viewer, &paper.doi)
+        .await
+        .map_err(internal_error)?;
     let claim_count = asserted_count.max(labeled_count);
 
-    let authors = PaperRepository::list_authors(&server.pool, viewer, paper.id)
+    let authors = PaperRepository::list_authors(&mut *read, viewer, paper.id)
         .await
         .map_err(internal_error)?
         .into_iter()
@@ -163,7 +169,7 @@ pub async fn query_paper(
         .collect();
 
     let claim_rows =
-        PaperRepository::list_asserted_claims(&server.pool, viewer, paper.id, limit, offset)
+        PaperRepository::list_asserted_claims(&mut *read, viewer, paper.id, limit, offset)
             .await
             .map_err(internal_error)?;
 
@@ -174,7 +180,7 @@ pub async fn query_paper(
     // asserted claim is on the page and must say so (drain unit U008, backlog
     // `1e6efd2d` residual).
     let ids: Vec<uuid::Uuid> = claim_rows.iter().map(|c| c.id).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
         .await
         .map_err(internal_error)?;
 
@@ -234,7 +240,8 @@ pub async fn query_claims_by_evidence(
     let min_truth = params.min_truth.unwrap_or(0.0);
 
     // Search claims and filter by evidence type
-    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
+    let mut read = server.read_as(viewer, "query_claims_by_evidence").await?;
+    let claims = ClaimRepository::list(&mut *read, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -246,7 +253,7 @@ pub async fn query_claims_by_evidence(
             continue;
         }
 
-        let evidence_list = EvidenceRepository::get_by_claim(&server.pool, viewer, claim.id)
+        let evidence_list = EvidenceRepository::get_by_claim(&mut *read, viewer, claim.id)
             .await
             .unwrap_or_default();
 
@@ -272,7 +279,7 @@ pub async fn query_claims_by_evidence(
         }
     }
 
-    success_json(&claim_responses(server, viewer, matched).await?)
+    success_json(&claim_responses(&mut read, viewer, matched).await?)
 }
 
 pub async fn query_claims_by_methodology(
@@ -283,7 +290,10 @@ pub async fn query_claims_by_methodology(
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
-    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
+    let mut read = server
+        .read_as(viewer, "query_claims_by_methodology")
+        .await?;
+    let claims = ClaimRepository::list(&mut *read, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -298,7 +308,7 @@ pub async fn query_claims_by_methodology(
         // Check reasoning traces for methodology
         if let Some(trace_id) = claim.trace_id {
             if let Ok(Some(trace)) =
-                ReasoningTraceRepository::get_by_id(&server.pool, viewer, trace_id).await
+                ReasoningTraceRepository::get_by_id(&mut *read, viewer, trace_id).await
             {
                 let method_name = trace.methodology.description().to_lowercase();
                 if method_name.contains(&methodology_lower) {
@@ -312,7 +322,7 @@ pub async fn query_claims_by_methodology(
         }
     }
 
-    success_json(&claim_responses(server, viewer, matched).await?)
+    success_json(&claim_responses(&mut read, viewer, matched).await?)
 }
 
 pub async fn query_claims_by_label(
@@ -354,8 +364,9 @@ pub async fn query_claims_by_label(
         });
     }
 
+    let mut read = server.read_as(viewer, "query_claims_by_label").await?;
     let rows = ClaimRepository::list_by_labels(
-        &server.pool,
+        &mut *read,
         viewer,
         epigraph_db::LabelQuery {
             labels: &params.labels,
@@ -376,7 +387,7 @@ pub async fn query_claims_by_label(
     let mut source_urls = if params.include_source_urls {
         let ids: Vec<uuid::Uuid> = rows.iter().map(|(c, _)| c.id.as_uuid()).collect();
         Some(
-            EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &ids)
+            EvidenceRepository::source_urls_by_claim_ids(&mut *read, viewer, &ids)
                 .await
                 .map_err(internal_error)?,
         )

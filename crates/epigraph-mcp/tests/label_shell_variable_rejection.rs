@@ -345,7 +345,17 @@ async fn update_with_evidence_rejects_unexpanded_label_before_writing_evidence(p
 async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool: PgPool) {
     let signer = epigraph_crypto::AgentSigner::generate();
     let embedder = epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None);
-    let server = epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    let server = {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false)
+            .with_scoped_pool(scoped)
+    };
     let viewer = fixture::public_viewer(&pool).await;
 
     // Same shape as ingest_document_smoke.rs's fixture, with the DOI carrying an
