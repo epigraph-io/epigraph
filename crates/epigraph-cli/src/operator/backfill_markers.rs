@@ -64,8 +64,10 @@
 //!
 //! `get_claim`'s `ingesters` read `paper -ingested_claim-> claim` records,
 //! `query_paper` the stamped assertions themselves; the two must agree. So
-//! every paper assertion a run stamps gets a record of its principal, written
-//! by that same run (unless that principal already has one):
+//! every paper assertion a run stamps gets a record of its principal (unless
+//! that principal already has one), written in the SAME transaction as the
+//! stamp: a committed batch always carries its records, and there is no
+//! separate record phase a stopped run could miss.
 //!
 //! * a CREATION record (`created_claim: true`) only where the paper's ingest
 //!   PROVABLY created the claim, from the data:
@@ -83,6 +85,10 @@
 //!     creation record yet, and the paper has a legacy in-force authorship
 //!     signed by S.
 //!
+//!   When two provable assertions target one claim, the first batch to
+//!   stamp one (batches run in edge-id order) writes its creation record; in
+//!   one batch, the older assertion's.
+//!
 //!   Its authors (the claim's primary authors) are the paper's in-force
 //!   authorships stamped with S, in position order: the authors
 //!   `query_paper(ingested_by = S)` lists.
@@ -99,41 +105,47 @@
 //! UPDATE, no WAL). `--apply` needs `--written-before`, `--confirm-count`
 //! (the dry run's edge total under the same cutoff), `--ruling`, `--reason`
 //! and `--manifest-out`; it refuses unless migration 208's guard is installed
-//! and `legacy-ingest` is registered. Batches of `--batch-size` edges (then
-//! records), each in its own transaction under `lock_timeout`; the manifest
-//! records each batch's lines (tagged with the batch number) and is `fsync`ed
-//! BEFORE that batch's write, then gets a `committed_batch` line AFTER its
-//! commit. One `security_events` row per run, written in the first batch that
-//! changes anything.
+//! and `legacy-ingest` is registered. Batches of `--batch-size` edges, each
+//! in its own transaction under `lock_timeout`, the kinds in order, each to
+//! exhaustion (every authorship is stamped before any paper assertion); a
+//! paper-assertion batch writes its stamps' ingest records in that same
+//! transaction. The manifest records each batch's edge lines (tagged with the
+//! batch number) and is `fsync`ed BEFORE that batch's UPDATE, then its record
+//! lines (same batch number) BEFORE its COMMIT, then gets a `committed_batch`
+//! line AFTER its commit. One `security_events` row per run, written in the
+//! first batch that changes anything.
 //!
-//! A run writes the records of exactly the paper assertions IT stamped and
-//! committed, after its edge batches, whatever stopped them: `--max-batches`
-//! bounds the edge batches only, and every step of an edge batch (BEGIN, the
-//! locked candidate SELECT, where `lock_timeout` fires against a concurrent
-//! writer, the manifest write, the UPDATE, COMMIT) fails into `BATCH-FAILED`
-//! (exit 2) and stops the edge phase without leaving the run, so the committed
-//! batches still get their records and the summary still prints. So after
-//! every run, and after reversing any one run's manifest, `query_paper` and
-//! `get_claim`'s `ingesters` agree. A failed record batch is reported as
-//! `BATCH-FAILED` (exit 2) the same way; that run's stamps then lack records,
-//! and no later run adopts them, so reverse that run before resuming. A run
-//! with a `BATCH-FAILED` ends with `NEXT` lines saying which: resume (a fresh
-//! dry run's total, a new manifest), reverse first, and for a lock timeout,
-//! stop the concurrent writer or raise `--lock-timeout`. A failure after a
-//! batch's COMMIT but before its `committed_batch` line names the line to
-//! append by hand.
-//! A resumed run (a new manifest) must use the same `--written-before` and the
-//! same `--ingest-signer` / `--attestation-signer` lists as the first: they
-//! decide every paper's principal.
+//! So every batch a run committed carries its records however the run stops
+//! after it: `--max-batches`, a failed batch, or the process killed, crashed
+//! or disconnected with no summary printed. After any of those, and after
+//! reversing any one run's manifest, `query_paper` and `get_claim`'s
+//! `ingesters` agree, and the backfill is resumed as it stands: a fresh dry
+//! run's total, a NEW manifest, the same `--written-before` and the same
+//! `--ingest-signer` / `--attestation-signer` lists as the first run (they
+//! decide every paper's principal). Every step of a batch (BEGIN, the locked
+//! candidate SELECT, where `lock_timeout` fires against a concurrent writer,
+//! the manifest writes, the UPDATE, an ingest record, COMMIT) fails into
+//! `BATCH-FAILED` (exit 2), which rolls that batch back whole and stops the run
+//! without leaving it, so the summary still prints. A run with a
+//! `BATCH-FAILED` ends with `NEXT` lines: resume (or undo with the reversal),
+//! and for a lock timeout, stop the concurrent writer or raise
+//! `--lock-timeout`. A batch that committed but whose `committed_batch` line
+//! failed to write is reported as `BATCH-FAILED` with the line to append to
+//! the manifest by hand. A run that died between a COMMIT and its
+//! line (no summary) leaves that batch's lines uncommitted in the manifest;
+//! the reversal reports it as `UNCOMMITTED-BATCH`, and its edges are checked
+//! by hand (the stamps and records of that batch are all there or none are).
 //!
 //! # Reversal
 //!
 //! `reverse-ingest-markers --manifest <file>`: acts only on the batches the
 //! manifest records as COMMITTED (a batch whose lines were written but whose
-//! commit failed is reported, never reversed). Removes exactly the two labels
-//! each recorded edge was given, only while it still carries them (a
-//! compare-and-swap), and deletes each record the run wrote while it is
-//! still the run's. One audit row.
+//! commit failed is reported, never reversed). Each committed batch is
+//! reversed in ONE transaction, newest first: it deletes each record the
+//! batch wrote while it is still the run's and removes exactly the two labels
+//! each of its edges was given, only while it still carries them (a
+//! compare-and-swap). A reversal stopped anywhere therefore leaves no stamp
+//! without its record, and re-running it finishes the rest. One audit row.
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -555,8 +567,9 @@ fn provable_sql(f: &Frame) -> String {
 }
 
 /// [`provable_sql`] as a query over `pa`, further restricted by `scope` (a
-/// predicate on `pa`, `$2` onward).
-fn provable_from(f: &Frame, scope: &str) -> String {
+/// predicate on `pa`, `$2` onward); `within`, when given, restricts the `pp`
+/// CTE to those papers (a set expression covering every `pa` in scope).
+fn provable_from(f: &Frame, within: Option<&str>, scope: &str) -> String {
     format!(
         "WITH {} SELECT {{cols}} FROM edges pa \
            JOIN claims c ON c.id = pa.target_id \
@@ -564,7 +577,7 @@ fn provable_from(f: &Frame, scope: &str) -> String {
            JOIN reasoning_traces t ON t.id = c.trace_id \
            LEFT JOIN pp ON pp.paper = pa.source_id \
           WHERE {} {scope}",
-        f.pp_cte("$1::uuid[]", None),
+        f.pp_cte("$1::uuid[]", within),
         provable_sql(f)
     )
 }
@@ -751,6 +764,7 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
     c.provable_records = sqlx::query_scalar(
         &provable_from(
             &f,
+            None,
             &format!("AND NOT (pa.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[])"),
         )
         .replace("{cols}", "count(DISTINCT c.id)"),
@@ -987,14 +1001,13 @@ async fn audit(conn: &mut PgConnection, event: &str, details: &Value) -> anyhow:
 }
 
 /// What every write of one applied run shares.
-struct Act<'a> {
-    o: &'a Options,
+struct Act {
     frame: Frame,
     audit: Value,
     audited: bool,
 }
 
-impl Act<'_> {
+impl Act {
     async fn audit_once(&mut self, tx: &mut PgConnection) -> anyhow::Result<()> {
         if !self.audited {
             audit(tx, EVENT_APPLY, &self.audit).await?;
@@ -1090,7 +1103,6 @@ pub async fn run(
     let header_sha = sha256_hex(serde_json::to_string(&header)?.as_bytes());
     let mut manifest = ManifestOut::create(path, &header)?;
     let mut act = Act {
-        o,
         frame: o.frame(),
         audit: json!({
             "operation": OPERATION,
@@ -1104,9 +1116,6 @@ pub async fn run(
         }),
         audited: false,
     };
-    // The paper assertions this run stamped and committed: the run writes
-    // their ingest records, and only theirs.
-    let mut run_pa: Vec<Uuid> = Vec::new();
     let mut lock_timed_out = false;
     'kinds: for kind in Kind::ALL {
         let mut last = Uuid::nil();
@@ -1114,16 +1123,20 @@ pub async fn run(
             if o.max_batches.is_some_and(|m| report.batches >= m) {
                 break 'kinds;
             }
-            // Every step of an edge batch, BEGIN through COMMIT, runs inside
-            // this one caught block: whatever fails (the locked candidate
-            // SELECT timing out on a concurrent writer's lock, the manifest
-            // write, the UPDATE, the COMMIT) stops the edge phase without
-            // leaving `run`, so the record phase and the summary below
-            // always run for the batches that committed.
+            // Every step of a batch, BEGIN through COMMIT, runs inside this
+            // one caught block: whatever fails (the locked candidate SELECT
+            // timing out on a concurrent writer's lock, the manifest write,
+            // the UPDATE, an ingest record, the COMMIT) rolls the whole batch
+            // back and stops the run without leaving `run`, so the summary
+            // below always prints. A paper-assertion batch writes its stamps'
+            // ingest records in the SAME transaction: a committed batch
+            // always carries its records, however the run stops after it
+            // (killed included), and there is no separate record phase to
+            // miss.
             let mut numbered: Option<usize> = None;
-            let step: anyhow::Result<Option<(Uuid, Vec<Uuid>, u64)>> = async {
+            let step: anyhow::Result<Option<Done>> = async {
                 let mut tx = conn.begin().await.context("BEGIN")?;
-                let body: anyhow::Result<Option<(Uuid, Vec<Uuid>, u64)>> = async {
+                let body: anyhow::Result<Option<Done>> = async {
                     sqlx::query("SELECT set_config('lock_timeout', $1, true)")
                         .bind(&o.lock_timeout)
                         .execute(&mut *tx)
@@ -1184,8 +1197,23 @@ pub async fn run(
                     if n != ids.len() as u64 {
                         bail!("batch stamped {n} of {} locked edges", ids.len());
                     }
+                    let (mut created, mut other) = (0, 0);
+                    if kind == Kind::PaperAsserts {
+                        let (lines, c, x) =
+                            batch_records(&mut tx, &act.frame, o, &ids, batch).await?;
+                        // The record lines, fsynced before the commit that
+                        // writes them, under this batch's number.
+                        manifest.append(&lines)?;
+                        (created, other) = (c, x);
+                    }
                     act.audit_once(&mut tx).await?;
-                    Ok(Some((max_id, ids, n)))
+                    Ok(Some(Done {
+                        max_id,
+                        batch,
+                        stamped: n,
+                        created,
+                        other,
+                    }))
                 }
                 .await;
                 match body {
@@ -1194,6 +1222,7 @@ pub async fn run(
                             "COMMIT (the manifest holds this batch's lines with no commit \
                              line, so the reversal reports it as UNCOMMITTED-BATCH)",
                         )?;
+                        crash_point(done.batch, "commit");
                         Ok(Some(done))
                     }
                     Ok(None) => {
@@ -1209,24 +1238,24 @@ pub async fn run(
             .await;
             match step {
                 Ok(None) => break,
-                Ok(Some((max_id, ids, n))) => {
-                    let batch = numbered.expect("a committed batch is numbered");
+                Ok(Some(done)) => {
+                    let batch = done.batch;
                     act.audited = true;
-                    *report.stamped.entry(kind).or_default() += n;
-                    if kind == Kind::PaperAsserts {
-                        run_pa.extend_from_slice(&ids);
-                    }
+                    *report.stamped.entry(kind).or_default() += done.stamped;
+                    report.records += done.created;
+                    report.non_creation_records += done.other;
                     if let Err(e) = manifest.committed(batch) {
                         report.batch_failures.push(format!(
                             "{} batch {batch} COMMITTED, but its committed_batch line was not \
                              written ({e:#}): append the line {{\"committed_batch\": {batch}}} \
                              to the manifest by hand; until then the reversal reports this \
-                             batch as UNCOMMITTED-BATCH and leaves it stamped",
+                             batch as UNCOMMITTED-BATCH and leaves its stamps and records",
                             kind.as_str()
                         ));
                         break 'kinds;
                     }
-                    last = max_id;
+                    crash_point(batch, "line");
+                    last = done.max_id;
                 }
                 Err(e) => {
                     lock_timed_out |= is_lock_timeout(&e);
@@ -1240,21 +1269,6 @@ pub async fn run(
             }
         }
     }
-    // The records of exactly what this run committed, whatever stopped its
-    // edge phase (any failed edge batch step, --max-batches): every run
-    // leaves query_paper and get_claim's ingesters agreeing on its own
-    // stamps, and its manifest reverses exactly those. A record-phase failure
-    // is reported as an edge batch's is, and the summary still prints. A run
-    // that stamped no paper assertion selects nothing here (never another
-    // run's).
-    let records_failed =
-        match write_records(conn, &mut act, &mut manifest, &mut report, &run_pa).await {
-            Ok(()) => false,
-            Err(e) => {
-                report.batch_failures.push(format!("ingest records: {e:#}"));
-                true
-            }
-        };
     for (k, n) in &report.stamped {
         writeln!(out, "STAMPED\t{}\t{n}", k.as_str())?;
     }
@@ -1273,20 +1287,17 @@ pub async fn run(
         path.display(),
         path.display()
     )?;
-    for line in next_steps(&report, records_failed, lock_timed_out, path) {
+    for line in next_steps(&report, lock_timed_out, path) {
         writeln!(out, "NEXT\t{line}")?;
     }
     Ok(report)
 }
 
 /// What the operator does after a run that reported a `BATCH-FAILED`: the
-/// `NEXT` lines. Nothing after a clean run.
-fn next_steps(
-    report: &Report,
-    records_failed: bool,
-    lock_timed_out: bool,
-    manifest: &Path,
-) -> Vec<String> {
+/// `NEXT` lines. Nothing after a clean run. Every batch a run committed
+/// carries its ingest records, so the run can always be resumed as it is or
+/// undone.
+fn next_steps(report: &Report, lock_timed_out: bool, manifest: &Path) -> Vec<String> {
     if report.batch_failures.is_empty() {
         return Vec::new();
     }
@@ -1298,19 +1309,10 @@ fn next_steps(
                   --ingest-signer / --attestation-signer lists, then --apply with its TOTAL \
                   as --confirm-count and a NEW --manifest-out";
     let mut next = Vec::new();
-    if records_failed {
-        next.push(format!(
-            "reverse first: this run's stamped paper assertions lack their ingest records \
-             (query_paper and get_claim's ingesters disagree on them) and no later run writes \
-             them. Run: {reverse}"
-        ));
-        next.push(format!("then resume: {resume}"));
-    } else {
-        next.push(format!(
-            "resume: the batches this run committed carry their ingest records, so query_paper \
-             and get_claim's ingesters agree; {resume}. Or undo this run: {reverse}"
-        ));
-    }
+    next.push(format!(
+        "resume: every batch this run committed carries its ingest records, so query_paper and \
+         get_claim's ingesters agree; {resume}. Or undo this run: {reverse}"
+    ));
     if lock_timed_out {
         next.push(
             "a lock timeout means another transaction held a candidate edge: stop \
@@ -1320,6 +1322,25 @@ fn next_steps(
     }
     next
 }
+
+/// The environment variable of the test-only crash hook ([`crash_point`]).
+pub const TEST_CRASH_ENV: &str = "EPIGRAPH_OPERATOR_TEST_CRASH_AT";
+
+/// A test-only crash hook, compiled into debug builds only: when
+/// [`TEST_CRASH_ENV`] is `<batch>:commit` (right after that batch's COMMIT,
+/// before its `committed_batch` line), `<batch>:line` (after that line,
+/// before the next batch) or `<n>:reverse` (right after a reversal's n-th
+/// committed transaction), the process aborts there, as a kill would stop
+/// it: no unwinding, no summary.
+#[cfg(debug_assertions)]
+fn crash_point(batch: usize, at: &str) {
+    if std::env::var(TEST_CRASH_ENV).is_ok_and(|v| v == format!("{batch}:{at}")) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn crash_point(_batch: usize, _at: &str) {}
 
 /// Whether a batch failed on `lock_timeout` (SQLSTATE 55P03).
 fn is_lock_timeout(e: &anyhow::Error) -> bool {
@@ -1334,25 +1355,37 @@ fn is_lock_timeout(e: &anyhow::Error) -> bool {
 /// One record to write: paper, claim, principal, created.
 type RecordPlan = (Uuid, Uuid, Uuid, bool);
 
-/// The ingest records of the paper assertions THIS run stamped (`run_pa`,
-/// module doc): the provable creation records first, then a non-creation
-/// record for every one of them its principal has no record of.
-async fn write_records(
-    conn: &mut PgConnection,
-    act: &mut Act<'_>,
-    manifest: &mut ManifestOut,
-    report: &mut Report,
-    run_pa: &[Uuid],
-) -> anyhow::Result<()> {
-    let o = act.o;
+/// What one committed batch did.
+struct Done {
+    max_id: Uuid,
+    batch: usize,
+    stamped: u64,
+    created: u64,
+    other: u64,
+}
+
+/// The ingest records of one paper-assertion batch's stamps (`ids`, module
+/// doc), inside that batch's transaction: the provable creation records
+/// first, then a non-creation record for every stamped assertion its
+/// principal has no record of. Returns the manifest lines (tagged `batch`)
+/// and the creation and non-creation counts.
+async fn batch_records(
+    tx: &mut PgConnection,
+    f: &Frame,
+    o: &Options,
+    ids: &[Uuid],
+    batch: usize,
+) -> anyhow::Result<(Vec<Value>, u64, u64)> {
     let mut plan: Vec<RecordPlan> = Vec::new();
     if o.creation_records {
-        // Only over this run's stamps, and only where the stamp names the
-        // signer the proof names (the record's ingester is the edge's `by`).
+        // Only over this batch's stamps (the principal decided over their
+        // papers only), and only where the stamp names the signer the proof
+        // names (the record's ingester is the edge's `by`).
         let sql = format!(
             "{} ORDER BY c.id, pa.created_at, pa.id",
             provable_from(
-                &act.frame,
+                f,
+                Some("(SELECT x.source_id FROM edges x WHERE x.id = ANY($2::uuid[]))"),
                 &format!(
                     "AND pa.id = ANY($2::uuid[]) AND ({by_pa}) = pa.signer_id::text",
                     by_pa = ingest_written_by_sql("pa")
@@ -1365,12 +1398,13 @@ async fn write_records(
         );
         let created: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(&sql)
             .bind(&o.ingest_signers)
-            .bind(run_pa)
-            .fetch_all(&mut *conn)
-            .await?;
+            .bind(ids)
+            .fetch_all(&mut *tx)
+            .await
+            .context("the batch's provable creation records")?;
         plan.extend(created.into_iter().map(|(p, c, by)| (p, c, by, true)));
     }
-    // This run's stamped paper assertions, by the principal their label
+    // The batch's stamped paper assertions, by the principal their label
     // names. A pair a creation record above covers is skipped by the record
     // writer's own dedup (one record per paper, claim and ingester).
     let stamped: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(&format!(
@@ -1381,9 +1415,10 @@ async fn write_records(
         by_e = ingest_written_by_sql("e"),
         pas = paper_asserts("e"),
     ))
-    .bind(run_pa)
-    .fetch_all(&mut *conn)
-    .await?;
+    .bind(ids)
+    .fetch_all(&mut *tx)
+    .await
+    .context("the batch's stamped paper assertions")?;
     let creations: BTreeSet<(Uuid, Uuid, Uuid)> =
         plan.iter().map(|(p, c, by, _)| (*p, *c, *by)).collect();
     plan.extend(
@@ -1393,99 +1428,69 @@ async fn write_records(
             .map(|(p, c, by)| (p, c, by, false)),
     );
     let mut authors_of: HashMap<(Uuid, Uuid), Vec<Uuid>> = HashMap::new();
-    // Not bounded by --max-batches: a run always writes the records of what
-    // it stamped.
-    for chunk in plan.chunks(o.batch_size.max(1)) {
-        report.batches += 1;
-        let batch = report.batches;
-        let mut tx = conn.begin().await?;
-        let result: anyhow::Result<(Vec<Value>, u64, u64)> = async {
-            sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-                .bind(&o.lock_timeout)
-                .execute(&mut *tx)
-                .await?;
-            let mut lines = Vec::new();
-            let (mut created_n, mut other_n) = (0u64, 0u64);
-            for (paper, claim, by, created) in chunk {
-                if let Entry::Vacant(slot) = authors_of.entry((*paper, *by)) {
-                    // The authorships this principal's ingest of the paper holds
-                    // (the authors query_paper(ingested_by = by) lists), in
-                    // position order.
-                    let authors: Vec<Uuid> = sqlx::query_scalar(&format!(
-                        "SELECT ea.source_id FROM edges ea \
-                      WHERE ea.target_id = $1 AND {au} \
-                        AND (ea.valid_to IS NULL OR ea.valid_to > now()) \
-                        AND {by_ea} = $2::text \
-                      ORDER BY CASE WHEN ea.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
-                                    THEN (ea.properties ->> 'position')::bigint END NULLS LAST, \
-                               ea.created_at, ea.id",
-                        au = authored("ea"),
-                        by_ea = ingest_written_by_sql("ea"),
-                    ))
-                    .bind(paper)
-                    .bind(by.to_string())
-                    .fetch_all(&mut *tx)
-                    .await?;
-                    slot.insert(authors);
-                }
-                let authors = &authors_of[&(*paper, *by)];
-                let wrote = epigraph_db::ClaimIngestRepository::record_signed_conn(
-                    &mut tx, None, *paper, *claim, *by, *created, authors, TOOL, PIPELINE,
-                )
-                .await
-                .map_err(|e| anyhow!("ingest record for claim {claim}: {e}"))?;
-                if !wrote {
-                    continue;
-                }
-                let id: Uuid = sqlx::query_scalar(&format!(
-                    "SELECT e.id FROM edges e \
-                  WHERE e.source_id = $1 AND e.target_id = $2 \
-                    AND e.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
-                    AND e.properties -> '{INGEST_WRITTEN_PROPERTY}' ->> 'tool' = $3 \
-                    AND e.properties ->> '{INGESTED_BY_PROPERTY}' = $4"
-                ))
-                .bind(paper)
-                .bind(claim)
-                .bind(TOOL)
-                .bind(by.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
-                if *created {
-                    created_n += 1;
-                } else {
-                    other_n += 1;
-                }
-                lines.push(json!({
-                    "record": id, "paper": paper, "claim": claim, "by": by,
-                    "created": created, "batch": batch,
-                }));
-            }
-            if !lines.is_empty() {
-                act.audit_once(&mut tx).await?;
-            }
-            Ok((lines, created_n, other_n))
+    let mut lines = Vec::new();
+    let (mut created_n, mut other_n) = (0u64, 0u64);
+    for (paper, claim, by, created) in &plan {
+        if let Entry::Vacant(slot) = authors_of.entry((*paper, *by)) {
+            // The authorships this principal's ingest of the paper holds (the
+            // authors query_paper(ingested_by = by) lists), in position order.
+            // Every authorship is stamped before any paper assertion: a run
+            // stamps the kinds in order, each to exhaustion.
+            let authors: Vec<Uuid> = sqlx::query_scalar(&format!(
+                "SELECT ea.source_id FROM edges ea \
+                  WHERE ea.target_id = $1 AND {au} \
+                    AND (ea.valid_to IS NULL OR ea.valid_to > now()) \
+                    AND {by_ea} = $2::text \
+                  ORDER BY CASE WHEN ea.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
+                                THEN (ea.properties ->> 'position')::bigint END NULLS LAST, \
+                           ea.created_at, ea.id",
+                au = authored("ea"),
+                by_ea = ingest_written_by_sql("ea"),
+            ))
+            .bind(paper)
+            .bind(by.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+            slot.insert(authors);
         }
-        .await;
-        let (lines, created_n, other_n) = match result {
-            Ok(r) => r,
-            Err(e) => {
-                tx.rollback().await.ok();
-                bail!("records batch {batch}: {e:#}");
-            }
-        };
-        // The record lines, fsynced before the commit they describe; the
-        // commit line after it.
-        manifest.append(&lines)?;
-        tx.commit().await?;
-        if !lines.is_empty() {
-            act.audited = true;
+        let authors = &authors_of[&(*paper, *by)];
+        let wrote = epigraph_db::ClaimIngestRepository::record_signed_conn(
+            &mut *tx, None, *paper, *claim, *by, *created, authors, TOOL, PIPELINE,
+        )
+        .await
+        .map_err(|e| anyhow!("ingest record for claim {claim}: {e}"))?;
+        if !wrote {
+            continue;
         }
-        manifest.committed(batch)?;
-        report.records += created_n;
-        report.non_creation_records += other_n;
+        let id: Uuid = sqlx::query_scalar(&format!(
+            "SELECT e.id FROM edges e \
+              WHERE e.source_id = $1 AND e.target_id = $2 \
+                AND e.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
+                AND e.properties -> '{INGEST_WRITTEN_PROPERTY}' ->> 'tool' = $3 \
+                AND e.properties ->> '{INGESTED_BY_PROPERTY}' = $4"
+        ))
+        .bind(paper)
+        .bind(claim)
+        .bind(TOOL)
+        .bind(by.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if *created {
+            created_n += 1;
+        } else {
+            other_n += 1;
+        }
+        lines.push(json!({
+            "record": id, "paper": paper, "claim": claim, "by": by,
+            "created": created, "batch": batch,
+        }));
     }
-    Ok(())
+    Ok((lines, created_n, other_n))
 }
+
+/// One committed batch to reverse: its records, and its edges with the
+/// `by` each was stamped with.
+type BatchUndo = (Vec<Uuid>, Vec<(Uuid, Uuid)>);
 
 /// What a reversal did.
 #[derive(Debug, Default)]
@@ -1508,7 +1513,6 @@ pub async fn reverse(
     conn: &mut PgConnection,
     manifest: &Path,
     apply: bool,
-    batch_size: usize,
     lock_timeout: &str,
     out: &mut impl Write,
 ) -> anyhow::Result<ReverseReport> {
@@ -1581,47 +1585,50 @@ pub async fn reverse(
         pending.entry(*b).or_default().1 += 1;
     }
     r.uncommitted = pending.into_iter().map(|(b, (e, n))| (b, e, n)).collect();
-    // Only what the run committed.
-    let edges: Vec<(Uuid, Uuid)> = edges
-        .into_iter()
-        .filter(|(b, ..)| committed.contains(b))
-        .map(|(_, e, by)| (e, by))
-        .collect();
-    let records: Vec<Uuid> = records
-        .into_iter()
-        .filter(|(b, _)| committed.contains(b))
-        .map(|(_, id)| id)
-        .collect();
-    let mut audited = false;
-    // Records first (each names a claim the run's stamped assertion vouches
-    // for), then the labels; each chunk in its own transaction, committed
-    // under --apply. Every statement is a compare-and-swap, so a re-run, or a
+    // Only what the run committed, per batch: each committed batch is
+    // reversed in ONE transaction (its records and its labels together), so
+    // a reversal stopped anywhere, killed included, never leaves a stamp
+    // without its record; newest batch first, the order the run wrote them
+    // in reversed. Every statement is a compare-and-swap, so a re-run, or a
     // run after a partial one, restores only what is still the run's.
-    let record_chunks: Vec<&[Uuid]> = records.chunks(batch_size.max(1)).collect();
-    let edge_chunks: Vec<&[(Uuid, Uuid)]> = edges.chunks(batch_size.max(1)).collect();
-    let total = record_chunks.len() + edge_chunks.len();
-    for step in 0..total.max(1) {
+    let mut by_batch: BTreeMap<i64, BatchUndo> = BTreeMap::new();
+    let (mut n_edges, mut n_records) = (0usize, 0usize);
+    for (b, e, by) in edges.into_iter().filter(|(b, ..)| committed.contains(b)) {
+        by_batch.entry(b).or_default().1.push((e, by));
+        n_edges += 1;
+    }
+    for (b, id) in records.into_iter().filter(|(b, _)| committed.contains(b)) {
+        by_batch.entry(b).or_default().0.push(id);
+        n_records += 1;
+    }
+    let mut audited = false;
+    let mut steps: Vec<BatchUndo> = by_batch.into_values().rev().collect();
+    if steps.is_empty() {
+        // Nothing committed: still one (audited) transaction.
+        steps.push((Vec::new(), Vec::new()));
+    }
+    for (step, (recs, chunk)) in steps.into_iter().enumerate() {
         let mut tx = conn.begin().await?;
         sqlx::query("SELECT set_config('lock_timeout', $1, true)")
             .bind(lock_timeout)
             .execute(&mut *tx)
             .await?;
         declare(&mut tx, true).await?;
-        if step < record_chunks.len() {
-            let chunk = record_chunks[step];
+        if !recs.is_empty() {
             let n = sqlx::query(&format!(
                 "DELETE FROM edges e WHERE e.id = ANY($1) \
                    AND e.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
                    AND e.properties -> '{INGEST_WRITTEN_PROPERTY}' ->> 'tool' = $2"
             ))
-            .bind(chunk)
+            .bind(&recs)
             .bind(TOOL)
             .execute(&mut *tx)
             .await?
             .rows_affected();
             r.records_deleted += n;
-            r.records_held += chunk.len() as u64 - n;
-        } else if let Some(chunk) = edge_chunks.get(step - record_chunks.len()) {
+            r.records_held += recs.len() as u64 - n;
+        }
+        if !chunk.is_empty() {
             let ids: Vec<Uuid> = chunk.iter().map(|c| c.0).collect();
             let bys: Vec<Uuid> = chunk.iter().map(|c| c.1).collect();
             let n = sqlx::query(&format!(
@@ -1654,8 +1661,8 @@ pub async fn reverse(
                         "operation": OPERATION,
                         "manifest_sha256": file_sha,
                         "written_before": header.get("written_before"),
-                        "edges": edges.len(),
-                        "records": records.len(),
+                        "edges": n_edges,
+                        "records": n_records,
                         "uncommitted_batches": r.uncommitted.len(),
                     }),
                 )
@@ -1663,6 +1670,7 @@ pub async fn reverse(
                 audited = true;
             }
             tx.commit().await?;
+            crash_point(step + 1, "reverse");
         } else {
             tx.rollback().await?;
         }

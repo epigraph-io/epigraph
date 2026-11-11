@@ -44,7 +44,7 @@
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
 //!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
-//!         [--batch-size N] [--apply --written-before RFC3339 --confirm-count N \
+//!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
 //!          --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
 //!     epigraph-operator reverse-ingest-markers --manifest backfill-1.jsonl [--apply]
 //!     epigraph-operator register-system-agent --role legacy-ingest --create-agent \
@@ -864,12 +864,12 @@ enum Command {
         /// Edges per transaction.
         #[arg(long, default_value_t = 2000)]
         batch_size: usize,
-        /// Stop after this many EDGE batches. However the edge phase stops
-        /// (this bound, or any failed edge batch, a lock timeout included),
-        /// the run still writes the ingest records of the paper assertions it
-        /// stamped and committed, and prints its summary. A re-run with a new
-        /// manifest, the same --written-before and the same signer lists
-        /// picks up the rest.
+        /// Stop after this many batches. A paper-assertion batch writes its
+        /// stamps' ingest records in its own transaction, so every committed
+        /// batch carries its records however the run stops (this bound, a
+        /// failed batch, a lock timeout, or the process killed). A re-run
+        /// with a new manifest, the same --written-before and the same signer
+        /// lists picks up the rest.
         #[arg(long)]
         max_batches: Option<usize>,
         /// `lock_timeout` for each batch (a PostgreSQL interval).
@@ -880,20 +880,18 @@ enum Command {
         statement_timeout: String,
     },
     /// Reverse a `backfill-ingest-markers` run from its manifest: for every
-    /// batch the manifest records as committed, remove the two labels each
-    /// recorded edge was given (only while it still carries them) and delete
-    /// the ingest records it wrote. Dry run rolls back.
+    /// batch the manifest records as committed, newest first and each in one
+    /// transaction, delete the ingest records it wrote and remove the two
+    /// labels each recorded edge was given (only while it still carries
+    /// them). Dry run rolls back.
     ReverseIngestMarkers {
         /// The run's manifest.
         #[arg(long)]
         manifest: PathBuf,
-        /// Commit. Without it, every chunk is rolled back.
+        /// Commit. Without it, every batch is rolled back.
         #[arg(long)]
         apply: bool,
-        /// Edges per transaction.
-        #[arg(long, default_value_t = 2000)]
-        batch_size: usize,
-        /// `lock_timeout` for each chunk.
+        /// `lock_timeout` for each batch.
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
@@ -2204,21 +2202,10 @@ async fn main_inner() -> anyhow::Result<i32> {
         Command::ReverseIngestMarkers {
             manifest,
             apply,
-            batch_size,
             lock_timeout,
         } => {
-            if batch_size == 0 {
-                anyhow::bail!("--batch-size must be at least 1");
-            }
-            backfill_markers::reverse(
-                &mut conn,
-                &manifest,
-                apply,
-                batch_size,
-                &lock_timeout,
-                &mut stdout,
-            )
-            .await?;
+            backfill_markers::reverse(&mut conn, &manifest, apply, &lock_timeout, &mut stdout)
+                .await?;
             Ok(0)
         }
         Command::RestrictClaims { claims_file, .. } => {
