@@ -17,9 +17,11 @@ visibility:
 | author agents (`agents`, one per paper author, `did_key_for_author`) | the walk's step 3 | `agents` is readable by every session (its policy is `true`) |
 | `authored` edges, author agent → paper | the walk's step 3 | a paper or agent endpoint contributes `public` to the meet; 120's `epigraph_edges_tenancy` keeps such structural edges `('public', world)` |
 | `processed_by` edge, paper → ingesting agent, `properties.pipeline` | `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn` | same as `authored` |
+| `asserts` edge, paper → an already-PUBLIC claim the walk converged onto | the walk, for every atom whose content already exists | both endpoints public, so the meet is public |
+| the `doi:<doi>` label on such a converged public claim, when the agent may write it | `label_resolved_claim` | the claim is public |
 
 So anyone can learn that a document exists, its title, DOI and journal, who wrote it, which agent
-ingested it and with which pipeline, and when.
+ingested it and with which pipeline, when, and which already-public statements it asserts.
 
 ## 2. Reads that disclose it
 
@@ -50,8 +52,9 @@ ingest the same DOI privately, or one privately and one publicly. Options:
    publicize of the claims must also publicize or merge the paper row.
 3. **Public bibliographic row, scoped stamps.** Accept that title, DOI and journal are public
    bibliographic facts (they are, for a published paper), and scope only what says *this
-   tenant ingested it*: the `processed_by` and `authored` edges and the author agents. This is
-   wrong for an unpublished or internal document, whose title is itself confidential.
+   tenant ingested it*: the `processed_by` and `authored` edges, the author agents, and the
+   `asserts` edges onto converged public claims (with their `doi:` labels). This is wrong for
+   an unpublished or internal document, whose title is itself confidential.
 
 Option 2 is the only one that makes a confidential ingest safe. It is also the largest. The
 operator should choose before any migration is written.
@@ -69,7 +72,10 @@ operator should choose before any migration is written.
 * Move `ensure_paper_node` into the ingest's stamped transaction, so the paper row is written
   with the same viewer and declaration as the claims.
 * Edges: give `paper` an entry in `epigraph_node_tenancy`, so `authored`, `processed_by` and
-  `asserts` take the meet with the paper row instead of `('public', world)`.
+  `asserts` take the meet with the paper row instead of `('public', world)`. That also scopes
+  an `asserts` edge onto a converged public claim: its meet becomes the paper's tenancy.
+* Labels: `label_resolved_claim` must not add `doi:<doi>` to a public claim for a non-public
+  ingest (or the label must move to the scoped edge).
 * Author agents: keep them public as identities (an author's name is not tenant data), but
   their `authored` edges to a scoped paper take the paper's tenancy through the meet above.
 * `epigraph_publicize_claims` / `epigraph_share_claims_with_team`: when every claim a paper
@@ -84,6 +90,8 @@ On the app role (`ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
   no `paper_id`; its `query_paper`, `GET /api/v1/papers` and `get_neighborhood` from the author
   agent show no row and no `authored` / `processed_by` edge. A member sees all of them.
 * A private ingest: only the home group reads the paper row.
+* A team ingest whose atom converges onto an existing public claim: a non-member sees neither
+  the `asserts` edge from the paper nor a `doi:` label on that claim.
 * The same DOI ingested by two teams: two rows, neither visible to the other team; each team's
   `check_already_ingested` answers for its own row only.
 * A public ingest behaves byte for byte as today (row, edges, dedup, `check_already_ingested`).

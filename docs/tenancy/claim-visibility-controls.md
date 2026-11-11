@@ -66,12 +66,17 @@ Added to:
     `ensure_paper_node` writes it on the pool before the walk, with no `VisibilityChoice`;
   * the author agents (`agents` rows named after the paper's authors) and their `authored`
     edges to the paper;
-  * the paper's `processed_by` edge, which is what `check_already_ingested` reports.
+  * the paper's `processed_by` edge, which is what `check_already_ingested` reports;
+  * the `asserts` edge from the paper to every claim the ingest converged onto that is already
+    **public** (an existing atom with the same content). Both endpoints are public, so the edge
+    is public, and anyone can see which public statements the document contains. A converged
+    public claim the agent may write also gets the document's `doi:<doi>` label.
 
-  The two edges have a paper or agent endpoint, so 120's `epigraph_edges_tenancy` keeps them
-  `('public', world)`. So for a `team` or `private` ingest, the claims are scoped, but anyone
-  can learn that the document exists, its title and DOI, who wrote it, and that it was
-  ingested. **Do not ingest a confidential document until a follow-up adds tenancy to these
+  The paper-to-agent edges have a paper or agent endpoint, and the converged `asserts` edges
+  two public endpoints, so 120's `epigraph_edges_tenancy` keeps them all public. So for a
+  `team` or `private` ingest, the new claims are scoped, but anyone can learn that the
+  document exists, its title and DOI, who wrote it, that it was ingested, and which
+  already-public statements it asserts. **Do not ingest a confidential document until a follow-up adds tenancy to these
   rows** (operator ruling, 2026-11-11). The follow-up's design is
   [papers-tenancy-followup.md](papers-tenancy-followup.md).
 * The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting
