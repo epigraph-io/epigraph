@@ -43,8 +43,9 @@
 //!         [--accept-unenforced]]
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
-//!         [--ingest-signer <uuid>]... [--no-creation-records] [--batch-size N] \
-//!         [--apply --confirm-count N --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
+//!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
+//!         [--batch-size N] [--apply --written-before RFC3339 --confirm-count N \
+//!          --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
 //!     epigraph-operator reverse-ingest-markers --manifest backfill-1.jsonl [--apply]
 //!     epigraph-operator register-system-agent --role legacy-ingest --create-agent \
 //!         --reason TEXT [--apply]
@@ -812,22 +813,33 @@ enum Command {
         sample: usize,
     },
     /// Stamp the document ingest's marker (as migration 208's reserved
-    /// labels, outside the signed attestation) onto every pre-marker
-    /// ingest-shaped edge: `agent -authored-> paper`, `paper -asserts->
-    /// claim`, and an `agent -asserts-> claim` closing a legacy triangle.
-    /// `by` = the edge's signer when a real ingesting agent signed it, else
-    /// the registered `legacy-ingest` principal. Writes provable creation
-    /// records. Dry run (default) is read-only. Reversed by
-    /// `reverse-ingest-markers --manifest`.
+    /// labels, outside the signed attestation) onto every legacy
+    /// ingest-shaped edge written before `--written-before`: `agent -authored->
+    /// paper`, `paper -asserts-> claim`, and an `agent -asserts-> claim`
+    /// closing a legacy authored -> paper -> claim chain. One principal per
+    /// PAPER: its one classified ingest signer when all of its real-signed
+    /// authored and paper asserts edges name one, else the registered
+    /// `legacy-ingest` principal; an agent assertion takes its (oldest)
+    /// chain's paper's. Writes an ingest record for every stamped assertion
+    /// (a creation record only where provable). Dry run (default) is
+    /// read-only. Reversed by `reverse-ingest-markers --manifest`.
     BackfillIngestMarkers {
-        /// A bulk-attestation signer: its edges are stamped as `legacy-ingest`.
+        /// A bulk-attestation signer: it never decides a paper's principal.
         /// Repeat for each.
         #[arg(long = "attestation-signer")]
         attestation_signers: Vec<Uuid>,
-        /// A real ingesting agent: its signed edges keep it as `by`. Repeat for
-        /// each. `--apply` refuses while any signer is in neither list.
+        /// A real ingesting agent: a paper all of whose real-signed authored
+        /// and paper asserts edges it signed takes it as principal. Repeat for
+        /// each. `--apply` refuses while any signer of those edges is in
+        /// neither list (agent -> claim signers need no classification).
         #[arg(long = "ingest-signer")]
         ingest_signers: Vec<Uuid>,
+        /// Only edges written before this moment (RFC 3339, e.g.
+        /// 2026-11-10T06:00:00Z: the maintenance window's start, with ingest
+        /// stopped) are stamped. Required under `--apply`; give the dry run
+        /// the same value. Recorded in the manifest and the audit row.
+        #[arg(long, value_parser = backfill_markers::parse_written_before)]
+        written_before: Option<chrono::DateTime<chrono::Utc>>,
         /// Perform the writes. Without it, the census only (read-only).
         #[arg(long)]
         apply: bool,
@@ -844,7 +856,8 @@ enum Command {
         /// Why (manifest and audit row).
         #[arg(long, default_value = "")]
         reason: String,
-        /// Do not write creation records for legacy literature claims.
+        /// Do not write creation records for legacy literature claims (they
+        /// get non-creation records instead).
         #[arg(long)]
         no_creation_records: bool,
         /// Edges per transaction.
@@ -861,9 +874,10 @@ enum Command {
         #[arg(long, default_value = "10min")]
         statement_timeout: String,
     },
-    /// Reverse a `backfill-ingest-markers` run from its manifest: remove the
-    /// two labels each recorded edge was given (only while it still carries
-    /// them) and delete the creation records it wrote. Dry run rolls back.
+    /// Reverse a `backfill-ingest-markers` run from its manifest: for every
+    /// batch the manifest records as committed, remove the two labels each
+    /// recorded edge was given (only while it still carries them) and delete
+    /// the ingest records it wrote. Dry run rolls back.
     ReverseIngestMarkers {
         /// The run's manifest.
         #[arg(long)]
@@ -1151,6 +1165,7 @@ async fn main_inner() -> anyhow::Result<i32> {
     let backfill_opts = if let Command::BackfillIngestMarkers {
         attestation_signers,
         ingest_signers,
+        written_before,
         apply,
         confirm_count,
         manifest_out,
@@ -1166,6 +1181,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         let o = backfill_markers::Options {
             apply: *apply,
             confirm_count: *confirm_count,
+            written_before: *written_before,
             ruling: ruling.clone(),
             reason: reason.clone(),
             manifest_out: manifest_out.clone(),
