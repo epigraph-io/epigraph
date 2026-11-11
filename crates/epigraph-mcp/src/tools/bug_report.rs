@@ -129,7 +129,8 @@ fn success_json(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
 /// for every other refusal: no write identity (an elevated or principal-less
 /// request), the intake not configured (BUG03), an unbound or system caller
 /// (BUG06, BUG07, OPL01), a role's agent whose role its own human does not
-/// hold now (ROL01), the rate limit (BUG08). Nothing is written on any of
+/// hold now (ROL01, on a database armed for operator binding, as the claims
+/// trigger asks it), the rate limit (BUG08). Nothing is written on any of
 /// them. The input checks and the preflight (BUG01-03, BUG06-08, ROL01) run
 /// before the embedding provider is called; what reaches the provider and is
 /// then refused is a caller whose state changed between the preflight and

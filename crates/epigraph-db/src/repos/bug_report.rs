@@ -237,7 +237,8 @@ impl BugReportRepository {
 
     /// Raise the refusal [`submit_conn`](Self::submit_conn) would raise for
     /// the stamped principal before it reads any report (BUG01-03, BUG06-08
-    /// and 166's ROL01), or return `Ok(())`. Writes nothing. ADVISORY: the write
+    /// and, on a database armed for operator binding, 166's ROL01, exactly
+    /// when the write's claims trigger asks it), or return `Ok(())`. Writes nothing. ADVISORY: the write
     /// repeats every check, so a pass here admits nothing by itself; it lets
     /// the caller skip work (the embedding call) for a report the write
     /// would refuse.

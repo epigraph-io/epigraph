@@ -1669,12 +1669,19 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_submit_bug_report", 207),
     ("epigraph_my_bug_reports", 207),
     // 207's caller gate (shared by the write and the preflight). Under a
-    // non-member owner its count of the FORCEd `security_events` admits no
-    // row (every reporter reads as having filed nothing: OPEN on the limit),
-    // but its last step, 166's `epigraph_require_role_holder`, is EXECUTE-able
-    // by the maintenance role only and is checked against the gate's owner,
-    // so every call that reaches it is refused 42501: the gate, the write and
-    // the preflight then fail LOUD for every caller the earlier checks pass.
+    // non-member owner (measured with `epigraph_app` owning it and EXECUTE
+    // granted back to its maintenance-owned callers) its count of the FORCEd
+    // `security_events` still sees the reporter's own `bug_report.submitted`
+    // rows through `security_events_read`'s own-row arm (both callers pass
+    // the stamped principal), so the limit holds (BUG08). On a database armed
+    // for operator binding its last step, 166's `epigraph_require_role_holder`,
+    // is EXECUTE-able by the maintenance role only and is checked against the
+    // gate's owner, so every call that reaches it is refused 42501: the gate,
+    // the write and the preflight then fail LOUD for every caller the earlier
+    // checks pass. Disarmed, that step is skipped exactly as the claims
+    // trigger skips it (`epigraph_operator_binding_armed()` is app-callable,
+    // so the guard itself runs); the measured linked reporter under its limit
+    // then passed and filed, as under the proper owner.
     ("epigraph_bug_report_gate", 207),
     ("epigraph_bug_report_preflight", 207),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the

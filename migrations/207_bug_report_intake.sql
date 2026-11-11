@@ -74,9 +74,12 @@
 --         personal group);
 --   BUG08 the caller's per-hour or per-day limit is reached;
 --   ROL01 (166's code, raised by 166's own check, unchanged) the caller is
---         attached to a role that its own linked human does not hold now.
---         The staged insert's statement trigger refuses it anyway; section
---         (c0) asks the same check first so the preflight refuses it too.
+--         attached to a role that its own linked human does not hold now,
+--         on a database ARMED for operator binding (122). The staged
+--         insert's statement trigger refuses it there anyway; section (c0)
+--         asks the same check first, under the trigger's own armed guard, so
+--         the preflight refuses exactly what the trigger refuses. Disarmed,
+--         neither refuses it.
 -- Membership of the intake group is NOT required; that is the point.
 --
 -- THE ROW. One claim authored by the caller (`claims.agent_id`), owned by the
@@ -210,9 +213,12 @@ CREATE POLICY security_events_bug_report_privileged ON public.security_events
 -- BUG06, BUG07 and BUG08 for `p_principal`, against the limits the caller
 -- read from the settings row, then 166's ROL01 for it
 -- (`epigraph_require_role_holder`, the check the claims trigger runs on the
--- staged insert, so the message and the rule are the trigger's own); returns
--- the caller's home group (section 3). ROL01 is last so every caller keeps
--- the refusal order the write had before the preflight existed.
+-- staged insert, behind the same `epigraph_operator_binding_armed()` guard
+-- every claims-trigger call of it in 166 and 185 sits behind, so the rule,
+-- the message and WHEN it applies are the trigger's own: armed, it refuses
+-- what the trigger would; disarmed, it admits what the trigger admits);
+-- returns the caller's home group (section 3). ROL01 is last so every caller
+-- keeps the refusal order the write had before the preflight existed.
 -- One body for the write (c) and the preflight (c2), so the two cannot
 -- disagree about who is admitted. It takes the principal as an ARGUMENT, so
 -- it answers for anyone: EXECUTE is revoked from PUBLIC and never granted to
@@ -308,15 +314,19 @@ BEGIN
     END IF;
     -- 166's ROL01: a role's agent writes only while its own linked human
     -- holds the role. The reporter is the staged claim's writer and author,
-    -- the only acting agent of the write.
-    PERFORM public.epigraph_require_role_holder(p_principal);
+    -- the only acting agent of the write. Only when armed, as the claims
+    -- trigger asks it (166 `epigraph_require_writer_scope`): unguarded, the
+    -- gate refused on a disarmed database what the trigger admits.
+    IF public.epigraph_operator_binding_armed() THEN
+        PERFORM public.epigraph_require_role_holder(p_principal);
+    END IF;
     RETURN v_home;
 END $$;
 COMMENT ON FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, boolean) IS
     'Migration 207: the bug-report intake''s caller checks (BUG06 system agent, BUG07 unbound '
     'or homeless, BUG08 limit, then 166''s ROL01 role holder) for the given principal; returns '
-    'its home group. Maintenance only: called by epigraph_submit_bug_report and '
-    'epigraph_bug_report_preflight.';
+    'its home group. ROL01 applies only on an armed database, as in the claims trigger. '
+    'Maintenance only: called by epigraph_submit_bug_report and epigraph_bug_report_preflight.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_bug_report_gate(uuid, integer, integer, boolean)
     FROM PUBLIC;
 

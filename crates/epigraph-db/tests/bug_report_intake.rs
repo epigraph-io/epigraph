@@ -5,7 +5,9 @@
 //! database ARMED for operator binding (122). On an unarmed database the
 //! claims trigger checks no writer scope, so a definer that inserted straight
 //! into the intake group would pass there and fail in production; every
-//! fixture here arms first.
+//! fixture here arms first. The one exception is
+//! `a_disarmed_database_admits_a_role_agent_as_its_trigger_does`, which pins
+//! that the gate's ROL01 is no stricter than the trigger's when disarmed.
 //!
 //! Pinned:
 //! * a reporter that is not a member of the intake group files a report; the
@@ -24,7 +26,8 @@
 //!   app-callable;
 //! * a role-attached reporter (166) is refused ROL01 by the preflight and by
 //!   the write alike while its own human does not hold the role, and files
-//!   once it does;
+//!   once it does; on a disarmed database, where the claims trigger does not
+//!   ask ROL01, neither does the gate;
 //! * an unconfigured intake (or one whose group is suspended) refuses;
 //! * session temporary objects named like the definer's relations change
 //!   nothing;
@@ -931,6 +934,35 @@ async fn the_preflight_refuses_a_role_agent_its_holder_does_not_cover(pool: PgPo
         .await
         .expect("CALIBRATION: the holder's own agent files");
     assert_eq!(claims_by(&pool, w.reporter).await, 1);
+}
+
+/// The gate asks ROL01 only when the claims trigger would: on a database
+/// ARMED for operator binding (122), the guard 166's
+/// `epigraph_require_writer_scope` puts in front of the same check.
+/// Disarmed, the trigger admits a role-attached agent whose role has no
+/// holder, so the preflight passes it and the write files it; an unguarded
+/// gate refused it ROL01 here, stricter than the trigger it copies. The
+/// armed half of the same setup is the test above.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_disarmed_database_admits_a_role_agent_as_its_trigger_does(pool: PgPool) {
+    let w = bare_world(&pool).await;
+    configure(&pool, w.intake, 20, 200).await;
+    seed_role(&pool, ROLE).await;
+    attach(&pool, ROLE, w.reporter).await;
+    let armed: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM operator_binding_arming)")
+        .fetch_one(&pool)
+        .await
+        .expect("read the arming");
+    assert!(!armed, "this test's premise is a disarmed database");
+
+    // No holder: the trigger's rule does not apply disarmed, so neither does
+    // the gate's.
+    assert_eq!(code(preflight_as(&pool, w.reporter).await), "ok");
+    submit_as(&pool, w.reporter, &report("disarmed, no holder"))
+        .await
+        .expect("disarmed, the write admits what the claims trigger admits");
+    assert_eq!(claims_by(&pool, w.reporter).await, 1);
+    assert_eq!(markers_of(&pool, w.reporter).await, 1);
 }
 
 /// `(owner, security definer, app may execute, PUBLIC may execute)`.
