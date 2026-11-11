@@ -2463,6 +2463,11 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
     prints every edge to a group-private node that is not the target's
     (`SOURCE-NODE-EDGE`, with the node, and a `source-node edges` count). An
     edge to a public node, or to one in the target, goes to the target alone.
+    An edge to a moving claim's reasoning trace is also read through the
+    trace, so the batch that moves the trace re-meets it whichever batch
+    moves its other end, and an edge from a claim outside the run to a moving
+    trace takes the exact meet as well (co-owned, `CO-OWNED-EDGE`; a public
+    one holds the claim, `public-row`).
     A later act that re-tenants the claim again (another regroup, a
     restriction, the privatization pipeline's re-meet) puts such an edge back
     on the trigger's meet.

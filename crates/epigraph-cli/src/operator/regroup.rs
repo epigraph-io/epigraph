@@ -64,7 +64,12 @@
 //!   every entity type whose table has `owner_group_id` and `visibility`, read
 //!   from the schema at start and printed as `NODE-TYPES`) is met with the
 //!   node's OWN tuple (a reasoning trace that follows a moved claim counts as
-//!   moved).
+//!   moved). An edge to such a trace is read through the trace as well as
+//!   through its other end, as an evidence edge is read through the evidence:
+//!   the batch that moves the trace re-meets it whichever batch moved its
+//!   other end, and an edge from a claim outside the run to a moving trace
+//!   takes the exact meet too (co-owned, reported as `CO-OWNED-EDGE`; a public
+//!   one holds the claim, `public-row`).
 //!   `epigraph_node_tenancy` (070), and so the trigger, count such a node as
 //!   public: left alone, the trigger would put an edge from a source-private
 //!   workflow on `('group', TARGET)` alone, which source-only members lose and
@@ -499,6 +504,130 @@ async fn ends_of(
     Ok(ends)
 }
 
+/// Every edge with an endpoint that is a [`NodeTypes`] row in `attached` (a
+/// reasoning trace that follows a candidate), as `restrict::fetch_evidence_edges`
+/// reads every edge with an endpoint that is attached evidence. An edge between
+/// a claim of an earlier batch and the trace of a later batch's claim is
+/// reached through the claim in the earlier batch and through the trace in
+/// the later one, so the later batch re-meets it (apply) and settles it
+/// (reverse). An edge from a claim outside the run to a moving trace is
+/// reached too: it takes the exact meet, like every other edge of a moving row.
+///
+/// The edge hangs off the claim of each endpoint that is an attached row
+/// (node or evidence) and each endpoint that is a claim in `in_set`; a claim
+/// endpoint outside `in_set` is a neighbour. Keys in `skip` (already read
+/// through a claim or evidence endpoint) are left out.
+///
+/// # Errors
+/// The read fails.
+async fn fetch_node_edges(
+    conn: &mut PgConnection,
+    nodes: &NodeTypes,
+    attached: &Snapshot,
+    in_set: &BTreeSet<Uuid>,
+    skip: &BTreeSet<RowKey>,
+) -> anyhow::Result<Snapshot> {
+    let mut out = Snapshot::new();
+    let table_type: BTreeMap<&str, &str> = nodes
+        .iter()
+        .map(|(ty, t)| (t.as_str(), ty.as_str()))
+        .collect();
+    // (entity type, id) -> the claim the row follows, for every attached node
+    // row and every attached evidence row.
+    let mut row_claim: BTreeMap<(String, Uuid), Uuid> = BTreeMap::new();
+    for (k, a) in attached {
+        let ty = if k.0 == "evidence" {
+            "evidence"
+        } else if let Some(ty) = table_type.get(k.0.as_str()) {
+            ty
+        } else {
+            continue;
+        };
+        if let Ok(id) = Uuid::parse_str(&k.1) {
+            row_claim.insert((ty.to_string(), id), a.claim);
+        }
+    }
+    let (tys, ids): (Vec<String>, Vec<Uuid>) = row_claim
+        .keys()
+        .filter(|(ty, _)| ty != "evidence")
+        .cloned()
+        .unzip();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT DISTINCT e.id, e.source_id, e.source_type::text, e.target_id, \
+                e.target_type::text, e.owner_group_id, e.visibility::text, \
+                e.co_owner_group_id, {} \
+           FROM edges e \
+           JOIN unnest($1::text[], $2::uuid[]) AS n(ty, id) \
+             ON (e.source_type::text = n.ty AND e.source_id = n.id) \
+             OR (e.target_type::text = n.ty AND e.target_id = n.id)",
+        tables::EDGE_WRITER_SQL
+    );
+    let rows: Vec<(
+        Uuid,
+        Uuid,
+        String,
+        Uuid,
+        String,
+        Uuid,
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+    )> = sqlx::query_as(&sql)
+        .bind(&tys)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await
+        .context("reading edges with a node endpoint")?;
+    for (id, s_id, s_ty, t_id, t_ty, owner, visibility, co_owner, writer) in rows {
+        let key = ("edges".to_string(), id.to_string());
+        if skip.contains(&key) {
+            continue;
+        }
+        let mut claims = BTreeSet::new();
+        let mut neighbours = BTreeSet::new();
+        for (nid, ty) in [(s_id, s_ty), (t_id, t_ty)] {
+            if ty == "claim" {
+                if in_set.contains(&nid) {
+                    claims.insert(nid);
+                } else {
+                    neighbours.insert(nid);
+                }
+            } else if let Some(c) = row_claim.get(&(ty, nid)) {
+                claims.insert(*c);
+            }
+        }
+        let Some(claim) = claims.iter().next().copied() else {
+            continue;
+        };
+        out.insert(
+            key,
+            Attached {
+                table: "edges".into(),
+                pk: id.to_string(),
+                claim,
+                claims,
+                tenancy: Tenancy {
+                    owner,
+                    visibility,
+                    co_owner,
+                },
+                writer,
+                endpoints_public: None,
+                shared_outside: false,
+                neighbours,
+                writer_owned: None,
+                evidence_type: None,
+                labels: Vec::new(),
+                preview: None,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// A node `(id, type)` or a state `(owner, visibility)`.
 type Pair = (Uuid, String);
 
@@ -675,6 +804,9 @@ async fn classify_rows(
     let claim_edge_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
     let ev_edges = fetch_evidence_edges(conn, &ev_claim, cands, &claim_edge_keys).await?;
     attached.extend(ev_edges);
+    let seen: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    let node_edges = fetch_node_edges(conn, ctx.nodes, &attached, cands, &seen).await?;
+    attached.extend(node_edges);
     let keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
     let ends = ends_of(conn, ctx.nodes, &edge_ids(&keys)).await?;
     let frag_neighbours: Vec<Uuid> = attached
@@ -846,9 +978,12 @@ pub struct BatchOutcome {
     pub already: usize,
     pub post_rows: BTreeMap<RowKey, RowState>,
     pub co_owned: Vec<String>,
-    /// `SOURCE-NODE-EDGE` lines: an edge to a group-private node (not the
-    /// target's) that keeps requiring the node's group.
-    pub node_edges: Vec<String>,
+    /// Every edge with a node end, by id, with its `SOURCE-NODE-EDGE` line
+    /// (an edge to a group-private node, not the target's, that keeps
+    /// requiring the node's group) or `None` when this batch leaves it with
+    /// nothing to report. A later batch's verdict replaces an earlier one's:
+    /// an edge to the trace of a later batch's claim is settled there.
+    pub node_edges: Vec<(String, Option<String>)>,
     pub sample: Vec<String>,
     pub audit_written: bool,
 }
@@ -1228,21 +1363,28 @@ async fn run_batch(
                 } else {
                     format!("group {}", node_state.0)
                 };
-                out.node_edges.push(format!(
-                    "SOURCE-NODE-EDGE\t{}\tclaim {}\t{} -> {}\t{} {} ({}, {}): {label}\t\
-                     readable only by a member of every group the tuple names",
-                    k.1,
-                    s0.get(k).map_or(Uuid::nil(), |a| a.claim),
-                    s0.get(k)
-                        .map_or_else(|| "?".to_string(), |a| RowState::of(a).to_string()),
-                    st,
-                    node.1,
-                    node.0,
-                    node_state.0,
-                    node_state.1,
+                out.node_edges.push((
+                    k.1.clone(),
+                    Some(format!(
+                        "SOURCE-NODE-EDGE\t{}\tclaim {}\t{} -> {}\t{} {} ({}, {}): {label}\t\
+                         readable only by a member of every group the tuple names",
+                        k.1,
+                        s0.get(k).map_or(Uuid::nil(), |a| a.claim),
+                        s0.get(k)
+                            .map_or_else(|| "?".to_string(), |a| RowState::of(a).to_string()),
+                        st,
+                        node.1,
+                        node.0,
+                        node_state.0,
+                        node_state.1,
+                    )),
                 ));
+                continue;
             }
-            continue;
+            // The node requires nothing beyond the target (public, in the
+            // target, or a trace that moved with its claim). The edge is
+            // co-owned only through its OTHER end, reported below.
+            out.node_edges.push((k.1.clone(), None));
         }
         let Some(co) = st.tenancy.co_owner else {
             continue;
@@ -1250,7 +1392,10 @@ async fn run_batch(
         let moved_end = |n: &(Uuid, String)| match n.1.as_str() {
             "claim" => moving.contains(&n.0),
             "evidence" => s0.contains_key(&("evidence".to_string(), n.0.to_string())),
-            _ => false,
+            ty => ctx
+                .nodes
+                .get(ty)
+                .is_some_and(|t| s0.contains_key(&(t.clone(), n.0.to_string()))),
         };
         let (other, other_state) = if moved_end(&e.source) {
             (&e.target, &e.target_state)
@@ -1596,9 +1741,11 @@ pub async fn run(
                 }
                 sampled += b.sample.iter().filter(|l| l.contains("\tclaims\t")).count();
                 co_owned.extend(b.co_owned);
-                for l in b.node_edges {
-                    let id = l.split('\t').nth(1).unwrap_or_default().to_string();
-                    node_edges.insert(id, l);
+                for (id, l) in b.node_edges {
+                    match l {
+                        Some(l) => node_edges.insert(id, l),
+                        None => node_edges.remove(&id),
+                    };
                 }
                 writeln!(
                     out,
@@ -1823,6 +1970,12 @@ async fn reverse_batch(
     let ev_edges = fetch_evidence_edges(conn, &ev_claim, &cand_ids, &claim_edge_keys).await?;
     // Every evidence edge counts: an unrecorded one was written after the act.
     attached.extend(ev_edges);
+    // So does every edge to a node row that follows a candidate (a reasoning
+    // trace): the later batch of a run settles an edge between a claim of an
+    // earlier batch and its trace.
+    let seen: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    let node_edges = fetch_node_edges(conn, rc.nodes, &attached, &cand_ids, &seen).await?;
+    attached.extend(node_edges);
     let all_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
     let ends_now = ends_of(conn, rc.nodes, &edge_ids(&all_keys)).await?;
 

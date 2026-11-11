@@ -1662,6 +1662,144 @@ async fn a_trace_edge_takes_the_exact_meet(pool: PgPool) {
     );
 }
 
+/// An edge from C1 to the reasoning trace of C2, both listed, moved one per
+/// batch. C1's batch meets the edge with C2's trace still in SRC; C2's batch
+/// reaches the edge through the trace (as it reaches an evidence edge through
+/// the evidence) and settles it on DST alone, so no SOURCE-NODE-EDGE line
+/// survives. The reversal, one per batch too, passes through the interim meet
+/// and ends byte for byte where it started.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_trace_edge_across_batches_is_settled_by_the_later_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c1 =
+        fixture::seed_group_claim(&pool, fx.operator, fx.src, "C1: SRC, cites C2's trace").await;
+    let c2 = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C2: SRC, with a trace").await;
+    let trace_c2 = fixture::seed_reasoning_trace(&pool, c2, "deductive").await;
+    let e = typed_edge(&pool, c1, "claim", trace_c2, "trace").await;
+    assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c1, c2]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(2),
+            extra: &["--batch-size", "1"],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "reasoning_traces", trace_c2).await, grp(fx.dst));
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.dst, "group".to_string(), None),
+        "{}",
+        r.show()
+    );
+    assert!(
+        !r.stdout
+            .lines()
+            .any(|l| l.starts_with("SOURCE-NODE-EDGE\t")),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("source-node edges: 0"), "{}", r.show());
+    assert_eq!(
+        reads_as(&pool, &[fx.dst], "edges", &[e]).await,
+        vec![e],
+        "a DST-only reader reads the settled edge"
+    );
+    let rv = reverse(&pool, &[&mf], &["--batch-size", "1"], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert!(
+        rv.stdout
+            .contains("BATCH 2/2\tOK\t1 claim(s) restored, 0 edge(s)"),
+        "{}",
+        rv.show()
+    );
+    assert!(
+        !rv.stdout.contains("not restored (held)"),
+        "nothing was held, so no edge may be blamed on a held endpoint\n{}",
+        rv.show()
+    );
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "trace edge across batches reversed",
+    );
+}
+
+/// An edge from the trace of a moving claim C to S, a SRC claim that is not
+/// listed and stays. The trace follows C to DST, so the edge takes the exact
+/// meet of the trace and S: co-owned by both groups, reported as a
+/// CO-OWNED-EDGE whose other end is S (the trace, its source end, moved). The
+/// reversal brings the trace back with C and the edge back on its recorded
+/// tuple, byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_from_an_unlisted_claim_to_a_moving_trace_is_co_owned(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, with a trace").await;
+    let s = fixture::seed_group_claim(&pool, fx.operator, fx.src, "S: SRC, stays").await;
+    let trace_c = fixture::seed_reasoning_trace(&pool, c, "deductive").await;
+    let e = typed_edge(&pool, trace_c, "trace", s, "claim").await;
+    assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "reasoning_traces", trace_c).await, grp(fx.dst));
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.dst, "group".to_string(), Some(fx.src)),
+        "{}",
+        r.show()
+    );
+    assert!(
+        has_line(
+            &r.stdout,
+            "CO-OWNED-EDGE\t",
+            &[
+                &e.to_string(),
+                &format!("other end claim {s}"),
+                "source group"
+            ]
+        ),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("co-owned edges: 1"), "{}", r.show());
+    assert!(r.stdout.contains("source-node edges: 0"), "{}", r.show());
+    assert!(reads_as(&pool, &[fx.src], "edges", &[e]).await.is_empty());
+    assert!(reads_as(&pool, &[fx.dst], "edges", &[e]).await.is_empty());
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "unlisted claim's trace edge reversed",
+    );
+}
+
 /// The node types the tool meets by their own row are exactly the entity
 /// types (other than claim and evidence) whose table has tenancy columns at
 /// head, and every one of them has a test above. A type that gains tenancy
