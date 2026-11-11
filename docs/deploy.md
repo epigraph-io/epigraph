@@ -68,10 +68,10 @@ The four logins:
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
 hatch of migration 074. Nothing connects as it in production.
 
-Five `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
+Six `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
 switches the session to the application role: `reown-claims`,
-`reown-linked`, `reown-reverse`, `restrict-claims` and `hide-evidence` (its
-`--apply`). For those runs only, point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at
+`reown-linked`, `reown-reverse`, `restrict-claims`, `regroup-claims` and
+`hide-evidence` (its `--apply`). For those runs only, point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at
 a superuser login (the migration login, if it is one). The standing maintenance login, the one in
 `MAINTENANCE_DATABASE_URL` and in every other operator run, stays a
 non-superuser.
@@ -467,7 +467,7 @@ not to the API.
 
 | Variable | Meaning |
 |---|---|
-| `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` | The only DSN it reads. A login outside `epigraph_maintenance` is refused. Five verbs need a superuser DSN instead and say so (`reown-claims`, `reown-linked`, `reown-reverse`, `restrict-claims`, and `hide-evidence` for its `--apply`). |
+| `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` | The only DSN it reads. A login outside `epigraph_maintenance` is refused. Six verbs need a superuser DSN instead and say so (`reown-claims`, `reown-linked`, `reown-reverse`, `restrict-claims`, `regroup-claims`, and `hide-evidence` for its `--apply`). |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | Required by `verify-confirmations`: the values the API's ceremonies ran under. |
 
 ### Other CLIs and scripts
@@ -2407,6 +2407,61 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   other edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
 - **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
   on reverse.
+
+### `epigraph-operator regroup-claims` — move group-private claims between groups (no migration)
+
+This verb moves listed claims that are `('group', <source>)` to
+`('group', <target>)`, together with every row that follows only them, keeping
+`group` visibility. It is for claims an earlier act put in the wrong group:
+`restrict-claims` moves only public claims, and reversing the earlier act
+first would make the claims public for a while and, on a linked graph, can
+leave a shared edge public while its other end stays private. Nothing this
+verb does makes a row public. `reown-reverse` reverses it exactly. It needs a
+SUPERUSER DSN, like `restrict-claims`. Module doc:
+`crates/epigraph-cli/src/operator/regroup.rs`.
+
+```bash
+# dry run: plan, every held claim with its reason code, every co-owned edge, a sample
+epigraph-operator regroup-claims --claims-file ids.txt --source-group <group> \
+    --target-group <group> --operator <person> --manifest-out regroup-1.jsonl
+# apply: repeat the dry run's eligible count back
+epigraph-operator regroup-claims ... --manifest-out regroup-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>"
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
+```
+
+- **Who**: `--operator` must be a registered human operator and a live admin
+  of both groups. The target must be an active `team` or `community` group;
+  neither group may be the world or seed group, and they must differ.
+- **Eligible**: a claim that is `('group', <source>)` and not sealed. A claim
+  already `('group', <target>)` counts as done, so a re-run resumes. A public
+  claim (`public-claim`) and another group's claim (`not-in-source`) are held.
+- **Held whole, never partly moved**: a claim carrying a public row
+  (`public-row`), a row owned by a third group (`third-group`), pinned
+  evidence (`pinned`), or an edge whose new meet would drop a group its
+  current tuple requires (`edge-would-widen`). The plan applies these checks
+  too, so its eligible count is the number `--confirm-count` repeats.
+- **Edges** take the meet of their endpoints, as on INSERT. An edge whose
+  other end stays in the source becomes co-owned by both groups, so only a
+  member of both reads it. Every such edge is printed (`CO-OWNED-EDGE`) and
+  counted. Edges with an evidence endpoint get the same meet, which the tool
+  writes itself because the trigger does not re-meet them.
+- **Left as they are**: an outsider's challenge (it is the challenger's; it
+  is readable with its claim) and a fragment shared with a claim that stays.
+- **Invariants per batch**: the row census, every row's end state, and
+  readability measured as an unstamped session (unchanged) and as a session
+  reading only the source and only the target (each must match the tenancy
+  model before and after). A table without enforced row security is refused.
+- **Audit**: one `security_events` row per applied run
+  (`privatization.cli_regroup`) and per reversed manifest
+  (`privatization.cli_regroup_reverse`).
+- **Exit**: `--apply` exits 3 when any listed claim was held or the moved
+  count differs from `--confirm-count`.
+- **Reverse** is a compare-and-swap per claim. A claim something moved since,
+  a row written after the act, or a neighbour that moved since holds the
+  claim (exit 3). An edge stays on the meet of its current endpoints until
+  every endpoint the manifest moved is back, then takes its recorded tuple.
 
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's
