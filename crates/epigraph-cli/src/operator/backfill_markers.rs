@@ -245,6 +245,16 @@ fn authored(x: &str) -> String {
     )
 }
 
+/// `x` is an `agent -asserts-> claim` edge other than a workflow
+/// executor's attribution (never stamped).
+fn agent_asserts(x: &str) -> String {
+    format!(
+        "{x}.source_type = 'agent' AND {x}.relationship = 'asserts' \
+         AND {x}.target_type = 'claim' \
+         AND COALESCE({x}.properties ->> 'source', '') <> 'workflow_attribution'"
+    )
+}
+
 fn paper_asserts(x: &str) -> String {
     format!(
         "{x}.source_type = 'paper' AND {x}.relationship = 'asserts' \
@@ -301,16 +311,27 @@ impl Frame {
             Kind::Authored => authored(e),
             Kind::PaperAsserts => paper_asserts(e),
             Kind::AgentAsserts => format!(
-                "{e}.source_type = 'agent' AND {e}.relationship = 'asserts' \
-                 AND {e}.target_type = 'claim' \
-                 AND COALESCE({e}.properties ->> 'source', '') <> 'workflow_attribution' \
-                 AND EXISTS (SELECT 1 {})",
+                "{} AND EXISTS (SELECT 1 {})",
+                agent_asserts(e),
                 self.chain_from(e)
             ),
         };
         format!(
             "({shape} AND {} \
               AND NOT ({e}.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[]))",
+            self.legacy(e)
+        )
+    }
+
+    /// SQL: edge `e` is an `agent -asserts-> claim` candidate WITHOUT the
+    /// chain test: joined to the chains it closes (`ea`, `pa` as in
+    /// [`Self::chain_from`]), each joined row is a chain, so the join itself
+    /// is the test and the [`Self::candidate`] EXISTS would only repeat it.
+    fn agent_asserts_unchained(&self, e: &str) -> String {
+        format!(
+            "({} AND {} \
+              AND NOT ({e}.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[]))",
+            agent_asserts(e),
             self.legacy(e)
         )
     }
@@ -357,6 +378,50 @@ impl Frame {
             ls = self.legacy("s"),
         )
     }
+}
+
+impl Frame {
+    /// The classified-signer rows of [`Self::pp_cte`] as a row stream for a
+    /// per-paper window: `SELECT <nulls> paper, sid` over the legacy paper
+    /// `asserts` and `authored` edges signed by one of `ing` (a `uuid[]`
+    /// placeholder), `sid` as text. `nulls` is the NULL padding of the
+    /// stream's leading columns; `within`, when given, restricts the papers.
+    fn signer_rows(&self, ing: &str, nulls: &str, within: Option<&str>) -> String {
+        let (r1, r2) = within.map_or_else(
+            || (String::new(), String::new()),
+            |w| {
+                (
+                    format!("AND s.source_id IN {w}"),
+                    format!("AND s.target_id IN {w}"),
+                )
+            },
+        );
+        format!(
+            "SELECT {nulls} s.source_id, s.signer_id::text FROM edges s \
+              WHERE {pas} AND {ls} AND s.signer_id = ANY({ing}) {r1} \
+             UNION ALL \
+             SELECT {nulls} s.target_id, s.signer_id::text FROM edges s \
+              WHERE {au} AND {ls} AND s.signer_id = ANY({ing}) {r2}",
+            pas = paper_asserts("s"),
+            au = authored("s"),
+            ls = self.legacy("s"),
+        )
+    }
+}
+
+/// SQL: the principal of the paper of a row of stream `x` (columns `paper`
+/// and `sid`, the classified-signer rows [`Frame::signer_rows`] among
+/// them), over `WINDOW w AS (PARTITION BY x.paper)`: the paper's signer rows
+/// name one signer exactly when their least and greatest agree (as `pp.n =
+/// 1`, `pp.sids[1]`); else, or with none, `l` (the legacy principal). The
+/// same value as [`principal`] over the paper's `pp` row, with no join to
+/// `pp`: a join the planner sizes at one row is planned as a nested loop
+/// that re-runs `pp`'s aggregate for every row.
+fn principal_window(x: &str, l: &str) -> String {
+    format!(
+        "COALESCE(CASE WHEN min({x}.sid) OVER w = max({x}.sid) OVER w \
+                       THEN (min({x}.sid) OVER w)::uuid END, {l})"
+    )
 }
 
 /// The order that picks an agent assertion's chain: its IN-FORCE chains
@@ -625,6 +690,272 @@ type SignerRow = (
     i64,
 );
 
+/// A census statement's bind parameter, in `$n` order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bind {
+    /// The `legacy-ingest` principal (`uuid`; the nil uuid when unregistered).
+    Legacy,
+    /// The `--ingest-signer` list (`uuid[]`).
+    Ingest,
+    /// The `--attestation-signer` list (`uuid[]`).
+    Attestation,
+}
+
+/// One statement of the read-only census, exactly as [`census`] runs it.
+#[derive(Clone, Debug)]
+pub struct Statement {
+    pub name: String,
+    pub sql: String,
+    /// Its parameters, `$1` first.
+    pub binds: &'static [Bind],
+}
+
+impl Statement {
+    fn new(name: impl Into<String>, sql: String, binds: &'static [Bind]) -> Self {
+        Self {
+            name: name.into(),
+            sql,
+            binds,
+        }
+    }
+}
+
+/// The census's statements over the corpus (the schema probes aside), in
+/// the order [`census`] runs them.
+#[must_use]
+pub fn census_statements(f: &Frame) -> Vec<Statement> {
+    let mut v: Vec<Statement> = Kind::ALL.into_iter().map(|k| kind_counts(f, k)).collect();
+    v.extend([
+        signers_statement(f),
+        paper_classes(f),
+        paper_conflicts(f),
+        chains_statement(f),
+        provable_count(f),
+        planned_records(f),
+    ]);
+    v
+}
+
+/// Per kind: candidates, in force, unsigned, attestation, ingest-signed,
+/// other signer.
+fn kind_counts(f: &Frame, kind: Kind) -> Statement {
+    Statement::new(
+        format!("kind:{}", kind.as_str()),
+        format!(
+            "SELECT count(*), \
+                    count(*) FILTER (WHERE e.valid_to IS NULL OR e.valid_to > now()), \
+                    count(*) FILTER (WHERE e.signer_id IS NULL), \
+                    count(*) FILTER (WHERE e.signer_id = ANY($1)), \
+                    count(*) FILTER (WHERE e.signer_id = ANY($2)), \
+                    count(*) FILTER (WHERE e.signer_id IS NOT NULL \
+                                       AND NOT (e.signer_id = ANY($1)) \
+                                       AND NOT (e.signer_id = ANY($2))) \
+               FROM edges e WHERE {}",
+            f.candidate(kind, "e")
+        ),
+        &[Bind::Attestation, Bind::Ingest],
+    )
+}
+
+/// The distinct signers of the candidates ([`SignerRow`]).
+fn signers_statement(f: &Frame) -> Statement {
+    Statement::new(
+        "signers",
+        format!(
+            "SELECT e.signer_id, a.display_name, a.agent_type::text, a.key_kind::text, \
+                    count(*) FILTER (WHERE {au}), \
+                    count(*) FILTER (WHERE {pas}), \
+                    count(*) FILTER (WHERE e.source_type = 'agent' AND e.relationship = 'asserts'), \
+                    count(*) FILTER (WHERE {pas} AND EXISTS ( \
+                        SELECT 1 FROM claims c WHERE c.id = e.target_id \
+                                                 AND c.agent_id = e.signer_id)) \
+               FROM edges e LEFT JOIN agents a ON a.id = e.signer_id \
+              WHERE e.signer_id IS NOT NULL AND (({c0}) OR ({c1}) OR ({c2})) \
+              GROUP BY 1, 2, 3, 4 ORDER BY count(*) DESC, 1",
+            au = authored("e"),
+            pas = paper_asserts("e"),
+            c0 = f.candidate(Kind::Authored, "e"),
+            c1 = f.candidate(Kind::PaperAsserts, "e"),
+            c2 = f.candidate(Kind::AgentAsserts, "e"),
+        ),
+        &[],
+    )
+}
+
+/// `WITH pp, papers`: the papers with a candidate `authored` or paper
+/// `asserts` edge. `$1` = ingest signers.
+fn papers_cte(f: &Frame) -> String {
+    format!(
+        "WITH {pp}, papers AS (SELECT e.source_id AS paper FROM edges e WHERE {c1} \
+                               UNION SELECT e.target_id FROM edges e WHERE {c0})",
+        pp = f.pp_cte("$1::uuid[]", None),
+        c0 = f.candidate(Kind::Authored, "e"),
+        c1 = f.candidate(Kind::PaperAsserts, "e"),
+    )
+}
+
+/// The candidate papers by the principal they take: a signer's id,
+/// `conflict` or `legacy`.
+fn paper_classes(f: &Frame) -> Statement {
+    Statement::new(
+        "paper-classes",
+        format!(
+            "{} \
+             SELECT CASE WHEN pp.n = 1 THEN pp.sids[1]::text \
+                         WHEN pp.n > 1 THEN 'conflict' ELSE 'legacy' END, count(*) \
+               FROM papers LEFT JOIN pp USING (paper) GROUP BY 1 ORDER BY 2 DESC, 1",
+            papers_cte(f)
+        ),
+        &[Bind::Ingest],
+    )
+}
+
+/// Up to [`CONFLICTS_LISTED`] conflicting papers with their signers.
+fn paper_conflicts(f: &Frame) -> Statement {
+    Statement::new(
+        "paper-conflicts",
+        format!(
+            "{} \
+             SELECT papers.paper, pp.sids FROM papers JOIN pp USING (paper) \
+              WHERE pp.n > 1 ORDER BY 1 LIMIT {CONFLICTS_LISTED}",
+            papers_cte(f)
+        ),
+        &[Bind::Ingest],
+    )
+}
+
+/// Chains: every (agent assertion, authorship, paper assertion), each pair
+/// counted; the chain an agent assertion's principal comes from is the
+/// first by [`CHAIN_ORDER`] (oldest in-force), as the apply picks it. One
+/// row: (chains, chains on another principal, multi-principal agent
+/// assertions).
+///
+/// Linear whatever the planner estimates: ONE stream of rows (every chain,
+/// and every classified-signer row of a legacy `authored` / paper `asserts`
+/// edge, as [`Frame::pp_cte`] reads them) and windows over it, with no join
+/// but the chain join itself (index lookups from the authorships).
+///
+/// * a paper's principal is a window over the paper's rows: its signer rows
+///   name one signer exactly when their least and greatest agree (as
+///   `pp.n = 1`, `pp.sids[1]`), else none and it takes the legacy principal;
+/// * the chosen chain's principal is a window over the agent assertion's
+///   chains (`first_value` by the chain's [`CHAIN_ORDER`] rank, a total
+///   order: it ends in the two edge ids);
+/// * a chain is on another principal when the two differ, and an agent
+///   assertion is multi-principal exactly when it has such a chain (the
+///   chosen principal is one of its own).
+///
+/// The planner cannot size the chains (on a production corpus it estimates
+/// the legacy authorships at a few rows, so the chains at one). A version
+/// that joined a chain CTE with itself was planned as a nested loop over two
+/// CTE scans, O(chains^2); one that joined the chains to `pp` was planned as
+/// a nested loop re-running `pp`'s aggregate for every chain. Neither
+/// finished on ~10^5 chains.
+fn chains_statement(f: &Frame) -> Statement {
+    Statement::new(
+        "chains",
+        format!(
+            "WITH x AS (SELECT e.id AS e, \
+                               row_number() OVER (PARTITION BY e.id \
+                                                  ORDER BY {CHAIN_ORDER}) AS k, \
+                               ea.target_id AS paper, NULL::text AS sid \
+                          FROM edges e JOIN edges ea ON ea.source_id = e.source_id \
+                          JOIN edges pa ON pa.source_id = ea.target_id \
+                                       AND pa.target_id = e.target_id \
+                         WHERE {open} AND {au} AND {lea} AND {pas} AND {lpa} \
+                        UNION ALL {signers}), \
+                  p AS (SELECT x.e, x.k, {prin} AS principal \
+                          FROM x WINDOW w AS (PARTITION BY x.paper)), \
+                  c AS (SELECT p.e, p.principal, \
+                               first_value(p.principal) OVER (PARTITION BY p.e \
+                                                              ORDER BY p.k) AS chosen \
+                          FROM p WHERE p.e IS NOT NULL) \
+             SELECT count(*), \
+                    count(*) FILTER (WHERE c.principal <> c.chosen), \
+                    count(DISTINCT c.e) FILTER (WHERE c.principal <> c.chosen) \
+               FROM c",
+            open = f.agent_asserts_unchained("e"),
+            au = authored("ea"),
+            lea = f.legacy("ea"),
+            pas = paper_asserts("pa"),
+            lpa = f.legacy("pa"),
+            signers = f.signer_rows("$2::uuid[]", "NULL, NULL,", None),
+            prin = principal_window("x", "$1::uuid"),
+        ),
+        &[Bind::Legacy, Bind::Ingest],
+    )
+}
+
+/// The claims whose creation record a run would write: provable, over the
+/// candidates only (a run writes the records of the assertions IT stamps).
+fn provable_count(f: &Frame) -> Statement {
+    Statement::new(
+        "provable-records",
+        provable_from(
+            f,
+            None,
+            &format!("AND NOT (pa.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[])"),
+        )
+        .replace("{cols}", "count(DISTINCT c.id)"),
+        &[Bind::Ingest],
+    )
+}
+
+/// Every candidate paper assertion's (paper, claim, principal) with no
+/// record of that principal: the records a run writes (the provable ones a
+/// creation record, the rest a non-creation record).
+fn planned_records(f: &Frame) -> Statement {
+    Statement::new(
+        "planned-records",
+        format!(
+            "WITH {pp}, \
+             x AS (SELECT DISTINCT e.source_id AS paper, e.target_id AS claim, \
+                          ({prin})::text AS by \
+                     FROM edges e LEFT JOIN pp ON pp.paper = e.source_id \
+                    WHERE {cand}) \
+             SELECT count(*) FROM x \
+              WHERE NOT EXISTS (SELECT 1 FROM edges r \
+                                 WHERE r.source_id = x.paper AND r.target_id = x.claim \
+                                   AND r.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
+                                   AND r.properties ->> '{INGESTED_BY_PROPERTY}' = x.by \
+                                   AND {by_r} = x.by)",
+            pp = f.pp_cte("$2::uuid[]", None),
+            by_r = ingest_written_by_sql("r"),
+            prin = principal("pp", "$1::uuid"),
+            cand = f.candidate(Kind::PaperAsserts, "e"),
+        ),
+        &[Bind::Legacy, Bind::Ingest],
+    )
+}
+
+/// The values of a statement's [`Bind`]s.
+struct Binds<'a> {
+    legacy: Uuid,
+    ingest: &'a [Uuid],
+    attestation: &'a [Uuid],
+}
+
+impl<'a> Binds<'a> {
+    fn on<'q, O>(
+        &self,
+        st: &'q Statement,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>
+    where
+        'a: 'q,
+        O: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>,
+    {
+        let mut q = sqlx::query_as(&st.sql);
+        for b in st.binds {
+            q = match b {
+                Bind::Legacy => q.bind(self.legacy),
+                Bind::Ingest => q.bind(self.ingest),
+                Bind::Attestation => q.bind(self.attestation),
+            };
+        }
+        q
+    }
+}
+
 /// The read-only census.
 ///
 /// # Errors
@@ -645,7 +976,11 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
         legacy_principal: legacy_principal(&mut tx).await?,
         ..Census::default()
     };
-    let legacy = c.legacy_principal.unwrap_or(Uuid::nil());
+    let b = Binds {
+        legacy: c.legacy_principal.unwrap_or(Uuid::nil()),
+        ingest: &o.ingest_signers,
+        attestation: &o.attestation_signers,
+    };
     c.reserved_labels_present = sqlx::query_scalar(
         "SELECT count(*) FROM edges e \
           WHERE EXISTS (SELECT 1 FROM unnest(e.labels) l WHERE l LIKE 'epigraph:%')",
@@ -653,44 +988,21 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
     .fetch_one(&mut *tx)
     .await?;
     for kind in Kind::ALL {
-        let row: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(&format!(
-            "SELECT count(*), \
-                    count(*) FILTER (WHERE e.valid_to IS NULL OR e.valid_to > now()), \
-                    count(*) FILTER (WHERE e.signer_id IS NULL), \
-                    count(*) FILTER (WHERE e.signer_id = ANY($1)), \
-                    count(*) FILTER (WHERE e.signer_id = ANY($2)), \
-                    count(*) FILTER (WHERE e.signer_id IS NOT NULL \
-                                       AND NOT (e.signer_id = ANY($1)) \
-                                       AND NOT (e.signer_id = ANY($2))) \
-               FROM edges e WHERE {}",
-            f.candidate(kind, "e")
-        ))
-        .bind(&o.attestation_signers)
-        .bind(&o.ingest_signers)
-        .fetch_one(&mut *tx)
-        .await?;
+        let st = kind_counts(&f, kind);
+        let row: (i64, i64, i64, i64, i64, i64) = b
+            .on(&st)
+            .fetch_one(&mut *tx)
+            .await
+            .with_context(|| format!("census {}", st.name))?;
         c.per_kind
             .insert(kind, [row.0, row.1, row.2, row.3, row.4, row.5]);
     }
-    let rows: Vec<SignerRow> = sqlx::query_as(&format!(
-        "SELECT e.signer_id, a.display_name, a.agent_type::text, a.key_kind::text, \
-                count(*) FILTER (WHERE {au}), \
-                count(*) FILTER (WHERE {pas}), \
-                count(*) FILTER (WHERE e.source_type = 'agent' AND e.relationship = 'asserts'), \
-                count(*) FILTER (WHERE {pas} AND EXISTS ( \
-                    SELECT 1 FROM claims c WHERE c.id = e.target_id \
-                                             AND c.agent_id = e.signer_id)) \
-           FROM edges e LEFT JOIN agents a ON a.id = e.signer_id \
-          WHERE e.signer_id IS NOT NULL AND (({c0}) OR ({c1}) OR ({c2})) \
-          GROUP BY 1, 2, 3, 4 ORDER BY count(*) DESC, 1",
-        au = authored("e"),
-        pas = paper_asserts("e"),
-        c0 = f.candidate(Kind::Authored, "e"),
-        c1 = f.candidate(Kind::PaperAsserts, "e"),
-        c2 = f.candidate(Kind::AgentAsserts, "e"),
-    ))
-    .fetch_all(&mut *tx)
-    .await?;
+    let st = signers_statement(&f);
+    let rows: Vec<SignerRow> = b
+        .on(&st)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("census {}", st.name))?;
     let roles: Vec<(Uuid, String)> =
         if sqlx::query_scalar::<_, bool>("SELECT to_regclass('public.system_agents') IS NOT NULL")
             .fetch_one(&mut *tx)
@@ -720,22 +1032,12 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
         .collect();
 
     // Papers, by the principal they take.
-    let papers_cte = format!(
-        "WITH {pp}, papers AS (SELECT e.source_id AS paper FROM edges e WHERE {c1} \
-                               UNION SELECT e.target_id FROM edges e WHERE {c0})",
-        pp = f.pp_cte("$1::uuid[]", None),
-        c0 = f.candidate(Kind::Authored, "e"),
-        c1 = f.candidate(Kind::PaperAsserts, "e"),
-    );
-    let classes: Vec<(String, i64)> = sqlx::query_as(&format!(
-        "{papers_cte} \
-         SELECT CASE WHEN pp.n = 1 THEN pp.sids[1]::text \
-                     WHEN pp.n > 1 THEN 'conflict' ELSE 'legacy' END, count(*) \
-           FROM papers LEFT JOIN pp USING (paper) GROUP BY 1 ORDER BY 2 DESC, 1"
-    ))
-    .bind(&o.ingest_signers)
-    .fetch_all(&mut *tx)
-    .await?;
+    let st = paper_classes(&f);
+    let classes: Vec<(String, i64)> = b
+        .on(&st)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("census {}", st.name))?;
     for (class, n) in classes {
         c.papers += n;
         match class.as_str() {
@@ -746,86 +1048,36 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
                 .push((Uuid::parse_str(id).context("paper principal")?, n)),
         }
     }
-    c.conflicts = sqlx::query_as(&format!(
-        "{papers_cte} \
-         SELECT papers.paper, pp.sids FROM papers JOIN pp USING (paper) \
-          WHERE pp.n > 1 ORDER BY 1 LIMIT {CONFLICTS_LISTED}"
-    ))
-    .bind(&o.ingest_signers)
-    .fetch_all(&mut *tx)
-    .await?;
+    let st = paper_conflicts(&f);
+    c.conflicts = b
+        .on(&st)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("census {}", st.name))?;
 
-    // Chains: every (agent assertion, authorship, paper assertion), each pair
-    // counted; the chain an agent assertion's principal comes from is the
-    // first by CHAIN_ORDER (oldest in-force), as the apply picks it.
-    let (chains, other, multi): (i64, i64, i64) = sqlx::query_as(&format!(
-        "WITH {pp}, \
-         tri AS (SELECT e.id AS e, ea.target_id AS paper, \
-                        row_number() OVER (PARTITION BY e.id ORDER BY {CHAIN_ORDER}) AS k \
-                   FROM edges e JOIN edges ea ON ea.source_id = e.source_id \
-                   JOIN edges pa ON pa.source_id = ea.target_id AND pa.target_id = e.target_id \
-                  WHERE {cand} AND {au} AND {lea} AND {pas} AND {lpa}), \
-         pr AS (SELECT tri.e, tri.k, {prin} AS principal FROM tri \
-                  LEFT JOIN pp ON pp.paper = tri.paper), \
-         ch AS (SELECT pr.e, pr.principal FROM pr WHERE pr.k = 1) \
-         SELECT (SELECT count(*) FROM pr), \
-                (SELECT count(*) FROM pr JOIN ch ON ch.e = pr.e \
-                  WHERE pr.principal <> ch.principal), \
-                (SELECT count(*) FROM (SELECT pr.e FROM pr GROUP BY pr.e \
-                                        HAVING count(DISTINCT pr.principal) > 1) m)",
-        pp = f.pp_cte("$2::uuid[]", None),
-        cand = f.candidate(Kind::AgentAsserts, "e"),
-        au = authored("ea"),
-        lea = f.legacy("ea"),
-        pas = paper_asserts("pa"),
-        lpa = f.legacy("pa"),
-        prin = principal("pp", "$1::uuid"),
-    ))
-    .bind(legacy)
-    .bind(&o.ingest_signers)
-    .fetch_one(&mut *tx)
-    .await?;
+    let st = chains_statement(&f);
+    let (chains, other, multi): (i64, i64, i64) = b
+        .on(&st)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("census {}", st.name))?;
     c.chains = chains;
     c.chains_on_another_principal = other;
     c.agent_asserts_multi_principal = multi;
 
-    // A run writes the records of the assertions IT stamps, so the plan
-    // counts the candidates only.
-    c.provable_records = sqlx::query_scalar(
-        &provable_from(
-            &f,
-            None,
-            &format!("AND NOT (pa.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[])"),
-        )
-        .replace("{cols}", "count(DISTINCT c.id)"),
-    )
-    .bind(&o.ingest_signers)
-    .fetch_one(&mut *tx)
-    .await?;
+    let st = provable_count(&f);
+    (c.provable_records,) = b
+        .on(&st)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("census {}", st.name))?;
 
-    // Every candidate paper assertion with no record of its principal gets
-    // one; the provable ones get a creation record instead.
-    let pairs: i64 = sqlx::query_scalar(&format!(
-        "WITH {pp}, \
-         x AS (SELECT DISTINCT e.source_id AS paper, e.target_id AS claim, \
-                      ({prin})::text AS by \
-                 FROM edges e LEFT JOIN pp ON pp.paper = e.source_id \
-                WHERE {cand}) \
-         SELECT count(*) FROM x \
-          WHERE NOT EXISTS (SELECT 1 FROM edges r \
-                             WHERE r.source_id = x.paper AND r.target_id = x.claim \
-                               AND r.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
-                               AND r.properties ->> '{INGESTED_BY_PROPERTY}' = x.by \
-                               AND {by_r} = x.by)",
-        pp = f.pp_cte("$2::uuid[]", None),
-        by_r = ingest_written_by_sql("r"),
-        prin = principal("pp", "$1::uuid"),
-        cand = f.candidate(Kind::PaperAsserts, "e"),
-    ))
-    .bind(legacy)
-    .bind(&o.ingest_signers)
-    .fetch_one(&mut *tx)
-    .await?;
+    let st = planned_records(&f);
+    let (pairs,): (i64,) = b
+        .on(&st)
+        .fetch_one(&mut *tx)
+        .await
+        .with_context(|| format!("census {}", st.name))?;
     c.planned_non_creation = pairs
         - if o.creation_records {
             c.provable_records
