@@ -137,6 +137,8 @@
 //! line (no summary) leaves that batch's lines uncommitted in the manifest;
 //! the reversal reports it as `UNCOMMITTED-BATCH`, and its edges are checked
 //! by hand (the stamps and records of that batch are all there or none are).
+//! If one of that batch's stamps rests on a record of an earlier batch of
+//! the run, the reversal refuses until the line is appended (see Reversal).
 //!
 //! # Reversal
 //!
@@ -154,9 +156,16 @@
 //! different runs (a paced or resumed backfill), the later run writes no
 //! record and its stamp rests on the earlier run's. So before any write,
 //! dry run or `--apply`, the reversal refuses (nothing written) while any
-//! stamped paper assertion OUTSIDE its manifest matches (paper, claim, `by`)
-//! a record its committed batches wrote, naming those edges: reverse the
-//! newer manifest first.
+//! stamped paper assertion OUTSIDE its manifest's COMMITTED batches matches
+//! (paper, claim, `by`) a record those batches wrote, naming those edges. An
+//! edge listed only in an uncommitted batch counts as outside: a batch's
+//! lines are written before its UPDATE, so a rolled-back batch lists edges a
+//! newer run may since have stamped. For an edge not in the manifest at all
+//! the refusal says to reverse the newer manifest first. For one in an
+//! uncommitted batch it names the batch and both remedies, since the
+//! manifest cannot tell them apart: reverse the newer manifest first if one
+//! lists it; if none does, that batch committed before its line was written,
+//! so check its edges are all stamped and append its `committed_batch` line.
 //!
 //! A version 2 manifest (written before a batch's records shared its
 //! stamps' transaction) is still reversed, with a `LEGACY-MANIFEST` line: its
@@ -1525,6 +1534,48 @@ async fn batch_records(
     Ok((lines, created_n, other_n))
 }
 
+/// The reversal's refusal while `total` stamped paper assertions outside
+/// the manifest's committed batches rest on records those batches wrote.
+/// `outside` are not in the manifest at all (a newer run stamped them);
+/// `in_uncommitted` are listed in one of its uncommitted batches, keyed by
+/// batch: either a newer run stamped them after that batch rolled back, or
+/// the batch committed and the run died before its `committed_batch` line.
+/// The manifest cannot tell those apart, so it names both remedies.
+fn leaning_refusal(
+    manifest: &Path,
+    total: usize,
+    outside: &[String],
+    in_uncommitted: &BTreeMap<i64, Vec<String>>,
+) -> String {
+    let m = manifest.display();
+    let mut msg = format!(
+        "{m} cannot be reversed yet: {total} stamped paper assertion(s) outside its committed \
+         batches rest on the ingest records those batches wrote (one record per paper, claim \
+         and principal). Nothing was done."
+    );
+    if !outside.is_empty() {
+        msg.push_str(&format!(
+            " {} not in this manifest: {}. A newer run stamped them: reverse the newer \
+             manifest that stamped them first, then this one.",
+            outside.len(),
+            outside.join("; ")
+        ));
+    }
+    for (b, named) in in_uncommitted {
+        msg.push_str(&format!(
+            " {} in this manifest's uncommitted batch {b} (lines but no committed_batch \
+             line): {}. If a newer manifest lists them, reverse that newer manifest first, \
+             then this one. If none does, batch {b} committed before the run wrote its line \
+             (the run was killed after that COMMIT): check that batch {b}'s edges are all \
+             stamped, append the line {{\"committed_batch\": {b}}} to {m}, then reverse \
+             this manifest again.",
+            named.len(),
+            named.join("; ")
+        ));
+    }
+    msg
+}
+
 /// One committed batch to reverse: its records, and its edges with the
 /// `by` each was stamped with.
 type BatchUndo = (Vec<Uuid>, Vec<(Uuid, Uuid)>);
@@ -1545,8 +1596,10 @@ pub struct ReverseReport {
 /// # Errors
 /// The manifest is not a backfill manifest of version [`VERSION`] or
 /// [`LEGACY_VERSION`]; a currently stamped paper assertion outside this
-/// manifest rests on a record this manifest's committed batches wrote (a
-/// newer run's stamp: reverse that run first; nothing is written); or a
+/// manifest's COMMITTED batches rests on a record those batches wrote (a
+/// newer run's stamp: reverse that run first; or, listed in one of its
+/// uncommitted batches with no newer run, that batch committed without its
+/// line: append it; nothing is written, see [`leaning_refusal`]); or a
 /// statement failed.
 #[allow(clippy::too_many_lines)]
 pub async fn reverse(
@@ -1638,7 +1691,19 @@ pub async fn reverse(
     // copy of a pair this run's records cover wrote no record of its own and
     // rests on this run's. Deleting it would leave that stamp without one,
     // so refuse until the newer run is reversed (then this one is exact).
-    let mine: Vec<Uuid> = edges.iter().map(|(_, e, _)| *e).collect();
+    // Only this manifest's COMMITTED edges are excluded: an uncommitted
+    // batch's lines are written before its UPDATE, so a rolled-back batch
+    // lists edges a newer run may since have stamped.
+    let mine: Vec<Uuid> = edges
+        .iter()
+        .filter(|(b, ..)| committed.contains(b))
+        .map(|(_, e, _)| *e)
+        .collect();
+    let uncommitted_edge: BTreeMap<Uuid, i64> = edges
+        .iter()
+        .filter(|(b, ..)| !committed.contains(b))
+        .map(|(b, e, _)| (*e, *b))
+        .collect();
     let (mut rp, mut rc, mut rb) = (Vec::new(), Vec::new(), Vec::new());
     for (b, _, p, c, by) in &records {
         if committed.contains(b) {
@@ -1667,18 +1732,18 @@ pub async fn reverse(
         .await
         .context("the stamps outside this manifest that rest on its records")?;
         if !leaning.is_empty() {
-            let named: Vec<String> = leaning
-                .iter()
-                .map(|(e, p, c, by)| format!("edge {e} (paper {p} asserts claim {c}, by {by})"))
-                .collect();
+            let mut outside = Vec::new();
+            let mut in_uncommitted: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+            for (e, p, c, by) in &leaning {
+                let named = format!("edge {e} (paper {p} asserts claim {c}, by {by})");
+                match uncommitted_edge.get(e) {
+                    Some(b) => in_uncommitted.entry(*b).or_default().push(named),
+                    None => outside.push(named),
+                }
+            }
             bail!(
-                "{} cannot be reversed yet: {} stamped paper assertion(s) outside it rest on \
-                 the ingest records it wrote (one record per paper, claim and principal): {}. \
-                 Reverse the newer manifest that stamped them first, then this one. Nothing \
-                 was done",
-                manifest.display(),
-                leaning.len(),
-                named.join("; ")
+                "{}",
+                leaning_refusal(manifest, leaning.len(), &outside, &in_uncommitted)
             );
         }
     }
@@ -1839,6 +1904,39 @@ mod tests {
             "{next:#?}"
         );
         assert_eq!(next.len(), 2, "{next:#?}");
+    }
+
+    /// The reversal's refusal names where each leaning stamp sits: not in
+    /// the manifest at all, reverse the newer manifest first; in one of its
+    /// uncommitted batches, that batch and both remedies (a newer manifest
+    /// first, or the batch's `committed_batch` line when no newer run
+    /// stamped it). Each group's advice appears only with that group.
+    #[test]
+    fn the_refusal_gives_each_leaning_stamp_its_remedy() {
+        let m = Path::new("/tmp/run-1.jsonl");
+        let head = "/tmp/run-1.jsonl cannot be reversed yet: 1 stamped paper assertion(s) \
+                    outside its committed batches rest on the ingest records those batches \
+                    wrote (one record per paper, claim and principal). Nothing was done.";
+        let newer = " 1 not in this manifest: edge A. A newer run stamped them: reverse the \
+                     newer manifest that stamped them first, then this one.";
+        let own = " 1 in this manifest's uncommitted batch 7 (lines but no committed_batch \
+                   line): edge B. If a newer manifest lists them, reverse that newer manifest \
+                   first, then this one. If none does, batch 7 committed before the run wrote \
+                   its line (the run was killed after that COMMIT): check that batch 7's edges \
+                   are all stamped, append the line {\"committed_batch\": 7} to \
+                   /tmp/run-1.jsonl, then reverse this manifest again.";
+        let outside = vec!["edge A".to_string()];
+        let in_7 = BTreeMap::from([(7, vec!["edge B".to_string()])]);
+        assert_eq!(
+            leaning_refusal(m, 1, &outside, &BTreeMap::new()),
+            format!("{head}{newer}")
+        );
+        assert_eq!(leaning_refusal(m, 1, &[], &in_7), format!("{head}{own}"));
+        let both = leaning_refusal(m, 2, &outside, &in_7);
+        assert_eq!(
+            both,
+            format!("{}{newer}{own}", head.replace(": 1 stamped", ": 2 stamped"))
+        );
     }
 
     /// Without a missing line there is no `first:` step, and a clean run has
