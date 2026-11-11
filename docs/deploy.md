@@ -2421,7 +2421,8 @@ SUPERUSER DSN, like `restrict-claims`. Module doc:
 `crates/epigraph-cli/src/operator/regroup.rs`.
 
 ```bash
-# dry run: plan, every held claim with its reason code, every co-owned edge, a sample
+# dry run: plan, every held claim with its reason code, every co-owned edge and
+# source-node edge, a sample
 epigraph-operator regroup-claims --claims-file ids.txt --source-group <group> \
     --target-group <group> --operator <person> --manifest-out regroup-1.jsonl
 # apply: repeat the dry run's eligible count back
@@ -2438,15 +2439,39 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   already `('group', <target>)` counts as done, so a re-run resumes. A public
   claim (`public-claim`) and another group's claim (`not-in-source`) are held.
 - **Held whole, never partly moved**: a claim carrying a public row
-  (`public-row`), a row owned by a third group (`third-group`), pinned
-  evidence (`pinned`), or an edge whose new meet would drop a group its
-  current tuple requires (`edge-would-widen`). The plan applies these checks
-  too, so its eligible count is the number `--confirm-count` repeats.
-- **Edges** take the meet of their endpoints, as on INSERT. An edge whose
-  other end stays in the source becomes co-owned by both groups, so only a
-  member of both reads it. Every such edge is printed (`CO-OWNED-EDGE`) and
-  counted. Edges with an evidence endpoint get the same meet, which the tool
-  writes itself because the trigger does not re-meet them.
+  (`public-row`), a row owned by a third group (`third-group`), sealed
+  evidence (`sealed-evidence`: an `evidence_encryption` row, whose ciphertext
+  is keyed to the group that sealed it), pinned evidence (`pinned`), or an
+  edge whose new meet would drop a group its current tuple requires
+  (`edge-would-widen`). The plan applies these checks too, so its eligible
+  count is the number `--confirm-count` repeats.
+- **Edges** take the EXACT meet of their endpoints: the INSERT rule applied
+  to what each endpoint is.
+  - An edge whose other end is a claim or evidence that stays in the source
+    becomes co-owned by both groups, so only a member of both reads it. Every
+    such edge is printed (`CO-OWNED-EDGE`) and counted. Edges with an evidence
+    endpoint get the same meet, which the tool writes itself because the
+    trigger does not re-meet them.
+  - An edge whose other end is a NODE with its own tenancy (the `NODE-TYPES`
+    line lists them; at head a workflow, frame, context, perspective,
+    community or reasoning trace) is met with the node's own tuple. The
+    trigger and `epigraph_node_tenancy` count such a node as public, so left
+    alone an `executes` edge from a source-private workflow would go to the
+    target alone: source-only members would lose it, and target-only members
+    would gain an edge naming a workflow they cannot read. The tool writes the
+    exact meet instead (co-owned by the node's group and the target) and
+    prints every edge to a group-private node that is not the target's
+    (`SOURCE-NODE-EDGE`, with the node, and a `source-node edges` count). An
+    edge to a public node, or to one in the target, goes to the target alone.
+    A later act that re-tenants the claim again (another regroup, a
+    restriction, the privatization pipeline's re-meet) puts such an edge back
+    on the trigger's meet.
+- **Locks**: each batch, dry runs included, holds `SHARE ROW EXCLUSIVE` on
+  `edges`, `harvester_fragments` and the derived tables with no key to claims
+  (`LOCKED-PER-BATCH`), so an edge or fragment inserted on a moving claim
+  while the batch runs either lands before the batch reads its rows or is
+  stamped after the move. Every write to those tables on the instance waits
+  for the batch; keep `--batch-size` small on a busy instance.
 - **Left as they are**: an outsider's challenge (it is the challenger's; it
   is readable with its claim) and a fragment shared with a claim that stays.
 - **Invariants per batch**: the row census, every row's end state, and
@@ -2459,9 +2484,24 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 - **Exit**: `--apply` exits 3 when any listed claim was held or the moved
   count differs from `--confirm-count`.
 - **Reverse** is a compare-and-swap per claim. A claim something moved since,
-  a row written after the act, or a neighbour that moved since holds the
-  claim (exit 3). An edge stays on the meet of its current endpoints until
-  every endpoint the manifest moved is back, then takes its recorded tuple.
+  a row written after the act, a neighbour that moved since, evidence sealed
+  since, or an edge whose recorded tuple would be wider than the exact meet of
+  its endpoints after the restore (an endpoint the neighbour watch does not
+  cover moved: another claim's evidence, a node) holds the claim (exit 3). An
+  edge stays on the meet of its current endpoints until every endpoint the
+  manifest moved is back, then takes its recorded tuple. An edge to a node of
+  a third group was already wider than that node before the act, so its
+  reversal holds the claim rather than write the wider tuple back.
+- **Authority for its first use** (the 17 legacy workflow claims an earlier
+  restriction put in the wrong team group): two operator rulings, both of
+  2026-11-11. "Do both along with the 25 mixed lineage move" decides the
+  move; "Build a regroup-claims verb" authorizes this tool to carry it out.
+  The apply's `--ruling` text cites both. Before applying, read the dry run's
+  `SOURCE-NODE-EDGE` lines: each is an edge from a group-private workflow (or
+  other node) to one of the claims, and it stays co-owned with that node's
+  group. Compare the count with the `executes` edges measured on production
+  from source-group workflow rows to the listed claims; any other line is a
+  reason to stop.
 
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's
