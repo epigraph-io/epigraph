@@ -1721,11 +1721,21 @@ async fn a_lock_timeout_on_the_candidate_select_still_writes_the_committed_stamp
     let r1 = apply(&pool, &fx, 24, &m1, &["--lock-timeout", "300ms"]).await;
     holder.rollback().await.expect("release");
     assert_eq!(r1.code, 2, "{}", r1.show());
+    let failed: Vec<&str> = r1
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH-FAILED\t"))
+        .collect();
+    assert!(
+        failed.len() == 1
+            && failed[0].starts_with("BATCH-FAILED\tagent-asserts-claim")
+            && failed[0].contains("canceling statement due to lock timeout"),
+        "the BATCH-FAILED line itself carries the database's cause: {}",
+        r1.show()
+    );
     for want in [
         "STAMPED\tagent-authored-paper\t10",
         "STAMPED\tpaper-asserts-claim\t7",
-        "BATCH-FAILED\tagent-asserts-claim",
-        "lock timeout",
         "\nCREATION-RECORDS-WRITTEN\t1",
         "NON-CREATION-RECORDS-WRITTEN\t6",
         "MANIFEST\t",
