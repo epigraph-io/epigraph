@@ -1825,6 +1825,57 @@ async fn an_edge_from_an_unlisted_claim_to_a_moving_trace_is_co_owned(pool: PgPo
     );
 }
 
+/// An edge from a moving claim's reasoning trace to a PUBLIC frame. The
+/// trigger counts both ends as public, so the edge is a public row; read
+/// through the trace, it holds its claim whole (`public-row`), as a public
+/// evidence edge does: this tool never touches a public row. The plan's
+/// eligible count leaves the claim out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_edge_from_a_moving_trace_holds_its_claim(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, with a trace").await;
+    let trace_c = fixture::seed_reasoning_trace(&pool, c, "deductive").await;
+    let e = typed_edge(&pool, trace_c, "trace", fx.frame, "frame").await;
+    assert_eq!(
+        edge(&pool, e).await.1,
+        "public",
+        "both ends count as public"
+    );
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains("PLAN: 1 requested, 0 eligible, 1 held, 0 already"),
+        "{}",
+        r.show()
+    );
+    assert!(
+        has_line(
+            &r.stdout,
+            "HELD\t",
+            &[&c.to_string(), "public-row", &format!("edges {e}")]
+        ),
+        "{}",
+        r.show()
+    );
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.src));
+}
+
 /// The node types the tool meets by their own row are exactly the entity
 /// types (other than claim and evidence) whose table has tenancy columns at
 /// head, and every one of them has a test above. A type that gains tenancy
