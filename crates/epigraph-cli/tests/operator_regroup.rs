@@ -1541,6 +1541,7 @@ async fn a_source_node_edge_is_co_owned_and_reported(pool: PgPool, ty: &str, nod
     );
     assert!(r.stdout.contains("source-node edges: 1"), "{}", r.show());
     assert!(r.stdout.contains("co-owned edges: 0"), "{}", r.show());
+    assert!(r.stdout.contains("irreversible edges: 0 "), "{}", r.show());
     assert!(reads_as(&pool, &[fx.src], "edges", &[e]).await.is_empty());
     assert!(reads_as(&pool, &[fx.dst], "edges", &[e]).await.is_empty());
     assert_eq!(
@@ -1554,6 +1555,25 @@ async fn a_source_node_edge_is_co_owned_and_reported(pool: PgPool, ty: &str, nod
     assert_eq!(rv.code, 0, "{}", rv.show());
     assert_same(&before, &snapshot(&pool, true).await, "node edge reversed");
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+}
+
+/// The dry run and the apply both name edge `e` as IRREVERSIBLE-EDGE, with
+/// claim `c`, and count it: the reversal will hold `c`.
+fn assert_irreversible(r: &Run, e: Uuid, c: Uuid) {
+    assert!(
+        has_line(
+            &r.stdout,
+            "IRREVERSIBLE-EDGE\t",
+            &[
+                &e.to_string(),
+                &format!("claim {c}"),
+                "will not be reversible"
+            ]
+        ),
+        "no IRREVERSIBLE-EDGE line for edge {e}\n{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("irreversible edges: 1 "), "{}", r.show());
 }
 
 fn row_table(ty: &str) -> &'static str {
@@ -1710,6 +1730,11 @@ async fn a_trace_edge_across_batches_is_settled_by_the_later_batch(pool: PgPool)
         r.show()
     );
     assert!(r.stdout.contains("source-node edges: 0"), "{}", r.show());
+    assert!(
+        r.stdout.contains("irreversible edges: 0 "),
+        "C1, moved by the first batch, comes back to SRC too\n{}",
+        r.show()
+    );
     assert_eq!(
         reads_as(&pool, &[fx.dst], "edges", &[e]).await,
         vec![e],
@@ -1873,7 +1898,8 @@ async fn an_edge_to_a_public_node_goes_to_the_target(pool: PgPool) {
 /// An edge to a node of a THIRD group is met with that group (it keeps
 /// requiring it) and reported. Its recorded prior, the claim's tuple alone,
 /// was already wider than the node: the reversal will not write it back and
-/// holds the claim instead.
+/// holds the claim instead, which the dry run and the apply both report
+/// (IRREVERSIBLE-EDGE and its count).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
@@ -1885,6 +1911,21 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
     let mf = dir.join("m.jsonl");
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert_irreversible(&dry, e, c);
     let r = regroup(
         &pool,
         Regroup {
@@ -1912,6 +1953,7 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
         "{}",
         r.show()
     );
+    assert_irreversible(&r, e, c);
     let rv = reverse(&pool, &[&mf], &[], true).await;
     assert_eq!(rv.code, 3, "{}", rv.show());
     assert!(
@@ -1931,10 +1973,12 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
 }
 
 /// An edge from a workflow that is already in the TARGET goes to the target
-/// alone (the node requires nothing beyond the target) and is not reported.
-/// Its recorded prior, the claim's tuple alone, was wider than the node (a
-/// SOURCE-only reader read an edge naming a TARGET-private workflow), so the
-/// reversal will not write it back and holds the claim instead.
+/// alone (the node requires nothing beyond the target) and is not a
+/// SOURCE-NODE-EDGE. Its recorded prior, the claim's tuple alone, was wider
+/// than the node (a SOURCE-only reader read an edge naming a TARGET-private
+/// workflow), so the reversal will not write it back and holds the claim
+/// instead. The dry run and the apply both say so up front (IRREVERSIBLE-EDGE
+/// and its count).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
@@ -1946,6 +1990,21 @@ async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(po
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
     let mf = dir.join("m.jsonl");
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert_irreversible(&dry, e, c);
     let r = regroup(
         &pool,
         Regroup {
@@ -1968,6 +2027,7 @@ async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(po
         "{}",
         r.show()
     );
+    assert_irreversible(&r, e, c);
     let rv = reverse(&pool, &[&mf], &[], true).await;
     assert_eq!(rv.code, 3, "{}", rv.show());
     assert!(

@@ -2495,10 +2495,12 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   cover moved: another claim's evidence, a node) holds the claim (exit 3). An
   edge stays on the meet of its current endpoints until every endpoint the
   manifest moved is back, then takes its recorded tuple. An edge to a
-  group-private node that is not in the source (one in the target, which the
-  dry run does not report, or one of a third group) was already wider than
-  that node before the act, so its reversal holds the claim rather than write
-  the wider tuple back: such a claim cannot be reversed by this tool.
+  group-private node that is not in the source (one in the target or one of
+  a third group) was already wider than that node before the act, so its
+  reversal holds the claim rather than write the wider tuple back: such a
+  claim cannot be reversed by this tool. The dry run and the apply predict
+  this for every edge and print each one (`IRREVERSIBLE-EDGE`, naming the
+  claim, and an `irreversible edges` count with the number of claims).
 - **Authority for its first use** (the 17 legacy workflow claims an earlier
   restriction put in the wrong team group): two operator rulings, both of
   2026-11-11. "Do both along with the 25 mixed lineage move" decides the
@@ -2508,9 +2510,11 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   other node) to one of the claims, and it stays co-owned with that node's
   group. Compare the count with the `executes` edges measured on production
   from source-group workflow rows to the listed claims; any other line is a
-  reason to stop. Measure the edges from target-group workflow rows to the
-  listed claims too: they move without a line, and their claims cannot be
-  reversed by this tool.
+  reason to stop. Then read the `irreversible edges` count: every
+  `IRREVERSIBLE-EDGE` line names a claim the act could not undo (an edge from
+  a target-group or third-group workflow, or another node, to it). A count
+  above zero is a reason to stop unless the decision accepts those claims as
+  not reversible.
 
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's

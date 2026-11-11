@@ -88,7 +88,11 @@
 //! group-private node that is NOT in the source (a target node, which is not
 //! reported, or a third group's) had a recorded tuple wider than the node
 //! before the act, so the reversal holds its claim rather than write that
-//! tuple back.
+//! tuple back. The dry run and the apply predict that hold for every edge (its
+//! first recorded prior against the meet of its endpoints with every row this
+//! run moved back on its prior) and report each such edge with the claims it
+//! names (`IRREVERSIBLE-EDGE` lines and a count): those claims will not be
+//! reversible by this tool.
 //!
 //! An edge is accepted only when its new meet is at least as narrow as its
 //! current tuple with the source replaced by the target; otherwise it holds
@@ -708,6 +712,12 @@ pub async fn check_groups(
 #[derive(Default, Debug)]
 struct Known {
     rows: BTreeMap<RowKey, RowState>,
+    /// The FIRST prior this run recorded for each row: the one
+    /// `reverse::resolve` keeps, so the one a reversal writes back.
+    priors: BTreeMap<RowKey, RowState>,
+    /// Claims an earlier batch of this run moved (a reversal puts them back
+    /// in the source).
+    claims: BTreeSet<Uuid>,
 }
 
 /// Fixed inputs to every batch.
@@ -984,6 +994,15 @@ pub struct BatchOutcome {
     /// nothing to report. A later batch's verdict replaces an earlier one's:
     /// an edge to the trace of a later batch's claim is settled there.
     pub node_edges: Vec<(String, Option<String>)>,
+    /// Every edge of the batch, by id, with its `IRREVERSIBLE-EDGE` line and
+    /// the claims it names (its recorded prior is wider than the meet its
+    /// endpoints will have after a restore, so `reown-reverse` will hold
+    /// them), or `None`. A later batch's verdict replaces an earlier one's.
+    pub irreversible: Vec<(String, Option<(String, BTreeSet<Uuid>)>)>,
+    /// The prior of every row this batch recorded.
+    pub prior_rows: BTreeMap<RowKey, RowState>,
+    /// The claims this batch moved.
+    pub moved_claims: BTreeSet<Uuid>,
     pub sample: Vec<String>,
     pub audit_written: bool,
 }
@@ -1422,6 +1441,83 @@ async fn run_batch(
             st.tenancy.owner
         ));
     }
+    // ---- the edges the reversal will refuse ----
+    // `reown-reverse` writes an edge's FIRST recorded prior back only when it
+    // is at least as narrow as the meet of its endpoints after the restore
+    // (every row this run moved back on its prior, every other endpoint as it
+    // is now); otherwise it holds the claim. Predict that here, so the dry
+    // run says which claims the act could not undo (an edge to a node of the
+    // target or of a third group: its prior, stamped with the node counted as
+    // public, was already wider than the node).
+    let prior_of = |k: &RowKey| -> Option<RowState> {
+        known
+            .priors
+            .get(k)
+            .cloned()
+            .or_else(|| s0.get(k).map(RowState::of))
+    };
+    let at_restore = |n: &Pair, now: &Pair| -> Pair {
+        let key = match n.1.as_str() {
+            "claim" if moving.contains(&n.0) || known.claims.contains(&n.0) => {
+                return (ctx.source, GROUP.to_string());
+            }
+            "claim" => return now.clone(),
+            "evidence" => ("evidence".to_string(), n.0.to_string()),
+            ty => match ctx.nodes.get(ty) {
+                Some(t) => (t.clone(), n.0.to_string()),
+                None => return now.clone(),
+            },
+        };
+        prior_of(&key).map_or_else(
+            || now.clone(),
+            |st| (st.tenancy.owner, st.tenancy.visibility),
+        )
+    };
+    for (k, a) in s0.iter().filter(|(k, _)| k.0 == "edges") {
+        let (Some(e), Some(prior)) = (ends.get(&k.1), prior_of(k)) else {
+            continue;
+        };
+        let ss = at_restore(&e.source, &e.source_state);
+        let ts = at_restore(&e.target, &e.target_state);
+        let verdict = meet(&ss, &ts)
+            .filter(|m| !narrows(m, &prior.tenancy))
+            .map(|m| {
+                let names: BTreeSet<Uuid> = a.claims.intersection(&moving).copied().collect();
+                let list = names
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let line = format!(
+                    "IRREVERSIBLE-EDGE\t{}\tclaim {list}\t{prior} -> {}\tafter a restore {} {} \
+                     ({}, {}) and {} {} ({}, {}) meet at {}\tthe recorded tuple is wider than \
+                     that meet, so reown-reverse will hold claim {list}: it will not be reversible",
+                    k.1,
+                    s2.get(k)
+                        .map_or_else(|| "?".to_string(), ToString::to_string),
+                    e.source.1,
+                    e.source.0,
+                    ss.0,
+                    ss.1,
+                    e.target.1,
+                    e.target.0,
+                    ts.0,
+                    ts.1,
+                    RowState {
+                        tenancy: m,
+                        writer_owned: None
+                    }
+                );
+                (line, names)
+            });
+        out.irreversible.push((k.1.clone(), verdict));
+    }
+    out.prior_rows = s0
+        .iter()
+        .map(|(k, a)| (k.clone(), RowState::of(a)))
+        .collect();
+    out.moved_claims.clone_from(&moving);
+
     for c in eligible.iter().take(ctx.sample) {
         out.sample.push(format!(
             "SAMPLE\t{}\tclaims\t{}\t({}, {}) -> ('group', {})",
@@ -1458,6 +1554,9 @@ pub struct RunReport {
     pub moved_by_table: BTreeMap<String, usize>,
     pub co_owned_edges: usize,
     pub source_node_edges: usize,
+    /// Edges whose reversal will hold their claim, and those claims.
+    pub irreversible_edges: usize,
+    pub irreversible_claims: usize,
     pub manifest_rows: usize,
     pub audit_written: bool,
 }
@@ -1711,6 +1810,7 @@ pub async fn run(
     let mut sampled = 0usize;
     let mut co_owned: Vec<String> = Vec::new();
     let mut node_edges: BTreeMap<String, String> = BTreeMap::new();
+    let mut irreversible: BTreeMap<String, (String, BTreeSet<Uuid>)> = BTreeMap::new();
     for (i, batch) in batches.iter().enumerate() {
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let audit =
@@ -1735,6 +1835,16 @@ pub async fn run(
                 report.audit_written |= b.audit_written;
                 if opts.apply {
                     known.rows.extend(b.post_rows);
+                    for (k, st) in b.prior_rows {
+                        known.priors.entry(k).or_insert(st);
+                    }
+                    known.claims.extend(b.moved_claims);
+                }
+                for (id, v) in b.irreversible {
+                    match v {
+                        Some(v) => irreversible.insert(id, v),
+                        None => irreversible.remove(&id),
+                    };
                 }
                 for l in &b.sample {
                     writeln!(out, "{l}")?;
@@ -1787,6 +1897,15 @@ pub async fn run(
     for l in node_edges.values() {
         writeln!(out, "{l}")?;
     }
+    report.irreversible_edges = irreversible.len();
+    report.irreversible_claims = irreversible
+        .values()
+        .flat_map(|(_, c)| c.iter())
+        .collect::<BTreeSet<_>>()
+        .len();
+    for (l, _) in irreversible.values() {
+        writeln!(out, "{l}")?;
+    }
     report.manifest_rows = sink.len();
     for (id, h) in &report.held_under_lock {
         writeln!(out, "HELD-UNDER-LOCK\t{id}\t{}\t{h}", h.code())?;
@@ -1806,6 +1925,12 @@ pub async fn run(
         "  source-node edges: {} (an edge to a group-private node of a NODE-TYPES type that \
          is not the target's; it stays co-owned with that node's group)",
         report.source_node_edges
+    )?;
+    writeln!(
+        out,
+        "  irreversible edges: {} (IRREVERSIBLE-EDGE: reown-reverse will hold the {} claim(s) \
+         they name, which this tool then cannot reverse)",
+        report.irreversible_edges, report.irreversible_claims
     )?;
     writeln!(out, "  manifest row records: {}", report.manifest_rows)?;
     writeln!(
