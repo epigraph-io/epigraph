@@ -244,10 +244,10 @@ async fn is_member(pool: &PgPool, group: Uuid, agent: Uuid) -> bool {
 const INVISIBLE_ENDPOINTS: &[u32] = &[
     0x01, 0x1F, 0x20, 0x7F, 0x85, 0x9F, 0xA0, 0xAD, 0x34F, 0x600, 0x605, 0x61C, 0x6DD, 0x70F,
     0x890, 0x891, 0x8E2, 0x115F, 0x1160, 0x1680, 0x17B4, 0x17B5, 0x180B, 0x180E, 0x180F, 0x2000,
-    0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E, 0x202F, 0x205F, 0x2060, 0x2064,
-    0x2066, 0x206F, 0x2800, 0x3000, 0x3164, 0xFE00, 0xFE0F, 0xFEFF, 0xFFA0, 0xFFF9, 0xFFFB,
-    0x110BD, 0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020,
-    0xE007F, 0xE0100, 0xE01EF,
+    0x200A, 0x200B, 0x200F, 0x2028, 0x2029, 0x202A, 0x202E, 0x202F, 0x205F, 0x2060, 0x2064, 0x2066,
+    0x206F, 0x2800, 0x3000, 0x3164, 0xFE00, 0xFE0F, 0xFEFF, 0xFFA0, 0xFFF9, 0xFFFB, 0x110BD,
+    0x110CD, 0x13430, 0x1343F, 0x1BCA0, 0x1BCA3, 0x1D173, 0x1D17A, 0xE0001, 0xE0020, 0xE007F,
+    0xE0100, 0xE01EF,
 ];
 
 /// The neighbour just outside each range of the filler and selector
@@ -910,11 +910,17 @@ async fn the_preflight_refuses_a_role_agent_its_holder_does_not_cover(pool: PgPo
 
     // No holder.
     assert_eq!(code(preflight_as(&pool, w.reporter).await), "ROL01");
-    assert_eq!(code(submit_as(&pool, w.reporter, &report("x")).await), "ROL01");
+    assert_eq!(
+        code(submit_as(&pool, w.reporter, &report("x")).await),
+        "ROL01"
+    );
     // Held, by a human the reporter is not linked to.
     let theirs = grant(&pool, ROLE, stranger).await;
     assert_eq!(code(preflight_as(&pool, w.reporter).await), "ROL01");
-    assert_eq!(code(submit_as(&pool, w.reporter, &report("y")).await), "ROL01");
+    assert_eq!(
+        code(submit_as(&pool, w.reporter, &report("y")).await),
+        "ROL01"
+    );
     assert_eq!(claims_by(&pool, w.reporter).await, 0, "nothing was filed");
     assert_eq!(markers_of(&pool, w.reporter).await, 0, "and no marker");
 
