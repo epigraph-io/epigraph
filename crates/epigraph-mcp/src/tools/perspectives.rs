@@ -265,7 +265,8 @@ pub async fn list_perspectives(
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
-    let rows = PerspectiveRepository::list(&server.pool, viewer, limit, 0)
+    let mut read = server.read_as(viewer, "list_perspectives").await?;
+    let rows = PerspectiveRepository::list(&mut *read, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -301,7 +302,8 @@ pub async fn get_perspective(
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.perspective_id)?;
 
-    let row = PerspectiveRepository::get_by_id(&server.pool, viewer, id)
+    let mut read = server.read_as(viewer, "get_perspective").await?;
+    let row = PerspectiveRepository::get_by_id(&mut *read, viewer, id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("perspective {id} not found")))?;

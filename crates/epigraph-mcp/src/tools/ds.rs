@@ -124,11 +124,16 @@ pub async fn submit_ds_evidence(
     // does something, so the response says it did not.
     let mut warnings = deprecated_parameter_warnings(method, params.gamma);
 
-    // Get frame from DB
-    let mut frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
+    // The frame, read as the CALLER on its stamped read. Frames carry tenancy,
+    // and on the application role an unstamped connection admits public rows
+    // only, so a member's own group-private frame answered "frame not found".
+    // Released at once: the write transaction below is taken separately.
+    let mut read = server.read_as(viewer, "submit_ds_evidence").await?;
+    let mut frame_row = FrameRepository::get_by_id(&mut *read, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
+    drop(read);
 
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
@@ -753,45 +758,39 @@ pub async fn get_belief_in_mode(
         params.frame_id.as_deref(),
         params.perspective_id.as_deref(),
     )?;
+    // Every read of the call (lens existence, the belief, the lensed belief,
+    // the shadow view) on ONE connection stamped with the caller's viewer: on
+    // the plain pool row security admits public rows only, so a member's own
+    // group-private claim, frame and BBAs would read as absent.
+    let mut read = server.read_as(viewer, "get_belief").await?;
     if let Some((lens_frame, lens_perspective)) = lens {
-        crate::tools::lens::validate_lens_exists(
-            &server.pool,
-            viewer,
-            lens_frame,
-            lens_perspective,
-        )
-        .await?;
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, lens_frame, lens_perspective)
+            .await?;
     }
 
-    let interval = epigraph_engine::belief_query::get_belief_scoped(
-        &server.pool,
-        server.scoped.as_ref(),
-        viewer,
-        claim_id,
-        frame_id,
-    )
-    .await
-    .map_err(|e| match e {
-        epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
-            invalid_params(format!("frame {id} not found"))
-        }
-        epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
-            invalid_params(format!("claim {id} not found"))
-        }
-        epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
-            invalid_params(format!("invalid mass function: {msg}"))
-        }
-        other => internal_error(other),
-    })?;
+    let interval =
+        epigraph_engine::belief_query::get_belief_conn(&mut read, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+                    invalid_params(format!("frame {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+                    invalid_params(format!("claim {id} not found"))
+                }
+                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+                    invalid_params(format!("invalid mass function: {msg}"))
+                }
+                other => internal_error(other),
+            })?;
 
     // Additive lensed interval, computed under the chosen (frame, perspective).
     // The top-level belief/plausibility/etc above stay the global (unlensed)
     // values. Existence already validated → a compute failure is internal.
     let lensed_belief = match lens {
         Some((lens_frame, lens_perspective)) => {
-            let lensed = epigraph_engine::belief_query::get_perspective_belief_scoped(
-                &server.pool,
-                server.scoped.as_ref(),
+            let lensed = epigraph_engine::belief_query::get_perspective_belief_conn(
+                &mut read,
                 viewer,
                 claim_id,
                 lens_frame,
@@ -820,7 +819,8 @@ pub async fn get_belief_in_mode(
     };
 
     let shadow =
-        epigraph_engine::belief_query::shadow_belief(&server.pool, viewer, claim_id, mode).await;
+        epigraph_engine::belief_query::shadow_belief_conn(&mut read, viewer, claim_id, mode).await;
+    read.commit().await.map_err(internal_error)?;
 
     let ignorance = interval.plausibility - interval.belief;
     success_json(&BeliefResponse {
@@ -843,9 +843,11 @@ pub async fn list_frames(
     params: ListFramesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
-    let frames = FrameRepository::list(&server.pool, viewer, limit, 0)
+    let mut read = server.read_as(viewer, "list_frames").await?;
+    let frames = FrameRepository::list(&mut *read, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     let entries: Vec<FrameEntry> = frames
         .into_iter()
@@ -871,7 +873,11 @@ pub async fn compare_methods(
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = parse_uuid(&params.frame_id)?;
 
-    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
+    // Every read on ONE connection stamped with the caller's viewer, the
+    // frame and the BBAs included: on the plain pool row security admits
+    // public rows only, so a member's own group-private BBAs would be missing.
+    let mut read = server.read_as(viewer, "compare_methods").await?;
+    let frame_row = FrameRepository::get_by_id(&mut *read, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
@@ -880,46 +886,22 @@ pub async fn compare_methods(
         .map_err(internal_error)?;
 
     let all_bbas =
-        MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
+        MassFunctionRepository::get_for_claim_frame(&mut *read, viewer, claim_id, frame_id)
             .await
             .map_err(internal_error)?;
     // Ruling R-22: only the BBAs whose sources this viewer can read; a
     // reader outside a group never sees a fold of BBAs derived from it.
-    // On the viewer-stamped read when the server has one, so a group member's
-    // own group's sources are visible to the session as well as the viewer.
     // Each row's source (writing agent and the live human it acts for) is
     // read on the same connection, for the same-human rule below.
-    let (all_bbas, sources) = match server.scoped.as_ref() {
-        Some(scoped) => {
-            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
-            let rows =
-                epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, all_bbas)
-                    .await
-                    .map_err(internal_error)?;
-            let sources =
-                epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &rows)
-                    .await
-                    .map_err(internal_error)?;
-            (rows, sources)
-        }
-        None => {
-            let rows = epigraph_engine::derivation_scope::retain_for_viewer(
-                &server.pool,
-                viewer,
-                all_bbas,
-            )
+    let all_bbas =
+        epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, all_bbas)
             .await
             .map_err(internal_error)?;
-            let sources = epigraph_engine::source_dependence::bba_sources_for_rows_on_pool(
-                &server.pool,
-                viewer,
-                &rows,
-            )
+    let sources =
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &all_bbas)
             .await
             .map_err(internal_error)?;
-            (rows, sources)
-        }
-    };
+    read.commit().await.map_err(internal_error)?;
 
     if all_bbas.is_empty() {
         return Err(invalid_params("no BBAs stored for this claim/frame"));
@@ -1033,16 +1015,12 @@ pub async fn scoped_belief(
     // belief live from the claim's labelled BBAs — each discounted by this
     // perspective's source-reliability map — rather than reading the cache. This
     // reflects current evidence no matter how it was ingested.
+    let mut read = server.read_as(viewer, "scoped_belief").await?;
     if scope_type == "perspective" {
         if let Some(frame_id_str) = params.frame_id.as_deref() {
             let frame_id = parse_uuid(frame_id_str)?;
-            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
-                &server.pool,
-                server.scoped.as_ref(),
-                viewer,
-                claim_id,
-                frame_id,
-                scope_id,
+            let interval = epigraph_engine::belief_query::get_perspective_belief_conn(
+                &mut read, viewer, claim_id, frame_id, scope_id,
             )
             .await
             .map_err(|e| match e {
@@ -1060,6 +1038,7 @@ pub async fn scoped_belief(
                 }
                 other => internal_error(other),
             })?;
+            read.commit().await.map_err(internal_error)?;
             return success_json(&ScopedBeliefResponse {
                 claim_id: claim_id.to_string(),
                 scope_type: scope_type.to_string(),
@@ -1073,15 +1052,15 @@ pub async fn scoped_belief(
         }
     }
 
-    let row =
-        ScopedBeliefRepository::get(&server.pool, viewer, claim_id, scope_type, Some(scope_id))
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "no scoped belief for claim {claim_id} with {scope_type} {scope_id}"
-                ))
-            })?;
+    let row = ScopedBeliefRepository::get(&mut *read, viewer, claim_id, scope_type, Some(scope_id))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "no scoped belief for claim {claim_id} with {scope_type} {scope_id}"
+            ))
+        })?;
+    read.commit().await.map_err(internal_error)?;
 
     success_json(&ScopedBeliefResponse {
         claim_id: claim_id.to_string(),
@@ -1102,10 +1081,12 @@ pub async fn get_divergence(
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let row = DivergenceRepository::get_latest(&server.pool, viewer, claim_id)
+    let mut read = server.read_as(viewer, "get_divergence").await?;
+    let row = DivergenceRepository::get_latest(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("no divergence data for claim {claim_id}")))?;
+    read.commit().await.map_err(internal_error)?;
 
     success_json(&DivergenceResponse {
         claim_id: claim_id.to_string(),

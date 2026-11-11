@@ -54,8 +54,9 @@ pub async fn get_provenance_chain(
     let claim_id = parse_uuid(&params.claim_id)?;
     let max_depth = params.max_depth.unwrap_or(4);
 
-    let chain = ProvenanceChainRepository::chain(
-        &server.pool,
+    let mut read = server.read_as(viewer, "get_provenance_chain").await?;
+    let chain = ProvenanceChainRepository::chain_conn(
+        &mut read,
         viewer,
         claim_id,
         max_depth,

@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use futures::future::try_join_all;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -902,6 +901,30 @@ impl WorkflowRepository {
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
+        // `ConnectionFailed`, as `LineageRepository::get_lineage` maps its
+        // acquire: pool exhaustion is not a failing query.
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::resolve_steps_to_heads_conn(&mut conn, viewer, workflow_id).await
+    }
+
+    /// [`Self::resolve_steps_to_heads`] on a caller-supplied connection: the
+    /// shape a request reaches through `ScopedPool::read_as`, so every read
+    /// runs under the viewer's own session GUCs and row security agrees with
+    /// the in-query predicates. The pool form delegates here, so the
+    /// statements exist once. One connection serves one statement at a time,
+    /// so the per-step head lookups run in sequence (the pool form used to
+    /// run them concurrently on separate checkouts).
+    ///
+    /// # Errors
+    /// As [`Self::resolve_steps_to_heads`].
+    pub async fn resolve_steps_to_heads_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
         // step_lineage_id, in PLAN ORDER: the `plan_index` order below, then
         // reordered by the `step_follows` chain (`in_chain_order`, ruling R-38).
@@ -931,21 +954,22 @@ impl WorkflowRepository {
             sq = sq.bind(g);
         }
         let step_rows: Vec<(Uuid, Option<Uuid>)> =
-            sq.fetch_all(pool).await.map_err(DbError::from)?;
+            sq.fetch_all(&mut *conn).await.map_err(DbError::from)?;
         // Plan order is the `step_follows` chain (ruling R-38): `add_step`
         // leaves a middle insert unindexed, so `plan_index` alone lists it last.
-        let step_rows = in_chain_order(pool, viewer, step_rows, |r| r.0)
+        let step_rows = in_chain_order(&mut *conn, viewer, step_rows, |r| r.0)
             .await
             .map_err(DbError::from)?;
 
-        let head_futures = step_rows.iter().map(|(_, step_lineage_id)| async move {
-            if let Some(lineage_id) = *step_lineage_id {
-                ClaimRepository::latest_in_lineage(pool, viewer, lineage_id).await
-            } else {
-                Ok(Vec::new())
-            }
-        });
-        let heads_per_step: Vec<Vec<LineageHead>> = try_join_all(head_futures).await?;
+        let mut heads_per_step: Vec<Vec<LineageHead>> = Vec::with_capacity(step_rows.len());
+        for (_, step_lineage_id) in &step_rows {
+            heads_per_step.push(match *step_lineage_id {
+                Some(lineage_id) => {
+                    ClaimRepository::latest_in_lineage(&mut *conn, viewer, lineage_id).await?
+                }
+                None => Vec::new(),
+            });
+        }
 
         let resolved = step_rows
             .into_iter()
@@ -1168,6 +1192,18 @@ impl WorkflowRepository {
     /// [`DbError::InvalidData`] naming the retired head, rather than handing
     /// back a claim the caller cannot evolve or should not attach evidence to.
     ///
+    /// # The connection decides what this can see
+    ///
+    /// The step walk filters by `viewer` in the query, but on the application
+    /// role row security ALSO filters by whatever tenancy context the
+    /// connection carries. A raw pool connection carries none, so a
+    /// group-private workflow's steps and `executes` edges are dropped by the
+    /// session policy and this answers `Ok(None)` to the group's own members.
+    /// A request path therefore calls [`Self::resolve_step_claim_conn`] on a
+    /// connection stamped with the same viewer; this pool form only acquires
+    /// and delegates, for callers that run on a role row security does not
+    /// filter (tests, maintenance).
+    ///
     /// # Errors
     /// Returns `DbError` if a database query fails, and
     /// `DbError::InvalidData` when every head of the step's lineage is retired.
@@ -1178,19 +1214,41 @@ impl WorkflowRepository {
         step_index: usize,
         prefer_head: bool,
     ) -> Result<Option<Uuid>, DbError> {
-        let Some(max_gen) = Self::max_generation_by_canonical(pool, canonical_name)
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::resolve_step_claim_conn(&mut conn, viewer, canonical_name, step_index, prefer_head)
+            .await
+    }
+
+    /// [`Self::resolve_step_claim`] on a caller-supplied connection: the
+    /// primitive. All three statements (the latest generation, the root at
+    /// that generation and the step walk) run on `conn`, so on a connection
+    /// stamped with `viewer` they see exactly the rows that viewer may read.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_step_claim`].
+    pub async fn resolve_step_claim_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        canonical_name: &str,
+        step_index: usize,
+        prefer_head: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        let Some(max_gen) = Self::max_generation_by_canonical(&mut *conn, canonical_name)
             .await
             .map_err(DbError::from)?
         else {
             return Ok(None);
         };
-        let Some(workflow_id) = Self::find_root_by_canonical(pool, canonical_name, max_gen)
+        let Some(workflow_id) = Self::find_root_by_canonical(&mut *conn, canonical_name, max_gen)
             .await
             .map_err(DbError::from)?
         else {
             return Ok(None);
         };
-        let steps = Self::resolve_steps_to_heads(pool, viewer, workflow_id).await?;
+        let steps = Self::resolve_steps_to_heads_conn(conn, viewer, workflow_id).await?;
         let Some(step) = steps.into_iter().nth(step_index) else {
             return Ok(None);
         };

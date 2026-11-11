@@ -84,8 +84,9 @@ pub async fn suggest_alternative_sets(
     };
     let min_strength = params.min_pair_strength.clamp(0.0, 1.0);
 
+    let mut read = server.read_as(viewer, "suggest_alternative_sets").await?;
     let candidates = epigraph_db::AlternativeSetRepository::scan_candidates(
-        &server.pool,
+        &mut *read,
         viewer,
         target_filter,
         min_strength,

@@ -950,8 +950,9 @@ pub async fn query_claims(
     // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
     // most of the page (backlog 31e7b727). Off unless the caller asks.
     let exclude_spine = params.exclude_spine.unwrap_or(false);
+    let mut read = server.read_as(viewer, "query_claims").await?;
     let claims = ClaimRepository::list_by_belief_range(
-        &server.pool,
+        &mut *read,
         viewer,
         min,
         max,
@@ -975,9 +976,10 @@ pub async fn query_claims(
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
     // is_current, so an explicit `is_current=false` request keeps its labels,
     // matching get_labels' label source. A missing id → no labels.
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     let results: Vec<ClaimResponse> = claims
         .into_iter()
@@ -1019,12 +1021,16 @@ pub async fn get_claim(
         params.frame_id.as_deref(),
         params.perspective_id.as_deref(),
     )?;
+    // The claim's own reads on ONE connection stamped with the caller's
+    // viewer: on the plain pool row security admits public rows only, so a
+    // member's own group-private claim would read as not found.
+    let mut read = server.read_as(viewer, "get_claim").await?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
             .await?;
     }
 
-    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, viewer, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -1037,19 +1043,27 @@ pub async fn get_claim(
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
-    let classification = ClaimRepository::get_classification(&server.pool, viewer, id)
+    let classification = ClaimRepository::get_classification(&mut *read, viewer, id)
         .await
         .map_err(internal_error)?;
+
+    // The URLs of the claim's evidence, always (possibly empty): one
+    // single-id call to the batched, per-evidence-row-filtered read, so a
+    // consumer needs no `get_provenance` to find them (backlog 43ab8c73).
+    let source_urls = EvidenceRepository::source_urls_by_claim_ids(&mut *read, viewer, &[id])
+        .await
+        .map_err(internal_error)?
+        .remove(&id)
+        .unwrap_or_default();
 
     // Additive lensed belief: compute the claim's belief under the chosen lens.
     // Frame/perspective existence is already validated, so a compute failure
     // here is a genuine internal error (single-claim tool → propagate, no
-    // page-degrade semantics).
+    // page-degrade semantics). On the same stamped read.
     let lensed_belief = match lens {
         Some((frame_id, perspective_id)) => {
-            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
-                &server.pool,
-                server.scoped.as_ref(),
+            let interval = epigraph_engine::belief_query::get_perspective_belief_conn(
+                &mut read,
                 viewer,
                 id,
                 frame_id,
@@ -1079,15 +1093,7 @@ pub async fn get_claim(
         }
         None => None,
     };
-
-    // The URLs of the claim's evidence, always (possibly empty): one
-    // single-id call to the batched, per-evidence-row-filtered read, so a
-    // consumer needs no `get_provenance` to find them (backlog 43ab8c73).
-    let source_urls = EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &[id])
-        .await
-        .map_err(internal_error)?
-        .remove(&id)
-        .unwrap_or_default();
+    read.commit().await.map_err(internal_error)?;
 
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
@@ -1156,7 +1162,10 @@ pub async fn verify_claim(
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, claim_id)
+    // Every read below on ONE connection stamped with the caller's viewer
+    // (the plain pool's session sees public rows only).
+    let mut read = server.read_as(viewer, "verify_claim").await?;
+    let claim = ClaimRepository::get_by_id(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -1178,7 +1187,7 @@ pub async fn verify_claim(
         //
         // Second query, on this branch only: the matching case needs no
         // `properties` read at all, so the common path is unchanged.
-        let properties = ClaimRepository::get_properties(&server.pool, viewer, claim_id)
+        let properties = ClaimRepository::get_properties(&mut *read, viewer, claim_id)
             .await
             .map_err(internal_error)?
             .unwrap_or(serde_json::Value::Null);
@@ -1187,12 +1196,10 @@ pub async fn verify_claim(
             // workflow that executes it — recovered from the edge, not guessed.
             // On the caller's read: the executing `workflows` rows carry
             // their plan's tenancy (migration 183, ruling R-74).
-            let mut read = super::workflows::CallerRead::open(server, viewer).await?;
             let names =
-                epigraph_db::WorkflowRepository::executing_canonical_names(read.conn(), viewer, id)
+                epigraph_db::WorkflowRepository::executing_canonical_names(&mut *read, viewer, id)
                     .await
                     .map_err(internal_error)?;
-            read.close().await?;
             match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
                 &claim.content,
                 &claim.content_hash,
@@ -1223,12 +1230,13 @@ pub async fn verify_claim(
     // present and rejected" — both of which report `signature_valid = false`.
     let signed = claim.signature.is_some();
     let keys = if signed {
-        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&server.pool, viewer, id)
+        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&mut *read, viewer, id)
             .await
             .map_err(internal_error)?
     } else {
         Vec::new()
     };
+    read.commit().await.map_err(internal_error)?;
     let binding = crate::signing_identity::bind_signature(
         &claim.content_hash,
         claim.signature.as_ref(),
@@ -1313,16 +1321,25 @@ pub async fn update_with_evidence(
         }
         parse_uuid(params.claim_id.trim())?
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
-        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
-            .await
-            // `InvalidData` (every head of the step's lineage is retired) is
-            // the caller's to fix, not an internal error.
-            .map_err(crate::errors::db_caller_error)?
-            .ok_or_else(|| {
-                invalid_params(format!(
-                    "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
-                ))
-            })?
+        // On the caller's stamped read, not the plain pool: the step walk's
+        // claims and `executes` edges are tenancy-filtered, and an unstamped
+        // application session admits public rows only, so a group-private
+        // workflow's steps answered "no step" to the group's own members. The
+        // read is released before anything below takes a write transaction.
+        let mut read = server.read_as(viewer, "update_with_evidence").await?;
+        let resolved = epigraph_db::WorkflowRepository::resolve_step_claim_conn(
+            &mut read, viewer, name, idx, true,
+        )
+        .await
+        // `InvalidData` (every head of the step's lineage is retired) is
+        // the caller's to fix, not an internal error.
+        .map_err(crate::errors::db_caller_error)?;
+        drop(read);
+        resolved.ok_or_else(|| {
+            invalid_params(format!(
+                "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
+            ))
+        })?
     } else {
         return Err(invalid_params(
             "provide a claim to update: either `claim_id`, or both `canonical_name` and `step_index`",
@@ -2859,7 +2876,8 @@ pub async fn query_undecomposed_claims(
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let claims = ClaimRepository::list_undecomposed(&server.pool, viewer, limit, offset)
+    let mut read = server.read_as(viewer, "query_undecomposed_claims").await?;
+    let claims = ClaimRepository::list_undecomposed(&mut *read, viewer, limit, offset)
         .await
         .map_err(internal_error)?;
 
@@ -2872,9 +2890,10 @@ pub async fn query_undecomposed_claims(
     // does — not a hardcoded `[]` (drain unit U008, backlog `1e6efd2d`
     // residual).
     let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     // `looks_atomic`: the same heuristic `decompose_claims` skips on, so an
     // agent can tell the terminal-by-policy rows (U073, backlog `5e1debbc`)

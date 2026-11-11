@@ -58,8 +58,9 @@ pub async fn get_recall_events(
     let since = parse_opt_time(params.since.as_deref(), "since")?;
     let until = parse_opt_time(params.until.as_deref(), "until")?;
 
+    let mut read = server.read_as(viewer, "get_recall_events").await?;
     let rows = RecallEventRepository::list(
-        &server.pool,
+        &mut *read,
         viewer,
         agent_id,
         claim_id,

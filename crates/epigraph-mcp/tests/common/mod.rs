@@ -244,32 +244,61 @@ use serde_json::Value;
 /// `--agent-key`, which is what `main::select_signer` rung 3 produces. This is
 /// the strict-ownership configuration; `EpiGraphMcpFull::new` defaults
 /// `signer_identity_declared` to `true`.
+///
+/// # It carries a `ScopedPool`, as every deployed server does
+///
+/// A content-reading tool reads on `EpiGraphMcpFull::read_as`, which REFUSES on
+/// a server with no `ScopedPool` rather than reading on the plain pool (where
+/// row security admits public rows only). So this fixture attaches one, built
+/// LAZILY on `pool`'s own connect options
+/// (`ScopedPool::connect_lazy_for_tests`): the constructor stays synchronous
+/// for its ~190 call sites, and a test that never reads opens no extra
+/// connection. It connects as `pool` does, a `#[sqlx::test]` superuser, so it
+/// filters nothing: a test that must SEE row security builds its server on the
+/// application role instead (`tests/mcp_reads_are_stamped_app_role.rs`). A
+/// test of the refusal itself uses [`build_unscoped_test_server`].
 pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = lazy_scoped_pool(&pool);
+    build_scoped_test_server(pool, scoped)
+}
+
+/// [`build_test_server`] WITHOUT a `ScopedPool`: for the tests that assert a
+/// tool refuses on such a server. Nothing else should want it.
+pub fn build_unscoped_test_server(pool: PgPool) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
     EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
 }
 
-/// [`build_test_server`] plus the [`epigraph_db::ScopedPool`] that the canonical
-/// write path now REQUIRES.
+/// A `ScopedPool` on `pool`'s own connect options (same database, same role),
+/// connecting lazily. See [`build_test_server`].
+pub fn lazy_scoped_pool(pool: &PgPool) -> epigraph_db::ScopedPool {
+    epigraph_db::ScopedPool::connect_lazy_for_tests(
+        (*pool.connect_options()).clone(),
+        epigraph_db::SessionGucMode::Session,
+    )
+}
+
+/// The server with a CALLER-SUPPLIED [`epigraph_db::ScopedPool`], which both the
+/// canonical write path and every content read REQUIRE.
 ///
-/// # Why a second constructor rather than changing the first
+/// # Why a second constructor
 ///
 /// `submit_claim`, `memorize`, `batch_submit_claims` and `resolve_backlog_item`
 /// run their claim + trace + evidence + `update_trace_id` in ONE transaction
 /// stamped from the author's viewer, and `ScopedPool::begin_as` is the only thing
 /// that can open one. A server with no `ScopedPool` REFUSES those tools outright,
 /// deliberately — falling back to the unstamped pool is how a `42501` on
-/// `reasoning_traces` becomes a committed claim with no provenance. So a write
-/// test needs this; a read test does not, and making the ~230 `build_test_server`
-/// call sites async to give every one of them a pool they will not use would be
-/// churn with a running cost (each `ScopedPool::connect` opens its own
-/// connections).
+/// `reasoning_traces` becomes a committed claim with no provenance. Content reads
+/// refuse the same way (`EpiGraphMcpFull::read_as`). [`build_test_server`]
+/// attaches a lazily-connected pool on the fixture's own options; this form is
+/// for a test that chooses its pool (an application-role pool, a transaction-mode
+/// one, `fixture::scoped_pool`).
 ///
 /// # Why `scoped` is a PARAMETER and not built in here
 ///
-/// The pool has to come from `fixture::scoped_pool`, and this module cannot reach
-/// it. Two routes were tried and both are worse:
+/// A connected pool comes from `fixture::scoped_pool`, and this module cannot
+/// reach it. Two routes were tried and both are worse:
 ///
 /// * `#[path]`-including the canonical fixture here as well — MEASURED to fail
 ///   `clippy::duplicate_mod` under `-D warnings`, because every test binary that
@@ -322,11 +351,11 @@ pub fn build_scoped_test_server_generated_signer(
 ///
 /// This is what epiclaw agent containers run: the agent-runner spawns
 /// `epigraph-mcp --database-url <url>` over stdio with no key.
+///
+/// Carries a lazily-connected `ScopedPool`, for [`build_test_server`]'s reason.
 pub fn build_test_server_generated_signer(pool: PgPool) -> EpiGraphMcpFull {
-    let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
-        .with_generated_signer_identity()
+    let scoped = lazy_scoped_pool(&pool);
+    build_scoped_test_server_generated_signer(pool, scoped)
 }
 
 pub async fn seed_agent(pool: &PgPool) -> Uuid {
