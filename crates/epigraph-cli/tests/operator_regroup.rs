@@ -12,7 +12,8 @@
 //!   the only provenance of. Everything it carries moves with it.
 //! * B: `('group', SRC)`, linked to S (`('group', SRC)`, NOT listed, so it
 //!   stays) by a claim edge and by an evidence edge (B's evidence -> S's
-//!   evidence), and to a public claim P. B moves; the edges to S become
+//!   evidence), to a public claim P, and from a group-private workflow in SRC
+//!   (`executes`; the meet counts a workflow endpoint as public). B moves; the edges to S become
 //!   co-owned `(DST, group, co-owner SRC)`, readable only by a member of both.
 //! * The holds: N is `('group', H)` (not the source's); Q is sealed; R carries
 //!   an evidence row owned by H; V carries a PUBLIC evidence row; W carries
@@ -117,6 +118,8 @@ struct Fx {
     e_bs: Uuid,
     e_bp: Uuid,
     e_ev_bs: Uuid,
+    wf: Uuid,
+    e_wf_b: Uuid,
     n: Uuid,
     q: Uuid,
     r: Uuid,
@@ -282,6 +285,31 @@ async fn seed(pool: &PgPool) -> Fx {
     let e_bs = fixture::seed_edge(pool, b, s).await;
     let e_bp = fixture::seed_edge(pool, b, p).await;
     let e_ev_bs = evidence_edge(pool, ev_b, ev_s, src).await;
+    // A group-private workflow in SRC that executes B. The edges arm (and
+    // `epigraph_node_tenancy`) count a workflow endpoint as public, so the
+    // edge is B's meet: (SRC, group) now, (DST, group) once B moves; the
+    // workflow row itself is a node and is not touched.
+    let wf = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, owner_group_id, visibility) \
+         VALUES ($1, 'regroup-fixture-wf', 0, 'goal', $2, 'group')",
+    )
+    .bind(wf)
+    .bind(src)
+    .execute(pool)
+    .await
+    .expect("seed workflow");
+    let e_wf_b = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, 'workflow', $3, 'claim', 'executes')",
+    )
+    .bind(e_wf_b)
+    .bind(wf)
+    .bind(b)
+    .execute(pool)
+    .await
+    .expect("seed executes edge");
 
     // The holds.
     sqlx::query(
@@ -350,6 +378,8 @@ async fn seed(pool: &PgPool) -> Fx {
         e_bs,
         e_bp,
         e_ev_bs,
+        wf,
+        e_wf_b,
         n,
         q,
         r,
@@ -394,6 +424,7 @@ const SNAP_TABLES: &[&str] = &[
     "factors",
     "evidence_visibility_pins",
     "claim_encryption",
+    "workflows",
     "groups",
     "group_memberships",
     "agents",
@@ -786,6 +817,12 @@ async fn an_edge_to_a_claim_that_stays_in_source_becomes_co_owned(pool: PgPool) 
         edge(&pool, fx.e_bp).await,
         (fx.dst, "group".to_string(), None)
     );
+    assert_eq!(
+        edge(&pool, fx.e_wf_b).await,
+        (fx.dst, "group".to_string(), None),
+        "a workflow endpoint counts as public in the meet"
+    );
+    assert_eq!(row(&pool, "workflows", fx.wf).await, grp(fx.src));
     assert_eq!(row(&pool, "claims", fx.s).await, grp(fx.src));
     assert_eq!(row(&pool, "evidence", fx.ev_s).await, grp(fx.src));
     assert_eq!(row(&pool, "evidence", fx.ev_b).await, grp(fx.dst));
@@ -1034,6 +1071,12 @@ async fn apply_then_reverse_restores_every_row_byte_for_byte(pool: PgPool) {
     let rv = reverse(&pool, &[&mf], &[], true).await;
     assert_eq!(rv.code, 0, "{}", rv.show());
     assert!(rv.stdout.contains("claims restored: 2"), "{}", rv.show());
+    assert!(
+        rv.stdout
+            .contains("regroup manifests: 1 audit row(s) written"),
+        "{}",
+        rv.show()
+    );
     assert_same(&before, &snapshot(&pool, true).await, "apply then reverse");
     let audit = audit_rows(&pool).await;
     assert_eq!(

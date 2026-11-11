@@ -529,9 +529,15 @@ pub struct Report {
     /// an endpoint the manifest moved is not restored yet (held, or in a later
     /// batch); the batch that restores it restores the edge.
     pub edges_deferred: usize,
-    /// Restrict and regroup manifests: audit rows written (one per manifest
-    /// reversed under `--apply` that changed anything).
+    /// Restrict manifests: audit rows written (one per manifest reversed under
+    /// `--apply` that changed anything).
     pub restrict_audit_rows: usize,
+    /// Regroup manifests: audit rows written (one per manifest reversed under
+    /// `--apply` that changed anything).
+    pub regroup_audit_rows: usize,
+    /// Regroup manifests: recorded edges left on the meet of their current
+    /// endpoints because an endpoint the manifest moved is not restored.
+    pub regroup_edges_deferred: usize,
 }
 
 fn tally(
@@ -808,8 +814,23 @@ pub async fn run(
     if report.restrict_audit_rows > 0 {
         writeln!(
             out,
-            "  restrict/regroup manifests: {} audit row(s) written",
+            "  restrict manifests: {} audit row(s) written",
             report.restrict_audit_rows
+        )?;
+    }
+    if report.regroup_edges_deferred > 0 {
+        writeln!(
+            out,
+            "  regroup manifests: {} edge(s) left on the meet of their current endpoints because \
+             an endpoint the manifest moved is not restored (held)",
+            report.regroup_edges_deferred
+        )?;
+    }
+    if report.regroup_audit_rows > 0 {
+        writeln!(
+            out,
+            "  regroup manifests: {} audit row(s) written",
+            report.regroup_audit_rows
         )?;
     }
     if report.missing_rows > 0 {

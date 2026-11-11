@@ -2053,8 +2053,8 @@ pub async fn reverse_manifest(
             }
         }
     }
-    report.restrict_audit_rows += usize::from(audited);
-    report.edges_deferred += still_deferred.len();
+    report.regroup_audit_rows += usize::from(audited);
+    report.regroup_edges_deferred += still_deferred.len();
     Ok(true)
 }
 
