@@ -631,7 +631,7 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document",
+        "do_ingest_document_reporting",
         5,
         Signed,
     ),
