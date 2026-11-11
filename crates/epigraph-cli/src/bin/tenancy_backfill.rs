@@ -2813,6 +2813,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_share_claims_with_team",
             "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
             true,
+        ),
         // 207: the bug-report intake's two definers run on the request DSN
         // (MCP submit_bug_report / list_my_bug_reports), so both are
         // app-callable; a missing grant refuses every report (42501).
