@@ -13,8 +13,10 @@
 //! * B: `('group', SRC)`, linked to S (`('group', SRC)`, NOT listed, so it
 //!   stays) by a claim edge and by an evidence edge (B's evidence -> S's
 //!   evidence), to a public claim P, and from a group-private workflow in SRC
-//!   (`executes`; the meet counts a workflow endpoint as public). B moves; the edges to S become
-//!   co-owned `(DST, group, co-owner SRC)`, readable only by a member of both.
+//!   (`executes`). B moves; the edges to S become co-owned `(DST, group,
+//!   co-owner SRC)`, readable only by a member of both, and so does the edge
+//!   from the workflow, which the tool meets with the workflow's own tuple
+//!   (`(SRC, group, co-owner DST)`) where the trigger would count it public.
 //! * The holds: N is `('group', H)` (not the source's); Q is sealed; R carries
 //!   an evidence row owned by H; V carries a PUBLIC evidence row; W carries
 //!   PINNED evidence; E carries an edge to P DECLARED co-owned by H (the move's
@@ -287,8 +289,9 @@ async fn seed(pool: &PgPool) -> Fx {
     let e_ev_bs = evidence_edge(pool, ev_b, ev_s, src).await;
     // A group-private workflow in SRC that executes B. The edges arm (and
     // `epigraph_node_tenancy`) count a workflow endpoint as public, so the
-    // edge is B's meet: (SRC, group) now, (DST, group) once B moves; the
-    // workflow row itself is a node and is not touched.
+    // trigger stamps B's tuple, (SRC, group). Once B moves, the tool writes
+    // the exact meet, (SRC, group, co-owner DST); the workflow row itself is a
+    // node and is not touched.
     let wf = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO workflows (id, canonical_name, generation, goal, owner_group_id, visibility) \
@@ -677,6 +680,22 @@ async fn a_dry_run_writes_nothing_and_reports_holds_and_co_owned_edges(pool: PgP
         r.show()
     );
     assert!(r.stdout.contains("co-owned edges: 2"), "{}", r.show());
+    // The edge from SRC's workflow is reported on its own line.
+    assert!(
+        has_line(
+            &r.stdout,
+            "SOURCE-NODE-EDGE\t",
+            &[
+                &fx.e_wf_b.to_string(),
+                "workflow",
+                &fx.wf.to_string(),
+                "source group"
+            ]
+        ),
+        "no SOURCE-NODE-EDGE line for the workflow edge\n{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("source-node edges: 1"), "{}", r.show());
     assert!(r.stdout.contains("claims moved: 2"), "{}", r.show());
     assert!(
         r.stdout.contains("audit row: none (dry run)"),
@@ -819,8 +838,28 @@ async fn an_edge_to_a_claim_that_stays_in_source_becomes_co_owned(pool: PgPool) 
     );
     assert_eq!(
         edge(&pool, fx.e_wf_b).await,
-        (fx.dst, "group".to_string(), None),
-        "a workflow endpoint counts as public in the meet"
+        (fx.src, "group".to_string(), Some(fx.dst)),
+        "the edge from SRC's workflow takes the exact meet (the workflow is its source end)"
+    );
+    assert!(
+        has_line(
+            &r.stdout,
+            "SOURCE-NODE-EDGE\t",
+            &[&fx.e_wf_b.to_string(), "workflow", "source group"]
+        ),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("source-node edges: 1"), "{}", r.show());
+    assert!(reads_as(&pool, &[fx.src], "edges", &[fx.e_wf_b])
+        .await
+        .is_empty());
+    assert!(reads_as(&pool, &[fx.dst], "edges", &[fx.e_wf_b])
+        .await
+        .is_empty());
+    assert_eq!(
+        reads_as(&pool, &[fx.src, fx.dst], "edges", &[fx.e_wf_b]).await,
+        vec![fx.e_wf_b]
     );
     assert_eq!(row(&pool, "workflows", fx.wf).await, grp(fx.src));
     assert_eq!(row(&pool, "claims", fx.s).await, grp(fx.src));
@@ -1383,4 +1422,437 @@ async fn claims_a_restriction_put_in_source_regroup_and_both_acts_reverse(pool: 
     let rv = reverse(&pool, &[&m_restrict, &m_regroup], &[], true).await;
     assert_eq!(rv.code, 0, "{}", rv.show());
     assert_same(&before, &snapshot(&pool, true).await, "both acts reversed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edges to nodes with their own tenancy (workflow, frame, context,
+// perspective, community)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Insert a node of entity type `ty` owned by `(owner, visibility)`.
+async fn seed_node(pool: &PgPool, ty: &str, owner: Uuid, visibility: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let name = format!("regroup-node-{id}");
+    let sql = match ty {
+        "workflow" => {
+            "INSERT INTO workflows (id, canonical_name, generation, goal, owner_group_id, \
+                                    visibility) VALUES ($1, $2, 0, 'goal', $3, $4)"
+        }
+        "frame" => {
+            "INSERT INTO frames (id, name, hypotheses, owner_group_id, visibility) \
+             VALUES ($1, $2, ARRAY['a','b'], $3, $4)"
+        }
+        "context" => {
+            "INSERT INTO contexts (id, name, context_type, owner_group_id, visibility) \
+             VALUES ($1, $2, 'domain', $3, $4)"
+        }
+        "perspective" => {
+            "INSERT INTO perspectives (id, name, owner_group_id, visibility) \
+             VALUES ($1, $2, $3, $4)"
+        }
+        "community" => {
+            "INSERT INTO communities (id, name, owner_group_id, visibility) \
+             VALUES ($1, $2, $3, $4)"
+        }
+        other => panic!("no seeder for node type {other}"),
+    };
+    sqlx::query(sql)
+        .bind(id)
+        .bind(&name)
+        .bind(owner)
+        .bind(visibility)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed {ty}: {e}"));
+    id
+}
+
+/// An edge between `(a, a_ty)` and `(b, b_ty)`, stamped by the trigger.
+async fn typed_edge(pool: &PgPool, a: Uuid, a_ty: &str, b: Uuid, b_ty: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, $5, 'relates_to')",
+    )
+    .bind(id)
+    .bind(a)
+    .bind(a_ty)
+    .bind(b)
+    .bind(b_ty)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("seed {a_ty} -> {b_ty} edge: {e}"));
+    id
+}
+
+/// A fresh SRC claim C linked to a SRC-private node of type `ty` (the node is
+/// the edge's source end when `node_first`). The trigger counts the node as
+/// public, so the edge starts on C's tuple. Regrouping C writes the EXACT meet
+/// (co-owned by SRC through the node), reports it as a SOURCE-NODE-EDGE, and
+/// neither a SRC-only nor a DST-only reader reads it; reversing puts every
+/// row back byte for byte.
+async fn a_source_node_edge_is_co_owned_and_reported(pool: PgPool, ty: &str, node_first: bool) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, linked to a node").await;
+    let table = row_table(ty);
+    let node = seed_node(&pool, ty, fx.src, "group").await;
+    let e = if node_first {
+        typed_edge(&pool, node, ty, c, "claim").await
+    } else {
+        typed_edge(&pool, c, "claim", node, ty).await
+    };
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.src, "group".to_string(), None),
+        "the trigger counts the {ty} as public"
+    );
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let want = if node_first {
+        (fx.src, "group".to_string(), Some(fx.dst))
+    } else {
+        (fx.dst, "group".to_string(), Some(fx.src))
+    };
+    assert_eq!(edge(&pool, e).await, want, "{ty} edge\n{}", r.show());
+    assert!(
+        has_line(
+            &r.stdout,
+            "SOURCE-NODE-EDGE\t",
+            &[&e.to_string(), ty, &node.to_string(), "source group"]
+        ),
+        "no SOURCE-NODE-EDGE line for the {ty} edge\n{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("source-node edges: 1"), "{}", r.show());
+    assert!(r.stdout.contains("co-owned edges: 0"), "{}", r.show());
+    assert!(reads_as(&pool, &[fx.src], "edges", &[e]).await.is_empty());
+    assert!(reads_as(&pool, &[fx.dst], "edges", &[e]).await.is_empty());
+    assert_eq!(
+        reads_as(&pool, &[fx.src, fx.dst], "edges", &[e]).await,
+        vec![e]
+    );
+    assert_eq!(row(&pool, table, node).await, grp(fx.src), "the node moved");
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.dst));
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, true).await, "node edge reversed");
+    assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+}
+
+fn row_table(ty: &str) -> &'static str {
+    match ty {
+        "workflow" => "workflows",
+        "frame" => "frames",
+        "context" => "contexts",
+        "perspective" => "perspectives",
+        "community" => "communities",
+        other => panic!("no table for {other}"),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_workflow_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "workflow", true).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_frame_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "frame", false).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_context_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "context", true).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_perspective_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "perspective", false).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_community_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "community", true).await;
+}
+
+/// A reasoning trace is an entity type with its own tenancy that FOLLOWS its
+/// claim. An edge from C to C's own trace ends on the target alone (both ends
+/// move, and nothing is reported); an edge from the trace of S2, which stays
+/// in SRC, to C is co-owned and reported. The reversal puts both back byte
+/// for byte: C's trace comes back with C, so the first edge's recorded tuple
+/// is no wider than its endpoints.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_trace_edge_takes_the_exact_meet(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, with a trace").await;
+    let s2 = fixture::seed_group_claim(&pool, fx.operator, fx.src, "S2: SRC, stays").await;
+    let trace_c = fixture::seed_reasoning_trace(&pool, c, "deductive").await;
+    let trace_s2 = fixture::seed_reasoning_trace(&pool, s2, "deductive").await;
+    let e_own = typed_edge(&pool, c, "claim", trace_c, "trace").await;
+    let e_other = typed_edge(&pool, trace_s2, "trace", c, "claim").await;
+    for e in [e_own, e_other] {
+        assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+    }
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "reasoning_traces", trace_c).await, grp(fx.dst));
+    assert_eq!(row(&pool, "reasoning_traces", trace_s2).await, grp(fx.src));
+    assert_eq!(
+        edge(&pool, e_own).await,
+        (fx.dst, "group".to_string(), None)
+    );
+    assert_eq!(
+        edge(&pool, e_other).await,
+        (fx.src, "group".to_string(), Some(fx.dst))
+    );
+    assert!(
+        has_line(
+            &r.stdout,
+            "SOURCE-NODE-EDGE\t",
+            &[
+                &e_other.to_string(),
+                "trace",
+                &trace_s2.to_string(),
+                "source group"
+            ]
+        ),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("source-node edges: 1"), "{}", r.show());
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "trace edges reversed",
+    );
+}
+
+/// The node types the tool meets by their own row are exactly the entity
+/// types (other than claim and evidence) whose table has tenancy columns at
+/// head, and every one of them has a test above. A type that gains tenancy
+/// columns fails here until it is covered.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_node_types_are_every_tenanted_entity_type(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.lines().any(|l| l.starts_with(
+            "NODE-TYPES\tcommunity=communities,context=contexts,frame=frames,\
+             perspective=perspectives,trace=reasoning_traces,workflow=workflows\t"
+        )),
+        "{}",
+        r.show()
+    );
+}
+
+/// An edge to a PUBLIC node goes to the target alone (the node requires no
+/// group) and is not reported.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_to_a_public_node_goes_to_the_target(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c =
+        fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, linked to a frame").await;
+    let e = typed_edge(&pool, c, "claim", fx.frame, "frame").await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(edge(&pool, e).await, (fx.dst, "group".to_string(), None));
+    assert!(
+        !r.stdout
+            .lines()
+            .any(|l| l.starts_with("SOURCE-NODE-EDGE\t")),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("source-node edges: 0"), "{}", r.show());
+}
+
+/// An edge to a node of a THIRD group is met with that group (it keeps
+/// requiring it) and reported. Its recorded prior, the claim's tuple alone,
+/// was already wider than the node: the reversal will not write it back and
+/// holds the claim instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c =
+        fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, run by H's workflow").await;
+    let wf = seed_node(&pool, "workflow", fx.h_group, "group").await;
+    let e = typed_edge(&pool, wf, "workflow", c, "claim").await;
+    assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.h_group, "group".to_string(), Some(fx.dst))
+    );
+    assert!(
+        has_line(
+            &r.stdout,
+            "SOURCE-NODE-EDGE\t",
+            &[&e.to_string(), &format!("group {}", fx.h_group)]
+        ),
+        "{}",
+        r.show()
+    );
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&c.to_string(), &e.to_string(), "widen"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.dst));
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.h_group, "group".to_string(), Some(fx.dst))
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sealed evidence, a moved evidence endpoint, a concurrent edge insert
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An evidence edge from B's evidence to the evidence of a claim S2 that is
+/// not in the manifest: the neighbour watch sees only claim endpoints, so S2
+/// moving on to H after the act is invisible to it, and the edge itself is
+/// still on its post tuple. Writing its recorded `(SRC, group)` back would let
+/// SRC-only members read an edge to H-private evidence; the reversal checks
+/// the recorded tuple against the meet of the endpoints after the restore and
+/// holds B.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reversal_holds_an_edge_whose_evidence_endpoint_moved_since(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let s2 = fixture::seed_group_claim(&pool, fx.operator, fx.src, "S2: SRC, not listed").await;
+    let ev_s2 = evidence(&pool, s2, "S2's evidence").await;
+    let e = evidence_edge(&pool, fx.ev_b, ev_s2, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.b]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let post = (fx.dst, "group".to_string(), Some(fx.src));
+    assert_eq!(edge(&pool, e).await, post);
+    exec(
+        &pool,
+        "UPDATE claims SET owner_group_id = $2 WHERE id = $1",
+        &[s2, fx.h_group],
+    )
+    .await;
+    assert_eq!(row(&pool, "evidence", ev_s2).await, grp(fx.h_group));
+    assert_eq!(
+        edge(&pool, e).await,
+        post,
+        "the trigger does not re-meet it"
+    );
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&fx.b.to_string(), &e.to_string(), "widen"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.dst));
+    assert_eq!(edge(&pool, e).await, post);
+    assert!(reads_as(&pool, &[fx.src], "edges", &[e]).await.is_empty());
 }

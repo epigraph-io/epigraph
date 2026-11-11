@@ -50,13 +50,33 @@
 //! * a fragment the claim shares with a claim that does not end in the target
 //!   is a NODE: the cascade narrows it and this tool puts it back, in the same
 //!   transaction, as `restrict-claims` does;
-//! * an edge takes the MEET of its endpoints, exactly as on INSERT. An edge
-//!   whose other end stays in the source becomes `('group', TARGET, co-owner
-//!   SOURCE)` (or `(SOURCE, group, co-owner TARGET)` when the source end is its
-//!   source), readable only by a member of both. Every such edge is reported
+//! * an edge takes the EXACT MEET of its endpoints: the INSERT rule, applied
+//!   to what each endpoint is. An edge whose other end is a claim or evidence
+//!   that stays in the source becomes `('group', TARGET, co-owner SOURCE)` (or
+//!   `(SOURCE, group, co-owner TARGET)` when the source end is its source),
+//!   readable only by a member of both. Every such edge is reported
 //!   (`CO-OWNED-EDGE` lines and a count).
+//! * an edge whose other end is a NODE with its own tenancy (at head: a
+//!   workflow, frame, context, perspective, community or reasoning trace;
+//!   every entity type whose table has `owner_group_id` and `visibility`, read
+//!   from the schema at start and printed as `NODE-TYPES`) is met with the
+//!   node's OWN tuple (a reasoning trace that follows a moved claim counts as
+//!   moved).
+//!   `epigraph_node_tenancy` (070), and so the trigger, count such a node as
+//!   public: left alone, the trigger would put an edge from a source-private
+//!   workflow on `('group', TARGET)` alone, which source-only members lose and
+//!   target-only members gain while it names a workflow they cannot read. The
+//!   tool writes the exact meet instead (co-owned with the node's group) and
+//!   reports every edge to a group-private node that is not the target's
+//!   (`SOURCE-NODE-EDGE` lines and a count). A public node, or one in the
+//!   target, contributes nothing, so such an edge goes to the target alone.
 //! * an edge with an EVIDENCE endpoint is not re-met by the trigger; this tool
 //!   writes the meet itself, in the same transaction, and records it.
+//!
+//! The exact meet of a node edge is not what the trigger derives: a later act
+//! that re-tenants the claim again (another regroup, a restriction, the
+//! privatization pipeline's edge re-meet) puts it back on the tenancy-less
+//! meet. The reversal of THIS act checks it (below).
 //!
 //! An edge is accepted only when its new meet is at least as narrow as its
 //! current tuple with the source replaced by the target; otherwise it holds
@@ -93,10 +113,13 @@
 //! compare-and-swap per claim: a claim is restored only while it is still in
 //! the state this run left it; a recorded row that is in neither its prior nor
 //! its post state (nor the meet a partial reversal leaves an edge on), a row
-//! written after the act (the cascade would carry it into the source), or a
-//! neighbour that moved since, HOLDS the claim. An edge is put back on its
-//! recorded tuple only once every endpoint this manifest moved is back; until
-//! then it carries the meet of its current endpoints. One
+//! written after the act (the cascade would carry it into the source), a
+//! neighbour that moved since, or an edge whose
+//! recorded tuple would be WIDER than the exact meet of its endpoints after
+//! the restore (an endpoint the neighbour watch does not cover moved: a
+//! foreign claim's evidence, a node), HOLDS the claim. An edge is put back on
+//! its recorded tuple only once every endpoint this manifest moved is back;
+//! until then it carries the meet of its current endpoints. One
 //! `privatization.cli_regroup_reverse` row per reversed manifest.
 //!
 //! # Exit codes
@@ -109,8 +132,9 @@ use super::manifest::{self, Record, Sink, Writer};
 use super::reown::{counter_delta, counter_violations, BatchError};
 use super::restrict::{
     claim_record, edge_ends, edge_ids, evidence_ids, fetch_evidence_edges, is_outsider_challenge,
-    meet, operator_details, pinned_of, reader_groups, record_of, sealed_of, sha256_file,
-    sha256_hex, spec_of, states_of, unenforced_reasons, write_audit, write_rows, RowState,
+    meet, narrows, operator_details, pinned_of, reader_groups, record_of, sealed_of, sha256_file,
+    sha256_hex, spec_of, states_of, unenforced_reasons, write_audit, write_rows, EdgeEnds,
+    RowState,
 };
 use super::tables::{
     self, app_readable, app_readable_as, fetch_attached, fetch_claims, xact_counters, Attached,
@@ -358,6 +382,114 @@ fn model_readable(
     out
 }
 
+/// The edge-endpoint types, other than `claim` and `evidence`, whose backing
+/// table carries its own `(owner_group_id, visibility)`: entity type -> table.
+///
+/// `epigraph_node_tenancy` (070) answers `('public', world)` for every type but
+/// claim and evidence, so the trigger's meet treats such a node as public even
+/// when the row itself is group-private (a workflow, migration 183; a frame,
+/// context, perspective or community, migration 062; a reasoning trace, which
+/// follows its claim). Read from the schema,
+/// not from `entity_types.tenancy_tier` (which still says `derived` for
+/// `workflow`), so a type that gains tenancy columns later is covered.
+pub type NodeTypes = BTreeMap<String, String>;
+
+fn is_plain_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// [`NodeTypes`], read from `entity_types` and `information_schema`.
+///
+/// # Errors
+/// The read fails, or a registered table name is not a plain identifier.
+pub async fn node_types(conn: &mut PgConnection) -> anyhow::Result<NodeTypes> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT et.type_name::text, et.table_name::text FROM public.entity_types et \
+          WHERE et.type_name NOT IN ('claim', 'evidence') \
+            AND et.table_name IS NOT NULL AND et.schema_name = 'public' \
+            AND EXISTS (SELECT 1 FROM information_schema.columns c \
+                         WHERE c.table_schema = 'public' AND c.table_name = et.table_name \
+                           AND c.column_name = 'owner_group_id') \
+            AND EXISTS (SELECT 1 FROM information_schema.columns c \
+                         WHERE c.table_schema = 'public' AND c.table_name = et.table_name \
+                           AND c.column_name = 'visibility') \
+          ORDER BY 1",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .context("reading the tenanted edge-endpoint types")?;
+    for (ty, t) in &rows {
+        if !is_plain_ident(t) {
+            bail!("entity type {ty} names table {t:?}, which is not a plain identifier; refusing");
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
+/// `restrict::edge_ends`, with every endpoint of a [`NodeTypes`] type read
+/// from its OWN row instead of `epigraph_node_tenancy`'s public answer: the
+/// exact meet of what the two endpoints are. A node row that is gone keeps
+/// the oracle's answer.
+async fn ends_of(
+    conn: &mut PgConnection,
+    nodes: &NodeTypes,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeMap<String, EdgeEnds>> {
+    let mut ends = edge_ends(conn, ids).await?;
+    let mut by_type: BTreeMap<String, BTreeSet<Uuid>> = BTreeMap::new();
+    for e in ends.values() {
+        for (id, ty) in [&e.source, &e.target] {
+            if nodes.contains_key(ty) {
+                by_type.entry(ty.clone()).or_default().insert(*id);
+            }
+        }
+    }
+    let mut own: BTreeMap<(String, Uuid), (Uuid, String)> = BTreeMap::new();
+    for (ty, idset) in by_type {
+        let v: Vec<Uuid> = idset.into_iter().collect();
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
+            "SELECT id, owner_group_id, visibility::text FROM public.\"{}\" WHERE id = ANY($1)",
+            nodes[&ty]
+        ))
+        .bind(&v)
+        .fetch_all(&mut *conn)
+        .await
+        .with_context(|| format!("reading the tenancy of {ty} endpoints"))?;
+        for (id, o, vis) in rows {
+            own.insert((ty.clone(), id), (o, vis));
+        }
+    }
+    for e in ends.values_mut() {
+        if let Some(st) = own.get(&(e.source.1.clone(), e.source.0)) {
+            e.source_state = st.clone();
+        }
+        if let Some(st) = own.get(&(e.target.1.clone(), e.target.0)) {
+            e.target_state = st.clone();
+        }
+    }
+    Ok(ends)
+}
+
+/// A node `(id, type)` or a state `(owner, visibility)`.
+type Pair = (Uuid, String);
+
+/// The endpoint of `e` that is a [`NodeTypes`] node, with its own state.
+fn node_end<'e>(nodes: &NodeTypes, e: &'e EdgeEnds) -> Option<(&'e Pair, &'e Pair)> {
+    if nodes.contains_key(&e.source.1) {
+        Some((&e.source, &e.source_state))
+    } else if nodes.contains_key(&e.target.1) {
+        Some((&e.target, &e.target_state))
+    } else {
+        None
+    }
+}
+
 /// The source and target groups and the operator, checked. Returns the
 /// target's kind.
 ///
@@ -431,6 +563,7 @@ struct Known {
 struct Ctx<'a> {
     specs: &'a [TableSpec],
     unkeyed: &'a [String],
+    nodes: &'a NodeTypes,
     source: Uuid,
     target: Uuid,
     lock_timeout: &'a str,
@@ -440,7 +573,6 @@ struct Ctx<'a> {
 /// The row-level classification of a set of candidate claims.
 struct Classified {
     attached: Snapshot,
-    ev_edge_keys: BTreeSet<RowKey>,
     pinned: BTreeSet<String>,
     already_in_target: BTreeSet<Uuid>,
     hold: BTreeMap<Uuid, Hold>,
@@ -475,10 +607,9 @@ async fn classify_rows(
         .collect();
     let claim_edge_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
     let ev_edges = fetch_evidence_edges(conn, &ev_claim, cands, &claim_edge_keys).await?;
-    let ev_edge_keys: BTreeSet<RowKey> = ev_edges.keys().cloned().collect();
     attached.extend(ev_edges);
     let keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
-    let ends = edge_ends(conn, &edge_ids(&keys)).await?;
+    let ends = ends_of(conn, ctx.nodes, &edge_ids(&keys)).await?;
     let frag_neighbours: Vec<Uuid> = attached
         .values()
         .filter(|a| a.table == "harvester_fragments")
@@ -494,7 +625,6 @@ async fn classify_rows(
         .collect();
     let mut cl = Classified {
         attached: Snapshot::new(),
-        ev_edge_keys,
         pinned,
         already_in_target,
         hold: BTreeMap::new(),
@@ -507,7 +637,11 @@ async fn classify_rows(
                 attached.contains_key(&("evidence".to_string(), pk.clone()))
                     && !cl.pinned.contains(&pk)
             }
-            _ => false,
+            // A node row that follows a candidate (a reasoning trace).
+            other => ctx
+                .nodes
+                .get(other)
+                .is_some_and(|t| attached.contains_key(&(t.clone(), id.to_string()))),
         }
     };
     let in_target = (ctx.target, GROUP.to_string());
@@ -642,6 +776,9 @@ pub struct BatchOutcome {
     pub already: usize,
     pub post_rows: BTreeMap<RowKey, RowState>,
     pub co_owned: Vec<String>,
+    /// `SOURCE-NODE-EDGE` lines: an edge to a group-private node (not the
+    /// target's) that keeps requiring the node's group.
+    pub node_edges: Vec<String>,
     pub sample: Vec<String>,
     pub audit_written: bool,
 }
@@ -807,31 +944,45 @@ async fn run_batch(
     )
     .await?;
 
-    // The evidence-endpoint edges: the meet of their endpoints NOW.
-    let ev_keys: BTreeSet<RowKey> = keys.intersection(&cl.ev_edge_keys).cloned().collect();
-    let ends_ev = edge_ends(conn, &edge_ids(&ev_keys)).await?;
-    let mut ev_writes: Vec<(String, RowState)> = Vec::new();
-    for k in &ev_keys {
-        let (Some(a), Some(e)) = (s0.get(k), ends_ev.get(&k.1)) else {
+    // Every edge: the EXACT meet of its endpoints now. The trigger re-met the
+    // claim-endpoint edges, but with a node endpoint (a workflow, a frame...)
+    // counted as public; it does not re-meet evidence-endpoint edges at all.
+    // Both are written here; an edge the trigger already put on its exact
+    // meet is not written again.
+    let edge_keys: BTreeSet<RowKey> = keys.iter().filter(|k| k.0 == "edges").cloned().collect();
+    let mid_edges = states_of(conn, ctx.specs, &claim_ids, &edge_keys).await?;
+    let ends_mid = ends_of(conn, ctx.nodes, &edge_ids(&edge_keys)).await?;
+    let mut edge_writes: Vec<(String, RowState)> = Vec::new();
+    let mut trigger_edges = 0i64;
+    for k in &edge_keys {
+        let (Some(a), Some(cur)) = (s0.get(k), mid_edges.get(k)) else {
             continue;
         };
-        if let Some(m) = meet(&e.source_state, &e.target_state) {
-            if m != a.tenancy {
-                ev_writes.push((
-                    k.1.clone(),
-                    RowState {
-                        tenancy: m,
-                        writer_owned: None,
-                    },
-                ));
-            }
+        if cur.tenancy != a.tenancy {
+            trigger_edges += 1;
+        }
+        let Some(m) = ends_mid
+            .get(&k.1)
+            .and_then(|e| meet(&e.source_state, &e.target_state))
+        else {
+            continue;
+        };
+        if m != cur.tenancy {
+            edge_writes.push((
+                k.1.clone(),
+                RowState {
+                    tenancy: m,
+                    writer_owned: None,
+                },
+            ));
         }
     }
-    write_rows(conn, spec_of(ctx.specs, "edges"), &claim_ids, &ev_writes).await?;
+    let edges_written =
+        write_rows(conn, spec_of(ctx.specs, "edges"), &claim_ids, &edge_writes).await?;
 
     let s2 = states_of(conn, ctx.specs, &claim_ids, &keys).await?;
     let after_claims = fetch_claims(conn, &claim_ids, false).await?;
-    let ends = edge_ends(conn, &edge_ids(&keys)).await?;
+    let ends = ends_of(conn, ctx.nodes, &edge_ids(&keys)).await?;
     let counters_after = xact_counters(conn).await?;
     let views_after = three_views(conn, ctx, &claim_ids, &keys).await?;
 
@@ -891,6 +1042,12 @@ async fn run_batch(
             "rows changed per table {actual:?} differ from rows planned {planned:?}"
         ));
     }
+    if usize::try_from(edges_written).ok() != Some(edge_writes.len()) {
+        v.push(format!(
+            "the edge meet write changed {edges_written} row(s), {} were planned",
+            edge_writes.len()
+        ));
+    }
     let mut expect_counts: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     expect_counts.insert(
         "claims".into(),
@@ -902,8 +1059,14 @@ async fn run_batch(
             .or_default()
             .1 += 2 * i64::try_from(nodes_restored).unwrap_or(i64::MAX);
     }
-    for (t, n) in &planned {
+    for (t, n) in planned.iter().filter(|(t, _)| t.as_str() != "edges") {
         expect_counts.entry(t.clone()).or_default().1 += i64::try_from(*n).unwrap_or(i64::MAX);
+    }
+    // An edge row is updated once by the trigger (when it changed it) and once
+    // by the meet write (when it wrote it).
+    let edge_updates = trigger_edges + i64::try_from(edges_written).unwrap_or(i64::MAX);
+    if edge_updates > 0 {
+        expect_counts.entry("edges".into()).or_default().1 += edge_updates;
     }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
@@ -981,12 +1144,37 @@ async fn run_batch(
     }
     sink.record_post(&post)?;
 
-    // ---- the co-owned edges (every one), and the sample ----
+    // ---- the co-owned edges (every one), the node edges, and the sample ----
     for (k, st) in s2.iter().filter(|(k, _)| k.0 == "edges") {
-        let Some(co) = st.tenancy.co_owner else {
+        let Some(e) = ends.get(&k.1) else {
             continue;
         };
-        let Some(e) = ends.get(&k.1) else {
+        if let Some((node, node_state)) = node_end(ctx.nodes, e) {
+            // A group-private node that is not the target's: the edge keeps
+            // requiring that node's group, so it is narrower than the claim.
+            if node_state.1 == GROUP && node_state.0 != ctx.target {
+                let label = if node_state.0 == ctx.source {
+                    "source group".to_string()
+                } else {
+                    format!("group {}", node_state.0)
+                };
+                out.node_edges.push(format!(
+                    "SOURCE-NODE-EDGE\t{}\tclaim {}\t{} -> {}\t{} {} ({}, {}): {label}\t\
+                     readable only by a member of every group the tuple names",
+                    k.1,
+                    s0.get(k).map_or(Uuid::nil(), |a| a.claim),
+                    s0.get(k)
+                        .map_or_else(|| "?".to_string(), |a| RowState::of(a).to_string()),
+                    st,
+                    node.1,
+                    node.0,
+                    node_state.0,
+                    node_state.1,
+                ));
+            }
+            continue;
+        }
+        let Some(co) = st.tenancy.co_owner else {
             continue;
         };
         let moved_end = |n: &(Uuid, String)| match n.1.as_str() {
@@ -1054,6 +1242,7 @@ pub struct RunReport {
     pub claims_moved: usize,
     pub moved_by_table: BTreeMap<String, usize>,
     pub co_owned_edges: usize,
+    pub source_node_edges: usize,
     pub manifest_rows: usize,
     pub audit_written: bool,
 }
@@ -1150,6 +1339,7 @@ pub async fn run(
         );
     }
     let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
+    let nodes = node_types(conn).await?;
     tables::probe_session_switch(conn).await?;
     let guard = super::hide::guard_status(conn).await?;
     if !guard.complete() {
@@ -1169,6 +1359,7 @@ pub async fn run(
     let ctx = Ctx {
         specs: &specs,
         unkeyed: &unkeyed,
+        nodes: &nodes,
         source: opts.source,
         target: opts.target,
         lock_timeout: &opts.lock_timeout,
@@ -1214,10 +1405,21 @@ pub async fn run(
     }
     writeln!(
         out,
+        "NODE-TYPES\t{}\t(edge endpoints with their own tenancy: the meet reads the node's own row)",
+        nodes
+            .iter()
+            .map(|(ty, t)| format!("{ty}={t}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )?;
+    writeln!(
+        out,
         "RULE: every row that follows a moved claim goes from ('group', source) to ('group', \
-         target); an edge takes the meet of its endpoints (one that stays in the source makes it \
-         co-owned); a shared fragment and an outsider's challenge stay as they are; a claim with \
-         a public, pinned or third-group row is HELD whole; nothing becomes public"
+         target); an edge takes the exact meet of its endpoints (an end that stays in the source, \
+         a claim or evidence (CO-OWNED-EDGE) or a group-private node such as a workflow or frame \
+         (SOURCE-NODE-EDGE), makes it co-owned); a shared fragment and an outsider's challenge \
+         stay as they are; a claim with a public, pinned or third-group row is \
+         HELD whole; nothing becomes public"
     )?;
 
     if opts.apply {
@@ -1294,6 +1496,7 @@ pub async fn run(
     let total = batches.len();
     let mut sampled = 0usize;
     let mut co_owned: Vec<String> = Vec::new();
+    let mut node_edges: BTreeMap<String, String> = BTreeMap::new();
     for (i, batch) in batches.iter().enumerate() {
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let audit =
@@ -1324,6 +1527,10 @@ pub async fn run(
                 }
                 sampled += b.sample.iter().filter(|l| l.contains("\tclaims\t")).count();
                 co_owned.extend(b.co_owned);
+                for l in b.node_edges {
+                    let id = l.split('\t').nth(1).unwrap_or_default().to_string();
+                    node_edges.insert(id, l);
+                }
                 writeln!(
                     out,
                     "BATCH {}/{total}\tOK\t{} claim(s) moved",
@@ -1360,6 +1567,10 @@ pub async fn run(
     for l in last.values() {
         writeln!(out, "{l}")?;
     }
+    report.source_node_edges = node_edges.len();
+    for l in node_edges.values() {
+        writeln!(out, "{l}")?;
+    }
     report.manifest_rows = sink.len();
     for (id, h) in &report.held_under_lock {
         writeln!(out, "HELD-UNDER-LOCK\t{id}\t{}\t{h}", h.code())?;
@@ -1373,6 +1584,12 @@ pub async fn run(
         out,
         "  co-owned edges: {} (an edge whose other end is not in the target)",
         report.co_owned_edges
+    )?;
+    writeln!(
+        out,
+        "  source-node edges: {} (an edge to a group-private node of a NODE-TYPES type that \
+         is not the target's; it stays co-owned with that node's group)",
+        report.source_node_edges
     )?;
     writeln!(out, "  manifest row records: {}", report.manifest_rows)?;
     writeln!(
@@ -1439,6 +1656,7 @@ const NEWER_FIRST: &str = "if a NEWER run moved it, reverse that manifest first 
 struct RevCtx<'a> {
     specs: &'a [TableSpec],
     unkeyed: &'a [String],
+    nodes: &'a NodeTypes,
     res: &'a super::reverse::Resolved,
     source: Uuid,
     lock_timeout: &'a str,
@@ -1457,6 +1675,7 @@ async fn reverse_batch(
     let ctx = Ctx {
         specs,
         unkeyed: rc.unkeyed,
+        nodes: rc.nodes,
         source: rc.source,
         target: res.target,
         lock_timeout: rc.lock_timeout,
@@ -1536,69 +1755,28 @@ async fn reverse_batch(
     // Every evidence edge counts: an unrecorded one was written after the act.
     attached.extend(ev_edges);
     let all_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
-    let ends_now = edge_ends(conn, &edge_ids(&all_keys)).await?;
+    let ends_now = ends_of(conn, rc.nodes, &edge_ids(&all_keys)).await?;
 
-    // An endpoint of a recorded edge that this manifest moved and that is back
-    // on its recorded prior now (a partial reversal's other half).
-    let ev_rec_now: BTreeMap<Uuid, (Uuid, String)> = {
-        let evs: Vec<Uuid> = ends_now
-            .values()
-            .flat_map(|e| [&e.source, &e.target])
-            .filter(|(id, ty)| {
-                ty == "evidence" && res.rows.contains_key(&("evidence".into(), id.to_string()))
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        if evs.is_empty() {
-            BTreeMap::new()
-        } else {
-            sqlx::query_as::<_, (Uuid, Uuid, String)>(
-                "SELECT id, owner_group_id, visibility::text FROM evidence WHERE id = ANY($1)",
-            )
-            .bind(&evs)
-            .fetch_all(&mut *conn)
-            .await?
-            .into_iter()
-            .map(|(i, o, v)| (i, (o, v)))
-            .collect()
-        }
+    // The manifest's recorded prior of an edge endpoint it moved: a claim its
+    // run moved, or a row it recorded (evidence, or a node row such as a
+    // reasoning trace that followed its claim). An endpoint's CURRENT state
+    // is its own row's (`ends_of`).
+    let recorded_prior = |(id, ty): &Pair| -> Option<Pair> {
+        let r: Option<&Record> = match ty.as_str() {
+            "claim" if res.claim_posts.contains_key(id) => prior_claims.get(id).copied(),
+            "claim" => None,
+            "evidence" => res.rows.get(&("evidence".to_string(), id.to_string())),
+            other => rc
+                .nodes
+                .get(other)
+                .and_then(|t| res.rows.get(&(t.clone(), id.to_string()))),
+        };
+        r.map(|r| (r.owner_group_id, r.visibility.clone()))
     };
-    let moved_cl: Vec<Uuid> = ends_now
-        .values()
-        .flat_map(|e| [&e.source, &e.target])
-        .filter(|(id, ty)| ty == "claim" && res.claim_posts.contains_key(id))
-        .map(|(id, _)| *id)
-        .collect();
-    let cl_rec_now: BTreeMap<Uuid, (Uuid, String)> = fetch_claims(conn, &moved_cl, false)
-        .await?
-        .into_iter()
-        .map(|c| (c.id, (c.owner, c.visibility)))
-        .collect();
-    // Is `node` one this manifest moved, and NOT yet back on its prior?
-    let pending = |(id, ty): &(Uuid, String)| -> bool {
-        match ty.as_str() {
-            "claim" => prior_claims.get(id).is_some_and(|r| {
-                res.claim_posts.contains_key(id)
-                    && cl_rec_now.get(id) != Some(&(r.owner_group_id, r.visibility.clone()))
-            }),
-            "evidence" => res
-                .rows
-                .get(&("evidence".to_string(), id.to_string()))
-                .is_some_and(|r| {
-                    ev_rec_now.get(id) != Some(&(r.owner_group_id, r.visibility.clone()))
-                }),
-            _ => false,
-        }
-    };
-    let recorded_endpoint = |(id, ty): &(Uuid, String)| -> bool {
-        match ty.as_str() {
-            "claim" => res.claim_posts.contains_key(id),
-            "evidence" => res
-                .rows
-                .contains_key(&("evidence".to_string(), id.to_string())),
-            _ => false,
-        }
-    };
+    // Is `node`, now in `state`, one this manifest moved and NOT yet back on
+    // its prior?
+    let pending =
+        |node: &Pair, state: &Pair| -> bool { recorded_prior(node).is_some_and(|r| r != *state) };
 
     // ---- rows: the CAS; an unrecorded row would be carried into the source ----
     let mut drift: BTreeMap<Uuid, String> = BTreeMap::new();
@@ -1613,9 +1791,10 @@ async fn reverse_batch(
                 // is not; that state is this reversal's own.
                 let partial = k.0 == "edges"
                     && ends_now.get(&k.1).is_some_and(|e| {
-                        let some_back = [&e.source, &e.target]
-                            .into_iter()
-                            .any(|n| recorded_endpoint(n) && !pending(n));
+                        let some_back =
+                            [(&e.source, &e.source_state), (&e.target, &e.target_state)]
+                                .into_iter()
+                                .any(|(n, st)| recorded_prior(n).is_some() && !pending(n, st));
                         some_back
                             && meet(&e.source_state, &e.target_state).as_ref() == Some(&cur.tenancy)
                     });
@@ -1689,6 +1868,95 @@ async fn reverse_batch(
             }
         }
     }
+    // ---- an edge put back on its recorded tuple must be at least as narrow
+    // as the meet of its endpoints as they will be after this batch: an
+    // endpoint that moved since (a claim outside the manifest, ITS evidence,
+    // a node) may require a group the recorded tuple does not. A held claim
+    // changes which endpoints come back, so iterate to a fixpoint. ----
+    let mut work_ids: BTreeSet<Uuid> = cand_ids
+        .iter()
+        .filter(|c| !drift.contains_key(*c))
+        .copied()
+        .collect();
+    loop {
+        let mut newly: Vec<(Uuid, String)> = Vec::new();
+        for (k, a) in attached.iter().filter(|(k, _)| k.0 == "edges") {
+            let Some(rec) = res.rows.get(k) else {
+                continue;
+            };
+            if a.claims.is_disjoint(&work_ids) {
+                continue;
+            }
+            let Some(e) = ends_now.get(&k.1) else {
+                continue;
+            };
+            // An endpoint's state after this batch, and whether it is one this
+            // manifest moved that is still not back (the edge then waits on
+            // the meet, which is safe by construction).
+            let after = |n: &Pair, now: &Pair| -> (Pair, bool) {
+                let recorded = recorded_prior(n);
+                let restored = match n.1.as_str() {
+                    "claim" => work_ids.contains(&n.0),
+                    ty => {
+                        let table = if ty == "evidence" {
+                            Some("evidence")
+                        } else {
+                            rc.nodes.get(ty).map(String::as_str)
+                        };
+                        table.is_some_and(|t| {
+                            attached
+                                .get(&(t.to_string(), n.0.to_string()))
+                                .is_some_and(|ra| !ra.claims.is_disjoint(&work_ids))
+                        })
+                    }
+                };
+                let state = match (&recorded, restored) {
+                    (Some(r), true) => r.clone(),
+                    _ => now.clone(),
+                };
+                let pending = recorded.as_ref().is_some_and(|r| *r != state);
+                (state, pending)
+            };
+            let (ss, s_pending) = after(&e.source, &e.source_state);
+            let (ts, t_pending) = after(&e.target, &e.target_state);
+            if s_pending || t_pending {
+                continue;
+            }
+            let recorded = RowState::of_record(rec);
+            if let Some(m) = meet(&ss, &ts) {
+                if !narrows(&m, &recorded.tenancy) {
+                    let why = format!(
+                        "edge {} would go back to {recorded}, but its endpoints after the \
+                         restore ({} {} ({}, {}), {} {} ({}, {})) meet at {}: an endpoint moved \
+                         since and the recorded tuple would widen the edge; not reversing",
+                        k.1,
+                        e.source.1,
+                        e.source.0,
+                        ss.0,
+                        ss.1,
+                        e.target.1,
+                        e.target.0,
+                        ts.0,
+                        ts.1,
+                        RowState {
+                            tenancy: m,
+                            writer_owned: None
+                        }
+                    );
+                    for c in a.claims.intersection(&work_ids) {
+                        newly.push((*c, why.clone()));
+                    }
+                }
+            }
+        }
+        if newly.is_empty() {
+            break;
+        }
+        for (c, why) in newly {
+            work_ids.remove(&c);
+            drift.entry(c).or_insert(why);
+        }
+    }
     let work: Vec<(Uuid, &Record)> = cands
         .into_iter()
         .filter(|(id, _)| !drift.contains_key(id))
@@ -1755,50 +2023,7 @@ async fn reverse_batch(
 
     // ---- recorded edges: their recorded tuple once every endpoint this
     // manifest moved is back; otherwise the meet of their endpoints now ----
-    let ends = edge_ends(conn, &edge_ids(&keys)).await?;
-    let ev_back: BTreeMap<Uuid, (Uuid, String)> = {
-        let evs: Vec<Uuid> = ends
-            .values()
-            .flat_map(|e| [&e.source, &e.target])
-            .filter(|(id, ty)| {
-                ty == "evidence" && res.rows.contains_key(&("evidence".into(), id.to_string()))
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        if evs.is_empty() {
-            BTreeMap::new()
-        } else {
-            sqlx::query_as::<_, (Uuid, Uuid, String)>(
-                "SELECT id, owner_group_id, visibility::text FROM evidence WHERE id = ANY($1)",
-            )
-            .bind(&evs)
-            .fetch_all(&mut *conn)
-            .await?
-            .into_iter()
-            .map(|(i, o, v)| (i, (o, v)))
-            .collect()
-        }
-    };
-    let cl_back: BTreeMap<Uuid, (Uuid, String)> = fetch_claims(conn, &moved_cl, false)
-        .await?
-        .into_iter()
-        .map(|c| (c.id, (c.owner, c.visibility)))
-        .collect();
-    let still_pending = |(id, ty): &(Uuid, String)| -> bool {
-        match ty.as_str() {
-            "claim" => prior_claims.get(id).is_some_and(|r| {
-                res.claim_posts.contains_key(id)
-                    && cl_back.get(id) != Some(&(r.owner_group_id, r.visibility.clone()))
-            }),
-            "evidence" => res
-                .rows
-                .get(&("evidence".to_string(), id.to_string()))
-                .is_some_and(|r| {
-                    ev_back.get(id) != Some(&(r.owner_group_id, r.visibility.clone()))
-                }),
-            _ => false,
-        }
-    };
+    let ends = ends_of(conn, rc.nodes, &edge_ids(&keys)).await?;
     let mut deferred: BTreeSet<String> = BTreeSet::new();
     let mut edge_rows: Vec<(String, RowState)> = Vec::new();
     let mut edge_want: BTreeMap<RowKey, RowState> = BTreeMap::new();
@@ -1806,7 +2031,7 @@ async fn reverse_batch(
         let (Some(rec), Some(cur), Some(e)) = (res.rows.get(k), s1.get(k), ends.get(&k.1)) else {
             continue;
         };
-        let want = if still_pending(&e.source) || still_pending(&e.target) {
+        let want = if pending(&e.source, &e.source_state) || pending(&e.target, &e.target_state) {
             deferred.insert(k.1.clone());
             match meet(&e.source_state, &e.target_state) {
                 Some(m) => RowState {
@@ -1869,6 +2094,23 @@ async fn reverse_batch(
         }
         if got.tenancy.visibility == PUBLIC && a.tenancy.visibility != PUBLIC {
             v.push(format!("{} {} WIDENED to {got}", k.0, k.1));
+        }
+        if k.0 == "edges" {
+            if let Some(m) = ends
+                .get(&k.1)
+                .and_then(|e| meet(&e.source_state, &e.target_state))
+            {
+                if !narrows(&m, &got.tenancy) {
+                    v.push(format!(
+                        "edge {} ended as {got}, wider than the meet {} of its endpoints",
+                        k.1,
+                        RowState {
+                            tenancy: m,
+                            writer_owned: None
+                        }
+                    ));
+                }
+            }
         }
     }
     let mut expect_counts: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
@@ -2000,9 +2242,11 @@ pub async fn reverse_manifest(
         res.claim_posts.len(),
         res.rows.len()
     )?;
+    let nodes = node_types(conn).await?;
     let rc = RevCtx {
         specs,
         unkeyed,
+        nodes: &nodes,
         res: &res,
         source,
         lock_timeout: &opts.lock_timeout,
