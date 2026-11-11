@@ -1118,21 +1118,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::search_hierarchical_by_text",
         ],
     ),
-    // write: the ingest transaction is stamped with the system agent and binds
-    // the caller's principal for the database's write-authority check
-    // (`begin_system_ingest_stamped_tx`); the authorship edges name that
-    // principal; embeddings for the rows this request just ingested (the
-    // claims', and the workflow row's goal embedding, each on a transaction
-    // stamped from the workflow-ingest system agent).
+    // write: the ingest runs AS THE CALLER, on a transaction stamped from the
+    // handler's viewer (`begin_caller_workflow_tx`, viewed), as do the
+    // post-commit embeds; the authorship edges name that principal.
     (
         "workflows.rs",
         "ingest_workflow",
-        &[
-            "begin_system_ingest_stamped_tx",
-            "embed_inserted_workflow_claims",
-            "record_api_authorship",
-            "store_workflow_goal_embedding",
-        ],
+        &["record_api_authorship"],
     ),
     // stamped: the `workflows` row is locked (SELECT .. FOR UPDATE) and its
     // counters updated on the caller's stamped write transaction, where row
@@ -1169,20 +1161,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "BehavioralExecutionRepository::rolling_success_rate",
         ],
     ),
-    // write: as ingest_workflow (stamped system ingest binding the caller's
-    // principal, authorship edges), the ingest and the embeddings of the rows it
-    // inserted.
+    // write: as ingest_workflow (the caller's own stamp, viewed; authorship
+    // edges), plus the `workflow.created` event.
     (
         "workflows.rs",
         "store_workflow",
-        &[
-            "EventRepository::insert",
-            "begin_system_ingest_stamped_tx",
-            "embed_inserted_workflow_claims",
-            "epigraph_ingest_executor::execute_workflow_ingest_plan",
-            "record_api_authorship",
-            "store_workflow_goal_embedding",
-        ],
+        &["EventRepository::insert", "record_api_authorship"],
     ),
     // ── route helpers a handler hands its viewer to ──────────────────────
     //
@@ -1321,16 +1305,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query(UPDATE).execute",
         ],
     ),
-    // write: workflows.rs's ingest helpers run on the system-ingest transaction
-    // that binds the caller's principal for the database's write-authority
-    // check; the lineage anchors are workflows rows, read under row security
-    // on that stamped transaction (migration 183, ruling R-74), the
+    // write: workflows.rs's ingest helpers run on the caller-stamped
+    // transaction; the lineage anchors are workflows rows, read under row
+    // security on that stamped transaction (migration 183, ruling R-74), the
     // authority check is for the caller's principal over each anchor, and the
     // rest record the submitter, the per-anchor provenance and the admin audit.
+    // The post-commit goal embedding updates the row the caller just wrote,
+    // on a transaction stamped from its viewer (row security decides).
     (
         "workflows.rs",
-        "auto_wire_inserted_edges",
-        &["begin_system_ingest_stamped_tx"],
+        "store_workflow_goal_embedding",
+        &["WorkflowRepository::set_goal_embedding"],
     ),
     (
         "workflows.rs",
@@ -1350,21 +1335,26 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // viewer to `workflow_authority`, which reads the target row through it
     // (`WorkflowRepository::tenancy_as_viewer`, viewed) before any answer names
     // the row. Unviewed, by design:
-    // * the step routes' system-ingest transaction and the executor's step
-    //   write on it (the rows are the system agent's; the caller's authority
-    //   is the gate), the AUTHORED edges and the per-write provenance / admin
-    //   audit rows;
+    // * the executor's step write on the caller-stamped transaction
+    //   (`begin_caller_workflow_tx`, viewed; row security decides the rows,
+    //   the caller's authority over the workflow is the gate), the AUTHORED
+    //   edges and the per-write provenance / admin audit rows;
     // * the head / lineage resolution, which must see every workflow the
     //   write would touch so each is authority-checked (an unreadable one is
     //   then refused by the viewed read);
     // * the gate's own arms, which run only on a row the caller reads: the
-    //   recorded submitter, the submitter's operator and the admin grant.
+    //   recorded submitter, the submitter's operator, the caller's own acting
+    //   operator link (the delegate arm, operator ruling R-183: migration
+    //   107's caller-side definer, keyed on the caller, not on a row), the
+    //   caller's live membership of the row's owner group
+    //   (`api_owner_group_arm`, given the viewed read's owner group; asked of
+    //   the live-membership definer and the caller-stamped session, not of a
+    //   viewer) and the admin grant.
     (
         "workflows.rs",
         "add_step",
         &[
             "audit_api_admin_workflow_write",
-            "begin_system_ingest_stamped_tx",
             "epigraph_ingest_executor::add_step",
             "record_api_authorship",
             "record_api_caller_workflow_write",
@@ -1375,7 +1365,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "delete_step",
         &[
             "audit_api_admin_workflow_write",
-            "begin_system_ingest_stamped_tx",
             "epigraph_ingest_executor::delete_step",
             "record_api_caller_workflow_write",
         ],
@@ -1394,10 +1383,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "workflows.rs",
         "workflow_authority",
         &[
+            "AgentRepository::operator_actor",
             "AgentRepository::operator_of_author",
             "WorkflowRepository::submitter_of",
             "api_admin_arm",
             "api_admin_arm",
+            "api_owner_group_arm",
+            "api_owner_group_arm",
         ],
     ),
 ];

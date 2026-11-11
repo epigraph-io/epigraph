@@ -13,7 +13,7 @@
 //! The codebase has no dedicated not-found `ErrorCode`; per convention
 //! (`ds.rs::get_belief`, `claims.rs::get_claim`) not-found is `INVALID_PARAMS`.
 
-use epigraph_db::{FrameRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{FrameRepository, PerspectiveRepository};
 use uuid::Uuid;
 
 use crate::errors::{internal_error, invalid_params, McpError};
@@ -84,26 +84,28 @@ pub fn resolve_lens_get_belief(
 /// Verify both the frame and perspective exist BEFORE any belief compute, so a
 /// typo'd UUID fails fast (and the page loop is never entered with a bad lens).
 ///
-/// Must be called once per tool invocation, not per claim.
+/// Must be called once per tool invocation, not per claim. `conn` is the
+/// caller's viewer-stamped read (`EpiGraphMcpFull::read_as`), so a frame or
+/// perspective private to the caller's group is found.
 ///
 /// # Errors
 /// `INVALID_PARAMS` naming the missing entity (codebase convention surfaces
 /// not-found as `INVALID_PARAMS`; there is no separate not-found code).
 /// `INTERNAL_ERROR` on a database failure.
 pub async fn validate_lens_exists(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<(), McpError> {
-    if FrameRepository::get_by_id(pool, viewer, frame_id)
+    if FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .is_none()
     {
         return Err(invalid_params(format!("frame {frame_id} not found")));
     }
-    if PerspectiveRepository::get_by_id(pool, viewer, perspective_id)
+    if PerspectiveRepository::get_by_id(&mut *conn, viewer, perspective_id)
         .await
         .map_err(internal_error)?
         .is_none()

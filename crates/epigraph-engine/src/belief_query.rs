@@ -120,8 +120,29 @@ pub async fn get_belief(
     claim_id: Uuid,
     frame_id: Option<Uuid>,
 ) -> Result<BeliefInterval, BeliefQueryError> {
+    get_belief_scoped(pool, None, viewer, claim_id, frame_id).await
+}
+
+/// [`get_belief`] on a caller-supplied connection, every read of it: the
+/// form a request reaches through `ScopedPool::read_as`, so the session's
+/// row security and the in-query predicates agree under FORCE (a member reads
+/// its own group's claim, frame and BBAs). The pool forms delegate here.
+///
+/// In `SessionGucMode::Transaction` the connection is one transaction, so a
+/// failed statement aborts the rest of the read; the best-effort per-frame
+/// tier loads ([`FramedBeliefContext`]) then fail the read rather than
+/// falling back. Session mode has no transaction and is unaffected.
+///
+/// # Errors
+/// As [`get_belief`].
+pub async fn get_belief_conn(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Option<Uuid>,
+) -> Result<BeliefInterval, BeliefQueryError> {
     if let Some(frame_id) = frame_id {
-        return framed_belief(pool, None, viewer, claim_id, frame_id).await;
+        return framed_belief(conn, viewer, claim_id, frame_id).await;
     }
 
     // ── Unframed path: cached DS columns from claim row ───────────────────
@@ -135,7 +156,8 @@ pub async fn get_belief(
     // claim moved by epistemic edges reported its pre-edge truth_value here while
     // reporting the edge-derived value there.
     let cols =
-        ClaimRepository::get_belief_columns(pool, viewer, ClaimId::from_uuid(claim_id)).await?;
+        ClaimRepository::get_belief_columns(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
+            .await?;
 
     // A claim row must exist even when its DS columns are NULL, so absence of the row
     // — not absence of the columns — is what ClaimNotFound means.
@@ -165,7 +187,7 @@ pub async fn get_belief(
     // No DS state has ever been written for this claim. Fall back to the truth_value
     // reconstruction rather than reporting zeros — a belief of 0.0 would make an
     // unassessed claim indistinguishable from a refuted one.
-    let claim = ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(claim_id))
+    let claim = ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
         .await?
         .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
 
@@ -176,12 +198,12 @@ pub async fn get_belief(
 ///
 /// Ruling R-22: a framed read folds only the BBAs whose sources `viewer` can
 /// read, and that is decided by a read the SESSION's row security also
-/// filters. On an unstamped application pool every group-private source is
-/// invisible, so a group member's read would drop its own group's BBAs.
-/// With `scoped`, the framed path's derivation and source reads run on a
-/// connection stamped with `viewer`, so a member folds them; without it they
-/// run on `pool`, as before. The unframed path reads the cache and is
-/// [`get_belief`]'s own.
+/// filters. On an unstamped application pool every group-private row is
+/// invisible, so a group member's read would drop its own group's claim,
+/// frame and BBAs. With `scoped`, EVERY read of the call (the claim's cached
+/// columns, the frame, the assignment, the BBAs, the lens tiers, the
+/// derivation and source reads) runs on one connection stamped with `viewer`
+/// ([`get_belief_conn`]); without it, on one connection of `pool`, as before.
 ///
 /// # Errors
 /// As [`get_belief`].
@@ -192,37 +214,34 @@ pub async fn get_belief_scoped(
     claim_id: Uuid,
     frame_id: Option<Uuid>,
 ) -> Result<BeliefInterval, BeliefQueryError> {
-    match frame_id {
-        Some(frame_id) => framed_belief(pool, scoped, viewer, claim_id, frame_id).await,
-        None => get_belief(pool, viewer, claim_id, None).await,
-    }
+    let mut conn = scope_conn(pool, scoped, viewer).await?;
+    get_belief_conn(&mut conn, viewer, claim_id, frame_id).await
 }
 
-/// The framed path of [`get_belief`] / [`get_belief_scoped`]: live
-/// recomputation from stored BBAs.
+/// The framed path of [`get_belief_conn`]: live recomputation from stored
+/// BBAs.
 async fn framed_belief(
-    pool: &PgPool,
-    scoped: Option<&epigraph_db::ScopedPool>,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
 ) -> Result<BeliefInterval, BeliefQueryError> {
     // ── Framed path: live recomputation from stored BBAs ──────────────
-    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
+    let frame_row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await?
         .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
 
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
     let assignment =
-        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
+        FrameRepository::get_claim_assignment(&mut *conn, viewer, claim_id, frame_id).await?;
     let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
         assignment.and_then(|a| a.hypothesis_index),
         frame.hypothesis_count(),
     );
 
     let all_bbas =
-        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id).await?;
 
     if all_bbas.is_empty() {
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
@@ -236,7 +255,7 @@ async fn framed_belief(
     // `None`: no BBA left once those whose sources this viewer cannot read
     // are set aside (ruling R-22), which reads as an empty frame.
     let Some((combined, fold_conflict)) =
-        recompute_framed_belief(pool, scoped, viewer, &frame_row, &frame, &all_bbas, None).await?
+        recompute_framed_belief(conn, viewer, &frame_row, &frame, &all_bbas, None).await?
     else {
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     };
@@ -286,7 +305,8 @@ pub async fn get_perspective_belief(
 }
 
 /// [`get_perspective_belief`] with the caller's tenancy-aware pool, when it
-/// has one (see [`get_belief_scoped`]).
+/// has one: every read on one connection stamped with `viewer` (see
+/// [`get_belief_scoped`]).
 ///
 /// # Errors
 /// As [`get_perspective_belief`].
@@ -298,20 +318,36 @@ pub async fn get_perspective_belief_scoped(
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<BeliefInterval, BeliefQueryError> {
-    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
+    let mut conn = scope_conn(pool, scoped, viewer).await?;
+    get_perspective_belief_conn(&mut conn, viewer, claim_id, frame_id, perspective_id).await
+}
+
+/// [`get_perspective_belief`] on a caller-supplied connection, every read of
+/// it (see [`get_belief_conn`]). The pool forms delegate here.
+///
+/// # Errors
+/// As [`get_perspective_belief`].
+pub async fn get_perspective_belief_conn(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    perspective_id: Uuid,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    let frame_row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await?
         .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
     let assignment =
-        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
+        FrameRepository::get_claim_assignment(&mut *conn, viewer, claim_id, frame_id).await?;
     let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
         assignment.and_then(|a| a.hypothesis_index),
         frame.hypothesis_count(),
     );
 
     let all_bbas =
-        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id).await?;
     if all_bbas.is_empty() {
         // An empty BBA set is ambiguous on its own: it is equally the signature
         // of a real claim with no evidence in this frame AND of a `claim_id`
@@ -321,7 +357,7 @@ pub async fn get_perspective_belief_scoped(
         // .claim_id` is `REFERENCES claims(id)`, so a non-empty BBA set already
         // proves the claim row exists — which keeps the evidence-bearing path
         // at zero extra queries.
-        if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(claim_id))
+        if ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
             .await?
             .is_none()
         {
@@ -336,8 +372,7 @@ pub async fn get_perspective_belief_scoped(
     // global `get_belief`.
     // `None`: no BBA whose sources this viewer can read (ruling R-22).
     let Some((combined, fold_conflict)) = recompute_framed_belief(
-        pool,
-        scoped,
+        conn,
         viewer,
         &frame_row,
         &frame,
@@ -545,25 +580,30 @@ impl FramedBeliefContext {
     /// the perspective row is resolved and an unknown perspective reduces to
     /// no opinion, so a lensed read over an un-configured observer equals the
     /// global read.
+    ///
+    /// On the caller's connection, so a group-private perspective is read
+    /// under the viewer's own session (see [`get_belief_conn`] for what a
+    /// swallowed error costs in transaction mode).
     async fn resolve(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &epigraph_db::visibility::Viewer,
         frame_row: &FrameRow,
         perspective_id: Option<Uuid>,
     ) -> Result<Self, BeliefQueryError> {
         let frame_id = frame_row.id;
-        let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
-            .await
-            .ok()
-            .flatten();
+        let per_frame_intra =
+            FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
+                .await
+                .ok()
+                .flatten();
         let per_frame_weights =
-            FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+            FrameRepository::get_per_frame_evidence_type_weights(&mut *conn, frame_id)
                 .await
                 .ok()
                 .flatten();
         let (perspective, perspective_overrides) = match perspective_id {
             Some(pid) => {
-                let (p, o) = perspective_tier_inputs(pool, viewer, pid).await?;
+                let (p, o) = perspective_tier_inputs(&mut *conn, viewer, pid).await?;
                 (Some(p), o)
             }
             None => (None, None),
@@ -585,13 +625,13 @@ impl FramedBeliefContext {
 /// `belief_profile` override object. An unknown perspective is no opinion
 /// (empty maps, no object), so a lensed read over an un-configured observer
 /// equals the global read.
-async fn perspective_tier_inputs(
-    pool: &PgPool,
+async fn perspective_tier_inputs<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     viewer: &epigraph_db::visibility::Viewer,
     perspective_id: Uuid,
 ) -> Result<(PerspectiveReliability, Option<serde_json::Value>), BeliefQueryError> {
     Ok(
-        match PerspectiveRepository::get_by_id(pool, viewer, perspective_id).await? {
+        match PerspectiveRepository::get_by_id(executor, viewer, perspective_id).await? {
             Some(p) => (
                 PerspectiveReliability {
                     source_reliability: p.source_reliability().unwrap_or_default(),
@@ -669,10 +709,10 @@ pub fn combine_framed_bbas<S: Into<crate::source_dependence::BbaSource>>(
     Ok(Some((combined, conflict)))
 }
 
-/// The connection a framed read's derivation-scope and source reads run on: a
-/// read stamped with `viewer` when the caller has a tenancy-aware pool (row
-/// security then admits the viewer's own groups' sources), else one from
-/// `pool`, as before (ruling R-22; see [`get_belief_scoped`]).
+/// The ONE connection every read of a pool-form belief call runs on: a read
+/// stamped with `viewer` when the caller has a tenancy-aware pool (row
+/// security then admits the viewer's own groups' rows), else one from `pool`,
+/// as before (ruling R-22; see [`get_belief_scoped`]).
 enum ScopeConn<'a> {
     Stamped(epigraph_db::ScopedRead<'a>),
     Plain(sqlx::pool::PoolConnection<sqlx::Postgres>),
@@ -723,8 +763,7 @@ async fn scope_conn<'a>(
 /// sources `viewer` cannot read are set aside (ruling R-22), `rows` empty
 /// included.
 async fn recompute_framed_belief(
-    pool: &PgPool,
-    scoped: Option<&epigraph_db::ScopedPool>,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     frame_row: &FrameRow,
     frame: &FrameOfDiscernment,
@@ -734,16 +773,14 @@ async fn recompute_framed_belief(
     if rows.is_empty() {
         return Ok(None);
     }
-    let ctx = FramedBeliefContext::resolve(pool, viewer, frame_row, perspective_id).await?;
-    let mut conn = scope_conn(pool, scoped, viewer).await?;
+    let ctx = FramedBeliefContext::resolve(&mut *conn, viewer, frame_row, perspective_id).await?;
     // Ruling R-22: only the BBAs whose sources this viewer can read.
     let rows =
         crate::derivation_scope::retain_for_viewer(&mut *conn, viewer, rows.to_vec()).await?;
     if rows.is_empty() {
         return Ok(None);
     }
-    let sources = crate::source_dependence::bba_sources_for_rows(&mut conn, viewer, &rows).await?;
-    drop(conn);
+    let sources = crate::source_dependence::bba_sources_for_rows(conn, viewer, &rows).await?;
     combine_framed_bbas(frame, &rows, sources, &ctx)
 }
 
@@ -781,7 +818,8 @@ pub async fn get_perspective_belief_batch(
 }
 
 /// [`get_perspective_belief_batch`] with the caller's tenancy-aware pool, when
-/// it has one (see [`get_belief_scoped`]).
+/// it has one: the whole page on one connection stamped with `viewer` (see
+/// [`get_belief_scoped`]).
 ///
 /// # Errors
 /// As [`get_perspective_belief_batch`].
@@ -793,20 +831,42 @@ pub async fn get_perspective_belief_batch_scoped(
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<Vec<(Uuid, Result<BeliefInterval, BeliefQueryError>)>, BeliefQueryError> {
-    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
+    let mut conn = scope_conn(pool, scoped, viewer).await?;
+    get_perspective_belief_batch_conn(&mut conn, viewer, claim_ids, frame_id, perspective_id).await
+}
+
+/// [`get_perspective_belief_batch`] on a caller-supplied connection, every
+/// read of it (see [`get_belief_conn`]). The pool forms delegate here.
+///
+/// In `SessionGucMode::Transaction` a DATABASE error on one claim aborts the
+/// transaction, so the claims after it fail too; the item-level isolation
+/// holds for a malformed BBA (a parse or fold error), which issues no
+/// statement.
+///
+/// # Errors
+/// As [`get_perspective_belief_batch`].
+pub async fn get_perspective_belief_batch_conn(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[Uuid],
+    frame_id: Uuid,
+    perspective_id: Uuid,
+) -> Result<Vec<(Uuid, Result<BeliefInterval, BeliefQueryError>)>, BeliefQueryError> {
+    let frame_row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await?
         .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
 
     // Resolve perspective + per-frame overrides + calibration ONCE per page.
     // This is the hoist that removes the N+1.
-    let ctx = FramedBeliefContext::resolve(pool, viewer, &frame_row, Some(perspective_id)).await?;
+    let ctx =
+        FramedBeliefContext::resolve(&mut *conn, viewer, &frame_row, Some(perspective_id)).await?;
 
     let mut out = Vec::with_capacity(claim_ids.len());
     for &claim_id in claim_ids {
         out.push((
             claim_id,
-            perspective_belief_for_claim(pool, scoped, viewer, claim_id, frame_id, &frame, &ctx)
+            perspective_belief_for_claim(&mut *conn, viewer, claim_id, frame_id, &frame, &ctx)
                 .await,
         ));
     }
@@ -818,8 +878,7 @@ pub async fn get_perspective_belief_batch_scoped(
 /// claim-scoped; everything else was hoisted into `ctx`. Mirrors the tail of
 /// [`get_perspective_belief`] exactly so the two produce identical intervals.
 async fn perspective_belief_for_claim(
-    pool: &PgPool,
-    scoped: Option<&epigraph_db::ScopedPool>,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
@@ -827,29 +886,27 @@ async fn perspective_belief_for_claim(
     ctx: &FramedBeliefContext,
 ) -> Result<BeliefInterval, BeliefQueryError> {
     let assignment =
-        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
+        FrameRepository::get_claim_assignment(&mut *conn, viewer, claim_id, frame_id).await?;
     let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
         assignment.and_then(|a| a.hypothesis_index),
         frame.hypothesis_count(),
     );
 
     let all_bbas =
-        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id).await?;
     if all_bbas.is_empty() {
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 
     // Claim-scoped like the BBA fetch above (one query, skipped when no row
     // can carry a source key), so the page-level hoist is unchanged.
-    let mut conn = scope_conn(pool, scoped, viewer).await?;
     // Ruling R-22: only the BBAs whose sources this viewer can read.
     let all_bbas = crate::derivation_scope::retain_for_viewer(&mut *conn, viewer, all_bbas).await?;
     if all_bbas.is_empty() {
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
     let source_keys =
-        crate::source_dependence::bba_sources_for_rows(&mut conn, viewer, &all_bbas).await?;
-    drop(conn);
+        crate::source_dependence::bba_sources_for_rows(conn, viewer, &all_bbas).await?;
     let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, source_keys, ctx)?
         .expect("all_bbas is non-empty so combination yields Some");
 
@@ -900,7 +957,30 @@ pub async fn shadow_belief(
     if mode != crate::belief_view::CompoundBeliefMode::Shadow {
         return None;
     }
-    match shadow_view(pool, viewer, claim_id).await {
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(claim = %claim_id, %error, "shadow belief omitted: acquire failed");
+            return None;
+        }
+    };
+    shadow_belief_conn(&mut conn, viewer, claim_id, mode).await
+}
+
+/// [`shadow_belief`] on a caller-supplied connection: the form a request
+/// reaches through `ScopedPool::read_as`, so the compound and atom reads run
+/// under the viewer's own session (row security on an unstamped session
+/// admits public rows only). Issues no statement outside `Shadow` mode.
+pub async fn shadow_belief_conn(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    mode: crate::belief_view::CompoundBeliefMode,
+) -> Option<crate::belief_view::BeliefView> {
+    if mode != crate::belief_view::CompoundBeliefMode::Shadow {
+        return None;
+    }
+    match shadow_view(conn, viewer, claim_id).await {
         Ok(view) => view,
         Err(error) => {
             tracing::warn!(claim = %claim_id, %error, "shadow belief omitted");
@@ -912,22 +992,21 @@ pub async fn shadow_belief(
 /// [`shadow_belief`]'s computation: the compound derivation first, then the
 /// atom view.
 async fn shadow_view(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<Option<crate::belief_view::BeliefView>, String> {
-    let mut conn = pool.acquire().await.map_err(|e| format!("acquire: {e}"))?;
     let ctx = FramedBeliefContext::global();
     let ids = [claim_id];
     if let Some(view) =
-        crate::compound_belief::derive_compound_belief_batch(&mut conn, viewer, &ids, &ctx)
+        crate::compound_belief::derive_compound_belief_batch(&mut *conn, viewer, &ids, &ctx)
             .await?
             .remove(&claim_id)
     {
         return Ok(Some(view));
     }
     Ok(
-        crate::compound_belief::atom_belief_view_batch(&mut conn, viewer, &ids, &ctx)
+        crate::compound_belief::atom_belief_view_batch(conn, viewer, &ids, &ctx)
             .await?
             .remove(&claim_id),
     )

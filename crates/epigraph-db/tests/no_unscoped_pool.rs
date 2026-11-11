@@ -194,7 +194,10 @@
 //!   `claims_in_themes_at_dim` is itself an unconverted wrapper over the
 //!   converted `claims_in_themes_at_dim_since` — so they are convertible
 //!   whenever a shard wants them and are deferred only to keep this pass to one
-//!   rule.
+//!   rule. (Those are PR-27's counts. Since then `workflow.rs::resolve_step_claim`
+//!   has moved class: it is now a `Pool::acquire` wrapper over the
+//!   connection-taking primitive `resolve_step_claim_conn`, which MCP's
+//!   `update_with_evidence` and `evolve_step` call on the caller's stamped read.)
 //!
 //!   Do not read the count of unconverted functions as a count of blockers: the
 //!   paragraph this replaced did exactly that. Calling
@@ -578,7 +581,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "routes/elevate.rs",
-        4,
+        5,
         "Pre-authentication, BY DESIGN rather than by sequence. The passkey enrollment ceremony \
          (elevation plan EL-3, migration 124) is a page the operator opens on the device that \
          holds the authenticator, with no bearer token to present: the enrollment id (random, \
@@ -587,8 +590,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          ceremony (EL-5, migration 125) is the same: the ticket id (live for at most 5 minutes, \
          asserted once) and the passkey are its credentials. Three sites are one connection each \
          for the enrollment reader, challenge store and completion; the fourth is the one \
-         `ceremony_conn` acquire every ticket handler shares. Each calls one of 124's or 125's \
-         ceremony definers, keyed by that id, which need no stamp: their \
+         `ceremony_conn` acquire every ticket handler shares. The fifth is the enrollment \
+         anchor reader (migration 200, the anchored passkey path), one connection on the same \
+         unauthenticated enrollment page, keyed by the same enrollment id. Each calls one of \
+         124's, 125's or 200's ceremony definers, keyed by that id, which need no stamp: their \
          SECURITY DEFINER frame is what the tables' policies admit, and the application role \
          holds no DML on either table. Unlike the OAuth entries this is not 'before a principal \
          is minted': no principal is ever minted here, which is why a later shard must not read \

@@ -169,8 +169,9 @@ pub async fn set_source_reliability(
             .map_err(|e| {
                 invalid_params(format!(
                     "perspective {id} is owned by agent {owner}; setting its source \
-                     reliability over HTTP requires that owner, its operator, or claims:admin \
-                     ({}). Nothing was written.",
+                     reliability over HTTP requires that owner, its operator, an agent acting \
+                     for it through a live delegated run token, or claims:admin ({}). Nothing \
+                     was written.",
                     e.message
                 ))
             })?;
@@ -264,7 +265,8 @@ pub async fn list_perspectives(
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
-    let rows = PerspectiveRepository::list(&server.pool, viewer, limit, 0)
+    let mut read = server.read_as(viewer, "list_perspectives").await?;
+    let rows = PerspectiveRepository::list(&mut *read, viewer, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -300,7 +302,8 @@ pub async fn get_perspective(
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.perspective_id)?;
 
-    let row = PerspectiveRepository::get_by_id(&server.pool, viewer, id)
+    let mut read = server.read_as(viewer, "get_perspective").await?;
+    let row = PerspectiveRepository::get_by_id(&mut *read, viewer, id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("perspective {id} not found")))?;

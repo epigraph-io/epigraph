@@ -75,6 +75,12 @@ async fn platform_events(pool: &PgPool, event_type: &str) -> i64 {
 /// `passkey.register` act since migration 130
 /// (`viewer_fixture::passkey_register_act`).
 async fn registered_passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
+    registered_passkey_as(pool, person, n, "none").await
+}
+
+/// [`registered_passkey`] recorded with the attestation format `format`
+/// (`none` with the nil AAGUID, otherwise a model's).
+async fn registered_passkey_as(pool: &PgPool, person: Uuid, n: u8, format: &str) -> Uuid {
     let act = fixture::passkey_register_act(pool, person, "cli test", "cli key").await;
     let e: Uuid = sqlx::query_scalar(
         "SELECT public.epigraph_create_passkey_enrollment($1, 'cli test', 'cli key', $2)",
@@ -93,12 +99,19 @@ async fn registered_passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
     .expect("challenge");
     let mut cred = vec![0x5A_u8; 16];
     cred[0] = n;
+    let aaguid = if format == "none" {
+        Uuid::nil()
+    } else {
+        Uuid::from_u128(0x2fc0_579f_8113_47ea_b116_bb5a_8db9_202a)
+    };
     sqlx::query_scalar(
         "SELECT public.epigraph_complete_passkey_enrollment($1, $2, '{\"cred\": {}}'::jsonb, \
-                '00000000-0000-0000-0000-000000000000'::uuid, 'none', true, false)",
+                $3, $4, true, false)",
     )
     .bind(e)
     .bind(cred)
+    .bind(aaguid)
+    .bind(format)
     .fetch_one(pool)
     .await
     .expect("complete")
@@ -636,4 +649,134 @@ async fn end_elevation_by_person_and_list_elevations(pool: PgPool) {
         assert!(all.stdout.contains(&s.to_string()), "{}", all.show());
     }
     assert!(all.stdout.contains("ended"), "{}", all.show());
+}
+
+async fn is_live(pool: &PgPool, passkey: Uuid) -> bool {
+    sqlx::query_scalar("SELECT revoked_at IS NULL FROM person_authenticators WHERE id = $1")
+        .bind(passkey)
+        .fetch_one(pool)
+        .await
+        .expect("the passkey")
+}
+
+/// The `mode` of each `platform.passkey_revoked` row about `passkey`.
+async fn revoke_modes(pool: &PgPool, passkey: Uuid) -> Vec<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT details->>'mode' FROM security_events \
+          WHERE event_type = 'platform.passkey_revoked' AND details->>'authenticator_id' = $1",
+    )
+    .bind(passkey.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("the audit rows")
+}
+
+/// `revoke-passkey --compromised` revokes the phone AND the attested backup
+/// enrolled on an act the phone confirmed, audited `mode = compromised`; a
+/// dry run prints both as WOULD BE REVOKED and leaves both live with no audit
+/// row. The default (lost) revoke of another person's phone keeps that
+/// person's attested backup live, audited `mode = lost`; neither revoke
+/// touches the other person's passkeys. CALIBRATION: each backup was enrolled
+/// on an act its phone confirmed.
+///
+/// Verified to fail: the `compromised: true` arm calling `passkey::revoke`
+/// -> the backup stays live; `revoke_compromised` committing on a dry run ->
+/// the dry run revokes both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_passkey_compromised_takes_the_backup_and_lost_keeps_it(pool: PgPool) {
+    let (h, _) = fixture::seed_human_operator(&pool, "stolen phone").await;
+    fixture::make_custodian(&pool, h).await;
+    let phone = registered_passkey(&pool, h, 1).await;
+    let backup = registered_passkey_as(&pool, h, 2, "packed").await;
+    let (l, _) = fixture::seed_human_operator(&pool, "lost phone").await;
+    fixture::make_custodian(&pool, l).await;
+    let lost_phone = registered_passkey(&pool, l, 3).await;
+    let lost_backup = registered_passkey_as(&pool, l, 4, "packed").await;
+    for (child, parent) in [(backup, phone), (lost_backup, lost_phone)] {
+        let confirmer: Option<Uuid> = sqlx::query_scalar(
+            "SELECT a.authenticator_id FROM person_authenticators k \
+               JOIN passkey_enrollments en ON en.id = k.enrollment_id \
+               JOIN pending_admin_acts a ON a.id = en.act_id WHERE k.id = $1",
+        )
+        .bind(child)
+        .fetch_one(&pool)
+        .await
+        .expect("the backup's act");
+        assert_eq!(
+            confirmer,
+            Some(parent),
+            "CALIBRATION: enrolled on its phone's act"
+        );
+    }
+    let phone_s = phone.to_string();
+    let compromised = |apply: bool| {
+        let mut args = vec![
+            "revoke-passkey",
+            "--id",
+            phone_s.as_str(),
+            "--reason",
+            "phone stolen",
+            "--compromised",
+        ];
+        if apply {
+            args.push("--apply");
+        }
+        args
+    };
+
+    let dry = run_op(&pool, &compromised(false)).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("MODE compromised"), "{}", dry.show());
+    assert_eq!(
+        dry.stdout.matches("WOULD BE REVOKED").count(),
+        2,
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains(&phone_s) && dry.stdout.contains(&backup.to_string()),
+        "{}",
+        dry.show()
+    );
+    assert!(is_live(&pool, phone).await && is_live(&pool, backup).await);
+    assert_eq!(platform_events(&pool, "platform.passkey_revoked").await, 0);
+
+    let applied = run_op(&pool, &compromised(true)).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(!is_live(&pool, phone).await, "the phone");
+    assert!(!is_live(&pool, backup).await, "the attested backup");
+    for k in [phone, backup] {
+        assert_eq!(
+            revoke_modes(&pool, k).await,
+            vec![Some("compromised".to_string())]
+        );
+    }
+    assert!(
+        is_live(&pool, lost_phone).await && is_live(&pool, lost_backup).await,
+        "another person's passkeys are untouched"
+    );
+
+    let lost_s = lost_phone.to_string();
+    let lost = run_op(
+        &pool,
+        &[
+            "revoke-passkey",
+            "--id",
+            &lost_s,
+            "--reason",
+            "phone lost",
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(lost.code, 0, "{}", lost.show());
+    assert!(!is_live(&pool, lost_phone).await);
+    assert!(
+        is_live(&pool, lost_backup).await,
+        "a lost revoke keeps the attested backup"
+    );
+    assert_eq!(
+        revoke_modes(&pool, lost_phone).await,
+        vec![Some("lost".to_string())]
+    );
 }

@@ -36,7 +36,8 @@ pub async fn check_sheaf_consistency(
         _ => epigraph_engine::sheaf::RestrictionProfile::scientific(),
     };
 
-    let rows = SheafRepository::get_claim_neighbor_betp_pairs(&server.pool, viewer, None)
+    let mut read = server.read_as(viewer, "check_sheaf_consistency").await?;
+    let rows = SheafRepository::get_claim_neighbor_betp_pairs(&mut *read, viewer, None)
         .await
         .map_err(internal_error)?;
 
@@ -131,7 +132,8 @@ pub async fn sheaf_cohomology(
 ) -> Result<CallToolResult, McpError> {
     let threshold = params.threshold.unwrap_or(0.05);
 
-    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&server.pool, viewer, None)
+    let mut read = server.read_as(viewer, "sheaf_cohomology").await?;
+    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&mut *read, viewer, None)
         .await
         .map_err(internal_error)?;
 
@@ -221,7 +223,8 @@ pub async fn reconcile_sheaf(
     viewer: &epigraph_db::visibility::Viewer,
     params: ReconcileSheafParams,
 ) -> Result<CallToolResult, McpError> {
-    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&server.pool, viewer, None)
+    let mut read = server.read_as(viewer, "reconcile_sheaf").await?;
+    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&mut *read, viewer, None)
         .await
         .map_err(internal_error)?;
 

@@ -21,8 +21,9 @@
 # was vacuous by absence.
 #
 # THAT IS NO LONGER TRUE, and `a` is now the primary mode. The executor takes a
-# connection the caller has stamped from the `workflow-ingest-system` agent's
-# viewer, so `store_workflow` lands on a clean migration series. The refusal
+# connection stamped from the CALLER's own viewer (workflow writes are made as
+# the caller; before that change, from the `workflow-ingest-system` agent's), so
+# `store_workflow` lands on a clean migration series. The refusal
 # above is retained verbatim because it is what this mode is now the regression
 # test FOR: running `a` against a binary from before that conversion reproduces
 # it exactly, which is how the two binaries are told apart.
@@ -40,13 +41,16 @@
 # that cannot fail, so it measures the conversion on the only population the
 # conversion trivially covers.
 #
-# Workflow claims are not that population. `store_workflow` and `ingest_workflow`
-# both route through `epigraph_ingest_executor::execute_workflow_ingest_plan`,
-# which resolves `get_or_create_system_agent` ("workflow-ingest-system") and passes
-# THAT id to `create_with_id_if_absent` together with
-# `default_decl_for_author_pool(pool, system_agent_id)`. So every workflow claim
-# and every step claim is owned by the system agent's personal group, which the
-# MCP process's own agent is not a member of.
+# Workflow claims USED TO BE outside that population: `store_workflow` and
+# `ingest_workflow` authored every claim as the shared `workflow-ingest-system`
+# agent, owned by its default group, which the MCP process's own agent is not a
+# member of. Since workflow writes moved to the caller
+# (`execute_workflow_ingest_plan_in_group`), they are authored by the CALLER (on
+# stdio, the MCP process's own agent) and owned by its one team group, else its
+# default group, PRIVATE to that group unless the call declares
+# `{"visibility":"public","owner_group_id":G}`. The FOREIGN arm below therefore
+# seeds its claims under a freshly minted agent's group, never under a workflow
+# claim's author (which is now the MCP agent itself).
 #
 # This probe therefore seeds through `store_workflow` and then addresses
 # `deprecate_workflow` / `report_workflow_outcome` at the ids `store_workflow`
@@ -60,7 +64,7 @@
 # `deprecate_claim` matched zero rows, NO 42501 was raised, and the tool reported
 # success -- indistinguishable from "the write was allowed". Since U017 the tool
 # forks on what the id is (a readable claim -> the flat path; a `workflows` row
-# -> the hierarchical path on the system agent's stamp, which retires the
+# -> the hierarchical path on the caller's own stamp, which retires the
 # unshared thesis/phase/step claims; neither -> an error), so ARM 2 below should
 # now show steps_still_current drop for an unshared workflow. The
 # IDENTITY CHECK below is printed before any verdict for exactly that reason:
@@ -179,7 +183,7 @@ q "SELECT a.display_name||' x'||count(*) FROM claims c JOIN agents a ON a.id=c.a
 
 echo
 echo "=== REACHABILITY: can any DISCOVERY tool hand deprecate_workflow a"
-echo "=== system-agent-owned CLAIM id? (Since U017 deprecate_workflow forks on"
+echo "=== CLAIM id owned by another agent? (Since U017 deprecate_workflow forks on"
 echo "=== the id: a claim the caller can read takes the flat author-stamped path,"
 echo "=== a workflows row the hierarchical path, anything else is an error. So"
 echo "=== only a readable CLAIM id reaches the flat path's foreign-owner case.)"
@@ -241,7 +245,7 @@ echo "# id, returns through do_report_hierarchical_outcome_via_pool(&server.pool
 echo "# -- so ARM 1 above never executed a single stamped statement. The stamped"
 echo "# path is reached only for the legacy flat-workflow CLAIMS the tool's own"
 echo "# comment counts at ~144. deprecate_workflow now forks too (U017): a"
-echo "# workflows-row id takes the hierarchical path on the system agent's stamp,"
+echo "# workflows-row id takes the hierarchical path on the caller's own stamp,"
 echo "# so ARM 2 above did not exercise the author-stamped flat code either."
 echo "#"
 echo "# No tool creates that population any more, so it is seeded here as the"
@@ -270,20 +274,18 @@ if [ -z "$MCP_AGENT" ]; then
 else
   echo "mcp-agent rows sharing that display_name: $(q "SELECT count(*) FROM agents WHERE display_name='mcp-agent'")"
   OWN_GROUP=$(q "SELECT public.epigraph_ensure_personal_group('$MCP_AGENT')")
-  # THE SYSTEM AGENT, DERIVED FROM A WRITE IT MADE -- never by display_name, for
-  # the same measured reason as `mcp-agent` above: `display_name` is not unique,
-  # and picking an arbitrary row named `workflow-ingest-system` seeds the FOREIGN
-  # arm into a group nothing authored, which yields a refusal that looks exactly
-  # like the defect. The workflow ingest authors its claims as the real system
-  # agent, so reading `claims.agent_id` back off one of them cannot drift.
-  FOREIGN_AGENT=$(q "SELECT c.agent_id FROM claims c
-                       JOIN edges e ON e.target_id=c.id AND e.source_type='workflow'
-                                   AND e.relationship='executes'
-                      WHERE e.source_id='$WFID' LIMIT 1")
-  [ -n "$FOREIGN_AGENT" ] || FOREIGN_AGENT=$(q "SELECT id FROM agents WHERE display_name = 'workflow-ingest-system' LIMIT 1")
+  # A FOREIGN AGENT, MINTED HERE -- never by display_name (not unique, see
+  # `mcp-agent` above) and no longer off a workflow claim: workflow writes are
+  # authored by the caller, so the author of the claims `store_workflow` just
+  # wrote is the MCP agent itself, and seeding the FOREIGN arm there would
+  # silently test the OWN case. A fresh agent's personal group is one the MCP
+  # agent is certainly not a member of.
+  FOREIGN_AGENT=$(q "INSERT INTO agents (public_key, display_name)
+                     VALUES (decode(md5(random()::text) || md5(random()::text), 'hex'),
+                             'probe-workflow-foreign-$LABEL') RETURNING id" | head -1)
   FOREIGN_GROUP=$(q "SELECT public.epigraph_ensure_personal_group('$FOREIGN_AGENT')")
   echo "mcp-agent=$MCP_AGENT own_group=$OWN_GROUP"
-  echo "workflow-ingest-system=$FOREIGN_AGENT foreign_group=$FOREIGN_GROUP"
+  echo "foreign-agent=$FOREIGN_AGENT foreign_group=$FOREIGN_GROUP"
 
   seed_flat() {   # $1 = label suffix, $2 = owner group, $3 = author agent
     q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current,
