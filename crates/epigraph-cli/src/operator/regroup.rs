@@ -508,6 +508,20 @@ async fn ends_of(
     Ok(ends)
 }
 
+/// One edge as `fetch_node_edges` reads it: id, source (id, type), target
+/// (id, type), owner, visibility, co-owner, writer.
+type NodeEdgeRow = (
+    Uuid,
+    Uuid,
+    String,
+    Uuid,
+    String,
+    Uuid,
+    String,
+    Option<Uuid>,
+    Option<Uuid>,
+);
+
 /// Every edge with an endpoint that is a [`NodeTypes`] row in `attached` (a
 /// reasoning trace that follows a candidate), as `restrict::fetch_evidence_edges`
 /// reads every edge with an endpoint that is attached evidence. An edge between
@@ -569,17 +583,7 @@ async fn fetch_node_edges(
              OR (e.target_type::text = n.ty AND e.target_id = n.id)",
         tables::EDGE_WRITER_SQL
     );
-    let rows: Vec<(
-        Uuid,
-        Uuid,
-        String,
-        Uuid,
-        String,
-        Uuid,
-        String,
-        Option<Uuid>,
-        Option<Uuid>,
-    )> = sqlx::query_as(&sql)
+    let rows: Vec<NodeEdgeRow> = sqlx::query_as(&sql)
         .bind(&tys)
         .bind(&ids)
         .fetch_all(&mut *conn)
@@ -979,6 +983,9 @@ fn wanted(
     }
 }
 
+/// An `IRREVERSIBLE-EDGE` line and the claims it names.
+pub type Irreversible = (String, BTreeSet<Uuid>);
+
 /// What one apply batch did.
 #[derive(Default, Debug)]
 pub struct BatchOutcome {
@@ -998,7 +1005,7 @@ pub struct BatchOutcome {
     /// the claims it names (its recorded prior is wider than the meet its
     /// endpoints will have after a restore, so `reown-reverse` will hold
     /// them), or `None`. A later batch's verdict replaces an earlier one's.
-    pub irreversible: Vec<(String, Option<(String, BTreeSet<Uuid>)>)>,
+    pub irreversible: Vec<(String, Option<Irreversible>)>,
     /// The prior of every row this batch recorded.
     pub prior_rows: BTreeMap<RowKey, RowState>,
     /// The claims this batch moved.
@@ -1810,7 +1817,7 @@ pub async fn run(
     let mut sampled = 0usize;
     let mut co_owned: Vec<String> = Vec::new();
     let mut node_edges: BTreeMap<String, String> = BTreeMap::new();
-    let mut irreversible: BTreeMap<String, (String, BTreeSet<Uuid>)> = BTreeMap::new();
+    let mut irreversible: BTreeMap<String, Irreversible> = BTreeMap::new();
     for (i, batch) in batches.iter().enumerate() {
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let audit =
