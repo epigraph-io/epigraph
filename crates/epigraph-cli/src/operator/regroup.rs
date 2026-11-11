@@ -79,7 +79,11 @@
 //! The exact meet of a node edge is not what the trigger derives: a later act
 //! that re-tenants the claim again (another regroup, a restriction, the
 //! privatization pipeline's edge re-meet) puts it back on the tenancy-less
-//! meet. The reversal of THIS act checks it (below).
+//! meet. The reversal of THIS act checks it (below). An edge to a
+//! group-private node that is NOT in the source (a target node, which is not
+//! reported, or a third group's) had a recorded tuple wider than the node
+//! before the act, so the reversal holds its claim rather than write that
+//! tuple back.
 //!
 //! An edge is accepted only when its new meet is at least as narrow as its
 //! current tuple with the source replaced by the target; otherwise it holds

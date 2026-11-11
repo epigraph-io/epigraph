@@ -1792,6 +1792,59 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
     );
 }
 
+/// An edge from a workflow that is already in the TARGET goes to the target
+/// alone (the node requires nothing beyond the target) and is not reported.
+/// Its recorded prior, the claim's tuple alone, was wider than the node (a
+/// SOURCE-only reader read an edge naming a TARGET-private workflow), so the
+/// reversal will not write it back and holds the claim instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, run by DST's workflow")
+        .await;
+    let wf = seed_node(&pool, "workflow", fx.dst, "group").await;
+    let e = typed_edge(&pool, wf, "workflow", c, "claim").await;
+    assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(edge(&pool, e).await, (fx.dst, "group".to_string(), None));
+    assert!(
+        !r.stdout
+            .lines()
+            .any(|l| l.starts_with("SOURCE-NODE-EDGE\t")),
+        "{}",
+        r.show()
+    );
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&c.to_string(), &e.to_string(), "widen"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.dst));
+    assert_eq!(edge(&pool, e).await, (fx.dst, "group".to_string(), None));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sealed evidence, a moved evidence endpoint, a concurrent edge insert
 // ─────────────────────────────────────────────────────────────────────────────
