@@ -56,9 +56,13 @@ Added to:
   `tests/batch_submit_claims_parity.rs` requires an entry to accept every `submit_claim` field.
 * MCP `ingest_document`, `ingest_document_inline` and `ingest_document_spine`. The setting applies
   to every claim the ingest creates. Claims it converges onto keep their own tenancy.
-  `do_ingest_document` / `do_ingest_document_spine` keep writing public. They are the operator
-  CLI's and the test harness's entry points (section 3.5). The tools call the
-  `*_with_visibility` variants.
+* The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting
+  agent (the `--agent-key` signer). Omitted, it is D-V1 like every other surface, so an operator
+  ingest lands in that agent's team, else private, and never public unless `--visibility public`
+  says so (operator ruling, 2026-11-10: papers go to the ingester's team, not public).
+  `do_ingest_document` / `do_ingest_document_spine`, the core the tools and the CLI share, take the
+  choice as a required argument and have no defaulted wrapper. A test harness that needs a public
+  paper passes `VisibilityChoice::Public` explicitly.
 * REST `POST /api/v1/submit`, as top-level `visibility` / `group_id` packet fields. They are
   **outside** `signable_bytes`: a routing choice of the authenticated caller, so existing
   signatures still verify. A team must also be writable by the caller's own stamp.
@@ -130,8 +134,8 @@ declaration into `create_claim_idempotent`.
 These keep `default_decl_for_author` (public over the home group):
 
 * the system-agent and registry writers: workflow ingest, which already has its own `tenancy`
-  parameter; conventions; policies and challenges; hypothesis; and the CLI binaries, including
-  the operator `ingest_document` CLI through `do_ingest_document`;
+  parameter; conventions; policies and challenges; hypothesis; and the CLI binaries other than
+  the operator `ingest-document` CLI (section 3.1);
 * `TenancyDecl` and the `Visibility` vocabulary;
 * the database's widening, sealed and owner-immutability guards.
 
@@ -156,6 +160,14 @@ team-or-private, where it used to write public:
   `public`.
 * The `ingest_git` / `ingest_literature` CLIs post to `/submit`, so they now default to
   team/private too.
+* **The operator `ingest-document` CLI** now defaults to team/private for its acting agent, the
+  `--agent-key` signer. Run with no `--agent-key`, that is the deterministic ingest-cli agent,
+  which belongs to no team, so its papers land private in that agent's own personal group,
+  readable by no team member. To put a paper in a team, run it with the key of an agent that
+  writes the team (its own membership, its human's, or its default team), or pass
+  `--visibility team --group-id <team>` for a team that agent writes. A human's default team
+  reaches CLI ingests only through an agent linked to that human. A paper that must be public
+  takes `--visibility public`.
 * **`create_claim_core`'s structural edges** (AUTHORED, HAS_TRACE, DERIVED_FROM) used to be
   written after the commit on the unstamped pool, best-effort. A group-visible claim is
   invisible there, so the edge's reference check refused them silently. For a group-visible
