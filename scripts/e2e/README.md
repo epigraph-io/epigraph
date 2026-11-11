@@ -532,7 +532,10 @@ decision or conversion before the operator drops `claims_privacy`,
      link, a writer of the
      workflow's owner group, or the audited admin path).
    - `refresh_workflow_promotion`'s `merge_properties`: same population, same H3
-     question. Its A behaviour is inferred, not measured.
+     question. Its A behaviour is measured: on a member's own group-private
+     variant the tool fails at this write with the opaque -32603 and writes
+     nothing (`epigraph-mcp/tests/write_tool_source_reads_app_role.rs`,
+     `refresh_promotion_on_a_members_private_variant_fails_at_the_unstamped_write`).
    - `mark_duplicate`: CONVERTED in batch H-b (gate read, dedup and cascade on
      one caller-stamped transaction); both retraction cascades are stamped from
      the caller with a savepoint per edge and per target. A downstream claim the
