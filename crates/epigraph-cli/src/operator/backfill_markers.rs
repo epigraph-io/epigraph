@@ -64,8 +64,8 @@
 //!
 //! `get_claim`'s `ingesters` read `paper -ingested_claim-> claim` records,
 //! `query_paper` the stamped assertions themselves; the two must agree. So
-//! every stamped paper assertion gets a record of its principal (unless that
-//! principal already has one):
+//! every paper assertion a run stamps gets a record of its principal, written
+//! by that same run (unless that principal already has one):
 //!
 //! * a CREATION record (`created_claim: true`) only where the paper's ingest
 //!   PROVABLY created the claim, from the data:
@@ -105,6 +105,18 @@
 //! BEFORE that batch's write, then gets a `committed_batch` line AFTER its
 //! commit. One `security_events` row per run, written in the first batch that
 //! changes anything.
+//!
+//! A run writes the records of exactly the paper assertions IT stamped and
+//! committed, after its edge batches, whatever stopped them: `--max-batches`
+//! bounds the edge batches only, and a failed edge batch still leaves the
+//! committed ones their records. So after every run, and after reversing any
+//! one run's manifest, `query_paper` and `get_claim`'s `ingesters` agree. A
+//! failed record batch is reported as `BATCH-FAILED` (exit 2) as a failed edge
+//! batch is, and the summary still prints; that run's stamps then lack
+//! records, and no later run adopts them, so reverse that run before resuming.
+//! A resumed run (a new manifest) must use the same `--written-before` and the
+//! same `--ingest-signer` / `--attestation-signer` lists as the first: they
+//! decide every paper's principal.
 //!
 //! # Reversal
 //!
@@ -534,14 +546,16 @@ fn provable_sql(f: &Frame) -> String {
     )
 }
 
-fn provable_from(f: &Frame) -> String {
+/// [`provable_sql`] as a query over `pa`, further restricted by `scope` (a
+/// predicate on `pa`, `$2` onward).
+fn provable_from(f: &Frame, scope: &str) -> String {
     format!(
         "WITH {} SELECT {{cols}} FROM edges pa \
            JOIN claims c ON c.id = pa.target_id \
            JOIN papers p ON p.id = pa.source_id \
            JOIN reasoning_traces t ON t.id = c.trace_id \
            LEFT JOIN pp ON pp.paper = pa.source_id \
-          WHERE {}",
+          WHERE {} {scope}",
         f.pp_cte("$1::uuid[]", None),
         provable_sql(f)
     )
@@ -724,22 +738,27 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
     c.chains_on_another_principal = other;
     c.agent_asserts_multi_principal = multi;
 
-    c.provable_records =
-        sqlx::query_scalar(&provable_from(&f).replace("{cols}", "count(DISTINCT c.id)"))
-            .bind(&o.ingest_signers)
-            .fetch_one(&mut *tx)
-            .await?;
+    // A run writes the records of the assertions IT stamps, so the plan
+    // counts the candidates only.
+    c.provable_records = sqlx::query_scalar(
+        &provable_from(
+            &f,
+            &format!("AND NOT (pa.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[])"),
+        )
+        .replace("{cols}", "count(DISTINCT c.id)"),
+    )
+    .bind(&o.ingest_signers)
+    .fetch_one(&mut *tx)
+    .await?;
 
-    // Every legacy paper assertion (candidate or already stamped) with no
-    // record of its principal gets one; the provable ones get a creation
-    // record instead.
+    // Every candidate paper assertion with no record of its principal gets
+    // one; the provable ones get a creation record instead.
     let pairs: i64 = sqlx::query_scalar(&format!(
         "WITH {pp}, \
          x AS (SELECT DISTINCT e.source_id AS paper, e.target_id AS claim, \
-                      COALESCE(CASE WHEN e.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[] \
-                                    THEN {by_e} END, ({prin})::text) AS by \
+                      ({prin})::text AS by \
                  FROM edges e LEFT JOIN pp ON pp.paper = e.source_id \
-                WHERE {pas} AND {le}) \
+                WHERE {cand}) \
          SELECT count(*) FROM x \
           WHERE NOT EXISTS (SELECT 1 FROM edges r \
                              WHERE r.source_id = x.paper AND r.target_id = x.claim \
@@ -747,11 +766,9 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
                                AND r.properties ->> '{INGESTED_BY_PROPERTY}' = x.by \
                                AND {by_r} = x.by)",
         pp = f.pp_cte("$2::uuid[]", None),
-        by_e = ingest_written_by_sql("e"),
         by_r = ingest_written_by_sql("r"),
         prin = principal("pp", "$1::uuid"),
-        pas = paper_asserts("e"),
-        le = f.legacy("e"),
+        cand = f.candidate(Kind::PaperAsserts, "e"),
     ))
     .bind(legacy)
     .bind(&o.ingest_signers)
@@ -1079,6 +1096,9 @@ pub async fn run(
         }),
         audited: false,
     };
+    // The paper assertions this run stamped and committed: the run writes
+    // their ingest records, and only theirs.
+    let mut run_pa: Vec<Uuid> = Vec::new();
     'kinds: for kind in Kind::ALL {
         let mut last = Uuid::nil();
         loop {
@@ -1155,6 +1175,9 @@ pub async fn run(
                     act.audited = true;
                     manifest.committed(batch)?;
                     *report.stamped.entry(kind).or_default() += n;
+                    if kind == Kind::PaperAsserts {
+                        run_pa.extend_from_slice(&ids);
+                    }
                 }
                 Err(e) => {
                     tx.rollback().await.ok();
@@ -1167,8 +1190,14 @@ pub async fn run(
             last = max_id;
         }
     }
-    if report.batch_failures.is_empty() {
-        write_records(conn, &mut act, &mut manifest, &mut report).await?;
+    // The records of exactly what this run committed, whatever stopped its
+    // edge phase (a failed batch, --max-batches): every run leaves
+    // query_paper and get_claim's ingesters agreeing on its own stamps, and
+    // its manifest reverses exactly those. A record-phase failure is reported
+    // as an edge batch's is, and the summary still prints. A run that
+    // stamped no paper assertion selects nothing here (never another run's).
+    if let Err(e) = write_records(conn, &mut act, &mut manifest, &mut report, &run_pa).await {
+        report.batch_failures.push(format!("ingest records: {e:#}"));
     }
     for (k, n) in &report.stamped {
         writeln!(out, "STAMPED\t{}\t{n}", k.as_str())?;
@@ -1194,43 +1223,54 @@ pub async fn run(
 /// One record to write: paper, claim, principal, created.
 type RecordPlan = (Uuid, Uuid, Uuid, bool);
 
-/// The ingest records of the stamped assertions (module doc): the provable
-/// creation records first, then a non-creation record for every stamped
-/// legacy paper assertion its principal has no record of.
+/// The ingest records of the paper assertions THIS run stamped (`run_pa`,
+/// module doc): the provable creation records first, then a non-creation
+/// record for every one of them its principal has no record of.
 async fn write_records(
     conn: &mut PgConnection,
     act: &mut Act<'_>,
     manifest: &mut ManifestOut,
     report: &mut Report,
+    run_pa: &[Uuid],
 ) -> anyhow::Result<()> {
     let o = act.o;
     let mut plan: Vec<RecordPlan> = Vec::new();
     if o.creation_records {
+        // Only over this run's stamps, and only where the stamp names the
+        // signer the proof names (the record's ingester is the edge's `by`).
         let sql = format!(
             "{} ORDER BY c.id, pa.created_at, pa.id",
-            provable_from(&act.frame).replace(
+            provable_from(
+                &act.frame,
+                &format!(
+                    "AND pa.id = ANY($2::uuid[]) AND ({by_pa}) = pa.signer_id::text",
+                    by_pa = ingest_written_by_sql("pa")
+                )
+            )
+            .replace(
                 "{cols}",
                 "DISTINCT ON (c.id) pa.source_id, c.id, c.agent_id"
             )
         );
         let created: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(&sql)
             .bind(&o.ingest_signers)
+            .bind(run_pa)
             .fetch_all(&mut *conn)
             .await?;
         plan.extend(created.into_iter().map(|(p, c, by)| (p, c, by, true)));
     }
-    // Every stamped legacy paper assertion, under the run's cutoff, by the
-    // principal its label names. A pair a creation record above covers is
-    // skipped by the record writer's own dedup (one record per paper, claim
-    // and ingester).
+    // This run's stamped paper assertions, by the principal their label
+    // names. A pair a creation record above covers is skipped by the record
+    // writer's own dedup (one record per paper, claim and ingester).
     let stamped: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(&format!(
         "SELECT DISTINCT e.source_id, e.target_id, ({by_e})::uuid FROM edges e \
-          WHERE {pas} AND {le} AND e.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[] \
+          WHERE e.id = ANY($1::uuid[]) AND {pas} \
+            AND e.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[] \
           ORDER BY 1, 2, 3",
         by_e = ingest_written_by_sql("e"),
         pas = paper_asserts("e"),
-        le = act.frame.legacy("e"),
     ))
+    .bind(run_pa)
     .fetch_all(&mut *conn)
     .await?;
     let creations: BTreeSet<(Uuid, Uuid, Uuid)> =
@@ -1242,76 +1282,86 @@ async fn write_records(
             .map(|(p, c, by)| (p, c, by, false)),
     );
     let mut authors_of: HashMap<(Uuid, Uuid), Vec<Uuid>> = HashMap::new();
+    // Not bounded by --max-batches: a run always writes the records of what
+    // it stamped.
     for chunk in plan.chunks(o.batch_size.max(1)) {
-        if o.max_batches.is_some_and(|m| report.batches >= m) {
-            break;
-        }
         report.batches += 1;
         let batch = report.batches;
         let mut tx = conn.begin().await?;
-        sqlx::query("SELECT set_config('lock_timeout', $1, true)")
-            .bind(&o.lock_timeout)
-            .execute(&mut *tx)
-            .await?;
-        let mut lines = Vec::new();
-        let (mut created_n, mut other_n) = (0u64, 0u64);
-        for (paper, claim, by, created) in chunk {
-            if let Entry::Vacant(slot) = authors_of.entry((*paper, *by)) {
-                // The authorships this principal's ingest of the paper holds
-                // (the authors query_paper(ingested_by = by) lists), in
-                // position order.
-                let authors: Vec<Uuid> = sqlx::query_scalar(&format!(
-                    "SELECT ea.source_id FROM edges ea \
+        let result: anyhow::Result<(Vec<Value>, u64, u64)> = async {
+            sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+                .bind(&o.lock_timeout)
+                .execute(&mut *tx)
+                .await?;
+            let mut lines = Vec::new();
+            let (mut created_n, mut other_n) = (0u64, 0u64);
+            for (paper, claim, by, created) in chunk {
+                if let Entry::Vacant(slot) = authors_of.entry((*paper, *by)) {
+                    // The authorships this principal's ingest of the paper holds
+                    // (the authors query_paper(ingested_by = by) lists), in
+                    // position order.
+                    let authors: Vec<Uuid> = sqlx::query_scalar(&format!(
+                        "SELECT ea.source_id FROM edges ea \
                       WHERE ea.target_id = $1 AND {au} \
                         AND (ea.valid_to IS NULL OR ea.valid_to > now()) \
                         AND {by_ea} = $2::text \
                       ORDER BY CASE WHEN ea.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
                                     THEN (ea.properties ->> 'position')::bigint END NULLS LAST, \
                                ea.created_at, ea.id",
-                    au = authored("ea"),
-                    by_ea = ingest_written_by_sql("ea"),
-                ))
-                .bind(paper)
-                .bind(by.to_string())
-                .fetch_all(&mut *tx)
-                .await?;
-                slot.insert(authors);
-            }
-            let authors = &authors_of[&(*paper, *by)];
-            let wrote = epigraph_db::ClaimIngestRepository::record_signed_conn(
-                &mut tx, None, *paper, *claim, *by, *created, authors, TOOL, PIPELINE,
-            )
-            .await
-            .map_err(|e| anyhow!("ingest record for claim {claim}: {e}"))?;
-            if !wrote {
-                continue;
-            }
-            let id: Uuid = sqlx::query_scalar(&format!(
-                "SELECT e.id FROM edges e \
+                        au = authored("ea"),
+                        by_ea = ingest_written_by_sql("ea"),
+                    ))
+                    .bind(paper)
+                    .bind(by.to_string())
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    slot.insert(authors);
+                }
+                let authors = &authors_of[&(*paper, *by)];
+                let wrote = epigraph_db::ClaimIngestRepository::record_signed_conn(
+                    &mut tx, None, *paper, *claim, *by, *created, authors, TOOL, PIPELINE,
+                )
+                .await
+                .map_err(|e| anyhow!("ingest record for claim {claim}: {e}"))?;
+                if !wrote {
+                    continue;
+                }
+                let id: Uuid = sqlx::query_scalar(&format!(
+                    "SELECT e.id FROM edges e \
                   WHERE e.source_id = $1 AND e.target_id = $2 \
                     AND e.relationship = '{INGEST_RECORD_RELATIONSHIP}' \
                     AND e.properties -> '{INGEST_WRITTEN_PROPERTY}' ->> 'tool' = $3 \
                     AND e.properties ->> '{INGESTED_BY_PROPERTY}' = $4"
-            ))
-            .bind(paper)
-            .bind(claim)
-            .bind(TOOL)
-            .bind(by.to_string())
-            .fetch_one(&mut *tx)
-            .await?;
-            if *created {
-                created_n += 1;
-            } else {
-                other_n += 1;
+                ))
+                .bind(paper)
+                .bind(claim)
+                .bind(TOOL)
+                .bind(by.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+                if *created {
+                    created_n += 1;
+                } else {
+                    other_n += 1;
+                }
+                lines.push(json!({
+                    "record": id, "paper": paper, "claim": claim, "by": by,
+                    "created": created, "batch": batch,
+                }));
             }
-            lines.push(json!({
-                "record": id, "paper": paper, "claim": claim, "by": by,
-                "created": created, "batch": batch,
-            }));
+            if !lines.is_empty() {
+                act.audit_once(&mut tx).await?;
+            }
+            Ok((lines, created_n, other_n))
         }
-        if !lines.is_empty() {
-            act.audit_once(&mut tx).await?;
-        }
+        .await;
+        let (lines, created_n, other_n) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tx.rollback().await.ok();
+                bail!("records batch {batch}: {e:#}");
+            }
+        };
         // The record lines, fsynced before the commit they describe; the
         // commit line after it.
         manifest.append(&lines)?;

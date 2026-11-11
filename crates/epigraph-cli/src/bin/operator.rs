@@ -864,8 +864,10 @@ enum Command {
         /// Edges per transaction.
         #[arg(long, default_value_t = 2000)]
         batch_size: usize,
-        /// Stop after this many batches (a re-run with a new manifest picks up
-        /// the rest).
+        /// Stop after this many EDGE batches; the run still writes the ingest
+        /// records of the paper assertions it stamped. A re-run with a new
+        /// manifest, the same --written-before and the same signer lists
+        /// picks up the rest.
         #[arg(long)]
         max_batches: Option<usize>,
         /// `lock_timeout` for each batch (a PostgreSQL interval).
