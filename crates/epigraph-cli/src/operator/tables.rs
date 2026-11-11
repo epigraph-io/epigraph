@@ -855,6 +855,23 @@ pub async fn app_readable(
     claims: &[Uuid],
     attached: &BTreeSet<RowKey>,
 ) -> anyhow::Result<BTreeSet<RowKey>> {
+    app_readable_as(conn, specs, claims, attached, &[]).await
+}
+
+/// [`app_readable`] for an `epigraph_app` session whose read set
+/// (`epigraph.group_ids`, which the tenancy policies read) is exactly
+/// `groups`: what a member of those groups, and of no other, can read. Empty
+/// `groups` is the unstamped session.
+///
+/// # Errors
+/// The session switch is refused, or a read fails.
+pub async fn app_readable_as(
+    conn: &mut PgConnection,
+    specs: &[TableSpec],
+    claims: &[Uuid],
+    attached: &BTreeSet<RowKey>,
+    groups: &[Uuid],
+) -> anyhow::Result<BTreeSet<RowKey>> {
     sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
         .execute(&mut *conn)
         .await
@@ -863,7 +880,7 @@ pub async fn app_readable(
              that no row became less readable needs a connection that may switch session_user \
              (a superuser login); refusing to write without it",
         )?;
-    let result = app_readable_inner(conn, specs, claims, attached).await;
+    let result = app_readable_inner(conn, specs, claims, attached, groups).await;
     let reset = sqlx::query("SET LOCAL SESSION AUTHORIZATION DEFAULT")
         .execute(&mut *conn)
         .await;
@@ -879,14 +896,21 @@ async fn app_readable_inner(
     specs: &[TableSpec],
     claims: &[Uuid],
     attached: &BTreeSet<RowKey>,
+    groups: &[Uuid],
 ) -> anyhow::Result<BTreeSet<RowKey>> {
+    let read_set = groups
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     sqlx::query(
-        "SELECT set_config('epigraph.group_ids', '', true), \
+        "SELECT set_config('epigraph.group_ids', $1, true), \
                 set_config('epigraph.writable_group_ids', '', true), \
                 set_config('epigraph.principal_id', '', true), \
                 set_config('epigraph.elevation_id', '', true), \
                 set_config('epigraph.family_id', '', true)",
     )
+    .bind(read_set)
     .execute(&mut *conn)
     .await?;
     let bypass: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")

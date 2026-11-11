@@ -14,7 +14,9 @@
 //! stops there); 3 `link-retired` refused at least one id, `link` left the
 //! agent without a LIVE link (its link is retired, or its membership revoked),
 //! or `reown-reverse` HELD at least one claim or hidden row (it is not fully
-//! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
+//! restored), or `regroup-claims --apply` held a listed claim or moved a count
+//! other than `--confirm-count` (the list is not fully regrouped).
+//! `arm-operator-binding --apply` exits 1 when the census of unbound
 //! recent writers refused it. `verify-confirmations` exits 2 when at least one
 //! stored confirmation does not verify (each is recorded).
 //! `allow-author-binding-client` exits 3 when the allowance is recorded but
@@ -42,6 +44,10 @@
 //!         [--max-batches N] [--apply --confirm-count N --ruling TEXT --reason TEXT \
 //!         [--accept-unenforced]]
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
+//!     epigraph-operator regroup-claims --claims-file claims.txt --source-group <uuid> \
+//!         --target-group <uuid> --operator <uuid> --manifest-out regroup-1.jsonl \
+//!         [--apply --confirm-count N --ruling TEXT --reason TEXT]
+//!     epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 //!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
 //!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
 //!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
@@ -112,7 +118,7 @@ use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
     confirmations, custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy,
-    link, passkey, reown, reown_linked, reown_workflows, restrict, retire_link, reverse,
+    link, passkey, regroup, reown, reown_linked, reown_workflows, restrict, retire_link, reverse,
     system_agent, team_group,
 };
 use std::path::PathBuf;
@@ -818,6 +824,58 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         sample: usize,
     },
+    /// Move listed claims that are group-private in the source group (and
+    /// every row that follows only them) to the target group, keeping
+    /// visibility `group`; never makes anything public. Reversed exactly by
+    /// `reown-reverse --manifest`.
+    RegroupClaims {
+        /// One claim UUID per line; only these claims are ever touched.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The group the claims are in now (`('group', source)`); `--operator`
+        /// must be a live admin of it.
+        #[arg(long)]
+        source_group: Uuid,
+        /// The group the claims move into: an active team or community group
+        /// of which `--operator` is a live admin.
+        #[arg(long)]
+        target_group: Uuid,
+        /// The operator (a registered human operator's agent id) the act is
+        /// attributed to in the audit row.
+        #[arg(long)]
+        operator: Uuid,
+        /// Where to write the undo manifest. Must not exist. Written and
+        /// fsynced before any write under `--apply`.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back, and no manifest or audit row is
+        /// written.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's eligible claim count, repeated back.
+        #[arg(long)]
+        confirm_count: Option<usize>,
+        /// The decision this act carries out, recorded in the manifest and the
+        /// audit row. Required under `--apply`.
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why, recorded in the manifest and the audit row. Required under
+        /// `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Claims per transaction. Each batch holds `SHARE ROW EXCLUSIVE` on
+        /// `edges` and `harvester_fragments`, blocking every write to them on
+        /// the instance while it runs.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// How many claims the dry run lists row by row.
+        #[arg(long, default_value_t = 3)]
+        sample: usize,
+    },
     /// Move listed workflow LINEAGES (every generation, the plan claims they
     /// execute, the rows those carry, and their plan edges) out of the source
     /// group into a TEAM group, keeping every row's visibility
@@ -1331,6 +1389,41 @@ async fn main_inner() -> anyhow::Result<i32> {
             creation_records: !*no_creation_records,
         };
         backfill_markers::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
+    // regroup-claims' options, likewise refused before any connection.
+    let regroup_opts = if let Command::RegroupClaims {
+        claims_file,
+        source_group,
+        target_group,
+        operator: op,
+        manifest_out,
+        apply,
+        confirm_count,
+        ruling,
+        reason,
+        batch_size,
+        lock_timeout,
+        sample,
+    } = &cli.command
+    {
+        let o = regroup::Options {
+            claims_file: claims_file.clone(),
+            source: *source_group,
+            target: *target_group,
+            operator: *op,
+            manifest_out: manifest_out.clone(),
+            apply: *apply,
+            confirm_count: *confirm_count,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            batch_size: *batch_size,
+            lock_timeout: lock_timeout.clone(),
+            sample: *sample,
+        };
+        regroup::validate(&o)?;
         Some(o)
     } else {
         None
@@ -2370,6 +2463,15 @@ async fn main_inner() -> anyhow::Result<i32> {
             } else {
                 2
             })
+        }
+        Command::RegroupClaims { claims_file, .. } => {
+            let opts = regroup_opts.expect("built above");
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            let report = regroup::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(regroup::exit_code(&report, &opts))
         }
         Command::HideEvidence {
             claims_file,
