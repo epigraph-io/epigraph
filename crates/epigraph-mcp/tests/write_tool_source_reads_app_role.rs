@@ -602,6 +602,9 @@ fn promotion_params(variant: Uuid) -> EvaluateWorkflowPromotionParams {
 /// write is still on the plain pool (registered in
 /// `residual_unstamped_writes.rs`), so on this server it fails at that write
 /// for a group-private variant, a defect this read conversion does not own.
+/// That answer is pinned by
+/// `refresh_promotion_on_a_members_private_variant_fails_at_the_unstamped_write`
+/// below.
 #[sqlx::test(migrations = "../../migrations")]
 async fn promotion_reads_the_members_private_variant_edge(pool: PgPool) {
     let server = app_role_server(&pool).await;
@@ -636,4 +639,75 @@ async fn promotion_reads_the_members_private_variant_edge(pool: PgPool) {
          was read on an unstamped session and seen as missing): {}",
         first_text(&mine)
     );
+}
+
+/// `refresh_workflow_promotion` on a member's own group-private variant, as it
+/// answers TODAY, in both session modes. The variant-parent read runs as the
+/// caller and finds the private parent, so refresh reaches its
+/// `properties.promotion` write, which is still on the plain pool (the
+/// `ClaimRepository::merge_properties` entry in `residual_unstamped_writes.rs`).
+/// On the application role that unstamped UPDATE cannot see the group-private
+/// row, so it fails with the opaque -32603 and writes nothing.
+///
+/// This pins a KNOWN DEFECT so that any change to it is visible:
+///
+/// * `refreshed: false` (the lineage-root answer) means the variant-parent read
+///   went back to the plain pool and the member is again told, silently, that
+///   its variant has nothing to promote over. That is a regression.
+/// * `refreshed: true` means the write is now stamped. Flip this test to assert
+///   the written `properties.promotion` and remove the register entry.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refresh_promotion_on_a_members_private_variant_fails_at_the_unstamped_write(pool: PgPool) {
+    let (agent, _auth, viewer, group) = member(&pool).await;
+    let (variant, _parent) = private_variant(&pool, agent, group).await;
+
+    for mode in [SessionGucMode::Session, SessionGucMode::Transaction] {
+        let server = app_role_server_in(&pool, mode).await;
+        let res = epigraph_mcp::tools::workflows::refresh_workflow_promotion(
+            &server,
+            &viewer,
+            promotion_params(variant),
+        )
+        .await;
+        let err = match res {
+            Err(e) => e,
+            Ok(out) => {
+                let body = first_text(&out);
+                if body["refreshed"] == serde_json::Value::Bool(false) {
+                    panic!(
+                        "{mode:?}: refresh answered the lineage-root skip, so the \
+                         variant-parent read no longer sees the member's private edge \
+                         (regression): {body}"
+                    );
+                }
+                panic!(
+                    "{mode:?}: refresh now succeeds; if the properties.promotion write \
+                     is stamped, assert the written flag here and remove the \
+                     merge_properties entry from residual_unstamped_writes.rs: {body}"
+                );
+            }
+        };
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INTERNAL_ERROR,
+            "{mode:?}: the unstamped write fails as an internal error: {err:?}"
+        );
+        assert_eq!(
+            err.message,
+            epigraph_mcp::errors::INTERNAL_ERROR_MESSAGE,
+            "{mode:?}: the failure is the opaque internal error, not a designed refusal; a \
+             different message means the write fails by a different mechanism: {err:?}"
+        );
+
+        let written: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT properties -> 'promotion' FROM claims WHERE id = $1")
+                .bind(variant)
+                .fetch_one(&pool)
+                .await
+                .expect("read back the variant's properties");
+        assert!(
+            written.is_none(),
+            "{mode:?}: the failed refresh must write nothing, found {written:?}"
+        );
+    }
 }
