@@ -12,6 +12,9 @@
 //! Pinned, each on its own fresh database:
 //! * no `--visibility`, the agent writes exactly one team: every claim the
 //!   ingest creates is `group` over that team;
+//! * no `--visibility`, two writable teams and a default team: the default;
+//! * no `--visibility`, an agent in no team, operated by a human with two teams
+//!   and a default team: the human's default (the agent's own default unset);
 //! * no `--visibility`, the agent writes no team: every claim is `group` over
 //!   its own personal group (private), none public;
 //! * `--visibility public`: public, so a caller can still ask for it;
@@ -90,6 +93,13 @@ async fn cli_agent(pool: &PgPool, seed: u8) -> (Uuid, String) {
 
 /// A keyed TEAM group with `agent` as a writer.
 async fn team_with_writer(pool: &PgPool, agent: Uuid) -> Uuid {
+    let id = team(pool).await;
+    add_writer(pool, id, agent).await;
+    id
+}
+
+/// A keyed TEAM group with no members.
+async fn team(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     let key: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
     sqlx::query(
@@ -101,16 +111,45 @@ async fn team_with_writer(pool: &PgPool, agent: Uuid) -> Uuid {
     .execute(pool)
     .await
     .expect("seed team");
+    id
+}
+
+async fn add_writer(pool: &PgPool, group: Uuid, agent: Uuid) {
     sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
          VALUES ($1, $2, ''::bytea, 0, 'writer')",
     )
-    .bind(id)
+    .bind(group)
     .bind(agent)
     .execute(pool)
     .await
     .expect("seed membership");
-    id
+}
+
+async fn set_default_team(pool: &PgPool, agent: Uuid, group: Uuid) {
+    sqlx::query("UPDATE agents SET default_group_id = $2 WHERE id = $1")
+        .bind(agent)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("set the default team");
+}
+
+/// Every claim `agent` authored is `group` over `team`, and there is one.
+async fn assert_all_in(pool: &PgPool, agent: Uuid, team: Uuid, run: &Run, why: &str) {
+    let rows = authored(pool, agent).await;
+    assert!(
+        rows.len() >= 3,
+        "claims were created: {rows:?}\n{}",
+        run.show()
+    );
+    for (visibility, owner, _) in &rows {
+        assert_eq!(
+            (visibility.as_str(), *owner),
+            ("group", team),
+            "{why}: {rows:?}"
+        );
+    }
 }
 
 async fn ingest(pool: &PgPool, agent_key: &str, extra: &[&str]) -> Run {
@@ -241,4 +280,53 @@ async fn a_group_id_with_public_is_refused_before_any_write(pool: PgPool) {
         run.show()
     );
     assert!(authored(&pool, agent).await.is_empty(), "nothing written");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_default_cli_ingest_uses_the_acting_agents_default_team(pool: PgPool) {
+    let (agent, key) = cli_agent(&pool, 0x35).await;
+    team_with_writer(&pool, agent).await;
+    let chosen = team_with_writer(&pool, agent).await;
+    set_default_team(&pool, agent, chosen).await;
+
+    let run = ingest(&pool, &key, &[]).await;
+    assert_eq!(run.code, Some(0), "{}", run.show());
+    assert_all_in(
+        &pool,
+        agent,
+        chosen,
+        &run,
+        "two writable teams: the agent's default team decides",
+    )
+    .await;
+}
+
+/// The post-deploy shape: a human with a default team, and the CLI run with
+/// the key of an agent operated by that human, which is in no team itself.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_default_cli_ingest_by_an_operated_agent_uses_its_humans_default_team(pool: PgPool) {
+    let (agent, key) = cli_agent(&pool, 0x36).await;
+    let (human, _) = fixture::seed_human_operator(&pool, "cli-visibility-human").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+            .await
+            .expect("live link");
+    }
+    let other = team(&pool).await;
+    add_writer(&pool, other, human).await;
+    let chosen = team(&pool).await;
+    add_writer(&pool, chosen, human).await;
+    set_default_team(&pool, human, chosen).await;
+
+    let run = ingest(&pool, &key, &[]).await;
+    assert_eq!(run.code, Some(0), "{}", run.show());
+    assert_all_in(
+        &pool,
+        agent,
+        chosen,
+        &run,
+        "an operated agent with no default of its own takes its human's default team",
+    )
+    .await;
 }
