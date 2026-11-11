@@ -1367,6 +1367,89 @@ async fn a_record_phase_failure_is_reported_and_never_adopted(pool: PgPool) {
     assert_eq!(edge_snapshot(&pool).await, before);
 }
 
+/// A failed EDGE batch still leaves the batches the run committed their
+/// records: the agent-assertion phase fails after the authorships and the
+/// paper assertions committed, and the run writes those assertions' records,
+/// reports the failure (exit 2) and reverses exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_batch_failure_still_writes_the_committed_stamps_records(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let scoped = app_pool(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_agent_assertion_stamp() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.source_type = 'agent' AND NEW.relationship = 'asserts' \
+              AND NOT (OLD.labels @> ARRAY['epigraph:ingest_written']::text[]) \
+              AND NEW.labels @> ARRAY['epigraph:ingest_written']::text[] THEN \
+             RAISE EXCEPTION 'test: agent assertions refused'; \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("refusing function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_agent_assertion_stamp BEFORE UPDATE ON edges \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_agent_assertion_stamp()",
+    )
+    .execute(&pool)
+    .await
+    .expect("refusing trigger");
+
+    let m1 = scratch("edges-fail.jsonl");
+    let r1 = apply(&pool, &fx, 24, &m1, &[]).await;
+    assert_eq!(r1.code, 2, "{}", r1.show());
+    for want in [
+        "STAMPED\tagent-authored-paper\t10",
+        "STAMPED\tpaper-asserts-claim\t7",
+        "BATCH-FAILED\tagent-asserts-claim",
+        "test: agent assertions refused",
+        "\nCREATION-RECORDS-WRITTEN\t1",
+        "NON-CREATION-RECORDS-WRITTEN\t6",
+    ] {
+        assert!(r1.stdout.contains(want), "{want}: {}", r1.show());
+    }
+    assert!(
+        !r1.stdout.contains("STAMPED\tagent-asserts-claim"),
+        "{}",
+        r1.show()
+    );
+    assert_eq!(records_in(&m1), 7);
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(by_paper.len(), 7, "{by_paper:?}");
+    assert_eq!(
+        by_claim, by_paper,
+        "after a failed edge batch, get_claim's ingesters disagree with query_paper"
+    );
+
+    sqlx::query("DROP TRIGGER test_refuse_agent_assertion_stamp ON edges")
+        .execute(&pool)
+        .await
+        .expect("drop trigger");
+    let rev = run_op(
+        &pool,
+        &[
+            "reverse-ingest-markers",
+            "--manifest",
+            m1.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert!(
+        rev.stdout
+            .contains("REVERSED\tedges_restored=17\tedges_held=0\trecords_deleted=7"),
+        "{}",
+        rev.show()
+    );
+    assert_eq!(edge_snapshot(&pool).await, before);
+}
+
 /// `--apply` refuses before any write when no `legacy-ingest` principal is
 /// registered.
 #[sqlx::test(migrations = "../../migrations")]
