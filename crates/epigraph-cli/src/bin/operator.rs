@@ -819,10 +819,11 @@ enum Command {
     /// closing a legacy authored -> paper -> claim chain. One principal per
     /// PAPER: its one classified ingest signer when all of its real-signed
     /// authored and paper asserts edges name one, else the registered
-    /// `legacy-ingest` principal; an agent assertion takes its (oldest)
-    /// chain's paper's. Writes an ingest record for every stamped assertion
-    /// (a creation record only where provable). Dry run (default) is
-    /// read-only. Reversed by `reverse-ingest-markers --manifest`.
+    /// `legacy-ingest` principal; an agent assertion takes its (oldest
+    /// in-force, else oldest) chain's paper's. Writes an ingest record for
+    /// every stamped assertion (a creation record only where provable). Dry
+    /// run (default) is read-only. Reversed by `reverse-ingest-markers
+    /// --manifest`.
     BackfillIngestMarkers {
         /// A bulk-attestation signer: it never decides a paper's principal.
         /// Repeat for each.

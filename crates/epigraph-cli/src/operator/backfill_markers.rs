@@ -40,11 +40,13 @@
 //! as two ingests. An `agent -asserts-> claim` edge takes the principal of
 //! the paper whose chain it closes, never its own signer's; when it closes
 //! chains through papers of different principals, it takes the principal of
-//! its OLDEST chain (the oldest paper assertion), and the dry run counts
-//! those. So only the signers of `authored` and paper `asserts` edges are
-//! classified (`--ingest-signer` / `--attestation-signer`; `--apply` refuses
-//! while any is in neither list); an `agent -asserts-> claim` signer is
-//! reported for information only.
+//! its oldest IN-FORCE chain (authorship and paper assertion both in force;
+//! the agent card credits only through those), else of its oldest chain
+//! (the oldest paper assertion), and the dry run counts those. So only the
+//! signers of `authored` and paper `asserts` edges are classified
+//! (`--ingest-signer` / `--attestation-signer`; `--apply` refuses while any
+//! is in neither list); an `agent -asserts-> claim` signer is reported for
+//! information only.
 //!
 //! # Where the marker goes: labels, not `properties`
 //!
@@ -252,7 +254,8 @@ impl Frame {
     }
 
     /// SQL: the paper whose principal edge `e` of `kind` takes: its own
-    /// paper, or (an agent assertion) the paper of its oldest chain.
+    /// paper, or (an agent assertion) the paper of its chosen chain
+    /// ([`CHAIN_ORDER`]: oldest in-force, else oldest).
     fn paper_of(&self, kind: Kind, e: &str) -> String {
         match kind {
             Kind::Authored => format!("{e}.target_id"),
@@ -294,8 +297,14 @@ impl Frame {
     }
 }
 
-/// The order that picks an agent assertion's chain: oldest paper assertion.
-const CHAIN_ORDER: &str = "pa.created_at, pa.id, ea.created_at, ea.id";
+/// The order that picks an agent assertion's chain: its IN-FORCE chains
+/// (authorship and paper assertion both in force) first, then the oldest
+/// paper assertion. The agent card credits a claim only through in-force
+/// legs, so a retracted chain must not name the principal while a live one
+/// exists.
+const CHAIN_ORDER: &str = "((ea.valid_to IS NULL OR ea.valid_to > now()) \
+                            AND (pa.valid_to IS NULL OR pa.valid_to > now())) DESC, \
+                           pa.created_at, pa.id, ea.created_at, ea.id";
 
 /// SQL: the principal from a `pp` row aliased `pp` (LEFT JOINed; NULL when
 /// the paper has no classified ingest signer), `l` the legacy principal.
@@ -682,8 +691,8 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
     .await?;
 
     // Chains: every (agent assertion, authorship, paper assertion), each pair
-    // counted; the chain an agent assertion's principal comes from is its
-    // oldest (CHAIN_ORDER), as the apply picks it.
+    // counted; the chain an agent assertion's principal comes from is the
+    // first by CHAIN_ORDER (oldest in-force), as the apply picks it.
     let (chains, other, multi): (i64, i64, i64) = sqlx::query_as(&format!(
         "WITH {pp}, \
          tri AS (SELECT e.id AS e, ea.target_id AS paper, \
@@ -843,7 +852,8 @@ pub fn describe(c: &Census, o: &Options) -> Vec<String> {
     out.push(format!(
         "CHAINS\tchains={}\tchains_on_another_principal={}\tagent_asserts_multi_principal={}\t\
          (an agent assertion closing chains through papers of different principals takes its \
-         oldest chain's; the claim is credited through that chain)",
+         oldest in-force chain's, else its oldest chain's; the claim is credited through that \
+         chain)",
         c.chains, c.chains_on_another_principal, c.agent_asserts_multi_principal
     ));
     out.push(format!(

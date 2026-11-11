@@ -1595,3 +1595,40 @@ async fn a_papers_principal_reads_its_assertions_signers_under_the_cutoff(pool: 
         "get_claim's ingesters disagree with query_paper"
     );
 }
+
+/// An agent assertion closing chains through papers of different principals
+/// takes the principal of its oldest IN-FORCE chain: a chain through a
+/// retracted authorship never credits the claim (the agent card reads only
+/// in-force legs), so it must not name the principal either. R's chain
+/// through P6 is older but its authorship is retracted; its chain through P5
+/// (S) is in force, so R's assertion of C14 is S's and R's card counts C14.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_assertion_takes_its_oldest_in_force_chains_principal(pool: PgPool) {
+    let px = seed_principal_inputs(&pool).await;
+    let c14 = px.claims[7];
+    let scoped = app_pool(&pool).await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "principal-reader").await;
+    register_legacy(&pool).await;
+
+    let manifest = scratch("in-force-chain.jsonl");
+    let applied = apply_as(&pool, &px.t, px.classify(), 21, &manifest, &[]).await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    let r_c14: Vec<String> = sqlx::query_scalar(
+        "SELECT labels FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'asserts'",
+    )
+    .bind(px.r)
+    .bind(c14)
+    .fetch_one(&pool)
+    .await
+    .expect("R asserts C14");
+    assert!(
+        r_c14.contains(&format!("epigraph:ingest_written_by:{}", px.s)),
+        "the oldest IN-FORCE chain's principal: {r_c14:?}"
+    );
+    assert_eq!(
+        counts(&pool, &scoped, reader, px.r).await,
+        (1, 0, 1),
+        "R: P5 (its P6 authorship is retracted) and C14 through P5"
+    );
+}
