@@ -699,6 +699,11 @@ pub enum Bind {
     Ingest,
     /// The `--attestation-signer` list (`uuid[]`).
     Attestation,
+    /// A batch's keyset cursor: the last edge id of the previous batch
+    /// (`uuid`; the nil uuid first).
+    After,
+    /// The batch size (`bigint`).
+    Limit,
 }
 
 /// One statement of the read-only census, exactly as [`census`] runs it.
@@ -928,11 +933,58 @@ fn planned_records(f: &Frame) -> Statement {
     )
 }
 
+/// One apply batch's locking SELECT of `kind`: the next `$4` candidates
+/// after the cursor `$3` in id order, locked, each with the principal of
+/// its paper (`legacy` `$1`, ingest signers `$2`).
+///
+/// Linear whatever the planner estimates (a production corpus is sized at a
+/// few rows here):
+///
+/// * an agent assertion's chain test is `paper_of(e) IS NOT NULL` (the
+///   paper of its chosen chain exists exactly when a chain does, the same
+///   predicate as [`Frame::candidate`]'s EXISTS), a per-row lookup. As an
+///   EXISTS the planner turned it into a join from EVERY chain, so each
+///   batch computed and sorted every candidate (seconds per batch, ~10^2
+///   batches);
+/// * the principal is [`principal_window`] over the batch's rows and the
+///   classified-signer rows of the batch's papers, never a join of the
+///   batch with `pp` (sized at one row, that join re-ran `pp`'s aggregate
+///   for every row of the batch).
+#[must_use]
+pub fn batch_statement(f: &Frame, kind: Kind) -> Statement {
+    let paper = f.paper_of(kind, "e");
+    let cand = match kind {
+        Kind::AgentAsserts => format!(
+            "{} AND ({paper}) IS NOT NULL",
+            f.agent_asserts_unchained("e")
+        ),
+        Kind::Authored | Kind::PaperAsserts => f.candidate(kind, "e"),
+    };
+    Statement::new(
+        format!("batch:{}", kind.as_str()),
+        format!(
+            "WITH b AS (SELECT e.id, {paper} AS paper FROM edges e \
+                         WHERE {cand} AND e.id > $3 ORDER BY e.id LIMIT $4 \
+                           FOR UPDATE OF e), \
+                  x AS (SELECT b.id, b.paper, NULL::text AS sid FROM b \
+                        UNION ALL {signers}), \
+                  p AS (SELECT x.id, {prin} AS principal \
+                          FROM x WINDOW w AS (PARTITION BY x.paper)) \
+             SELECT p.id, p.principal FROM p WHERE p.id IS NOT NULL ORDER BY p.id",
+            signers = f.signer_rows("$2::uuid[]", "NULL,", Some("(SELECT b.paper FROM b)")),
+            prin = principal_window("x", "$1::uuid"),
+        ),
+        &[Bind::Legacy, Bind::Ingest, Bind::After, Bind::Limit],
+    )
+}
+
 /// The values of a statement's [`Bind`]s.
 struct Binds<'a> {
     legacy: Uuid,
     ingest: &'a [Uuid],
     attestation: &'a [Uuid],
+    after: Uuid,
+    limit: i64,
 }
 
 impl<'a> Binds<'a> {
@@ -950,6 +1002,8 @@ impl<'a> Binds<'a> {
                 Bind::Legacy => q.bind(self.legacy),
                 Bind::Ingest => q.bind(self.ingest),
                 Bind::Attestation => q.bind(self.attestation),
+                Bind::After => q.bind(self.after),
+                Bind::Limit => q.bind(self.limit),
             };
         }
         q
@@ -980,6 +1034,8 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
         legacy: c.legacy_principal.unwrap_or(Uuid::nil()),
         ingest: &o.ingest_signers,
         attestation: &o.attestation_signers,
+        after: Uuid::nil(),
+        limit: 0,
     };
     c.reserved_labels_present = sqlx::query_scalar(
         "SELECT count(*) FROM edges e \
@@ -1427,24 +1483,15 @@ pub async fn run(
                         .await?;
                     // The batch, locked, then the principal of each edge's
                     // paper, decided once per paper of the batch.
-                    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(&format!(
-                        "WITH b AS (SELECT e.id, {paper} AS paper FROM edges e \
-                                     WHERE {cand} AND e.id > $3 ORDER BY e.id LIMIT $4 \
-                                       FOR UPDATE OF e), \
-                              {pp} \
-                         SELECT b.id, {prin} FROM b LEFT JOIN pp ON pp.paper = b.paper \
-                          ORDER BY b.id",
-                        paper = act.frame.paper_of(kind, "e"),
-                        cand = act.frame.candidate(kind, "e"),
-                        pp = act
-                            .frame
-                            .pp_cte("$2::uuid[]", Some("(SELECT b.paper FROM b)")),
-                        prin = principal("pp", "$1::uuid"),
-                    ))
-                    .bind(legacy)
-                    .bind(&o.ingest_signers)
-                    .bind(last)
-                    .bind(i64::try_from(o.batch_size).unwrap_or(i64::MAX))
+                    let st = batch_statement(&act.frame, kind);
+                    let rows: Vec<(Uuid, Uuid)> = Binds {
+                        legacy,
+                        ingest: &o.ingest_signers,
+                        attestation: &o.attestation_signers,
+                        after: last,
+                        limit: i64::try_from(o.batch_size).unwrap_or(i64::MAX),
+                    }
+                    .on(&st)
                     .fetch_all(&mut *tx)
                     .await
                     .context("locking the batch's candidate edges")?;
