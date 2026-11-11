@@ -842,6 +842,21 @@ async fn a_backfill_reads_each_legacy_paper_as_one_ingest_and_reverses_exactly(p
     for (who, want, why) in cards {
         assert_eq!(counts(&pool, &scoped, reader, who).await, want, "{why}");
     }
+    // M's assertion of C6 closes chains through P1 (legacy-ingest, the older
+    // paper assertion) and P2 (S): it takes its oldest chain's principal.
+    let m_c6: Vec<String> = sqlx::query_scalar(
+        "SELECT labels FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'asserts'",
+    )
+    .bind(fx.m)
+    .bind(c6)
+    .fetch_one(&pool)
+    .await
+    .expect("M asserts C6");
+    assert!(
+        m_c6.contains(&format!("epigraph:ingest_written_by:{legacy}")),
+        "the oldest chain's principal: {m_c6:?}"
+    );
     let sorted = |mut v: Vec<Uuid>| {
         v.sort();
         v
