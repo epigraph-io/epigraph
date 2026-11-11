@@ -2,9 +2,10 @@
 //! bundled SQLite can return uninitialized page-cache memory on a crafted
 //! `-wal` file). `.cargo/audit.toml` ignores that advisory (operator ruling,
 //! 2026-11-10) on one condition: SQLite is NEVER COMPILED into this workspace.
-//! `libsqlite3-sys` is in `Cargo.lock` only because Cargo locks optional
-//! dependencies whatever the features, here as an optional dependency of
-//! `sqlx-sqlite`, which no crate enables.
+//! `libsqlite3-sys` is locked, not activated, as an optional dependency of
+//! `sqlx-sqlite`, which no crate enables; enabling it adds further lock
+//! entries. So a `--locked` build already refuses an SQLite enable that has
+//! not been re-locked, and this test catches one that has.
 //!
 //! Once the advisory is ignored, `cargo audit` says nothing if that condition
 //! breaks, and the audit CI job is advisory anyway. This test is the blocking
