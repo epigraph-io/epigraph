@@ -118,8 +118,10 @@
 //! So every batch a run committed carries its records however the run stops
 //! after it: `--max-batches`, a failed batch, or the process killed, crashed
 //! or disconnected with no summary printed. After any of those, and after
-//! reversing any one run's manifest, `query_paper` and `get_claim`'s
-//! `ingesters` agree, and the backfill is resumed as it stands: a fresh dry
+//! reversing the runs' manifests newest first (the reversal refuses an older
+//! one while a newer run's stamp rests on its records, see Reversal),
+//! `query_paper` and `get_claim`'s `ingesters` agree, and the backfill is
+//! resumed as it stands: a fresh dry
 //! run's total, a NEW manifest, the same `--written-before` and the same
 //! `--ingest-signer` / `--attestation-signer` lists as the first run (they
 //! decide every paper's principal). Every step of a batch (BEGIN, the locked
@@ -146,6 +148,15 @@
 //! each of its edges was given, only while it still carries them (a
 //! compare-and-swap). A reversal stopped anywhere therefore leaves no stamp
 //! without its record, and re-running it finishes the rest. One audit row.
+//!
+//! The record writer keeps one record per paper, claim and principal, so
+//! when two legacy copies of one `paper -asserts-> claim` pair are stamped by
+//! different runs (a paced or resumed backfill), the later run writes no
+//! record and its stamp rests on the earlier run's. So before any write,
+//! dry run or `--apply`, the reversal refuses (nothing written) while any
+//! stamped paper assertion OUTSIDE its manifest matches (paper, claim, `by`)
+//! a record its committed batches wrote, naming those edges: reverse the
+//! newer manifest first.
 
 use anyhow::{anyhow, bail, Context};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1522,8 +1533,10 @@ pub struct ReverseReport {
 /// Reverse a backfill run from its manifest (dry run: rolled back).
 ///
 /// # Errors
-/// The manifest is not a backfill manifest of this version, or a statement
-/// failed.
+/// The manifest is not a backfill manifest of this version; a currently
+/// stamped paper assertion outside this manifest rests on a record this
+/// manifest's committed batches wrote (a newer run's stamp: reverse that run
+/// first; nothing is written); or a statement failed.
 #[allow(clippy::too_many_lines)]
 pub async fn reverse(
     conn: &mut PgConnection,
@@ -1554,7 +1567,8 @@ pub async fn reverse(
         );
     }
     let mut edges: Vec<(i64, Uuid, Uuid)> = Vec::new();
-    let mut records: Vec<(i64, Uuid)> = Vec::new();
+    // (batch, record, paper, claim, by)
+    let mut records: Vec<(i64, Uuid, Uuid, Uuid, Uuid)> = Vec::new();
     let mut committed: BTreeSet<i64> = BTreeSet::new();
     for line in lines {
         let line = line?;
@@ -1587,7 +1601,13 @@ pub async fn reverse(
             }
             edges.push((batch, uuid("edge")?, uuid("by")?));
         } else if v.get("record").is_some() {
-            records.push((batch, uuid("record")?));
+            records.push((
+                batch,
+                uuid("record")?,
+                uuid("paper")?,
+                uuid("claim")?,
+                uuid("by")?,
+            ));
         } else {
             bail!("unrecognised manifest line: {line}");
         }
@@ -1597,10 +1617,59 @@ pub async fn reverse(
     for (b, ..) in edges.iter().filter(|(b, ..)| !committed.contains(b)) {
         pending.entry(*b).or_default().0 += 1;
     }
-    for (b, _) in records.iter().filter(|(b, _)| !committed.contains(b)) {
+    for (b, ..) in records.iter().filter(|(b, ..)| !committed.contains(b)) {
         pending.entry(*b).or_default().1 += 1;
     }
     r.uncommitted = pending.into_iter().map(|(b, (e, n))| (b, e, n)).collect();
+    // Before any write, dry run or not: the record writer keeps ONE record
+    // per paper, claim and principal, so a later run that stamped another
+    // copy of a pair this run's records cover wrote no record of its own and
+    // rests on this run's. Deleting it would leave that stamp without one,
+    // so refuse until the newer run is reversed (then this one is exact).
+    let mine: Vec<Uuid> = edges.iter().map(|(_, e, _)| *e).collect();
+    let (mut rp, mut rc, mut rb) = (Vec::new(), Vec::new(), Vec::new());
+    for (b, _, p, c, by) in &records {
+        if committed.contains(b) {
+            rp.push(*p);
+            rc.push(*c);
+            rb.push(*by);
+        }
+    }
+    if !rp.is_empty() {
+        let leaning: Vec<(Uuid, Uuid, Uuid, String)> = sqlx::query_as(&format!(
+            "SELECT DISTINCT e.id, e.source_id, e.target_id, ({by_e}) FROM edges e \
+               JOIN unnest($1::uuid[], $2::uuid[], $3::uuid[]) AS r(paper, claim, by) \
+                 ON e.source_id = r.paper AND e.target_id = r.claim \
+                AND ({by_e}) = r.by::text \
+              WHERE {pas} AND e.labels @> ARRAY['{INGEST_WRITTEN_LABEL}']::text[] \
+                AND NOT (e.id = ANY($4::uuid[])) \
+              ORDER BY e.id",
+            by_e = ingest_written_by_sql("e"),
+            pas = paper_asserts("e"),
+        ))
+        .bind(&rp)
+        .bind(&rc)
+        .bind(&rb)
+        .bind(&mine)
+        .fetch_all(&mut *conn)
+        .await
+        .context("the stamps outside this manifest that rest on its records")?;
+        if !leaning.is_empty() {
+            let named: Vec<String> = leaning
+                .iter()
+                .map(|(e, p, c, by)| format!("edge {e} (paper {p} asserts claim {c}, by {by})"))
+                .collect();
+            bail!(
+                "{} cannot be reversed yet: {} stamped paper assertion(s) outside it rest on \
+                 the ingest records it wrote (one record per paper, claim and principal): {}. \
+                 Reverse the newer manifest that stamped them first, then this one. Nothing \
+                 was done",
+                manifest.display(),
+                leaning.len(),
+                named.join("; ")
+            );
+        }
+    }
     // Only what the run committed, per batch: each committed batch is
     // reversed in ONE transaction (its records and its labels together), so
     // a reversal stopped anywhere, killed included, never leaves a stamp
@@ -1613,7 +1682,7 @@ pub async fn reverse(
         by_batch.entry(b).or_default().1.push((e, by));
         n_edges += 1;
     }
-    for (b, id) in records.into_iter().filter(|(b, _)| committed.contains(b)) {
+    for (b, id, ..) in records.into_iter().filter(|(b, ..)| committed.contains(b)) {
         by_batch.entry(b).or_default().0.push(id);
         n_records += 1;
     }

@@ -2289,3 +2289,192 @@ async fn an_agent_assertion_takes_its_oldest_in_force_chains_principal(pool: PgP
         "R: P5 (its P6 authorship is retracted) and C14 through P5"
     );
 }
+
+/// The low and high ids of P5's two legacy `asserts` copies of one claim:
+/// a run stamps in edge-id order, so a paced run's first run takes the low
+/// copy and the resume the high one.
+const LOW_COPY: &str = "00000000-0000-4000-8000-000000000002";
+const HIGH_COPY: &str = "ffffffff-ffff-4fff-bfff-fffffffffffe";
+
+/// The standard fixture plus P5: one legacy unsigned authorship (V) and TWO
+/// legacy unsigned `P5 -asserts-> C7` edges (a re-ingest writes a new edge;
+/// edges carry no triple uniqueness), all well before the cutoff. Both copies
+/// take legacy-ingest, and the record writer keeps one record per paper,
+/// claim and principal. Returns `(P5, C7)`.
+async fn seed_duplicate_pair(pool: &PgPool, fx: &Fx) -> (Uuid, Uuid) {
+    let p5 = paper(pool, "10.9999/backfill-duplicate", "Duplicated Legacy").await;
+    let c7 = fixture::seed_public_claim(pool, fx.f, "a legacy finding asserted twice").await;
+    for (id, src, src_t, tgt, tgt_t, rel, props) in [
+        (
+            Uuid::new_v4(),
+            fx.v,
+            "agent",
+            p5,
+            "paper",
+            "authored",
+            serde_json::json!({"position": 0, "role": "author"}),
+        ),
+        (
+            Uuid::parse_str(LOW_COPY).unwrap(),
+            p5,
+            "paper",
+            c7,
+            "claim",
+            "asserts",
+            serde_json::json!({}),
+        ),
+        (
+            Uuid::parse_str(HIGH_COPY).unwrap(),
+            p5,
+            "paper",
+            c7,
+            "claim",
+            "asserts",
+            serde_json::json!({}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, \
+                                relationship, properties, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, '2000-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(src)
+        .bind(src_t)
+        .bind(tgt)
+        .bind(tgt_t)
+        .bind(rel)
+        .bind(props)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed P5 {rel}: {e}"));
+    }
+    (p5, c7)
+}
+
+/// Whether edge `id` carries the backfill's stamp.
+async fn is_stamped(pool: &PgPool, id: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT labels @> ARRAY['epigraph:ingest_written']::text[] FROM edges WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(id).unwrap())
+    .fetch_one(pool)
+    .await
+    .expect("stamped?")
+}
+
+/// Two legacy copies of one `paper -asserts-> claim` pair land in different
+/// runs of a paced backfill: the resume stamps the second copy but writes no
+/// record (the first run's record already covers that paper, claim and
+/// principal), so its stamp rests on the first run's record. Reversing the
+/// FIRST run's manifest alone would delete that record and leave the second
+/// stamp without one. So that reversal is refused, dry run and `--apply`
+/// alike, with nothing written, naming the edge and the newer manifest to
+/// reverse first; reversing newest first then restores every edge row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reversal_refuses_while_a_newer_runs_stamp_rests_on_its_records(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (p5, c7) = seed_duplicate_pair(&pool, &fx).await;
+    let mut papers = fx.papers.to_vec();
+    papers.push(p5);
+    let mut claims = fx.claims.to_vec();
+    claims.push(c7);
+    let scoped = app_pool(&pool).await;
+    let legacy = register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+
+    // Batches 1-4: the 11 authorships; batch 5: the first three paper
+    // assertions, in id order, so the LOW copy.
+    let m1 = scratch("dup-1.jsonl");
+    let r1 = apply(
+        &pool,
+        &fx,
+        27,
+        &m1,
+        &["--batch-size", "3", "--max-batches", "5"],
+    )
+    .await;
+    assert_eq!(r1.code, 0, "{}", r1.show());
+    assert!(
+        is_stamped(&pool, LOW_COPY).await && !is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: run 1 stamps the low copy only"
+    );
+    let m2 = scratch("dup-2.jsonl");
+    let r2 = apply(&pool, &fx, 13, &m2, &["--batch-size", "3"]).await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    assert!(
+        is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: run 2 stamps the high copy"
+    );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+    assert!(
+        by_paper.contains(&(p5, legacy, c7, false)),
+        "CALIBRATION: {by_paper:?}"
+    );
+    assert_eq!(by_claim, by_paper, "CALIBRATION: both runs agree");
+    assert_eq!(
+        (records_in(&m1), records_in(&m2)),
+        (3, 5),
+        "CALIBRATION: run 2 writes no record for the high copy"
+    );
+
+    let stamped = edge_snapshot(&pool).await;
+    let records = record_count(&pool).await;
+    for apply_flag in [false, true] {
+        let mut args = vec!["reverse-ingest-markers", "--manifest", m1.to_str().unwrap()];
+        if apply_flag {
+            args.push("--apply");
+        }
+        let rev = run_op(&pool, &args).await;
+        assert_ne!(
+            rev.code,
+            0,
+            "reversing the older manifest alone (apply={apply_flag}) must be refused: {}",
+            rev.show()
+        );
+        assert!(
+            rev.stderr.contains(HIGH_COPY) && rev.stderr.contains("newer manifest"),
+            "the refusal names the edge and says to reverse the newer manifest first: {}",
+            rev.show()
+        );
+        assert_eq!(
+            edge_snapshot(&pool).await,
+            stamped,
+            "a refused reversal changes no edge row"
+        );
+        assert_eq!(record_count(&pool).await, records, "no record deleted");
+        assert_eq!(
+            audit_count(&pool, "ingest_marker.backfill_reverse").await,
+            0,
+            "no audit row"
+        );
+    }
+
+    for (m, want) in [
+        (
+            &m2,
+            "REVERSED\tedges_restored=13\tedges_held=0\trecords_deleted=5\trecords_held=0",
+        ),
+        (
+            &m1,
+            "REVERSED\tedges_restored=14\tedges_held=0\trecords_deleted=3\trecords_held=0",
+        ),
+    ] {
+        let rev = run_op(
+            &pool,
+            &[
+                "reverse-ingest-markers",
+                "--manifest",
+                m.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(rev.code, 0, "{}", rev.show());
+        assert!(rev.stdout.contains(want), "{want}: {}", rev.show());
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+        assert_eq!(by_claim, by_paper);
+    }
+    assert_eq!(edge_snapshot(&pool).await, before);
+    assert_eq!(record_count(&pool).await, 0);
+}
