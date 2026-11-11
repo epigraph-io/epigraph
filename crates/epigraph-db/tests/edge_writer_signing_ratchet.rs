@@ -450,7 +450,7 @@ const REGISTER: &[Site] = &[
     // a signature).
     site(
         "crates/epigraph-cli/src/operator/backfill_markers.rs",
-        "write_records",
+        "batch_records",
         1,
         Unsigned(NO_KEY_CLI),
     ),
