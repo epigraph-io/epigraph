@@ -150,7 +150,7 @@ def test_cluster_labels_leave_out_intake_reports(db, seed_agent):
         _cleanup(db, ids, group)
 
 
-REFINE_RUN = "44444444-4444-4444-4444-444444444444"
+REFINE_RUN = str(uuid.uuid4())
 
 
 def _refine_members(cur, agent_id, group):
