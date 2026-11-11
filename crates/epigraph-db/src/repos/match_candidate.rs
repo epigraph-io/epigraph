@@ -495,16 +495,21 @@ impl MatchCandidateRepo {
         status: Option<&str>,
         limit: i64,
     ) -> sqlx::Result<Vec<MatchCandidateRow>> {
-        Self::list_conn(&self.pool, viewer, status, limit).await
+        let mut conn = self.pool.acquire().await?;
+        Self::list_conn(&mut conn, viewer, status, limit).await
     }
 
-    /// [`Self::list`] on a caller-supplied executor, so an HTTP handler can run
-    /// it on its viewer-stamped connection (`AppState::read_as`). The repo's
-    /// own pool is unstamped: under FORCEd row security on the application
-    /// role, the joins to `claims` admit public claims only, and every
-    /// candidate naming one of the viewer's own group-private claims vanishes.
-    pub async fn list_conn<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// [`Self::list`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so the session's row security
+    /// agrees with the predicate. The pool form delegates here. The repo's own
+    /// pool is unstamped: under FORCEd row security on the application role,
+    /// the joins to `claims` admit public claims only, and every candidate
+    /// naming one of the viewer's own group-private claims vanishes.
+    ///
+    /// # Errors
+    /// As [`Self::list`].
+    pub async fn list_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         status: Option<&str>,
         limit: i64,
@@ -524,7 +529,7 @@ impl MatchCandidateRepo {
                 if let Some(g) = viewer.group_bind() {
                     q = q.bind(g);
                 }
-                q.fetch_all(executor).await
+                q.fetch_all(&mut *conn).await
             }
             None => {
                 let sql = viewer.splice(
@@ -540,7 +545,7 @@ impl MatchCandidateRepo {
                 if let Some(g) = viewer.group_bind() {
                     q = q.bind(g);
                 }
-                q.fetch_all(executor).await
+                q.fetch_all(&mut *conn).await
             }
         }
     }
@@ -554,13 +559,18 @@ impl MatchCandidateRepo {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Vec<MatchCandidateRow>> {
-        Self::list_for_claim_conn(&self.pool, viewer, claim_id).await
+        let mut conn = self.pool.acquire().await?;
+        Self::list_for_claim_conn(&mut conn, viewer, claim_id).await
     }
 
-    /// [`Self::list_for_claim`] on a caller-supplied executor; see
-    /// [`Self::list_conn`] for why.
-    pub async fn list_for_claim_conn<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// [`Self::list_for_claim`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so the session's row security
+    /// agrees with the predicate. The pool form delegates here.
+    ///
+    /// # Errors
+    /// As [`Self::list_for_claim`].
+    pub async fn list_for_claim_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Vec<MatchCandidateRow>> {
@@ -577,7 +587,7 @@ impl MatchCandidateRepo {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(executor).await
+        q.fetch_all(&mut *conn).await
     }
 
     /// Cross-source **sweep coverage** for one claim: the value of
@@ -620,6 +630,21 @@ impl MatchCandidateRepo {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Option<Option<DateTime<Utc>>>> {
+        let mut conn = self.pool.acquire().await?;
+        Self::last_match_scan_at_conn(&mut conn, viewer, claim_id).await
+    }
+
+    /// [`Self::last_match_scan_at`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so the session's row security
+    /// agrees with the predicate. The pool form delegates here.
+    ///
+    /// # Errors
+    /// As [`Self::last_match_scan_at`].
+    pub async fn last_match_scan_at_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> sqlx::Result<Option<Option<DateTime<Utc>>>> {
         let sql = viewer.splice(
             "SELECT c.last_match_scan_at FROM claims c
              WHERE c.id = $1 /* {VISIBILITY:c} */",
@@ -629,7 +654,7 @@ impl MatchCandidateRepo {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_optional(&self.pool).await
+        q.fetch_optional(&mut *conn).await
     }
 
     /// `CORROBORATES` edges incident on `claim_id` — the already-promoted half
@@ -655,13 +680,18 @@ impl MatchCandidateRepo {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Vec<(Uuid, Uuid, Uuid, serde_json::Value)>> {
-        Self::corroborates_edges_for_claim_conn(&self.pool, viewer, claim_id).await
+        let mut conn = self.pool.acquire().await?;
+        Self::corroborates_edges_for_claim_conn(&mut conn, viewer, claim_id).await
     }
 
-    /// [`Self::corroborates_edges_for_claim`] on a caller-supplied executor;
-    /// see [`Self::list_conn`] for why.
-    pub async fn corroborates_edges_for_claim_conn<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// [`Self::corroborates_edges_for_claim`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so the session's row security
+    /// agrees with the predicate. The pool form delegates here.
+    ///
+    /// # Errors
+    /// As [`Self::corroborates_edges_for_claim`].
+    pub async fn corroborates_edges_for_claim_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Vec<(Uuid, Uuid, Uuid, serde_json::Value)>> {
@@ -679,7 +709,7 @@ impl MatchCandidateRepo {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(executor).await
+        q.fetch_all(&mut *conn).await
     }
 }
 

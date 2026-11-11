@@ -37,18 +37,30 @@ const SECRET: &[u8] = b"runtime-guard-test-secret-at-least-32-bytes!!";
 const ACCEPT: &str = "application/json, text/event-stream";
 const SESSION_HEADER: &str = "Mcp-Session-Id";
 const REFUSAL: &str = "has an operator link to";
+/// JSON-RPC `invalid_params`: the code of the tool's own answer to `get_claim`
+/// for an id it cannot find (`tools/claims.rs::get_claim`). An internal error
+/// (-32603) or a refusal before dispatch carries a different code.
+const INVALID_PARAMS: i64 = -32602;
+/// `EpiGraphMcpFull::read_as`'s refusal on a server built without a ScopedPool.
+const SCOPED_POOL_REFUSAL: &str = "ScopedPool";
 const OPERATOR_REFUSAL: &str = "is the operator of linked agents";
 const HUMAN_REFUSAL: &str = "is a registered human operator";
 const ALLOWLIST_REFUSAL: &str = "is the agent of an allowlisted OAuth client";
 
-fn token() -> String {
+/// A `claims:read` bearer for a SEEDED agent principal. The principal matters
+/// for the CALIBRATION arm: a token with no agent principal is refused read
+/// authority by viewer resolution ("token carries no agent principal"), so its
+/// call never reaches the tool and "not refused by the link gate" would hold
+/// for a reason that has nothing to do with the gate.
+async fn token(pool: &PgPool) -> String {
+    let (caller, _) = fixture::seed_agent_with_group(pool, "runtime-guard-caller").await;
     let (token, _) = JwtConfig::from_secret(SECRET)
         .issue_access_token(
             Uuid::new_v4(),
             vec!["claims:read".to_string()],
             "service",
             None,
-            None,
+            Some(caller),
             ChronoDuration::minutes(5),
             epigraph_auth::AccessTokenBinding::NONE,
         )
@@ -68,7 +80,12 @@ async fn spawn_listener(pool: PgPool, signer: AgentSigner) -> String {
     let revocation = Arc::new(epigraph_mcp::auth::DbAccessTokenRevocation::new(
         pool.clone(),
     ));
-    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
+    // `main` builds every listener from a `ScopedPool` (content reads refuse
+    // without one), so the fixture does too.
+    let scoped = fixture::scoped_pool(&pool).await;
+    let embedder = Arc::new(
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone()),
+    );
     let service = StreamableHttpService::new(
         move || {
             Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
@@ -76,7 +93,8 @@ async fn spawn_listener(pool: PgPool, signer: AgentSigner) -> String {
                 signer.clone(),
                 embedder.clone(),
                 false,
-            ))
+            )
+            .with_scoped_pool(scoped.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
@@ -172,7 +190,15 @@ async fn handshake(client: &reqwest::Client, url: &str, token: &str) -> String {
     session
 }
 
-async fn call(client: &reqwest::Client, url: &str, token: &str, session: &str, id: u32) -> String {
+/// `get_claim` for `claim`, answered as raw SSE text.
+async fn call(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    session: &str,
+    id: u32,
+    claim: Uuid,
+) -> String {
     let mut resp = post(
         client,
         url,
@@ -181,11 +207,31 @@ async fn call(client: &reqwest::Client, url: &str, token: &str, session: &str, i
         serde_json::json!({
             "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": {"name": "get_claim",
-                       "arguments": {"claim_id": Uuid::new_v4().to_string()}}
+                       "arguments": {"claim_id": claim.to_string()}}
         }),
     )
     .await;
     read_sse_data(&mut resp).await
+}
+
+/// The JSON-RPC `error` object of the first SSE `data:` line, if any.
+fn rpc_error(sse: &str) -> Option<serde_json::Value> {
+    sse.lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .filter_map(|d| serde_json::from_str::<serde_json::Value>(d.trim()).ok())
+        .find_map(|v| v.get("error").cloned())
+}
+
+/// True only for the tool's OWN answer to `get_claim(claim)` on an id it
+/// cannot find: `invalid_params` with exactly `claim <claim> not found`. A
+/// failure before the tool runs (viewer resolution, a session or client
+/// lookup, the no-ScopedPool refusal) carries another code or text, even
+/// when that text also contains "not found".
+fn is_tools_own_not_found(sse: &str, claim: Uuid) -> bool {
+    rpc_error(sse).is_some_and(|e| {
+        e["code"].as_i64() == Some(INVALID_PARAMS)
+            && e["message"].as_str() == Some(format!("claim {claim} not found").as_str())
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -217,16 +263,22 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
     let public_key = signer.public_key();
     let url = spawn_listener(pool.clone(), signer).await;
     let client = reqwest::Client::new();
-    let token = token();
+    let token = token(&pool).await;
     let session = handshake(&client, &url, &token).await;
 
-    // 1. CALIBRATION: unlinked signer, the call is dispatched (the tool's own
-    //    answer — not-found for a random claim id — is irrelevant).
-    let before = call(&client, &url, &token, &session, 2).await;
+    // 1. CALIBRATION: unlinked signer, the call is dispatched AND answered by
+    //    the tool itself. For a random claim id that answer is the tool's own
+    //    "claim <id> not found"; asserting it (and the absence of the
+    //    no-ScopedPool refusal) is what stops this arm passing on a call that
+    //    failed for some other reason before the signer gate ever ran.
+    let probe = Uuid::new_v4();
+    let before = call(&client, &url, &token, &session, 2, probe).await;
     assert!(
-        before.contains("data:") && !before.contains(REFUSAL),
-        "CALIBRATION: an unlinked signer's call must not be refused, or the refusal below \
-         proves nothing:\n{before}"
+        is_tools_own_not_found(&before, probe)
+            && !before.contains(SCOPED_POOL_REFUSAL)
+            && !before.contains(REFUSAL),
+        "CALIBRATION: an unlinked signer's call must reach the tool and get its own \
+         not-found answer, or the refusal below proves nothing:\n{before}"
     );
 
     // 2. Link the signer AFTER startup, as a later stdio process or an operator
@@ -316,7 +368,7 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
     drop(conn);
 
     // 3. The next call on the same session is refused, naming why.
-    let after = call(&client, &url, &token, &session, 3).await;
+    let after = call(&client, &url, &token, &session, 3, Uuid::new_v4()).await;
     let refused = match kind {
         LinkKind::Acting | LinkKind::Retired => {
             after.contains(REFUSAL) && after.contains(&operator.to_string())
@@ -422,13 +474,21 @@ async fn spawn_principal_less_listener(
         StreamableHttpServerConfig, StreamableHttpService,
     };
     let signer = Arc::new(signer);
-    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
-    let probe = Arc::new(epigraph_mcp::EpiGraphMcpFull::new_shared(
-        pool.clone(),
-        signer.clone(),
-        embedder.clone(),
-        false,
-    ));
+    // As in `spawn_listener`: `main` attaches a `ScopedPool`, and without one
+    // the CALIBRATION `get_claim` below is refused before any gate runs.
+    let scoped = fixture::scoped_pool(&pool).await;
+    let embedder = Arc::new(
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone()),
+    );
+    let probe = Arc::new(
+        epigraph_mcp::EpiGraphMcpFull::new_shared(
+            pool.clone(),
+            signer.clone(),
+            embedder.clone(),
+            false,
+        )
+        .with_scoped_pool(scoped.clone()),
+    );
     let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
         probe as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
     )
@@ -440,7 +500,8 @@ async fn spawn_principal_less_listener(
                 signer.clone(),
                 embedder.clone(),
                 false,
-            ))
+            )
+            .with_scoped_pool(scoped.clone()))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),

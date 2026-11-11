@@ -17,7 +17,6 @@
 use rmcp::model::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::{internal_error, invalid_params, McpError};
@@ -151,8 +150,14 @@ pub struct ResolvedTheme {
 ///   retired k-means tool's additive runs left duplicate `auto-00` rows, so
 ///   picking the first match would silently scope to one of several distinct
 ///   themes.
+///
+/// `conn` is the caller's viewer-stamped read (`EpiGraphMcpFull::read_as`):
+/// the member count is a claim-derived read, which row security filters. The
+/// label lookup reads `claim_themes` alone, a registry with no tenancy
+/// (plan §2.4's `tenancy_exempt`), on `pool`.
 pub async fn resolve_theme_selector(
-    pool: &PgPool,
+    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     theme_id: Option<&str>,
     theme_label: Option<&str>,
@@ -194,7 +199,7 @@ pub async fn resolve_theme_selector(
             }
         };
 
-    let summary = ClaimThemeRepository::get_summary(pool, viewer, resolved_id)
+    let summary = ClaimThemeRepository::get_summary(&mut *conn, viewer, resolved_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("no theme with id {resolved_id}")))?;
@@ -235,8 +240,9 @@ pub async fn list_themes(
     let offset = params.offset.unwrap_or(0);
     let prefix = params.label_prefix.as_deref();
 
+    let mut read = server.read_as(viewer, "list_themes").await?;
     let rows = ClaimThemeRepository::list_summaries(
-        &server.pool,
+        &mut *read,
         viewer,
         prefix,
         i64::from(limit),
@@ -245,9 +251,12 @@ pub async fn list_themes(
     .await
     .map_err(internal_error)?;
 
+    // `claim_themes` carries no tenancy: the total is corpus-wide by design
+    // (see `ClaimThemeRepository::count_summaries`).
     let total = ClaimThemeRepository::count_summaries(&server.pool, prefix)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     let themes: Vec<ThemeSummaryOut> = rows.into_iter().map(Into::into).collect();
     let returned = themes.len() as i64;
@@ -300,8 +309,10 @@ pub async fn get_theme(
     viewer: &epigraph_db::visibility::Viewer,
     params: GetThemeParams,
 ) -> Result<CallToolResult, McpError> {
+    let mut read = server.read_as(viewer, "get_theme").await?;
     let resolved = resolve_theme_selector(
         &server.pool,
+        &mut read,
         viewer,
         params.theme_id.as_deref(),
         params.theme_label.as_deref(),
@@ -319,7 +330,7 @@ pub async fn get_theme(
     // fields the recall path needs, and duplicating the projection there would
     // let the two diverge.
     let summary: ThemeSummaryOut =
-        ClaimThemeRepository::get_summary(&server.pool, viewer, resolved.id)
+        ClaimThemeRepository::get_summary(&mut *read, viewer, resolved.id)
             .await
             .map_err(internal_error)?
             .ok_or_else(|| invalid_params(format!("no theme with id {}", resolved.id)))?
@@ -329,7 +340,7 @@ pub async fn get_theme(
         Vec::new()
     } else {
         ClaimThemeRepository::member_claim_ids(
-            &server.pool,
+            &mut *read,
             viewer,
             resolved.id,
             i64::from(members_limit),

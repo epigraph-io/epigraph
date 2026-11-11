@@ -600,10 +600,14 @@ impl EdgeSignatureRepository {
     /// `system_stats` reports (PR-09): a corpus-wide count would tell any
     /// caller the size of every group's private edges.
     ///
+    /// Generic over the executor (one statement), so a request passes the
+    /// connection `ScopedPool::read_as` stamped for its viewer and the
+    /// session's row security agrees with the predicate below.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    pub async fn coverage(
-        pool: &sqlx::PgPool,
+    pub async fn coverage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
     ) -> Result<EdgeSigningCoverage, DbError> {
         // `WHERE true` gives the marker a predicate to append ` AND (...)` to.
@@ -620,7 +624,7 @@ impl EdgeSignatureRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let (total, signed) = q.fetch_one(pool).await?;
+        let (total, signed) = q.fetch_one(executor).await?;
         Ok(EdgeSigningCoverage {
             total,
             signed,

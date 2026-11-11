@@ -157,7 +157,16 @@ async fn recall_with_context_auto_detect_reads_through_the_server_cache(pool: Pg
 
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    let server = EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    let server = {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
+    };
     assert_eq!(
         cached_centroid_population(&server, &viewer),
         None,
@@ -225,7 +234,16 @@ async fn sessions_of_one_factory_share_the_standing_read(pool: PgPool) {
 
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    let factory = SessionFactory::new(EpiGraphMcpFull::new(pool.clone(), signer, embedder, false));
+    let factory = SessionFactory::new({
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
+    });
     let session_a = factory.session();
     let session_b = factory.session();
     assert_eq!(
@@ -311,7 +329,16 @@ async fn explicit_3072_re_measures_a_cached_zero_before_refusing(pool: PgPool) {
 
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    let server = EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    let server = {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
+    };
 
     let params = |dim: Option<u32>| -> RecallWithContextParams {
         serde_json::from_value(

@@ -383,19 +383,18 @@ async fn an_elevated_read_is_served_and_its_recall_audit_lands(pool: PgPool) {
     );
 }
 
-/// PINNED GAP (hand-off to the `sudo` and acceptance batches): the MCP read
-/// tools read on the server's UNSTAMPED pool with the viewer's fragment, so on
-/// the application role an elevated request is NOT widened by migration 126:
-/// the arm needs the elevation settings stamped on the connection, and these
-/// reads stamp nothing (RLS then admits public rows only). An elevated
-/// `get_claim` of another person's private claim therefore answers "not
-/// found" today. Calibrations: the same server serves a public claim to the
-/// same viewer, and an application connection stamped from the same elevated
-/// viewer DOES read that private claim through the arm. Plan §6.2's "after
-/// sudo reads all" over MCP needs the MCP reads stamped first; flip this test
-/// when they are.
+/// FLIPPED (was the PINNED GAP "not widened until stamped"): the MCP read
+/// tools now read on a connection stamped from the request's viewer
+/// (`EpiGraphMcpFull::read_as`), so on the application role an elevated
+/// request IS widened by migration 126's arm, as plan §6.2's "after sudo
+/// reads all" requires: an elevated `get_claim` of another person's private
+/// claim is served. Before the stamping it answered "not found", because the
+/// reads ran on the plain pool's unstamped session. The other direction is
+/// asserted on the same server: the same principal's PLAIN (unelevated)
+/// viewer still gets "not found". Calibrations: the server serves a public
+/// claim, and a connection stamped from the elevated viewer reads the row.
 #[sqlx::test(migrations = "../../migrations")]
-async fn mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped(pool: PgPool) {
+async fn mcp_reads_are_widened_by_the_arms_once_they_are_stamped(pool: PgPool) {
     let (p, _) = fixture::seed_human_operator(&pool, "mcp-el7-gap-p").await;
     let (b, b_group) = fixture::seed_agent_with_group(&pool, "mcp-el7-gap-b").await;
     let (client, family) = make_holder(&pool, p, 5).await;
@@ -425,9 +424,29 @@ async fn mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped(pool: PgPo
     get(public)
         .await
         .expect("CALIBRATION: the tool serves a public claim on this server");
+    get(theirs)
+        .await
+        .expect("the stamped elevated MCP read sees a foreign private claim through the arm");
+    let plain = epigraph_db::visibility::Viewer::resolve(&pool, p)
+        .await
+        .expect("plain viewer");
     assert!(
-        get(theirs).await.is_err(),
-        "the unstamped MCP read does not see a foreign private claim, elevated or not"
+        !plain.is_elevated(),
+        "CALIBRATION: the plain viewer is not elevated"
+    );
+    let unelevated = epigraph_mcp::tools::claims::get_claim(
+        &server,
+        &plain,
+        epigraph_mcp::types::GetClaimParams {
+            claim_id: theirs.to_string(),
+            frame_id: None,
+            perspective_id: None,
+        },
+    )
+    .await;
+    assert!(
+        unelevated.is_err(),
+        "the same principal unelevated does not see the foreign private claim"
     );
 
     let mut conn = scoped.acquire_as(&v).await.expect("stamped checkout");
@@ -752,8 +771,8 @@ async fn listener(pool: &PgPool, arming_ttl: std::time::Duration, connector: boo
     use std::sync::Arc;
     let scoped = app_scoped(pool).await;
     // The tools' own pool is the application role too, as in production (the
-    // MCP reads run on it unstamped: see
-    // `mcp_reads_are_not_widened_by_the_arms_until_they_are_stamped`).
+    // MCP reads now run on the stamped `scoped` read instead: see
+    // `mcp_reads_are_widened_by_the_arms_once_they_are_stamped`).
     let pool = fixture::downgraded_pool(pool, "epigraph_app").await;
     // The transport reads migration 141's denylist on the application role,
     // as `main.rs` wires it.
@@ -915,9 +934,9 @@ async fn el8_log(pool: &PgPool) -> Vec<(String, i32, Vec<Uuid>, serde_json::Valu
 /// its result returns: surface `mcp:get_claim`, the call's id-shaped argument,
 /// the token's jti, the claim and its author as the result's rows, and no
 /// subject for a public row.
-/// A call whose result names B's private claim (the MCP read is not widened,
-/// so the tool answers "not found", naming the id) is recorded too, against
-/// B's group: the attempt is visible to B.
+/// A call whose result is B's private claim (the MCP read is stamped from the
+/// elevated viewer, so the arm widens it and the row is served) is recorded
+/// too, against B's group, with its rows: the access is visible to B.
 ///
 /// Verified to fail with `call_tool` returning the tool's result without
 /// recording it (no row).
@@ -964,12 +983,15 @@ async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPoo
 
     let answer = el8_get_claim(&url, &token, theirs).await;
     assert!(
-        !answer.to_string().contains("mcp el8 B's claim"),
-        "CALIBRATION: the MCP read is not widened: {answer}"
+        answer.to_string().contains("mcp el8 B's claim"),
+        "the stamped elevated MCP read is widened and serves B's claim: {answer}"
     );
     let log = el8_log(&pool).await;
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[1].2, vec![b_group], "the attempt is recorded for B");
+    // Served, B's claim carries the same two id-bearing objects as the public
+    // one above: the claim and its `authored_by.agent`.
+    assert_eq!(log[1].1, 2, "the served claim and its author are counted: {log:?}");
+    assert_eq!(log[1].2, vec![b_group], "the access is recorded for B");
 }
 
 /// FAIL-CLOSED: when the recorder cannot record (its EXECUTE revoked from the

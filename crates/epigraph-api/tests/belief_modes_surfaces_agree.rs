@@ -75,7 +75,10 @@ async fn system_stats_and_health_report_the_same_belief_modes(pool: PgPool) {
     // MCP: system_stats, as an anonymous caller would see it.
     let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x5Au8; 32]).expect("signer");
     let embedder = epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None);
-    let server = epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    // MCP content reads run on a connection stamped with the caller's viewer
+    // and refuse on a server with no `ScopedPool`, as a deployed server has one.
+    let server = epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false)
+        .with_scoped_pool(fixture::scoped_pool(&pool).await);
     let viewer = fixture::public_viewer(&pool).await;
     let result = epigraph_mcp::tools::batch::system_stats(
         &server,

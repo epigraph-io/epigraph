@@ -2499,11 +2499,14 @@ impl ClaimRepository {
     /// re-derived rather than left undecided: the seed is recovered through
     /// `WorkflowRepository::executing_canonical_names`.)
     ///
+    /// Generic over the executor (one statement), so a request passes the
+    /// connection `ScopedPool::read_as` stamped for its viewer.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_properties(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_properties<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Option<serde_json::Value>, DbError> {
@@ -2530,7 +2533,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let props: Option<serde_json::Value> = q.fetch_optional(pool).await?;
+        let props: Option<serde_json::Value> = q.fetch_optional(executor).await?;
         Ok(props)
     }
 
@@ -4017,7 +4020,6 @@ impl ClaimRepository {
     ///
     /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`).
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
     pub async fn search_by_embedding_since<'a, A>(
         executor: A,
         viewer: &crate::visibility::Viewer,
@@ -4031,6 +4033,40 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        let mut conn = executor.acquire().await?;
+        Self::search_by_embedding_since_conn(
+            &mut conn,
+            viewer,
+            query_embedding_pgvector,
+            dim,
+            limit,
+            paper_doi_filter,
+            since,
+            scope,
+        )
+        .await
+    }
+
+    /// [`Self::search_by_embedding_since`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so every statement runs under
+    /// the viewer's own session GUCs and row security agrees with the
+    /// in-query predicate. The other form acquires and delegates here, so the
+    /// statements exist once.
+    ///
+    /// # Errors
+    /// As [`Self::search_by_embedding_since`].
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_since_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        dim: u32,
+        limit: i64,
+        paper_doi_filter: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        scope: EmbeddingSeedScope,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
         let column = match dim {
             1536 => "embedding",
             3072 => "embedding_3072",
@@ -4118,7 +4154,7 @@ impl ClaimRepository {
         }
 
         // See "Iterative HNSW scan" above.
-        let mut tx = executor.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         sqlx::query(
             "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
                     set_config('hnsw.ef_search', $1, true)",
@@ -4456,6 +4492,47 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        let mut conn = executor.acquire().await?;
+        Self::search_hybrid_scoped_since_in_theme_conn(
+            &mut conn,
+            viewer,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            offset,
+            tags,
+            agent_id,
+            since,
+            theme_id,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped_since_in_theme`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so every statement runs under
+    /// the viewer's own session GUCs and row security agrees with the
+    /// in-query predicate. The other form acquires and delegates here, so the
+    /// statements exist once.
+    ///
+    /// # Errors
+    /// As [`Self::search_hybrid_scoped_since_in_theme`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since_in_theme_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -4522,7 +4599,7 @@ impl ClaimRepository {
         }
 
         // See "The dense leg runs with pgvector's iterative HNSW scan" above.
-        let mut tx = executor.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         sqlx::query(
             "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
                     set_config('hnsw.ef_search', $1, true)",
@@ -9797,9 +9874,31 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any underlying edge query fails.
-    #[instrument(skip(pool, viewer, seed_ids))]
     pub async fn graph_expand_seeds_since(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        seed_ids: &[Uuid],
+        max_depth: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GraphExpansionHit>, DbError> {
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::graph_expand_seeds_since_conn(&mut conn, viewer, seed_ids, max_depth, since).await
+    }
+
+    /// [`Self::graph_expand_seeds_since`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so every statement runs under
+    /// the viewer's own session GUCs and row security agrees with the
+    /// in-query predicate. The other form acquires and delegates here, so the
+    /// statements exist once.
+    ///
+    /// # Errors
+    /// As [`Self::graph_expand_seeds_since`].
+    #[instrument(skip(conn, viewer, seed_ids))]
+    pub async fn graph_expand_seeds_since_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         seed_ids: &[Uuid],
         max_depth: u32,
@@ -9830,9 +9929,10 @@ impl ClaimRepository {
             let mut next_frontier = Vec::new();
             let mut level_new: Vec<Uuid> = Vec::new();
             'level: for &node in &frontier {
-                let outgoing =
-                    crate::repos::edge::EdgeRepository::get_by_source(pool, viewer, node, "claim")
-                        .await?;
+                let outgoing = crate::repos::edge::EdgeRepository::get_by_source(
+                    &mut *conn, viewer, node, "claim",
+                )
+                .await?;
                 for e in outgoing {
                     if !EXPANSION_RELATIONSHIPS.contains(&e.relationship.as_str()) {
                         continue;
@@ -9868,7 +9968,7 @@ impl ClaimRepository {
                         wq = wq.bind(g);
                     }
                     let in_window: std::collections::HashSet<Uuid> =
-                        wq.fetch_all(pool).await?.into_iter().collect();
+                        wq.fetch_all(&mut *conn).await?.into_iter().collect();
                     level_new
                         .into_iter()
                         .filter(|id| in_window.contains(id))

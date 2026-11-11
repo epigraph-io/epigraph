@@ -31,8 +31,9 @@ pub async fn list_events(
 
     let limit = params.limit.unwrap_or(50).min(500);
 
+    let mut read = server.read_as(viewer, "list_events").await?;
     let events = EventRepository::list(
-        &server.pool,
+        &mut *read,
         viewer,
         params.event_type.as_deref(),
         actor_id,

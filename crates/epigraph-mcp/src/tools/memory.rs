@@ -528,12 +528,20 @@ async fn recall_post_embed(
     let tags = params.tags;
     let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
 
+    // Every read of the page (theme, lens, retrieval, workflows leg, belief,
+    // dispute and diversity post-passes) on ONE connection stamped with the
+    // caller's viewer, taken after the query embedding: on the plain pool row
+    // security admits public rows only, so a member's own group-private
+    // claims would never be recalled.
+    let mut read = server.read_as(viewer, "recall").await?;
+
     // Theme scope (backlog c95a2509). Resolved up front, and fails closed on
     // every ambiguity — see `themes::resolve_theme_selector`. Sharing that
     // resolver with `get_theme` is what makes `theme_label` mean the same thing
     // on both tools.
     let theme = crate::tools::themes::resolve_theme_selector(
         &server.pool,
+        &mut read,
         viewer,
         params.theme_id.as_deref(),
         params.theme_label.as_deref(),
@@ -590,7 +598,7 @@ async fn recall_post_embed(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
             .await?;
     }
 
@@ -606,8 +614,8 @@ async fn recall_post_embed(
     // reason: a scope that held on the hybrid path but not on the degrade path
     // would widen to the whole corpus precisely when the embedder is down.
     let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
-        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since_in_theme(
-            &server.pool,
+        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since_in_theme_conn(
+            &mut read,
             viewer,
             pgvec,
             &params.query,
@@ -623,7 +631,7 @@ async fn recall_post_embed(
         .await
         .map_err(internal_error)?,
         None => ClaimRepository::search_lexical_scoped_since_in_theme(
-            &server.pool,
+            &mut *read,
             viewer,
             &params.query,
             HYBRID_RRF_K,
@@ -661,20 +669,15 @@ async fn recall_post_embed(
     // nobody else does.
     let workflow_hits: Vec<epigraph_db::WorkflowGoalEmbeddingHit> = if params.include_workflows {
         match pgvec_opt.as_deref() {
-            Some(pgvec) => {
-                let mut read = super::workflows::CallerRead::open(server, viewer).await?;
-                let hits = WorkflowRepository::search_by_goal_embedding_since(
-                    read.conn(),
-                    viewer,
-                    pgvec,
-                    HYBRID_CANDIDATE_POOL,
-                    params.since,
-                )
-                .await
-                .map_err(internal_error)?;
-                read.close().await?;
-                hits
-            }
+            Some(pgvec) => WorkflowRepository::search_by_goal_embedding_since(
+                &mut *read,
+                viewer,
+                pgvec,
+                HYBRID_CANDIDATE_POOL,
+                params.since,
+            )
+            .await
+            .map_err(internal_error)?,
             None => Vec::new(),
         }
     } else {
@@ -727,7 +730,7 @@ async fn recall_post_embed(
                 MergedHit::Workflow(_) => None,
             })
             .collect();
-        match ClaimRepository::effective_belief_batch(&server.pool, viewer, &ids).await {
+        match ClaimRepository::effective_belief_batch(&mut *read, viewer, &ids).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
@@ -743,12 +746,9 @@ async fn recall_post_embed(
     for (merged_rrf_score, merged_hit) in merged {
         match merged_hit {
             MergedHit::Claim(hit) => {
-                if let Ok(Some(claim)) = ClaimRepository::get_by_id(
-                    &server.pool,
-                    viewer,
-                    ClaimId::from_uuid(hit.claim_id),
-                )
-                .await
+                if let Ok(Some(claim)) =
+                    ClaimRepository::get_by_id(&mut *read, viewer, ClaimId::from_uuid(hit.claim_id))
+                        .await
                 {
                     let tv = claim.truth_value.value();
                     // Absent key == invisible to this viewer / deleted between
@@ -853,9 +853,8 @@ async fn recall_post_embed(
             .iter()
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match epigraph_engine::belief_query::get_perspective_belief_batch_scoped(
-            &server.pool,
-            server.scoped.as_ref(),
+        match epigraph_engine::belief_query::get_perspective_belief_batch_conn(
+            &mut read,
             viewer,
             &claim_ids,
             frame_id,
@@ -914,7 +913,7 @@ async fn recall_post_embed(
             .filter(|r| r.result_type.is_none()) // workflows aren't claims
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match ClaimRepository::dispute_batch(&server.pool, viewer, &claim_ids).await {
+        match ClaimRepository::dispute_batch(&mut *read, viewer, &claim_ids).await {
             Ok(mut by_claim) => {
                 for r in &mut results {
                     let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -971,11 +970,7 @@ async fn recall_post_embed(
         // on both the hybrid and the lexical-fallback path — there is no
         // runtime dim choice here, unlike `recall_with_context`.
         match ClaimRepository::pairwise_cosine_distance_at_dim(
-            &server.pool,
-            viewer,
-            &claim_ids,
-            radius,
-            1536,
+            &mut *read, viewer, &claim_ids, radius, 1536,
         )
         .await
         {
