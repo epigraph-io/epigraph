@@ -1704,6 +1704,30 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // `claims_owner_immutable` refuses outside a privileged frame: every share
     // fails LOUD (42501) with nothing moved.
     ("epigraph_share_claims_with_team", 206),
+    // 207, the bug-report intake. The write fails LOUD under a non-member
+    // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
+    // `evidence` are refused by their WITH CHECK (the owner no longer passes
+    // `epigraph_definer_bypass()`), so no report is filed. The reporter's list
+    // fails SILENTLY: its reads of the FORCEd `security_events` and `claims`
+    // admit no row, so every reporter sees an empty list.
+    ("epigraph_submit_bug_report", 207),
+    ("epigraph_my_bug_reports", 207),
+    // 207's caller gate (shared by the write and the preflight). Under a
+    // non-member owner (measured with `epigraph_app` owning it and EXECUTE
+    // granted back to its maintenance-owned callers) its count of the FORCEd
+    // `security_events` still sees the reporter's own `bug_report.submitted`
+    // rows through `security_events_read`'s own-row arm (both callers pass
+    // the stamped principal), so the limit holds (BUG08). On a database armed
+    // for operator binding its last step, 166's `epigraph_require_role_holder`,
+    // is EXECUTE-able by the maintenance role only and is checked against the
+    // gate's owner, so every call that reaches it is refused 42501: the gate,
+    // the write and the preflight then fail LOUD for every caller the earlier
+    // checks pass. Disarmed, that step is skipped exactly as the claims
+    // trigger skips it (`epigraph_operator_binding_armed()` is app-callable,
+    // so the guard itself runs); the measured linked reporter under its limit
+    // then passed and filed, as under the proper owner.
+    ("epigraph_bug_report_gate", 207),
+    ("epigraph_bug_report_preflight", 207),
     // 208, the authorship countersign route (MCP `countersign_authorship`).
     // Its read and UPDATE of the FORCEd `operator_links` and of `edges` are
     // admitted by `epigraph_definer_bypass()` (the owner). Under a non-member
@@ -2789,6 +2813,31 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_share_claims_with_team",
             "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
             true,
+        // 207: the bug-report intake's two definers run on the request DSN
+        // (MCP submit_bug_report / list_my_bug_reports), so both are
+        // app-callable; a missing grant refuses every report (42501).
+        (
+            "epigraph_submit_bug_report",
+            "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
+            true,
+        ),
+        (
+            "epigraph_my_bug_reports",
+            "public.epigraph_my_bug_reports(integer)",
+            true,
+        ),
+        // 207: the preflight runs on the request DSN before the embedding
+        // call; the caller gate takes a principal as an argument, so the
+        // request DSN must never call it (an oracle for any agent).
+        (
+            "epigraph_bug_report_preflight",
+            "public.epigraph_bug_report_preflight()",
+            true,
+        ),
+        (
+            "epigraph_bug_report_gate",
+            "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
+            false,
         ),
         (
             "epigraph_confirm_admin_act",
@@ -3717,6 +3766,9 @@ mod definer_register_tests {
         // the caller (or the maintenance owner of 168's resolution definer,
         // which is what lets that definer through).
         "epigraph_challenge_resolution_guard",
+        // 207: the intake settings' audit trigger. It runs as the session
+        // writing the settings row, which only a maintenance session can.
+        "epigraph_bug_report_intake_settings_audit",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

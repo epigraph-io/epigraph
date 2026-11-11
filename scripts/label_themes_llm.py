@@ -46,6 +46,7 @@ import time
 import psycopg2
 import psycopg2.extras
 
+import theme_lib  # noqa: E402  (scripts/ is on sys.path when run as a script)
 from maintenance_dsn import maintenance_dsn
 
 psycopg2.extras.register_uuid()
@@ -73,15 +74,18 @@ def load_themes_with_samples(conn, limit=None):
             theme_id = theme["id"]
             # Top-10 claims most central to this theme. Joining on agents is
             # cosmetic (label includes the source for human review); the
-            # LEFT JOIN keeps claims whose agent row has been pruned.
+            # LEFT JOIN keeps claims whose agent row has been pruned. Bug
+            # reports filed through the intake are never sampled: the label is
+            # shown outside the intake group (theme_lib.not_intake_owned).
             cur.execute(
-                """
+                f"""
                 SELECT substring(c.content for 200) AS content,
                        COALESCE(a.display_name, 'unknown') AS agent
                 FROM claims c
                 LEFT JOIN agents a ON c.agent_id = a.id
                 WHERE c.theme_id = %s
                   AND c.embedding IS NOT NULL
+                  AND {theme_lib.not_intake_owned("c")}
                 ORDER BY c.embedding <=> (SELECT centroid FROM claim_themes WHERE id = %s)
                 LIMIT 10
                 """,

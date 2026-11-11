@@ -84,6 +84,7 @@ pub use pool::{
 pub use refusal_codes::{
     caller_refusal_code, supersede_refusal_code, CALLER_REFUSAL_CODES, SUPERSEDE_REFUSAL_CODES,
 };
+pub use repos::bug_report::{BugReportInput, BugReportReceipt, BugReportRepository, BugReportRow};
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::SpeaksFor;

@@ -39,6 +39,7 @@ import psycopg2
 import psycopg2.extras
 from sklearn.cluster import MiniBatchKMeans
 
+import theme_lib  # noqa: E402  (scripts/ is on sys.path when run as a script)
 from maintenance_dsn import maintenance_dsn
 
 psycopg2.extras.register_uuid()
@@ -363,7 +364,10 @@ def store_results(conn, atom_ids, beliefs, conflicts, n_clusters, parent_cluster
         # Label clusters by sampling top-belief members' content
         for c in range(n_clusters):
             top = sorted(atom_ids, key=lambda a: -beliefs[a][c]["belief"])[:5]
-            cur.execute("SELECT substring(content for 100) FROM claims WHERE id = ANY(%s::uuid[])", (top,))
+            # Never a bug report's text (theme_lib.not_intake_owned).
+            cur.execute("SELECT substring(c.content for 100) FROM claims c "
+                        "WHERE c.id = ANY(%s::uuid[]) AND " + theme_lib.not_intake_owned("c"),
+                        (top,))
             texts = [r[0] for r in cur.fetchall()]
             size = sum(1 for a in atom_ids
                        if max(range(n_clusters), key=lambda x: beliefs[a][x]["belief"]) == c)

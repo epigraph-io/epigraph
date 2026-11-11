@@ -3069,6 +3069,49 @@ pub struct SupersedeClaimParams {
     pub reason: String,
 }
 
+/// `submit_bug_report` (migration 207's intake).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SubmitBugReportParams {
+    #[schemars(description = "One-line summary of the defect; at most 200 characters, not blank.")]
+    pub title: String,
+
+    #[schemars(
+        description = "What happened and what should have happened; at most 20480 bytes, not \
+                       blank."
+    )]
+    pub description: String,
+
+    #[schemars(description = "Optional: blocker, major or minor.")]
+    #[serde(default)]
+    pub severity: Option<String>,
+
+    #[schemars(
+        description = "Optional: the affected component as a short lower-case slug (letters, \
+                       digits and hyphens, at most 48), e.g. mcp, api, ingest."
+    )]
+    #[serde(default)]
+    pub component: Option<String>,
+
+    #[schemars(description = "Optional: steps to reproduce; at most 20480 bytes.")]
+    #[serde(default)]
+    pub repro: Option<String>,
+
+    #[schemars(
+        description = "Optional: supporting text such as a log excerpt or an error message; at \
+                       most 51200 bytes. Never paste secrets."
+    )]
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+/// `list_my_bug_reports`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListMyBugReportsParams {
+    #[schemars(description = "Maximum reports to return, newest first (default 50, at most 200).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResolveBacklogItemParams {
     #[schemars(description = "UUID of the backlog claim being retired")]

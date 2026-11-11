@@ -1698,6 +1698,33 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Report a bug to the platform operators, whether or not you can read their backlog. WRITE-ONLY: the report is filed as ONE claim authored by you (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), owned by the instance's bug-intake group and visible only to that group, so you cannot read it back with get_claim, recall or any query; list_my_bug_reports shows your own reports and their labels. Labels: backlog, bug-report, intake, plus severity:<x> and component:<x> when given (triage decides everything after that). The answer is always {claim_id, submitted_at} and nothing else: there is no dedup, no similarity check and no hint about other reports, so filing something already reported is harmless. Refused with nothing written when the instance has no intake configured, when you are not an agent bound to a human operator (or are a system agent), when the title or description is empty or a field is too long (title 200 characters, description and repro 20480 bytes, evidence 51200 bytes), or when you have filed too many reports in the last hour or day. Never put secrets in a report."
+    )]
+    async fn submit_bug_report(
+        &self,
+        Parameters(params): Parameters<crate::types::SubmitBugReportParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::bug_report::submit_bug_report(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "List the bug reports YOU filed with submit_bug_report, newest first: claim_id, title, submitted_at, the report's current labels (how triage has classified it so far), resolved and is_current. Only your own reports filed through the intake are listed, never anything else in the intake group. A report the operators moved out of the intake group is no longer listed. Refused on a listener with no authenticated principal. limit defaults to 50, at most 200."
+    )]
+    async fn list_my_bug_reports(
+        &self,
+        Parameters(params): Parameters<crate::types::ListMyBugReportsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::bug_report::list_my_bug_reports(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. When the caller is authenticated (HTTP), the whole patch requires claims:admin or ownership of the claim, as PATCH /api/v1/claims/:id does. All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (another agent's claim) is refused with nothing written. With a claims:admin token (HTTP) a claim owned by a group you cannot write is written through the AUDITED ADMIN PATH instead: the write records you (the admin) as principal, never the claim's author, and a security_events audit row (claims.admin_write) names you, your token, the claim and the before/after state; it requires a live claims:admin grant on your token's own client record, and is refused with nothing written otherwise. On an --allow-unauthenticated-http listener the injected context carries claims:admin but no client record, so a claim owned by a group this server cannot write is refused there (ADM02) with nothing written. Adding or removing 'resolved' needs ownership on stdio too (the author, or an agent linked to the same operator; a server with no declared signer identity may retire only claims it authored). The response's admin_path field says which path ran."
     )]
     async fn patch_claim(
