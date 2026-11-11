@@ -72,9 +72,15 @@ impl Run {
 }
 
 async fn run_op(pool: &PgPool, args: &[&str]) -> Run {
+    run_op_env(pool, args, &[]).await
+}
+
+/// [`run_op`] with extra environment variables (the test-only crash hook).
+async fn run_op_env(pool: &PgPool, args: &[&str], env: &[(&str, &str)]) -> Run {
     let url = fixture::database_url_for(pool).await;
     let out = Command::new(BIN)
         .args(args)
+        .envs(env.iter().copied())
         .env("RUST_LOG", "warn")
         .env_remove("DATABASE_URL")
         .env_remove("MAINTENANCE_DATABASE_URL")
@@ -581,7 +587,7 @@ async fn apply(
     manifest: &std::path::Path,
     extra: &[&str],
 ) -> Run {
-    apply_as(pool, &fx.t, classify(fx), count, manifest, extra).await
+    apply_as(pool, &fx.t, classify(fx), count, manifest, extra, &[]).await
 }
 
 /// `backfill-ingest-markers --apply` under cutoff `t` with the given
@@ -593,6 +599,7 @@ async fn apply_as(
     count: u64,
     manifest: &std::path::Path,
     extra: &[&str],
+    env: &[(&str, &str)],
 ) -> Run {
     let count = count.to_string();
     let mut args: Vec<String> = [
@@ -615,7 +622,7 @@ async fn apply_as(
     args.extend(classes);
     args.extend(extra.iter().map(|s| (*s).to_string()));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_op(pool, &refs).await
+    run_op_env(pool, &refs, env).await
 }
 
 /// The whole act. Before it every reader reads the legacy fixture as
@@ -1272,13 +1279,224 @@ async fn a_paced_run_agrees_after_each_run_and_each_reversal(pool: PgPool) {
     assert_eq!(edge_snapshot(&pool).await, before);
 }
 
-/// A failure in the record phase is caught as an edge batch's is: the run
-/// still prints its summary (STAMPED, BATCH-FAILED, MANIFEST) and exits 2,
-/// and its manifest reverses it. A later run never adopts its stamps: it
-/// writes records only for the assertions it stamped itself.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_record_phase_failure_is_reported_and_never_adopted(pool: PgPool) {
+/// The process KILLED between batches, after a paper-assertion batch
+/// committed (a test-only hook aborts it there, as SIGKILL would: no
+/// unwinding, no summary, no NEXT line). The batches it committed carry their
+/// ingest records already, so `query_paper` and `get_claim`'s `ingesters`
+/// agree with nothing repaired. Then the runbook's resume (a fresh dry run's
+/// total, a new manifest) finishes the backfill, and the two manifests,
+/// newest first, reverse it exactly with the readers agreeing after each.
+/// `at` is where the hook aborts: `line` after the batch's `committed_batch`
+/// line, `commit` right after its COMMIT, before that line.
+#[cfg(debug_assertions)]
+async fn a_run_killed_after_a_paper_assertion_batch(pool: PgPool, at: &str) {
     let fx = seed(&pool).await;
+    let scoped = app_pool(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+
+    // Batch size 3: batches 1-4 are the 10 authorships, batch 5 the first
+    // three paper assertions; the hook kills the run right after it.
+    let m1 = scratch(&format!("killed-{at}.jsonl"));
+    let crash = format!("5:{at}");
+    let r1 = apply_as(
+        &pool,
+        &fx.t,
+        classify(&fx),
+        24,
+        &m1,
+        &["--batch-size", "3"],
+        &[(
+            epigraph_cli::operator::backfill_markers::TEST_CRASH_ENV,
+            &crash,
+        )],
+    )
+    .await;
+    assert_eq!(
+        r1.code,
+        -1,
+        "CALIBRATION: killed by a signal: {}",
+        r1.show()
+    );
+    assert!(
+        !r1.stdout.contains("MANIFEST\t") && !r1.stdout.contains("STAMPED\t"),
+        "CALIBRATION: a killed run prints no summary: {}",
+        r1.show()
+    );
+    assert_eq!(
+        stamped_count(&pool).await,
+        13,
+        "CALIBRATION: 5 batches committed"
+    );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(
+        by_paper.len(),
+        3,
+        "CALIBRATION: the killed run's three paper assertions read: {by_paper:?}"
+    );
+    assert_eq!(
+        by_claim, by_paper,
+        "a run killed after a paper-assertion batch committed leaves get_claim's ingesters \
+         disagreeing with query_paper"
+    );
+    assert_eq!(
+        records_in(&m1),
+        3,
+        "the killed run's manifest holds its records"
+    );
+
+    // The runbook's resume.
+    let mut dry: Vec<String> = vec![
+        "backfill-ingest-markers".into(),
+        "--written-before".into(),
+        fx.t.clone(),
+    ];
+    dry.extend(classify(&fx));
+    let dry: Vec<&str> = dry.iter().map(String::as_str).collect();
+    let d = run_op(&pool, &dry).await;
+    assert_eq!(d.code, 0, "{}", d.show());
+    assert!(
+        d.stdout.contains("TOTAL\tedges_to_stamp=11"),
+        "{}",
+        d.show()
+    );
+    let m2 = scratch(&format!("killed-{at}-resume.jsonl"));
+    let r2 = apply(&pool, &fx, 11, &m2, &["--batch-size", "3"]).await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    assert!(!r2.stdout.contains("NEXT\t"), "{}", r2.show());
+    assert_eq!(stamped_count(&pool).await, 24);
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(by_paper.len(), 7, "{by_paper:?}");
+    assert_eq!(by_claim, by_paper);
+    assert_eq!(
+        by_paper.iter().filter(|f| f.3).count(),
+        1,
+        "the one provable creation record, whichever run wrote it: {by_paper:?}"
+    );
+    assert_eq!(records_in(&m1) + records_in(&m2), 7);
+
+    // A kill after COMMIT but before the committed_batch line leaves batch 5
+    // out of m1's committed set; the operator appends the line by hand first
+    // (what the reversal's UNCOMMITTED-BATCH line says to check).
+    if at == "commit" {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&m1)
+            .expect("manifest");
+        std::io::Write::write_all(&mut f, b"{\"committed_batch\":5}\n").expect("append");
+    }
+    for (m, want) in [
+        (
+            &m2,
+            "REVERSED\tedges_restored=11\tedges_held=0\trecords_deleted=4",
+        ),
+        (
+            &m1,
+            "REVERSED\tedges_restored=13\tedges_held=0\trecords_deleted=3",
+        ),
+    ] {
+        let rev = run_op(
+            &pool,
+            &[
+                "reverse-ingest-markers",
+                "--manifest",
+                m.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(rev.code, 0, "{}", rev.show());
+        assert!(rev.stdout.contains(want), "{want}: {}", rev.show());
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+        assert_eq!(by_claim, by_paper);
+    }
+    assert_eq!(edge_snapshot(&pool).await, before);
+}
+
+/// Killed between batches (after the `committed_batch` line).
+#[cfg(debug_assertions)]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_killed_between_batches_leaves_the_readers_agreeing(pool: PgPool) {
+    a_run_killed_after_a_paper_assertion_batch(pool, "line").await;
+}
+
+/// Killed right after a batch's COMMIT, before its `committed_batch` line:
+/// the batch's records committed with its stamps all the same.
+#[cfg(debug_assertions)]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_killed_right_after_a_commit_leaves_the_readers_agreeing(pool: PgPool) {
+    a_run_killed_after_a_paper_assertion_batch(pool, "commit").await;
+}
+
+/// A REVERSAL killed part-way (the test-only hook aborts it after its fourth
+/// committed transaction: newest first, the three agent-assertion batches,
+/// then the last paper-assertion batch) leaves no stamp without its record:
+/// each committed batch is reversed in one transaction, records and labels
+/// together. The readers agree at the kill, and re-running the reversal
+/// finishes the rest and restores every edge row exactly.
+#[cfg(debug_assertions)]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reversal_killed_part_way_leaves_the_readers_agreeing(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let scoped = app_pool(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+    let m = scratch("reverse-killed.jsonl");
+    let r = apply(&pool, &fx, 24, &m, &["--batch-size", "3"]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(records_in(&m), 7, "CALIBRATION");
+
+    let args = [
+        "reverse-ingest-markers",
+        "--manifest",
+        m.to_str().unwrap(),
+        "--apply",
+    ];
+    let killed = run_op_env(
+        &pool,
+        &args,
+        &[(
+            epigraph_cli::operator::backfill_markers::TEST_CRASH_ENV,
+            "4:reverse",
+        )],
+    )
+    .await;
+    assert_eq!(killed.code, -1, "CALIBRATION: killed: {}", killed.show());
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(
+        by_claim, by_paper,
+        "a reversal killed part-way leaves get_claim's ingesters disagreeing with query_paper"
+    );
+    assert_eq!(by_paper.len(), 6, "CALIBRATION: {by_paper:?}");
+    assert_eq!(
+        stamped_count(&pool).await,
+        16,
+        "CALIBRATION: the 7 agent assertions and the last paper assertion restored"
+    );
+
+    let rerun = run_op(&pool, &args).await;
+    assert_eq!(rerun.code, 0, "{}", rerun.show());
+    assert!(
+        rerun.stdout.contains(
+            "REVERSED\tedges_restored=16\tedges_held=8\trecords_deleted=6\trecords_held=1"
+        ),
+        "{}",
+        rerun.show()
+    );
+    assert_eq!(edge_snapshot(&pool).await, before);
+}
+
+/// A failed INGEST RECORD write rolls its paper-assertion batch back WITH its
+/// stamps: a record is written in its stamps' own transaction, so no
+/// committed batch ever lacks its records. The run reports the failure (exit
+/// 2), its summary and a `NEXT` resume line (no reverse-first), and the
+/// readers agree (the committed authorships, no paper assertion). Following
+/// the resume finishes the backfill, and the two manifests reverse it
+/// exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_record_write_rolls_back_its_batchs_stamps(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let scoped = app_pool(&pool).await;
     register_legacy(&pool).await;
     let before = edge_snapshot(&pool).await;
     sqlx::query(
@@ -1305,72 +1523,78 @@ async fn a_record_phase_failure_is_reported_and_never_adopted(pool: PgPool) {
     let r1 = apply(&pool, &fx, 24, &m1, &["--batch-size", "3"]).await;
     assert_eq!(r1.code, 2, "{}", r1.show());
     for want in [
-        "STAMPED\tpaper-asserts-claim\t7",
+        "STAMPED\tagent-authored-paper\t10",
         "\nCREATION-RECORDS-WRITTEN\t0",
         "NON-CREATION-RECORDS-WRITTEN\t0",
-        "BATCH-FAILED\t",
+        "BATCH-FAILED\tpaper-asserts-claim batch 5",
         "test: ingest records refused",
         "MANIFEST\t",
-        "NEXT\treverse first:",
-        "NEXT\tthen resume:",
+        "NEXT\tresume:",
     ] {
         assert!(r1.stdout.contains(want), "{want}: {}", r1.show());
     }
     assert!(
-        !r1.stdout.contains("NEXT\tresume:"),
-        "a run whose stamps lack records must not be told to resume before reversing: {}",
+        !r1.stdout.contains("STAMPED\tpaper-asserts-claim"),
+        "a batch whose records failed must not keep its stamps: {}",
         r1.show()
     );
+    assert!(!r1.stdout.contains("reverse first"), "{}", r1.show());
     assert_eq!(
         stamped_count(&pool).await,
-        24,
-        "CALIBRATION: every edge stamped"
+        10,
+        "the failed batch's stamps rolled back with its records"
     );
     assert_eq!(
         record_count(&pool).await,
         0,
         "CALIBRATION: no record written"
     );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(by_claim, by_paper, "{}", r1.show());
 
     sqlx::query("DROP TRIGGER test_refuse_ingest_record ON edges")
         .execute(&pool)
         .await
         .expect("drop trigger");
     let m2 = scratch("records-after.jsonl");
-    let r2 = apply(&pool, &fx, 0, &m2, &[]).await;
+    let r2 = apply(&pool, &fx, 14, &m2, &["--batch-size", "3"]).await;
     assert_eq!(r2.code, 0, "{}", r2.show());
     for want in [
-        "\nCREATION-RECORDS\tprovable=0",
-        "NON-CREATION-RECORDS\tplanned=0",
-        "\nCREATION-RECORDS-WRITTEN\t0",
-        "NON-CREATION-RECORDS-WRITTEN\t0",
+        "STAMPED\tpaper-asserts-claim\t7",
+        "\nCREATION-RECORDS-WRITTEN\t1",
+        "NON-CREATION-RECORDS-WRITTEN\t6",
     ] {
-        assert!(
-            r2.stdout.contains(want),
-            "a later run adopted another run's stamps: {want}: {}",
-            r2.show()
-        );
+        assert!(r2.stdout.contains(want), "{want}: {}", r2.show());
     }
-    assert_eq!(records_in(&m2), 0);
-    assert_eq!(record_count(&pool).await, 0);
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+    assert_eq!(by_paper.len(), 7, "{by_paper:?}");
+    assert_eq!(by_claim, by_paper);
 
-    let rev = run_op(
-        &pool,
-        &[
-            "reverse-ingest-markers",
-            "--manifest",
-            m1.to_str().unwrap(),
-            "--apply",
-        ],
-    )
-    .await;
-    assert_eq!(rev.code, 0, "{}", rev.show());
-    assert!(
-        rev.stdout
-            .contains("REVERSED\tedges_restored=24\tedges_held=0\trecords_deleted=0"),
-        "{}",
-        rev.show()
-    );
+    for (m, want) in [
+        (
+            &m2,
+            "REVERSED\tedges_restored=14\tedges_held=0\trecords_deleted=7",
+        ),
+        (
+            &m1,
+            "REVERSED\tedges_restored=10\tedges_held=0\trecords_deleted=0",
+        ),
+    ] {
+        let rev = run_op(
+            &pool,
+            &[
+                "reverse-ingest-markers",
+                "--manifest",
+                m.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(rev.code, 0, "{}", rev.show());
+        assert!(rev.stdout.contains(want), "{want}: {}", rev.show());
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &fx.papers, &fx.claims).await;
+        assert_eq!(by_claim, by_paper);
+    }
     assert_eq!(edge_snapshot(&pool).await, before);
 }
 
@@ -1497,11 +1721,21 @@ async fn a_lock_timeout_on_the_candidate_select_still_writes_the_committed_stamp
     let r1 = apply(&pool, &fx, 24, &m1, &["--lock-timeout", "300ms"]).await;
     holder.rollback().await.expect("release");
     assert_eq!(r1.code, 2, "{}", r1.show());
+    let failed: Vec<&str> = r1
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH-FAILED\t"))
+        .collect();
+    assert!(
+        failed.len() == 1
+            && failed[0].starts_with("BATCH-FAILED\tagent-asserts-claim")
+            && failed[0].contains("canceling statement due to lock timeout"),
+        "the BATCH-FAILED line itself carries the database's cause: {}",
+        r1.show()
+    );
     for want in [
         "STAMPED\tagent-authored-paper\t10",
         "STAMPED\tpaper-asserts-claim\t7",
-        "BATCH-FAILED\tagent-asserts-claim",
-        "lock timeout",
         "\nCREATION-RECORDS-WRITTEN\t1",
         "NON-CREATION-RECORDS-WRITTEN\t6",
         "MANIFEST\t",
@@ -1947,6 +2181,7 @@ async fn a_papers_principal_reads_its_assertions_signers_under_the_cutoff(pool: 
         21,
         &manifest,
         &["--batch-size", "4"],
+        &[],
     )
     .await;
     assert_eq!(applied.code, 0, "{}", applied.show());
@@ -2033,7 +2268,7 @@ async fn an_agent_assertion_takes_its_oldest_in_force_chains_principal(pool: PgP
     register_legacy(&pool).await;
 
     let manifest = scratch("in-force-chain.jsonl");
-    let applied = apply_as(&pool, &px.t, px.classify(), 21, &manifest, &[]).await;
+    let applied = apply_as(&pool, &px.t, px.classify(), 21, &manifest, &[], &[]).await;
     assert_eq!(applied.code, 0, "{}", applied.show());
     let r_c14: Vec<String> = sqlx::query_scalar(
         "SELECT labels FROM edges WHERE source_id = $1 AND target_id = $2 \
@@ -2053,4 +2288,591 @@ async fn an_agent_assertion_takes_its_oldest_in_force_chains_principal(pool: PgP
         (1, 0, 1),
         "R: P5 (its P6 authorship is retracted) and C14 through P5"
     );
+}
+
+/// The low and high ids of P5's two legacy `asserts` copies of one claim:
+/// a run stamps in edge-id order, so a paced run's first run takes the low
+/// copy and the resume the high one.
+const LOW_COPY: &str = "00000000-0000-4000-8000-000000000002";
+const HIGH_COPY: &str = "ffffffff-ffff-4fff-bfff-fffffffffffe";
+
+/// The standard fixture plus P5: one legacy unsigned authorship (V) and TWO
+/// legacy unsigned `P5 -asserts-> C7` edges (a re-ingest writes a new edge;
+/// edges carry no triple uniqueness), all well before the cutoff. Both copies
+/// take legacy-ingest, and the record writer keeps one record per paper,
+/// claim and principal. Returns `(P5, C7)`.
+async fn seed_duplicate_pair(pool: &PgPool, fx: &Fx) -> (Uuid, Uuid) {
+    let p5 = paper(pool, "10.9999/backfill-duplicate", "Duplicated Legacy").await;
+    let c7 = fixture::seed_public_claim(pool, fx.f, "a legacy finding asserted twice").await;
+    for (id, src, src_t, tgt, tgt_t, rel, props) in [
+        (
+            Uuid::new_v4(),
+            fx.v,
+            "agent",
+            p5,
+            "paper",
+            "authored",
+            serde_json::json!({"position": 0, "role": "author"}),
+        ),
+        (
+            Uuid::parse_str(LOW_COPY).unwrap(),
+            p5,
+            "paper",
+            c7,
+            "claim",
+            "asserts",
+            serde_json::json!({}),
+        ),
+        (
+            Uuid::parse_str(HIGH_COPY).unwrap(),
+            p5,
+            "paper",
+            c7,
+            "claim",
+            "asserts",
+            serde_json::json!({}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, \
+                                relationship, properties, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, '2000-01-01T00:00:00Z')",
+        )
+        .bind(id)
+        .bind(src)
+        .bind(src_t)
+        .bind(tgt)
+        .bind(tgt_t)
+        .bind(rel)
+        .bind(props)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed P5 {rel}: {e}"));
+    }
+    (p5, c7)
+}
+
+/// Whether edge `id` carries the backfill's stamp.
+async fn is_stamped(pool: &PgPool, id: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT labels @> ARRAY['epigraph:ingest_written']::text[] FROM edges WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(id).unwrap())
+    .fetch_one(pool)
+    .await
+    .expect("stamped?")
+}
+
+/// Two legacy copies of one `paper -asserts-> claim` pair land in different
+/// runs of a paced backfill: the resume stamps the second copy but writes no
+/// record (the first run's record already covers that paper, claim and
+/// principal), so its stamp rests on the first run's record. Reversing the
+/// FIRST run's manifest alone would delete that record and leave the second
+/// stamp without one. So that reversal is refused, dry run and `--apply`
+/// alike, with nothing written, naming the edge and the newer manifest to
+/// reverse first; reversing newest first then restores every edge row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reversal_refuses_while_a_newer_runs_stamp_rests_on_its_records(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (p5, c7) = seed_duplicate_pair(&pool, &fx).await;
+    let mut papers = fx.papers.to_vec();
+    papers.push(p5);
+    let mut claims = fx.claims.to_vec();
+    claims.push(c7);
+    let scoped = app_pool(&pool).await;
+    let legacy = register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+
+    // Batches 1-4: the 11 authorships; batch 5: the first three paper
+    // assertions, in id order, so the LOW copy.
+    let m1 = scratch("dup-1.jsonl");
+    let r1 = apply(
+        &pool,
+        &fx,
+        27,
+        &m1,
+        &["--batch-size", "3", "--max-batches", "5"],
+    )
+    .await;
+    assert_eq!(r1.code, 0, "{}", r1.show());
+    assert!(
+        is_stamped(&pool, LOW_COPY).await && !is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: run 1 stamps the low copy only"
+    );
+    let m2 = scratch("dup-2.jsonl");
+    let r2 = apply(&pool, &fx, 13, &m2, &["--batch-size", "3"]).await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    assert!(
+        is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: run 2 stamps the high copy"
+    );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+    assert!(
+        by_paper.contains(&(p5, legacy, c7, false)),
+        "CALIBRATION: {by_paper:?}"
+    );
+    assert_eq!(by_claim, by_paper, "CALIBRATION: both runs agree");
+    assert_eq!(
+        (records_in(&m1), records_in(&m2)),
+        (3, 5),
+        "CALIBRATION: run 2 writes no record for the high copy"
+    );
+
+    let stamped = edge_snapshot(&pool).await;
+    let records = record_count(&pool).await;
+    for apply_flag in [false, true] {
+        let mut args = vec!["reverse-ingest-markers", "--manifest", m1.to_str().unwrap()];
+        if apply_flag {
+            args.push("--apply");
+        }
+        let rev = run_op(&pool, &args).await;
+        assert_ne!(
+            rev.code,
+            0,
+            "reversing the older manifest alone (apply={apply_flag}) must be refused: {}",
+            rev.show()
+        );
+        assert!(
+            rev.stderr.contains(HIGH_COPY)
+                && rev.stderr.contains("1 not in this manifest: edge ")
+                && rev.stderr.contains(
+                    "A newer run stamped them: reverse the newer manifest that stamped them \
+                     first, then this one."
+                ),
+            "the refusal names the edge and says to reverse the newer manifest first: {}",
+            rev.show()
+        );
+        assert!(
+            !rev.stderr.contains("uncommitted batch") && !rev.stderr.contains("committed_batch"),
+            "an edge outside the manifest gets no append-the-commit-line advice: {}",
+            rev.show()
+        );
+        assert_eq!(
+            edge_snapshot(&pool).await,
+            stamped,
+            "a refused reversal changes no edge row"
+        );
+        assert_eq!(record_count(&pool).await, records, "no record deleted");
+        assert_eq!(
+            audit_count(&pool, "ingest_marker.backfill_reverse").await,
+            0,
+            "no audit row"
+        );
+    }
+
+    for (m, want) in [
+        (
+            &m2,
+            "REVERSED\tedges_restored=13\tedges_held=0\trecords_deleted=5\trecords_held=0",
+        ),
+        (
+            &m1,
+            "REVERSED\tedges_restored=14\tedges_held=0\trecords_deleted=3\trecords_held=0",
+        ),
+    ] {
+        let rev = run_op(
+            &pool,
+            &[
+                "reverse-ingest-markers",
+                "--manifest",
+                m.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(rev.code, 0, "{}", rev.show());
+        assert!(rev.stdout.contains(want), "{want}: {}", rev.show());
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+        assert_eq!(by_claim, by_paper);
+    }
+    assert_eq!(edge_snapshot(&pool).await, before);
+    assert_eq!(record_count(&pool).await, 0);
+}
+
+/// The manifest format is version 3: a batch's record lines carry its
+/// stamps' batch number. A version 2 manifest (its records in separate
+/// batches numbered after every edge batch) is still reversed, exactly, with
+/// a `LEGACY-MANIFEST` line saying it is not batch-atomic; any other version
+/// is refused with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_version_2_manifest_is_reversed_with_a_legacy_line(pool: PgPool) {
+    let fx = seed(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+    let m = scratch("v3.jsonl");
+    let r = apply(&pool, &fx, 24, &m, &[]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let text = std::fs::read_to_string(&m).expect("manifest");
+    let mut lines = text.lines();
+    let mut header: serde_json::Value =
+        serde_json::from_str(lines.next().expect("header")).expect("header json");
+    assert_eq!(header["version"], 3, "a run writes a version 3 manifest");
+
+    // The version 2 shape: every record line in its own committed batch,
+    // numbered after every edge batch.
+    let mut body = String::new();
+    let mut record_batches = BTreeSet::new();
+    for line in lines {
+        let mut v: serde_json::Value = serde_json::from_str(line).expect("line");
+        if v.get("record").is_some() {
+            let b = v["batch"].as_i64().expect("batch") + 1000;
+            v["batch"] = serde_json::json!(b);
+            record_batches.insert(b);
+        }
+        body.push_str(&v.to_string());
+        body.push('\n');
+    }
+    assert!(!record_batches.is_empty(), "CALIBRATION: records written");
+    for b in &record_batches {
+        body.push_str(&serde_json::json!({ "committed_batch": b }).to_string());
+        body.push('\n');
+    }
+    let stamped = edge_snapshot(&pool).await;
+    let records = record_count(&pool).await;
+    let mut with_version = |n: i64| {
+        header["version"] = serde_json::json!(n);
+        let p = scratch(&format!("v{n}.jsonl"));
+        std::fs::write(&p, format!("{header}\n{body}")).expect("write");
+        p
+    };
+
+    let v1 = with_version(1);
+    let rev = run_op(
+        &pool,
+        &[
+            "reverse-ingest-markers",
+            "--manifest",
+            v1.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_ne!(
+        rev.code,
+        0,
+        "a version 1 manifest is refused: {}",
+        rev.show()
+    );
+    assert_eq!(edge_snapshot(&pool).await, stamped);
+    assert_eq!(record_count(&pool).await, records);
+
+    let v2 = with_version(2);
+    let rev = run_op(
+        &pool,
+        &[
+            "reverse-ingest-markers",
+            "--manifest",
+            v2.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert!(
+        rev.stdout.contains("LEGACY-MANIFEST\t"),
+        "a version 2 manifest is reversed with its LEGACY-MANIFEST line: {}",
+        rev.show()
+    );
+    assert_eq!(edge_snapshot(&pool).await, before);
+    assert_eq!(record_count(&pool).await, 0);
+}
+
+/// The batch number of `edge`'s line in `manifest`, and whether that batch
+/// has its `committed_batch` line.
+fn batch_of(manifest: &std::path::Path, edge: &str) -> (Option<i64>, bool) {
+    let text = std::fs::read_to_string(manifest).expect("manifest");
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .skip(1)
+        .map(|l| serde_json::from_str(l).expect("line"))
+        .collect();
+    let b = lines
+        .iter()
+        .find(|v| v.get("edge").and_then(serde_json::Value::as_str) == Some(edge))
+        .and_then(|v| v.get("batch").and_then(serde_json::Value::as_i64));
+    let committed = b.is_some_and(|b| {
+        lines
+            .iter()
+            .any(|v| v.get("committed_batch").and_then(serde_json::Value::as_i64) == Some(b))
+    });
+    (b, committed)
+}
+
+/// What the refusal says about a leaning stamp listed in this manifest's
+/// uncommitted batch 7: it cannot tell a newer run's stamp from its own
+/// batch that committed without its line, so it gives both remedies.
+fn says_batch_7_remedies(stderr: &str) -> bool {
+    stderr.contains(HIGH_COPY)
+        && stderr.contains(
+            "1 in this manifest's uncommitted batch 7 (lines but no committed_batch line): edge ",
+        )
+        && stderr.contains(
+            "If a newer manifest lists them, reverse that newer manifest first, then this one.",
+        )
+        && stderr.contains(
+            "If none does, batch 7 committed before the run wrote its line (the run was killed \
+             after that COMMIT): check that batch 7's edges are all stamped, append the line \
+             {\"committed_batch\": 7} to",
+        )
+        && !stderr.contains("not in this manifest")
+}
+
+/// An older run's ROLLED-BACK batch lists the edge a newer run stamps. Run 1
+/// fails batch 7 after writing its edge lines (a test-only trigger refuses
+/// the high copy's stamp), so m1 lists the high copy, uncommitted. The
+/// runbook's resume (run 2) stamps it and writes no record: the low copy's
+/// record, written by run 1's committed batch 5, already covers that paper,
+/// claim and principal. So the high copy's stamp rests on run 1's record.
+/// Reversing m1 alone must be REFUSED, dry run and `--apply`, with nothing
+/// written: the high copy is not in m1's COMMITTED batches, so it is a stamp
+/// m1's reversal would leave without its record. The refusal names batch 7
+/// and both remedies. Reversing m2 then m1 is exact.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rolled_back_batchs_lines_do_not_hide_a_newer_stamp_from_the_refusal(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (p5, c7) = seed_duplicate_pair(&pool, &fx).await;
+    let mut papers = fx.papers.to_vec();
+    papers.push(p5);
+    let mut claims = fx.claims.to_vec();
+    claims.push(c7);
+    let scoped = app_pool(&pool).await;
+    let legacy = register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_refuse_high_copy() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.id = '{HIGH_COPY}'::uuid \
+              AND NEW.labels @> ARRAY['epigraph:ingest_written']::text[] THEN \
+             RAISE EXCEPTION 'test: high copy refused'; \
+           END IF; \
+           RETURN NEW; \
+         END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("refusing function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_high_copy AFTER UPDATE ON edges \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_high_copy()",
+    )
+    .execute(&pool)
+    .await
+    .expect("refusing trigger");
+
+    // Batches 1-4: the 11 authorships; 5-7: the 9 paper assertions in id
+    // order, so the low copy in batch 5 and the high copy in batch 7.
+    let m1 = scratch("rolled-back-1.jsonl");
+    let r1 = apply(&pool, &fx, 27, &m1, &["--batch-size", "3"]).await;
+    assert_eq!(r1.code, 2, "{}", r1.show());
+    assert!(
+        r1.stdout
+            .contains("BATCH-FAILED\tpaper-asserts-claim batch 7")
+            && r1.stdout.contains("test: high copy refused"),
+        "CALIBRATION: batch 7 fails on the high copy: {}",
+        r1.show()
+    );
+    assert!(
+        is_stamped(&pool, LOW_COPY).await && !is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: run 1 stamps the low copy only"
+    );
+    assert_eq!(
+        batch_of(&m1, HIGH_COPY),
+        (Some(7), false),
+        "CALIBRATION: m1 lists the high copy in batch 7, with no commit line"
+    );
+    assert_eq!(
+        batch_of(&m1, LOW_COPY),
+        (Some(5), true),
+        "CALIBRATION: m1's committed batch 5 stamped the low copy"
+    );
+    sqlx::query("DROP TRIGGER test_refuse_high_copy ON edges")
+        .execute(&pool)
+        .await
+        .expect("drop trigger");
+
+    // The runbook's resume.
+    let left = u64::try_from(27 - stamped_count(&pool).await).unwrap();
+    let m2 = scratch("rolled-back-2.jsonl");
+    let r2 = apply(&pool, &fx, left, &m2, &["--batch-size", "3"]).await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    assert!(
+        is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: run 2 stamps the high copy"
+    );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+    assert!(
+        by_paper.contains(&(p5, legacy, c7, false)),
+        "CALIBRATION: {by_paper:?}"
+    );
+    assert_eq!(by_claim, by_paper, "CALIBRATION: both runs agree");
+
+    let stamped = edge_snapshot(&pool).await;
+    let records = record_count(&pool).await;
+    for apply_flag in [false, true] {
+        let mut args = vec!["reverse-ingest-markers", "--manifest", m1.to_str().unwrap()];
+        if apply_flag {
+            args.push("--apply");
+        }
+        let rev = run_op(&pool, &args).await;
+        assert_ne!(
+            rev.code,
+            0,
+            "reversing the older manifest alone (apply={apply_flag}) must be refused while \
+             the high copy rests on its record: {}",
+            rev.show()
+        );
+        assert!(
+            says_batch_7_remedies(&rev.stderr),
+            "the refusal names the edge, its uncommitted batch and both remedies: {}",
+            rev.show()
+        );
+        assert_eq!(
+            edge_snapshot(&pool).await,
+            stamped,
+            "a refused reversal changes no edge row"
+        );
+        assert_eq!(record_count(&pool).await, records, "no record deleted");
+        assert_eq!(
+            audit_count(&pool, "ingest_marker.backfill_reverse").await,
+            0,
+            "no audit row"
+        );
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+        assert_eq!(by_claim, by_paper, "the readers agree after the refusal");
+    }
+
+    for m in [&m2, &m1] {
+        let rev = run_op(
+            &pool,
+            &[
+                "reverse-ingest-markers",
+                "--manifest",
+                m.to_str().unwrap(),
+                "--apply",
+            ],
+        )
+        .await;
+        assert_eq!(rev.code, 0, "{}", rev.show());
+        assert!(
+            rev.stdout.contains("\tedges_held=0\t") && rev.stdout.contains("\trecords_held=0"),
+            "{}",
+            rev.show()
+        );
+        let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+        assert_eq!(by_claim, by_paper, "the readers agree after each reversal");
+    }
+    assert_eq!(edge_snapshot(&pool).await, before);
+    assert_eq!(record_count(&pool).await, 0);
+}
+
+/// A single run killed right after batch 7's COMMIT, before its
+/// `committed_batch` line: batch 7 stamped the high copy resting on the low
+/// copy's record from committed batch 5. The reversal cannot tell this from a
+/// newer run's stamp, so it refuses with nothing written and gives both
+/// remedies; with no newer run, appending batch 7's line (what the refusal
+/// says) makes the reversal exact.
+#[cfg(debug_assertions)]
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_killed_after_a_commit_with_a_leaning_stamp_is_refused_until_its_line_is_added(
+    pool: PgPool,
+) {
+    let fx = seed(&pool).await;
+    let (p5, c7) = seed_duplicate_pair(&pool, &fx).await;
+    let mut papers = fx.papers.to_vec();
+    papers.push(p5);
+    let mut claims = fx.claims.to_vec();
+    claims.push(c7);
+    let scoped = app_pool(&pool).await;
+    register_legacy(&pool).await;
+    let before = edge_snapshot(&pool).await;
+
+    let m1 = scratch("killed-leaning.jsonl");
+    let r1 = apply_as(
+        &pool,
+        &fx.t,
+        classify(&fx),
+        27,
+        &m1,
+        &["--batch-size", "3"],
+        &[(
+            epigraph_cli::operator::backfill_markers::TEST_CRASH_ENV,
+            "7:commit",
+        )],
+    )
+    .await;
+    assert_eq!(
+        r1.code,
+        -1,
+        "CALIBRATION: killed by a signal: {}",
+        r1.show()
+    );
+    assert_eq!(
+        stamped_count(&pool).await,
+        20,
+        "CALIBRATION: batches 1-7 committed"
+    );
+    assert!(
+        is_stamped(&pool, LOW_COPY).await && is_stamped(&pool, HIGH_COPY).await,
+        "CALIBRATION: both copies stamped"
+    );
+    assert_eq!(batch_of(&m1, LOW_COPY), (Some(5), true), "CALIBRATION");
+    assert_eq!(
+        batch_of(&m1, HIGH_COPY),
+        (Some(7), false),
+        "CALIBRATION: batch 7 committed but has no commit line"
+    );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+    assert_eq!(
+        by_claim, by_paper,
+        "CALIBRATION: the readers agree at the kill"
+    );
+
+    let stamped = edge_snapshot(&pool).await;
+    let records = record_count(&pool).await;
+    for apply_flag in [false, true] {
+        let mut args = vec!["reverse-ingest-markers", "--manifest", m1.to_str().unwrap()];
+        if apply_flag {
+            args.push("--apply");
+        }
+        let rev = run_op(&pool, &args).await;
+        assert_ne!(rev.code, 0, "apply={apply_flag}: {}", rev.show());
+        assert!(
+            says_batch_7_remedies(&rev.stderr),
+            "the refusal says to append batch 7's line when no newer run stamped it: {}",
+            rev.show()
+        );
+        assert_eq!(edge_snapshot(&pool).await, stamped, "no edge row changed");
+        assert_eq!(record_count(&pool).await, records, "no record deleted");
+    }
+
+    // What the refusal says: batch 7's edges are all stamped and no newer
+    // manifest exists, so append its line, then reverse.
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&m1)
+        .expect("manifest");
+    std::io::Write::write_all(&mut f, b"{\"committed_batch\": 7}\n").expect("append");
+    let rev = run_op(
+        &pool,
+        &[
+            "reverse-ingest-markers",
+            "--manifest",
+            m1.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert!(
+        rev.stdout
+            .contains("REVERSED\tedges_restored=20\tedges_held=0")
+            && rev.stdout.contains("\trecords_held=0")
+            && !rev.stdout.contains("UNCOMMITTED-BATCH"),
+        "{}",
+        rev.show()
+    );
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &papers, &claims).await;
+    assert_eq!(by_claim, by_paper);
+    assert_eq!(edge_snapshot(&pool).await, before);
+    assert_eq!(record_count(&pool).await, 0);
 }
