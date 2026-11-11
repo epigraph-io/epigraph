@@ -2235,8 +2235,19 @@ async fn reverse_batch(
     // ---- an edge put back on its recorded tuple must be at least as narrow
     // as the meet of its endpoints as they will be after this batch: an
     // endpoint that moved since (a claim outside the manifest, ITS evidence,
-    // a node) may require a group the recorded tuple does not. A held claim
-    // changes which endpoints come back, so iterate to a fixpoint. ----
+    // a node) may require a group the recorded tuple does not.
+    //
+    // The loop repeats until a round holds nothing new, but at this head the
+    // second round never does. A hold only takes claims out of `work_ids`,
+    // which turns an endpoint `after` called restored into one it does not.
+    // Such an endpoint is either still off its recorded prior (pending: the
+    // edge waits on the meet and is skipped) or already on it (its state is
+    // the same either way), and an endpoint with no recorded prior never
+    // depended on `work_ids`. So no checked edge sees a new state, and every
+    // edge that failed in the first round has no claim left in `work_ids`.
+    // The repeat is defensive: it keeps the check sound if `after` ever
+    // changes so that a hold can change a checked state. A test cannot make
+    // it fire, and a one-round mutant is equivalent. ----
     let mut work_ids: BTreeSet<Uuid> = cand_ids
         .iter()
         .filter(|c| !drift.contains_key(*c))
