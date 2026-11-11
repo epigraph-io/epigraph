@@ -26,9 +26,15 @@
 //!   crate that starts pulling SQLite in on its own.
 //!
 //! Why a manifest scan and not `cargo metadata` resolved features: `cargo
-//! metadata --all-features --locked --offline` exits 101 on the remote build
-//! host (it needs every package's manifest, including ones never built there),
-//! and without `--offline` a blocking test would depend on the network.
+//! metadata` reads the manifest of every package in its resolve, including
+//! locked packages no build compiles, and without `--offline` a blocking test
+//! would depend on the network. `cargo metadata --all-features --locked
+//! --offline` exits 101 even on a long-lived cache: it wants crates built only
+//! for other targets. With `--filter-platform <host>` it can run offline on
+//! such a cache, but on a fresh `CARGO_HOME` after building this crate it exits
+//! 101 ("failed to download"). Its resolve still holds the locked but inactive
+//! `sqlx-sqlite` and `libsqlite3-sys`, which no build downloads, so a CI runner
+//! whose cache misses would fail the check for a reason unrelated to SQLite.
 //!
 //! Blind spot: a third-party crate that enables `sqlx/sqlite` through its OWN
 //! manifest is invisible to both scans (the lockfile records no features).
