@@ -49,7 +49,7 @@
 //!
 //! * a derived row that is `('group', SOURCE)` becomes `('group', TARGET)`;
 //! * an OUTSIDER's challenge (migration 168) is the challenger's and stays as
-//!   it is (its readability follows the claim, ruling R-CH1b);
+//!   it is (its readability follows the claim, migration 168);
 //! * a fragment the claim shares with a claim that does not end in the target
 //!   is a NODE: the cascade narrows it and this tool puts it back, in the same
 //!   transaction, as `restrict-claims` does;
@@ -755,8 +755,8 @@ async fn classify_rows(
             _ if k.0 == "evidence" && cl.pinned.contains(&k.1) => {
                 Some(Hold::Pinned { id: k.1.clone() })
             }
-            // Migration 168 (R-CH1): an outsider's challenge is the
-            // challenger's; the cascade leaves it, and so does this act.
+            // Migration 168: an outsider's challenge is the challenger's; the
+            // cascade leaves it, and so does this act.
             _ if is_outsider_challenge(&k.0, a.writer_owned) => None,
             Kind::Fragments if !cl.fragment_moves(a, cands) => None,
             _ if a.tenancy.visibility == PUBLIC => Some(Hold::PublicRow {

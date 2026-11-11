@@ -91,9 +91,10 @@ pub struct Record {
     /// move that shares a row with one it did (see the module doc).
     pub neighbour: bool,
     /// `Some(..)` only on a row of a table that carries migration 114's
-    /// `writer_owned` flag, and only in a `restrict-claims` manifest: a
-    /// narrowing clears the flag (the row follows the claim), so its reversal
-    /// must put the recorded value back. `None` (absent) everywhere else.
+    /// `writer_owned` flag, and only in a `restrict-claims` or
+    /// `regroup-claims` manifest: the act's cascade clears the flag (the row
+    /// follows the claim), so its reversal must put the recorded value back.
+    /// `None` (absent) everywhere else.
     pub writer_owned: Option<bool>,
 }
 
