@@ -87,6 +87,13 @@
 //!
 //! # Invariants checked in every batch, before its commit
 //!
+//! Each batch first holds `SHARE ROW EXCLUSIVE` on `edges`,
+//! `harvester_fragments` and the derived tables with no key to claims
+//! (`LOCKED-PER-BATCH`), so a concurrent INSERT on a moving claim either
+//! commits before the batch reads its rows or is stamped after the move: no
+//! edge or fragment lands on the pre-move tuple behind the batch. That blocks
+//! every write to those tables on the instance while a batch runs.
+//!
 //! Every moved claim is `('group', TARGET)`; every recorded row ends exactly
 //! where the rule above puts it and no row became public; the per-table row
 //! census matches the plan (no other row of any table changed); and three
@@ -574,6 +581,7 @@ struct Known {
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
     specs: &'a [TableSpec],
+    /// Every table each batch locks (`batch_lock_tables`).
     unkeyed: &'a [String],
     nodes: &'a NodeTypes,
     source: Uuid,
@@ -618,6 +626,29 @@ async fn sealed_evidence_of(
     .await
     .context("reading evidence_encryption")?;
     Ok(v.into_iter().map(|u| u.to_string()).collect())
+}
+
+/// The tables every batch (apply and reverse) holds `SHARE ROW EXCLUSIVE` on
+/// for its duration: the derived tables with no key to claims
+/// (`tables::unkeyed_tables`), plus `edges` and `harvester_fragments`.
+///
+/// Why the last two: a concurrent INSERT of an edge (or fragment) on a moving
+/// claim is stamped by its trigger from the claim as that statement reads it,
+/// so one that read the claim before the batch's commit would land on the
+/// pre-move (source) tuple after the commit, outside every check. The lock
+/// makes such an INSERT either commit before the batch reads its rows (the
+/// batch then sees and moves it) or wait until the batch commits (its trigger,
+/// which reads the claim with a fresh snapshot, then sees the move). Cost: a
+/// batch, dry runs included, blocks every edge and fragment write on the
+/// instance while it runs; keep batches short.
+fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = unkeyed.to_vec();
+    for t in ["edges", "harvester_fragments"] {
+        if !out.iter().any(|u| u == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// Read every row the candidates carry and decide, per row, whether it
@@ -1373,7 +1404,7 @@ pub async fn run(
             t.name
         );
     }
-    let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
+    let unkeyed = batch_lock_tables(&tables::unkeyed_tables(conn, &specs).await?);
     let nodes = node_types(conn).await?;
     tables::probe_session_switch(conn).await?;
     let guard = super::hide::guard_status(conn).await?;
@@ -1431,13 +1462,12 @@ pub async fn run(
     for (id, h) in &held {
         writeln!(out, "HELD\t{id}\t{}\t{h}", h.code())?;
     }
-    if !unkeyed.is_empty() {
-        writeln!(
-            out,
-            "LOCKED-PER-BATCH\t{}\t(no key to claims: each batch holds SHARE ROW EXCLUSIVE on them)",
-            unkeyed.join(",")
-        )?;
-    }
+    writeln!(
+        out,
+        "LOCKED-PER-BATCH\t{}\t(each batch holds SHARE ROW EXCLUSIVE on them: no concurrent \
+         write to them on the instance while it runs)",
+        unkeyed.join(",")
+    )?;
     writeln!(
         out,
         "NODE-TYPES\t{}\t(edge endpoints with their own tenancy: the meet reads the node's own row)",
@@ -2294,10 +2324,11 @@ pub async fn reverse_manifest(
         res.claim_posts.len(),
         res.rows.len()
     )?;
+    let locks = batch_lock_tables(unkeyed);
     let nodes = node_types(conn).await?;
     let rc = RevCtx {
         specs,
-        unkeyed,
+        unkeyed: &locks,
         nodes: &nodes,
         res: &res,
         source,

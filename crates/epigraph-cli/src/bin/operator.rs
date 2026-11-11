@@ -847,7 +847,9 @@ enum Command {
         /// `--apply`.
         #[arg(long, default_value = "")]
         reason: String,
-        /// Claims per transaction.
+        /// Claims per transaction. Each batch holds `SHARE ROW EXCLUSIVE` on
+        /// `edges` and `harvester_fragments`, blocking every write to them on
+        /// the instance while it runs.
         #[arg(long, default_value_t = 200)]
         batch_size: usize,
         /// `lock_timeout` for each batch (a PostgreSQL interval).

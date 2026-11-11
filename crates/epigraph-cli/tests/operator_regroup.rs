@@ -1947,3 +1947,115 @@ async fn the_reversal_holds_an_edge_whose_evidence_endpoint_moved_since(pool: Pg
     assert_eq!(edge(&pool, e).await, post);
     assert!(reads_as(&pool, &[fx.src], "edges", &[e]).await.is_empty());
 }
+
+/// A concurrent edge INSERT on a moving claim, open (uncommitted) when the
+/// regroup starts: its trigger stamped the claim's SOURCE tuple. The batch
+/// waits for it (it locks `edges`), then sees the committed edge and moves
+/// it. Without the lock the batch would commit past the invisible row, which
+/// would then commit on the source tuple of a claim now in the target.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_concurrent_edge_insert_on_a_moving_claim_is_waited_for_and_moved(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, gains an edge").await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c]);
+    let mf = dir.join("m.jsonl");
+
+    let mut tx = pool.begin().await.expect("begin");
+    let late = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, 'claim', $3, 'claim', 'supports')",
+    )
+    .bind(late)
+    .bind(c)
+    .bind(fx.p)
+    .execute(&mut *tx)
+    .await
+    .expect("concurrent edge insert");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pid");
+
+    let url = fixture::database_url_for(&pool).await;
+    let (src, dst, op) = (
+        fx.src.to_string(),
+        fx.dst.to_string(),
+        fx.operator.to_string(),
+    );
+    let mut child = Command::new(BIN)
+        .args([
+            "regroup-claims",
+            "--claims-file",
+            ids.to_str().unwrap(),
+            "--source-group",
+            &src,
+            "--target-group",
+            &dst,
+            "--operator",
+            &op,
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+            "--confirm-count",
+            "1",
+            "--ruling",
+            RULING,
+            "--reason",
+            "test",
+            "--lock-timeout",
+            "60s",
+        ])
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, &url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn epigraph-operator");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let out = child.wait_with_output().expect("output");
+            panic!(
+                "the regroup finished ({status}) without waiting for the open edge insert\n\
+                 --- stdout\n{}\n--- stderr\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE $1 = ANY (pg_blocking_pids(pid)))",
+        )
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .expect("pg_blocking_pids");
+        if blocked {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the regroup never blocked on the open insert"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tx.commit().await.expect("commit the concurrent insert");
+    let out = child.wait_with_output().expect("output");
+    let run = Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    };
+    assert_eq!(run.code, 0, "{}", run.show());
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.dst));
+    assert_eq!(
+        edge(&pool, late).await,
+        (fx.dst, "group".to_string(), None),
+        "the edge committed during the batch was moved with its claim\n{}",
+        run.show()
+    );
+}
