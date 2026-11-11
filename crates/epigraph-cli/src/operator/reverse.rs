@@ -529,8 +529,8 @@ pub struct Report {
     /// an endpoint the manifest moved is not restored yet (held, or in a later
     /// batch); the batch that restores it restores the edge.
     pub edges_deferred: usize,
-    /// Restrict manifests: audit rows written (one per manifest reversed under
-    /// `--apply` that changed anything).
+    /// Restrict and regroup manifests: audit rows written (one per manifest
+    /// reversed under `--apply` that changed anything).
     pub restrict_audit_rows: usize,
 }
 
@@ -630,6 +630,7 @@ pub async fn run(
     for (p, m) in &ordered {
         if super::hide::is_hide_manifest(m)
             || super::restrict::is_restrict_manifest(m)
+            || super::regroup::is_regroup_manifest(m)
             || super::reown_workflows::is_reown_workflows_manifest(m)
         {
             resolved.push((p, None, m));
@@ -649,6 +650,25 @@ pub async fn run(
         // or refused whole (see `reown_workflows`'s module doc).
         if super::reown_workflows::is_reown_workflows_manifest(m) {
             if !super::reown_workflows::reverse_manifest(
+                conn,
+                path,
+                m,
+                &specs,
+                &unkeyed,
+                opts,
+                &mut report,
+                out,
+            )
+            .await?
+            {
+                break 'manifests;
+            }
+            continue;
+        }
+        // A regroup manifest (`regroup-claims --apply`) moves claims back to
+        // their source group; its own batches (see `regroup`'s module doc).
+        if super::regroup::is_regroup_manifest(m) {
+            if !super::regroup::reverse_manifest(
                 conn,
                 path,
                 m,
@@ -788,7 +808,7 @@ pub async fn run(
     if report.restrict_audit_rows > 0 {
         writeln!(
             out,
-            "  restrict manifests: {} audit row(s) written",
+            "  restrict/regroup manifests: {} audit row(s) written",
             report.restrict_audit_rows
         )?;
     }
