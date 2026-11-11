@@ -145,7 +145,7 @@ pub async fn get_cross_source_matches(
 
     let edge_rows = map_sqlx(
         epigraph_db::MatchCandidateRepo::corroborates_edges_for_claim_conn(
-            &mut *read, &viewer, claim_id,
+            &mut read, &viewer, claim_id,
         )
         .await,
     )?;
@@ -160,7 +160,7 @@ pub async fn get_cross_source_matches(
         .collect();
 
     let candidate_rows = map_sqlx(
-        epigraph_db::MatchCandidateRepo::list_for_claim_conn(&mut *read, &viewer, claim_id).await,
+        epigraph_db::MatchCandidateRepo::list_for_claim_conn(&mut read, &viewer, claim_id).await,
     )?;
     crate::routes::finish_scoped_read(read, "get_cross_source_matches").await?;
     let pending: Vec<PendingCandidate> = candidate_rows
@@ -273,7 +273,7 @@ pub async fn list_candidates(
     // `claims` join, and its excerpt by the content read.
     let mut read = crate::routes::open_scoped_read(&state, &viewer, "list_candidates").await?;
     let rows = map_sqlx(
-        epigraph_db::MatchCandidateRepo::list_conn(&mut *read, &viewer, status_ref, q.limit).await,
+        epigraph_db::MatchCandidateRepo::list_conn(&mut read, &viewer, status_ref, q.limit).await,
     )?;
 
     let mut claim_ids: Vec<Uuid> = Vec::with_capacity(rows.len() * 2);

@@ -990,7 +990,10 @@ async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPoo
     assert_eq!(log.len(), 2, "{log:?}");
     // Served, B's claim carries the same two id-bearing objects as the public
     // one above: the claim and its `authored_by.agent`.
-    assert_eq!(log[1].1, 2, "the served claim and its author are counted: {log:?}");
+    assert_eq!(
+        log[1].1, 2,
+        "the served claim and its author are counted: {log:?}"
+    );
     assert_eq!(log[1].2, vec![b_group], "the access is recorded for B");
 }
 

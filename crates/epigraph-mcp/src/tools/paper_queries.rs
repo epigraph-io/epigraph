@@ -234,17 +234,11 @@ pub async fn query_paper(
             .map_err(internal_error)?;
             let truncated = authors.len() > usize::try_from(MAX_INGEST_AUTHORS).unwrap_or(200);
             authors.truncate(usize::try_from(MAX_INGEST_AUTHORS).unwrap_or(200));
-            let count =
-                PaperRepository::count_asserted_claims_by(&mut *read, viewer, paper.id, by)
-                    .await
-                    .map_err(internal_error)?;
+            let count = PaperRepository::count_asserted_claims_by(&mut *read, viewer, paper.id, by)
+                .await
+                .map_err(internal_error)?;
             let rows = PaperRepository::list_asserted_claims_by(
-                &mut *read,
-                viewer,
-                paper.id,
-                by,
-                limit,
-                offset,
+                &mut *read, viewer, paper.id, by, limit, offset,
             )
             .await
             .map_err(internal_error)?;
