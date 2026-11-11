@@ -116,6 +116,22 @@ async fn edge_at(
     signer: Option<Uuid>,
     late: bool,
 ) -> Uuid {
+    edge_row(pool, src, tgt, rel, props, signer, late, false).await
+}
+
+/// [`edge_at`], RETRACTED when `retracted` (its `valid_to` written at insert,
+/// a millisecond after it: out of force by the time any run reads it).
+#[allow(clippy::too_many_arguments)]
+async fn edge_row(
+    pool: &PgPool,
+    src: (Uuid, &str),
+    tgt: (Uuid, &str),
+    rel: &str,
+    props: serde_json::Value,
+    signer: Option<Uuid>,
+    late: bool,
+    retracted: bool,
+) -> Uuid {
     let (sig, hash): (Option<Vec<u8>>, Option<Vec<u8>>) = match signer {
         Some(s) => (
             Some(s.as_bytes().iter().copied().cycle().take(64).collect()),
@@ -133,9 +149,10 @@ async fn edge_at(
     };
     sqlx::query_scalar(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
-                            properties, signature, signer_id, content_hash, created_at) \
+                            properties, signature, signer_id, content_hash, created_at, valid_to) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                 CASE WHEN $10 THEN now() + interval '1 hour' ELSE now() END) RETURNING id",
+                 CASE WHEN $10 THEN now() + interval '1 hour' ELSE now() END, \
+                 CASE WHEN $11 THEN now() + interval '1 millisecond' END) RETURNING id",
     )
     .bind(src.0)
     .bind(src.1)
@@ -147,6 +164,7 @@ async fn edge_at(
     .bind(signer)
     .bind(hash)
     .bind(late)
+    .bind(retracted)
     .fetch_one(pool)
     .await
     .unwrap_or_else(|e| panic!("seed {rel} edge: {e}"))
@@ -563,6 +581,19 @@ async fn apply(
     manifest: &std::path::Path,
     extra: &[&str],
 ) -> Run {
+    apply_as(pool, &fx.t, classify(fx), count, manifest, extra).await
+}
+
+/// `backfill-ingest-markers --apply` under cutoff `t` with the given
+/// classification flags.
+async fn apply_as(
+    pool: &PgPool,
+    t: &str,
+    classes: Vec<String>,
+    count: u64,
+    manifest: &std::path::Path,
+    extra: &[&str],
+) -> Run {
     let count = count.to_string();
     let mut args: Vec<String> = [
         "backfill-ingest-markers",
@@ -570,7 +601,7 @@ async fn apply(
         "--confirm-count",
         &count,
         "--written-before",
-        &fx.t,
+        t,
         "--manifest-out",
         manifest.to_str().unwrap(),
         "--ruling",
@@ -581,7 +612,7 @@ async fn apply(
     .iter()
     .map(|s| (*s).to_string())
     .collect();
-    args.extend(classify(fx));
+    args.extend(classes);
     args.extend(extra.iter().map(|s| (*s).to_string()));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     run_op(pool, &refs).await
@@ -1259,4 +1290,308 @@ async fn the_dry_run_works_before_the_marker_migrations_are_applied(pool: PgPool
     assert!(r.stderr.contains("migration 208"), "{}", r.show());
     assert_eq!(edge_snapshot(&pool).await, before, "nothing written");
     assert!(!m0.exists(), "no manifest for a refused run");
+}
+
+/// A second legacy fixture: the INPUTS of a paper's principal. A paper's
+/// principal is decided from the real signers of its legacy `authored` AND
+/// paper `asserts` edges, both under the run's cutoff; the creation proof
+/// reads both legs under it too.
+///
+/// * P5, ASSERTIONS-ONLY signer (principal S): H and R authored P5 unsigned;
+///   P5 asserts C7 signed by S, C8 and C14 unsigned; H asserts C7 and C8.
+///   LATE: N authored P5 signed by the second ingester S2 (after the cutoff,
+///   so P5 has no conflict).
+/// * P6, CONFLICT BETWEEN ASSERTIONS (legacy-ingest): J authored P6 unsigned,
+///   R authored P6 unsigned and RETRACTED; P6 asserts C9 signed by S and C10
+///   signed by S2, and C14 unsigned (written BEFORE P5's assertion of C14);
+///   J asserts C9.
+/// * P7, CONFLICT ACROSS KINDS (legacy-ingest): K authored P7 signed by S,
+///   P7 asserts C11 signed by S2; K asserts C11.
+/// * P8, PROVABLE (principal S): Q authored P8 signed by S, P8 asserts C12
+///   signed by S (C12 filed by S with S's extraction trace of P8); Q asserts
+///   C12. LATE: P8 asserts C13 signed by S, C13 shaped exactly like C12.
+/// * P9, ITS ONLY SIGNED AUTHORSHIP LATE (principal S): P9 asserts C15 signed
+///   by S (C15 filed by S with S's extraction trace of P9). LATE: U authored
+///   P9 signed by S. No legacy authorship of S's, so no creation record.
+/// * R asserts C14, closing chains through P6 (legacy-ingest, the OLDER paper
+///   assertion, but R's authorship of P6 is retracted) and P5 (S, in force).
+///
+/// All names and identifiers are invented.
+#[allow(dead_code)]
+struct Px {
+    s: Uuid,
+    s2: Uuid,
+    f: Uuid,
+    h: Uuid,
+    j: Uuid,
+    k: Uuid,
+    n: Uuid,
+    q: Uuid,
+    r: Uuid,
+    u: Uuid,
+    papers: [Uuid; 5],
+    claims: [Uuid; 9],
+    t: String,
+}
+
+impl Px {
+    /// S and S2 are the only signers of an `authored` or paper `asserts`
+    /// edge: both real ingesters.
+    fn classify(&self) -> Vec<String> {
+        vec![
+            "--ingest-signer".into(),
+            self.s.to_string(),
+            "--ingest-signer".into(),
+            self.s2.to_string(),
+        ]
+    }
+}
+
+async fn seed_principal_inputs(pool: &PgPool) -> Px {
+    let (s, _) = fixture::seed_agent_with_group(pool, "principal-ingester").await;
+    let (s2, _) = fixture::seed_agent_with_group(pool, "principal-ingester-two").await;
+    let (f, _) = fixture::seed_agent_with_group(pool, "principal-filer").await;
+    let mut au = Vec::new();
+    for n in ["h", "j", "k", "n", "q", "r", "u"] {
+        au.push(
+            fixture::seed_agent_with_group(pool, &format!("principal-author-{n}"))
+                .await
+                .0,
+        );
+    }
+    let (h, j, k, n, q, r, u) = (au[0], au[1], au[2], au[3], au[4], au[5], au[6]);
+    let p5 = paper(pool, "10.9999/principal-asserts-only", "Assertions Signed").await;
+    let p6 = paper(
+        pool,
+        "10.9999/principal-asserts-conflict",
+        "Assertions Disagree",
+    )
+    .await;
+    let p7 = paper(pool, "10.9999/principal-cross-conflict", "Kinds Disagree").await;
+    let p8 = paper(pool, "10.9999/principal-provable", "Provable Legacy").await;
+    let p9 = paper(pool, "10.9999/principal-late-author", "Author Came Late").await;
+    let c7 =
+        fixture::seed_public_claim(pool, f, "a finding only its assertion's signer vouches for")
+            .await;
+    let c8 = fixture::seed_public_claim(pool, f, "an unsigned finding of the same paper").await;
+    let c9 = fixture::seed_public_claim(pool, f, "a finding one ingester asserted").await;
+    let c10 = fixture::seed_public_claim(pool, f, "a finding another ingester asserted").await;
+    let c11 = fixture::seed_public_claim(pool, f, "a finding asserted across a split").await;
+    let c12 = fixture::seed_public_claim(pool, s, "a provable legacy finding").await;
+    let c13 = fixture::seed_public_claim(pool, s, "a finding asserted after the cutoff").await;
+    let c14 = fixture::seed_public_claim(pool, f, "a finding two papers state").await;
+    let c15 =
+        fixture::seed_public_claim(pool, s, "a finding whose signed authorship came late").await;
+    for c in [c12, c13] {
+        trace(
+            pool,
+            c,
+            "Extracted from 'Provable Legacy' (DOI: 10.9999/principal-provable); level 3 (atom)",
+        )
+        .await;
+    }
+    trace(
+        pool,
+        c15,
+        "Extracted from 'Author Came Late' (DOI: 10.9999/principal-late-author); level 3 (atom)",
+    )
+    .await;
+
+    let empty = || serde_json::json!({});
+    let pos = |n: i64| serde_json::json!({"position": n, "role": "author"});
+    let ag = |id: Uuid| (id, "agent");
+    let pa = |id: Uuid| (id, "paper");
+    let cl = |id: Uuid| (id, "claim");
+
+    // P6 first: its assertion of C14 is the OLDER of R's two chains, and it
+    // runs through R's retracted authorship.
+    edge(pool, ag(j), pa(p6), "authored", pos(0), None).await;
+    edge_row(pool, ag(r), pa(p6), "authored", pos(1), None, false, true).await;
+    edge(pool, pa(p6), cl(c9), "asserts", empty(), Some(s)).await;
+    edge(pool, pa(p6), cl(c10), "asserts", empty(), Some(s2)).await;
+    edge(pool, pa(p6), cl(c14), "asserts", empty(), None).await;
+    edge(pool, ag(j), cl(c9), "asserts", empty(), None).await;
+    // P5: its one real signer is on an assertion.
+    edge(pool, ag(h), pa(p5), "authored", pos(0), None).await;
+    edge(pool, ag(r), pa(p5), "authored", pos(1), None).await;
+    edge(pool, pa(p5), cl(c7), "asserts", empty(), Some(s)).await;
+    edge(pool, pa(p5), cl(c8), "asserts", empty(), None).await;
+    edge(pool, pa(p5), cl(c14), "asserts", empty(), None).await;
+    edge(pool, ag(h), cl(c7), "asserts", empty(), None).await;
+    edge(pool, ag(h), cl(c8), "asserts", empty(), None).await;
+    edge(pool, ag(r), cl(c14), "asserts", empty(), None).await;
+    // P7: S on the authorship, S2 on the assertion.
+    edge(pool, ag(k), pa(p7), "authored", pos(0), Some(s)).await;
+    edge(pool, pa(p7), cl(c11), "asserts", empty(), Some(s2)).await;
+    edge(pool, ag(k), cl(c11), "asserts", empty(), None).await;
+    // P8: provable.
+    edge(pool, ag(q), pa(p8), "authored", pos(0), Some(s)).await;
+    edge(pool, pa(p8), cl(c12), "asserts", empty(), Some(s)).await;
+    edge(pool, ag(q), cl(c12), "asserts", empty(), None).await;
+    // P9: a signed assertion, no legacy authorship.
+    edge(pool, pa(p9), cl(c15), "asserts", empty(), Some(s)).await;
+
+    let t: String = sqlx::query_scalar(
+        "SELECT to_char((max(created_at) + interval '1 millisecond') AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM edges",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("cutoff");
+    // Late: after the cutoff.
+    edge_at(pool, ag(n), pa(p5), "authored", pos(2), Some(s2), true).await;
+    edge_at(pool, pa(p8), cl(c13), "asserts", empty(), Some(s), true).await;
+    edge_at(pool, ag(u), pa(p9), "authored", pos(0), Some(s), true).await;
+
+    Px {
+        s,
+        s2,
+        f,
+        h,
+        j,
+        k,
+        n,
+        q,
+        r,
+        u,
+        papers: [p5, p6, p7, p8, p9],
+        claims: [c7, c8, c9, c10, c11, c12, c13, c14, c15],
+        t,
+    }
+}
+
+/// A paper's principal reads the signers of its paper `asserts` edges as
+/// well as its `authored` ones, and only edges written before the cutoff
+/// decide it or prove a creation. A paper whose only real signer is on an
+/// assertion takes that signer, and its authors' cards count its claims;
+/// two real signers on its assertions, or one on an authorship and another
+/// on an assertion, make it a CONFLICT read as the legacy ingest. A late
+/// second signer moves no principal; a late, provable-shaped assertion and a
+/// late signed authorship prove no creation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_papers_principal_reads_its_assertions_signers_under_the_cutoff(pool: PgPool) {
+    let px = seed_principal_inputs(&pool).await;
+    let [p5, p6, p7, p8, p9] = px.papers;
+    let [c7, c8, c9, c10, c11, c12, _c13, c14, c15] = px.claims;
+    let scoped = app_pool(&pool).await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "principal-reader").await;
+    let legacy = register_legacy(&pool).await;
+
+    let mut args = vec![
+        "backfill-ingest-markers".to_string(),
+        "--written-before".into(),
+        px.t.clone(),
+    ];
+    args.extend(px.classify());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let dry = run_op(&pool, &refs).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    let mut both = [px.s, px.s2];
+    both.sort();
+    for want in [
+        "KIND\tagent-authored-paper\tcandidates=6".to_string(),
+        "KIND\tpaper-asserts-claim\tcandidates=9".to_string(),
+        "KIND\tagent-asserts-claim\tcandidates=6".to_string(),
+        "PAPERS\tpapers=5\tby_one_ingest_signer=3\tlegacy_ingest_no_real_signer=0\t\
+         legacy_ingest_conflicting_signers=2"
+            .to_string(),
+        format!("PAPER-PRINCIPAL\t{}\tpapers=3", px.s),
+        format!("CONFLICT\tpaper={p6}\tsigners={},{}", both[0], both[1]),
+        format!("CONFLICT\tpaper={p7}\tsigners={},{}", both[0], both[1]),
+        "CHAINS\tchains=7\tchains_on_another_principal=1\tagent_asserts_multi_principal=1"
+            .to_string(),
+        "CREATION-RECORDS\tprovable=1".to_string(),
+        "NON-CREATION-RECORDS\tplanned=8".to_string(),
+        "TOTAL\tedges_to_stamp=21".to_string(),
+    ] {
+        assert!(
+            dry.stdout.contains(&want),
+            "missing {want:?}: {}",
+            dry.show()
+        );
+    }
+    assert!(
+        !dry.stdout.contains(&format!("CONFLICT\tpaper={p5}")),
+        "a late second signer is no conflict: {}",
+        dry.show()
+    );
+    assert!(!dry.stdout.contains("UNCLASSIFIED"), "{}", dry.show());
+
+    let manifest = scratch("principal-inputs.jsonl");
+    let applied = apply_as(
+        &pool,
+        &px.t,
+        px.classify(),
+        21,
+        &manifest,
+        &["--batch-size", "4"],
+    )
+    .await;
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    for want in [
+        "CREATION-RECORDS-WRITTEN\t1",
+        "NON-CREATION-RECORDS-WRITTEN\t8",
+    ] {
+        assert!(applied.stdout.contains(want), "{want}: {}", applied.show());
+    }
+
+    let sorted = |mut v: Vec<Uuid>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        listing(&pool, &scoped, p5, px.s).await,
+        (vec![px.s], sorted(vec![px.h, px.r]), 3),
+        "a paper whose one real signer is on an assertion is that signer's ingest"
+    );
+    assert_eq!(
+        listing(&pool, &scoped, p6, legacy).await,
+        (vec![legacy], vec![px.j], 3),
+        "two real signers on a paper's assertions: the legacy ingest"
+    );
+    assert_eq!(
+        listing(&pool, &scoped, p7, legacy).await,
+        (vec![legacy], vec![px.k], 1),
+        "one real signer on an authorship, another on an assertion: the legacy ingest"
+    );
+    assert_eq!(
+        listing(&pool, &scoped, p8, px.s).await,
+        (vec![px.s], vec![px.q], 1),
+        "a late assertion is not stamped"
+    );
+    assert_eq!(
+        listing(&pool, &scoped, p9, px.s).await,
+        (vec![px.s], vec![], 1),
+        "a late authorship is not stamped"
+    );
+    for (who, want, why) in [
+        (px.h, (1, 0, 2), "H: P5 and C7+C8, all S's"),
+        (px.j, (1, 0, 1), "J: P6 and C9, legacy-ingest"),
+        (px.k, (1, 0, 1), "K: P7 and C11, legacy-ingest"),
+        (px.q, (1, 0, 1), "Q: P8 and C12, S's"),
+        (px.n, (0, 0, 0), "N: a late authorship is not stamped"),
+        (px.u, (0, 0, 0), "U: a late authorship is not stamped"),
+    ] {
+        assert_eq!(counts(&pool, &scoped, reader, who).await, want, "{why}");
+    }
+
+    let (by_paper, by_claim) = ingest_facts(&pool, &scoped, &px.papers, &px.claims).await;
+    let want: BTreeSet<IngestFact> = [
+        (p5, px.s, c7, false),
+        (p5, px.s, c8, false),
+        (p5, px.s, c14, false),
+        (p6, legacy, c9, false),
+        (p6, legacy, c10, false),
+        (p6, legacy, c14, false),
+        (p7, legacy, c11, false),
+        (p8, px.s, c12, true),
+        (p9, px.s, c15, false),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(by_paper, want, "query_paper's per-ingest listing");
+    assert_eq!(
+        by_claim, by_paper,
+        "get_claim's ingesters disagree with query_paper"
+    );
 }
