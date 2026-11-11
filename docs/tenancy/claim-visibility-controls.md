@@ -55,11 +55,32 @@ Added to:
 * MCP `submit_claim`, `memorize`, and `batch_submit_claims`. For the batch it is per entry:
   `tests/batch_submit_claims_parity.rs` requires an entry to accept every `submit_claim` field.
 * MCP `ingest_document`, `ingest_document_inline` and `ingest_document_spine`. The setting applies
-  to every claim the ingest creates. Claims it converges onto keep their own tenancy.
+  to every claim the ingest creates, with their evidence, traces and `asserts` edges. Claims it
+  converges onto keep their own tenancy.
+
+  **An ingest's visibility scopes its CLAIMS only.** The rest of what an ingest writes stays
+  world-readable whatever `visibility` says, because it has no row security:
+
+  * the `papers` row: title, DOI (or synthesized document key) and journal. `papers` has no
+    row-level security in any migration (127: "papers and workflows carry no tenancy"), and
+    `ensure_paper_node` writes it on the pool before the walk, with no `VisibilityChoice`;
+  * the author agents (`agents` rows named after the paper's authors) and their `authored`
+    edges to the paper;
+  * the paper's `processed_by` edge, which is what `check_already_ingested` reports.
+
+  The two edges have a paper or agent endpoint, so 120's `epigraph_edges_tenancy` keeps them
+  `('public', world)`. So for a `team` or `private` ingest, the claims are scoped, but anyone
+  can learn that the document exists, its title and DOI, who wrote it, and that it was
+  ingested. **Do not ingest a confidential document until a follow-up adds tenancy to these
+  rows** (operator ruling, 2026-11-11). The follow-up's design is
+  [papers-tenancy-followup.md](papers-tenancy-followup.md).
 * The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting
   agent (the `--agent-key` signer). Omitted, it is D-V1 like every other surface, so an operator
-  ingest lands in that agent's team, else private, and never public unless `--visibility public`
-  says so (operator ruling, 2026-11-10: papers go to the ingester's team, not public).
+  ingest's claims land in that agent's team, else private, and are never public unless
+  `--visibility public` says so (operator ruling, 2026-11-10: papers go to the ingester's team,
+  not public). As above, that covers the claims, not the paper's own record. The CLI prints
+  where the claims landed on stderr: the visibility, the owner group and, when the default fell
+  back to private, D-V1's note.
   `do_ingest_document` / `do_ingest_document_spine`, the core the tools and the CLI share, take the
   choice as a required argument and have no defaulted wrapper. A test harness that needs a public
   paper passes `VisibilityChoice::Public` explicitly.
@@ -74,7 +95,9 @@ Added to:
 `submit_claim`, `memorize`, the batch entries, `POST /submit` and `POST /claims` responses gain
 `visibility` (`team` / `private` / `public`), `owner_group_id`, and `visibility_note`. The note is
 set when a default was resolved in a way the caller should know about (D-V1), or when an existing
-claim was returned (D-V4). Ingest responses are unchanged.
+claim was returned (D-V4). Ingest responses are unchanged. The operator `ingest-document` CLI,
+the one synchronous ingest caller, prints the resolved visibility, owner group and note on stderr
+instead (`do_ingest_document_reporting`).
 
 ### 3.2 Resolution (one function, every surface)
 
@@ -92,8 +115,11 @@ unstamped connection. The document ingest calls it directly, because its `owner_
 * `Team(Some(g))` → `g` must be one of `epigraph_writable_teams(author)`. Then the result is
   `TenancyDecl::group(g)`. Otherwise the call is refused (`Authority`) with nothing written. The
   refusal says a reader membership does not admit writes, and does not say whether `g` exists.
-* `Team(None)` / `Default` → D-V1. An explicit `Team(None)` that finds no single team is refused
-  (`Input`), because the caller asked for a team. `Default` falls back to private, with a note.
+* `Team(None)` / `Default` → D-V1. The agent's own default team if it is still writable, else its
+  live human's default team under the same condition (each checked on its own:
+  `default_group_of`, then `human_default_group_of`), else the single writable team. An explicit
+  `Team(None)` that finds no single team is refused (`Input`), because the caller asked for a
+  team. `Default` falls back to private, with a note.
 
 Resolution runs **before** the author-stamped transaction opens. When the author writes the team
 only through its human (`via = 'operator'`, D-V3), the result carries a `TeamWriteGrant`. Only
@@ -162,12 +188,17 @@ team-or-private, where it used to write public:
   team/private too.
 * **The operator `ingest-document` CLI** now defaults to team/private for its acting agent, the
   `--agent-key` signer. Run with no `--agent-key`, that is the deterministic ingest-cli agent,
-  which belongs to no team, so its papers land private in that agent's own personal group,
-  readable by no team member. To put a paper in a team, run it with the key of an agent that
-  writes the team (its own membership, its human's, or its default team), or pass
-  `--visibility team --group-id <team>` for a team that agent writes. A human's default team
-  reaches CLI ingests only through an agent linked to that human. A paper that must be public
-  takes `--visibility public`.
+  which belongs to no team, so its papers' claims land private in that agent's own personal
+  group, readable by no team member. The CLI says so on stderr (`... written PRIVATE (owner
+  group <id>) ...` with D-V1's note), so an operator is not left to assume a team. To put a
+  paper's claims in a team, run it with the key of an agent that writes the team (its own
+  membership, its human's, or its default team), or pass `--visibility team --group-id <team>`
+  for a team that agent writes. A human's default team reaches CLI ingests only through an
+  agent linked to that human. A paper that must be public takes `--visibility public`.
+  Whatever the flags, the paper's own record (title, DOI, journal), its author agents and its
+  `processed_by` stamp stay world-readable (section 3.1); a confidential document should not
+  be ingested until the follow-up in [papers-tenancy-followup.md](papers-tenancy-followup.md)
+  lands.
 * **`create_claim_core`'s structural edges** (AUTHORED, HAS_TRACE, DERIVED_FROM) used to be
   written after the commit on the unstamped pool, best-effort. A group-visible claim is
   invisible there, so the edge's reference check refused them silently. For a group-visible
@@ -369,7 +400,8 @@ now measures the stamped structural edges), and the explicit-`public` fixtures.
 
 * **D-V1 default team.** If `agents.default_group_id` is set and still a team the author may
   write, it is used. Otherwise the author's own human's `default_group_id` is used under the
-  same condition. Otherwise the single team the author may write. Otherwise the write is
+  same condition, checked on its own, so a stale default of the agent's never hides a valid one
+  of its human's. Otherwise the single team the author may write. Otherwise the write is
   **private**, and the response carries a `visibility_note` saying why: no team, or several and
   no default. A default write **never** falls back to public. `default_group_id` (062) was
   unused. Migration 206 adds `epigraph_set_default_group`, served as MCP `set_default_group`
