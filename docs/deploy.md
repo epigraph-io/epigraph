@@ -2433,18 +2433,39 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 ```
 
 - **Who**: `--operator` must be a registered human operator and a live admin
-  of both groups. The target must be an active `team` or `community` group;
-  neither group may be the world or seed group, and they must differ.
+  of both groups. The target must be an active `team` or `community` group,
+  or the operator's OWN personal group (the group carrying
+  `did:epigraph:personal:<operator>`, created by the operator). Another
+  person's personal group is refused, and so is the personal group of an
+  agent the operator operates, even when the operator administers it: that
+  group is the agent's, and the ownership model moves an operated agent's
+  claims out of it (`reown-linked`), never into it. The source is held to
+  the same rule: an active `team` or `community` group, or the operator's own
+  personal group. Another person's personal group and an operated agent's
+  are refused as `--source-group` even when the operator administers them,
+  so their claims never leave them through this verb, into the operator's own
+  group or into a team (`reown-workflows`' private move applies the same
+  rule). Neither group may be the world or seed group, and they must differ.
 - **Eligible**: a claim that is `('group', <source>)` and not sealed. A claim
   already `('group', <target>)` counts as done, so a re-run resumes. A public
-  claim (`public-claim`) and another group's claim (`not-in-source`) are held.
+  claim (`public-claim`) and another group's claim (`not-in-source`) are held,
+  and so is a sealed claim (`sealed`): one with a `claim_encryption` row, or
+  with a `claim_version_encryption` row on one of its versions (the version
+  row would follow the claim away from the group that keys it). The `HELD`
+  line names the table.
 - **Held whole, never partly moved**: a claim carrying a public row
   (`public-row`), a row owned by a third group (`third-group`), sealed
   evidence (`sealed-evidence`: an `evidence_encryption` row, whose ciphertext
-  is keyed to the group that sealed it), pinned evidence (`pinned`), or an
-  edge whose new meet would drop a group its current tuple requires
-  (`edge-would-widen`). The plan applies these checks too, so its eligible
-  count is the number `--confirm-count` repeats.
+  is keyed to the group that sealed it), a sealed edge the move would
+  re-tuple (`sealed-edge`: an `edge_encryption` row; the line names the edge
+  and its key group), pinned evidence (`pinned`), or an edge whose new meet
+  would drop a group its current tuple requires (`edge-would-widen`). The
+  plan applies these checks too, so its eligible count is the number
+  `--confirm-count` repeats. Ciphertext is never re-keyed by a move, and it
+  never leaves the group it is keyed to, whether the target is a team or the
+  operator's personal group. Each batch repeats the checks under its locks,
+  with its claims, their evidence and their edges taken `FOR UPDATE` before
+  it reads the seal tables, so a seal that lands after the dry run holds too.
 - **Edges** take the EXACT meet of their endpoints: the INSERT rule applied
   to what each endpoint is.
   - An edge whose other end is a claim or evidence that stays in the source
@@ -2489,10 +2510,13 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 - **Exit**: `--apply` exits 3 when any listed claim was held or the moved
   count differs from `--confirm-count`.
 - **Reverse** is a compare-and-swap per claim. A claim something moved since,
-  a row written after the act, a neighbour that moved since, evidence sealed
-  since, or an edge whose recorded tuple would be wider than the exact meet of
-  its endpoints after the restore (an endpoint the neighbour watch does not
-  cover moved: another claim's evidence, a node) holds the claim (exit 3). An
+  a row written after the act, a neighbour that moved since, a claim, claim
+  version or evidence row sealed since, a sealed edge the reversal would
+  change (the run held every sealed edge it would have re-tupled, so such an
+  edge was sealed after it), or an edge whose recorded tuple would be wider
+  than the exact meet of its endpoints after the restore (an endpoint the
+  neighbour watch does not cover moved: another claim's evidence, a node)
+  holds the claim (exit 3). An
   edge stays on the meet of its current endpoints until every endpoint the
   manifest moved is back, then takes its recorded tuple. An edge to a
   group-private node that is not in the source (one in the target or one of
@@ -2515,6 +2539,128 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   a target-group or third-group workflow, or another node, to it). A count
   above zero is a reason to stop unless the decision accepts those claims as
   not reversible.
+
+### `epigraph-operator reown-workflows --from-visibility group` — move group-private lineages to another group (no migration)
+
+`reown-workflows` moves public lineages (`('public', <source>)`) into a team,
+or narrows them in place. With `--from-visibility group` it instead moves
+lineages that are ALREADY group-private, `('group', <source>)`, whole to
+`('group', <target>)`: every generation, the plan claims they execute (and
+their step lineages), every row those carry, and the plan edges. Nothing
+becomes public. It needs a SUPERUSER DSN, like `regroup-claims`. Module doc:
+`crates/epigraph-cli/src/operator/reown_workflows.rs` ("A private move").
+
+```bash
+# dry run: plan, held lineages, LEFT-CLAIM / SHARED-SPLIT / CO-OWNED-EDGE lines,
+# ELIGIBLE-WORKFLOW-ROWS
+epigraph-operator reown-workflows --canonical-names-file lineages.txt \
+    --from-group <source group> --target-group <target group> --operator <person> \
+    --from-visibility group --visibility group --manifest-out private-move-1.jsonl
+# apply: repeat ELIGIBLE-WORKFLOW-ROWS back
+epigraph-operator reown-workflows ... --manifest-out private-move-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>"
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
+```
+
+- **Who**: the source is `--from-group` or, without it, the operator's
+  personal group. The rows are private, so the source is held to the same
+  rule as the target: an active `team` or `community` group the operator is a
+  live admin of, or the OWN personal group of an operator who is a registered
+  human operator. Another person's personal group and an operated agent's are
+  refused as `--from-group` even when the operator administers them, and an
+  operated agent passed as `--operator` cannot move its own group's rows. The target must be another group that
+  passes the same rule (the one `regroup-claims` applies). `--visibility
+  group` is required and `--catch-up` is refused.
+- **Public input is refused**: a public generation holds its lineage
+  (`PublicInput`). An unshared public plan claim, or a public row a moving
+  claim carries, holds its lineage as a hand-off, and an `--apply` then exits
+  3: moving the rest would split the plan. Narrow such a plan in place first
+  (the public act, `--visibility group` with the target equal to the source).
+- **Left where it is, reported**: a plan claim shared with a lineage the list
+  omits (`LEFT-CLAIM ... SHARED`, and `SHARED-SPLIT` when that lineage is the
+  source's private one: list both in one run), or owned by another group.
+  An edge from a moved row to one that stays in its group becomes co-owned by
+  both groups, readable only by a member of both (`CO-OWNED-EDGE`).
+- **Held whole**: a private row a third group owns, an edge whose new tuple
+  would drop a group its current one requires, an edge to a group-private
+  frame, context, perspective, community or reasoning trace that does not move
+  (the edges trigger counts such a node as public, so the edge would go to the
+  target naming a node the target cannot read), and a SEALED row: a plan claim
+  with a `claim_encryption` row or a sealed version
+  (`claim_version_encryption`), evidence of one with an `evidence_encryption`
+  row, or a moving edge with an `edge_encryption` row. A move does not re-key
+  ciphertext, and ciphertext never leaves the group it is keyed to, so the
+  `HELD-LINEAGE` line reads `<claim|evidence|edge> <id> is sealed (<table>,
+  keyed to group <group>)` and an `--apply` exits 3. Each batch re-plans under
+  its locks, so a seal that lands after the dry run holds too.
+- **Invariants per batch**: the public act's (every row's end state, the row
+  census, the unstamped view, the atlas epoch), plus what a session reading
+  ONLY the source and one reading ONLY the target read among the batch's rows,
+  before and after, each against the tenancy model.
+- **Reverse**: as for the public act (all of a manifest or nothing; refused
+  when the plan changed or grew since, or when a moved claim, claim version,
+  evidence row or edge was sealed since: ciphertext keyed to the target never
+  goes back to the source).
+
+#### Moving a pinned (scheduled) pipeline
+
+A client that runs pinned workflows reads each generation's plan through
+`GET /api/v1/workflows/:id/plan` with its OWN reader principal's token. The
+read is viewer-scoped: it answers 404 when that principal can see none of the
+generation's `executes` edges, and `hidden_count` counts every plan claim it
+cannot read. After the move every row of the plan is owned by the target
+group, so that reader principal needs a live membership of the TARGET group;
+its membership of the source no longer reads anything of the plan. A client
+that also checks each plan item's owner group against the group its pin
+records refuses the plan from the moment the move commits until its pins
+record the target. A non-member principal the client uses to prove that
+outsiders see nothing must NOT be a member of the target.
+
+Operator ruling, 2026-11-12: the pinned procurement pipeline moves, private,
+from the team group that runs it to the consultancy team group. In the steps
+below `<source>` is the team group that holds the pipeline now and `<target>`
+is the consultancy team group. The operator must be a live admin of both, and
+both must be active `team` or `community` groups (see **Who** above).
+
+0. Build the lineage list from what the client has pinned, not from memory:
+   every pinned root and every child generation a root names. A root that
+   names its children only in its own content (no `executes` or `variant_of`
+   edge between them) does not join them in the plan, so a child missing
+   from the list stays in the source and the root's check refuses it at the
+   next fire. If the client binds ONE owner group per schedule owner, every
+   pinned lineage of that owner must be in this one act: re-pointing the
+   owner's group breaks any of its pins left behind. `--confirm-count` is
+   the dry run's `ELIGIBLE-WORKFLOW-ROWS` (generations, not lineages).
+1. Before the move, add the reader principal's agent to the target group
+   (`epigraph-operator group-member add --group <target> --agent <reader agent>
+   --role <role per operator ruling> --reason "<why>" --apply`). The role is
+   the operator's ruling, not this runbook's: the target group's membership
+   policy may admit new members as writers only, and an operated agent is a
+   member only where its operator writes. Check the non-member principal is not in the
+   target (`epigraph-operator group-roster --group <target>`). If the client
+   publishes new generations, its publishing agent needs a writer membership
+   of the target too.
+2. Dry run the move (`--from-group <source> --target-group <target>
+   --from-visibility group --visibility group`). Stop on any `HELD-LINEAGE`,
+   `LEFT-CLAIM` or `SHARED-SPLIT` line for the pipeline's lineages, and on a
+   sealed hold in particular (a `HELD-LINEAGE` line reading `... is sealed
+   (claim_encryption | claim_version_encryption | evidence_encryption |
+   edge_encryption, keyed to group <source>)`): a claim left in the source
+   keeps the source as its owner, so an owner-group check refuses the plan,
+   and the reader would still need the source; a sealed row's lineage cannot
+   move with this tool (it does not re-key ciphertext) and needs its own
+   ruling.
+3. Pause the client's pinned schedules for these lineages (or pick a window
+   with no fire), then apply with the dry run's count.
+4. Verify a plan fetch AS the reader principal for each pinned generation:
+   200, `hidden_count` 0, every item's `owner_group_id` the target and
+   `visibility` `group`. The same fetch as the non-member principal: 404.
+5. Change the pins' recorded owner group to the target in the client's
+   configuration, have the client verify the pins live, install them, and
+   resume the schedules.
+6. Undo: `reown-reverse` the manifest, then restore the pins' previous owner
+   group.
 
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's

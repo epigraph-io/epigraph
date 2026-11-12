@@ -16,8 +16,10 @@
 //! `('group', TARGET)` counts as done, so a re-run resumes. Every other listed
 //! claim is HELD with its reason: a public claim (`public-claim`: regroup never
 //! touches public input; that is `restrict-claims`' job), a claim of another
-//! group (`not-in-source`), a sealed claim (`sealed`: its ciphertext is the
-//! source group's).
+//! group (`not-in-source`), a sealed claim (`sealed`: a `claim_encryption`
+//! row, or a `claim_version_encryption` row on one of its versions, whose
+//! version row would follow the claim; the ciphertext is keyed to the group
+//! that sealed it).
 //!
 //! A claim is also HELD, WHOLE, when a row it carries would not follow it
 //! cleanly, so a claim is never moved partially:
@@ -29,6 +31,10 @@
 //! * `sealed-evidence`: evidence with an `evidence_encryption` row. Its
 //!   ciphertext is keyed to the group that sealed it; moved, the row would sit
 //!   in the target where no target member can decrypt it.
+//! * `sealed-edge`: an edge with an `edge_encryption` row whose tuple the
+//!   move would change. Its ciphertext is keyed to the group that sealed it;
+//!   re-tupled, that group could lose the row while the row's new readers
+//!   cannot decrypt it.
 //! * `pinned`: pinned evidence (migration 110). The cascade never changes its
 //!   owner, so it would stay in the source while its claim moved.
 //! * `edge-would-widen`: an edge whose new meet would drop a group its current
@@ -37,7 +43,10 @@
 //!
 //! The pre-pass runs the same row checks, read-only, so the plan's eligible
 //! count (the number `--confirm-count` repeats back) already excludes them;
-//! each batch repeats them under its locks.
+//! each batch repeats them under its locks. A batch takes its claims, their
+//! evidence and their edges `FOR UPDATE` before it reads the seal tables, so
+//! a seal (whose foreign key onto the row would wait for the lock) either
+//! committed before the read or lands after the batch commits.
 //!
 //! # What follows the claim
 //!
@@ -120,8 +129,15 @@
 //!
 //! On the maintenance DSN (as every verb), with `--operator` a REGISTERED
 //! human operator (`epigraph_is_human_operator`) who is a live admin of BOTH
-//! groups. The target must be an active `team` or `community` group; neither
-//! group may be the world or seed group; source and target differ. There is no
+//! groups. The target must be an active `team` or `community` group, or the
+//! operator's OWN personal group (the one carrying the operator's personal
+//! did_key, created by the operator; never another person's, nor an operated
+//! agent's: see [`check_private_target`]). The SOURCE is held to the same
+//! rule ([`check_private_source`]): an active `team` or `community` group, or
+//! the operator's own personal group; another person's personal group and an
+//! operated agent's never give up their claims, whoever administers them.
+//! Neither group may be the world or seed group; source and target differ.
+//! There is no
 //! other operator identity: `restrict-claims` authorizes by the target's
 //! admin, and this verb adds the source's admin and the human registry.
 //!
@@ -137,7 +153,9 @@
 //! the state this run left it; a recorded row that is in neither its prior nor
 //! its post state (nor the meet a partial reversal leaves an edge on), a row
 //! written after the act (the cascade would carry it into the source), a
-//! neighbour that moved since, evidence sealed since, or an edge whose
+//! neighbour that moved since, a claim, claim version, evidence row or edge
+//! sealed since (an edge only when the reversal would change its tuple; the
+//! run held every sealed edge it would have re-tupled), or an edge whose
 //! recorded tuple would be WIDER than the exact meet of its endpoints after
 //! the restore (an endpoint the neighbour watch does not cover moved: a
 //! foreign claim's evidence, a node), HOLDS the claim. An edge is put back on
@@ -155,9 +173,8 @@ use super::manifest::{self, Record, Sink, Writer};
 use super::reown::{counter_delta, counter_violations, BatchError};
 use super::restrict::{
     claim_record, edge_ends, edge_ids, evidence_ids, fetch_evidence_edges, is_outsider_challenge,
-    meet, narrows, operator_details, pinned_of, reader_groups, record_of, sealed_of, sha256_file,
-    sha256_hex, spec_of, states_of, unenforced_reasons, write_audit, write_rows, EdgeEnds,
-    RowState,
+    meet, narrows, operator_details, pinned_of, reader_groups, record_of, sha256_file, sha256_hex,
+    spec_of, states_of, unenforced_reasons, write_audit, write_rows, EdgeEnds, RowState,
 };
 use super::tables::{
     self, app_readable, app_readable_as, fetch_attached, fetch_claims, xact_counters, Attached,
@@ -245,9 +262,19 @@ pub enum Hold {
         owner: Uuid,
         visibility: String,
     },
-    Sealed,
+    /// The claim is sealed: `seal` is `claim_encryption` (the claim itself)
+    /// or `claim_version_encryption` (one of its versions).
+    Sealed {
+        seal: &'static str,
+    },
     SealedEvidence {
         id: String,
+    },
+    /// An edge with an `edge_encryption` row whose tuple the move would
+    /// change, keyed to `group`.
+    SealedEdge {
+        id: String,
+        group: Uuid,
     },
     PublicRow {
         table: String,
@@ -281,8 +308,9 @@ impl Hold {
             Self::NotFound => "not-found",
             Self::PublicClaim { .. } => "public-claim",
             Self::NotInSource { .. } => "not-in-source",
-            Self::Sealed => "sealed",
+            Self::Sealed { .. } => "sealed",
             Self::SealedEvidence { .. } => "sealed-evidence",
+            Self::SealedEdge { .. } => "sealed-edge",
             Self::PublicRow { .. } => "public-row",
             Self::ThirdGroup { .. } => "third-group",
             Self::Pinned { .. } => "pinned",
@@ -305,14 +333,20 @@ impl fmt::Display for Hold {
                 f,
                 "the claim is ({owner}, {visibility}), not ('group', source)"
             ),
-            Self::Sealed => write!(
+            Self::Sealed { seal } => write!(
                 f,
-                "the claim is sealed (claim_encryption): its ciphertext is the source group's"
+                "the claim is sealed ({seal}): its ciphertext is keyed to the group that sealed \
+                 it, so the row would move where no target member can decrypt it"
             ),
             Self::SealedEvidence { id } => write!(
                 f,
                 "evidence {id} is sealed (evidence_encryption): its ciphertext is keyed to the \
                  source group, so the row would move where no target member can decrypt it"
+            ),
+            Self::SealedEdge { id, group } => write!(
+                f,
+                "edge {id} is sealed (edge_encryption, keyed to group {group}): the move would \
+                 change its tuple, and its ciphertext never leaves the group that holds its key"
             ),
             Self::PublicRow { table, id, state } => write!(
                 f,
@@ -650,13 +684,134 @@ fn node_end<'e>(nodes: &NodeTypes, e: &'e EdgeEnds) -> Option<(&'e Pair, &'e Pai
     }
 }
 
+/// The operator's OWN personal group, when the operator is a registered human
+/// operator ([`super::operator_group`]'s test: the group carrying
+/// `did:epigraph:personal:<operator>` and created by the operator); `None`
+/// otherwise. The one personal group a group-to-group move may name, as its
+/// target here or as a private workflow move's source.
+///
+/// # Errors
+/// The registry read fails.
+pub async fn own_personal_group(
+    conn: &mut PgConnection,
+    operator: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
+    let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await
+        .context("reading the human-operator registry")?;
+    Ok(if human {
+        super::operator_group(conn, operator).await.ok()
+    } else {
+        None
+    })
+}
+
+/// The SOURCE of a group-to-group move of private rows (`regroup-claims`, a
+/// private `reown-workflows` move), checked: an ACTIVE `team` or `community`
+/// group, or the operator's own personal group ([`own_personal_group`]: the
+/// operator a registered human). The caller checks that the operator is a
+/// live admin of it and that it is not the world or seed group; `flag` names
+/// the option the source came from, for the refusal.
+///
+/// Another person's personal group and an operated agent's are refused
+/// whoever administers them: their private rows never leave them through
+/// this verb, into the operator's own group or into a team.
+///
+/// # Errors
+/// The group is missing, not active, of another kind, or a personal group
+/// that is not the operator's own.
+pub async fn check_private_source(
+    conn: &mut PgConnection,
+    source: Uuid,
+    operator: Uuid,
+    flag: &str,
+) -> anyhow::Result<()> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT kind::text, status::text FROM groups WHERE id = $1")
+            .bind(source)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((kind, status)) = row else {
+        bail!("{flag} {source}: no such group; refusing");
+    };
+    if status != "active" {
+        bail!("{flag} {source} has status {status:?}, not active; refusing");
+    }
+    match kind.as_str() {
+        "team" | "community" => Ok(()),
+        "personal" => {
+            if own_personal_group(conn, operator).await? != Some(source) {
+                bail!(
+                    "{flag} {source} is a personal group that is not the operator's own \
+                     personal group (did:epigraph:personal:{operator}, created by the operator, \
+                     a registered human operator); refusing: a group-to-group move takes \
+                     private rows only out of a team or community group the operator \
+                     administers, or out of the operator's own personal group, never out of \
+                     another person's or an operated agent's"
+                );
+            }
+            Ok(())
+        }
+        other => bail!(
+            "{flag} {source} is kind {other}, not a team or community group nor the operator's \
+             own personal group; refusing"
+        ),
+    }
+}
+
+/// The target of a group-to-group move, checked: an active group the
+/// operator is a live admin of ([`super::restrict::check_target`], which also
+/// refuses the world and seed groups), of kind `team` or `community`, or the
+/// operator's OWN personal group. Returns its kind.
+///
+/// "Own" is [`super::operator_group`]'s test: the group carrying
+/// `did:epigraph:personal:<operator>` and created by the operator, and the
+/// operator is a registered human operator. Every other personal group is
+/// refused whoever administers it: another person's, and an OPERATED agent's
+/// (its own writes land there and it administers it; the ownership model
+/// moves an operated agent's claims out of it into the operator's group,
+/// `reown-linked`, never into it).
+///
+/// # Errors
+/// The target is missing, world or seed, not active, not administered by the
+/// operator, of another kind, or a personal group that is not the operator's
+/// own.
+pub async fn check_private_target(
+    conn: &mut PgConnection,
+    target: Uuid,
+    operator: Uuid,
+) -> anyhow::Result<String> {
+    let kind = super::restrict::check_target(conn, target, operator).await?;
+    match kind.as_str() {
+        "team" | "community" => Ok(kind),
+        "personal" => {
+            if own_personal_group(conn, operator).await? != Some(target) {
+                bail!(
+                    "--target-group {target} is a personal group that is not the operator's own \
+                     personal group (did:epigraph:personal:{operator}, created by the operator, \
+                     a registered human operator); refusing: claims move into a team or \
+                     community group, or into the operator's own personal group only"
+                );
+            }
+            Ok(kind)
+        }
+        other => bail!(
+            "--target-group {target} is kind {other}, not a team or community group nor the \
+             operator's own personal group; refusing"
+        ),
+    }
+}
+
 /// The source and target groups and the operator, checked. Returns the
 /// target's kind.
 ///
 /// # Errors
-/// Either group is missing, world or seed; the target is not an active team
-/// or community group; the operator is not a registered human operator or not
-/// a live admin of both groups.
+/// Either group is missing, world or seed; the source is not one
+/// [`check_private_source`] accepts, nor the target one
+/// [`check_private_target`] accepts; the operator is not a registered human
+/// operator or not a live admin of both groups.
 pub async fn check_groups(
     conn: &mut PgConnection,
     source: Uuid,
@@ -689,10 +844,11 @@ pub async fn check_groups(
              a person's act)"
         );
     }
-    let kind = super::restrict::check_target(conn, target, operator).await?;
-    if kind != "team" && kind != "community" {
-        bail!("--target-group {target} is kind {kind}, not a team or community group; refusing");
-    }
+    // The rows are private on both sides: the source is held to the target's
+    // rule, so another person's or an operated agent's personal group never
+    // gives up its claims, whoever administers it.
+    check_private_source(conn, source, operator, "--source-group").await?;
+    let kind = check_private_target(conn, target, operator).await?;
     let admin: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM group_memberships \
                          WHERE group_id = $1 AND agent_id = $2 AND role = 'admin' \
@@ -775,6 +931,81 @@ async fn sealed_evidence_of(
     Ok(v.into_iter().map(|u| u.to_string()).collect())
 }
 
+/// The edges among `ids` that are sealed (an `edge_encryption` row), with the
+/// group their ciphertext is keyed to.
+async fn sealed_edges_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeMap<String, Uuid>> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let v: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT edge_id, group_id FROM edge_encryption WHERE edge_id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await
+            .context("reading edge_encryption")?;
+    Ok(v.into_iter().map(|(e, g)| (e.to_string(), g)).collect())
+}
+
+/// Take `ids` of `table` (`edges` or `evidence`) `FOR UPDATE`, in id order,
+/// inside a batch. A seal's foreign key onto the row takes `FOR KEY SHARE`,
+/// which neither the batch's table locks nor its later UPDATEs (`FOR NO KEY
+/// UPDATE`) block; with the rows locked first, a seal either committed before
+/// the batch reads the seal table or waits until the batch commits.
+async fn lock_rows(conn: &mut PgConnection, table: &str, ids: &[Uuid]) -> anyhow::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let sql = match table {
+        "edges" => "SELECT id FROM edges WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        "evidence" => "SELECT id FROM evidence WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        other => bail!("lock_rows: unexpected table {other}"),
+    };
+    sqlx::query(sql)
+        .bind(ids)
+        .execute(&mut *conn)
+        .await
+        .with_context(|| format!("locking {table} rows"))?;
+    Ok(())
+}
+
+/// The claims among `ids` that are sealed, with the table that seals them: a
+/// `claim_encryption` row (the claim itself), or else a
+/// `claim_version_encryption` row (one of its versions; the version row
+/// follows the claim, away from the group that keys its ciphertext).
+/// `reown-workflows`' private move holds the same set.
+async fn sealed_claims_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeMap<Uuid, &'static str>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    for (seal, sql) in [
+        (
+            "claim_encryption",
+            "SELECT DISTINCT claim_id FROM claim_encryption WHERE claim_id = ANY($1)",
+        ),
+        (
+            "claim_version_encryption",
+            "SELECT DISTINCT claim_id FROM claim_version_encryption WHERE claim_id = ANY($1)",
+        ),
+    ] {
+        let v: Vec<Uuid> = sqlx::query_scalar(sql)
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await
+            .with_context(|| format!("reading {seal}"))?;
+        for id in v {
+            out.entry(id).or_insert(seal);
+        }
+    }
+    Ok(out)
+}
+
 /// The tables every batch (apply and reverse) holds `SHARE ROW EXCLUSIVE` on
 /// for its duration: the derived tables with no key to claims
 /// (`tables::unkeyed_tables`), plus `edges` and `harvester_fragments`.
@@ -800,14 +1031,20 @@ fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
 
 /// Read every row the candidates carry and decide, per row, whether it
 /// follows cleanly; a row that does not holds every candidate it hangs off.
+/// `lock` (inside a batch): the evidence and edge rows are taken `FOR UPDATE`
+/// before their seal tables are read ([`lock_rows`]).
 async fn classify_rows(
     conn: &mut PgConnection,
     ctx: &Ctx<'_>,
     cands: &BTreeSet<Uuid>,
     known: &Known,
+    lock: bool,
 ) -> anyhow::Result<Classified> {
     let cand_ids: Vec<Uuid> = cands.iter().copied().collect();
     let mut attached = fetch_attached(conn, ctx.specs, &cand_ids).await?;
+    if lock {
+        lock_rows(conn, "evidence", &evidence_ids(&attached)).await?;
+    }
     let pinned = pinned_of(conn, &evidence_ids(&attached)).await?;
     let sealed_ev = sealed_evidence_of(conn, &evidence_ids(&attached)).await?;
     let ev_claim: BTreeMap<Uuid, Uuid> = attached
@@ -822,6 +1059,10 @@ async fn classify_rows(
     let node_edges = fetch_node_edges(conn, ctx.nodes, &attached, cands, &seen).await?;
     attached.extend(node_edges);
     let keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    if lock {
+        lock_rows(conn, "edges", &edge_ids(&keys)).await?;
+    }
+    let sealed_edges = sealed_edges_of(conn, &edge_ids(&keys)).await?;
     let ends = ends_of(conn, ctx.nodes, &edge_ids(&keys)).await?;
     let frag_neighbours: Vec<Uuid> = attached
         .values()
@@ -882,7 +1123,15 @@ async fn classify_rows(
                     meet(&s, &t)
                 });
                 match m {
-                    Some(m) if edge_accepts(&a.tenancy, &m, ctx.source, ctx.target) => None,
+                    // A sealed edge the move would re-tuple: its ciphertext
+                    // stays keyed to its group, which would lose the row.
+                    Some(m) if edge_accepts(&a.tenancy, &m, ctx.source, ctx.target) => sealed_edges
+                        .get(&k.1)
+                        .filter(|_| m != a.tenancy)
+                        .map(|g| Hold::SealedEdge {
+                            id: k.1.clone(),
+                            group: *g,
+                        }),
                     other => Some(Hold::EdgeWouldWiden {
                         id: k.1.clone(),
                         from: state,
@@ -1080,7 +1329,9 @@ async fn run_batch(
         .await?;
     let locked = fetch_claims(conn, batch, true).await?;
     tables::lock_unkeyed_tables(conn, ctx.unkeyed).await?;
-    let sealed = sealed_of(conn, batch).await?;
+    // The claims are locked FOR UPDATE above, so no seal of either kind (a
+    // foreign key onto `claims`) can land on one before this batch commits.
+    let sealed = sealed_claims_of(conn, batch).await?;
 
     let by_id: BTreeMap<Uuid, &ClaimRow> = locked.iter().map(|r| (r.id, r)).collect();
     let mut cands: BTreeSet<Uuid> = BTreeSet::new();
@@ -1091,7 +1342,9 @@ async fn run_batch(
         };
         match classify_claim(c, ctx.source, ctx.target) {
             Ok(false) => out.already += 1,
-            Ok(true) if sealed.contains(id) => out.held.push((*id, Hold::Sealed)),
+            Ok(true) if sealed.contains_key(id) => {
+                out.held.push((*id, Hold::Sealed { seal: sealed[id] }))
+            }
             Ok(true) => {
                 cands.insert(*id);
             }
@@ -1101,7 +1354,7 @@ async fn run_batch(
     if cands.is_empty() {
         return Ok(out);
     }
-    let cl = classify_rows(conn, ctx, &cands, known).await?;
+    let cl = classify_rows(conn, ctx, &cands, known, true).await?;
     let eligible: Vec<ClaimRow> = cands
         .iter()
         .filter(|id| !cl.hold.contains_key(id))
@@ -1597,7 +1850,7 @@ async fn pre_pass(
     let (mut eligible, mut already, mut held) = (Vec::new(), Vec::new(), Vec::new());
     for chunk in ids.chunks(5000) {
         let rows = fetch_claims(conn, chunk, false).await?;
-        let sealed = sealed_of(conn, chunk).await?;
+        let sealed = sealed_claims_of(conn, chunk).await?;
         let by_id: BTreeMap<Uuid, &ClaimRow> = rows.iter().map(|r| (r.id, r)).collect();
         let mut cands = BTreeSet::new();
         for id in chunk {
@@ -1607,7 +1860,9 @@ async fn pre_pass(
             };
             match classify_claim(c, ctx.source, ctx.target) {
                 Ok(false) => already.push(*id),
-                Ok(true) if sealed.contains(id) => held.push((*id, Hold::Sealed)),
+                Ok(true) if sealed.contains_key(id) => {
+                    held.push((*id, Hold::Sealed { seal: sealed[id] }))
+                }
                 Ok(true) => {
                     cands.insert(*id);
                 }
@@ -1617,7 +1872,7 @@ async fn pre_pass(
         if cands.is_empty() {
             continue;
         }
-        let cl = classify_rows(conn, ctx, &cands, &Known::default()).await?;
+        let cl = classify_rows(conn, ctx, &cands, &Known::default(), false).await?;
         for id in chunk {
             if !cands.contains(id) {
                 continue;
@@ -1738,8 +1993,10 @@ pub async fn run(
          target); an edge takes the exact meet of its endpoints (an end that stays in the source, \
          a claim or evidence (CO-OWNED-EDGE) or a group-private node such as a workflow or frame \
          (SOURCE-NODE-EDGE), makes it co-owned); a shared fragment and an outsider's challenge \
-         stay as they are; a claim with a public, pinned, sealed-evidence or third-group row is \
-         HELD whole; nothing becomes public"
+         stay as they are; a sealed claim (a claim_encryption or claim_version_encryption row) \
+         is HELD, and so, whole, is a claim with a public, pinned, sealed-evidence, sealed-edge \
+         (an edge_encryption row the move would re-tuple) or third-group row; nothing becomes \
+         public"
     )?;
 
     if opts.apply {
@@ -2037,7 +2294,7 @@ async fn reverse_batch(
     let ids: Vec<Uuid> = batch.iter().map(|(id, _)| *id).collect();
     let locked = fetch_claims(conn, &ids, true).await?;
     tables::lock_unkeyed_tables(conn, rc.unkeyed).await?;
-    let sealed = sealed_of(conn, &ids).await?;
+    let sealed = sealed_claims_of(conn, &ids).await?;
     let now: BTreeMap<Uuid, &ClaimRow> = locked.iter().map(|c| (c.id, c)).collect();
     let prior_claims: BTreeMap<Uuid, &Record> = res.claims.iter().map(|(i, r)| (*i, r)).collect();
 
@@ -2078,10 +2335,14 @@ async fn reverse_batch(
             ));
             continue;
         }
-        if sealed.contains(id) {
+        if let Some(seal) = sealed.get(id) {
             out.held.push((
                 *id,
-                "the claim has been sealed since; its ciphertext is the target's".into(),
+                format!(
+                    "the claim has been sealed since the run ({seal}); its ciphertext is not \
+                     the source group's, so restoring it would leave it undecryptable; not \
+                     reversing"
+                ),
             ));
             continue;
         }
@@ -2109,6 +2370,8 @@ async fn reverse_batch(
     let node_edges = fetch_node_edges(conn, rc.nodes, &attached, &cand_ids, &seen).await?;
     attached.extend(node_edges);
     let all_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    lock_rows(conn, "evidence", &evidence_ids(&attached)).await?;
+    lock_rows(conn, "edges", &edge_ids(&all_keys)).await?;
     let ends_now = ends_of(conn, rc.nodes, &edge_ids(&all_keys)).await?;
 
     // The manifest's recorded prior of an edge endpoint it moved: a claim its
@@ -2233,6 +2496,34 @@ async fn reverse_batch(
         let why = format!(
             "evidence {} has been sealed since the run (evidence_encryption); its ciphertext is \
              not the source group's, so restoring it would leave it undecryptable; not reversing",
+            k.1
+        );
+        for cl in a.claims.intersection(&cand_ids) {
+            drift.entry(*cl).or_insert_with(|| why.clone());
+        }
+    }
+    // ---- sealed edges: the run held every sealed edge it would re-tuple, so
+    // a sealed edge whose tuple the reversal would change (its recorded prior
+    // differs from its tuple now, or it waits on an endpoint not yet back)
+    // was sealed since the run, under a key the source does not hold ----
+    let sealed_edges = sealed_edges_of(conn, &edge_ids(&all_keys)).await?;
+    for (k, a) in attached.iter().filter(|(k, _)| k.0 == "edges") {
+        let Some(group) = sealed_edges.get(&k.1) else {
+            continue;
+        };
+        let changes = res.rows.get(k).is_none_or(|rec| {
+            RowState::of_record(rec).tenancy != a.tenancy
+                || ends_now.get(&k.1).is_some_and(|e| {
+                    pending(&e.source, &e.source_state) || pending(&e.target, &e.target_state)
+                })
+        });
+        if !changes {
+            continue;
+        }
+        let why = format!(
+            "edge {} is sealed (edge_encryption, keyed to group {group}); restoring its claim \
+             would change its tuple, and its ciphertext never leaves the group that holds its \
+             key; not reversing",
             k.1
         );
         for cl in a.claims.intersection(&cand_ids) {

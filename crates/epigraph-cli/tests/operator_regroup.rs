@@ -156,6 +156,19 @@ async fn team_group(pool: &PgPool, label: &str, admin: Uuid) -> Uuid {
     g
 }
 
+/// Make `agent` a live admin of `group` (a row the fixture adds directly).
+async fn admin_of(pool: &PgPool, group: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed admin membership");
+}
+
 async fn evidence(pool: &PgPool, claim: Uuid, text: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -1021,6 +1034,10 @@ async fn bad_groups_and_unauthorized_operators_are_refused(pool: PgPool) {
         let (agent, _) = fixture::seed_human_operator(&pool, "stranger").await;
         team_group(&pool, "stranger team", agent).await
     };
+    // Another person's personal group, which the operator ADMINISTERS: so its
+    // refusal can only come from whose group it is, not from the admin check.
+    let (_, stranger_personal) = fixture::seed_human_operator(&pool, "stranger person").await;
+    admin_of(&pool, stranger_personal, fx.operator).await;
     let (robot, _) = fixture::seed_agent_with_group(&pool, "robot").await;
     let robot_src = team_group(&pool, "robot src", robot).await;
     let robot_dst = team_group(&pool, "robot dst", robot).await;
@@ -1028,9 +1045,9 @@ async fn bad_groups_and_unauthorized_operators_are_refused(pool: PgPool) {
         (fx.src, fx.src, fx.operator, "is the source group"),
         (
             fx.src,
-            fx.operator_group,
+            stranger_personal,
             fx.operator,
-            "not a team or community",
+            "not the operator's own personal group",
         ),
         (
             stranger_team,
@@ -1070,6 +1087,233 @@ async fn bad_groups_and_unauthorized_operators_are_refused(pool: PgPool) {
     }
     assert_same(&before, &after, "refusals");
     assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// The operator's OWN personal group is a target (operator ruling,
+/// 2026-11-12: legacy workflow claims a team holds go private to the person
+/// whose lineages supersede them). A and B move into it with everything that
+/// follows them; B's edge to S, which stays in SRC, is co-owned by both; a
+/// reader of the personal group reads them and a SRC-only reader does not;
+/// the reversal puts every row back byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operators_own_personal_group_is_a_target_and_the_move_reverses_exactly(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a, fx.b]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let g = fx.operator_group;
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(2),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!("target_group={g} (personal)")),
+        "{}",
+        r.show()
+    );
+    for c in [fx.a, fx.b] {
+        assert_eq!(row(&pool, "claims", c).await, grp(g), "claim {c}");
+    }
+    for (t, id) in [
+        ("evidence", fx.ev_a),
+        ("reasoning_traces", fx.trace_a),
+        ("mass_functions", fx.mf_a),
+        ("claim_versions", fx.cv_a),
+        ("harvester_fragments", fx.frag_a),
+        ("evidence", fx.ev_b),
+    ] {
+        assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
+    }
+    assert_eq!(
+        edge(&pool, fx.e_bs).await,
+        (g, "group".to_string(), Some(fx.src)),
+        "an edge to a claim that stays in SRC is co-owned by both groups"
+    );
+    assert_eq!(
+        reads_as(&pool, &[g], "claims", &[fx.a, fx.b]).await,
+        sorted(vec![fx.a, fx.b])
+    );
+    assert!(reads_as(&pool, &[fx.src], "claims", &[fx.a, fx.b])
+        .await
+        .is_empty());
+    assert!(reads_as(&pool, &[], "claims", &[fx.a, fx.b])
+        .await
+        .is_empty());
+    let audit = audit_rows(&pool).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].2["target_group_id"], g.to_string());
+    assert_eq!(audit[0].2["target_group_kind"], "personal");
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "a move into the operator's personal group, then its reversal",
+    );
+}
+
+/// A run into a personal group that is not the operator's own.
+async fn refused_personal_target(pool: &PgPool, fx: &Fx, target: Uuid) {
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let before = snapshot(pool, false).await;
+    for apply_count in [None, Some(1)] {
+        let mf = dir.join(format!("m-{apply_count:?}.jsonl"));
+        let r = regroup(
+            pool,
+            Regroup {
+                ids: &ids,
+                src: fx.src,
+                dst: target,
+                operator: fx.operator,
+                manifest: &mf,
+                apply_count,
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(r.code, 1, "{}", r.show());
+        assert!(
+            r.stderr.contains("not the operator's own personal group"),
+            "{}",
+            r.show()
+        );
+        assert!(!mf.exists());
+    }
+    assert_same(&before, &snapshot(pool, false).await, "a refused target");
+    assert!(audit_rows(pool).await.is_empty());
+}
+
+/// Another person's personal group is refused, even though the operator is
+/// a live admin of it: a regroup never puts claims in a group that is someone
+/// else's own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_personal_group_is_refused_even_to_its_admin(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (_, theirs) = fixture::seed_human_operator(&pool, "another person").await;
+    admin_of(&pool, theirs, fx.operator).await;
+    refused_personal_target(&pool, &fx, theirs).await;
+}
+
+/// An agent the operator OPERATES (a live operator link) has its own personal
+/// group, and the operator is made a live admin of it: still refused. That
+/// group is the agent's, where the agent's own writes land and which the
+/// agent administers; migration 107's ownership model moves an operated
+/// agent's claims OUT of it into the operator's group (`reown-linked`), never
+/// into it. "The operator's own personal group" is the one carrying the
+/// operator's personal did_key, created by the operator.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agents_personal_group_is_refused_even_to_its_operator(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (agent, agents_group) = fixture::seed_agent_with_group(&pool, "operated agent").await;
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(agent)
+        .bind(fx.operator)
+        .execute(&pool)
+        .await
+        .expect("link the agent to the operator");
+    admin_of(&pool, agents_group, fx.operator).await;
+    refused_personal_target(&pool, &fx, agents_group).await;
+}
+
+/// The SOURCE is held to the target's rule: an active team or community group
+/// the operator administers, or the operator's OWN personal group. Another
+/// person's personal group and an operated agent's are refused as
+/// `--source-group` even though the operator administers both (so the
+/// refusal comes from whose group it is, not from the admin check), into the
+/// operator's own personal group and into a team alike. Each holds a claim the
+/// run would otherwise move, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_or_an_operated_agents_personal_group_is_refused_as_source(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (person, theirs) = fixture::seed_human_operator(&pool, "another person").await;
+    admin_of(&pool, theirs, fx.operator).await;
+    let (agent, agents_group) = fixture::seed_agent_with_group(&pool, "operated agent").await;
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(agent)
+        .bind(fx.operator)
+        .execute(&pool)
+        .await
+        .expect("link the agent to the operator");
+    admin_of(&pool, agents_group, fx.operator).await;
+    let c_theirs =
+        fixture::seed_group_claim(&pool, person, theirs, "another person's private claim").await;
+    let c_agent =
+        fixture::seed_group_claim(&pool, agent, agents_group, "an operated agent's claim").await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, false).await;
+    let cases = [
+        (theirs, c_theirs, fx.operator_group),
+        (theirs, c_theirs, fx.dst),
+        (agents_group, c_agent, fx.operator_group),
+    ];
+    for (i, (src, claim, dst)) in cases.into_iter().enumerate() {
+        let ids = ids_file(&dir, &format!("ids{i}.txt"), &[claim]);
+        let mf = dir.join(format!("m{i}.jsonl"));
+        let r = regroup(
+            &pool,
+            Regroup {
+                ids: &ids,
+                src,
+                dst,
+                operator: fx.operator,
+                manifest: &mf,
+                apply_count: Some(1),
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(r.code, 1, "case {i}: {}", r.show());
+        assert!(
+            r.stderr.contains("--source-group")
+                && r.stderr.contains("not the operator's own personal group"),
+            "case {i}: {}",
+            r.show()
+        );
+        assert!(!mf.exists(), "case {i}");
+        assert_eq!(row(&pool, "claims", claim).await, grp(src), "case {i}");
+    }
+    assert_same(&before, &snapshot(&pool, false).await, "refused sources");
+    assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// The operator's OWN personal group is a source: a claim moved into it is
+/// moved out of it again into a team.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operators_own_personal_group_is_a_source(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let g = fx.operator_group;
+    for (i, (src, dst)) in [(fx.src, g), (g, fx.dst)].into_iter().enumerate() {
+        let r = regroup(
+            &pool,
+            Regroup {
+                ids: &ids,
+                src,
+                dst,
+                operator: fx.operator,
+                manifest: &dir.join(format!("m{i}.jsonl")),
+                apply_count: Some(1),
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(r.code, 0, "step {i}: {}", r.show());
+        assert_eq!(row(&pool, "claims", fx.a).await, grp(dst), "step {i}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2187,6 +2431,254 @@ async fn sealed_evidence_holds_its_claim_in_the_move_and_in_the_reversal(pool: P
     );
     assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.dst));
     assert_eq!(row(&pool, "evidence", fx.ev_b).await, grp(fx.dst));
+}
+
+/// An active key epoch 0 for `group` (the seals' foreign key).
+async fn key_epoch(pool: &PgPool, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+        &[group],
+    )
+    .await;
+}
+
+async fn seal_edge(pool: &PgPool, e: Uuid, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO edge_encryption (edge_id, group_id, epoch, privacy_tier, encrypted_labels) \
+         VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+        &[e, group],
+    )
+    .await;
+}
+
+async fn seal_version(pool: &PgPool, cv: Uuid, claim: Uuid, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO claim_version_encryption (claim_version_id, claim_id, group_id, epoch, \
+                                               encrypted_content) \
+         VALUES ($1, $2, $3, 0, ''::bytea)",
+        &[cv, claim, group],
+    )
+    .await;
+}
+
+/// An edge sealed under the source (`edge_encryption`) holds the claim whose
+/// move would re-tuple it, into a team and into the operator's own personal
+/// group alike: its ciphertext is keyed to the source, so the moved edge would
+/// sit where no reader holds the key while source members lose it. The plan
+/// excludes the claim and names the edge; the apply exits 3 and writes
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_edge_holds_the_claim_that_would_move_it(pool: PgPool) {
+    let fx = seed(&pool).await;
+    seal_edge(&pool, fx.e_bp, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.b]);
+    let before = snapshot(&pool, false).await;
+    for (i, dst) in [fx.dst, fx.operator_group].into_iter().enumerate() {
+        let dry = regroup(
+            &pool,
+            Regroup {
+                ids: &ids,
+                src: fx.src,
+                dst,
+                operator: fx.operator,
+                manifest: &dir.join(format!("dry{i}.jsonl")),
+                apply_count: None,
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(dry.code, 0, "target {i}: {}", dry.show());
+        assert!(
+            dry.stdout
+                .contains("PLAN: 1 requested, 0 eligible, 1 held, 0 already ('group', target)"),
+            "target {i}: {}",
+            dry.show()
+        );
+        assert!(
+            has_line(
+                &dry.stdout,
+                "HELD\t",
+                &[
+                    &fx.b.to_string(),
+                    "sealed-edge",
+                    &fx.e_bp.to_string(),
+                    "edge_encryption"
+                ]
+            ),
+            "target {i}: {}",
+            dry.show()
+        );
+    }
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.operator_group,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(0),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.src));
+    assert_eq!(
+        edge(&pool, fx.e_bp).await,
+        (fx.src, "group".to_string(), None)
+    );
+    assert_eq!(
+        reads_as(&pool, &[fx.src], "edges", &[fx.e_bp]).await,
+        vec![fx.e_bp]
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "a sealed-edge hold");
+    assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// An edge the run moved and that was sealed since (under the target) holds
+/// its claim in the reversal: its ciphertext is the target's, so it never
+/// goes back to the source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reversal_holds_an_edge_sealed_since(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let g = fx.operator_group;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.b]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(edge(&pool, fx.e_bp).await, (g, "group".to_string(), None));
+    key_epoch(&pool, g).await;
+    seal_edge(&pool, fx.e_bp, g).await;
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&fx.b.to_string(), &fx.e_bp.to_string(), "edge_encryption"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(g));
+    assert_eq!(edge(&pool, fx.e_bp).await, (g, "group".to_string(), None));
+}
+
+/// A claim with a sealed VERSION (`claim_version_encryption`) and no
+/// `claim_encryption` row is held as sealed: the version row would follow the
+/// claim away from the group that keys its ciphertext. A version sealed under
+/// the target after the act holds the claim in the reversal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_claim_version_holds_its_claim_in_the_move_and_in_the_reversal(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let g = fx.operator_group;
+    seal_version(&pool, fx.cv_a, fx.a, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains("PLAN: 1 requested, 0 eligible, 1 held, 0 already ('group', target)"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        has_line(
+            &dry.stdout,
+            "HELD\t",
+            &[&fx.a.to_string(), "sealed", "claim_version_encryption"]
+        ),
+        "{}",
+        dry.show()
+    );
+    let held = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &dir.join("held.jsonl"),
+            apply_count: Some(0),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(held.code, 3, "{}", held.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(fx.src));
+    assert_eq!(row(&pool, "claim_versions", fx.cv_a).await, grp(fx.src));
+
+    // Unsealed, A moves; its version sealed under the target since holds the
+    // reversal.
+    exec(
+        &pool,
+        "DELETE FROM claim_version_encryption WHERE claim_version_id = $1",
+        &[fx.cv_a],
+    )
+    .await;
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    key_epoch(&pool, g).await;
+    seal_version(&pool, fx.cv_a, fx.a, g).await;
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&fx.a.to_string(), "claim_version_encryption"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(g));
+    assert_eq!(row(&pool, "claim_versions", fx.cv_a).await, grp(g));
 }
 
 /// An evidence edge from B's evidence to the evidence of a claim S2 that is

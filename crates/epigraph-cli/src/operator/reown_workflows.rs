@@ -46,6 +46,61 @@
 //!   its rows. The dry run counts them (`BEHAVIORAL-EXECUTIONS`); the read
 //!   paths must gate them on the workflow's readability.
 //!
+//! # A private move (`--from-visibility group`)
+//!
+//! Lineages that are ALREADY private, `('group', source)`, move whole to
+//! `('group', target)` with `--from-visibility group --visibility group`:
+//! a group-private pipeline that belongs to another group, or a narrowed
+//! lineage that belongs in the operator's own group. The target is another
+//! group: an active `team` or `community` group the operator administers, or
+//! the operator's OWN personal group (`regroup::check_private_target`, the
+//! rule `regroup-claims` applies); never another person's personal group nor
+//! an operated agent's. The source (`--from-group`, or the default) is held
+//! to the same rule (`regroup::check_private_source`): its rows are private, so
+//! another person's or an operated agent's personal group never gives them
+//! up, whoever administers it or runs the tool. `--catch-up` is refused. It
+//! is the public act's machinery with the FROM state `('group', source)`:
+//!
+//! * a SEALED row holds its lineage (`LineageHold::Sealed`): a plan claim
+//!   with a `claim_encryption` row or a sealed version
+//!   (`claim_version_encryption`), an evidence row of one with an
+//!   `evidence_encryption` row, or a moving edge with an `edge_encryption`
+//!   row. Its ciphertext is keyed to the group that sealed it and a move does
+//!   not re-key it, so ciphertext never leaves that group; an `--apply` then
+//!   exits 3. Each batch locks the moving claims, edges and evidence rows
+//!   `FOR UPDATE` (which blocks a new seal's foreign key) and re-plans, so a
+//!   seal that lands after the dry run holds too;
+//! * a generation or an unshared plan claim that is PUBLIC is public input,
+//!   the public act's to narrow first: a public generation holds its lineage
+//!   (`PublicInput`), and an unshared public plan claim, or a public derived
+//!   row, holds it as a hand-off (an `--apply` exits 3), because moving the
+//!   rest would split the plan. Nothing becomes public, and nothing public is
+//!   narrowed but the plan's own edges (an edge is never more visible than
+//!   the plan it describes; such an edge bumps the atlas epoch as in the
+//!   public act);
+//! * [`hand_off`] lets a private row the SOURCE owns (or the target already
+//!   owns) change owner, when its new tuple still requires every group its
+//!   old one did with the source replaced by the target (a co-owner is
+//!   kept). A private row a third group owns still holds the lineage;
+//! * a plan claim shared with a lineage the list omits stays where it is,
+//!   reported as SHARED and, when that lineage is the source's in the FROM
+//!   state, as `SHARED-SPLIT`. Every edge between a moved row and one that
+//!   stays in its group is co-owned by both groups and printed
+//!   (`CO-OWNED-EDGE`);
+//! * an edge to a group-private node of another type with its own tenancy (a
+//!   frame, context, perspective, community or reasoning trace that does not
+//!   end in the TO state) holds its lineage: the cascade meets such a node as
+//!   public, so the edge would go to the target naming a node the target
+//!   cannot read;
+//! * an unstamped session reads none of these rows before or after, so every
+//!   batch also reads them as a session whose read set is ONLY the source and
+//!   one whose read set is ONLY the target, before and after, and each must
+//!   read exactly what the tenancy model says (a public row, or one whose
+//!   owner and co-owner are that group);
+//! * the manifest header records `from_visibility: group`; `reown-reverse`
+//!   reverses it exactly, without arming 074's declassify guard (no claim
+//!   widens).
+//!
 //! # What moves, table by table
 //!
 //! * `workflows`: every generation of a listed lineage, which must all be in
@@ -236,7 +291,9 @@
 //! * a moved claim now executed by a workflow the run did not move;
 //! * a row attached to a moved claim, or an edge touching a moved claim or
 //!   workflow, that the run did not see (new evidence, a BBA, a new link);
-//! * a moved claim or its evidence sealed since.
+//! * a moved claim, a version of one, its evidence or a moved edge sealed
+//!   since (`claim_encryption`, `claim_version_encryption`,
+//!   `evidence_encryption`, `edge_encryption`).
 //!
 //! Exact or nothing: a partial restore would split a plan between two owners.
 //! The widening statement (claims back to public) runs with migration 074's
@@ -326,6 +383,19 @@ impl Visibility {
     }
 }
 
+/// `--from-visibility`: `public` (the default: the public act) or `group` (a
+/// private move). Returns whether the move is private.
+///
+/// # Errors
+/// Anything but `public` or `group`.
+pub fn parse_from_visibility(s: &str) -> anyhow::Result<bool> {
+    match s {
+        "public" => Ok(false),
+        "group" => Ok(true),
+        other => bail!("--from-visibility must be public or group, not {other:?}"),
+    }
+}
+
 /// The resolved act: where rows come from, where they go, and how visible.
 #[derive(Clone, Copy, Debug)]
 pub struct Act {
@@ -336,6 +406,10 @@ pub struct Act {
     /// change only their other (stray) generations; the stray generations' own
     /// private rows may go into the TO state ([`StrayScope`]).
     pub catch_up: bool,
+    /// `--from-visibility group`: a PRIVATE MOVE. The FROM state is
+    /// `('group', source)`, the TO state `('group', target)`, and the target
+    /// is another group ([`resolve_groups`]). Public input is never taken.
+    pub from_private: bool,
 }
 
 impl Act {
@@ -344,7 +418,7 @@ impl Act {
     pub fn from_state(&self) -> Tenancy {
         Tenancy {
             owner: self.source,
-            visibility: PUBLIC.into(),
+            visibility: if self.from_private { GROUP } else { PUBLIC }.into(),
             co_owner: None,
         }
     }
@@ -392,6 +466,9 @@ impl Act {
     }
 
     fn name(&self) -> &'static str {
+        if self.from_private {
+            return "PRIVATE-MOVE";
+        }
         match (self.in_place(), self.visibility, self.catch_up) {
             (true, _, false) => "NARROW-IN-PLACE",
             (true, _, true) => "CATCH-UP-NARROW-IN-PLACE",
@@ -417,6 +494,9 @@ pub struct Options {
     pub visibility: Visibility,
     /// `--catch-up` (see [`Act::catch_up`]); needs `--visibility group`.
     pub catch_up: bool,
+    /// `--from-visibility group` (see [`Act::from_private`]); needs
+    /// `--visibility group`, never `--catch-up`.
+    pub from_private: bool,
     /// `--after-manifest` (`--catch-up` only): the manifests of the acts a
     /// catch-up follows. A move's catch-up takes a lineage only when one of
     /// its TO generations is a row one of them moved into the TO state; in
@@ -444,6 +524,20 @@ pub fn validate(opts: &Options) -> anyhow::Result<()> {
     }
     if !opts.after_manifests.is_empty() && !opts.catch_up {
         bail!("--after-manifest is for --catch-up only: it names the act a catch-up follows");
+    }
+    if opts.from_private {
+        if opts.visibility != Visibility::Group {
+            bail!(
+                "--from-visibility group needs --visibility group: a private move keeps every \
+                 row group-private (it ends ('group', target))"
+            );
+        }
+        if opts.catch_up {
+            bail!(
+                "--from-visibility group does not take --catch-up: a private move takes a \
+                 lineage whole, from ('group', source) only"
+            );
+        }
     }
     if opts.apply {
         if opts.ruling.trim().is_empty() {
@@ -494,7 +588,10 @@ pub fn read_names_file(path: &Path) -> anyhow::Result<Vec<String>> {
 /// `--from-group` is world or seed or not administered by the operator; the
 /// operator has no personal group; the target is the source without
 /// `--visibility group`, or a move's target is not an active team group the
-/// operator administers.
+/// operator administers. A private move's target is the source, or not one
+/// `regroup::check_private_target` accepts; its source is not an active team
+/// or community group nor a registered human operator's own personal group
+/// ([`super::regroup::check_private_source`]).
 pub async fn resolve_groups(
     conn: &mut PgConnection,
     opts: &Options,
@@ -515,6 +612,26 @@ pub async fn resolve_groups(
         }
         None => operator_group(conn, opts.operator).await?,
     };
+    if opts.from_private {
+        // The rows are PRIVATE, so the source is held to the target's rule:
+        // an active team or community group the operator administers, or the
+        // operator's OWN personal group. Another person's or an operated
+        // agent's personal group never gives up its private rows to a team,
+        // whoever administers it; nor does an operated agent's own group when
+        // the agent itself is passed as --operator (the default source).
+        super::regroup::check_private_source(conn, source, opts.operator, "--from-group").await?;
+        if source == opts.target {
+            bail!(
+                "--target-group {} is the source group: a private move moves between two groups \
+                 (to narrow public lineages in place, omit --from-visibility)",
+                opts.target
+            );
+        }
+        // An active team or community group the operator administers, or the
+        // operator's OWN personal group (the rule regroup-claims applies).
+        super::regroup::check_private_target(conn, opts.target, opts.operator).await?;
+        return Ok((source, opts.target));
+    }
     if source == opts.target {
         if opts.visibility != Visibility::Group {
             bail!(
@@ -648,6 +765,12 @@ pub struct MovingEdge {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LineageHold {
     NotFound,
+    /// (A private move only.) A public generation: public input is the public
+    /// act's (`--from-visibility public`), never a private move's.
+    PublicInput {
+        generation: i32,
+        owner: Uuid,
+    },
     OwnedElsewhere {
         generation: i32,
         owner: Uuid,
@@ -685,6 +808,20 @@ pub enum LineageHold {
         post: String,
         why: &'static str,
     },
+    /// (A private move only.) A row of the plan is SEALED: its ciphertext
+    /// (`seal`, keyed to the group that sealed it) does not move with the
+    /// row, so the target's members would get a row they cannot decrypt and
+    /// the source's would lose one they can. Holds every lineage joined to
+    /// it, and an `--apply` exits 3, as a hand-off does.
+    Sealed {
+        /// `claim`, `evidence` or `edge`.
+        what: &'static str,
+        id: Uuid,
+        /// The table holding the ciphertext.
+        seal: &'static str,
+        /// The group its key epoch belongs to.
+        group: Uuid,
+    },
 }
 
 impl LineageHold {
@@ -692,7 +829,7 @@ impl LineageHold {
     /// the narrowing's own rule: an `--apply` with one exits 3.
     #[must_use]
     pub fn is_hand_off(&self) -> bool {
-        matches!(self, Self::HandOff { .. })
+        matches!(self, Self::HandOff { .. } | Self::Sealed { .. })
     }
 }
 
@@ -711,10 +848,16 @@ impl fmt::Display for LineageHold {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => write!(f, "no workflow row has this canonical name"),
+            Self::PublicInput { generation, owner } => write!(
+                f,
+                "generation {generation} is ({owner}, public): a private move never takes public \
+                 input (narrow it first with the public act, --visibility group); the whole \
+                 lineage stays"
+            ),
             Self::OwnedElsewhere { generation, owner } => write!(
                 f,
-                "generation {generation} is owned by group {owner}, and is neither the source's \
-                 public row nor in this run's target state; the whole lineage stays"
+                "generation {generation} is owned by group {owner}, and is in neither this run's \
+                 FROM state (the source's) nor its target state; the whole lineage stays"
             ),
             Self::NotPublic {
                 generation,
@@ -765,6 +908,17 @@ impl fmt::Display for LineageHold {
                 f,
                 "{table} {id} is {prior}; narrowing this plan would make it {post}, and {why}; \
                  the whole lineage stays (an --apply exits 3)"
+            ),
+            Self::Sealed {
+                what,
+                id,
+                seal,
+                group,
+            } => write!(
+                f,
+                "{what} {id} is sealed ({seal}, keyed to group {group}): a move does not re-key \
+                 its ciphertext, so the target's members could not decrypt it; ciphertext never \
+                 leaves the group it is keyed to, and the whole lineage stays (an --apply exits 3)"
             ),
         }
     }
@@ -1005,6 +1159,14 @@ fn tuple_text(t: &Tenancy) -> String {
 ///   migration 114's writer-owned rows and for every public edge, which 120's
 ///   meet re-owns by design; the source's, the target's and world rows are
 ///   always taken).
+///
+/// A PRIVATE MOVE ([`Act::from_private`]) is the operator's act on the
+/// source's private rows, so a private row OWNED by the source (or already by
+/// the target) may change owner, as `regroup-claims` moves it: when `post` is
+/// not public and requires every group `prior` requires, with the source
+/// replaced by the target ([`moved_image`]; a co-owner `prior` requires is
+/// kept). A private row a third group owns still holds, and a public `prior`
+/// keeps the rules above.
 fn hand_off(
     act: &Act,
     prior: &Tenancy,
@@ -1016,6 +1178,14 @@ fn hand_off(
         return None;
     }
     let ours = |g: Uuid| g == act.source || g == act.target;
+    if act.from_private
+        && prior.visibility != PUBLIC
+        && post.visibility != PUBLIC
+        && ours(prior.owner)
+        && restrict::reader_groups(post).is_superset(&moved_image(act, prior))
+    {
+        return None;
+    }
     if own
         && act.catch_up
         && *post == act.to_state()
@@ -1042,6 +1212,16 @@ fn hand_off(
              (not writer-owned, so the database does not hand it over)",
         )
     }
+}
+
+/// The groups a reader of `t` must belong to, with the act's source replaced
+/// by its target: what a row must still require once a private move carried
+/// it (`regroup-claims`' image rule).
+fn moved_image(act: &Act, t: &Tenancy) -> BTreeSet<Uuid> {
+    restrict::reader_groups(t)
+        .into_iter()
+        .map(|g| if g == act.source { act.target } else { g })
+        .collect()
 }
 
 /// `--catch-up`: the stray generations' OWN rows, the only rows its hand-off
@@ -1238,8 +1418,18 @@ async fn classify_narrowing(
             out.kept_rows.insert(k.clone(), a.clone());
             continue;
         }
+        // A private move never takes a public row (an outsider's challenge
+        // is never moved, so it never reaches here).
+        let public_input = act.from_private && a.tenancy.visibility == PUBLIC;
         // A derived row is never one of a stray generation's own rows.
-        if let Some(why) = hand_off(act, &a.tenancy, &post.tenancy, writer_owned, false) {
+        if let Some(why) = if public_input {
+            Some(
+                "it is public: a private move never takes a public row (narrow the plan first \
+                 with the public act, --visibility group)",
+            )
+        } else {
+            hand_off(act, &a.tenancy, &post.tenancy, writer_owned, false)
+        } {
             out.hand_offs.push((
                 anchors,
                 LineageHold::HandOff {
@@ -1294,6 +1484,20 @@ async fn classify_narrowing(
         .chain(out.ev_edges.iter())
         .cloned()
         .collect();
+    // A private move: every endpoint of a type with its own tenancy other
+    // than a workflow (a frame, context, perspective, community or reasoning
+    // trace), with the tuple it ends in (its own, or a moving trace's post).
+    let other_nodes = if act.from_private {
+        let mut m = node_tuples(conn, &all_edges).await?;
+        for ((id, _), (table, t)) in &mut m {
+            if let Some(p) = out.rows_post.get(&(table.clone(), id.to_string())) {
+                *t = p.tenancy.clone();
+            }
+        }
+        m
+    } else {
+        BTreeMap::new()
+    };
     for e in all_edges {
         if !inside_node(&e.source) && !inside_node(&e.target) {
             continue;
@@ -1338,7 +1542,24 @@ async fn classify_narrowing(
             out.kept.push((e, "already as narrow as its plan"));
             continue;
         }
-        if let Some(why) = hand_off(act, &e.tenancy, &post, true, stray.owns_edge(&e)) {
+        // The cascade meets such a node as public: an edge to a group-private
+        // node that does not end in the TO state would go to the target while
+        // naming a node the target's members cannot read.
+        let private_node = [&e.source, &e.target].into_iter().any(|n| {
+            other_nodes
+                .get(n)
+                .is_some_and(|(_, t)| t.visibility != PUBLIC && *t != to)
+        });
+        let why = if private_node {
+            Some(
+                "it names a group-private node (a frame, context, perspective, community or \
+                 reasoning trace) that does not move with the plan, which the cascade counts as \
+                 public: moved, the edge would name a node its new readers cannot read",
+            )
+        } else {
+            hand_off(act, &e.tenancy, &post, true, stray.owns_edge(&e))
+        };
+        if let Some(why) = why {
             let anchors = vec![e.source.0, e.target.0];
             out.hand_offs.push((
                 anchors,
@@ -1441,7 +1662,13 @@ pub async fn plan(
         if let Some(w) = other {
             out.held.push((
                 name.clone(),
-                if w.tenancy.visibility == PUBLIC {
+                if act.from_private && w.tenancy.visibility == PUBLIC {
+                    LineageHold::PublicInput {
+                        generation: w.generation,
+                        owner: w.tenancy.owner,
+                    }
+                } else if act.from_private || w.tenancy.visibility == PUBLIC {
+                    // A private move: another group's private generation.
                     LineageHold::OwnedElsewhere {
                         generation: w.generation,
                         owner: w.tenancy.owner,
@@ -1598,7 +1825,9 @@ pub async fn plan(
             c,
             format!("also executed by workflow {w} ({n}), outside the listed lineages"),
         );
-        if o == Some(source) && v.as_deref() == Some(PUBLIC) {
+        // The source's lineage in this run's FROM state (public, or under a
+        // private move the source's private state).
+        if o == Some(source) && v.as_deref() == Some(from.visibility.as_str()) {
             split_of.entry(c).or_default().insert(n);
         }
     }
@@ -1653,6 +1882,9 @@ pub async fn plan(
     let mut left: BTreeMap<Uuid, Left> = BTreeMap::new();
     let mut already: BTreeSet<Uuid> = BTreeSet::new();
     let mut candidates: BTreeSet<Uuid> = BTreeSet::new();
+    // A private move's unshared PUBLIC plan claims: public input, which holds
+    // the whole lineage (moving the rest would split the plan).
+    let mut public_input: Vec<Uuid> = Vec::new();
     let mut stray = StrayScope::default();
     if act.catch_up {
         stray.workflows.clone_from(&moving_wf);
@@ -1697,7 +1929,9 @@ pub async fn plan(
             left.insert(*id, Left::Shared(by.iter().cloned().collect()));
         } else if c.owner != source {
             left.insert(*id, Left::NotSourceOwned { owner: c.owner });
-        } else if c.visibility != PUBLIC && !stray.claims.contains(id) {
+        } else if act.from_private && c.visibility == PUBLIC {
+            public_input.push(*id);
+        } else if c.visibility != from.visibility && !stray.claims.contains(id) {
             left.insert(
                 *id,
                 Left::NotPublic {
@@ -1760,6 +1994,29 @@ pub async fn plan(
         kept_edges = n.kept;
         ev_edges = n.ev_edges;
         hand_offs = n.hand_offs;
+        if act.from_private {
+            // Every plan claim the move started from (step members
+            // included), every evidence row of one, every moving edge.
+            hand_offs.extend(sealed_holds(conn, &cand, &ev_claim, &moving_edges).await?);
+        }
+        for id in &public_input {
+            hand_offs.push((
+                vec![*id],
+                LineageHold::HandOff {
+                    table: "claims".into(),
+                    id: id.to_string(),
+                    prior: tuple_text(&Tenancy {
+                        owner: source,
+                        visibility: PUBLIC.into(),
+                        co_owner: None,
+                    }),
+                    post: tuple_text(&to),
+                    why: "it is public: a private move never takes public input (narrow the plan \
+                          first with the public act, --visibility group), and moving the rest \
+                          would split the plan",
+                },
+            ));
+        }
     } else {
         // ---- keep: cascaded rows ----
         for a in attached.values() {
@@ -2140,6 +2397,140 @@ async fn workflow_tenancy(
         .collect())
 }
 
+/// A private move's sealed rows, each a hold anchored on its plan claim (or a
+/// moving edge's endpoints): a claim among `claims` with a `claim_encryption`
+/// row or a sealed version (`claim_version_encryption`), an evidence row of
+/// `evidence` (evidence id -> its claim) with an `evidence_encryption` row,
+/// and a moving edge with an `edge_encryption` row. The ciphertext stays keyed
+/// to its group whatever the row's tuple becomes (`regroup-claims` holds the
+/// same set: `Hold::Sealed` for a claim or version seal,
+/// `Hold::SealedEvidence`, and `Hold::SealedEdge` for an edge it would re-tuple).
+async fn sealed_holds(
+    conn: &mut PgConnection,
+    claims: &[Uuid],
+    evidence: &BTreeMap<Uuid, Uuid>,
+    edges: &[MovingEdge],
+) -> anyhow::Result<Vec<(Vec<Uuid>, LineageHold)>> {
+    let mut out = Vec::new();
+    for (seal, sql) in [
+        (
+            "claim_encryption",
+            "SELECT claim_id, group_id FROM claim_encryption WHERE claim_id = ANY($1)",
+        ),
+        (
+            "claim_version_encryption",
+            "SELECT DISTINCT ON (claim_id) claim_id, group_id FROM claim_version_encryption \
+              WHERE claim_id = ANY($1) ORDER BY claim_id, group_id",
+        ),
+    ] {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(sql)
+            .bind(claims)
+            .fetch_all(&mut *conn)
+            .await
+            .with_context(|| format!("reading {seal}"))?;
+        for (id, group) in rows {
+            out.push((
+                vec![id],
+                LineageHold::Sealed {
+                    what: "claim",
+                    id,
+                    seal,
+                    group,
+                },
+            ));
+        }
+    }
+    let ev: Vec<Uuid> = evidence.keys().copied().collect();
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT evidence_id, group_id FROM evidence_encryption WHERE evidence_id = ANY($1)",
+    )
+    .bind(&ev)
+    .fetch_all(&mut *conn)
+    .await
+    .context("reading evidence_encryption")?;
+    for (id, group) in rows {
+        out.push((
+            vec![evidence[&id]],
+            LineageHold::Sealed {
+                what: "evidence",
+                id,
+                seal: "evidence_encryption",
+                group,
+            },
+        ));
+    }
+    let ends: BTreeMap<Uuid, Vec<Uuid>> = edges
+        .iter()
+        .map(|e| (e.row.id, vec![e.row.source.0, e.row.target.0]))
+        .collect();
+    let ids: Vec<Uuid> = ends.keys().copied().collect();
+    let rows: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT edge_id, group_id FROM edge_encryption WHERE edge_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await
+            .context("reading edge_encryption")?;
+    for (id, group) in rows {
+        out.push((
+            ends[&id].clone(),
+            LineageHold::Sealed {
+                what: "edge",
+                id,
+                seal: "edge_encryption",
+                group,
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// Every endpoint of `edges` whose entity type has its own tenancy columns
+/// and is not a workflow (`regroup::node_types`: a frame, context,
+/// perspective, community, reasoning trace, ...): `(id, type) -> (table, its
+/// own tuple)`. `epigraph_node_tenancy` answers public for these, so the
+/// edges trigger's meet does not see a group-private one.
+async fn node_tuples(
+    conn: &mut PgConnection,
+    edges: &[EdgeRow],
+) -> anyhow::Result<BTreeMap<(Uuid, String), (String, Tenancy)>> {
+    let nodes = super::regroup::node_types(conn).await?;
+    let mut by_type: BTreeMap<String, BTreeSet<Uuid>> = BTreeMap::new();
+    for e in edges {
+        for (id, ty) in [&e.source, &e.target] {
+            if ty != "workflow" && nodes.contains_key(ty) {
+                by_type.entry(ty.clone()).or_default().insert(*id);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (ty, ids) in by_type {
+        let table = &nodes[&ty];
+        let v: Vec<Uuid> = ids.into_iter().collect();
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
+            "SELECT id, owner_group_id, visibility::text FROM public.\"{table}\" \
+              WHERE id = ANY($1)"
+        ))
+        .bind(&v)
+        .fetch_all(&mut *conn)
+        .await
+        .with_context(|| format!("reading the tenancy of {ty} endpoints"))?;
+        for (id, owner, visibility) in rows {
+            out.insert(
+                (id, ty.clone()),
+                (
+                    table.clone(),
+                    Tenancy {
+                        owner,
+                        visibility,
+                        co_owner: None,
+                    },
+                ),
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// The plan rows of `comps` that are PUBLIC now: every generation of their
 /// lineages; every plan claim but those a narrowing may leave public
 /// ([`Left::may_stay_public`]); the narrowed claims' cascaded rows (an
@@ -2253,26 +2644,33 @@ async fn atlas_epoch(conn: &mut PgConnection) -> anyhow::Result<Option<i64>> {
     ))
 }
 
-/// The `workflows` and `edges` keys an UNSTAMPED `epigraph_app` session reads
-/// among `wf` and `edges` (the claims and cascaded rows go through
-/// `tables::app_readable`).
+/// The `workflows` and `edges` keys an `epigraph_app` session whose read set
+/// is exactly `groups` (empty: UNSTAMPED) reads among `wf` and `edges` (the
+/// claims and cascaded rows go through `tables::app_readable_as`).
 async fn app_readable_wf_edges(
     conn: &mut PgConnection,
     wf: &[Uuid],
     edges: &[Uuid],
+    groups: &[Uuid],
 ) -> anyhow::Result<BTreeSet<RowKey>> {
+    let read_set = groups
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
         .execute(&mut *conn)
         .await
         .context("SET LOCAL SESSION AUTHORIZATION epigraph_app was refused")?;
     let inner = async {
         sqlx::query(
-            "SELECT set_config('epigraph.group_ids', '', true), \
+            "SELECT set_config('epigraph.group_ids', $1, true), \
                     set_config('epigraph.writable_group_ids', '', true), \
                     set_config('epigraph.principal_id', '', true), \
                     set_config('epigraph.elevation_id', '', true), \
                     set_config('epigraph.family_id', '', true)",
         )
+        .bind(&read_set)
         .execute(&mut *conn)
         .await?;
         let bypass: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")
@@ -2315,9 +2713,66 @@ async fn readable(
     wf: &[Uuid],
     edges: &[Uuid],
 ) -> anyhow::Result<BTreeSet<RowKey>> {
-    let mut out = tables::app_readable(conn, specs, claims, keys).await?;
-    out.extend(app_readable_wf_edges(conn, wf, edges).await?);
+    readable_as(conn, specs, claims, keys, wf, edges, &[]).await
+}
+
+/// Every key an application session whose read set is exactly `groups`
+/// reads among these rows (empty `groups`: the unstamped session).
+async fn readable_as(
+    conn: &mut PgConnection,
+    specs: &[TableSpec],
+    claims: &[Uuid],
+    keys: &BTreeSet<RowKey>,
+    wf: &[Uuid],
+    edges: &[Uuid],
+    groups: &[Uuid],
+) -> anyhow::Result<BTreeSet<RowKey>> {
+    let mut out = tables::app_readable_as(conn, specs, claims, keys, groups).await?;
+    out.extend(app_readable_wf_edges(conn, wf, edges, groups).await?);
     Ok(out)
+}
+
+/// A private move's view check: for each of the source and the target, the
+/// keys among `model` (key -> tuple) a reader of ONLY that group reads, by
+/// the tenancy model (a public row, or one whose owner and co-owner are both
+/// that group), must be exactly the keys `db` says such a session reads. A
+/// challenge is left out (migration 168 gates an outsider's on its claim), and
+/// so is every table whose row security is not enforced.
+fn view_violations(
+    when: &str,
+    views: &[(Uuid, BTreeSet<RowKey>)],
+    model: &BTreeMap<RowKey, Tenancy>,
+    unenforced: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut v = Vec::new();
+    let checked = |k: &RowKey| k.0 != "challenges" && !unenforced.contains_key(&k.0);
+    for (g, db) in views {
+        let read: BTreeSet<Uuid> = std::iter::once(*g).collect();
+        let want: BTreeSet<&RowKey> = model
+            .iter()
+            .filter(|(k, t)| {
+                checked(k)
+                    && (t.visibility == PUBLIC || restrict::reader_groups(t).is_subset(&read))
+            })
+            .map(|(k, _)| k)
+            .collect();
+        let got: BTreeSet<&RowKey> = db.iter().filter(|k| checked(k)).collect();
+        for k in want.difference(&got) {
+            v.push(format!(
+                "{when}: a reader of only group {g} cannot read {} {}, which the tenancy model \
+                 says it reads",
+                k.0, k.1
+            ));
+        }
+        for k in got.difference(&want) {
+            v.push(format!(
+                "{when}: a reader of only group {g} reads {} {}, which the tenancy model says it \
+                 cannot",
+                k.0, k.1
+            ));
+        }
+    }
+    v
 }
 
 async fn write_audit(
@@ -2541,6 +2996,17 @@ pub async fn run_batch(
         .await?;
     let lock_claims: Vec<Uuid> = planned.iter().flat_map(|c| c.claim_ids()).collect();
     fetch_claims(conn, &lock_claims, true).await?;
+    if act.from_private {
+        // A seal inserted now would take FOR KEY SHARE on its row: the claims
+        // (and moving edges, below) are locked FOR UPDATE already, and an
+        // UPDATE's own lock does not block it, so the evidence rows are
+        // locked FOR UPDATE too. The re-plan below then reads every seal that
+        // landed since the dry plan, and holds its lineage.
+        sqlx::query("SELECT id FROM evidence WHERE claim_id = ANY($1) ORDER BY id FOR UPDATE")
+            .bind(&lock_claims)
+            .fetch_all(&mut *conn)
+            .await?;
+    }
     tables::lock_unkeyed_tables(conn, ctx.unkeyed).await?;
     let lock_edges: Vec<Uuid> = planned
         .iter()
@@ -2611,6 +3077,31 @@ pub async fn run_batch(
     }
     let readable_before =
         readable(conn, ctx.specs, &claim_ids, &keys, &wf_ids, &all_edge_ids).await?;
+    // A private move: the unstamped view reads none of these private rows, so
+    // it cannot see the move; a reader of only the source and one of only the
+    // target can, and must read exactly what the tenancy model says, before
+    // (proving the model) and after (proving the move).
+    let view_groups: Vec<Uuid> = if act.from_private {
+        vec![act.source, act.target]
+    } else {
+        Vec::new()
+    };
+    let mut views_before = Vec::new();
+    for g in &view_groups {
+        views_before.push((
+            *g,
+            readable_as(
+                conn,
+                ctx.specs,
+                &claim_ids,
+                &keys,
+                &wf_ids,
+                &all_edge_ids,
+                &[*g],
+            )
+            .await?,
+        ));
+    }
     let epoch_before = atlas_epoch(conn).await?;
     let bump_due = tables::layout_epoch_bump_due(conn).await?;
     let counters_before = xact_counters(conn).await?;
@@ -2686,9 +3177,71 @@ pub async fn run_batch(
         .collect();
     let readable_after =
         readable(conn, ctx.specs, &claim_ids, &keys, &wf_ids, &all_edge_ids).await?;
+    let mut views_after = Vec::new();
+    for g in &view_groups {
+        views_after.push((
+            *g,
+            readable_as(
+                conn,
+                ctx.specs,
+                &claim_ids,
+                &keys,
+                &wf_ids,
+                &all_edge_ids,
+                &[*g],
+            )
+            .await?,
+        ));
+    }
 
     // ---- invariants ----
     let mut v = Vec::new();
+    if act.from_private {
+        let mut model_before: BTreeMap<RowKey, Tenancy> = BTreeMap::new();
+        let mut model_after: BTreeMap<RowKey, Tenancy> = BTreeMap::new();
+        for w in comps.iter().flat_map(|c| c.workflows.iter()) {
+            let k = ("workflows".to_string(), w.id.to_string());
+            model_before.insert(k.clone(), w.tenancy.clone());
+            model_after.insert(k, to.clone());
+        }
+        for c in comps.iter().flat_map(|c| c.claims.iter()) {
+            let k = ("claims".to_string(), c.id.to_string());
+            model_before.insert(k.clone(), claim_tenancy(c));
+            model_after.insert(k, to.clone());
+        }
+        for (k, a) in &rows {
+            model_before.insert(k.clone(), a.tenancy.clone());
+            if let Some(p) = rows_post.get(k) {
+                model_after.insert(k.clone(), p.tenancy.clone());
+            }
+        }
+        for (k, a) in &kept_rows {
+            model_before.insert(k.clone(), a.tenancy.clone());
+            model_after.insert(k.clone(), a.tenancy.clone());
+        }
+        for e in &moving {
+            let k = ("edges".to_string(), e.row.id.to_string());
+            model_before.insert(k.clone(), e.row.tenancy.clone());
+            model_after.insert(k, e.post.clone());
+        }
+        for e in &kept_edges {
+            let k = ("edges".to_string(), e.id.to_string());
+            model_before.insert(k.clone(), e.tenancy.clone());
+            model_after.insert(k, e.tenancy.clone());
+        }
+        v.extend(view_violations(
+            "before the move",
+            &views_before,
+            &model_before,
+            ctx.unenforced,
+        ));
+        v.extend(view_violations(
+            "after the move",
+            &views_after,
+            &model_after,
+            ctx.unenforced,
+        ));
+    }
     for (what, n, want) in [
         ("workflows", n_wf, wf_ids.len()),
         ("claims", n_claims, claim_ids.len()),
@@ -2971,7 +3524,7 @@ pub fn exit_code(report: &RunReport, opts: &Options) -> i32 {
     }
 }
 
-fn print_plan(out: &mut dyn std::io::Write, p: &Plan) -> anyhow::Result<usize> {
+fn print_plan(out: &mut dyn std::io::Write, p: &Plan, act: &Act) -> anyhow::Result<usize> {
     for (n, h) in &p.held {
         writeln!(out, "HELD-LINEAGE\t{n}\t{h}")?;
     }
@@ -3007,12 +3560,38 @@ fn print_plan(out: &mut dyn std::io::Write, p: &Plan) -> anyhow::Result<usize> {
             writeln!(out, "LEFT-CLAIM\t{id}\t{why}")?;
         }
         for (id, other) in &c.splits {
-            writeln!(
-                out,
-                "SHARED-SPLIT\t{id}\t{other}\talso executed by the source's public lineage \
-                 {other}, which this list omits: narrowed in separate runs it stays public for \
-                 good; list both lineages in one run, or rule on it"
-            )?;
+            if act.from_private {
+                writeln!(
+                    out,
+                    "SHARED-SPLIT\t{id}\t{other}\talso executed by the source's private lineage \
+                     {other}, which this list omits: moved in separate runs it never moves and \
+                     stays in the source; list both lineages in one run, or rule on it"
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "SHARED-SPLIT\t{id}\t{other}\talso executed by the source's public lineage \
+                     {other}, which this list omits: narrowed in separate runs it stays public \
+                     for good; list both lineages in one run, or rule on it"
+                )?;
+            }
+        }
+        if act.from_private {
+            for e in c.edges.iter().filter(|e| e.post.co_owner.is_some()) {
+                writeln!(
+                    out,
+                    "CO-OWNED-EDGE\t{}\t{} {} -[{}]-> {} {}\t{} -> {}\tits other end stays in \
+                     its group: only a member of both groups reads it",
+                    e.row.id,
+                    e.row.source.1,
+                    e.row.source.0,
+                    e.row.relationship,
+                    e.row.target.1,
+                    e.row.target.0,
+                    tuple_text(&e.row.tenancy),
+                    tuple_text(&e.post)
+                )?;
+            }
         }
         eligible_rows += c.workflows.len();
         claims += c.claims.len();
@@ -3078,6 +3657,7 @@ pub async fn run(
         target,
         visibility: opts.visibility,
         catch_up: opts.catch_up,
+        from_private: opts.from_private,
     };
     tables::probe_session_switch(conn).await?;
     let names_sha256 = sha256_file(&opts.names_file)?;
@@ -3123,7 +3703,7 @@ pub async fn run(
         p.already.len(),
         p.components.len()
     )?;
-    let eligible = print_plan(out, &p)?;
+    let eligible = print_plan(out, &p, &act)?;
     report.eligible_workflow_rows = eligible;
     report.held_hand_off = p
         .held
@@ -3155,21 +3735,40 @@ pub async fn run(
         )?;
     }
     if act.narrows() {
-        writeln!(
-            out,
-            "RULE: only ('public', source) generations and plan claims change (with --catch-up \
-             also a stray generation's own private ones), and each ends ('group', target); the \
-             claims narrow through the tenancy cascade (derived rows, fragments, every edge with \
-             a claim endpoint; another writer's public row joins the claim's group and loses its \
-             writer_owned flag, which the manifest records; pinned evidence keeps its owner); \
-             an edge with no narrowing claim endpoint (a workflow's, or one on a narrowing \
-             step's evidence) is narrowed by this tool to the meet of its endpoints; a plan \
-             claim stays public only when SHARED or not the source's; a row the narrowing \
-             would hand to the target (a private row changing owner, a widening, another \
-             group's public row the database does not take) holds its whole lineage, and an \
-             --apply then exits 3; writer_group_id is not rewritten; the atlas epoch bumps once \
-             per batch that narrows a public row"
-        )?;
+        if act.from_private {
+            writeln!(
+                out,
+                "RULE: a PRIVATE MOVE: only ('group', source) generations and plan claims change, \
+                 each ends ('group', target), whole lineages only; a public generation or unshared \
+                 public plan claim holds its lineage (public input is the public act's), and so does \
+                 a public derived row; the claims move through the tenancy cascade (derived rows, \
+                 fragments, every edge with a claim endpoint); an edge with no moving claim endpoint \
+                 (a workflow's, or one on a moving step's evidence) is written by this tool to the \
+                 meet of its endpoints; an edge to a plan claim that stays (SHARED, or another \
+                 group's) is co-owned by both groups (CO-OWNED-EDGE); a row the move would hand to \
+                 the target that the source does not own (a third group's private row), a widening, \
+                 an edge to a group-private node that does not move, or a SEALED claim, claim \
+                 version, evidence row or edge (its ciphertext stays keyed to its group), holds its \
+                 whole lineage, and an --apply then exits 3; writer_group_id is not rewritten; every batch checks what \
+                 a reader of only the source and of only the target reads, before and after"
+            )?;
+        } else {
+            writeln!(
+                out,
+                "RULE: only ('public', source) generations and plan claims change (with --catch-up \
+                 also a stray generation's own private ones), and each ends ('group', target); the \
+                 claims narrow through the tenancy cascade (derived rows, fragments, every edge with \
+                 a claim endpoint; another writer's public row joins the claim's group and loses its \
+                 writer_owned flag, which the manifest records; pinned evidence keeps its owner); \
+                 an edge with no narrowing claim endpoint (a workflow's, or one on a narrowing \
+                 step's evidence) is narrowed by this tool to the meet of its endpoints; a plan \
+                 claim stays public only when SHARED or not the source's; a row the narrowing \
+                 would hand to the target (a private row changing owner, a widening, another \
+                 group's public row the database does not take) holds its whole lineage, and an \
+                 --apply then exits 3; writer_group_id is not rewritten; the atlas epoch bumps once \
+                 per batch that narrows a public row"
+            )?;
+        }
         if unenforced.is_empty() {
             writeln!(
                 out,
@@ -3208,8 +3807,18 @@ pub async fn run(
             for n in &report.held_hand_off {
                 writeln!(
                     out,
-                    "SHORTFALL\theld\t{n}\tnarrowing it would hand the target a row it must not \
-                     get (its HELD-LINEAGE line); it stays public; exit 3"
+                    "SHORTFALL\theld\t{n}\t{} would hand the target a row it must not get (its \
+                     HELD-LINEAGE line); it stays {}; exit 3",
+                    if act.from_private {
+                        "moving it"
+                    } else {
+                        "narrowing it"
+                    },
+                    if act.from_private {
+                        "where it is"
+                    } else {
+                        "public"
+                    }
                 )?;
             }
         }
@@ -3226,6 +3835,7 @@ pub async fn run(
         "source_group_id": source,
         "target_group_id": target,
         "visibility": act.visibility.as_str(),
+        "from_visibility": act.from_state().visibility,
         "catch_up": act.catch_up,
         "act": act.name(),
         "created_at": chrono::Utc::now().to_rfc3339(),
@@ -3255,6 +3865,7 @@ pub async fn run(
         "command": "reown-workflows",
         "act": act.name(),
         "visibility": act.visibility.as_str(),
+        "from_visibility": act.from_state().visibility,
         "catch_up": act.catch_up,
         "behavioral_executions_unhidden": report.behavioral_rows,
         "ruling": opts.ruling,
@@ -3421,8 +4032,18 @@ pub async fn run(
         for n in &report.held_hand_off {
             writeln!(
                 out,
-                "SHORTFALL\theld\t{n}\tnarrowing it would hand the target a row it must not get \
-                 (its HELD-LINEAGE line); it stays public"
+                "SHORTFALL\theld\t{n}\t{} would hand the target a row it must not get (its \
+                 HELD-LINEAGE line); it stays {}",
+                if act.from_private {
+                    "moving it"
+                } else {
+                    "narrowing it"
+                },
+                if act.from_private {
+                    "where it is"
+                } else {
+                    "public"
+                }
             )?;
         }
         if !report.left_public.is_empty() {
@@ -3648,6 +4269,14 @@ pub async fn reverse_manifest(
             .get("catch_up")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // Absent in a manifest written before the private move existed: the
+        // public act.
+        from_private: parse_from_visibility(
+            m.header
+                .get("from_visibility")
+                .and_then(Value::as_str)
+                .unwrap_or("public"),
+        )?,
     };
     let rec = read_records(m, &specs, path)?;
     let (wf_ids, claim_ids, edge_ids) = (
@@ -4042,6 +4671,29 @@ async fn reverse_tx(
     {
         held.push((ev, format!("evidence {ev} has been sealed since the run")));
     }
+    for c in sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT claim_id FROM claim_version_encryption WHERE claim_id = ANY($1)",
+    )
+    .bind(&claim_ids)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        held.push((
+            c,
+            format!("claim {c} has a version sealed since the run (claim_version_encryption)"),
+        ));
+    }
+    for e in
+        sqlx::query_scalar::<_, Uuid>("SELECT edge_id FROM edge_encryption WHERE edge_id = ANY($1)")
+            .bind(&edge_ids)
+            .fetch_all(&mut *conn)
+            .await?
+    {
+        held.push((
+            e,
+            format!("edge {e} has been sealed since the run (edge_encryption)"),
+        ));
+    }
     if !held.is_empty() {
         return Ok(RevOutcome::Held(held));
     }
@@ -4092,7 +4744,9 @@ async fn reverse_tx(
     .context("restoring workflows")?
     .rows_affected();
     // The one widening statement on claims (074's guard), armed around it only.
-    let widens = act.narrows();
+    // A private move's reversal moves claims group to group: it widens no
+    // claim, so the guard stays unarmed.
+    let widens = act.narrows() && !act.from_private;
     if widens {
         sqlx::query("SELECT set_config('epigraph.allow_declassify', 'yes', true)")
             .execute(&mut *conn)
@@ -4326,6 +4980,7 @@ mod tests {
             reason: "why".into(),
             visibility: Visibility::Keep,
             catch_up: false,
+            from_private: false,
             after_manifests: Vec::new(),
             batch_size: 25,
             lock_timeout: "5s".into(),
@@ -4459,6 +5114,7 @@ mod tests {
             target: t,
             visibility: Visibility::Keep,
             catch_up: false,
+            from_private: false,
         };
         assert_eq!(mv.to_state().visibility, "public");
         assert_eq!(mv.name(), "MOVE");
@@ -4504,6 +5160,7 @@ mod tests {
             target: Uuid::from_u128(2),
             visibility: Visibility::Group,
             catch_up: false,
+            from_private: false,
         };
         let held = |prior: Tenancy, post: Tenancy, taken: bool| {
             hand_off(&act, &prior, &post, taken, false).is_some()
@@ -4538,6 +5195,72 @@ mod tests {
         assert!(held_own(t(1, "group", None), t(2, "group", Some(1))));
         assert!(held_own(t(3, "group", None), t(2, "group", None)));
         assert!(held_own(t(1, "group", Some(3)), t(2, "group", None)));
+    }
+
+    #[test]
+    fn a_private_move_takes_the_sources_private_rows_and_holds_the_rest() {
+        // source 1, target 2, a third group 3.
+        let act = Act {
+            source: Uuid::from_u128(1),
+            target: Uuid::from_u128(2),
+            visibility: Visibility::Group,
+            catch_up: false,
+            from_private: true,
+        };
+        assert_eq!(act.from_state(), t(1, "group", None));
+        assert_eq!(act.to_state(), t(2, "group", None));
+        assert_eq!(act.name(), "PRIVATE-MOVE");
+        let held = |prior: Tenancy, post: Tenancy| hand_off(&act, &prior, &post, true, false);
+        // The source's private row, into the target: the act itself.
+        assert!(held(t(1, "group", None), t(2, "group", None)).is_none());
+        // Co-owned with a group that stays (a shared claim's edge): kept.
+        assert!(held(t(1, "group", None), t(2, "group", Some(1))).is_none());
+        assert!(held(t(2, "group", Some(3)), t(2, "group", Some(3))).is_none());
+        assert!(held(t(1, "group", Some(3)), t(2, "group", Some(3))).is_none());
+        // ...but dropping a co-owner the row requires is a widening: held.
+        assert!(held(t(1, "group", Some(3)), t(2, "group", None)).is_some());
+        // A third group's private row: held.
+        assert!(held(t(3, "group", None), t(2, "group", None)).is_some());
+        assert!(held(t(3, "group", Some(1)), t(2, "group", Some(3))).is_some());
+        // Never to public.
+        assert!(held(t(1, "group", None), t(2, "public", None)).is_some());
+        // The public act's rule does not change: a source-private row is held
+        // there.
+        let public_act = Act {
+            from_private: false,
+            ..act
+        };
+        assert!(hand_off(
+            &public_act,
+            &t(1, "group", None),
+            &t(2, "group", None),
+            true,
+            false
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_private_move_needs_group_visibility_and_no_catch_up() {
+        assert!(parse_from_visibility("group").unwrap());
+        assert!(!parse_from_visibility("public").unwrap());
+        assert!(parse_from_visibility("private").is_err());
+        let private = Options {
+            from_private: true,
+            visibility: Visibility::Group,
+            ..opts()
+        };
+        validate(&private).unwrap();
+        let keep = Options {
+            visibility: Visibility::Keep,
+            ..private.clone()
+        };
+        assert!(validate(&keep).is_err());
+        let cu = Options {
+            catch_up: true,
+            ..private
+        };
+        assert!(validate(&cu).is_err());
     }
 
     #[test]
