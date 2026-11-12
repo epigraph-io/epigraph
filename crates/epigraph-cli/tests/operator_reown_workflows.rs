@@ -3415,6 +3415,191 @@ async fn a_private_move_holds_a_lineage_carrying_a_third_groups_row(pool: PgPool
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Where a sealed row sits on alpha's plan.
+#[derive(Clone, Copy, Debug)]
+enum Seal {
+    /// `claim_encryption` on the step S2.
+    Claim,
+    /// `evidence_encryption` on S1's evidence.
+    Evidence,
+    /// `edge_encryption` on the plan edge P -> S2.
+    Edge,
+    /// `claim_version_encryption` on a version of S2.
+    ClaimVersion,
+}
+
+/// Seal one row of alpha's plan under the source's key epoch 0; returns the
+/// id the hold must name and the (table, row) whose tuple must not change.
+async fn seal(pool: &PgPool, fx: &Fx, how: Seal) -> (Uuid, &'static str, Uuid) {
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(fx.src)
+    .execute(pool)
+    .await
+    .expect("the source's key epoch");
+    match how {
+        Seal::Claim => {
+            sqlx::query(
+                "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                               encrypted_content) \
+                 VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+            )
+            .bind(fx.s2)
+            .bind(fx.src)
+            .execute(pool)
+            .await
+            .expect("seal S2");
+            (fx.s2, "claims", fx.s2)
+        }
+        Seal::Evidence => {
+            sqlx::query(
+                "INSERT INTO evidence_encryption (evidence_id, group_id, epoch, privacy_tier, \
+                                                  encrypted_content) \
+                 VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+            )
+            .bind(fx.ev_s1)
+            .bind(fx.src)
+            .execute(pool)
+            .await
+            .expect("seal S1's evidence");
+            (fx.ev_s1, "evidence", fx.ev_s1)
+        }
+        Seal::Edge => {
+            let e = fx.plan_edges[2];
+            sqlx::query(
+                "INSERT INTO edge_encryption (edge_id, group_id, epoch, privacy_tier, \
+                                              encrypted_labels) \
+                 VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+            )
+            .bind(e)
+            .bind(fx.src)
+            .execute(pool)
+            .await
+            .expect("seal the edge P -> S2");
+            (e, "edges", e)
+        }
+        Seal::ClaimVersion => {
+            let v: Uuid = sqlx::query_scalar(
+                "INSERT INTO claim_versions (claim_id, version_number, content, truth_value) \
+                 VALUES ($1, 1, 'alpha step two, version 1', 0.7) RETURNING id",
+            )
+            .bind(fx.s2)
+            .fetch_one(pool)
+            .await
+            .expect("a version of S2");
+            sqlx::query(
+                "INSERT INTO claim_version_encryption (claim_version_id, claim_id, group_id, \
+                                                       epoch, encrypted_content) \
+                 VALUES ($1, $2, $3, 0, ''::bytea)",
+            )
+            .bind(v)
+            .bind(fx.s2)
+            .bind(fx.src)
+            .execute(pool)
+            .await
+            .expect("seal S2's version");
+            (fx.s2, "claims", fx.s2)
+        }
+    }
+}
+
+/// A sealed row on a moving plan: its ciphertext is keyed to the SOURCE, and
+/// the move would not re-key it, so the target's members would get rows they
+/// cannot decrypt (and the reversal would refuse it for good). The dry run
+/// HOLDS the lineage and names the sealed row; nothing of alpha moves, an
+/// `--apply` with the dry run's count moves beta only and exits 3, and the
+/// reversal restores every row exactly.
+async fn a_private_move_holds_a_sealed(pool: PgPool, how: Seal) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let (named, table, row) = seal(&pool, &fx, how).await;
+    let private = (fx.src, "group".to_string());
+    assert_eq!(tenancy(&pool, table, row).await, private, "{how:?}");
+    let before = snapshot(&pool).await;
+    let m = dir.join("private.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{how:?}: {}", dry.show());
+    assert!(
+        line_with(
+            &dry.stdout,
+            "HELD-LINEAGE\talpha\t",
+            &[&named.to_string(), "sealed"]
+        ),
+        "{how:?}: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{how:?}: {}",
+        dry.show()
+    );
+    assert_eq!(snapshot(&pool).await, before, "a dry run writes nothing");
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        Some("1"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 3, "{how:?}: {}", r.show());
+    assert!(
+        line_with(&r.stdout, "SHORTFALL\theld\talpha", &[]),
+        "{how:?}: {}",
+        r.show()
+    );
+    for w in [fx.w_a0, fx.w_a1] {
+        assert_eq!(tenancy(&pool, "workflows", w).await, private, "{how:?}");
+    }
+    assert_eq!(tenancy(&pool, table, row).await, private, "{how:?}");
+    assert_eq!(
+        tenancy(&pool, "workflows", fx.w_b0).await,
+        (fx.target, "group".to_string())
+    );
+    let rev = reverse(&pool, &m, true).await;
+    assert_eq!(rev.code, 0, "{how:?}: {}", rev.show());
+    assert_eq!(snapshot(&pool).await, before, "{how:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_lineage_with_a_sealed_plan_claim(pool: PgPool) {
+    a_private_move_holds_a_sealed(pool, Seal::Claim).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_lineage_with_sealed_evidence(pool: PgPool) {
+    a_private_move_holds_a_sealed(pool, Seal::Evidence).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_lineage_with_a_sealed_plan_edge(pool: PgPool) {
+    a_private_move_holds_a_sealed(pool, Seal::Edge).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_lineage_with_a_sealed_claim_version(pool: PgPool) {
+    a_private_move_holds_a_sealed(pool, Seal::ClaimVersion).await;
+}
+
 /// A private lineage `name`, one generation executing one claim, both
 /// `('group', g)`, written on the maintenance pool. Returns (workflow, claim).
 async fn private_lineage(pool: &PgPool, author: Uuid, g: Uuid, name: &str) -> (Uuid, Uuid) {

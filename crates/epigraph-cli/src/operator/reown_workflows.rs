@@ -61,6 +61,15 @@
 //! it. `--catch-up` is refused. It is the public act's machinery with the
 //! FROM state `('group', source)`:
 //!
+//! * a SEALED row holds its lineage (`LineageHold::Sealed`): a plan claim
+//!   with a `claim_encryption` row or a sealed version
+//!   (`claim_version_encryption`), an evidence row of one with an
+//!   `evidence_encryption` row, or a moving edge with an `edge_encryption`
+//!   row. Its ciphertext is keyed to the group that sealed it and a move does
+//!   not re-key it, so ciphertext never leaves that group; an `--apply` then
+//!   exits 3. Each batch locks the moving claims, edges and evidence rows
+//!   `FOR UPDATE` (which blocks a new seal's foreign key) and re-plans, so a
+//!   seal that lands after the dry run holds too;
 //! * a generation or an unshared plan claim that is PUBLIC is public input,
 //!   the public act's to narrow first: a public generation holds its lineage
 //!   (`PublicInput`), and an unshared public plan claim, or a public derived
@@ -843,6 +852,20 @@ pub enum LineageHold {
         post: String,
         why: &'static str,
     },
+    /// (A private move only.) A row of the plan is SEALED: its ciphertext
+    /// (`seal`, keyed to the group that sealed it) does not move with the
+    /// row, so the target's members would get a row they cannot decrypt and
+    /// the source's would lose one they can. Holds every lineage joined to
+    /// it, and an `--apply` exits 3, as a hand-off does.
+    Sealed {
+        /// `claim`, `evidence` or `edge`.
+        what: &'static str,
+        id: Uuid,
+        /// The table holding the ciphertext.
+        seal: &'static str,
+        /// The group its key epoch belongs to.
+        group: Uuid,
+    },
 }
 
 impl LineageHold {
@@ -850,7 +873,7 @@ impl LineageHold {
     /// the narrowing's own rule: an `--apply` with one exits 3.
     #[must_use]
     pub fn is_hand_off(&self) -> bool {
-        matches!(self, Self::HandOff { .. })
+        matches!(self, Self::HandOff { .. } | Self::Sealed { .. })
     }
 }
 
@@ -929,6 +952,17 @@ impl fmt::Display for LineageHold {
                 f,
                 "{table} {id} is {prior}; narrowing this plan would make it {post}, and {why}; \
                  the whole lineage stays (an --apply exits 3)"
+            ),
+            Self::Sealed {
+                what,
+                id,
+                seal,
+                group,
+            } => write!(
+                f,
+                "{what} {id} is sealed ({seal}, keyed to group {group}): a move does not re-key \
+                 its ciphertext, so the target's members could not decrypt it; ciphertext never \
+                 leaves the group it is keyed to, and the whole lineage stays (an --apply exits 3)"
             ),
         }
     }
@@ -2004,6 +2038,11 @@ pub async fn plan(
         kept_edges = n.kept;
         ev_edges = n.ev_edges;
         hand_offs = n.hand_offs;
+        if act.from_private {
+            // Every plan claim the move started from (step members
+            // included), every evidence row of one, every moving edge.
+            hand_offs.extend(sealed_holds(conn, &cand, &ev_claim, &moving_edges).await?);
+        }
         for id in &public_input {
             hand_offs.push((
                 vec![*id],
@@ -2400,6 +2439,92 @@ async fn workflow_tenancy(
             )
         })
         .collect())
+}
+
+/// A private move's sealed rows, each a hold anchored on its plan claim (or a
+/// moving edge's endpoints): a claim among `claims` with a `claim_encryption`
+/// row or a sealed version (`claim_version_encryption`), an evidence row of
+/// `evidence` (evidence id -> its claim) with an `evidence_encryption` row,
+/// and a moving edge with an `edge_encryption` row. The ciphertext stays keyed
+/// to its group whatever the row's tuple becomes (`regroup-claims` holds the
+/// same claims and evidence, `Hold::Sealed`/`Hold::SealedEvidence`).
+async fn sealed_holds(
+    conn: &mut PgConnection,
+    claims: &[Uuid],
+    evidence: &BTreeMap<Uuid, Uuid>,
+    edges: &[MovingEdge],
+) -> anyhow::Result<Vec<(Vec<Uuid>, LineageHold)>> {
+    let mut out = Vec::new();
+    for (seal, sql) in [
+        (
+            "claim_encryption",
+            "SELECT claim_id, group_id FROM claim_encryption WHERE claim_id = ANY($1)",
+        ),
+        (
+            "claim_version_encryption",
+            "SELECT DISTINCT ON (claim_id) claim_id, group_id FROM claim_version_encryption \
+              WHERE claim_id = ANY($1) ORDER BY claim_id, group_id",
+        ),
+    ] {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(sql)
+            .bind(claims)
+            .fetch_all(&mut *conn)
+            .await
+            .with_context(|| format!("reading {seal}"))?;
+        for (id, group) in rows {
+            out.push((
+                vec![id],
+                LineageHold::Sealed {
+                    what: "claim",
+                    id,
+                    seal,
+                    group,
+                },
+            ));
+        }
+    }
+    let ev: Vec<Uuid> = evidence.keys().copied().collect();
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT evidence_id, group_id FROM evidence_encryption WHERE evidence_id = ANY($1)",
+    )
+    .bind(&ev)
+    .fetch_all(&mut *conn)
+    .await
+    .context("reading evidence_encryption")?;
+    for (id, group) in rows {
+        out.push((
+            vec![evidence[&id]],
+            LineageHold::Sealed {
+                what: "evidence",
+                id,
+                seal: "evidence_encryption",
+                group,
+            },
+        ));
+    }
+    let ends: BTreeMap<Uuid, Vec<Uuid>> = edges
+        .iter()
+        .map(|e| (e.row.id, vec![e.row.source.0, e.row.target.0]))
+        .collect();
+    let ids: Vec<Uuid> = ends.keys().copied().collect();
+    let rows: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT edge_id, group_id FROM edge_encryption WHERE edge_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *conn)
+            .await
+            .context("reading edge_encryption")?;
+    for (id, group) in rows {
+        out.push((
+            ends[&id].clone(),
+            LineageHold::Sealed {
+                what: "edge",
+                id,
+                seal: "edge_encryption",
+                group,
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// Every endpoint of `edges` whose entity type has its own tenancy columns
@@ -2914,6 +3039,17 @@ pub async fn run_batch(
         .await?;
     let lock_claims: Vec<Uuid> = planned.iter().flat_map(|c| c.claim_ids()).collect();
     fetch_claims(conn, &lock_claims, true).await?;
+    if act.from_private {
+        // A seal inserted now would take FOR KEY SHARE on its row: the claims
+        // (and moving edges, below) are locked FOR UPDATE already, and an
+        // UPDATE's own lock does not block it, so the evidence rows are
+        // locked FOR UPDATE too. The re-plan below then reads every seal that
+        // landed since the dry plan, and holds its lineage.
+        sqlx::query("SELECT id FROM evidence WHERE claim_id = ANY($1) ORDER BY id FOR UPDATE")
+            .bind(&lock_claims)
+            .fetch_all(&mut *conn)
+            .await?;
+    }
     tables::lock_unkeyed_tables(conn, ctx.unkeyed).await?;
     let lock_edges: Vec<Uuid> = planned
         .iter()
@@ -3654,8 +3790,9 @@ pub async fn run(
                  meet of its endpoints; an edge to a plan claim that stays (SHARED, or another \
                  group's) is co-owned by both groups (CO-OWNED-EDGE); a row the move would hand to \
                  the target that the source does not own (a third group's private row), a widening, \
-                 or an edge to a group-private node that does not move, holds its whole lineage, and \
-                 an --apply then exits 3; writer_group_id is not rewritten; every batch checks what \
+                 an edge to a group-private node that does not move, or a SEALED claim, claim \
+                 version, evidence row or edge (its ciphertext stays keyed to its group), holds its \
+                 whole lineage, and an --apply then exits 3; writer_group_id is not rewritten; every batch checks what \
                  a reader of only the source and of only the target reads, before and after"
             )?;
         } else {
