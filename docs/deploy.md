@@ -2588,6 +2588,15 @@ records refuses the plan from the moment the move commits until its pins
 record the target. A non-member principal the client uses to prove that
 outsiders see nothing must NOT be a member of the target.
 
+0. Build the lineage list from what the client has pinned, not from memory:
+   every pinned root and every child generation a root names. A root that
+   names its children only in its own content (no `executes` or `variant_of`
+   edge between them) does not join them in the plan, so a child missing
+   from the list stays in the source and the root's check refuses it at the
+   next fire. If the client binds ONE owner group per schedule owner, every
+   pinned lineage of that owner must be in this one act: re-pointing the
+   owner's group breaks any of its pins left behind. `--confirm-count` is
+   the dry run's `ELIGIBLE-WORKFLOW-ROWS` (generations, not lineages).
 1. Before the move, add the reader principal's agent to the target group
    (`epigraph-operator group-member add --group <target> --agent <reader agent>
    --role reader --reason "<why>" --apply`; an operated agent is a member only
