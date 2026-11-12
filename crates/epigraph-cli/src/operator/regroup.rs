@@ -123,8 +123,12 @@
 //! groups. The target must be an active `team` or `community` group, or the
 //! operator's OWN personal group (the one carrying the operator's personal
 //! did_key, created by the operator; never another person's, nor an operated
-//! agent's: see [`check_private_target`]); neither group may be the world or
-//! seed group; source and target differ. There is no
+//! agent's: see [`check_private_target`]). The SOURCE is held to the same
+//! rule ([`check_private_source`]): an active `team` or `community` group, or
+//! the operator's own personal group; another person's personal group and an
+//! operated agent's never give up their claims, whoever administers them.
+//! Neither group may be the world or seed group; source and target differ.
+//! There is no
 //! other operator identity: `restrict-claims` authorizes by the target's
 //! admin, and this verb adds the source's admin and the human registry.
 //!
@@ -677,6 +681,59 @@ pub async fn own_personal_group(
     })
 }
 
+/// The SOURCE of a group-to-group move of private rows (`regroup-claims`, a
+/// private `reown-workflows` move), checked: an ACTIVE `team` or `community`
+/// group, or the operator's own personal group ([`own_personal_group`]: the
+/// operator a registered human). The caller checks that the operator is a
+/// live admin of it and that it is not the world or seed group; `flag` names
+/// the option the source came from, for the refusal.
+///
+/// Another person's personal group and an operated agent's are refused
+/// whoever administers them: their private rows never leave them through
+/// this verb, into the operator's own group or into a team.
+///
+/// # Errors
+/// The group is missing, not active, of another kind, or a personal group
+/// that is not the operator's own.
+pub async fn check_private_source(
+    conn: &mut PgConnection,
+    source: Uuid,
+    operator: Uuid,
+    flag: &str,
+) -> anyhow::Result<()> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT kind::text, status::text FROM groups WHERE id = $1")
+            .bind(source)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((kind, status)) = row else {
+        bail!("{flag} {source}: no such group; refusing");
+    };
+    if status != "active" {
+        bail!("{flag} {source} has status {status:?}, not active; refusing");
+    }
+    match kind.as_str() {
+        "team" | "community" => Ok(()),
+        "personal" => {
+            if own_personal_group(conn, operator).await? != Some(source) {
+                bail!(
+                    "{flag} {source} is a personal group that is not the operator's own \
+                     personal group (did:epigraph:personal:{operator}, created by the operator, \
+                     a registered human operator); refusing: a group-to-group move takes \
+                     private rows only out of a team or community group the operator \
+                     administers, or out of the operator's own personal group, never out of \
+                     another person's or an operated agent's"
+                );
+            }
+            Ok(())
+        }
+        other => bail!(
+            "{flag} {source} is kind {other}, not a team or community group nor the operator's \
+             own personal group; refusing"
+        ),
+    }
+}
+
 /// The target of a group-to-group move, checked: an active group the
 /// operator is a live admin of ([`super::restrict::check_target`], which also
 /// refuses the world and seed groups), of kind `team` or `community`, or the
@@ -724,7 +781,8 @@ pub async fn check_private_target(
 /// target's kind.
 ///
 /// # Errors
-/// Either group is missing, world or seed; the target is not one
+/// Either group is missing, world or seed; the source is not one
+/// [`check_private_source`] accepts, nor the target one
 /// [`check_private_target`] accepts; the operator is not a registered human
 /// operator or not a live admin of both groups.
 pub async fn check_groups(
@@ -759,6 +817,10 @@ pub async fn check_groups(
              a person's act)"
         );
     }
+    // The rows are private on both sides: the source is held to the target's
+    // rule, so another person's or an operated agent's personal group never
+    // gives up its claims, whoever administers it.
+    check_private_source(conn, source, operator, "--source-group").await?;
     let kind = check_private_target(conn, target, operator).await?;
     let admin: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM group_memberships \

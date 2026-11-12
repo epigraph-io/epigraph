@@ -1228,6 +1228,94 @@ async fn an_operated_agents_personal_group_is_refused_even_to_its_operator(pool:
     refused_personal_target(&pool, &fx, agents_group).await;
 }
 
+/// The SOURCE is held to the target's rule: an active team or community group
+/// the operator administers, or the operator's OWN personal group. Another
+/// person's personal group and an operated agent's are refused as
+/// `--source-group` even though the operator administers both (so the
+/// refusal comes from whose group it is, not from the admin check), into the
+/// operator's own personal group and into a team alike. Each holds a claim the
+/// run would otherwise move, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_or_an_operated_agents_personal_group_is_refused_as_source(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (person, theirs) = fixture::seed_human_operator(&pool, "another person").await;
+    admin_of(&pool, theirs, fx.operator).await;
+    let (agent, agents_group) = fixture::seed_agent_with_group(&pool, "operated agent").await;
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(agent)
+        .bind(fx.operator)
+        .execute(&pool)
+        .await
+        .expect("link the agent to the operator");
+    admin_of(&pool, agents_group, fx.operator).await;
+    let c_theirs =
+        fixture::seed_group_claim(&pool, person, theirs, "another person's private claim").await;
+    let c_agent =
+        fixture::seed_group_claim(&pool, agent, agents_group, "an operated agent's claim").await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, false).await;
+    let cases = [
+        (theirs, c_theirs, fx.operator_group),
+        (theirs, c_theirs, fx.dst),
+        (agents_group, c_agent, fx.operator_group),
+    ];
+    for (i, (src, claim, dst)) in cases.into_iter().enumerate() {
+        let ids = ids_file(&dir, &format!("ids{i}.txt"), &[claim]);
+        let mf = dir.join(format!("m{i}.jsonl"));
+        let r = regroup(
+            &pool,
+            Regroup {
+                ids: &ids,
+                src,
+                dst,
+                operator: fx.operator,
+                manifest: &mf,
+                apply_count: Some(1),
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(r.code, 1, "case {i}: {}", r.show());
+        assert!(
+            r.stderr.contains("--source-group")
+                && r.stderr.contains("not the operator's own personal group"),
+            "case {i}: {}",
+            r.show()
+        );
+        assert!(!mf.exists(), "case {i}");
+        assert_eq!(row(&pool, "claims", claim).await, grp(src), "case {i}");
+    }
+    assert_same(&before, &snapshot(&pool, false).await, "refused sources");
+    assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// The operator's OWN personal group is a source: a claim moved into it is
+/// moved out of it again into a team.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operators_own_personal_group_is_a_source(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let g = fx.operator_group;
+    for (i, (src, dst)) in [(fx.src, g), (g, fx.dst)].into_iter().enumerate() {
+        let r = regroup(
+            &pool,
+            Regroup {
+                ids: &ids,
+                src,
+                dst,
+                operator: fx.operator,
+                manifest: &dir.join(format!("m{i}.jsonl")),
+                apply_count: Some(1),
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(r.code, 0, "step {i}: {}", r.show());
+        assert_eq!(row(&pool, "claims", fx.a).await, grp(dst), "step {i}");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Reverse and re-run
 // ─────────────────────────────────────────────────────────────────────────────
