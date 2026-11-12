@@ -3670,3 +3670,116 @@ async fn a_private_move_holds_a_lineage_with_an_edge_to_a_private_node_that_stay
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The operator sequence for legacy claims a team holds (operator ruling,
+/// 2026-11-12): alpha's thesis supersedes a legacy flat workflow claim L that
+/// is group-private in a science team. Narrowing alpha in place in the
+/// operator's personal group would hand the team's private edge to the
+/// operator's group, so the narrowing HOLDS alpha (exit 3). `regroup-claims`
+/// moves L into the operator's OWN personal group; the same narrowing then
+/// takes alpha whole, and the edge ends private to the operator's group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_claim_regrouped_into_the_personal_group_lets_its_superseder_narrow(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let science = team_group(&pool, "science team", fx.operator, "admin").await;
+    let (legacy, e_sup) = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let l = claim(
+            &mut m,
+            fx.operator,
+            science,
+            "group",
+            0,
+            "a legacy flat workflow",
+        )
+        .await;
+        let e = edge(&mut m, (fx.t, "claim"), (l, "claim"), "supersedes").await;
+        (l, e)
+    };
+    assert_eq!(
+        edge_tenancy(&pool, e_sup).await,
+        (science, "group".to_string(), None)
+    );
+    let dir = scratch_dir();
+    let held = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &dir.join("narrow-held.jsonl"),
+        &["alpha"],
+        fx.src,
+        None,
+        Some("0"),
+        GROUP,
+    )
+    .await;
+    assert_eq!(held.code, 3, "{}", held.show());
+    assert!(
+        line_with(&held.stdout, "HELD-LINEAGE\talpha\t", &[&e_sup.to_string()]),
+        "{}",
+        held.show()
+    );
+
+    let ids = dir.join("legacy.txt");
+    std::fs::write(&ids, format!("{legacy}\n")).expect("ids file");
+    let (science_s, src_s, op_s) = (
+        science.to_string(),
+        fx.src.to_string(),
+        fx.operator.to_string(),
+    );
+    let regroup_manifest = dir.join("regroup.jsonl");
+    let rg = run_op(
+        &pool,
+        &[
+            "regroup-claims",
+            "--claims-file",
+            ids.to_str().unwrap(),
+            "--source-group",
+            &science_s,
+            "--target-group",
+            &src_s,
+            "--operator",
+            &op_s,
+            "--manifest-out",
+            regroup_manifest.to_str().unwrap(),
+            "--apply",
+            "--confirm-count",
+            "1",
+            "--ruling",
+            RULING,
+            "--reason",
+            "the legacy claims go private to the operator",
+        ],
+    )
+    .await;
+    assert_eq!(rg.code, 0, "{}", rg.show());
+    assert_eq!(
+        tenancy(&pool, "claims", legacy).await,
+        (fx.src, "group".to_string())
+    );
+
+    let narrow = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &dir.join("narrow.jsonl"),
+        &["alpha"],
+        fx.src,
+        None,
+        Some("2"),
+        GROUP,
+    )
+    .await;
+    assert_eq!(narrow.code, 0, "{}", narrow.show());
+    for w in [fx.w_a0, fx.w_a1] {
+        assert_eq!(
+            tenancy(&pool, "workflows", w).await,
+            (fx.src, "group".to_string())
+        );
+    }
+    assert_eq!(
+        edge_tenancy(&pool, e_sup).await,
+        (fx.src, "group".to_string(), None)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
