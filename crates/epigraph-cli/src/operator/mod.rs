@@ -29,9 +29,10 @@
 //!   plan claims they execute, the rows those carry, and their plan edges) out
 //!   of a source group into a TEAM group the operator administers, keeping
 //!   every row's visibility or narrowing it to the team; or narrow them in
-//!   place within their owner group (see [`reown_workflows`]). `reown-reverse`
-//!   reverses its manifest exactly, or refuses it whole when the plan changed
-//!   or grew since.
+//!   place within their owner group; or, with `--from-visibility group`, move
+//!   lineages that are already group-private to another group, private (see
+//!   [`reown_workflows`]). `reown-reverse` reverses its manifest exactly, or
+//!   refuses it whole when the plan changed or grew since.
 //!
 //! And the operator-binding commands (migration 122; see [`bind`]):
 //!

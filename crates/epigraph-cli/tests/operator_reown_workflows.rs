@@ -2961,3 +2961,712 @@ async fn catch_up_in_a_move_holds_a_public_generation_beside_a_native_target_one
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A private move: ('group', source) -> ('group', target)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PRIVATE: &[&str] = &["--from-visibility", "group", "--visibility", "group"];
+
+/// A run of `names` with `extra` arguments into `target`: an `--apply`
+/// confirming `confirm` when given, else a dry run. `from` is `--from-group`
+/// (the operator's personal group when `None`).
+#[allow(clippy::too_many_arguments)]
+async fn run_names(
+    pool: &PgPool,
+    fx: &Fx,
+    dir: &Path,
+    manifest: &Path,
+    names: &[&str],
+    target: Uuid,
+    from: Option<Uuid>,
+    confirm: Option<&str>,
+    extra: &[&str],
+) -> Run {
+    let file = names_file(dir, names);
+    let target = target.to_string();
+    let operator = fx.operator.to_string();
+    let from = from.map(|g| g.to_string());
+    let mut args = vec![
+        "reown-workflows",
+        "--canonical-names-file",
+        file.to_str().unwrap(),
+        "--target-group",
+        &target,
+        "--operator",
+        &operator,
+        "--manifest-out",
+        manifest.to_str().unwrap(),
+    ];
+    if let Some(g) = from.as_deref() {
+        args.extend(["--from-group", g]);
+    }
+    if let Some(n) = confirm {
+        args.extend([
+            "--apply",
+            "--confirm-count",
+            n,
+            "--ruling",
+            RULING,
+            "--reason",
+            "the plans move with the team that runs them",
+        ]);
+    }
+    args.extend(extra.iter().copied());
+    run_op(pool, &args).await
+}
+
+/// The setup every private-move test starts from: alpha and beta narrowed IN
+/// PLACE by the real narrowing act, so their generations, plan claims, rows
+/// and plan edges are in the source's private state exactly as that act
+/// leaves them (nothing hand-forged).
+async fn narrowed(pool: &PgPool, fx: &Fx, dir: &Path) {
+    let m = dir.join("narrow-in-place.jsonl");
+    let r = run_names(
+        pool,
+        fx,
+        dir,
+        &m,
+        &["alpha", "beta"],
+        fx.src,
+        None,
+        Some("3"),
+        GROUP,
+    )
+    .await;
+    assert_eq!(r.code, 0, "the in-place narrowing: {}", r.show());
+    let private = (fx.src, "group".to_string());
+    for w in [fx.w_a0, fx.w_a1, fx.w_b0] {
+        assert_eq!(tenancy(pool, "workflows", w).await, private);
+    }
+    assert_eq!(tenancy(pool, "claims", fx.s2).await, private);
+}
+
+/// The ids among `ids` of `table` an `epigraph_app` session whose read set
+/// is exactly `groups` reads.
+async fn reads_as(pool: &PgPool, groups: &[Uuid], table: &str, ids: &[Uuid]) -> Vec<Uuid> {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
+        .execute(&mut *tx)
+        .await
+        .expect("become epigraph_app");
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, true), \
+                set_config('epigraph.writable_group_ids', '', true), \
+                set_config('epigraph.principal_id', '', true)",
+    )
+    .bind(csv(groups))
+    .execute(&mut *tx)
+    .await
+    .expect("stamp");
+    let mut out: Vec<Uuid> = sqlx::query_scalar(&format!(
+        "SELECT id FROM {table} WHERE id = ANY($1) ORDER BY id"
+    ))
+    .bind(ids)
+    .fetch_all(&mut *tx)
+    .await
+    .expect("read as epigraph_app");
+    tx.rollback().await.expect("rollback");
+    out.sort();
+    out
+}
+
+fn sorted(mut v: Vec<Uuid>) -> Vec<Uuid> {
+    v.sort();
+    v
+}
+
+/// A self-contained private plan moves between groups and back: alpha and
+/// beta, narrowed in place in the operator's personal group, move to a team
+/// (the default source), then from that team to a second team
+/// (`--from-group`), then from the second team into the operator's OWN
+/// personal group. Each hop moves every generation, plan claim, row and plan
+/// edge from `('group', source)` to `('group', target)`, never touches a
+/// public row (the shared step X stays public), keeps the edge to the private
+/// note PN co-owned with PN's group, never moves the atlas epoch, and is
+/// readable by exactly the target's members. Reversing the three manifests
+/// (newest first) restores every row exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_carries_a_narrowed_plan_between_groups_and_reverses_exactly(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let team2 = team_group(&pool, "second team", fx.operator, "admin").await;
+    let before = snapshot(&pool).await;
+    let epoch_before = epoch(&pool).await;
+    let names = ["alpha", "beta"];
+    let moved_claims = [
+        fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb, fx.s5, fx.s6,
+    ];
+
+    // Dry run: the plan, nothing written.
+    let m1 = dir.join("private-1.jsonl");
+    let dry = run_names(
+        &pool, &fx, &dir, &m1, &names, fx.target, None, None, PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("act=PRIVATE-MOVE"), "{}", dry.show());
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t3"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        line_with(&dry.stdout, "CO-OWNED-EDGE\t", &[&fx.e_s6_pn.to_string()]),
+        "the edge to the note that stays in the source is reported: {}",
+        dry.show()
+    );
+    assert_eq!(snapshot(&pool).await, before, "a dry run wrote");
+    assert!(!m1.exists());
+
+    // Hop 1: the operator's personal group -> the target team.
+    let r1 = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m1,
+        &names,
+        fx.target,
+        None,
+        Some("3"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r1.code, 0, "{}", r1.show());
+    let in_target = (fx.target, "group".to_string());
+    for w in [fx.w_a0, fx.w_a1, fx.w_b0] {
+        assert_eq!(tenancy(&pool, "workflows", w).await, in_target, "wf {w}");
+    }
+    for c in moved_claims {
+        assert_eq!(tenancy(&pool, "claims", c).await, in_target, "claim {c}");
+    }
+    assert_eq!(tenancy(&pool, "evidence", fx.ev_s1).await, in_target);
+    assert_eq!(tenancy(&pool, "mass_functions", fx.mf_s2).await, in_target);
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fx.frag56).await,
+        in_target
+    );
+    for e in &fx.plan_edges {
+        assert_eq!(edge_tenancy(&pool, *e).await.0, fx.target, "plan edge {e}");
+    }
+    assert_eq!(
+        tenancy(&pool, "claims", fx.x).await,
+        (fx.src, "public".to_string()),
+        "the shared public step is never touched"
+    );
+    assert_eq!(
+        edge_tenancy(&pool, fx.e_s6_pn).await,
+        (fx.target, "group".to_string(), Some(fx.src)),
+        "an edge to the note that stays in the source is co-owned by both"
+    );
+    assert_eq!(epoch(&pool).await, epoch_before, "nothing public narrowed");
+    assert_eq!(
+        reads_as(&pool, &[fx.target], "claims", &moved_claims).await,
+        sorted(moved_claims.to_vec())
+    );
+    assert!(reads_as(&pool, &[fx.src], "claims", &moved_claims)
+        .await
+        .is_empty());
+    assert!(
+        reads_as(&pool, &[fx.src], "workflows", &[fx.w_a0, fx.w_a1, fx.w_b0])
+            .await
+            .is_empty()
+    );
+    let body = std::fs::read_to_string(&m1).expect("manifest");
+    let header: serde_json::Value =
+        serde_json::from_str(body.lines().next().unwrap()).expect("header");
+    assert_eq!(header["from_visibility"], "group");
+    assert_eq!(header["act"], "PRIVATE-MOVE");
+
+    // Hop 2: the target team -> a second team (`--from-group`).
+    let m2 = dir.join("private-2.jsonl");
+    let r2 = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m2,
+        &names,
+        team2,
+        Some(fx.target),
+        Some("3"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    for c in moved_claims {
+        assert_eq!(
+            tenancy(&pool, "claims", c).await,
+            (team2, "group".to_string())
+        );
+    }
+    assert_eq!(
+        edge_tenancy(&pool, fx.e_s6_pn).await,
+        (team2, "group".to_string(), Some(fx.src)),
+        "the co-owner the note requires is kept"
+    );
+
+    // Hop 3: the second team -> the operator's OWN personal group.
+    let m3 = dir.join("private-3.jsonl");
+    let r3 = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m3,
+        &names,
+        fx.src,
+        Some(team2),
+        Some("3"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r3.code, 0, "{}", r3.show());
+    for c in moved_claims {
+        assert_eq!(
+            tenancy(&pool, "claims", c).await,
+            (fx.src, "group".to_string())
+        );
+    }
+    assert_eq!(epoch(&pool).await, epoch_before);
+    assert_eq!(
+        security_events(&pool, "operator.workflows_reowned").await,
+        4,
+        "the narrowing and three moves: one audit row each"
+    );
+
+    let rev = reverse_many(&pool, &[&m1, &m2, &m3], true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(
+        snapshot(&pool).await,
+        before,
+        "the reversals did not restore every row: {}",
+        rev.show()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A plan claim alpha shares with a lineage the list omits (epsilon, also
+/// narrowed in the source) is LEFT where it is, reported as SHARED and as a
+/// SHARED-SPLIT naming epsilon, and the edges from alpha's moved claims to it
+/// become co-owned by both groups. The rest of alpha moves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_leaves_a_shared_plan_claim_where_it_is_and_reports_the_split(pool: PgPool) {
+    let fx = seed(&pool).await;
+    {
+        let mut m = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut m, "epsilon", 0, None, fx.src, "public").await;
+        edge(&mut m, (w, "workflow"), (fx.s2, "claim"), "executes").await;
+    }
+    let dir = scratch_dir();
+    let m0 = dir.join("narrow.jsonl");
+    let r0 = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m0,
+        &["alpha", "epsilon"],
+        fx.src,
+        None,
+        Some("3"),
+        GROUP,
+    )
+    .await;
+    assert_eq!(r0.code, 0, "{}", r0.show());
+    assert_eq!(
+        tenancy(&pool, "claims", fx.s2).await,
+        (fx.src, "group".to_string())
+    );
+    let m = dir.join("private.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha"],
+        fx.target,
+        None,
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(&dry.stdout, "LEFT-CLAIM\t", &[&fx.s2.to_string(), "SHARED"]),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        line_with(
+            &dry.stdout,
+            "SHARED-SPLIT\t",
+            &[&fx.s2.to_string(), "epsilon"]
+        ),
+        "{}",
+        dry.show()
+    );
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha"],
+        fx.target,
+        None,
+        Some("2"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        tenancy(&pool, "claims", fx.s2).await,
+        (fx.src, "group".to_string()),
+        "the shared claim stays"
+    );
+    assert_eq!(
+        tenancy(&pool, "mass_functions", fx.mf_s2).await,
+        (fx.src, "group".to_string()),
+        "and so does every row it carries"
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.s1).await,
+        (fx.target, "group".to_string())
+    );
+    // plan_edges[2] is P -decomposes_to-> S2.
+    assert_eq!(
+        edge_tenancy(&pool, fx.plan_edges[2]).await,
+        (fx.target, "group".to_string(), Some(fx.src))
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A row of a private plan owned by a third group (another person's evidence
+/// on S1) would be handed to the target: the whole lineage is HELD, nothing of
+/// it moves, and an `--apply` that moves the rest exits 3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_lineage_carrying_a_third_groups_row(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    sqlx::query("UPDATE evidence SET owner_group_id = $2 WHERE id = $1")
+        .bind(fx.ev_s1)
+        .bind(fx.stranger_group)
+        .execute(&pool)
+        .await
+        .expect("a third group's evidence");
+    let before = snapshot(&pool).await;
+    let m = dir.join("private.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(
+            &dry.stdout,
+            "HELD-LINEAGE\talpha\t",
+            &[&fx.ev_s1.to_string()]
+        ),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        dry.show()
+    );
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        Some("1"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(
+        tenancy(&pool, "workflows", fx.w_b0).await,
+        (fx.target, "group".to_string())
+    );
+    for w in [fx.w_a0, fx.w_a1] {
+        assert_eq!(
+            tenancy(&pool, "workflows", w).await,
+            (fx.src, "group".to_string())
+        );
+    }
+    assert_eq!(
+        tenancy(&pool, "evidence", fx.ev_s1).await,
+        (fx.stranger_group, "group".to_string())
+    );
+    let rev = reverse(&pool, &m, true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(snapshot(&pool).await, before);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Public input is reown-workflows' public act, never a private move's: a
+/// public lineage is HELD (`public`), and so is a private lineage whose
+/// unshared plan claim is public (the plan would split). Nothing is written,
+/// and an `--apply` with the dry run's count exits 3 on the claim hold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_refuses_public_input(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let pubc = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut m, "zeta", 0, None, fx.src, "group").await;
+        let c = claim(&mut m, fx.operator, fx.src, "public", 0, "zeta thesis").await;
+        edge(&mut m, (w, "workflow"), (c, "claim"), "executes").await;
+        c
+    };
+    let dir = scratch_dir();
+    let before = snapshot(&pool).await;
+    let m = dir.join("private.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "zeta"],
+        fx.target,
+        None,
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(&dry.stdout, "HELD-LINEAGE\talpha\t", &["public"]),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        line_with(
+            &dry.stdout,
+            "HELD-LINEAGE\tzeta\t",
+            &[&pubc.to_string(), "public"]
+        ),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t0"),
+        "{}",
+        dry.show()
+    );
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "zeta"],
+        fx.target,
+        None,
+        Some("0"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(snapshot(&pool).await, before, "nothing is written");
+    assert!(!m.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--confirm-count` must repeat the dry run's count: a mismatch is refused
+/// before any write, with no manifest and no audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_refuses_a_confirm_count_mismatch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let before = snapshot(&pool).await;
+    let audits = security_events(&pool, "operator.workflows_reowned").await;
+    let m = dir.join("private.jsonl");
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        Some("2"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("does not match"), "{}", r.show());
+    assert_eq!(snapshot(&pool).await, before);
+    assert!(!m.exists());
+    assert_eq!(
+        security_events(&pool, "operator.workflows_reowned").await,
+        audits
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The targets and flags a private move refuses before writing: another
+/// person's personal group (even administered by the operator), a team the
+/// operator only writes, the source itself, and the flag combinations that do
+/// not describe a private move.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_refuses_bad_targets_and_flags(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let before = snapshot(&pool).await;
+    let catch_up: Vec<&str> = PRIVATE.iter().copied().chain(["--catch-up"]).collect();
+    let cases: Vec<(Uuid, &[&str], &str)> = vec![
+        (
+            fx.stranger_group,
+            PRIVATE,
+            "not the operator's own personal group",
+        ),
+        (fx.not_admin_team, PRIVATE, "not a live admin"),
+        (fx.src, PRIVATE, "moves between two groups"),
+        (
+            fx.target,
+            &["--from-visibility", "group"],
+            "--from-visibility group needs --visibility group",
+        ),
+        (fx.target, &catch_up, "--catch-up"),
+        (
+            fx.target,
+            &["--from-visibility", "private", "--visibility", "group"],
+            "--from-visibility must be public or group",
+        ),
+    ];
+    for (i, (target, extra, needle)) in cases.into_iter().enumerate() {
+        let m = dir.join(format!("m{i}.jsonl"));
+        let r = run_names(
+            &pool,
+            &fx,
+            &dir,
+            &m,
+            &["alpha"],
+            target,
+            None,
+            Some("2"),
+            extra,
+        )
+        .await;
+        assert_eq!(r.code, 1, "case {i}: {}", r.show());
+        assert!(r.stderr.contains(needle), "case {i}: {}", r.show());
+        assert!(!m.exists());
+    }
+    assert_eq!(snapshot(&pool).await, before);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An edge from a plan claim to a frame that is private to the SOURCE and
+/// does not move: the cascade counts the frame as public, so moving the step
+/// would put the edge in the target while it names a frame the target's
+/// members cannot read. The lineage is HELD (the edge is named) and nothing
+/// of it moves. A PUBLIC frame contributes nothing, so its edge moves with
+/// the plan.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_lineage_with_an_edge_to_a_private_node_that_stays(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let frame = |owner: Uuid, visibility: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO frames (name, hypotheses, owner_group_id, visibility) \
+                 VALUES ('frame-' || gen_random_uuid()::text, ARRAY['a','b'], $1, $2) \
+                 RETURNING id",
+            )
+            .bind(owner)
+            .bind(visibility)
+            .fetch_one(&pool)
+            .await
+            .expect("seed frame")
+        }
+    };
+    let link = |a: Uuid, f: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                 VALUES ($1, 'claim', $2, 'frame', 'relates_to') RETURNING id",
+            )
+            .bind(a)
+            .bind(f)
+            .fetch_one(&pool)
+            .await
+            .expect("seed claim -> frame edge")
+        }
+    };
+    let private_frame = frame(fx.src, "group").await;
+    let public_frame = frame(WORLD, "public").await;
+    let e_private = link(fx.s1, private_frame).await;
+    let e_public = link(fx.tb, public_frame).await;
+    let before = snapshot(&pool).await;
+    let m = dir.join("private.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(
+            &dry.stdout,
+            "HELD-LINEAGE\talpha\t",
+            &[&e_private.to_string(), "group-private node"]
+        ),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        dry.show()
+    );
+    assert_eq!(snapshot(&pool).await, before);
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        Some("1"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(
+        tenancy(&pool, "claims", fx.s1).await,
+        (fx.src, "group".to_string())
+    );
+    assert_eq!(
+        edge_tenancy(&pool, e_private).await,
+        (fx.src, "group".to_string(), None)
+    );
+    assert_eq!(
+        edge_tenancy(&pool, e_public).await,
+        (fx.target, "group".to_string(), None),
+        "beta's edge to a public frame moves with beta"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

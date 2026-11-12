@@ -50,6 +50,7 @@
 //!     epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 //!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
 //!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
+//!         [--visibility keep|group] [--from-visibility public|group] \
 //!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
 //!         --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest reown-wf-1.jsonl [--apply]
@@ -900,6 +901,16 @@ enum Command {
         /// bumps the atlas layout epoch; re-run `atlas_layout --apply` after).
         #[arg(long, default_value = "keep")]
         visibility: String,
+        /// The state rows move FROM. `public` (the default): the public act
+        /// above. `group`: a PRIVATE MOVE (needs `--visibility group`, never
+        /// `--catch-up`): only `('group', source)` generations and plan claims
+        /// change, each ending `('group', target)`, whole lineages only, with
+        /// their rows and plan edges; a public generation or unshared public
+        /// plan claim holds its lineage. The target is another group: an
+        /// active team or community group `--operator` administers, or the
+        /// operator's OWN personal group. Nothing becomes public.
+        #[arg(long, default_value = "public")]
+        from_visibility: String,
         /// With `--visibility group`: catch a lineage up to a narrowing that
         /// already ran. Takes only a lineage with a generation already in the
         /// target state (recorded as seen, never written); its other
@@ -1281,6 +1292,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         canonical_names_file,
         target_group,
         visibility,
+        from_visibility,
         catch_up,
         after_manifest,
         operator: op,
@@ -1306,6 +1318,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             reason: reason.clone(),
             visibility: reown_workflows::Visibility::parse(visibility)?,
             catch_up: *catch_up,
+            from_private: reown_workflows::parse_from_visibility(from_visibility)?,
             after_manifests: after_manifest.clone(),
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
