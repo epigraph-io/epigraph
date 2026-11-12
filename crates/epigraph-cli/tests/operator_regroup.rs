@@ -2444,6 +2444,16 @@ async fn key_epoch(pool: &PgPool, group: Uuid) {
     .await;
 }
 
+async fn seal_edge(pool: &PgPool, e: Uuid, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO edge_encryption (edge_id, group_id, epoch, privacy_tier, encrypted_labels) \
+         VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+        &[e, group],
+    )
+    .await;
+}
+
 async fn seal_version(pool: &PgPool, cv: Uuid, claim: Uuid, group: Uuid) {
     exec(
         pool,
@@ -2453,6 +2463,125 @@ async fn seal_version(pool: &PgPool, cv: Uuid, claim: Uuid, group: Uuid) {
         &[cv, claim, group],
     )
     .await;
+}
+
+/// An edge sealed under the source (`edge_encryption`) holds the claim whose
+/// move would re-tuple it, into a team and into the operator's own personal
+/// group alike: its ciphertext is keyed to the source, so the moved edge would
+/// sit where no reader holds the key while source members lose it. The plan
+/// excludes the claim and names the edge; the apply exits 3 and writes
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_edge_holds_the_claim_that_would_move_it(pool: PgPool) {
+    let fx = seed(&pool).await;
+    seal_edge(&pool, fx.e_bp, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.b]);
+    let before = snapshot(&pool, false).await;
+    for (i, dst) in [fx.dst, fx.operator_group].into_iter().enumerate() {
+        let dry = regroup(
+            &pool,
+            Regroup {
+                ids: &ids,
+                src: fx.src,
+                dst,
+                operator: fx.operator,
+                manifest: &dir.join(format!("dry{i}.jsonl")),
+                apply_count: None,
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(dry.code, 0, "target {i}: {}", dry.show());
+        assert!(
+            dry.stdout
+                .contains("PLAN: 1 requested, 0 eligible, 1 held, 0 already ('group', target)"),
+            "target {i}: {}",
+            dry.show()
+        );
+        assert!(
+            has_line(
+                &dry.stdout,
+                "HELD\t",
+                &[
+                    &fx.b.to_string(),
+                    "sealed-edge",
+                    &fx.e_bp.to_string(),
+                    "edge_encryption"
+                ]
+            ),
+            "target {i}: {}",
+            dry.show()
+        );
+    }
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.operator_group,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(0),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.src));
+    assert_eq!(
+        edge(&pool, fx.e_bp).await,
+        (fx.src, "group".to_string(), None)
+    );
+    assert_eq!(
+        reads_as(&pool, &[fx.src], "edges", &[fx.e_bp]).await,
+        vec![fx.e_bp]
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "a sealed-edge hold");
+    assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// An edge the run moved and that was sealed since (under the target) holds
+/// its claim in the reversal: its ciphertext is the target's, so it never
+/// goes back to the source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reversal_holds_an_edge_sealed_since(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let g = fx.operator_group;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.b]);
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(edge(&pool, fx.e_bp).await, (g, "group".to_string(), None));
+    key_epoch(&pool, g).await;
+    seal_edge(&pool, fx.e_bp, g).await;
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&fx.b.to_string(), &fx.e_bp.to_string(), "edge_encryption"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(g));
+    assert_eq!(edge(&pool, fx.e_bp).await, (g, "group".to_string(), None));
 }
 
 /// A claim with a sealed VERSION (`claim_version_encryption`) and no

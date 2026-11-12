@@ -31,6 +31,10 @@
 //! * `sealed-evidence`: evidence with an `evidence_encryption` row. Its
 //!   ciphertext is keyed to the group that sealed it; moved, the row would sit
 //!   in the target where no target member can decrypt it.
+//! * `sealed-edge`: an edge with an `edge_encryption` row whose tuple the
+//!   move would change. Its ciphertext is keyed to the group that sealed it;
+//!   re-tupled, that group could lose the row while the row's new readers
+//!   cannot decrypt it.
 //! * `pinned`: pinned evidence (migration 110). The cascade never changes its
 //!   owner, so it would stay in the source while its claim moved.
 //! * `edge-would-widen`: an edge whose new meet would drop a group its current
@@ -39,7 +43,10 @@
 //!
 //! The pre-pass runs the same row checks, read-only, so the plan's eligible
 //! count (the number `--confirm-count` repeats back) already excludes them;
-//! each batch repeats them under its locks.
+//! each batch repeats them under its locks. A batch takes its claims, their
+//! evidence and their edges `FOR UPDATE` before it reads the seal tables, so
+//! a seal (whose foreign key onto the row would wait for the lock) either
+//! committed before the read or lands after the batch commits.
 //!
 //! # What follows the claim
 //!
@@ -146,8 +153,9 @@
 //! the state this run left it; a recorded row that is in neither its prior nor
 //! its post state (nor the meet a partial reversal leaves an edge on), a row
 //! written after the act (the cascade would carry it into the source), a
-//! neighbour that moved since, a claim, claim version or evidence row sealed
-//! since, or an edge whose
+//! neighbour that moved since, a claim, claim version, evidence row or edge
+//! sealed since (an edge only when the reversal would change its tuple; the
+//! run held every sealed edge it would have re-tupled), or an edge whose
 //! recorded tuple would be WIDER than the exact meet of its endpoints after
 //! the restore (an endpoint the neighbour watch does not cover moved: a
 //! foreign claim's evidence, a node), HOLDS the claim. An edge is put back on
@@ -262,6 +270,12 @@ pub enum Hold {
     SealedEvidence {
         id: String,
     },
+    /// An edge with an `edge_encryption` row whose tuple the move would
+    /// change, keyed to `group`.
+    SealedEdge {
+        id: String,
+        group: Uuid,
+    },
     PublicRow {
         table: String,
         id: String,
@@ -296,6 +310,7 @@ impl Hold {
             Self::NotInSource { .. } => "not-in-source",
             Self::Sealed { .. } => "sealed",
             Self::SealedEvidence { .. } => "sealed-evidence",
+            Self::SealedEdge { .. } => "sealed-edge",
             Self::PublicRow { .. } => "public-row",
             Self::ThirdGroup { .. } => "third-group",
             Self::Pinned { .. } => "pinned",
@@ -327,6 +342,11 @@ impl fmt::Display for Hold {
                 f,
                 "evidence {id} is sealed (evidence_encryption): its ciphertext is keyed to the \
                  source group, so the row would move where no target member can decrypt it"
+            ),
+            Self::SealedEdge { id, group } => write!(
+                f,
+                "edge {id} is sealed (edge_encryption, keyed to group {group}): the move would \
+                 change its tuple, and its ciphertext never leaves the group that holds its key"
             ),
             Self::PublicRow { table, id, state } => write!(
                 f,
@@ -911,6 +931,46 @@ async fn sealed_evidence_of(
     Ok(v.into_iter().map(|u| u.to_string()).collect())
 }
 
+/// The edges among `ids` that are sealed (an `edge_encryption` row), with the
+/// group their ciphertext is keyed to.
+async fn sealed_edges_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeMap<String, Uuid>> {
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let v: Vec<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT edge_id, group_id FROM edge_encryption WHERE edge_id = ANY($1)")
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await
+            .context("reading edge_encryption")?;
+    Ok(v.into_iter().map(|(e, g)| (e.to_string(), g)).collect())
+}
+
+/// Take `ids` of `table` (`edges` or `evidence`) `FOR UPDATE`, in id order,
+/// inside a batch. A seal's foreign key onto the row takes `FOR KEY SHARE`,
+/// which neither the batch's table locks nor its later UPDATEs (`FOR NO KEY
+/// UPDATE`) block; with the rows locked first, a seal either committed before
+/// the batch reads the seal table or waits until the batch commits.
+async fn lock_rows(conn: &mut PgConnection, table: &str, ids: &[Uuid]) -> anyhow::Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let sql = match table {
+        "edges" => "SELECT id FROM edges WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        "evidence" => "SELECT id FROM evidence WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        other => bail!("lock_rows: unexpected table {other}"),
+    };
+    sqlx::query(sql)
+        .bind(ids)
+        .execute(&mut *conn)
+        .await
+        .with_context(|| format!("locking {table} rows"))?;
+    Ok(())
+}
+
 /// The claims among `ids` that are sealed, with the table that seals them: a
 /// `claim_encryption` row (the claim itself), or else a
 /// `claim_version_encryption` row (one of its versions; the version row
@@ -971,14 +1031,20 @@ fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
 
 /// Read every row the candidates carry and decide, per row, whether it
 /// follows cleanly; a row that does not holds every candidate it hangs off.
+/// `lock` (inside a batch): the evidence and edge rows are taken `FOR UPDATE`
+/// before their seal tables are read ([`lock_rows`]).
 async fn classify_rows(
     conn: &mut PgConnection,
     ctx: &Ctx<'_>,
     cands: &BTreeSet<Uuid>,
     known: &Known,
+    lock: bool,
 ) -> anyhow::Result<Classified> {
     let cand_ids: Vec<Uuid> = cands.iter().copied().collect();
     let mut attached = fetch_attached(conn, ctx.specs, &cand_ids).await?;
+    if lock {
+        lock_rows(conn, "evidence", &evidence_ids(&attached)).await?;
+    }
     let pinned = pinned_of(conn, &evidence_ids(&attached)).await?;
     let sealed_ev = sealed_evidence_of(conn, &evidence_ids(&attached)).await?;
     let ev_claim: BTreeMap<Uuid, Uuid> = attached
@@ -993,6 +1059,10 @@ async fn classify_rows(
     let node_edges = fetch_node_edges(conn, ctx.nodes, &attached, cands, &seen).await?;
     attached.extend(node_edges);
     let keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    if lock {
+        lock_rows(conn, "edges", &edge_ids(&keys)).await?;
+    }
+    let sealed_edges = sealed_edges_of(conn, &edge_ids(&keys)).await?;
     let ends = ends_of(conn, ctx.nodes, &edge_ids(&keys)).await?;
     let frag_neighbours: Vec<Uuid> = attached
         .values()
@@ -1053,7 +1123,15 @@ async fn classify_rows(
                     meet(&s, &t)
                 });
                 match m {
-                    Some(m) if edge_accepts(&a.tenancy, &m, ctx.source, ctx.target) => None,
+                    // A sealed edge the move would re-tuple: its ciphertext
+                    // stays keyed to its group, which would lose the row.
+                    Some(m) if edge_accepts(&a.tenancy, &m, ctx.source, ctx.target) => sealed_edges
+                        .get(&k.1)
+                        .filter(|_| m != a.tenancy)
+                        .map(|g| Hold::SealedEdge {
+                            id: k.1.clone(),
+                            group: *g,
+                        }),
                     other => Some(Hold::EdgeWouldWiden {
                         id: k.1.clone(),
                         from: state,
@@ -1276,7 +1354,7 @@ async fn run_batch(
     if cands.is_empty() {
         return Ok(out);
     }
-    let cl = classify_rows(conn, ctx, &cands, known).await?;
+    let cl = classify_rows(conn, ctx, &cands, known, true).await?;
     let eligible: Vec<ClaimRow> = cands
         .iter()
         .filter(|id| !cl.hold.contains_key(id))
@@ -1794,7 +1872,7 @@ async fn pre_pass(
         if cands.is_empty() {
             continue;
         }
-        let cl = classify_rows(conn, ctx, &cands, &Known::default()).await?;
+        let cl = classify_rows(conn, ctx, &cands, &Known::default(), false).await?;
         for id in chunk {
             if !cands.contains(id) {
                 continue;
@@ -1915,8 +1993,10 @@ pub async fn run(
          target); an edge takes the exact meet of its endpoints (an end that stays in the source, \
          a claim or evidence (CO-OWNED-EDGE) or a group-private node such as a workflow or frame \
          (SOURCE-NODE-EDGE), makes it co-owned); a shared fragment and an outsider's challenge \
-         stay as they are; a claim with a public, pinned, sealed-evidence or third-group row is \
-         HELD whole; nothing becomes public"
+         stay as they are; a sealed claim (a claim_encryption or claim_version_encryption row) \
+         is HELD, and so, whole, is a claim with a public, pinned, sealed-evidence, sealed-edge \
+         (an edge_encryption row the move would re-tuple) or third-group row; nothing becomes \
+         public"
     )?;
 
     if opts.apply {
@@ -2290,6 +2370,8 @@ async fn reverse_batch(
     let node_edges = fetch_node_edges(conn, rc.nodes, &attached, &cand_ids, &seen).await?;
     attached.extend(node_edges);
     let all_keys: BTreeSet<RowKey> = attached.keys().cloned().collect();
+    lock_rows(conn, "evidence", &evidence_ids(&attached)).await?;
+    lock_rows(conn, "edges", &edge_ids(&all_keys)).await?;
     let ends_now = ends_of(conn, rc.nodes, &edge_ids(&all_keys)).await?;
 
     // The manifest's recorded prior of an edge endpoint it moved: a claim its
@@ -2414,6 +2496,34 @@ async fn reverse_batch(
         let why = format!(
             "evidence {} has been sealed since the run (evidence_encryption); its ciphertext is \
              not the source group's, so restoring it would leave it undecryptable; not reversing",
+            k.1
+        );
+        for cl in a.claims.intersection(&cand_ids) {
+            drift.entry(*cl).or_insert_with(|| why.clone());
+        }
+    }
+    // ---- sealed edges: the run held every sealed edge it would re-tuple, so
+    // a sealed edge whose tuple the reversal would change (its recorded prior
+    // differs from its tuple now, or it waits on an endpoint not yet back)
+    // was sealed since the run, under a key the source does not hold ----
+    let sealed_edges = sealed_edges_of(conn, &edge_ids(&all_keys)).await?;
+    for (k, a) in attached.iter().filter(|(k, _)| k.0 == "edges") {
+        let Some(group) = sealed_edges.get(&k.1) else {
+            continue;
+        };
+        let changes = res.rows.get(k).is_none_or(|rec| {
+            RowState::of_record(rec).tenancy != a.tenancy
+                || ends_now.get(&k.1).is_some_and(|e| {
+                    pending(&e.source, &e.source_state) || pending(&e.target, &e.target_state)
+                })
+        });
+        if !changes {
+            continue;
+        }
+        let why = format!(
+            "edge {} is sealed (edge_encryption, keyed to group {group}); restoring its claim \
+             would change its tuple, and its ciphertext never leaves the group that holds its \
+             key; not reversing",
             k.1
         );
         for cl in a.claims.intersection(&cand_ids) {
