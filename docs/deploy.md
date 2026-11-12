@@ -2439,18 +2439,33 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   person's personal group is refused, and so is the personal group of an
   agent the operator operates, even when the operator administers it: that
   group is the agent's, and the ownership model moves an operated agent's
-  claims out of it (`reown-linked`), never into it. Neither group may be the
-  world or seed group, and they must differ.
+  claims out of it (`reown-linked`), never into it. The source is held to
+  the same rule: an active `team` or `community` group, or the operator's own
+  personal group. Another person's personal group and an operated agent's
+  are refused as `--source-group` even when the operator administers them,
+  so their claims never leave them through this verb, into the operator's own
+  group or into a team (`reown-workflows`' private move applies the same
+  rule). Neither group may be the world or seed group, and they must differ.
 - **Eligible**: a claim that is `('group', <source>)` and not sealed. A claim
   already `('group', <target>)` counts as done, so a re-run resumes. A public
-  claim (`public-claim`) and another group's claim (`not-in-source`) are held.
+  claim (`public-claim`) and another group's claim (`not-in-source`) are held,
+  and so is a sealed claim (`sealed`): one with a `claim_encryption` row, or
+  with a `claim_version_encryption` row on one of its versions (the version
+  row would follow the claim away from the group that keys it). The `HELD`
+  line names the table.
 - **Held whole, never partly moved**: a claim carrying a public row
   (`public-row`), a row owned by a third group (`third-group`), sealed
   evidence (`sealed-evidence`: an `evidence_encryption` row, whose ciphertext
-  is keyed to the group that sealed it), pinned evidence (`pinned`), or an
-  edge whose new meet would drop a group its current tuple requires
-  (`edge-would-widen`). The plan applies these checks too, so its eligible
-  count is the number `--confirm-count` repeats.
+  is keyed to the group that sealed it), a sealed edge the move would
+  re-tuple (`sealed-edge`: an `edge_encryption` row; the line names the edge
+  and its key group), pinned evidence (`pinned`), or an edge whose new meet
+  would drop a group its current tuple requires (`edge-would-widen`). The
+  plan applies these checks too, so its eligible count is the number
+  `--confirm-count` repeats. Ciphertext is never re-keyed by a move, and it
+  never leaves the group it is keyed to, whether the target is a team or the
+  operator's personal group. Each batch repeats the checks under its locks,
+  with its claims, their evidence and their edges taken `FOR UPDATE` before
+  it reads the seal tables, so a seal that lands after the dry run holds too.
 - **Edges** take the EXACT meet of their endpoints: the INSERT rule applied
   to what each endpoint is.
   - An edge whose other end is a claim or evidence that stays in the source
@@ -2495,10 +2510,13 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 - **Exit**: `--apply` exits 3 when any listed claim was held or the moved
   count differs from `--confirm-count`.
 - **Reverse** is a compare-and-swap per claim. A claim something moved since,
-  a row written after the act, a neighbour that moved since, evidence sealed
-  since, or an edge whose recorded tuple would be wider than the exact meet of
-  its endpoints after the restore (an endpoint the neighbour watch does not
-  cover moved: another claim's evidence, a node) holds the claim (exit 3). An
+  a row written after the act, a neighbour that moved since, a claim, claim
+  version or evidence row sealed since, a sealed edge the reversal would
+  change (the run held every sealed edge it would have re-tupled, so such an
+  edge was sealed after it), or an edge whose recorded tuple would be wider
+  than the exact meet of its endpoints after the restore (an endpoint the
+  neighbour watch does not cover moved: another claim's evidence, a node)
+  holds the claim (exit 3). An
   edge stays on the meet of its current endpoints until every endpoint the
   manifest moved is back, then takes its recorded tuple. An edge to a
   group-private node that is not in the source (one in the target or one of
