@@ -55,8 +55,11 @@
 //! group: an active `team` or `community` group the operator administers, or
 //! the operator's OWN personal group (`regroup::check_private_target`, the
 //! rule `regroup-claims` applies); never another person's personal group nor
-//! an operated agent's. `--catch-up` is refused. It is the public act's
-//! machinery with the FROM state `('group', source)`:
+//! an operated agent's. A `--from-group` source is held to the same rule
+//! (`check_private_source`): its rows are private, so another person's or an
+//! operated agent's personal group never gives them up, whoever administers
+//! it. `--catch-up` is refused. It is the public act's machinery with the
+//! FROM state `('group', source)`:
 //!
 //! * a generation or an unshared plan claim that is PUBLIC is public input,
 //!   the public act's to narrow first: a public generation holds its lineage
@@ -575,7 +578,9 @@ pub fn read_names_file(path: &Path) -> anyhow::Result<Vec<String>> {
 /// operator has no personal group; the target is the source without
 /// `--visibility group`, or a move's target is not an active team group the
 /// operator administers. A private move's target is the source, or not one
-/// `regroup::check_private_target` accepts.
+/// `regroup::check_private_target` accepts; its `--from-group` is not an
+/// active team or community group nor the operator's own personal group
+/// ([`check_private_source`]).
 pub async fn resolve_groups(
     conn: &mut PgConnection,
     opts: &Options,
@@ -597,6 +602,14 @@ pub async fn resolve_groups(
         None => operator_group(conn, opts.operator).await?,
     };
     if opts.from_private {
+        // The rows are PRIVATE, so the source is held to the target's rule:
+        // an active team or community group the operator administers, or the
+        // operator's OWN personal group. Another person's or an operated
+        // agent's personal group never gives up its private rows to a team,
+        // whoever administers it.
+        if opts.from_group.is_some() {
+            check_private_source(conn, source, opts.operator).await?;
+        }
         if source == opts.target {
             bail!(
                 "--target-group {} is the source group: a private move moves between two groups \
@@ -638,6 +651,51 @@ pub async fn resolve_groups(
         );
     }
     Ok((source, opts.target))
+}
+
+/// A private move's `--from-group` (already checked: not world or seed, the
+/// operator a live admin): an ACTIVE `team` or `community` group, or the
+/// operator's own personal group ([`super::regroup::own_personal_group`]).
+///
+/// # Errors
+/// The group is missing, not active, of another kind, or a personal group
+/// that is not the operator's own.
+async fn check_private_source(
+    conn: &mut PgConnection,
+    source: Uuid,
+    operator: Uuid,
+) -> anyhow::Result<()> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT kind::text, status::text FROM groups WHERE id = $1")
+            .bind(source)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some((kind, status)) = row else {
+        bail!("--from-group {source}: no such group; refusing");
+    };
+    if status != "active" {
+        bail!("--from-group {source} has status {status:?}, not active; refusing");
+    }
+    match kind.as_str() {
+        "team" | "community" => Ok(()),
+        "personal" => {
+            if super::regroup::own_personal_group(conn, operator).await? != Some(source) {
+                bail!(
+                    "--from-group {source} is a personal group that is not the operator's own \
+                     personal group (did:epigraph:personal:{operator}, created by the operator, \
+                     a registered human operator); refusing: a private move takes private rows \
+                     only out of a team or community group the operator administers, or out of \
+                     the operator's own personal group, never out of another person's or an \
+                     operated agent's"
+                );
+            }
+            Ok(())
+        }
+        other => bail!(
+            "--from-group {source} is kind {other}, not a team or community group nor the \
+             operator's own personal group; refusing"
+        ),
+    }
 }
 
 async fn live_admin(conn: &mut PgConnection, group: Uuid, agent: Uuid) -> anyhow::Result<bool> {

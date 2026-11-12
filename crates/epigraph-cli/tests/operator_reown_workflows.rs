@@ -3415,6 +3415,104 @@ async fn a_private_move_holds_a_lineage_carrying_a_third_groups_row(pool: PgPool
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A private lineage `name`, one generation executing one claim, both
+/// `('group', g)`, written on the maintenance pool. Returns (workflow, claim).
+async fn private_lineage(pool: &PgPool, author: Uuid, g: Uuid, name: &str) -> (Uuid, Uuid) {
+    let mut m = pool.acquire().await.expect("acquire");
+    let w = workflow(&mut m, name, 0, None, g, "group").await;
+    let c = claim(&mut m, author, g, "group", 0, &format!("{name} thesis")).await;
+    edge(&mut m, (w, "workflow"), (c, "claim"), "executes").await;
+    (w, c)
+}
+
+async fn make_admin(pool: &PgPool, g: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(g)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("make the operator an admin");
+}
+
+/// A private move takes rows only out of an active team or community group
+/// the operator administers, or out of the operator's OWN personal group:
+/// another person's personal group and an operated agent's are refused as
+/// `--from-group` even though the operator administers both (so the refusal
+/// comes from the kind, not the admin check), and nothing is written. The
+/// operator's own personal group named explicitly is accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_refuses_another_persons_or_an_agents_personal_group_as_source(
+    pool: PgPool,
+) {
+    let fx = seed(&pool).await;
+    let (person, person_group) = fixture::seed_human_operator(&pool, "another person").await;
+    make_admin(&pool, person_group, fx.operator).await;
+    let (agent, agent_group) = fixture::seed_agent_with_group(&pool, "operated agent").await;
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(agent)
+        .bind(fx.operator)
+        .execute(&pool)
+        .await
+        .expect("link the agent to the operator");
+    make_admin(&pool, agent_group, fx.operator).await;
+    private_lineage(&pool, person, person_group, "zeta-person").await;
+    private_lineage(&pool, agent, agent_group, "zeta-agent").await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool).await;
+    for (i, (g, name)) in [(person_group, "zeta-person"), (agent_group, "zeta-agent")]
+        .into_iter()
+        .enumerate()
+    {
+        let m = dir.join(format!("m{i}.jsonl"));
+        let r = run_names(
+            &pool,
+            &fx,
+            &dir,
+            &m,
+            &[name],
+            fx.target,
+            Some(g),
+            Some("1"),
+            PRIVATE,
+        )
+        .await;
+        assert_eq!(r.code, 1, "case {i}: {}", r.show());
+        assert!(
+            r.stderr.contains("--from-group")
+                && r.stderr.contains("not the operator's own personal group"),
+            "case {i}: {}",
+            r.show()
+        );
+        assert!(!m.exists(), "case {i}");
+    }
+    assert_eq!(snapshot(&pool).await, before, "nothing is written");
+    // The operator's own personal group, named explicitly, is a source.
+    narrowed(&pool, &fx, &dir).await;
+    let m = dir.join("own.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        Some(fx.src),
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t3"),
+        "{}",
+        dry.show()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Public input is reown-workflows' public act, never a private move's: a
 /// public lineage is HELD (`public`), and so is a private lineage whose
 /// unshared plan claim is public (the plan would split). Nothing is written,

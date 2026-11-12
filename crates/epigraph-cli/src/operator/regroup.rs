@@ -653,6 +653,30 @@ fn node_end<'e>(nodes: &NodeTypes, e: &'e EdgeEnds) -> Option<(&'e Pair, &'e Pai
     }
 }
 
+/// The operator's OWN personal group, when the operator is a registered human
+/// operator ([`super::operator_group`]'s test: the group carrying
+/// `did:epigraph:personal:<operator>` and created by the operator); `None`
+/// otherwise. The one personal group a group-to-group move may name, as its
+/// target here or as a private workflow move's source.
+///
+/// # Errors
+/// The registry read fails.
+pub async fn own_personal_group(
+    conn: &mut PgConnection,
+    operator: Uuid,
+) -> anyhow::Result<Option<Uuid>> {
+    let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await
+        .context("reading the human-operator registry")?;
+    Ok(if human {
+        super::operator_group(conn, operator).await.ok()
+    } else {
+        None
+    })
+}
+
 /// The target of a group-to-group move, checked: an active group the
 /// operator is a live admin of ([`super::restrict::check_target`], which also
 /// refuses the world and seed groups), of kind `team` or `community`, or the
@@ -679,17 +703,7 @@ pub async fn check_private_target(
     match kind.as_str() {
         "team" | "community" => Ok(kind),
         "personal" => {
-            let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
-                .bind(operator)
-                .fetch_one(&mut *conn)
-                .await
-                .context("reading the human-operator registry")?;
-            let own = if human {
-                super::operator_group(conn, operator).await.ok()
-            } else {
-                None
-            };
-            if own != Some(target) {
+            if own_personal_group(conn, operator).await? != Some(target) {
                 bail!(
                     "--target-group {target} is a personal group that is not the operator's own \
                      personal group (did:epigraph:personal:{operator}, created by the operator, \
