@@ -538,7 +538,11 @@ Surfaces, all on the caller's stamped transaction (the CLI stamps `--operator`):
   (--group <id> | --private | --clear) [--apply]` on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN`. Without
   `--apply` it is a dry run that executes the definer and rolls back, so a refusal shows before
   anything is committed. All listed agents are set in ONE transaction: one refused agent refuses
-  them all (exit 1). The audit row's `session_user` names the maintenance login.
+  them all (exit 1). The maintenance DSN is already privileged, so the CLI adds no authority: it
+  applies the definer's rules to whoever `--operator` names, and first refuses an `--operator`
+  that is not a registered live human operator (otherwise `--operator X --agent X` would pass the
+  `self` arm for any agent X and be audited as that agent's own act). The audit row's
+  `session_user` names the maintenance login.
 
 ### 7.4 What changes for existing callers
 

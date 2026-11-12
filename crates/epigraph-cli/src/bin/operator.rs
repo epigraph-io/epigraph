@@ -28,9 +28,10 @@
 //! (NOT-A-MEMBER: nothing to revoke, usually a mistyped id).
 //! `retire-link` exits 1 when the agent has no operator link (NO-LINK: nothing
 //! to retire, usually a mistyped id); a link already retired exits 0.
-//! `set-default-group` exits 1 when the definer refused an agent (REFUSED: not
-//! the operator's live-linked agent, or a team the agent may not write);
-//! nothing is changed for any listed agent then.
+//! `set-default-group` exits 1 when `--operator` is not a registered live
+//! human operator, or the definer refused an agent (REFUSED: not the
+//! operator's live-linked agent, or a team the agent may not write); nothing
+//! is changed for any listed agent then.
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -535,10 +536,11 @@ enum Command {
     /// sends it to the agent's home group (the operator's personal group)
     /// ahead of the operator's own default team; `--group` names a team the
     /// agent may write; `--clear` makes it inherit the operator's default
-    /// again. Runs migration 209's definer with `--operator` stamped as the
-    /// principal, so it refuses (exit 1) unless `--operator` is a registered
-    /// live human operator with a LIVE, non-retired operator link to every
-    /// listed agent. One transaction for all agents (all or nothing), one
+    /// again. Refuses (exit 1) an `--operator` that is not a registered live
+    /// human operator, then runs migration 209's definer with `--operator`
+    /// stamped as the principal, which refuses (exit 1) unless it holds a
+    /// LIVE, non-retired operator link to every listed agent (or is the agent
+    /// itself). One transaction for all agents (all or nothing), one
     /// `agent.default_group_set` audit row per agent.
     #[command(group(clap::ArgGroup::new("default").required(true).args(["group", "private", "clear"])))]
     SetDefaultGroup {

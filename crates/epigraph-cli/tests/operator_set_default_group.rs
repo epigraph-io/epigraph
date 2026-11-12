@@ -8,10 +8,11 @@
 //! `session_user`; a list that includes an agent the operator holds only a
 //! RETIRED link to is refused (exit 1, VIS05) and changes NONE of the listed
 //! agents; an `--operator` that does not operate the agent is refused the
-//! same way, so a maintenance login cannot set a default on anyone's
-//! authority but the live operator's; `--group` replaces a private default
-//! with a team; and exactly one of `--group` / `--private` / `--clear` is
-//! required.
+//! same way; an `--operator` that is not a registered human operator is
+//! refused before the definer runs, so `--operator X --agent X` cannot set an
+//! arbitrary agent's default as its own (self) act; `--group` replaces a
+//! private default with a team; and exactly one of `--group` / `--private` /
+//! `--clear` is required.
 
 mod viewer_fixture;
 
@@ -187,6 +188,11 @@ async fn set_default_group_acts_only_on_the_live_operators_authority(pool: PgPoo
         &["--clear", "--apply"],
     ));
     let foreign_state = defaults(&pool, &[c1]).await;
+    let as_itself = go(with(
+        &["set-default-group", "--operator", &a2, "--agent", &a2],
+        &["--clear", "--apply"],
+    ));
+    let as_itself_state = defaults(&pool, &[c2]).await;
     let team_run = go(with(
         &["set-default-group", "--operator", &h, "--agent", &a1],
         &["--group", &t, "--apply"],
@@ -248,6 +254,20 @@ async fn set_default_group_acts_only_on_the_live_operators_authority(pool: PgPoo
     assert_eq!(foreign.code, 1, "{}", foreign.show());
     assert!(foreign.stdout.contains("VIS05"), "{}", foreign.show());
     assert_eq!(foreign_state, vec![(None, true)]);
+
+    assert_eq!(as_itself.code, 1, "{}", as_itself.show());
+    assert!(
+        as_itself.stdout.contains(&format!(
+            "REFUSED\toperator={c2}\tnot a registered live human operator"
+        )),
+        "{}",
+        as_itself.show()
+    );
+    assert_eq!(
+        as_itself_state,
+        vec![(None, true)],
+        "a non-human --operator naming itself changes nothing"
+    );
 
     assert_eq!(team_run.code, 0, "{}", team_run.show());
     assert!(

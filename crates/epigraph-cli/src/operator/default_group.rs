@@ -2,15 +2,20 @@
 //! live human operator operates (migration 209; operator ruling 2026-11-12:
 //! "epiclaw defaults to my private group").
 //!
-//! The command runs on the maintenance DSN, but it decides nothing itself. It
-//! stamps `--operator` as the transaction's principal (`epigraph.principal_id`,
+//! The maintenance DSN is already privileged, so this command does not add an
+//! authority of its own: it applies the definer's rules to whoever
+//! `--operator` names. It refuses an `--operator` that is not a registered
+//! live human operator (`epigraph_is_human_operator`) before anything else, so
+//! `--operator X --agent X` cannot pass the definer's `self` arm for an
+//! arbitrary agent X and be audited as that agent's own act. It then stamps
+//! `--operator` as the transaction's principal (`epigraph.principal_id`,
 //! transaction-local) and calls the same definer the API and MCP call,
-//! `epigraph_set_agent_default_group`, once per agent. So the definer applies
-//! the same rule on every surface: the operator must be a registered, live
-//! human operator holding a live, non-retired operator link to each agent, and
-//! a team must be one the agent may write. Each change writes one
-//! `agent.default_group_set` audit row attributed to the operator. The audit
-//! row's `session_user` records the maintenance login that ran the command.
+//! `epigraph_set_agent_default_group`, once per agent: the operator must hold a
+//! live, non-retired operator link to each agent (or be the agent, for its own
+//! default), and a team must be one the agent may write. Each change writes
+//! one `agent.default_group_set` audit row attributed to the operator. The
+//! audit row's `session_user` records the maintenance login that ran the
+//! command.
 //!
 //! ONE transaction for every listed agent: committed under `--apply`, rolled
 //! back otherwise, so a dry run executes the definer for real and prints exactly
@@ -42,6 +47,8 @@ pub enum Outcome {
     Set(Vec<Change>),
     /// The definer refused `agent`; nothing was changed for any agent.
     Refused { agent: Uuid, why: String },
+    /// `--operator` is not a registered live human operator; nothing was run.
+    NotAnOperator,
 }
 
 impl Outcome {
@@ -50,7 +57,7 @@ impl Outcome {
     pub const fn exit_code(&self) -> i32 {
         match self {
             Self::Set(_) => 0,
-            Self::Refused { .. } => 1,
+            Self::Refused { .. } | Self::NotAnOperator => 1,
         }
     }
 }
@@ -84,6 +91,10 @@ pub fn describe(operator: Uuid, outcome: &Outcome, apply: bool) -> Vec<String> {
             "REFUSED\tagent={agent}\toperator={operator}\t{why}\tnothing was changed for any \
              listed agent"
         )],
+        Outcome::NotAnOperator => vec![format!(
+            "REFUSED\toperator={operator}\tnot a registered live human operator (a live \
+             human_operators row and an active human OAuth client); nothing was changed"
+        )],
     }
 }
 
@@ -113,6 +124,14 @@ pub async fn run(
     anyhow::ensure!(!agents.is_empty(), "--agent names at least one agent");
     let mut seen = std::collections::BTreeSet::new();
     let agents: Vec<Uuid> = agents.iter().copied().filter(|a| seen.insert(*a)).collect();
+
+    let is_human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !is_human {
+        return Ok(Outcome::NotAnOperator);
+    }
 
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     sqlx::query("SELECT set_config('epigraph.principal_id', $1, true)")
