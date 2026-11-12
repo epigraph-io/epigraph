@@ -33,10 +33,13 @@ PR #784, decisions D-V1..D-V5), [papers-tenancy-followup.md](papers-tenancy-foll
   * Pinned evidence, writer-owned rows and outsiders' challenges **never** move with the claim.
   * Sealed rows are refused.
   * Anything that removes a current reader is a **narrowing**, and is maintenance-only (R2).
-* **Operator rulings 2026-11-12** (section 0.1) settle five of the original questions: a
-  human is required, team → team is allowed but narrowing is maintenance-only, a publicize can
-  be undone in the app for a configurable window, attached rows stay in the team, and boundary
-  edges are included at their most private meet.
+* **Operator rulings 2026-11-12** (section 0.1, R1–R8) settle eight questions:
+  * a human is required for every act;
+  * team → team is allowed, but any narrowing is maintenance-only;
+  * a share or a publicize can be undone in the app for a configurable window (default 48 h);
+  * that app undo refuses once anyone outside the original audience has built on the item;
+  * the maintenance undo keeps attached rows in the team;
+  * boundary edges are included at their most private meet.
 * **Phases:** seven implementable PRs (section 7.1). **Open
   questions:** numbered in section 8.
 
@@ -64,27 +67,27 @@ that implement it.
   * **How this spec reads it.** A move in which some reader of A cannot read B (`readers_losing
     > 0`) removes an audience. The app therefore refuses it with `SHR11 narrowing:
     maintenance only` and points to `regroup-claims`. The app performs a move only when
-    `readers_losing = 0`. Open question 17 asks whether that is the intent.
+    `readers_losing = 0`. R6 confirms this reading.
   * Sections 4.1, 4.2 and 4.5.
 * **R3 (question 3): "Undoing publicise is viable for, say, 48 hours (configurable), then
   maintenance only."**
   * An app-level undo of a publicize is allowed inside a window that defaults to **48 hours**.
-    The window is measured from the publicize's audit row (`share.publicized`, or 206's
+    The window is measured from the act's audit row (`share.publicized`, or 206's
     `claim.publicized`).
-  * The window is held in a maintenance-written settings row (`share_settings.publicize_undo_window`),
-    in the shape of 207's `bug_report_intake_settings`. Nothing is hard-coded.
-  * Who may run it: the authority that may publicize, which is a human live admin of the owning
-    group (D-V2 plus R1).
+  * The window is held in a maintenance-written settings row (`share_settings.undo_window`), in
+    the shape of 207's `bug_report_intake_settings`. Nothing is hard-coded.
+  * Who may run it: the authority that may do the act. For a publicize that is a human live
+    admin of the owning group (D-V2 plus R1).
   * After the window, the undo is maintenance-only (`reown-reverse`).
+  * R7 extends the window to shares. R8 limits what the app undo may do inside it.
   * Sections 4.8 and 7.1 (P2).
 * **R4 (question 4): "Kept in the team."**
-  * When a share or move is undone, any claim that teammates attached rows to after the share
-    **stays in the team**, together with those rows. Attached rows are evidence, BBAs, traces
-    and edges. The undo neither pulls them back nor refuses.
-  * The undo reverts only the claims nobody attached anything to, and reports the ones it kept.
-  * Undoing a share is itself a narrowing (it removes the team as an audience). Under R2 it is
-    therefore maintenance-only: `reown-reverse` on the plan. Open question 18 asks whether R3's
-    window should also apply to undoing a share.
+  * When a share or move is undone **on the maintenance path** (`reown-reverse`), any claim
+    that teammates attached rows to after the share **stays in the team**, together with those
+    rows. Attached rows are evidence, BBAs, traces and edges.
+  * That undo reverts only the claims nobody attached anything to, and reports the ones it kept
+    as `kept_attached`.
+  * The **app** undo inside the window does not keep anything. Under R8 it refuses outright.
   * Section 4.8.
 * **R5 (question 6): "include it in the most private permission set."**
   * A boundary edge whose other end stays private is **included** in the plan. It is recorded
@@ -95,6 +98,33 @@ that implement it.
   * This is the 072 intersection, which arm (d) already computes. The act also applies it to
     evidence-endpoint edges, which arm (d) misses.
   * Section 3.3.
+* **R6 (question 17): "Yeah, refuse."**
+  * Confirms R2's reading. A team → team move that any reader of the source cannot follow into
+    the target is a narrowing. The app refuses it (`SHR11`), and it is maintenance-only
+    (`regroup-claims`).
+  * Sections 4.5 and 7.2.
+* **R7 (question 18): "yes."**
+  * The configurable undo window (default 48 h) also covers undoing a **share**, and so a
+    team → team move, which is a share between teams. It is measured from that act's audit
+    row.
+  * Who may run it: the authority that may do the act. That is the human who is a live admin of
+    the group the rows came **from**: the home group for a share, team A for a move.
+  * After the window, the undo is maintenance-only, with R4's rule.
+  * Sections 4.8 and 7.1 (P2).
+* **R8 (question 19): "Undo probably refuses at that point. Once the conversation starts, your
+  public contribution to the conversation is irrevocable."**
+  * **The principle: once others have built on a public contribution, it is irrevocable from
+    the app; only maintenance can reverse it.**
+  * This spec applies it to both kinds of act. Inside the window, the app undo of a publicize
+    or a share **refuses the whole act**, all or nothing, if any principal outside the act's
+    **original audience** has attached a row to any item since the act. The refusal is
+    `SHR13 built on: maintenance only`.
+  * The original audience is the readers of the owning group before the act: the home group
+    for a share, team A for a move, the owning group for a publicize.
+  * The refusal names the blocking rows: table, id, writer and `created_at`. Each of these rows
+    is readable by the caller, because it hangs off an item the caller's group owns, or is
+    public.
+  * Section 4.8.
 
 ## 1. Where we are
 
@@ -402,7 +432,7 @@ everything in terms of that set.
 | private (home) → team | `share` | no, for practical purposes: readers go from the home group to the team (section 4.5) | claims: 206. Others: new. |
 | team A → team B | `move` | only if some reader of A cannot read B (`readers_losing > 0`); then maintenance-only (R2) | CLI `regroup-claims` / `reown-workflows` only. **R2:** app-callable when nothing narrows. |
 | team → public, private → public | `publicize` | no | claims: 206 (D-V2). Others: new. |
-| public → group, team → private | privatization | yes | **Maintenance-only (R2)**: CLI `restrict-claims`, admin privatization pipeline. Out of scope except as the undo of this feature's own acts (4.8). The one app exception is R3's publicize-undo window. |
+| public → group, team → private | privatization | yes | **Maintenance-only (R2)**: CLI `restrict-claims`, admin privatization pipeline. Out of scope except as the undo of this feature's own acts (4.8). The one app exception is the undo window (R3, R7), refused once others have built on the item (R8). |
 
 ### 4.2 Who may do it
 
@@ -417,8 +447,8 @@ The roles:
 | share private → team | a **human** (R1) who is a live admin of the home group (in practice, the human whose personal group it is) and who writes the target by **own** membership (`via = 'own'`) | author **or** home admin; the target is any team in `epigraph_writable_teams(caller)`, including `via = 'operator'`. **An operated agent passes today.** |
 | move A → B | a **human** (R1) with its own live admin membership of A and writer membership of B; refused when `readers_losing > 0` (R2) | not app-callable |
 | publicize | a **human** (R1) with its own live admin membership of the owning group (D-V2) | D-V2 without the human test |
-| undo a publicize | inside the R3 window: a **human** live admin of the owning group. After it: maintenance only. | none |
-| undo a share or move | maintenance only (R2): `reown-reverse` on the plan; attached claims stay (R4) | none |
+| undo a publicize | inside the window (R3): a **human** live admin of the owning group; refused if anyone outside the owning group has built on it (R8). After the window, or when refused: maintenance only. | none |
+| undo a share or move | inside the window (R7): a **human** live admin of the source group (home, or team A); refused if anyone outside that group has built on it (R8). After the window, or when refused: maintenance only (`reown-reverse`), which keeps attached claims in the team (R4). | none |
 
 * **Operated agents (verified at `55b524f37`).** 206's classification together with
   `epigraph_writable_teams`'s `operator` arm lets an operated epiclaw agent move work it authored
@@ -483,12 +513,14 @@ The roles:
   to readers.
 * **Private → team** is a narrowing only for readers of the home group who are not in the team.
   A personal group's readers are the human and its role-attached agents. The human must write
-  the target (R1), so the set is normally empty. When it is not, R2 applies, and open question
-  17 asks whether the human's own agents should count.
-* **Team → team** is always computed this way. Under R2 the app performs it only when the
-  target's readers include every reader of the source.
+  the target (R1), so the set is normally empty. When it is not, R2 applies. Open question 20
+  asks whether the human's own agents should count.
+* **Team → team** is always computed this way. Under R2 and R6 the app performs it only when
+  the target's readers include every reader of the source.
 * **Publicize** never narrows.
-* **The one app exception is R3:** undoing a publicize inside the window (4.8).
+* **The one app exception is the undo window (R3, R7).** Undoing a share, move or publicize
+  inside the window is allowed, and only while nobody outside the original audience has built
+  on it (R8). See 4.8.
 
 ### 4.6 How dependent rows follow
 
@@ -591,44 +623,53 @@ The roles:
     transaction (the census that `operator/reown.rs` takes with `pg_stat_xact_user_tables`).
   * The `security_events` details are **not** enough for this: they do not record the
     before-state of pinned, writer-owned or co-owned rows.
-* **Undo** (`reverse_share(plan_id)`) replays the before-images newest-first, compare-and-swap
+* **Undo** (`share_undo` in the app, `reown-reverse` on maintenance) replays the before-images newest-first, compare-and-swap
   per row: a row whose current tuple is not the plan's after-image is **held**, exactly as in
   `reown-reverse`.
-* **Undoing a share or a move is a narrowing,** so under R2 it is **maintenance-only**:
-  `epigraph-operator reown-reverse` gains a dispatch for `share_plan` manifests read from the
-  database.
-  * **R4: attached claims stay in the team.** A claim is "attached" if, since the share, a
-    principal other than the plan's actor added any row stamped with the team. That means
-    evidence, BBAs or traces (stamped by arm (c)), or an edge whose meet includes the team.
-  * Such a claim is not reverted. It keeps its tenancy, its derived rows and its edges, and is
-    listed in the undo's report as `kept_attached`.
-  * Only claims nobody attached anything to are restored to their before-images. The hull and
-    workflow rules still apply. A kept claim keeps its hull members in the team as well, so no
-    `supersedes` or lineage reference dangles.
-* **Undoing a publicize (R3).**
-  * **Inside the window**, default 48 h from the publicize's audit row and configurable in
-    `share_settings`, a human live admin of the owning group may undo it from the app. The act
-    is the definer `epigraph_share_unpublicize(plan_id, reason)`, owned by
-    `epigraph_maintenance` like 206's acts. The window is decided in the body, against the audit
-    row's `created_at` and the settings row, both read live.
-  * The undo restores the manifest's before-images. The claim goes back to `('group', owner)`.
-    Arm (d) re-meets the incident edges, and `claims_atlas_layout_narrowed` bumps the layout
-    epoch (section 6.1).
-  * **Rows written since the publicize by principals outside the owning group** are the R4
-    case on a public claim:
+* **Every undo is a narrowing.** It removes the team's audience (share, move) or the public's
+  (publicize). It therefore has exactly two paths.
+* **The app path, inside the window (R3, R7, R8).**
+  * The window defaults to 48 h from the act's audit row and is configurable in
+    `share_settings.undo_window`.
+  * Inside it, the human who holds the act's authority may undo it from the app:
+    * for a publicize, a human live admin of the owning group;
+    * for a share or a move, a human live admin of the source group (the home group, or team
+      A).
+  * The act is the definer `epigraph_share_undo(plan_id, reason)`, owned by
+    `epigraph_maintenance` like 206's acts. It decides the window in its body, against the audit
+    row's `created_at` and the settings row, both read live. Outside the window it refuses with
+    `SHR12 window closed: maintenance only`.
+  * **R8, all or nothing.** The body first looks for a row attached since the act, to any item
+    of the plan, by a principal outside the **original audience**. The original audience is the
+    readers of the owning group before the act. Attached rows are:
+    * evidence, BBAs and traces stamped by arm (c);
     * outsiders' writer-owned evidence, BBAs and traces (114);
     * challenges (168);
-    * D8 writer-owned edges (120).
+    * edges, including D8 writer-owned edges (120), whose writer is outside the audience.
 
-    Arm (d) would hand the writer-owned rows to the owning group when the claim narrows, and an
-    outsider's edge would become unreadable to its writer. The in-window undo therefore
-    **keeps** any such claim public, lists it as `kept_attached`, and reverts the rest. This is
-    R4's rule ("kept") applied to the public audience. Open question 19 asks whether the
-    operator would rather refuse here.
-  * **After the window** the undo is maintenance-only: `reown-reverse` on the plan, which is
-    today's `restrict-claims --allow-non-world-owner` in effect.
+    If there is even one, the undo **refuses the whole act** with `SHR13 built on: maintenance
+    only` and names every blocking row (table, id, writer, `created_at`). Nothing is changed.
+    In the operator's words: "Once the conversation starts, your public contribution to the
+    conversation is irrevocable."
+  * Otherwise the undo replays the manifest's before-images, compare-and-swap per row. A
+    publicized claim goes back to `('group', owner)`: arm (d) re-meets the incident edges and
+    `claims_atlas_layout_narrowed` bumps the layout epoch (section 6.1). A shared claim goes
+    back to the home group, or to team A.
   * Events and webhooks already delivered during the window cannot be recalled (section 6.4).
     The response says so.
+* **The maintenance path: after the window, or after an R8 refusal.**
+  * `epigraph-operator reown-reverse` gains a dispatch for `share_plan` manifests read from the
+    database. For a publicize this is in effect today's `restrict-claims
+    --allow-non-world-owner`.
+  * **R4: attached claims stay in the team.** A claim is "attached" if, since the act, a
+    principal other than the plan's actor added any row stamped with the claim's new owner (or
+    a public row, for a publicize). Such a claim is not reverted. It keeps its tenancy, its
+    derived rows and its edges, and is listed as `kept_attached`.
+  * Only claims nobody attached anything to are restored to their before-images. The hull and
+    workflow rules still apply. A kept claim keeps its hull members with it, so no `supersedes`
+    or lineage reference dangles.
+  * An operator who means to reverse a built-on claim anyway does it as a separate, explicit
+    narrowing (`regroup-claims`, `restrict-claims`), under that verb's own ruling and reason.
 
 ## 5. Surfaces
 
@@ -647,11 +688,10 @@ The same rules apply on all three surfaces:
 | `share_preview` | `unit: {claims: [..]} \| {workflow: name} \| {selection: ..} \| {root: {table, id}}`, `to_group_id`, `act: share\|move\|publicize`, `hull?` | `claims:write` | returns `plan_id`, `plan_digest`, the classification, dependent counts, the boundary report and `readers_losing`; writes only the plan. A non-human caller gets `refused_not_human` (R1). |
 | `share_apply` | `plan_id`, `plan_digest`, `reason` | `claims:write` | human only (R1); applies batch by batch; resumable by calling it again; refuses `readers_losing > 0` with `SHR11` (R2) |
 | `share_status` | `plan_id` | `claims:read` | the plan's state, cursor and per-batch outcomes; readable by the actor and by admins of either group |
-| `share_unpublicize` | `plan_id`, `reason` | `claims:write` | R3: a human live admin of the owning group, inside the window. Outside the window it answers `SHR12 window closed: maintenance only`. Returns `reverted` and `kept_attached`. |
-| `share_claims_with_team`, `publicize_claims` (206) | unchanged, plus `dry_run: bool`, **default true** after P1 | `claims:write` | human only after P1 (R1); kept for one-shot use of up to 500 ids; internally a one-batch plan, so a publicize gets the R3 undo too |
+| `share_undo` | `plan_id`, `reason` | `claims:write` | Undoes a share, move or publicize inside the window (R3, R7). Callable by a human live admin of the source group (share, move) or of the owning group (publicize). Outside the window it answers `SHR12 window closed: maintenance only`. If anyone outside the original audience has built on the plan, it answers `SHR13 built on: maintenance only` and lists the blocking rows (R8). All or nothing. |
+| `share_claims_with_team`, `publicize_claims` (206) | unchanged, plus `dry_run: bool`, **default true** after P1 | `claims:write` | human only after P1 (R1); kept for one-shot use of up to 500 ids; internally a one-batch plan, so each gets the windowed undo too |
 
-There is no app tool that reverses a share or a move: that narrows, and R2 makes it
-maintenance-only (section 5.3).
+Past the window, or after an R8 refusal, an undo is maintenance-only (section 5.3).
 
 ### 5.2 REST
 
@@ -660,7 +700,7 @@ maintenance-only (section 5.3).
 | `POST /api/v1/shares/preview` | `share_preview` |
 | `POST /api/v1/shares/{plan_id}/apply` | `share_apply` |
 | `GET /api/v1/shares/{plan_id}` | `share_status` |
-| `POST /api/v1/shares/{plan_id}/unpublicize` | `share_unpublicize` |
+| `POST /api/v1/shares/{plan_id}/undo` | `share_undo` |
 | `POST /api/v1/claims/share-with-team`, `POST /api/v1/claims/publicize` (206) | unchanged, plus `?dry_run=` |
 
 * Refusals map as in 206: input → 400, authority → 403, state (held, digest mismatch,
@@ -679,8 +719,9 @@ maintenance-only (section 5.3).
   * exit codes 0, 1, 2, 3;
   * a JSONL manifest opened `create_new` and fsynced before the write.
 * **`reown-reverse`** gains a dispatch for `share_plan` manifests, which it reads from the
-  database by plan id. It is the only undo of a share or a move (R2), and the only undo of a
-  publicize once R3's window has closed. It keeps attached claims (R4), as the app undo does.
+  database by plan id. It is the only undo once the window has closed (R3, R7), or once the
+  app undo has refused because others have built on the plan (R8). It keeps attached claims in
+  place (R4).
 * **Existing verbs stay** as the maintenance-side tools for the same moves:
   * `regroup-claims` for team → team;
   * `reown-workflows` for workflows;
@@ -701,7 +742,7 @@ maintenance-only (section 5.3).
 * **Publicize** only widens. The layout simply lacks the new claims until the next
   `atlas_layout` run. That is stale, but nothing leaks. Open question 15 asks whether apply
   should queue a rebuild.
-* **Undo of a publicize** (R3's app window, or `reown-reverse`) narrows, so the trigger fires and the layout stops being served until
+* **Undo of a publicize** (the app window, or `reown-reverse`) narrows, so the trigger fires and the layout stops being served until
   a rebuild. The trigger keys on the `visibility` change itself, not on any caller, so a
   maintenance replay is covered. A test pins this (7.2).
 
@@ -790,12 +831,12 @@ registrations listed after the table.
 | phase | content | migration |
 |---|---|---|
 | **P1: claim-set hardening** | **R1's human-only gate on both 206 acts** (`refused_not_human`; drop share's author arm; the target writable by own membership); **recompute or vacate the DS cache of every moved claim (the leak in 4.6)**; `preview` mode on the two 206 acts (classification and dependent counts, no write); re-meet of evidence-endpoint edges in share and publicize; `harvester_sources` follow; `shared-fragment` hold; the lineage hull as an option (default per open question 5); the missing HTTP test for `share-with-team` | yes: `CREATE OR REPLACE` of the 206 definers with a new signature, keeping the old one as a wrapper |
-| **P2: share plans and the publicize undo** | `share_plans`, `share_plan_items`, `share_plan_rows` (FORCE RLS); `share_settings` (maintenance-written, `publicize_undo_window` default 48 h); definers `epigraph_share_preview`, `epigraph_share_apply`, `epigraph_share_unpublicize` (R3, keeping attached claims); the `share.` prefix policy; MCP and REST surfaces; claim-set unit on plans; boundary edges included at the most restrictive meet (R5) | yes |
+| **P2: share plans and the windowed undo** | `share_plans`, `share_plan_items`, `share_plan_rows` (FORCE RLS); `share_settings` (maintenance-written, `undo_window` default 48 h); definers `epigraph_share_preview`, `epigraph_share_apply`, `epigraph_share_undo` (R3, R7; refuses all or nothing with `SHR13` when built on, R8); the `share.` prefix policy; MCP and REST surfaces; claim-set unit on plans; boundary edges included at the most restrictive meet (R5) | yes |
 | **P3: workflow unit** | `epigraph_share_workflow_preview/apply`: every generation, level 0–2 claims, siblings, plan edges, exclusive atoms; catch-up; interaction with 202 tested | yes (definers) |
 | **P4: subgraph selection** | the selection grammar, evaluated on the caller's connection, frozen; boundary report (edges included per R5) | yes (one STABLE invoker function; no new table) |
-| **P5: move team → team** | human admin of the source who writes the target (R1, R2); `readers_losing` computed and any narrowing refused with `SHR11` (R2); the app counterpart of `regroup-claims`, with the same holds | yes (definer) |
+| **P5: move team → team** | human admin of the source who writes the target (R1, R2); `readers_losing` computed and any narrowing refused with `SHR11` (R2, R6); the windowed undo of a move (R7, R8); the app counterpart of `regroup-claims`, with the same holds | yes (definer) |
 | **P6: generic registry and ratchet** | `tenancy_share_registry`, seeded from section 2; the catalog ratchet; registries and `harvester_sources` as roots | yes |
-| **P7: operator CLI parity** | `epigraph-operator share-{claims,workflow,selection}`, `publicize-*`, dry run by default, `--apply`, JSONL manifest; `reown-reverse` dispatches `share_plan` manifests: the undo of a share or a move (R2), and of a publicize after the window (R3), keeping attached claims (R4) | no |
+| **P7: operator CLI parity** | `epigraph-operator share-{claims,workflow,selection}`, `publicize-*`, dry run by default, `--apply`, JSONL manifest; `reown-reverse` dispatches `share_plan` manifests: the undo after the window (R3, R7) or after an R8 refusal, keeping attached claims (R4) | no |
 
 **Order:** P1 first, then P2, which every later phase builds on. P3, P4 and P5 are independent
 of each other. P6 can land any time after P2. P7 can land after P2.
@@ -806,7 +847,7 @@ of each other. P6 can land any time after P2. P7 can land after P2.
   guard fail open);
 * `elevation_arms_census.rs`;
 * `maintenance_surface_register.rs`;
-* `scope_map.rs` (`claims:write` for the acts, including `share_unpublicize`).
+* `scope_map.rs` (`claims:write` for the acts, including `share_undo`).
 
 ### 7.2 Test strategy
 
@@ -851,22 +892,24 @@ wrong implementation. A test that only round-trips a happy path does not count.
    * The `search_path` write window must be closed again on every exit path, including the
      refusal path.
 7. **Undo.**
-   * Share then `reown-reverse` returns every untouched row to its exact before-image:
-     byte-equal tuples, including `co_owner_group_id`, `writer_owned` and pins.
-   * R4: a claim that a teammate attached evidence, a BBA, a trace or an edge to in between
-     stays in the team. The teammate's row stays readable to the teammate, the claim is reported
-     as `kept_attached`, and its hull members stay with it. The test fails if the row moves to
-     the home group, or if the whole undo is refused.
+   * A `share_undo` of a share, a move and a publicize, each inside the window with nothing
+     built on it, returns every touched row to its exact before-image: byte-equal tuples,
+     including `co_owner_group_id`, `writer_owned` and pins.
+   * **R3/R7 window.** At window + 1 s each act's undo answers `SHR12` and changes nothing. The
+     test shrinks `share_settings.undo_window` and does not sleep. Changing the settings row on
+     the app role is refused. A writer (not admin) of the source group is refused, and so is an
+     operated agent of the admin (R1).
+   * **R8 all or nothing.** Fixture: a 50-claim plan, where one principal outside the original
+     audience attaches one row to one claim inside the window. Run it once for each attachment
+     kind: an evidence row, a BBA, a trace, a challenge, a D8 edge, and (for a share) a
+     teammate's arm (c) row. Each time the undo answers `SHR13`, names exactly that row, and
+     changes **none** of the 50 claims. The test fails on a partial revert. A row attached by a
+     member of the original audience does not block.
+   * **R4 on the maintenance path.** After the window, `reown-reverse` keeps the built-on
+     claim in place with its attached row readable to its writer, reports it `kept_attached`
+     with its hull members, and restores the other 49.
    * A row changed by a third party is held, not overwritten.
    * Reversing twice changes nothing.
-   * R2: the app has no undo for a share or a move. A test enumerates the MCP router and the
-     REST route table and asserts that no app surface reaches `share_plan` reversal for those
-     acts.
-   * R3: inside the window, a human admin's `share_unpublicize` restores the before-images. At
-     window + 1 s it answers `SHR12` and changes nothing. The test shrinks the window through
-     `share_settings` and does not sleep. Changing the settings row on the app role is refused.
-     A writer (not admin) is refused, and so is an operated agent of the admin. An outsider's
-     evidence attached during the window keeps that claim public and listed `kept_attached`.
 8. **Workflow-specific.**
    * After a share, a teammate's `add_step` on the lineage succeeds and `find_workflow` resolves
      the true head.
@@ -884,7 +927,7 @@ wrong implementation. A test that only round-trips a happy path does not count.
    a pre-undo run is no longer served.
 11. **Sealed.** Each sealed class in 4.4 is held. A direct app-role UPDATE is still refused by 074
     and 115.
-12. **R1, the human gate.** On every act (share, move, publicize, unpublicize, and the 206 tools
+12. **R1, the human gate.** On every act (share, move, publicize, undo, and the 206 tools
     after P1), each of these callers is refused with `refused_not_human` and changes nothing:
     * an operated epiclaw agent whose human is an admin of every group involved;
     * a stdio agent with an operator link;
@@ -894,9 +937,9 @@ wrong implementation. A test that only round-trips a happy path does not count.
     The same human, calling directly, succeeds. The fixture gives the agent every membership,
     so the test fails if any membership arm, rather than the human test, admits it.
 13. **R2, narrowing refused in the app.** A move from A to B, where one reader of A is not in B,
-    answers `SHR11` with nothing written. Adding that reader to B makes the same plan apply. A
-    private → team share where a non-human reader of the home group would lose read follows
-    the open question 17 ruling.
+    answers `SHR11` with nothing written (R6). Adding that reader to B makes the same plan
+    apply. A private → team share where a non-human reader of the home group would lose read
+    follows the open question 20 ruling.
 14. **R5, boundary edges.** For each class in 3.3, the edge is in the plan's items and manifest
     after apply. Its tuple equals the most restrictive meet, and it is read by exactly the
     principals in both endpoint groups. This covers a teammate who is not in the home group, a
@@ -905,14 +948,14 @@ wrong implementation. A test that only round-trips a happy path does not count.
 
 ## 8. Open questions for the operator
 
-Questions 1–4 and 6 were ruled on 2026-11-12 (section 0.1). They keep their numbers so that
+Questions 1–4, 6 and 17–19 were ruled on 2026-11-12 (section 0.1). They keep their numbers so that
 earlier references stay valid.
 
 1. *Resolved by R1:* every act needs the human.
 2. *Resolved by R2:* team → team is allowed in the app; narrowing is maintenance-only.
 3. *Resolved by R3:* app undo within a configurable window, default 48 h; maintenance-only
    after it.
-4. *Resolved by R4:* attached rows, and their claims, stay in the team.
+4. *Resolved by R4:* on the maintenance undo, attached rows and their claims stay in the team.
 5. **Lineage hull for a claim-set share.** Include the `supersedes` chain and `step_lineage`
    siblings by default (the safe choice), or only on request?
 6. *Resolved by R5:* included, at the most restrictive meet of the endpoints.
@@ -939,14 +982,11 @@ earlier references stay valid.
 16. **The DS cache fix for claims already shared or publicized under 206.** Should P1 include a
     one-off recompute of every claim named in a `claim.publicized` or `claim.shared_with_team`
     row, run on the maintenance connection?
-17. **R2's scope.** This spec reads "reducing visibility is maintenance only" as covering any
-    move that leaves a reader of the source unable to read the target. In that reading the app
-    moves team → team only when the target's readers include all of the source's, which may be
-    rare between two real teams. Is that the intent? And should the human's own role-attached
-    agents count as readers lost when the human shares out of their personal group?
-18. **Undoing a share in the app.** R3 gives a publicize a 48 h app-side undo, but a share undo
-    narrows too, and R2 makes it maintenance-only. Should the same window apply to undoing a
-    share or a move?
-19. **Outsiders' attachments during a publicize window.** The in-window undo keeps public any
-    claim that a principal outside the owning group attached a row to (R4 applied to the
-    public). Would the operator rather the undo refuse entirely in that case?
+17. *Resolved by R6:* a move that any source reader cannot follow is a narrowing; the app
+    refuses it.
+18. *Resolved by R7:* the undo window also covers shares (and moves).
+19. *Resolved by R8:* the in-window undo refuses all or nothing once anyone outside the
+    original audience has built on the item.
+20. **The human's own agents as readers.** When a human shares out of their personal group,
+    should their own role-attached agents, which read that group, count as readers lost (and so
+    make the app refuse under R2), or be treated as part of the human?
