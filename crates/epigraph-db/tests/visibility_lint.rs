@@ -1868,9 +1868,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_visibility.rs",
+        "default_private_of",
+        "READ through 209's definer `epigraph_default_private(agent)`: one boolean, the agent's \
+         own private default. A preference about the agent, not a corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
+        "human_default_private_of",
+        "READ through 209's definer `epigraph_default_private` applied to 149's app-callable \
+         definer `epigraph_human_of(agent, true)`: one boolean, the live human's private default. \
+         A preference about the agent's human, not a corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
         "resolve_visibility_choice",
-        "Composes `writable_teams`, `default_group_of` and `human_default_group_of` (all \
-         definers) into the write-time \
+        "Composes `writable_teams`, `default_group_of`, `human_default_group_of`, \
+         `default_private_of` and `human_default_private_of` (all definers) into the write-time \
          visibility decision for one author. Reads no corpus row; the decision is enforced by \
          the claims trigger and policies on the WRITE's stamped transaction.",
     ),
@@ -1891,10 +1904,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_visibility.rs",
-        "set_default_group_conn",
-        "WRITE through 206's definer `epigraph_set_default_group`: the STAMPED session \
-         principal's own `agents.default_group_id`, authority checked in the body (VIS01 / \
-         VIS02) and audited. The viewer is spent on the stamp.",
+        "set_agent_default_conn",
+        "WRITE through 209's definer `epigraph_set_agent_default_group` on a STAMPED \
+         transaction: one agent's `default_group_id` / `default_private`, authority decided in the \
+         body from the stamped principal (the agent itself, or its registered live human operator \
+         through a live, non-retired operator link; VIS01 / VIS02 / VIS05), audited. The viewer \
+         is spent on the stamp.",
     ),
     (
         "claim_visibility.rs",

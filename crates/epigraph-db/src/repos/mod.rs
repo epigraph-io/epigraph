@@ -172,7 +172,8 @@ pub use claim_theme::{
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use claim_visibility::{
-    ChoiceResolution, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome, WriteTenancyReport,
+    ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,
+    WriteTenancyReport,
 };
 pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
 pub use community::{CommunityRepository, MembershipOutcome};

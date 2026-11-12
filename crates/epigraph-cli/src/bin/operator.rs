@@ -28,6 +28,10 @@
 //! (NOT-A-MEMBER: nothing to revoke, usually a mistyped id).
 //! `retire-link` exits 1 when the agent has no operator link (NO-LINK: nothing
 //! to retire, usually a mistyped id); a link already retired exits 0.
+//! `set-default-group` exits 1 when `--operator` is not a registered live
+//! human operator, or the definer refused an agent (REFUSED: not the
+//! operator's live-linked agent, or a team the agent may not write); nothing
+//! is changed for any listed agent then.
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -114,13 +118,15 @@
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
 //!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
+//!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
+//!         (--group <uuid> | --private | --clear) [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
-    confirmations, custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy,
-    link, passkey, regroup, reown, reown_linked, reown_workflows, restrict, retire_link, reverse,
-    system_agent, team_group,
+    confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation, group_role, hide,
+    human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows, restrict,
+    retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -526,6 +532,38 @@ enum Command {
     /// reported and nothing is written). Refused while the agent still holds a
     /// live writer/admin row in the operator's group, unless
     /// `--revoke-membership`. Exits 1 when the agent has no link.
+    /// Set the default of agents a live human operator operates (migration
+    /// 209): where a claim write that names no visibility lands. `--private`
+    /// sends it to the agent's home group (the operator's personal group)
+    /// ahead of the operator's own default team; `--group` names a team the
+    /// agent may write; `--clear` makes it inherit the operator's default
+    /// again. Refuses (exit 1) an `--operator` that is not a registered live
+    /// human operator, then runs migration 209's definer with `--operator`
+    /// stamped as the principal, which refuses (exit 1) unless it holds a
+    /// LIVE, non-retired operator link to every listed agent (or is the agent
+    /// itself). One transaction for all agents (all or nothing), one
+    /// `agent.default_group_set` audit row per agent.
+    #[command(group(clap::ArgGroup::new("default").required(true).args(["group", "private", "clear"])))]
+    SetDefaultGroup {
+        /// The live human operator on whose authority this runs.
+        #[arg(long)]
+        operator: Uuid,
+        /// An agent it operates. Repeat for several.
+        #[arg(long = "agent", required = true)]
+        agents: Vec<Uuid>,
+        /// A team the agent may write.
+        #[arg(long)]
+        group: Option<Uuid>,
+        /// A private default.
+        #[arg(long)]
+        private: bool,
+        /// No default of its own: inherit the operator's.
+        #[arg(long)]
+        clear: bool,
+        /// Commit. Without it, every call and audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
     RetireLink {
         /// The linked agent's id.
         #[arg(long)]
@@ -2161,6 +2199,28 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the revocation and its audit row were rolled back.");
             }
             Ok(0)
+        }
+        Command::SetDefaultGroup {
+            operator,
+            agents,
+            group,
+            private,
+            clear: _,
+            apply,
+        } => {
+            let setting = match (group, private) {
+                (Some(g), _) => epigraph_db::DefaultGroupSetting::Team(g),
+                (None, true) => epigraph_db::DefaultGroupSetting::Private,
+                (None, false) => epigraph_db::DefaultGroupSetting::Clear,
+            };
+            let outcome = default_group::run(&mut conn, operator, &agents, setting, apply).await?;
+            for line in default_group::describe(operator, &outcome, apply) {
+                println!("{line}");
+            }
+            if !apply && outcome.exit_code() == 0 {
+                println!("DRY RUN: every change and its audit row were rolled back.");
+            }
+            Ok(outcome.exit_code())
         }
         Command::RetireLink {
             agent,

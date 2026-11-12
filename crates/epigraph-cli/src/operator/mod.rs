@@ -172,6 +172,7 @@ pub mod client_status;
 pub mod confirmations;
 pub mod custodian;
 pub mod dcr_sweep;
+pub mod default_group;
 pub mod delete_frames;
 pub mod elevation;
 pub mod group_role;

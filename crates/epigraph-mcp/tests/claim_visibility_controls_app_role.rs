@@ -27,6 +27,11 @@
 //!   created first;
 //! * both acts decide against the owner a concurrent session commits while
 //!   they wait for its row lock, never against the version they read first.
+//! * migration 209 (Part D): an agent's PRIVATE default beats its live
+//!   human's default team and the single-team fallback, an unset one still
+//!   inherits the human's team, an explicit visibility still wins, and only the
+//!   agent itself or its registered live human operator (through a LIVE link)
+//!   may set it, each change audited once.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -404,6 +409,8 @@ async fn several_teams_go_private_until_a_default_is_set(pool: PgPool) {
         &dv,
         SetDefaultGroupParams {
             group_id: Some(other.to_string()),
+            private: None,
+            agent_id: None,
         },
         Some(&token(dave)),
     )
@@ -416,6 +423,8 @@ async fn several_teams_go_private_until_a_default_is_set(pool: PgPool) {
         &dv,
         SetDefaultGroupParams {
             group_id: Some(t2.to_string()),
+            private: None,
+            agent_id: None,
         },
         Some(&token(dave)),
     )
@@ -1083,4 +1092,476 @@ async fn share_decides_on_the_owner_a_concurrent_change_commits(pool: PgPool) {
     .await
     .expect("audit");
     assert_eq!(audited, 0, "nothing was shared, so nothing is audited");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Part D: a private default, and an operator setting its agents' defaults (209)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `set_default_group` as `caller`, for `agent` (`None`: the caller itself).
+async fn set_default(
+    pool: &PgPool,
+    s: &AppRole,
+    caller: Uuid,
+    agent: Option<Uuid>,
+    group: Option<Uuid>,
+    private: bool,
+) -> Result<serde_json::Value, epigraph_mcp::errors::McpError> {
+    set_default_group(
+        &s.server,
+        &viewer(pool, caller).await,
+        SetDefaultGroupParams {
+            group_id: group.map(|g| g.to_string()),
+            private: private.then_some(true),
+            agent_id: agent.map(|a| a.to_string()),
+        },
+        Some(&token(caller)),
+    )
+    .await
+    .map(|r| first_text(&r))
+}
+
+/// `(default_group_id, default_private)` as stored.
+async fn default_of(pool: &PgPool, agent: Uuid) -> (Option<Uuid>, bool) {
+    sqlx::query_as("SELECT default_group_id, default_private FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("agent default")
+}
+
+/// The `agent.default_group_set` rows naming `target`, oldest first:
+/// `(agent_id, details)`. 209's rows name the target in `details`; 206's
+/// (none are written any more) named it only as `agent_id`.
+async fn default_audit(pool: &PgPool, target: Uuid) -> Vec<(Option<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'agent.default_group_set' \
+            AND details->>'target_agent_id' = $1::text \
+          ORDER BY created_at, id",
+    )
+    .bind(target)
+    .fetch_all(pool)
+    .await
+    .expect("default audit rows")
+}
+
+/// The ruling's shape: a human operator who writes the team NDI (and whose
+/// own default is NDI), an NDI member who only reads, and agents the human
+/// operates through LIVE links.
+struct Fleet {
+    ndi: Uuid,
+    human: Uuid,
+    human_home: Uuid,
+    member: Uuid,
+}
+
+async fn fleet(pool: &PgPool, s: &AppRole) -> Fleet {
+    let ndi = team(pool, "ndi").await;
+    let (human, human_home) = fixture::seed_human_operator(pool, "def-human").await;
+    let (member, _) = fixture::seed_agent_with_group(pool, "def-ndi-member").await;
+    add_member(pool, ndi, human, "writer").await;
+    add_member(pool, ndi, member, "reader").await;
+    let body = set_default(pool, s, human, None, Some(ndi), false)
+        .await
+        .expect("the human's own default is NDI");
+    assert_eq!(body["set_by"], "self", "{body}");
+    Fleet {
+        ndi,
+        human,
+        human_home,
+        member,
+    }
+}
+
+/// A new agent operated by `human` through a LIVE link.
+async fn crew_of(pool: &PgPool, human: Uuid, label: &str) -> Uuid {
+    let (crew, _) = fixture::seed_agent_with_group(pool, label).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
+        .await
+        .expect("live link");
+    crew
+}
+
+/// The ruling (2026-11-12): the human's default is the team NDI, the agent it
+/// operates is set PRIVATE by the human, and the agent's write that names no
+/// visibility lands private in the HUMAN's personal group (the operated
+/// agent's home), where an NDI member cannot read it. The change is audited
+/// once, attributed to the operator, with the previous and new values.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operators_private_default_keeps_its_agents_writes_out_of_its_team(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let crew = crew_of(&pool, f.human, "def-crew").await;
+
+    // CALIBRATION: before the private default the crew agent inherits NDI and
+    // the member reads it, so "the member cannot read" below is not a member
+    // that reads nothing.
+    let before = write_as(&pool, &s, crew, submit("crew before private", None, None))
+        .await
+        .expect("inherits NDI");
+    assert_eq!(body_owner(&before), f.ndi, "{before}");
+    assert!(reads(&pool, &s, f.member, claim_of(&before)).await);
+
+    let body = set_default(&pool, &s, f.human, Some(crew), None, true)
+        .await
+        .expect("the live operator sets the agent private");
+    assert_eq!(body["agent_id"], crew.to_string(), "{body}");
+    assert_eq!(body["set_by"], "operator", "{body}");
+    assert_eq!(body["default_private"], true, "{body}");
+    assert_eq!(default_of(&pool, crew).await, (None, true));
+    assert_eq!(
+        default_of(&pool, f.human).await,
+        (Some(f.ndi), false),
+        "the human's own default is untouched"
+    );
+
+    let body = write_as(&pool, &s, crew, submit("crew after private", None, None))
+        .await
+        .expect("lands private");
+    let c = claim_of(&body);
+    assert_eq!(body["visibility"], "private", "{body}");
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        ("group".to_string(), f.human_home),
+        "private to the operator's personal group, the operated agent's home"
+    );
+    assert!(derived_tenancy(&pool, c)
+        .await
+        .iter()
+        .all(|d| *d == ("group".to_string(), f.human_home)));
+    assert!(
+        !reads(&pool, &s, f.member, c).await,
+        "an NDI member must not read the private-default write"
+    );
+    assert!(reads(&pool, &s, f.human, c).await, "the operator reads it");
+
+    let audit = default_audit(&pool, crew).await;
+    assert_eq!(audit.len(), 1, "one row per change: {audit:?}");
+    let (who, d) = &audit[0];
+    assert_eq!(*who, Some(f.human), "attributed to the operator who acted");
+    assert_eq!(d["via"], "operator", "{d}");
+    assert_eq!(d["operator_id"], f.human.to_string(), "{d}");
+    assert_eq!(d["previous"], serde_json::Value::Null, "{d}");
+    assert_eq!(d["previous_private"], false, "{d}");
+    assert_eq!(d["default_group_id"], serde_json::Value::Null, "{d}");
+    assert_eq!(d["default_private"], true, "{d}");
+    assert_eq!(d["migration"], 209, "{d}");
+}
+
+fn body_owner(body: &serde_json::Value) -> Uuid {
+    parse_uuid_field(body, "owner_group_id")
+}
+
+/// 206 preserved: an agent with no default of its own still inherits its
+/// human's default team. The human writes TWO teams, so the single-team
+/// fallback cannot be what put the claim in NDI; the human's default did.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_with_no_default_still_inherits_its_humans_team(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let second = team(&pool, "second").await;
+    add_member(&pool, second, f.human, "writer").await;
+    let crew = crew_of(&pool, f.human, "def-crew-unset").await;
+    // A sibling set private does not change this one.
+    let sibling = crew_of(&pool, f.human, "def-crew-sibling").await;
+    set_default(&pool, &s, f.human, Some(sibling), None, true)
+        .await
+        .expect("sibling private");
+
+    let body = write_as(&pool, &s, crew, submit("unset crew write", None, None))
+        .await
+        .expect("inherits");
+    assert_eq!(body["visibility"], "team", "{body}");
+    assert_eq!(body_owner(&body), f.ndi, "{body}");
+    assert!(reads(&pool, &s, f.member, claim_of(&body)).await);
+    assert_eq!(default_of(&pool, crew).await, (None, false));
+}
+
+/// The likeliest live shape: the human sets NO default and writes exactly one
+/// team, so every agent it operates has one writable team and the single-team
+/// fallback would put its writes there. A private default must beat that too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_default_beats_the_single_team_fallback(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let ndi = team(&pool, "only-team").await;
+    let (human, human_home) = fixture::seed_human_operator(&pool, "def-solo-human").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "def-solo-member").await;
+    add_member(&pool, ndi, human, "writer").await;
+    add_member(&pool, ndi, member, "reader").await;
+    let private_crew = crew_of(&pool, human, "def-solo-private").await;
+    let plain_crew = crew_of(&pool, human, "def-solo-plain").await;
+    assert_eq!(default_of(&pool, human).await, (None, false));
+
+    // CALIBRATION: with nothing set, the fallback sends the write to the team.
+    let body = write_as(&pool, &s, plain_crew, submit("fallback write", None, None))
+        .await
+        .expect("fallback");
+    assert_eq!(body_owner(&body), ndi, "{body}");
+
+    set_default(&pool, &s, human, Some(private_crew), None, true)
+        .await
+        .expect("private");
+    let body = write_as(&pool, &s, private_crew, submit("solo private", None, None))
+        .await
+        .expect("private write");
+    assert_eq!(body["visibility"], "private", "{body}");
+    assert_eq!(body_owner(&body), human_home, "{body}");
+    assert!(!reads(&pool, &s, member, claim_of(&body)).await);
+}
+
+/// An explicit visibility on the write wins over a private default: `team`
+/// with a group, `team` with none (the caller asked for a team: the team
+/// chain, here the human's default), and `public`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicit_visibility_beats_a_private_default(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let crew = crew_of(&pool, f.human, "def-crew-explicit").await;
+    set_default(&pool, &s, f.human, Some(crew), None, true)
+        .await
+        .expect("private");
+
+    let body = write_as(
+        &pool,
+        &s,
+        crew,
+        submit("explicit team", Some("team"), Some(f.ndi)),
+    )
+    .await
+    .expect("explicit team");
+    assert_eq!(body_owner(&body), f.ndi, "{body}");
+    assert!(reads(&pool, &s, f.member, claim_of(&body)).await);
+
+    let body = write_as(&pool, &s, crew, submit("team no group", Some("team"), None))
+        .await
+        .expect("explicit team without a group");
+    assert_eq!(body["visibility"], "team", "{body}");
+    assert_eq!(body_owner(&body), f.ndi, "{body}");
+
+    let body = write_as(
+        &pool,
+        &s,
+        crew,
+        submit("explicit public", Some("public"), None),
+    )
+    .await
+    .expect("explicit public");
+    assert_eq!(
+        tenancy(&pool, "claims", claim_of(&body)).await,
+        ("public".to_string(), f.human_home)
+    );
+}
+
+/// Only the agent itself or its live human operator may set its default. A
+/// registered human operator that does not operate the agent, and another
+/// agent of the same human, are refused (VIS05) with nothing changed and
+/// nothing audited, and an unknown agent is refused the same way. The agent
+/// itself may set and clear its own default, private included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_agent_or_its_live_operator_sets_its_default(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let crew = crew_of(&pool, f.human, "def-crew-target").await;
+    let sibling = crew_of(&pool, f.human, "def-crew-other").await;
+    let (stranger, _) = fixture::seed_human_operator(&pool, "def-stranger-human").await;
+    add_member(&pool, f.ndi, stranger, "admin").await;
+
+    for (who, what) in [
+        (stranger, "a human operator that does not operate it"),
+        (sibling, "another agent of the same human"),
+    ] {
+        let err = set_default(&pool, &s, who, Some(crew), None, true)
+            .await
+            .expect_err(what);
+        assert!(err.message.contains("VIS05"), "{what}: {err:?}");
+        assert_eq!(default_of(&pool, crew).await, (None, false), "{what}");
+    }
+    let unknown = Uuid::new_v4();
+    let err = set_default(&pool, &s, f.human, Some(unknown), None, true)
+        .await
+        .expect_err("an unknown agent");
+    assert!(err.message.contains("VIS05"), "{err:?}");
+    assert!(default_audit(&pool, crew).await.is_empty());
+    assert!(default_audit(&pool, unknown).await.is_empty());
+
+    // The agent itself: private, then clear (it inherits NDI again).
+    let body = set_default(&pool, &s, crew, None, None, true)
+        .await
+        .expect("its own private default");
+    assert_eq!(body["set_by"], "self", "{body}");
+    assert_eq!(default_of(&pool, crew).await, (None, true));
+    let body = write_as(&pool, &s, crew, submit("self private", None, None))
+        .await
+        .expect("private");
+    assert_eq!(body_owner(&body), f.human_home, "{body}");
+    set_default(&pool, &s, crew, None, None, false)
+        .await
+        .expect("clear");
+    assert_eq!(default_of(&pool, crew).await, (None, false));
+    let body = write_as(&pool, &s, crew, submit("self cleared", None, None))
+        .await
+        .expect("inherits again");
+    assert_eq!(body_owner(&body), f.ndi, "{body}");
+    let audit = default_audit(&pool, crew).await;
+    assert_eq!(audit.len(), 2, "{audit:?}");
+    assert!(audit
+        .iter()
+        .all(|(who, d)| *who == Some(crew) && d["via"] == "self"));
+}
+
+/// A RETIRED link names who owns a retired identity's claims and confers no
+/// authority over it: its operator may not set its default. The same operator
+/// on a LIVE-linked agent can (calibration).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_link_confers_no_authority_over_the_default(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let live = crew_of(&pool, f.human, "def-crew-live").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "def-crew-retired").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, f.human)
+            .await
+            .expect("retired link");
+    }
+    let err = set_default(&pool, &s, f.human, Some(retired), None, true)
+        .await
+        .expect_err("a retired link");
+    assert!(err.message.contains("VIS05"), "{err:?}");
+    assert_eq!(default_of(&pool, retired).await, (None, false));
+    assert!(default_audit(&pool, retired).await.is_empty());
+
+    set_default(&pool, &s, f.human, Some(live), None, true)
+        .await
+        .expect("CALIBRATION: the same operator on a live link");
+    assert_eq!(default_of(&pool, live).await, (None, true));
+}
+
+/// A team default set for an agent must be a team the AGENT may write (its own
+/// membership or its live human's); a group and `private` together are a
+/// malformed request; and the table refuses both at once outright.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_team_default_must_be_writable_by_the_agent(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let crew = crew_of(&pool, f.human, "def-crew-team").await;
+    let elsewhere = team(&pool, "not-the-humans").await;
+
+    let err = set_default(&pool, &s, f.human, Some(crew), Some(elsewhere), false)
+        .await
+        .expect_err("a team neither writes");
+    assert!(err.message.contains("VIS02"), "{err:?}");
+    let err = set_default(&pool, &s, f.human, Some(crew), Some(f.ndi), true)
+        .await
+        .expect_err("both");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert_eq!(default_of(&pool, crew).await, (None, false));
+
+    let body = set_default(&pool, &s, f.human, Some(crew), Some(f.ndi), false)
+        .await
+        .expect("a team the agent writes through its human");
+    assert_eq!(body["default_group_id"], f.ndi.to_string(), "{body}");
+    assert_eq!(default_of(&pool, crew).await, (Some(f.ndi), false));
+
+    let r = sqlx::query("UPDATE agents SET default_private = true WHERE id = $1")
+        .bind(crew)
+        .execute(&pool)
+        .await;
+    assert_eq!(
+        r.err().and_then(|e| e
+            .as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))),
+        Some("23514".to_string()),
+        "agents_default_private_or_group refuses a team AND private"
+    );
+}
+
+/// 206's one-argument `epigraph_set_default_group`, which a pre-209 binary
+/// still calls, delegates to 209's setter: setting a team over a private
+/// default clears the flag (the CHECK would refuse otherwise), and it writes
+/// exactly ONE audit row, not one per function.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_206_setter_clears_a_private_default_and_audits_once(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let f = fleet(&pool, &s).await;
+    let crew = crew_of(&pool, f.human, "def-crew-206").await;
+    set_default(&pool, &s, crew, None, None, true)
+        .await
+        .expect("private");
+    // Counted on `agent_id` (the caller, here the agent itself), not on 209's
+    // `target_agent_id`, so a second, 206-shaped row would be counted too.
+    let rows_of = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM security_events \
+                  WHERE event_type = 'agent.default_group_set' AND agent_id = $1",
+            )
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    let before = rows_of(crew).await;
+    let v = viewer(&pool, crew).await;
+    let mut tx = s.scoped.begin_as(&v).await.expect("stamped tx");
+    let got: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_set_default_group($1)")
+        .bind(f.ndi)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("206's setter on the application role");
+    tx.commit().await.expect("commit");
+    assert_eq!(got, Some(f.ndi));
+    assert_eq!(default_of(&pool, crew).await, (Some(f.ndi), false));
+    assert_eq!(
+        rows_of(crew).await - before,
+        1,
+        "exactly one row for one call"
+    );
+    assert_eq!(default_audit(&pool, crew).await.len(), 2);
+}
+
+/// The operator arm needs BOTH a live link AND a LIVE registered human
+/// operator. Revoking a human operator (122's
+/// `epigraph_revoke_human_operator`) leaves its operator links live, so the
+/// link alone would still admit it: the `epigraph_is_human_operator` check is
+/// what refuses a revoked human. Calibrated: the same human and link are
+/// admitted before the revocation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_human_operator_cannot_set_its_agents_default(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (human, _) = fixture::seed_human_operator(&pool, "def-revoked-human").await;
+    let crew = crew_of(&pool, human, "def-crew-of-revoked").await;
+    set_default(&pool, &s, human, Some(crew), None, true)
+        .await
+        .expect("CALIBRATION: a live human with a live link");
+    assert_eq!(default_of(&pool, crew).await, (None, true));
+
+    let revoked: bool = sqlx::query_scalar(
+        "SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, 'test: revoked')",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("revoke the human operator");
+    assert!(revoked);
+    let live_link: bool =
+        sqlx::query_scalar("SELECT NOT retired FROM operator_links WHERE agent_id = $1")
+            .bind(crew)
+            .fetch_one(&pool)
+            .await
+            .expect("link");
+    assert!(
+        live_link,
+        "PREMISE: revoking the human leaves the link live"
+    );
+
+    let err = set_default(&pool, &s, human, Some(crew), None, false)
+        .await
+        .expect_err("a revoked human operator");
+    assert!(err.message.contains("VIS05"), "{err:?}");
+    assert_eq!(default_of(&pool, crew).await, (None, true), "unchanged");
 }

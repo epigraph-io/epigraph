@@ -1665,7 +1665,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Set the team your claim writes go to when they name no visibility (submit_claim, memorize, batch_submit_claims, ingest_document*). It must be a team you, or your human operator, may write. Omit group_id to clear it. With no default, a write goes to your only team, else private. Your operated agents use your default when they have none of their own. Audited (agent.default_group_set). Returns {agent_id, default_group_id, writable_teams: [{group_id, via: own | operator}]}."
+        description = "Set where claim writes go when they name no visibility (submit_claim, memorize, batch_submit_claims, ingest_document*): a team (group_id; one you, or your human operator, may write), private (private: true; your home group, ahead of your human's default team and of the only-team fallback), or neither (omit both: clear, inherit your human's default). With no default, a write goes to your human's default, else your only team, else private. Your operated agents use your default when they have none of their own. A live human operator may set the default of an agent it operates (agent_id; a live, not retired, operator link). An explicit visibility on a write always wins. Audited (agent.default_group_set). Returns {agent_id, default_group_id, default_private, set_by: self | operator, writable_teams: [{group_id, via: own | operator}]}."
     )]
     async fn set_default_group(
         &self,

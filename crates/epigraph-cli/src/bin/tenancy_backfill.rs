@@ -1704,6 +1704,18 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // `claims_owner_immutable` refuses outside a privileged frame: every share
     // fails LOUD (42501) with nothing moved.
     ("epigraph_share_claims_with_team", 206),
+    // 209, an agent's private default and the operator's setter. The READ
+    // `epigraph_default_private` reads only `agents` (readable to every role),
+    // so its answer does not change under a non-member owner; registered so
+    // the pre-flight still sees an owner the guarded `OWNER TO` failed to set.
+    ("epigraph_default_private", 209),
+    // 209's setter fails LOUD for every operator call under a non-member
+    // owner: its read of the FORCEd `operator_links` (definer-only read
+    // policy) then sees no link, so every operator is refused (VIS05). The
+    // agent's own call reaches 077's `agents_self_update` (its own row) and
+    // the UPDATE moves; a foreign row would move 0 rows, which the body
+    // refuses (VIS06) rather than auditing a change that did not happen.
+    ("epigraph_set_agent_default_group", 209),
     // 207, the bug-report intake. The write fails LOUD under a non-member
     // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
     // `evidence` are refused by their WITH CHECK (the owner no longer passes
@@ -2812,6 +2824,19 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_share_claims_with_team",
             "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
+            true,
+        ),
+        // 209: the private-default read runs on every claim write that names
+        // no visibility (a missing grant is 42501 on every default write); the
+        // setter is the API, MCP and operator-CLI default surface.
+        (
+            "epigraph_default_private",
+            "public.epigraph_default_private(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_agent_default_group",
+            "public.epigraph_set_agent_default_group(uuid, uuid, boolean)",
             true,
         ),
         // 207: the bug-report intake's two definers run on the request DSN

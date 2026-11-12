@@ -5,7 +5,10 @@
 //! Spec and owner decisions D-V1..D-V5: `docs/tenancy/claim-visibility-controls.md`.
 //! Database half: migration 206 (`epigraph_writable_teams`,
 //! `epigraph_default_group`, `epigraph_set_default_group`,
-//! `epigraph_publicize_claims`, `epigraph_share_claims_with_team`).
+//! `epigraph_publicize_claims`, `epigraph_share_claims_with_team`) and
+//! migration 209 (`agents.default_private`, `epigraph_default_private`,
+//! `epigraph_set_agent_default_group`: a private default, and an operator
+//! setting the default of an agent it operates).
 //!
 //! # Where this sits relative to `default_decl_for_author`
 //!
@@ -163,6 +166,38 @@ pub struct VisibilityActOutcome {
     pub outcome: String,
 }
 
+/// What [`ClaimRepository::set_agent_default_conn`] sets an agent's default to
+/// (migration 209).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultGroupSetting {
+    /// A team the agent may write (its own writer/admin membership or its live
+    /// human's), checked when it is set and again at every write.
+    Team(Uuid),
+    /// Private: a write that names no visibility lands in the agent's home
+    /// group, ahead of its human's default team and of the single-team
+    /// fallback.
+    Private,
+    /// Neither: the agent inherits its live human's default again.
+    Clear,
+}
+
+impl DefaultGroupSetting {
+    /// The team, if it is one.
+    #[must_use]
+    pub const fn group(self) -> Option<Uuid> {
+        match self {
+            Self::Team(g) => Some(g),
+            Self::Private | Self::Clear => None,
+        }
+    }
+
+    /// `true` for [`Self::Private`].
+    #[must_use]
+    pub const fn private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+}
+
 /// The user-facing word for a stored `(visibility, owner)` pair.
 fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
     match visibility {
@@ -177,7 +212,8 @@ fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
 fn map_vis_error(e: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(db) = &e {
         let msg = db.message();
-        if msg.starts_with("VIS01") || msg.starts_with("VIS02") {
+        // VIS05 (209): neither the agent itself nor its live human operator.
+        if msg.starts_with("VIS01") || msg.starts_with("VIS02") || msg.starts_with("VIS05") {
             return DbError::Refused {
                 kind: RefusalKind::Authority,
                 message: msg.to_string(),
@@ -192,7 +228,8 @@ fn map_vis_error(e: sqlx::Error) -> DbError {
         // A claim changed under the act after it was classified (migration
         // 206, "DECIDED ON THE ROWS IT WRITES"); nothing was changed and a
         // retry classifies the new state.
-        if msg.starts_with("VIS04") {
+        // VIS06 (209): the default's row did not move; nothing was changed.
+        if msg.starts_with("VIS04") || msg.starts_with("VIS06") {
             return DbError::Refused {
                 kind: RefusalKind::State,
                 message: msg.to_string(),
@@ -325,6 +362,38 @@ impl ClaimRepository {
         .await?)
     }
 
+    /// `agents.default_private` of `agent` itself (migration 209's definer
+    /// `epigraph_default_private`); `false` for an unknown agent.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails or migration 209 is absent.
+    pub async fn default_private_of(conn: &mut PgConnection, agent: Uuid) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_default_private($1)")
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// `agents.default_private` of `agent`'s live human
+    /// (`epigraph_human_of(agent, true)`); `false` with no live human. For a
+    /// human it is its own flag again.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails or migration 209 is absent.
+    pub async fn human_default_private_of(
+        conn: &mut PgConnection,
+        agent: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT public.epigraph_default_private(public.epigraph_human_of($1, true))",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     /// Resolve a caller-facing write's [`VisibilityChoice`] for `agent`.
     ///
     /// * `Public`: `('public', home)`, today's answer, byte for byte.
@@ -339,6 +408,12 @@ impl ClaimRepository {
     ///   lands PRIVATE with a note, and an explicit `Team(None)` is refused,
     ///   because the caller asked for a team and no single team is implied.
     ///   Never public.
+    /// * `Default` only (migration 209, operator ruling 2026-11-12): a PRIVATE
+    ///   default comes first. The agent's own `default_private`, else, when the
+    ///   agent has no usable default team of its own, its live human's. It
+    ///   wins over the human's default team and over the single-team fallback.
+    ///   An explicit `Team(None)` asked for a team and still resolves through
+    ///   the team chain.
     ///
     /// Run it on any connection: every read is a definer.
     ///
@@ -414,6 +489,15 @@ impl ClaimRepository {
                 }
             }
             VisibilityChoice::Team(None) | VisibilityChoice::Default => {
+                // 209: a PRIVATE default beats every team below it, the
+                // single-team fallback included, but only for a write that
+                // names no visibility. An explicit `team` asked for a team.
+                let by_default = choice == VisibilityChoice::Default;
+                if by_default && Self::default_private_of(&mut *conn, agent).await? {
+                    return Ok(Self::private_by_default(
+                        "this agent's own default is private",
+                    ));
+                }
                 let teams = Self::writable_teams(&mut *conn, agent).await?;
                 let writable =
                     |d: Option<Uuid>| d.and_then(|d| teams.iter().find(|(t, _)| *t == d));
@@ -424,6 +508,13 @@ impl ClaimRepository {
                 // would let a stale own default hide a valid human default.
                 let mut picked = writable(Self::default_group_of(&mut *conn, agent).await?);
                 if picked.is_none() {
+                    // The agent has no usable default team of its own, so its
+                    // live human's default decides, private included (209).
+                    if by_default && Self::human_default_private_of(&mut *conn, agent).await? {
+                        return Ok(Self::private_by_default(
+                            "the default of this agent's live human is private",
+                        ));
+                    }
                     picked = writable(Self::human_default_group_of(&mut *conn, agent).await?);
                 }
                 let picked = picked.or_else(|| (teams.len() == 1).then(|| &teams[0]));
@@ -457,6 +548,18 @@ impl ClaimRepository {
                     )),
                 })
             }
+        }
+    }
+
+    /// A no-visibility write that a private default (209) sent home.
+    fn private_by_default(why: &str) -> ChoiceResolution {
+        ChoiceResolution::Home {
+            public: false,
+            note: Some(format!(
+                "no visibility was named and {why}, so this is PRIVATE (readable only by your \
+                 home group). share_claims_with_team moves it into a team and publicize_claims \
+                 publishes it"
+            )),
         }
     }
 
@@ -521,23 +624,35 @@ impl ClaimRepository {
         })
     }
 
-    /// Set (or, with `None`, clear) the session principal's default team.
-    /// `conn` must be stamped as that principal. Audited by the definer.
+    /// Set `agent`'s default (a team, private, or clear) through migration
+    /// 209's definer `epigraph_set_agent_default_group`, as the session
+    /// principal on `conn` (which must be stamped). The definer admits the
+    /// agent itself (`"self"`) or the registered live human operator holding a
+    /// live, non-retired operator link to it (`"operator"`), checks a team
+    /// against the AGENT's writable teams, and writes one
+    /// `agent.default_group_set` audit row attributed to the caller. Returns
+    /// how the caller was admitted.
     ///
     /// # Errors
-    /// `DbError::Refused` (`Authority`) without a principal or for a group that
-    /// is not one of the principal's writable teams; `DbError::QueryFailed`
+    /// `DbError::Refused`: `Authority` without a principal (VIS01), for a team
+    /// the agent may not write (VIS02), or for a caller that is neither the
+    /// agent nor its live operator (VIS05); `State` if the row did not move
+    /// (VIS06). Nothing is changed on any of them. `DbError::QueryFailed`
     /// otherwise.
-    pub async fn set_default_group_conn(
+    pub async fn set_agent_default_conn(
         conn: &mut PgConnection,
-        group: Option<Uuid>,
-    ) -> Result<(), DbError> {
-        sqlx::query("SELECT public.epigraph_set_default_group($1)")
-            .bind(group)
-            .execute(&mut *conn)
-            .await
-            .map_err(map_vis_error)?;
-        Ok(())
+        agent: Uuid,
+        setting: DefaultGroupSetting,
+    ) -> Result<String, DbError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT public.epigraph_set_agent_default_group($1, $2, $3)",
+        )
+        .bind(agent)
+        .bind(setting.group())
+        .bind(setting.private())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_vis_error)
     }
 
     /// Publish group-visible claims (group -> public), as the session principal
