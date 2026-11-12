@@ -291,7 +291,9 @@
 //! * a moved claim now executed by a workflow the run did not move;
 //! * a row attached to a moved claim, or an edge touching a moved claim or
 //!   workflow, that the run did not see (new evidence, a BBA, a new link);
-//! * a moved claim or its evidence sealed since.
+//! * a moved claim, a version of one, its evidence or a moved edge sealed
+//!   since (`claim_encryption`, `claim_version_encryption`,
+//!   `evidence_encryption`, `edge_encryption`).
 //!
 //! Exact or nothing: a partial restore would split a plan between two owners.
 //! The widening statement (claims back to public) runs with migration 074's
@@ -4713,6 +4715,29 @@ async fn reverse_tx(
     .await?
     {
         held.push((ev, format!("evidence {ev} has been sealed since the run")));
+    }
+    for c in sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT claim_id FROM claim_version_encryption WHERE claim_id = ANY($1)",
+    )
+    .bind(&claim_ids)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        held.push((
+            c,
+            format!("claim {c} has a version sealed since the run (claim_version_encryption)"),
+        ));
+    }
+    for e in
+        sqlx::query_scalar::<_, Uuid>("SELECT edge_id FROM edge_encryption WHERE edge_id = ANY($1)")
+            .bind(&edge_ids)
+            .fetch_all(&mut *conn)
+            .await?
+    {
+        held.push((
+            e,
+            format!("edge {e} has been sealed since the run (edge_encryption)"),
+        ));
     }
     if !held.is_empty() {
         return Ok(RevOutcome::Held(held));

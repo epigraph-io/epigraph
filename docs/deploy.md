@@ -2581,7 +2581,9 @@ epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
   ONLY the source and one reading ONLY the target read among the batch's rows,
   before and after, each against the tenancy model.
 - **Reverse**: as for the public act (all of a manifest or nothing; refused
-  when the plan changed or grew since).
+  when the plan changed or grew since, or when a moved claim, claim version,
+  evidence row or edge was sealed since: ciphertext keyed to the target never
+  goes back to the source).
 
 #### Moving a pinned (scheduled) pipeline
 

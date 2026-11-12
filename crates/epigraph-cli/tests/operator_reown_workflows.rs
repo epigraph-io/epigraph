@@ -3600,6 +3600,109 @@ async fn a_private_move_holds_a_lineage_with_a_sealed_claim_version(pool: PgPool
     a_private_move_holds_a_sealed(pool, Seal::ClaimVersion).await;
 }
 
+/// A row sealed under the TARGET's key after a private move cannot go back
+/// to the source: the reversal refuses the whole manifest, naming the row,
+/// and writes nothing. A sealed plan edge and a sealed claim version are
+/// held as a sealed claim and sealed evidence are. (The version exists
+/// before the move, so the run records it and only its seal is new.)
+async fn a_private_move_reversal_refuses_a_row_sealed_since(pool: PgPool, how: Seal) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let version: Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_versions (claim_id, version_number, content, truth_value) \
+         VALUES ($1, 1, 'alpha step two, version 1', 0.7) RETURNING id",
+    )
+    .bind(fx.s2)
+    .fetch_one(&pool)
+    .await
+    .expect("a version of S2");
+    let m = dir.join("private.jsonl");
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        Some("3"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 0, "{how:?}: {}", r.show());
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(fx.target)
+    .execute(&pool)
+    .await
+    .expect("the target's key epoch");
+    let named = match how {
+        Seal::Edge => {
+            let e = fx.plan_edges[2];
+            sqlx::query(
+                "INSERT INTO edge_encryption (edge_id, group_id, epoch, privacy_tier, \
+                                              encrypted_labels) \
+                 VALUES ($1, $2, 0, 'fully_private', ''::bytea)",
+            )
+            .bind(e)
+            .bind(fx.target)
+            .execute(&pool)
+            .await
+            .expect("seal the moved edge P -> S2");
+            e
+        }
+        Seal::ClaimVersion => {
+            assert_eq!(
+                tenancy(&pool, "claim_versions", version).await,
+                (fx.target, "group".to_string()),
+                "the version moved with S2"
+            );
+            sqlx::query(
+                "INSERT INTO claim_version_encryption (claim_version_id, claim_id, group_id, \
+                                                       epoch, encrypted_content) \
+                 VALUES ($1, $2, $3, 0, ''::bytea)",
+            )
+            .bind(version)
+            .bind(fx.s2)
+            .bind(fx.target)
+            .execute(&pool)
+            .await
+            .expect("seal S2's version");
+            fx.s2
+        }
+        other => panic!("{other:?}: covered by the claim and evidence reversal checks"),
+    };
+    let sealed = snapshot(&pool).await;
+    let rev = reverse(&pool, &m, true).await;
+    assert_eq!(rev.code, 3, "{how:?}: {}", rev.show());
+    assert!(
+        rev.stdout
+            .lines()
+            .any(|l| l.contains(&named.to_string()) && l.contains("sealed since the run")),
+        "{how:?}: {}",
+        rev.show()
+    );
+    assert_eq!(
+        snapshot(&pool).await,
+        sealed,
+        "a refused reversal writes nothing"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_reversal_refuses_an_edge_sealed_since(pool: PgPool) {
+    a_private_move_reversal_refuses_a_row_sealed_since(pool, Seal::Edge).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_reversal_refuses_a_claim_version_sealed_since(pool: PgPool) {
+    a_private_move_reversal_refuses_a_row_sealed_since(pool, Seal::ClaimVersion).await;
+}
+
 /// A private lineage `name`, one generation executing one claim, both
 /// `('group', g)`, written on the maintenance pool. Returns (workflow, claim).
 async fn private_lineage(pool: &PgPool, author: Uuid, g: Uuid, name: &str) -> (Uuid, Uuid) {
