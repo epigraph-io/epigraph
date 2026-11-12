@@ -2522,6 +2522,94 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   above zero is a reason to stop unless the decision accepts those claims as
   not reversible.
 
+### `epigraph-operator reown-workflows --from-visibility group` — move group-private lineages to another group (no migration)
+
+`reown-workflows` moves public lineages (`('public', <source>)`) into a team,
+or narrows them in place. With `--from-visibility group` it instead moves
+lineages that are ALREADY group-private, `('group', <source>)`, whole to
+`('group', <target>)`: every generation, the plan claims they execute (and
+their step lineages), every row those carry, and the plan edges. Nothing
+becomes public. It needs a SUPERUSER DSN, like `regroup-claims`. Module doc:
+`crates/epigraph-cli/src/operator/reown_workflows.rs` ("A private move").
+
+```bash
+# dry run: plan, held lineages, LEFT-CLAIM / SHARED-SPLIT / CO-OWNED-EDGE lines,
+# ELIGIBLE-WORKFLOW-ROWS
+epigraph-operator reown-workflows --canonical-names-file lineages.txt \
+    --from-group <source group> --target-group <target group> --operator <person> \
+    --from-visibility group --visibility group --manifest-out private-move-1.jsonl
+# apply: repeat ELIGIBLE-WORKFLOW-ROWS back
+epigraph-operator reown-workflows ... --manifest-out private-move-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>"
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
+```
+
+- **Who**: the source is `--from-group` (the operator must be a live admin of
+  it) or, without it, the operator's personal group. The target must be
+  another group: an active `team` or `community` group the operator
+  administers, or the operator's OWN personal group (the rule
+  `regroup-claims` applies; never another person's personal group nor an
+  operated agent's). `--visibility group` is required and `--catch-up` is
+  refused.
+- **Public input is refused**: a public generation holds its lineage
+  (`PublicInput`). An unshared public plan claim, or a public row a moving
+  claim carries, holds its lineage as a hand-off, and an `--apply` then exits
+  3: moving the rest would split the plan. Narrow such a plan in place first
+  (the public act, `--visibility group` with the target equal to the source).
+- **Left where it is, reported**: a plan claim shared with a lineage the list
+  omits (`LEFT-CLAIM ... SHARED`, and `SHARED-SPLIT` when that lineage is the
+  source's private one: list both in one run), or owned by another group.
+  An edge from a moved row to one that stays in its group becomes co-owned by
+  both groups, readable only by a member of both (`CO-OWNED-EDGE`).
+- **Held whole**: a private row a third group owns, an edge whose new tuple
+  would drop a group its current one requires, and an edge to a group-private
+  frame, context, perspective, community or reasoning trace that does not move
+  (the edges trigger counts such a node as public, so the edge would go to the
+  target naming a node the target cannot read).
+- **Invariants per batch**: the public act's (every row's end state, the row
+  census, the unstamped view, the atlas epoch), plus what a session reading
+  ONLY the source and one reading ONLY the target read among the batch's rows,
+  before and after, each against the tenancy model.
+- **Reverse**: as for the public act (all of a manifest or nothing; refused
+  when the plan changed or grew since).
+
+#### Moving a pinned (scheduled) pipeline
+
+A client that runs pinned workflows reads each generation's plan through
+`GET /api/v1/workflows/:id/plan` with its OWN reader principal's token. The
+read is viewer-scoped: it answers 404 when that principal can see none of the
+generation's `executes` edges, and `hidden_count` counts every plan claim it
+cannot read. After the move every row of the plan is owned by the target
+group, so that reader principal needs a live membership of the TARGET group;
+its membership of the source no longer reads anything of the plan. A client
+that also checks each plan item's owner group against the group its pin
+records refuses the plan from the moment the move commits until its pins
+record the target. A non-member principal the client uses to prove that
+outsiders see nothing must NOT be a member of the target.
+
+1. Before the move, add the reader principal's agent to the target group
+   (`epigraph-operator group-member add --group <target> --agent <reader agent>
+   --role reader --reason "<why>" --apply`; an operated agent is a member only
+   where its operator writes). Check the non-member principal is not in the
+   target (`epigraph-operator group-roster --group <target>`). If the client
+   publishes new generations, its publishing agent needs a writer membership
+   of the target too.
+2. Dry run the move. Stop on any `HELD-LINEAGE`, `LEFT-CLAIM` or
+   `SHARED-SPLIT` line for the pipeline's lineages: a claim left in the
+   source keeps the source as its owner, so an owner-group check refuses the
+   plan, and the reader would still need the source.
+3. Pause the client's pinned schedules for these lineages (or pick a window
+   with no fire), then apply with the dry run's count.
+4. Verify a plan fetch AS the reader principal for each pinned generation:
+   200, `hidden_count` 0, every item's `owner_group_id` the target and
+   `visibility` `group`. The same fetch as the non-member principal: 404.
+5. Change the pins' recorded owner group to the target in the client's
+   configuration, have the client verify the pins live, install them, and
+   resume the schedules.
+6. Undo: `reown-reverse` the manifest, then restore the pins' previous owner
+   group.
+
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's
 personal group. `hide-evidence` hides and pins selected evidence on the
