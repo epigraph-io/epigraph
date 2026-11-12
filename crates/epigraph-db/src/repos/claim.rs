@@ -1089,10 +1089,24 @@ pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
     "properties.supersede_act is reserved for the AUTHORED edge a supersession \
      writes (supersede_claim, custodial-supersede); nothing was written";
 
-/// The edge `properties` keys only an act writes:
-/// [`DUPLICATE_IDENTITY_PROPERTY`] and [`SUPERSEDE_ACT_PROPERTY`].
-pub const RESERVED_EDGE_PROPERTIES: &[&str] =
-    &[DUPLICATE_IDENTITY_PROPERTY, SUPERSEDE_ACT_PROPERTY];
+/// The edge `properties` keys only an act or the document ingest writes:
+/// [`DUPLICATE_IDENTITY_PROPERTY`], [`SUPERSEDE_ACT_PROPERTY`],
+/// [`crate::INGEST_WRITTEN_PROPERTY`] (which migration 198's guard also
+/// refuses in the database, for every writer), and the document ingest
+/// record's [`crate::INGESTED_BY_PROPERTY`], [`crate::CREATED_CLAIM_PROPERTY`]
+/// and [`crate::INGEST_AUTHORS_PROPERTY`] (an ingest record on a
+/// group-private claim is owned by that group, whose writers could otherwise
+/// patch a convergence into a creation, rewrite who ingested it, or rewrite
+/// the primary authors the creating ingest recorded).
+pub const RESERVED_EDGE_PROPERTIES: &[&str] = &[
+    DUPLICATE_IDENTITY_PROPERTY,
+    SUPERSEDE_ACT_PROPERTY,
+    crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY,
+    crate::repos::claim_ingest::INGESTED_BY_PROPERTY,
+    crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY,
+    crate::repos::claim_ingest::INGEST_AUTHORS_PROPERTY,
+    crate::repos::paper::AUTHORED_REPLACES_KEY,
+];
 
 /// The refusal for an application edge write whose `properties` carry a key
 /// of [`RESERVED_EDGE_PROPERTIES`], or `None` when it carries none.
@@ -1102,6 +1116,27 @@ pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<
         Some(DEDUP_IDENTITY_KEY_RESERVED)
     } else if properties.get(SUPERSEDE_ACT_PROPERTY).is_some() {
         Some(SUPERSEDE_ACT_KEY_RESERVED)
+    } else if properties
+        .get(crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY)
+        .is_some()
+    {
+        Some(crate::repos::ingest_written::INGEST_WRITTEN_KEY_RESERVED)
+    } else if properties
+        .get(crate::repos::claim_ingest::INGESTED_BY_PROPERTY)
+        .is_some()
+        || properties
+            .get(crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY)
+            .is_some()
+        || properties
+            .get(crate::repos::claim_ingest::INGEST_AUTHORS_PROPERTY)
+            .is_some()
+    {
+        Some(crate::repos::claim_ingest::INGEST_RECORD_KEYS_RESERVED)
+    } else if properties
+        .get(crate::repos::paper::AUTHORED_REPLACES_KEY)
+        .is_some()
+    {
+        Some(crate::repos::paper::AUTHORED_REPLACES_KEY_RESERVED)
     } else {
         None
     }
@@ -1203,6 +1238,35 @@ async fn non_public_frozen_relationships(
 /// keep the relationship's ordinary rule.
 pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
 
+/// Every replacement ([`migrate_superseded_edges`],
+/// [`repair_marked_duplicate`], [`migrate_consolidated_edges`]) leaves an
+/// edge carrying the document ingest's marker
+/// ([`crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY`]) on the claim it
+/// points at, whatever its source: a paper's `asserts`, its `ingested_claim`
+/// record, an author's `asserts`. Each records what ONE ingest stated about,
+/// or did to, THAT row (that its document asserts the claim, that it created
+/// or found the claim), and the readers trust it only as written. Moved,
+/// migration 198's guard would strip the marker and every reader would drop
+/// the claim from the paper (its count, its claims page, the author's card,
+/// the claim's ingest record), on both claims. Left in place, the paper keeps
+/// asserting the row its ingest created or found, which stays readable
+/// retired (`is_current = false`, `supersedes` naming the successor), and the
+/// claim the cascade points at reads no ingest of the paper. Agents'
+/// authorship already stays (R-133); this covers the paper-sourced edges with
+/// the same reasoning. The marker is the test, not the relationship: an
+/// unmarked (legacy) paper edge keeps the ordinary rule.
+///
+/// The key the cascades bind and test with `properties ? $n`.
+pub(crate) const INGEST_WRITTEN_FROZEN: &str =
+    crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY;
+
+/// The label form of [`INGEST_WRITTEN_FROZEN`]: a legacy ingest edge the
+/// backfill marked carries [`crate::repos::ingest_written::INGEST_WRITTEN_LABEL`]
+/// instead of the property (migration 208), and stays on its row the same way.
+/// The cascades bind it and test `labels @> ARRAY[$n]`.
+pub(crate) const INGEST_WRITTEN_FROZEN_LABEL: &str =
+    crate::repos::ingest_written::INGEST_WRITTEN_LABEL;
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -1258,6 +1322,9 @@ async fn require_privileged_session(
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// EVERY supersession leaves the document ingest's own edges on the retired
+/// claim ([`INGEST_WRITTEN_FROZEN`]).
 ///
 /// Neither direction moves a RETRACTED edge (`valid_to` set): it is history
 /// about the retired claim, as the dedup and merge cascades already treat
@@ -1349,6 +1416,7 @@ async fn migrate_superseded_edges(
            AND NOT COALESCE(properties->>$7 = ANY($6), false) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
+           AND NOT (properties ? $8 OR labels @> ARRAY[$9]::text[]) \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -1358,6 +1426,8 @@ async fn migrate_superseded_edges(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -2160,6 +2230,28 @@ impl ClaimRepository {
         decl: TenancyDecl,
         signer_id: Option<Uuid>,
     ) -> Result<Claim, DbError> {
+        Ok(
+            Self::create_signed_reporting_conn(conn, claim, decl, signer_id)
+                .await?
+                .0,
+        )
+    }
+
+    /// [`Self::create_signed_conn`], also saying whether THIS call inserted
+    /// the row (`true`) or returned an existing one (`false`: a dedup hit,
+    /// unlocked or under the dedup lock). A caller that must not rewrite or
+    /// take credit for a row it did not write (the document walk's
+    /// `persist_planned_claim`) decides from this, never from the row's
+    /// author or trace.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signed_reporting_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
         // A dedup HIT on an already-committed row is answered here, unlocked
@@ -2173,7 +2265,7 @@ impl ClaimRepository {
         if let Some(existing) =
             Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         // The serialization scope, exactly as in `create_or_get_signed`: a real
@@ -2245,7 +2337,7 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
         signer_id: Option<Uuid>,
-    ) -> Result<Claim, DbError> {
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Row;
 
         let id: Uuid = claim.id.into();
@@ -2274,7 +2366,7 @@ impl ClaimRepository {
         if let Some(existing) =
             Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         let (signature, signer_id) = v1_claim_signature_to_store(
@@ -2336,14 +2428,17 @@ impl ClaimRepository {
 
         let truth_value = TruthValue::new(row.truth_value)?;
 
-        Ok(claim_from_row(
-            row.id,
-            row.content,
-            row.agent_id,
-            row.trace_id,
-            truth_value,
-            row.created_at,
-            row.updated_at,
+        Ok((
+            claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ),
+            true,
         ))
     }
 
@@ -12010,6 +12105,10 @@ async fn migrate_consolidated_edges(
     // candidates either: they record who stated or wrote THAT source, and the
     // merged claim is content they never saw (ruling R-133, as in
     // `migrate_superseded_edges`). They stay on the retired source.
+    //
+    // Nor is an edge carrying the document ingest's marker
+    // (`INGEST_WRITTEN_FROZEN`): neither moved nor retracted as a redundant
+    // copy, it stays on the source its ingest created or found.
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -12033,6 +12132,7 @@ async fn migrate_consolidated_edges(
           AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT (e.source_type = 'agent' AND e.relationship = ANY($3))
           AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
+          AND NOT (e.properties ? $6 OR e.labels @> ARRAY[$7]::text[])
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -12047,6 +12147,8 @@ async fn migrate_consolidated_edges(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -12730,7 +12832,8 @@ async fn repair_marked_duplicate(
     // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
     // Agents' authorship of the duplicate and act-marked edges stay on it
-    // (ruling R-133, as in `migrate_superseded_edges`). Both point AT the
+    // (ruling R-133, as in `migrate_superseded_edges`), and so do the
+    // document ingest's own edges (`INGEST_WRITTEN_FROZEN`). Both point AT the
     // claim they record, so the incoming re-point tests them; the collision
     // guards never meet an agent-sourced edge (they act on claim-sourced ones).
     let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
@@ -12940,6 +13043,9 @@ async fn repair_marked_duplicate(
            -- canonical is content they never saw (ruling R-133).
            AND NOT (source_type = 'agent' AND relationship = ANY($4)) \
            AND NOT COALESCE(properties->>$6 = ANY($5), false) \
+           -- The document ingest's own edges stay on the row its ingest
+           -- created or found (`INGEST_WRITTEN_FROZEN`).
+           AND NOT (properties ? $7 OR labels @> ARRAY[$8]::text[]) \
          RETURNING id",
     )
     .bind(canon_uuid)
@@ -12948,6 +13054,8 @@ async fn repair_marked_duplicate(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *conn)
     .await?;
 

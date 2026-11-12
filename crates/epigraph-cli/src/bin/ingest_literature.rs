@@ -947,19 +947,15 @@ async fn main() {
                                 .await;
                             }
 
-                            // Edge: Claim --attributed_to--> each author agent
-                            for &author_id in author_agents.values() {
-                                create_prov_edge(
-                                    &client,
-                                    &args.endpoint,
-                                    result.claim_id,
-                                    "claim",
-                                    author_id,
-                                    "agent",
-                                    "attributed_to",
-                                )
-                                .await;
-                            }
+                            // No `claim --attributed_to--> author` edge. It
+                            // credits the author agent with the claim, and
+                            // POST /api/v1/edges accepts a credited edge only
+                            // from that agent itself or its operator: this
+                            // tool is neither, so every one was refused (403).
+                            // A document's authorship is recorded by the
+                            // document ingest (`ingest_document`), which
+                            // records a third party as pending their
+                            // countersignature.
                         }
                         Err(e) => {
                             eprintln!("[{}/{}] Response parse error: {e}", i + 1, packets.len());
@@ -1115,14 +1111,25 @@ async fn create_prov_edge(
         "properties": { "prov_type": format!("prov:{relationship}") },
     });
 
-    if let Err(e) = client
+    match client
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
     {
-        eprintln!("Warning: failed to create prov edge: {e}");
+        Err(e) => eprintln!("Warning: failed to create prov edge: {e}"),
+        // A refusal is a failure too: report the status and the server's
+        // reason, never carry on as if the edge exists.
+        Ok(response) if !response.status().is_success() => {
+            let status = response.status();
+            let reason = response.text().await.unwrap_or_default();
+            eprintln!(
+                "Warning: prov edge {source_type} -{relationship}-> {target_type} refused \
+                 ({status}): {reason}"
+            );
+        }
+        Ok(_) => {}
     }
 }
 

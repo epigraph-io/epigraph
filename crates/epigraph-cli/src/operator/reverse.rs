@@ -532,6 +532,12 @@ pub struct Report {
     /// Restrict manifests: audit rows written (one per manifest reversed under
     /// `--apply` that changed anything).
     pub restrict_audit_rows: usize,
+    /// Regroup manifests: audit rows written (one per manifest reversed under
+    /// `--apply` that changed anything).
+    pub regroup_audit_rows: usize,
+    /// Regroup manifests: recorded edges left on the meet of their current
+    /// endpoints because an endpoint the manifest moved is not restored.
+    pub regroup_edges_deferred: usize,
 }
 
 fn tally(
@@ -630,6 +636,7 @@ pub async fn run(
     for (p, m) in &ordered {
         if super::hide::is_hide_manifest(m)
             || super::restrict::is_restrict_manifest(m)
+            || super::regroup::is_regroup_manifest(m)
             || super::reown_workflows::is_reown_workflows_manifest(m)
         {
             resolved.push((p, None, m));
@@ -649,6 +656,25 @@ pub async fn run(
         // or refused whole (see `reown_workflows`'s module doc).
         if super::reown_workflows::is_reown_workflows_manifest(m) {
             if !super::reown_workflows::reverse_manifest(
+                conn,
+                path,
+                m,
+                &specs,
+                &unkeyed,
+                opts,
+                &mut report,
+                out,
+            )
+            .await?
+            {
+                break 'manifests;
+            }
+            continue;
+        }
+        // A regroup manifest (`regroup-claims --apply`) moves claims back to
+        // their source group; its own batches (see `regroup`'s module doc).
+        if super::regroup::is_regroup_manifest(m) {
+            if !super::regroup::reverse_manifest(
                 conn,
                 path,
                 m,
@@ -790,6 +816,21 @@ pub async fn run(
             out,
             "  restrict manifests: {} audit row(s) written",
             report.restrict_audit_rows
+        )?;
+    }
+    if report.regroup_edges_deferred > 0 {
+        writeln!(
+            out,
+            "  regroup manifests: {} edge(s) left on the meet of their current endpoints because \
+             an endpoint the manifest moved is not restored (held)",
+            report.regroup_edges_deferred
+        )?;
+    }
+    if report.regroup_audit_rows > 0 {
+        writeln!(
+            out,
+            "  regroup manifests: {} audit row(s) written",
+            report.regroup_audit_rows
         )?;
     }
     if report.missing_rows > 0 {

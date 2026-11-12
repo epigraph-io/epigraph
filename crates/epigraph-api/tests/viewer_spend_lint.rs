@@ -283,6 +283,30 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "resolve_challenge",
         &["ChallengeRepository::resolve_as_claim_owner"],
     ),
+    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md)
+    // runs each act on `AppState::write_as`, the transaction stamped with this
+    // viewer, and calls a migration-206 SECURITY DEFINER that reads the caller
+    // from that stamp (`epigraph_principal_id()`) and makes the authority
+    // decision itself; a claim the caller cannot read is answered not-found by
+    // the definer. `writable_teams` reports the caller's own teams back.
+    (
+        "claim_visibility.rs",
+        "publicize_claims",
+        &["ClaimRepository::publicize_conn"],
+    ),
+    (
+        "claim_visibility.rs",
+        "set_default_group",
+        &[
+            "ClaimRepository::set_default_group_conn",
+            "ClaimRepository::writable_teams",
+        ],
+    ),
+    (
+        "claim_visibility.rs",
+        "share_claims_with_team",
+        &["ClaimRepository::share_with_team_conn"],
+    ),
     // untenanted: the caller's own membership, and the seal record of a claim
     // already read through the viewer.
     (
@@ -423,16 +447,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "admin_cascade::record_deferral",
         ],
     ),
-    (
-        "cross_source.rs",
-        "get_cross_source_matches",
-        &["MatchCandidateRepo::new"],
-    ),
-    (
-        "cross_source.rs",
-        "list_candidates",
-        &["MatchCandidateRepo::new"],
-    ),
+    // `get_cross_source_matches` and `list_candidates` are gone from this
+    // table: both read through `MatchCandidateRepo::*_conn` on their stamped
+    // connection now, so neither constructs a repo over the raw pool.
     // gated: the frame and (since backlog 4815dcf7) the claim are read through
     // the viewer before the binding is written.
     (
@@ -496,11 +513,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write on a transaction stamped with the caller's viewer: the endpoint
     // existence checks run on it, and the edge trigger and WITH CHECK decide
-    // the write.
+    // the write. `AgentRepository::speaks_for` is an authority check, not a
+    // read of tenant content: is the caller the agent an asserts/AUTHORED
+    // edge comes from, or its human through a live binding (migration 149's
+    // binding records, identity data every session reads).
     (
         "edges.rs",
         "create_edge",
         &[
+            "AgentRepository::speaks_for",
             "EdgeRepository::create_if_not_exists_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_symmetric_if_absent_row_signed_conn",
@@ -533,15 +554,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "provenance::record_provenance",
         ],
     ),
-    // stamped: the edges naming an evidence row already read through the
-    // viewer (F-edges-unfiltered owns their predicate).
+    // stamped: the claim edge naming an evidence row already read through
+    // the viewer (F-edges-unfiltered owns its predicate). The agent is the
+    // row's own signer, read with the row, not from an edge.
     (
         "edges.rs",
         "get_evidence",
-        &[
-            "sqlx::query_as(SELECT).fetch_optional",
-            "sqlx::query_as(SELECT).fetch_optional",
-        ],
+        &["sqlx::query_as(SELECT).fetch_optional"],
     ),
     (
         "edges.rs",
@@ -1026,6 +1045,27 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "require_plan_authority",
         ],
     ),
+    // write on a transaction stamped with the caller's viewer: the claim is
+    // read through the viewer; the rest is identity data every session reads
+    // (the agent a name or ORCID derives, the system-agent registry) and the
+    // authority check `AgentRepository::speaks_for` (is the caller the claim's
+    // filer, each author and the ingestion agent, or its human through a live
+    // binding), then the four edge writes and the organization agent, which
+    // the edge trigger and WITH CHECK decide.
+    (
+        "provenance.rs",
+        "set_provenance",
+        &[
+            "AgentRepository::get_by_public_key",
+            "AgentRepository::speaks_for",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "SystemAgentRepository::registered_agent_ids",
+            "find_or_create_org_agent",
+        ],
+    ),
     // no SQL: the query embedding.
     ("rag.rs", "rag_context", &["generate_query_embedding"]),
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),
@@ -1191,6 +1231,18 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // best-effort post-commit embedding now receives the viewer
     // (`AppState::store_claim_embedding_as`, backlog 1e2315a9), so one
     // `sqlx::query(UPDATE).execute` left this list.
+    // Claim visibility controls (docs/tenancy/claim-visibility-controls.md):
+    // `resolve_write_decl` (on a `db_pool.acquire`) runs only definers (107's
+    // author decl, migration 206's team list) for the AUTHOR, before the
+    // transaction; `Viewer::resolve` re-resolves the CALLER's own viewer once
+    // when that resolution minted its home group mid-request;
+    // `write_tenancy_report` reads back the row this call wrote or found on a
+    // `begin_claim_write` transaction stamped with this viewer (it takes the
+    // connection, not the viewer), and falls back to the declaration only when
+    // that read fails. The structural edges now run on ONE loop
+    // site each way: `create_signed` on the raw pool for a public claim (as
+    // before), `create_signed_conn` on a `begin_claim_write` transaction
+    // stamped with this viewer for a group-visible one.
     (
         "claims.rs",
         "create_claim_core",
@@ -1198,13 +1250,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_id",
             "ClaimEncryptionRepository::insert_conn",
             "ClaimRepository::create_strict",
-            "ClaimRepository::default_decl_for_author",
             "ClaimRepository::lock_content_hash_agent",
+            "ClaimRepository::resolve_write_decl",
+            "ClaimRepository::write_tenancy_report",
             "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed_conn",
             "GroupKeyEpochRepository::get_current_epoch",
             "GroupMembershipRepository::is_member",
+            "Viewer::resolve",
+            "db_pool.acquire",
             "provenance::record_provenance",
             "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
@@ -1293,13 +1347,19 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write: submit.rs::persist_packet runs on the claim-write transaction
     // stamped with this viewer (claim, trace, evidence, edges); the raw-pool
-    // read is the packet's author agent (untenanted).
+    // read is the packet's author agent (untenanted). `resolve_write_decl`,
+    // `Viewer::resolve` and `write_tenancy_report` are `create_claim_core`'s
+    // (above), for the packet's `visibility`; the one `db_pool.acquire` is the
+    // resolution's.
     (
         "submit.rs",
         "persist_packet",
         &[
             "AgentRepository::get_by_id",
-            "ClaimRepository::default_decl_for_author",
+            "ClaimRepository::resolve_write_decl",
+            "ClaimRepository::write_tenancy_report",
+            "Viewer::resolve",
+            "db_pool.acquire",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",

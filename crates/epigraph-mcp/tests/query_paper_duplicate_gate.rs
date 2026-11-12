@@ -93,6 +93,7 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
             // page (backlog `0e6ec456`).
             limit: None,
             offset: None,
+            ingested_by: None,
         },
     )
     .await
@@ -120,6 +121,7 @@ async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
             doi: "10.9999/never-ingested".to_string(),
             limit: None,
             offset: None,
+            ingested_by: None,
         },
     )
     .await

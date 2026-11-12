@@ -42,6 +42,7 @@ from sklearn.preprocessing import normalize
 import umap
 
 from maintenance_dsn import maintenance_dsn
+import theme_lib
 
 psycopg2.extras.register_uuid()
 
@@ -51,10 +52,18 @@ def get_connection(database_url: str):
 
 
 def load_cluster_embeddings(conn, cluster_id: int, run_id: str):
-    """Load claim IDs, content, and embeddings for a given cluster."""
+    """Load claim IDs, content, embeddings, boundary ratios, silhouettes and
+    an intake-owned flag per member for a given cluster.
+
+    Every member is returned (a bug report filed through migration 207's
+    intake clusters and is reassigned like any claim); `intake_owned[i]` says
+    whether member i's text may NOT be shown to the operator who names the
+    sub-labels (theme_lib.not_intake_owned).
+    """
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT c.id::text, c.content, c.embedding::text, cc.boundary_ratio, cc.silhouette_score
+        cur.execute(f"""
+            SELECT c.id::text, c.content, c.embedding::text, cc.boundary_ratio, cc.silhouette_score,
+                   NOT ({theme_lib.not_intake_owned("c")}) AS intake_owned
             FROM claim_clusters cc
             JOIN claims c ON c.id = cc.claim_id
             WHERE cc.cluster_id = %s AND cc.cluster_run_id = %s
@@ -64,14 +73,15 @@ def load_cluster_embeddings(conn, cluster_id: int, run_id: str):
         rows = cur.fetchall()
 
     if not rows:
-        return [], [], np.array([]), [], []
+        return [], [], np.array([]), [], [], []
 
     ids = [r[0] for r in rows]
     contents = [r[1] for r in rows]
     embeddings = np.array([json.loads(r[2]) for r in rows], dtype=np.float32)
     boundary_ratios = [r[3] for r in rows]
     silhouettes = [r[4] for r in rows]
-    return ids, contents, embeddings, boundary_ratios, silhouettes
+    intake_owned = [bool(r[5]) for r in rows]
+    return ids, contents, embeddings, boundary_ratios, silhouettes, intake_owned
 
 
 def propose_sublabels(contents: list[str], n_samples: int = 10) -> list[str]:
@@ -92,18 +102,27 @@ def propose_sublabels(contents: list[str], n_samples: int = 10) -> list[str]:
 
 
 def interactive_label(conn, cluster_id: int, run_id: str):
-    """Interactive labeling session. Returns (labeled_ids, labels, sublabel_names)."""
-    ids, contents, embeddings, br, sil = load_cluster_embeddings(conn, cluster_id, run_id)
+    """Interactive labeling session. Returns (labeled_ids, labels, sublabel_names).
+
+    The operator reads member text and types the sub-label names that
+    train_and_apply stores in cluster_labels, so an intake-owned member's text
+    is never shown (theme_lib.not_intake_owned): the operator proposes and
+    labels from the other members only. Intake-owned members are still
+    reassigned by the trained classifier.
+    """
+    ids, contents, embeddings, br, sil, intake = load_cluster_embeddings(conn, cluster_id, run_id)
     if not ids:
         print("No claims in cluster", file=sys.stderr)
         return [], [], []
+    # Indices of the members whose text may be shown, in boundary order.
+    shown = [i for i in range(len(ids)) if not intake[i]]
 
     print(f"\nCluster {cluster_id}: {len(ids)} claims", file=sys.stderr)
     print(f"Boundary ratio: min={min(br):.3f}, max={max(br):.3f}, mean={np.mean(br):.3f}", file=sys.stderr)
     print(f"Silhouette: min={min(sil):.3f}, max={max(sil):.3f}, mean={np.mean(sil):.3f}", file=sys.stderr)
 
     # Show samples for human to propose sub-labels
-    propose_sublabels(contents)
+    propose_sublabels([contents[i] for i in shown])
 
     print("\n--- Propose sub-label names (comma-separated, e.g. 'mechanosynthesis,DNA nanotech') ---", file=sys.stderr)
     sublabel_input = input("Sub-labels: ").strip()
@@ -117,12 +136,12 @@ def interactive_label(conn, cluster_id: int, run_id: str):
     print(f"Now label some claims. For each, enter the sub-label number (0-{len(sublabels)-1}) or 's' to skip.", file=sys.stderr)
 
     # Show boundary claims for labeling (most ambiguous first)
-    n_to_label = min(30, len(ids))
+    n_to_label = min(30, len(shown))
     labeled_ids = []
     labels = []
 
-    for i in range(n_to_label):
-        print(f"\n[{i+1}/{n_to_label}] {contents[i][:150]}", file=sys.stderr)
+    for n, i in enumerate(shown[:n_to_label]):
+        print(f"\n[{n+1}/{n_to_label}] {contents[i][:150]}", file=sys.stderr)
         for j, sl in enumerate(sublabels):
             print(f"  {j}: {sl}", file=sys.stderr)
 
@@ -144,7 +163,7 @@ def train_and_apply(conn, cluster_id: int, run_id: str,
                     labeled_ids: list[str], labels: list[int],
                     sublabel_names: list[str]):
     """Train logistic regression on labeled claims, re-assign entire cluster."""
-    ids, contents, embeddings, br, sil = load_cluster_embeddings(conn, cluster_id, run_id)
+    ids, contents, embeddings, br, sil, _intake = load_cluster_embeddings(conn, cluster_id, run_id)
 
     # Build training set from labeled claims
     id_to_idx = {cid: i for i, cid in enumerate(ids)}
@@ -297,6 +316,15 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15,
                 fit_sample=10000):
     """Embedding-subcluster one cluster and write the split into the same run.
 
+    Sub-cluster labels: each kept sub-cluster's label is generated by the LLM
+    from up to 10 of its members' texts, never an intake-owned member's
+    (theme_lib.not_intake_owned): project_to_themes copies cluster_labels onto
+    claim_themes.label, which every viewer of one member reads. The filter is
+    on the SAMPLES only; intake-owned members still enter the UMAP/KMeans fit
+    and are reassigned, so a split is the same with or without an intake. A
+    sub-cluster with no other member keeps the placeholder `cluster-<id>` and
+    makes no LLM call.
+
     Memory-bounded for production cluster sizes (tens of thousands of members):
     ids+content are fetched first (small), embeddings are loaded in id-chunks via
     theme_lib (no multi-GB parse transient), and UMAP is FIT on a capped random
@@ -304,12 +332,13 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15,
     cluster size. (A full fit on ~57K members OOM'd a 1.9GB cgroup cap.)
     """
     import numpy as np
-    import theme_lib
 
     # ids + content only (small); embeddings loaded separately, memory-safe.
+    # Every member is fetched; `intake_owned` only keeps a report's text out of
+    # the label samples below.
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT c.id::text, c.content
+        cur.execute(f"""
+            SELECT c.id::text, c.content, NOT ({theme_lib.not_intake_owned("c")})
             FROM claim_clusters cc JOIN claims c ON c.id = cc.claim_id
             WHERE cc.cluster_run_id = %s AND cc.cluster_id = %s AND c.embedding IS NOT NULL
         """, (run_id, cluster_id))
@@ -319,6 +348,7 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15,
 
     ids = [r[0] for r in rows]
     contents = [r[1] for r in rows]
+    intake_owned = [bool(r[2]) for r in rows]
     embs = theme_lib.load_embeddings_for_ids(conn, ids)
 
     # Fit UMAP on a capped sample, then transform every member into that frame —
@@ -364,8 +394,10 @@ def auto_refine(conn, cluster_id, run_id, min_sub_size=50, min_silhouette=0.15,
             if len(members) < min_sub_size:
                 continue
             new_cid = next_id + written
-            samples = [contents[i] for i in range(len(ids)) if best_labels[i] == sub][:10]
-            label = llm_label_subcluster(samples, sub) or f"cluster-{new_cid}"
+            # Never an intake report's text (theme_lib.not_intake_owned).
+            samples = [contents[i] for i in range(len(ids))
+                       if best_labels[i] == sub and not intake_owned[i]][:10]
+            label = (llm_label_subcluster(samples, sub) if samples else "") or f"cluster-{new_cid}"
             cur.execute("""
                 UPDATE claim_clusters SET cluster_id = %s, computed_at = NOW()
                 WHERE cluster_run_id = %s AND claim_id = ANY(%s::uuid[])

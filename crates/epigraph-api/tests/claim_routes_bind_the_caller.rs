@@ -697,7 +697,11 @@ async fn batch_dedup_hit_on_another_humans_claim_writes_no_edges_or_provenance(p
     let b_content = format!("B's public claim {}", Uuid::new_v4());
     let b_req: epigraph_api::routes::claims::CreateClaimRequest =
         serde_json::from_value(serde_json::json!({
-            "content": b_content, "agent_id": b, "initial_truth": 0.6
+            "content": b_content, "agent_id": b, "initial_truth": 0.6,
+            // Explicit since the visibility controls: a write that names no
+            // visibility now lands in B's team, else private
+            // (docs/tenancy/claim-visibility-controls.md).
+            "visibility": "public"
         }))
         .expect("request");
     let resp = epigraph_api::routes::claims::create_claim(

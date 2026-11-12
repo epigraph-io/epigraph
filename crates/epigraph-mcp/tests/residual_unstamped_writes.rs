@@ -88,6 +88,31 @@ use std::path::{Path, PathBuf};
 // ===========================================================================
 const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
+        "claim_helper.rs",
+        "server.pool.acquire",
+        1,
+        "`resolve_claim_visibility` (docs/tenancy/claim-visibility-controls.md), the write-time \
+         visibility resolution of `submit_claim` / `memorize` / `batch_submit_claims` / \
+         `resolve_backlog_item`. It must run BEFORE the author-stamped transaction, because a \
+         team the author writes only through its live human (D-V3) has to be stamped INTO that \
+         transaction (`begin_author_stamped_tx_for`'s grant). Every statement it runs is a \
+         SECURITY DEFINER: `default_decl_for_author`'s 107 lookup and personal-group mint, and \
+         migration 206's `epigraph_writable_teams` / `epigraph_default_group` reads (the latter \
+         also over 149's `epigraph_human_of`, for D-V1's human default). The only \
+         row it can write is the author's own personal group, minted by the definer under its \
+         own identity exactly as the stamped path mints it, so a viewer stamp on the calling \
+         connection would change nothing the definers check.",
+    ),
+    (
+        "tools/ingestion.rs",
+        "server.pool.acquire",
+        1,
+        "`resolve_ingest_visibility`, the ingest tools' twin of `claim_helper.rs`'s \
+         `resolve_claim_visibility` (same reason, same definers): an `ingest_document*` call's \
+         visibility is resolved before `begin_ingest_tx`, so a D-V3 team grant can be stamped \
+         into the ingest transaction.",
+    ),
+    (
         "operator.rs",
         "server.pool.acquire",
         1,
@@ -214,8 +239,13 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`refresh_workflow_promotion`'s `properties.promotion` overwrite. Surfaced when `merge` \
          joined WRITE_TOKENS (batch H-a review). An `UPDATE claims`, so a clean migrate refuses \
-         it unstamped; its config-A behaviour is INFERRED, not measured (the probe's variant \
-         reached the lineage-root early return). Same population and the same H3 question as \
+         it unstamped. MEASURED on the application role over a clean migrate, both session \
+         modes: a member's own group-private variant now gets past the variant-parent read \
+         (which runs as the caller) and the tool fails at this write with the opaque -32603, \
+         writing nothing. Pinned by write_tool_source_reads_app_role.rs::\
+         refresh_promotion_on_a_members_private_variant_fails_at_the_unstamped_write. The cause \
+         the code implies: the unstamped UPDATE matches 0 rows under row security and \
+         `merge_properties` returns NotFound. Same population and the same H3 question as \
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),

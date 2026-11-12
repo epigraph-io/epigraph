@@ -58,11 +58,14 @@
 //!     (`SessionFactory` shares the cell), pinned by `server.rs`'s
 //!     `session_factory_tests`. The outcome (no revival, no ingest) is pinned
 //!     by `epigraph-mcp/tests/per_session_agent_resolution.rs`.
-//!   - `create_claim_idempotent` and `IngestTx::owner_decl` wrap a watched
-//!     call and are called from many tools. (The two
-//!     `begin_system_ingest_stamped_tx` wrappers were removed when workflow
-//!     writes moved to the caller.) The watched call inside each is registered, and every path
-//!     through them ends in migration 105's definer.
+//!   - `IngestTx::owner_decl` wraps a watched call and is called from many
+//!     tools. (The two `begin_system_ingest_stamped_tx` wrappers were removed
+//!     when workflow writes moved to the caller.) The watched call inside it is
+//!     registered, and every path through it ends in migration 105's definer.
+//!     `create_claim_idempotent` no longer reaches the mint: since the
+//!     visibility controls its caller resolves the declaration first
+//!     (`resolve_claim_visibility` -> the watched `resolve_write_decl`) and
+//!     passes it in.
 //!
 //!   A NEW wrapper — a function that calls one of these and is then called
 //!   from elsewhere — is caught once (its own call to the watched helper) and
@@ -107,6 +110,10 @@ const WATCHED: &[&str] = &[
     "personal_group_of_pool",
     "default_decl_for_author",
     "default_decl_for_author_pool",
+    // `ClaimRepository::resolve_write_decl` (claim_visibility.rs), the
+    // visibility controls' write-time resolution: its first step is
+    // `default_decl_for_author`. Three callers, all registered.
+    "resolve_write_decl",
     // `AgentRepository::ensure_for_client` (the OAuth principal mint) and the
     // API helper every token-mint site goes through.
     "ensure_for_client",
@@ -211,10 +218,26 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/claim_helper.rs",
+        "resolve_write_decl",
+        1,
+        "`resolve_claim_visibility`, every MCP claim write's visibility resolution, on a pool \
+         connection. Definer answer, as `create_claim_core`'s; the refusal maps through \
+         `visibility_caller_error`.",
+    ),
+    (
+        "epigraph-mcp/src/tools/claims.rs",
         "default_decl_for_author",
         1,
-        "`create_claim_idempotent`, inside the author-stamped transaction; the refusal maps to \
-         INVALID_REQUEST via `db_caller_error`.",
+        "`resolve_backlog_item`'s resolution claim: the caller's home group, read on the \
+         stamped `gate_tx` so a group-private original's tenancy can be compared. Definer \
+         answer.",
+    ),
+    (
+        "epigraph-db/src/repos/claim_visibility.rs",
+        "default_decl_for_author",
+        1,
+        "`resolve_write_decl`'s first step, the home group every visibility resolves against. \
+         Definer answer on whatever connection its caller passes.",
     ),
     (
         "epigraph-mcp/src/tools/ingestion.rs",
@@ -267,15 +290,18 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-api/src/routes/claims.rs",
-        "default_decl_for_author",
+        "resolve_write_decl",
         1,
-        "`create_claim`, inside its transaction. Definer answer.",
+        "`create_claim_core`'s plain tier, before its transaction, on a pool connection. Its \
+         `default_decl_for_author` step is the definer answer whatever the connection's stamp, \
+         and the rest of it reads only migration 206's definers.",
     ),
     (
         "epigraph-api/src/routes/submit.rs",
-        "default_decl_for_author",
+        "resolve_write_decl",
         1,
-        "`submit_packet`, inside its transaction. Definer answer.",
+        "`submit_packet`, before its transaction, on a pool connection. Definer answer, as \
+         `create_claim_core`'s.",
     ),
     (
         "epigraph-api/src/routes/conventions.rs",

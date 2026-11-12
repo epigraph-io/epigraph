@@ -27,7 +27,10 @@
 //! decide as in production.
 //!
 //! * P1 / P2: the egress and mirror packets, S's token, author L: 201, one
-//!   claim (L, HG, the labels and properties exactly as sent, public), its
+//!   claim (L, HG, the labels and properties exactly as sent, PRIVATE: the
+//!   templates name no `visibility`, so since the claim visibility controls
+//!   (`docs/tenancy/claim-visibility-controls.md`) they take the private
+//!   default, group-visible in HG, where S holds a writer membership), its
 //!   evidence and trace rows also in HG, response with a trace and one
 //!   evidence id.
 //! * P3: the same body again: 201 `was_duplicate`, same claim and trace, no
@@ -50,10 +53,15 @@
 //!   for an allowlisted principal (any author of its own human, the human
 //!   included); narrowing it later must flip this.
 //! * N6: S's token, author an agent of H whose link is RETIRED: 403 `OPL01`.
-//! * R1 / R2: the egress revoke (an admin client's standing `claims:admin`
-//!   token, admin-scope switch UNARMED, as during the arming window) removes
-//!   `policy:active` from the P1 row (HG) and the P4 row (S's group): 200,
-//!   label gone, one `claims.admin_write` audit row each.
+//! * R1 (since the claim visibility controls): the same revoke on the P1 row,
+//!   now PRIVATE in HG, is 404 to the admin client (no membership in HG):
+//!   nothing removed, no audit row. The host must send `visibility: public`
+//!   for its approvals to stay revocable that way.
+//! * R2: the egress revoke (an admin client's standing `claims:admin` token,
+//!   admin-scope switch UNARMED, as during the arming window) removes
+//!   `policy:active` from the public P4 row (S's group): 200, label gone, one
+//!   `claims.admin_write` audit row. (It did the same on the P1 row while
+//!   P1 was public.)
 //!
 //! Mutations (each verified to turn this test red; recorded in the PR):
 //! M1 the `client_allowlist` arm dropped from `epigraph_author_binding`;
@@ -78,6 +86,11 @@
 //! so the case cannot pass on a schema where membership alone would admit it.
 //! M6 (`claims_privacy` alone dropped before the first packet) turns the
 //! second test red with the same row-security refusal.
+//!
+//! The legacy policies admit the HG claim only while it is PUBLIC. Since the
+//! claim visibility controls, a packet that names no `visibility` is private,
+//! so in that shape the host's unchanged templates are REFUSED (Q0); the host
+//! must send `"visibility": "public"` (Q1, Q2) or hold a writer membership.
 
 mod viewer_fixture;
 
@@ -180,6 +193,10 @@ fn rest_egress_body(author: Uuid, host: &str) -> serde_json::Value {
         "initial_truth": 0.65,
         "properties": p["claim"]["properties"],
         "labels": p["claim"]["labels"],
+        // The OLD host body wrote public claims (every REST write did, before
+        // the claim visibility controls made team/private the default); the
+        // rows it stands for are public, so it says so.
+        "visibility": "public",
     })
 }
 
@@ -526,9 +543,12 @@ async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_under_an_armed_
             hg,
             strings(&p1["claim"]["labels"]),
             Some(p1["claim"]["properties"].clone()),
-            "public"
+            // The host's templates name no `visibility`, and L writes no team,
+            // so the packet takes the private default: group-visible in HG
+            // (docs/tenancy/claim-visibility-controls.md, D-V1/D-V5).
+            "group"
         ),
-        "P1: authored by L, owned by HG, labels and properties exactly as sent"
+        "P1: authored by L, owned by HG (private), labels and properties exactly as sent"
     );
     assert_eq!(
         dependents(&pool, p1_id).await,
@@ -713,7 +733,35 @@ async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_under_an_armed_
 
     // ── R1 / R2: the egress revoke on the new (HG) and the legacy (S) row ──
     let admin_token = token(&pool, &admin_client).await;
-    for (case, claim, owner) in [("R1", p1_id, hg), ("R2", legacy_id, s_group)] {
+    // R1: P1 is PRIVATE in HG (the templates name no `visibility`), and the
+    // admin client holds no membership there, so its standing `claims:admin`
+    // token cannot see the row: 404, label kept, no audit row. This is the
+    // revoke half of the host change the claim visibility controls require
+    // (docs/tenancy/claim-visibility-controls.md §3.6): a host whose approvals
+    // must stay revocable by that admin sends `"visibility": "public"`.
+    let (status, body) = call(
+        &state,
+        Method::PATCH,
+        &format!("/api/v1/claims/{p1_id}/labels"),
+        &admin_token,
+        &serde_json::json!({ "add": [], "remove": ["policy:active"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "R1: {body}");
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(p1_id)
+        .fetch_one(&pool)
+        .await
+        .expect("labels");
+    assert!(
+        labels.iter().any(|l| l == "policy:active"),
+        "R1: nothing removed: {labels:?}"
+    );
+    assert!(
+        admin_writes_for(&pool, p1_id).await.is_empty(),
+        "R1: no admin write audited"
+    );
+    for (case, claim, owner) in [("R2", legacy_id, s_group)] {
         let (status, body) = call(
             &state,
             Method::PATCH,
@@ -943,7 +991,32 @@ async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_through_the_leg
         "PREMISE: the legacy policies as deployed: permissive, public, ALL, no WITH CHECK"
     );
 
-    // ── Q1: the egress approval packet ──
+    // ── Q0: the template as the host renders it today names no `visibility`,
+    // so the claim takes the private default (group-visible in HG). The legacy
+    // policies admitted the HG insert only because it was PUBLIC; S has no
+    // membership in HG, so the private row is refused and nothing is written
+    // (docs/tenancy/claim-visibility-controls.md, D-V5: the host must send
+    // `visibility` or hold a writer membership in HG).
+    let (status, body) = post_packet(&state, &s_token, &p1).await;
+    assert!(
+        !status.is_success(),
+        "Q0: a private HG claim is refused to a non-member under the legacy policies: \
+         {status} {body}"
+    );
+    assert!(
+        rows_with_content(&pool, &p1["claim"]["content"])
+            .await
+            .is_empty(),
+        "Q0: nothing written"
+    );
+    // From here the host names `public` explicitly: the old shape.
+    let public = |mut packet: serde_json::Value| {
+        packet["visibility"] = serde_json::json!("public");
+        packet
+    };
+    let p1 = public(p1);
+
+    // ── Q1: the egress approval packet, `visibility: public` ──
     let (status, body) = post_packet(&state, &s_token, &p1).await;
     assert_eq!(status, StatusCode::CREATED, "Q1: {body}");
     assert_eq!(body["was_duplicate"], false, "Q1: {body}");
@@ -982,8 +1055,8 @@ async fn a_hosts_labelled_packets_land_in_the_bound_humans_group_through_the_leg
         "Q1: its evidence and trace are writer-owned by S's personal group, NOT HG"
     );
 
-    // ── Q2: the Foreman mirror packet ──
-    let p2 = mirror_packet(l, &format!("wi-{}", Uuid::new_v4().simple()));
+    // ── Q2: the Foreman mirror packet, `visibility: public` ──
+    let p2 = public(mirror_packet(l, &format!("wi-{}", Uuid::new_v4().simple())));
     let (status, body) = post_packet(&state, &s_token, &p2).await;
     assert_eq!(status, StatusCode::CREATED, "Q2: {body}");
     assert_eq!(body["was_duplicate"], false, "Q2: {body}");

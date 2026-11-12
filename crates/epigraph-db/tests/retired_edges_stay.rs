@@ -19,6 +19,11 @@
 //! `SUPERSEDES` edge on the retired claim was re-pointed (or, in the dedup
 //! repair, retracted as a colliding copy).
 //!
+//! The document ingest's record of a claim (`paper -ingested_claim->`) is
+//! about the row that ingest created or found: moved by any of the three, it
+//! loses its ingest-written marker, so the claim it then points at reads no
+//! ingest of that paper (the last test).
+//!
 //! Every act runs on the APPLICATION ROLE stamped as the claims' author; every
 //! edge half runs on the `epigraph_maintenance` role (the connection the
 //! inline cascade and the deferred replay use), twice, as a replay of an
@@ -656,5 +661,287 @@ async fn consolidate_leaves_upper_case_lineage_edges_on_the_sources(pool: PgPool
         ends(&pool, &[incoming, outgoing]).await,
         before,
         "both upper-case lineage edges stay on their sources"
+    );
+}
+
+// ── The document ingest's record of a claim stays with that claim ──────────
+
+/// `claim` created by `filer`'s ingest of a fresh paper, as the walk records
+/// it: the paper's ingest-written assertion, one author's authorship and
+/// assertion, and the creation record. Returns the paper, the record's edge
+/// id and the author.
+async fn ingest_created(pool: &PgPool, filer: Uuid, claim: Uuid) -> (Uuid, Uuid, Uuid) {
+    let paper: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $1) RETURNING id")
+            .bind(format!("10.9999/moved-record-{}", Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("paper");
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        filer,
+        paper,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
+    )
+    .await
+    .expect("the paper's assertion");
+    // The document's author, as the walk writes it: `authored -> paper` and
+    // the author's own `asserts -> claim`, both marked by the ingester.
+    let (author, _) = fixture::seed_agent_with_group(pool, "ingest-author").await;
+    for (src, st, tgt, tt, rel) in [
+        (author, "agent", paper, "paper", "authored"),
+        (author, "agent", claim, "claim", "asserts"),
+    ] {
+        epigraph_db::create_ingest_written_edge_if_absent_conn(
+            &mut conn,
+            None,
+            "ingest_document",
+            filer,
+            src,
+            st,
+            tgt,
+            tt,
+            rel,
+            None,
+        )
+        .await
+        .expect("the author's edge");
+    }
+    assert!(epigraph_db::ClaimIngestRepository::record_signed_conn(
+        &mut conn,
+        None,
+        paper,
+        claim,
+        filer,
+        true,
+        &[],
+        "ingest_document",
+        "test-pipeline",
+    )
+    .await
+    .expect("the creation record"));
+    let record: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND relationship = 'ingested_claim'",
+    )
+    .bind(paper)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("record id");
+    (paper, record, author)
+}
+
+/// What the readers make of the paper after the ingest: how many claims it
+/// asserts, which ones, and how many claims its author's card credits.
+async fn paper_reads(
+    pool: &PgPool,
+    filer: Uuid,
+    paper: Uuid,
+    author: Uuid,
+) -> (i64, Vec<Uuid>, i64) {
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, filer)
+        .await
+        .expect("viewer");
+    let count = epigraph_db::PaperRepository::count_asserted_claims(pool, &viewer, paper)
+        .await
+        .expect("count");
+    let listed = epigraph_db::PaperRepository::list_asserted_claims(pool, &viewer, paper, 10, 0)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    let mut conn = pool.acquire().await.expect("conn");
+    let card = epigraph_db::AgentLookupRepository::card(&mut conn, &viewer, author)
+        .await
+        .expect("card")
+        .expect("the author has a card");
+    (count, listed, card.counts.asserted_claims)
+}
+
+/// The papers `viewer` reads as having ingested `claim`, and the creator's.
+async fn ingests_of(pool: &PgPool, filer: Uuid, claim: Uuid) -> (Vec<Uuid>, Option<Uuid>) {
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, filer)
+        .await
+        .expect("viewer");
+    let mut conn = pool.acquire().await.expect("conn");
+    let got = epigraph_db::ClaimIngestRepository::for_claim(&mut conn, &viewer, claim)
+        .await
+        .expect("for_claim");
+    (
+        got.records.iter().map(|r| r.paper_id).collect(),
+        got.creator.map(|c| c.paper_id),
+    )
+}
+
+async fn filer_of(pool: &PgPool, claim: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("filer")
+}
+
+/// Whether `claim`'s `authored_by` block, filed by `filer` and read as the
+/// filer, is a document's (`literature`).
+async fn reads_as_literature(pool: &PgPool, filer: Uuid, claim: Uuid) -> bool {
+    let scoped = fixture::scoped_pool(pool).await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, filer)
+        .await
+        .expect("viewer");
+    let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+    let block = epigraph_db::AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim,
+        filer,
+        chrono::Utc::now(),
+        epigraph_db::PromptSnapshotAudience::OperatorAndAdmins,
+    )
+    .await
+    .expect("authored_by");
+    read.commit().await.expect("finish");
+    matches!(block, epigraph_db::AuthoredBy::Literature(_))
+}
+
+/// A creation record says which document ingest created THAT row, and the
+/// paper's ingest-written assertion says what THAT ingest stated. The three
+/// replacement cascades re-point incoming claim edges onto the successor, the
+/// canonical or the merge, but never an ingest-written edge: the record, the
+/// paper's assertion and the author's assertion stay on the row the ingest
+/// created, still marked. So the retired claim still reads the paper as its
+/// creator, the paper still asserts it (counted and listed), the author's
+/// card still credits it, and the claim the cascade points at reads no
+/// ingest of that paper, never as created by it, although its filer is the
+/// same ingester. CALIBRATION: before the act the retired claim reads the
+/// paper as its creator. This test: the supersede cascade.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_superseded_claims_ingest_record_names_no_ingest_on_its_successor(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
+    let old = claim_of(&pool, author, group, "ingest-created, superseded").await;
+    let (p, record, paper_author) = ingest_created(&pool, author, old).await;
+    assert_eq!(
+        ingests_of(&pool, author, old).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
+    assert!(
+        reads_as_literature(&pool, author, old).await,
+        "CALIBRATION: the claim block reads the paper as the creator"
+    );
+    let reads = paper_reads(&pool, author, p, paper_author).await;
+    assert_eq!(reads, (1, vec![old], 1), "CALIBRATION");
+    let new = supersede_act(&pool, author, group, old).await;
+    replay_supersede(&pool, old, new).await;
+    replay_supersede(&pool, old, new).await;
+    assert_eq!(
+        paper_reads(&pool, author, p, paper_author).await,
+        reads,
+        "the paper still asserts the claim its ingest created, and its author's card credits it"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, old).await,
+        (vec![p], Some(p)),
+        "the retired claim keeps its creation record (record on {:?})",
+        ends(&pool, &[record]).await
+    );
+    assert_eq!(
+        filer_of(&pool, new).await,
+        author,
+        "CALIBRATION: the same filer"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, new).await,
+        (vec![], None),
+        "the successor is no ingest's creation (record now on {:?})",
+        ends(&pool, &[record]).await
+    );
+    assert!(
+        !reads_as_literature(&pool, author, new).await,
+        "the successor's claim block is its filer's own"
+    );
+}
+
+/// As above, for the dedup cascade: an ingest-created duplicate of a claim
+/// its filer filed directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_duplicates_ingest_record_names_no_ingest_on_its_canonical(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
+    let dup = claim_of(&pool, author, group, "ingest-created duplicate").await;
+    let canonical = claim_of(&pool, author, group, "filed directly").await;
+    let (p, record, paper_author) = ingest_created(&pool, author, dup).await;
+    assert_eq!(
+        ingests_of(&pool, author, dup).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
+    let reads = paper_reads(&pool, author, p, paper_author).await;
+    assert_eq!(reads, (1, vec![dup], 1), "CALIBRATION");
+    dedup_act(&pool, author, group, dup, canonical).await;
+    replay_dedup(&pool, dup, canonical).await;
+    replay_dedup(&pool, dup, canonical).await;
+    assert_eq!(
+        paper_reads(&pool, author, p, paper_author).await,
+        reads,
+        "the paper still asserts the duplicate its ingest created, and its author's card credits it"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, dup).await,
+        (vec![p], Some(p)),
+        "the duplicate keeps its creation record (record on {:?})",
+        ends(&pool, &[record]).await
+    );
+    assert_eq!(
+        ingests_of(&pool, author, canonical).await,
+        (vec![], None),
+        "the canonical stays the filer's own (record now on {:?})",
+        ends(&pool, &[record]).await
+    );
+}
+
+/// As above, for the merge cascade.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_merge_sources_ingest_record_names_no_ingest_on_the_merge(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
+    let a = claim_of(&pool, author, group, "ingest-created merge source").await;
+    let b = claim_of(&pool, author, group, "another merge source").await;
+    let (p, record, paper_author) = ingest_created(&pool, author, a).await;
+    assert_eq!(
+        ingests_of(&pool, author, a).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
+    let reads = paper_reads(&pool, author, p, paper_author).await;
+    assert_eq!(reads, (1, vec![a], 1), "CALIBRATION");
+    let merged = consolidate_act(&pool, author, group, vec![a, b]).await;
+    replay_consolidate(&pool, merged, vec![a, b]).await;
+    replay_consolidate(&pool, merged, vec![a, b]).await;
+    assert_eq!(
+        paper_reads(&pool, author, p, paper_author).await,
+        reads,
+        "the paper still asserts the merge source its ingest created, and its author's card credits it"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, a).await,
+        (vec![p], Some(p)),
+        "the merge source keeps its creation record (record on {:?})",
+        ends(&pool, &[record]).await
+    );
+    assert_eq!(
+        filer_of(&pool, merged).await,
+        author,
+        "CALIBRATION: the same filer"
+    );
+    assert_eq!(
+        ingests_of(&pool, author, merged).await,
+        (vec![], None),
+        "the merge is no ingest's creation (record now on {:?})",
+        ends(&pool, &[record]).await
     );
 }

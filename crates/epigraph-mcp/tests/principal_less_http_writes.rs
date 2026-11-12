@@ -65,6 +65,8 @@ fn submit(content: &str, labels: &[&str]) -> SubmitClaimParams {
         reasoning: None,
         labels: labels.iter().map(|l| (*l).to_string()).collect(),
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -74,6 +76,8 @@ fn memorize(content: &str) -> MemorizeParams {
         confidence: None,
         tags: None,
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 

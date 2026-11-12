@@ -43,26 +43,42 @@ pub enum SystemAgentRole {
     /// `delete_step`, REST `/api/v1/workflows/*`) and every REST policy
     /// challenge is authored as.
     WorkflowIngest,
+    /// The ONE principal every pre-marker ingest edge that no real ingesting
+    /// agent signed is backfilled as written by (`epigraph-operator
+    /// backfill-ingest-markers`, migration 208), so all of them read as one
+    /// ingest. It writes and signs nothing: it is only ever a marker's `by`.
+    /// Created with a random public key whose secret never existed.
+    LegacyIngest,
 }
 
 impl SystemAgentRole {
-    /// Every role, in the order the CLI lists them.
+    /// Every role a WRITE path resolves (the arming census reports each one
+    /// unregistered): the roles some request authors rows as.
     pub const ALL: &'static [SystemAgentRole] = &[SystemAgentRole::WorkflowIngest];
 
-    /// The `system_agents.role` value. Migration 148's CHECK holds exactly
-    /// these, so a test that registers through this constant fails on any
-    /// drift between the two vocabularies.
+    /// Every role `system_agents` may hold (migration 148's CHECK, widened by
+    /// 208), in the order the CLI lists them: [`Self::ALL`] plus the roles no
+    /// request writes as ([`Self::LegacyIngest`], a marker principal only).
+    pub const REGISTRABLE: &'static [SystemAgentRole] = &[
+        SystemAgentRole::WorkflowIngest,
+        SystemAgentRole::LegacyIngest,
+    ];
+
+    /// The `system_agents.role` value. Migrations 148/208's CHECK holds
+    /// exactly [`Self::REGISTRABLE`], so a test that registers through this
+    /// constant fails on any drift between the two vocabularies.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WorkflowIngest => "workflow-ingest",
+            Self::LegacyIngest => "legacy-ingest",
         }
     }
 
     /// Parse a `system_agents.role` value.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|r| r.as_str() == s)
+        Self::REGISTRABLE.iter().copied().find(|r| r.as_str() == s)
     }
 
     /// The public constant name the pre-148 resolver derived this role's key
@@ -72,6 +88,7 @@ impl SystemAgentRole {
     pub const fn legacy_seed_name(self) -> &'static str {
         match self {
             Self::WorkflowIngest => "workflow-ingest-system",
+            Self::LegacyIngest => "legacy-ingest-system",
         }
     }
 
@@ -81,11 +98,14 @@ impl SystemAgentRole {
     #[must_use]
     pub fn legacy_public_key(self) -> [u8; 32] {
         static WORKFLOW_INGEST: OnceLock<[u8; 32]> = OnceLock::new();
-        match self {
-            Self::WorkflowIngest => *WORKFLOW_INGEST.get_or_init(|| {
-                epigraph_crypto::did_key::did_key_for_author(None, self.legacy_seed_name()).1
-            }),
-        }
+        static LEGACY_INGEST: OnceLock<[u8; 32]> = OnceLock::new();
+        let cell = match self {
+            Self::WorkflowIngest => &WORKFLOW_INGEST,
+            Self::LegacyIngest => &LEGACY_INGEST,
+        };
+        *cell.get_or_init(|| {
+            epigraph_crypto::did_key::did_key_for_author(None, self.legacy_seed_name()).1
+        })
     }
 }
 

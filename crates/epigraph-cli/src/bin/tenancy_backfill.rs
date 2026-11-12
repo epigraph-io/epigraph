@@ -1636,6 +1636,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refolds or vacates its cache, which is the defect the function closes.
     // The stake that makes the owner a control here.
     ("epigraph_claim_is_compound", 193),
+    // 199 (backlog 48421526), the prompt snapshot an agent ran at a claim's
+    // `created_at`, behind 161's prompt-history gate, for the claim read's
+    // `authored_by` block. Its only table is the FORCEd
+    // `agent_prompt_snapshots`, whose read policy admits only
+    // `epigraph_definer_bypass()`: under a non-member owner it sees no row and
+    // answers "no snapshot" to every caller, admitted or not (quiet, the stake
+    // that makes the owner a control here).
+    ("epigraph_agent_prompt_snapshot_at", 199),
+    // 199, the human an agent was bound to at an instant, for the claim
+    // read's `authored_by.human` and each ingester's human. Its link read is
+    // of the FORCEd `operator_links` (definer-only read policy) and its
+    // retirement read of `security_events`: under a non-member owner it sees
+    // no link and no audit row and answers from the allowance arm alone, so
+    // every linked agent's claims name no human (quiet, the stake that makes
+    // the owner a control here).
+    ("epigraph_operator_bound_at", 199),
     // 200, the anchored passkey path's reader of an enrollment's act and its
     // confirming passkey. Fails SILENTLY under a non-member owner: its reads of
     // the FORCEd `passkey_enrollments`, `pending_admin_acts` and
@@ -1660,6 +1676,67 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // non-member mints the next generation of a lineage it cannot read (the
     // takeover the function closes). The owner is load-bearing.
     ("epigraph_workflow_name_has_hidden_rows", 202),
+    // 206, claim visibility controls. The two READS fail CLOSED and SILENTLY
+    // under a non-member owner. `epigraph_writable_teams` reads `groups`
+    // through 077's `groups_tenancy`, which on the unstamped connection it is
+    // called on admits no row, so it answers "no team": every write that names
+    // no visibility lands private instead of in the author's team, and every
+    // explicit team write is refused. `epigraph_default_group` reads only
+    // `agents` (readable to every role) and 149's `epigraph_human_of`, so its
+    // answer does not change; it is registered so the pre-flight still sees
+    // an owner the migration's guarded `OWNER TO` failed to set.
+    ("epigraph_writable_teams", 206),
+    ("epigraph_default_group", 206),
+    // 206's default-team write changes only the principal's own `agents` row
+    // and writes a principal-attributed audit row, both of which 077 admits
+    // for any owner, and its authority check goes through the read above, so a
+    // non-member owner changes nothing here unless that read is mis-owned too
+    // (then every non-NULL default is refused VIS02, loud).
+    ("epigraph_set_default_group", 206),
+    // 206's publicize fails LOUD whenever re-meeting an incident edge changes
+    // its `owner_group_id`: 115's `edges_owner_immutable` refuses that outside
+    // a privileged frame (42501, the whole call rolls back).
+    // It fails SILENTLY for an incident edge outside the caller's writable
+    // groups: 117's restrictive `edges_update_owner` filters that row out, so
+    // the claim goes public and the edge stays group-only.
+    ("epigraph_publicize_claims", 206),
+    // 206's private -> team share changes `claims.owner_group_id`, which 115's
+    // `claims_owner_immutable` refuses outside a privileged frame: every share
+    // fails LOUD (42501) with nothing moved.
+    ("epigraph_share_claims_with_team", 206),
+    // 207, the bug-report intake. The write fails LOUD under a non-member
+    // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
+    // `evidence` are refused by their WITH CHECK (the owner no longer passes
+    // `epigraph_definer_bypass()`), so no report is filed. The reporter's list
+    // fails SILENTLY: its reads of the FORCEd `security_events` and `claims`
+    // admit no row, so every reporter sees an empty list.
+    ("epigraph_submit_bug_report", 207),
+    ("epigraph_my_bug_reports", 207),
+    // 207's caller gate (shared by the write and the preflight). Under a
+    // non-member owner (measured with `epigraph_app` owning it and EXECUTE
+    // granted back to its maintenance-owned callers) its count of the FORCEd
+    // `security_events` still sees the reporter's own `bug_report.submitted`
+    // rows through `security_events_read`'s own-row arm (both callers pass
+    // the stamped principal), so the limit holds (BUG08). On a database armed
+    // for operator binding its last step, 166's `epigraph_require_role_holder`,
+    // is EXECUTE-able by the maintenance role only and is checked against the
+    // gate's owner, so every call that reaches it is refused 42501: the gate,
+    // the write and the preflight then fail LOUD for every caller the earlier
+    // checks pass. Disarmed, that step is skipped exactly as the claims
+    // trigger skips it (`epigraph_operator_binding_armed()` is app-callable,
+    // so the guard itself runs); the measured linked reporter under its limit
+    // then passed and filed, as under the proper owner.
+    ("epigraph_bug_report_gate", 207),
+    ("epigraph_bug_report_preflight", 207),
+    // 208, the authorship countersign route (MCP `countersign_authorship`).
+    // Its read and UPDATE of the FORCEd `operator_links` and of `edges` are
+    // admitted by `epigraph_definer_bypass()` (the owner). Under a non-member
+    // owner it fails CLOSED and loud for an operator acting for its agent
+    // (the link read is filtered, so CSG02), and for the agent itself the
+    // UPDATE of a world-owned authorship row is refused by 117's restrictive
+    // update policy (42501): nothing is ever confirmed or declined that the
+    // owner could not see.
+    ("epigraph_countersign_authorship", 208),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2133,6 +2210,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the migration runner's superuser it keeps working with more authority
     // than intended, which only this check reports.
     ("epigraph_atlas_layout_narrowed", 197),
+    // 198, the agent-lookup card's disclosed roles (find_agent / get_agent).
+    // Its read of the FORCEd `role_assignments` is admitted by
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner the
+    // read is filtered to the session principal's own rows: fail CLOSED,
+    // fewer roles shown, never more.
+    ("epigraph_disclosed_role_assignments", 198),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2700,6 +2783,63 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_revoke_passkey_compromised(uuid, text)",
             false,
         ),
+        // 206: claim visibility controls, all five app-callable. The two
+        // reads run on every claim write that names no visibility
+        // (`ClaimRepository::resolve_visibility_choice`), so a
+        // missing grant there is 42501 on every default write, an outage like
+        // 107's actor read; the three writes are the publicize, share and
+        // default-team surfaces, which would be refused outright.
+        (
+            "epigraph_writable_teams",
+            "public.epigraph_writable_teams(uuid)",
+            true,
+        ),
+        (
+            "epigraph_default_group",
+            "public.epigraph_default_group(uuid)",
+            true,
+        ),
+        (
+            "epigraph_set_default_group",
+            "public.epigraph_set_default_group(uuid)",
+            true,
+        ),
+        (
+            "epigraph_publicize_claims",
+            "public.epigraph_publicize_claims(uuid[], text)",
+            true,
+        ),
+        (
+            "epigraph_share_claims_with_team",
+            "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
+            true,
+        ),
+        // 207: the bug-report intake's two definers run on the request DSN
+        // (MCP submit_bug_report / list_my_bug_reports), so both are
+        // app-callable; a missing grant refuses every report (42501).
+        (
+            "epigraph_submit_bug_report",
+            "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
+            true,
+        ),
+        (
+            "epigraph_my_bug_reports",
+            "public.epigraph_my_bug_reports(integer)",
+            true,
+        ),
+        // 207: the preflight runs on the request DSN before the embedding
+        // call; the caller gate takes a principal as an argument, so the
+        // request DSN must never call it (an oracle for any agent).
+        (
+            "epigraph_bug_report_preflight",
+            "public.epigraph_bug_report_preflight()",
+            true,
+        ),
+        (
+            "epigraph_bug_report_gate",
+            "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
+            false,
+        ),
         (
             "epigraph_confirm_admin_act",
             "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
@@ -2912,6 +3052,36 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_retire_operator_link",
             "public.epigraph_retire_operator_link(uuid, text, boolean)",
             false,
+        ),
+        // 198: the request path builds the agent-lookup card through it;
+        // without the grant find_agent / get_agent fail 42501.
+        (
+            "epigraph_disclosed_role_assignments",
+            "public.epigraph_disclosed_role_assignments(uuid[])",
+            true,
+        ),
+        // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
+        // calls it on the request DSN for `authored_by.prompt_snapshot`;
+        // without the grant every claim read is 42501.
+        (
+            "epigraph_agent_prompt_snapshot_at",
+            "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
+            true,
+        ),
+        // 199: every claim read calls it on the request DSN for
+        // `authored_by.human` (the filer's and each ingester's human);
+        // without the grant every claim read is 42501.
+        (
+            "epigraph_operator_bound_at",
+            "public.epigraph_operator_bound_at(uuid, timestamptz)",
+            true,
+        ),
+        // 208: MCP `countersign_authorship` calls it on the request DSN as
+        // the caller; without the grant every countersign is 42501.
+        (
+            "epigraph_countersign_authorship",
+            "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
+            true,
         ),
     ];
 
@@ -3597,6 +3767,9 @@ mod definer_register_tests {
         // the caller (or the maintenance owner of 168's resolution definer,
         // which is what lets that definer through).
         "epigraph_challenge_resolution_guard",
+        // 207: the intake settings' audit trigger. It runs as the session
+        // writing the settings row, which only a maintenance session can.
+        "epigraph_bug_report_intake_settings_audit",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

@@ -193,6 +193,29 @@ pub async fn begin_author_stamped_tx<'p>(
     author: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
 ) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
+    begin_author_stamped_tx_for(server, author, tool_name, None).await
+}
+
+/// [`begin_author_stamped_tx`] for a claim write whose declared tenancy may
+/// name a TEAM the author writes only through its live human (owner decision
+/// D-V3, `docs/tenancy/claim-visibility-controls.md`).
+///
+/// `grant` is the [`epigraph_db::TeamWriteGrant`] that
+/// `ClaimRepository::resolve_write_decl` returned, and only that function mints
+/// one. With it, the stamp carries the team in its writable set
+/// (`Viewer::with_team_write_grant`). The grant must name THIS author, or the
+/// write is refused. Everything else, including all three refusals of
+/// [`author_write_authority`], is unchanged.
+///
+/// # Errors
+/// As [`begin_author_stamped_tx`], plus `McpError::internal_error` for a grant
+/// that names another agent.
+pub async fn begin_author_stamped_tx_for<'p>(
+    server: &'p EpiGraphMcpFull,
+    author: crate::write_identity::WriteIdentity,
+    tool_name: &'static str,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
     let author_agent_id = author.agent_id();
     let (scoped, author_viewer) = author_write_authority(
         server.scoped.as_ref(),
@@ -201,6 +224,16 @@ pub async fn begin_author_stamped_tx<'p>(
         tool_name,
     )
     .await?;
+    let author_viewer = match grant {
+        None => author_viewer,
+        Some(g) => author_viewer.with_team_write_grant(g).ok_or_else(|| {
+            internal_error_text(format!(
+                "{tool_name}: the team-write grant names agent {}, not the author {author_agent_id}; \
+                 nothing was written",
+                g.agent()
+            ))
+        })?,
+    };
 
     scoped.begin_as(&author_viewer).await.map_err(|e| {
         tracing::error!(
@@ -214,6 +247,118 @@ pub async fn begin_author_stamped_tx<'p>(
             "{tool_name}: could not begin an author-stamped transaction"
         ))
     })
+}
+
+/// Map a visibility-control error for the caller. A designed refusal keeps its
+/// text, with `Input` as `INVALID_PARAMS` and `Authority`/`State` as
+/// `INVALID_REQUEST`. A claim the caller cannot read is answered exactly as a
+/// missing one. Everything else goes to [`crate::errors::db_caller_error`].
+pub fn visibility_caller_error(e: epigraph_db::DbError) -> McpError {
+    use epigraph_db::errors::RefusalKind;
+    match e {
+        epigraph_db::DbError::Refused {
+            kind: RefusalKind::Input,
+            message,
+        } => crate::errors::invalid_params(message),
+        epigraph_db::DbError::Refused { message, .. } => McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::from(message),
+            data: None,
+        },
+        epigraph_db::DbError::NotFound { entity, id } => {
+            crate::errors::invalid_params(format!("{entity} {id} not found"))
+        }
+        other => crate::errors::db_caller_error(other),
+    }
+}
+
+/// Resolve a claim write's `visibility` / `group_id` parameters for `author`
+/// (docs/tenancy/claim-visibility-controls.md): team by default, else private,
+/// never public unless asked. Runs BEFORE the author-stamped transaction
+/// because a team the author writes only through its human (D-V3) must be
+/// stamped into it ([`begin_author_stamped_tx_for`]). Every read is a migration
+/// 206 or 107 definer, so the unstamped pool answers correctly.
+///
+/// # Errors
+/// `INVALID_PARAMS` for a malformed or contradictory pair, and the caller
+/// errors of [`visibility_caller_error`] for a refused team or author.
+pub async fn resolve_claim_visibility(
+    server: &EpiGraphMcpFull,
+    author: uuid::Uuid,
+    visibility: Option<&str>,
+    group_id: Option<&str>,
+) -> Result<epigraph_db::ResolvedWriteDecl, McpError> {
+    let choice = epigraph_core::VisibilityChoice::parse_str(visibility, group_id)
+        .map_err(crate::errors::invalid_params)?;
+    let mut conn = server.pool.acquire().await.map_err(internal_error)?;
+    ClaimRepository::resolve_write_decl(&mut conn, author, choice)
+        .await
+        .map_err(visibility_caller_error)
+}
+
+/// The viewer the reads of ONE write run through (the DS wiring, the
+/// read-backs), when the request's own viewer would not see the row:
+///
+/// * the resolution just PROVISIONED the author's home group
+///   (`default_decl_for_author` mints a personal group on a miss), which the
+///   viewer resolved at the start of the request does not hold, so a private
+///   claim written there would be invisible to its own DS wiring. The viewer
+///   is re-resolved once (the rare first-write path; `epigraph-api`
+///   `routes/claims.rs::create_claim_core` does the same);
+/// * a D-V3 team grant: the viewer widened by it, for this write only.
+///
+/// `None` when neither applies, or when the grant names another agent: the
+/// caller then keeps its own viewer, and the stamp (which refuses such a
+/// grant) decides.
+///
+/// # Errors
+/// `McpError::internal_error` if the re-resolve fails.
+pub async fn write_viewer(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    author: uuid::Uuid,
+    resolved: &epigraph_db::ResolvedWriteDecl,
+) -> Result<Option<epigraph_db::visibility::Viewer>, McpError> {
+    let refreshed = if resolved.operator_grant.is_none()
+        && resolved.decl.visibility_bind() == Some("group")
+        && viewer.principal() == Some(author)
+        && viewer.group_bind().is_some_and(|g| {
+            resolved
+                .decl
+                .owner_group_bind()
+                .is_some_and(|o| !g.contains(&o))
+        }) {
+        Some(
+            epigraph_db::visibility::Viewer::resolve(&server.pool, author)
+                .await
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
+    let granted = resolved.operator_grant.as_ref().and_then(|g| {
+        refreshed
+            .as_ref()
+            .unwrap_or(viewer)
+            .with_team_write_grant(g)
+    });
+    Ok(granted.or(refreshed))
+}
+
+/// The tenancy the claim landed in, read on the write's own transaction
+/// (`ClaimRepository::write_tenancy_report`, D-V4 note included).
+///
+/// # Errors
+/// `McpError::internal_error` if the read fails.
+pub async fn claim_tenancy_report(
+    conn: &mut PgConnection,
+    claim_id: uuid::Uuid,
+    resolved: &epigraph_db::ResolvedWriteDecl,
+    was_created: bool,
+) -> Result<epigraph_db::WriteTenancyReport, McpError> {
+    ClaimRepository::write_tenancy_report(conn, claim_id, resolved, was_created)
+        .await
+        .map_err(internal_error)
 }
 
 /// Begin the ONE transaction a WORKFLOW write runs in (`store_workflow`,
@@ -687,21 +832,17 @@ pub async fn create_claim_idempotent(
     signer_agent_id: Option<uuid::Uuid>,
     tool_name: &'static str,
     edge_key: Option<EdgeSigningKey<'_>>,
+    decl: epigraph_core::TenancyDecl,
 ) -> Result<(Claim, bool), McpError> {
-    // Tenancy declaration (PR-16). Every MCP writer that reaches this helper
-    // (`submit_claim`, `memorize`, `batch_submit_claims`) posts a claim
-    // authored by the calling principal and carries no visibility parameter, so
-    // the declaration is the author's own personal group, publicly visible.
-    // Giving those tools a `visibility` argument is the write-side gate's work,
-    // not this PR's; when it arrives, this is the single place it lands for all
-    // three.
-    // `db_caller_error`, not `internal_error`: the one caller-side refusal this
-    // can return is migration 105's `MembershipRevoked` (the author's personal
-    // membership is revoked and the provisioning call will not restore it),
-    // which is a denial and must not read as a server fault.
-    let decl = ClaimRepository::default_decl_for_author(&mut *conn, claim.agent_id.into())
-        .await
-        .map_err(crate::errors::db_caller_error)?;
+    // Tenancy declaration. Every MCP writer that reaches this helper
+    // (`submit_claim`, `memorize`, `batch_submit_claims`) resolves it from the
+    // caller's `visibility` / `group_id` through
+    // `ClaimRepository::resolve_write_decl` (team by default, private and public
+    // on request; docs/tenancy/claim-visibility-controls.md) BEFORE the
+    // transaction opens, because a team the author writes only through its human
+    // must be stamped into the transaction (`begin_author_stamped_tx_for`).
+    // `resolve_write_decl` calls `default_decl_for_author` first, so its
+    // refusals (OPL01, OPL02, RVK01) still fire for every visibility.
     // The signature is persisted with its SIGNER (batch H-b, D1-sig): the author
     // is `claim.agent_id`, the signer is `signer_agent_id`, and since D1 they
     // differ for every authenticated caller. `verify_claim` checks the stored

@@ -14,7 +14,9 @@
 //! stops there); 3 `link-retired` refused at least one id, `link` left the
 //! agent without a LIVE link (its link is retired, or its membership revoked),
 //! or `reown-reverse` HELD at least one claim or hidden row (it is not fully
-//! restored). `arm-operator-binding --apply` exits 1 when the census of unbound
+//! restored), or `regroup-claims --apply` held a listed claim or moved a count
+//! other than `--confirm-count` (the list is not fully regrouped).
+//! `arm-operator-binding --apply` exits 1 when the census of unbound
 //! recent writers refused it. `verify-confirmations` exits 2 when at least one
 //! stored confirmation does not verify (each is recorded).
 //! `allow-author-binding-client` exits 3 when the allowance is recorded but
@@ -42,11 +44,22 @@
 //!         [--max-batches N] [--apply --confirm-count N --ruling TEXT --reason TEXT \
 //!         [--accept-unenforced]]
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
+//!     epigraph-operator regroup-claims --claims-file claims.txt --source-group <uuid> \
+//!         --target-group <uuid> --operator <uuid> --manifest-out regroup-1.jsonl \
+//!         [--apply --confirm-count N --ruling TEXT --reason TEXT]
+//!     epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 //!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
 //!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
 //!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
 //!         --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest reown-wf-1.jsonl [--apply]
+//!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
+//!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
+//!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
+//!          --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
+//!     epigraph-operator reverse-ingest-markers --manifest backfill-1.jsonl [--apply]
+//!     epigraph-operator register-system-agent --role legacy-ingest --create-agent \
+//!         --reason TEXT [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
@@ -103,9 +116,10 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, binding_client, client_scope, client_status, confirmations,
-    custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey,
-    reown, reown_linked, reown_workflows, restrict, retire_link, reverse, system_agent, team_group,
+    self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
+    confirmations, custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy,
+    link, passkey, regroup, reown, reown_linked, reown_workflows, restrict, retire_link, reverse,
+    system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -463,12 +477,22 @@ enum Command {
     /// workflow-ingest system agent. IMMUTABLE once applied: no revoke, no
     /// re-point. Register BEFORE rotating the agent's key and BEFORE arming.
     RegisterSystemAgent {
-        /// The role (`workflow-ingest`).
+        /// The role (`workflow-ingest` or `legacy-ingest`).
         #[arg(long)]
         role: String,
-        /// The agent id that is that role's system agent.
+        /// The agent id that is that role's system agent. Exactly one of
+        /// this and `--create-agent`.
         #[arg(long)]
-        agent: Uuid,
+        agent: Option<Uuid>,
+        /// Create a NEW agent for the role (a random public key whose secret
+        /// never existed: nobody can sign as it) and register it, in one
+        /// transaction. For a principal that writes and signs nothing
+        /// (`legacy-ingest`, the legacy ingest-marker backfill's `by`).
+        #[arg(long, conflicts_with = "agent")]
+        create_agent: bool,
+        /// With `--create-agent`: the new agent's display name.
+        #[arg(long, default_value = "legacy ingest")]
+        display_name: String,
         /// Recorded on the registry row and in the audit row.
         #[arg(long)]
         reason: String,
@@ -800,6 +824,58 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         sample: usize,
     },
+    /// Move listed claims that are group-private in the source group (and
+    /// every row that follows only them) to the target group, keeping
+    /// visibility `group`; never makes anything public. Reversed exactly by
+    /// `reown-reverse --manifest`.
+    RegroupClaims {
+        /// One claim UUID per line; only these claims are ever touched.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The group the claims are in now (`('group', source)`); `--operator`
+        /// must be a live admin of it.
+        #[arg(long)]
+        source_group: Uuid,
+        /// The group the claims move into: an active team or community group
+        /// of which `--operator` is a live admin.
+        #[arg(long)]
+        target_group: Uuid,
+        /// The operator (a registered human operator's agent id) the act is
+        /// attributed to in the audit row.
+        #[arg(long)]
+        operator: Uuid,
+        /// Where to write the undo manifest. Must not exist. Written and
+        /// fsynced before any write under `--apply`.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back, and no manifest or audit row is
+        /// written.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's eligible claim count, repeated back.
+        #[arg(long)]
+        confirm_count: Option<usize>,
+        /// The decision this act carries out, recorded in the manifest and the
+        /// audit row. Required under `--apply`.
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why, recorded in the manifest and the audit row. Required under
+        /// `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Claims per transaction. Each batch holds `SHARE ROW EXCLUSIVE` on
+        /// `edges` and `harvester_fragments`, blocking every write to them on
+        /// the instance while it runs.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// How many claims the dry run lists row by row.
+        #[arg(long, default_value_t = 3)]
+        sample: usize,
+    },
     /// Move listed workflow LINEAGES (every generation, the plan claims they
     /// execute, the rows those carry, and their plan edges) out of the source
     /// group into a TEAM group, keeping every row's visibility
@@ -883,6 +959,89 @@ enum Command {
         #[arg(long, default_value_t = 25)]
         batch_size: usize,
         /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
+    /// Stamp the document ingest's marker (as migration 208's reserved
+    /// labels, outside the signed attestation) onto every legacy
+    /// ingest-shaped edge written before `--written-before`: `agent -authored->
+    /// paper`, `paper -asserts-> claim`, and an `agent -asserts-> claim`
+    /// closing a legacy authored -> paper -> claim chain. One principal per
+    /// PAPER: its one classified ingest signer when all of its real-signed
+    /// authored and paper asserts edges name one, else the registered
+    /// `legacy-ingest` principal; an agent assertion takes its (oldest
+    /// in-force, else oldest) chain's paper's. Writes an ingest record for
+    /// every stamped assertion (a creation record only where provable). Dry
+    /// run (default) is read-only. Reversed by `reverse-ingest-markers
+    /// --manifest`.
+    BackfillIngestMarkers {
+        /// A bulk-attestation signer: it never decides a paper's principal.
+        /// Repeat for each.
+        #[arg(long = "attestation-signer")]
+        attestation_signers: Vec<Uuid>,
+        /// A real ingesting agent: a paper all of whose real-signed authored
+        /// and paper asserts edges it signed takes it as principal. Repeat for
+        /// each. `--apply` refuses while any signer of those edges is in
+        /// neither list (agent -> claim signers need no classification).
+        #[arg(long = "ingest-signer")]
+        ingest_signers: Vec<Uuid>,
+        /// Only edges written before this moment (RFC 3339, e.g.
+        /// 2026-11-10T06:00:00Z: the maintenance window's start, with ingest
+        /// stopped) are stamped. Required under `--apply`; give the dry run
+        /// the same value. Recorded in the manifest and the audit row.
+        #[arg(long, value_parser = backfill_markers::parse_written_before)]
+        written_before: Option<chrono::DateTime<chrono::Utc>>,
+        /// Perform the writes. Without it, the census only (read-only).
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's TOTAL edges_to_stamp, repeated back.
+        #[arg(long)]
+        confirm_count: Option<u64>,
+        /// Where to write the undo manifest (must not exist). Required under
+        /// `--apply`; fsynced before each batch's write.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// The decision this act carries out (manifest and audit row).
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why (manifest and audit row).
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Do not write creation records for legacy literature claims (they
+        /// get non-creation records instead).
+        #[arg(long)]
+        no_creation_records: bool,
+        /// Edges per transaction.
+        #[arg(long, default_value_t = 2000)]
+        batch_size: usize,
+        /// Stop after this many batches. A paper-assertion batch writes its
+        /// stamps' ingest records in its own transaction, so every committed
+        /// batch carries its records however the run stops (this bound, a
+        /// failed batch, a lock timeout, or the process killed). A re-run
+        /// with a new manifest, the same --written-before and the same signer
+        /// lists picks up the rest.
+        #[arg(long)]
+        max_batches: Option<usize>,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// `statement_timeout` for the read-only census.
+        #[arg(long, default_value = "10min")]
+        statement_timeout: String,
+    },
+    /// Reverse a `backfill-ingest-markers` run from its manifest: for every
+    /// batch the manifest records as committed, newest first and each in one
+    /// transaction, delete the ingest records it wrote and remove the two
+    /// labels each recorded edge was given (only while it still carries
+    /// them). Dry run rolls back.
+    ReverseIngestMarkers {
+        /// The run's manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Commit. Without it, every batch is rolled back.
+        #[arg(long)]
+        apply: bool,
+        /// `lock_timeout` for each batch.
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
@@ -1192,6 +1351,77 @@ async fn main_inner() -> anyhow::Result<i32> {
             sample: *sample,
         };
         restrict::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
+    let backfill_opts = if let Command::BackfillIngestMarkers {
+        attestation_signers,
+        ingest_signers,
+        written_before,
+        apply,
+        confirm_count,
+        manifest_out,
+        ruling,
+        reason,
+        no_creation_records,
+        batch_size,
+        max_batches,
+        lock_timeout,
+        statement_timeout,
+    } = &cli.command
+    {
+        let o = backfill_markers::Options {
+            apply: *apply,
+            confirm_count: *confirm_count,
+            written_before: *written_before,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            manifest_out: manifest_out.clone(),
+            attestation_signers: attestation_signers.clone(),
+            ingest_signers: ingest_signers.clone(),
+            batch_size: *batch_size,
+            max_batches: *max_batches,
+            lock_timeout: lock_timeout.clone(),
+            statement_timeout: statement_timeout.clone(),
+            creation_records: !*no_creation_records,
+        };
+        backfill_markers::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
+    // regroup-claims' options, likewise refused before any connection.
+    let regroup_opts = if let Command::RegroupClaims {
+        claims_file,
+        source_group,
+        target_group,
+        operator: op,
+        manifest_out,
+        apply,
+        confirm_count,
+        ruling,
+        reason,
+        batch_size,
+        lock_timeout,
+        sample,
+    } = &cli.command
+    {
+        let o = regroup::Options {
+            claims_file: claims_file.clone(),
+            source: *source_group,
+            target: *target_group,
+            operator: *op,
+            manifest_out: manifest_out.clone(),
+            apply: *apply,
+            confirm_count: *confirm_count,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            batch_size: *batch_size,
+            lock_timeout: lock_timeout.clone(),
+            sample: *sample,
+        };
+        regroup::validate(&o)?;
         Some(o)
     } else {
         None
@@ -1839,11 +2069,41 @@ async fn main_inner() -> anyhow::Result<i32> {
         Command::RegisterSystemAgent {
             role: _,
             agent,
+            create_agent,
+            display_name,
             reason,
             apply,
             key_not_legacy_ok,
         } => {
             let role = system_role.expect("parsed above for this command");
+            if create_agent {
+                let (id, outcome) = system_agent::create_and_register(
+                    &mut conn,
+                    role,
+                    &display_name,
+                    &reason,
+                    apply,
+                )
+                .await?;
+                println!(
+                    "{}{}\trole={role}\tagent={id}",
+                    if apply { "" } else { "WOULD BE " },
+                    match outcome {
+                        system_agent::Outcome::Registered => "CREATED-AND-REGISTERED",
+                        system_agent::Outcome::AlreadyRegistered => "ALREADY-REGISTERED",
+                    }
+                );
+                if !apply {
+                    println!(
+                        "DRY RUN: the new agent, its registration and the audit row were rolled \
+                         back (an --apply run creates a different id)."
+                    );
+                }
+                return Ok(0);
+            }
+            let Some(agent) = agent else {
+                anyhow::bail!("give --agent <uuid> or --create-agent; nothing was registered");
+            };
             let Some(identity) = system_agent::identity(&mut conn, role, agent).await? else {
                 anyhow::bail!("agent {agent} does not exist; nothing was registered");
             };
@@ -2159,6 +2419,25 @@ async fn main_inner() -> anyhow::Result<i32> {
             let report = reown_workflows::run(&mut conn, &opts, &names, &mut stdout).await?;
             Ok(reown_workflows::exit_code(&report, &opts))
         }
+        Command::BackfillIngestMarkers { .. } => {
+            let opts = backfill_opts.expect("built above");
+            let report =
+                backfill_markers::run(&mut conn, &opts, &db.session_user, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
+        }
+        Command::ReverseIngestMarkers {
+            manifest,
+            apply,
+            lock_timeout,
+        } => {
+            backfill_markers::reverse(&mut conn, &manifest, apply, &lock_timeout, &mut stdout)
+                .await?;
+            Ok(0)
+        }
         Command::RestrictClaims { claims_file, .. } => {
             let opts = restrict_opts.expect("built above");
             let ids = operator::read_ids_file(&claims_file)?;
@@ -2171,6 +2450,15 @@ async fn main_inner() -> anyhow::Result<i32> {
             } else {
                 2
             })
+        }
+        Command::RegroupClaims { claims_file, .. } => {
+            let opts = regroup_opts.expect("built above");
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            let report = regroup::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(regroup::exit_code(&report, &opts))
         }
         Command::HideEvidence {
             claims_file,

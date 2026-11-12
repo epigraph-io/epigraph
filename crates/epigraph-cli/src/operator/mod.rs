@@ -21,6 +21,10 @@
 //!   them, into a target group with `visibility = 'group'` (the audited admin
 //!   privatization act; see [`restrict`]). `reown-reverse` reverses its
 //!   manifest exactly.
+//! * `regroup-claims` — move listed claims that are group-private in one
+//!   group, and every row that follows only them, to another team or
+//!   community group, keeping `group` visibility and never making anything
+//!   public (see [`regroup`]). `reown-reverse` reverses its manifest exactly.
 //! * `reown-workflows` — move listed workflow lineages (every generation, the
 //!   plan claims they execute, the rows those carry, and their plan edges) out
 //!   of a source group into a TEAM group the operator administers, keeping
@@ -159,6 +163,7 @@
 
 pub mod admin_scopes;
 pub mod arm;
+pub mod backfill_markers;
 pub mod bind;
 pub mod binding_client;
 pub mod client_scope;
@@ -175,6 +180,7 @@ pub mod legacy;
 pub mod link;
 pub mod manifest;
 pub mod passkey;
+pub mod regroup;
 pub mod reown;
 pub mod reown_linked;
 pub mod reown_workflows;

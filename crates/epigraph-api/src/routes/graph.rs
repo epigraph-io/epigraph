@@ -646,8 +646,9 @@ pub struct ThemeOut {
     /// The stored theme label, cut to 200 characters. NOT viewer-scoped: for
     /// a theme with members the caller cannot read, it may be derived from
     /// their text (`scripts/label_themes_llm.py` samples members with no
-    /// visibility predicate). Residual recorded on
-    /// `D-PR16-theme-cluster-viewer-scope`.
+    /// visibility predicate, except that it never samples a claim the
+    /// bug-report intake group owns: `scripts/theme_lib.py::not_intake_owned`).
+    /// Residual recorded on `D-PR16-theme-cluster-viewer-scope`.
     pub label: String,
     /// Current claims assigned to this theme that the CALLER can read. Live,
     /// never the stored `claim_themes.claim_count` (backlog 57917c13).

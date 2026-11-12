@@ -297,21 +297,29 @@ async fn rest_add_step_on_an_armed_unregistered_database_needs_no_system_agent(p
 
 const RESERVED_AUTHOR: &str = "Workflow-Ingest-System.";
 
-/// A superuser `AppState`: `set_provenance` and `create_agent` run on the raw
-/// pool, and no tenancy question is asked here.
+/// A superuser `AppState`: `create_agent` runs on the raw pool, and no
+/// tenancy question is asked here.
 fn superuser_state(pool: &PgPool) -> AppState {
     AppState::with_db(pool.clone(), ApiConfig::default())
 }
 
+/// `set_provenance` as the claim's filer `owner`, on the application role
+/// (it writes on the caller's stamped transaction).
 async fn provenance(
-    state: &AppState,
+    pool: &PgPool,
+    owner: Uuid,
     claim: Uuid,
     authors: serde_json::Value,
 ) -> (StatusCode, String) {
+    let state = app_role_state(pool).await;
     let req: epigraph_api::routes::provenance::ProvenanceRequest =
         serde_json::from_value(serde_json::json!({ "authors": authors })).expect("request");
+    let mut auth = token(owner, ClientType::Service);
+    auth.scopes = vec!["claims:write".to_string(), "edges:write".to_string()];
     let r = epigraph_api::routes::provenance::set_provenance(
-        State(state.clone()),
+        ViewerExtractor(Viewer::resolve(pool, owner).await.expect("viewer")),
+        State(state),
+        Some(Extension(auth)),
         axum::extract::Path(claim),
         Json(req),
     )
@@ -361,7 +369,6 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
             .expect("the unarmed fallback creates S")
     };
     let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
-    let state = superuser_state(&pool);
     let ada = serde_json::json!({ "name": "Ada Lovelace", "position": 0 });
 
     for phase in ["(0) unregistered", "(a) registered", "(b) rotated"] {
@@ -386,7 +393,8 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
         .await;
 
         let (status, body) = provenance(
-            &state,
+            &pool,
+            owner,
             claim,
             serde_json::json!([ada, { "name": RESERVED_AUTHOR, "position": 1 }]),
         )
@@ -405,7 +413,8 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
         );
 
         let (status, body) = provenance(
-            &state,
+            &pool,
+            owner,
             claim,
             serde_json::json!([{ "name": RESERVED_AUTHOR, "orcid": "" }]),
         )
@@ -416,17 +425,26 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
             "{phase} (ii) empty ORCID: {body}"
         );
 
+        // CONTROL: a real ORCID derives from the ORCID, so the system-identity
+        // guard passes; the author is then a third party the filer does not
+        // speak for, which the authorship check refuses (403, not this 400).
         let (status, body) = provenance(
-            &state,
+            &pool,
+            owner,
             claim,
             serde_json::json!([{ "name": RESERVED_AUTHOR, "orcid": "0000-0002-1825-0097" }]),
         )
         .await;
         assert_eq!(
             status,
-            StatusCode::OK,
-            "{phase} (iii) control: a real ORCID derives from the ORCID: {body}"
+            StatusCode::FORBIDDEN,
+            "{phase} (iii) control: a real ORCID passes the system-identity guard: {body}"
         );
+        assert!(
+            body.contains("only itself or an agent it operates"),
+            "{phase} (iii): refused as a third party, not as a system identity: {body}"
+        );
+        assert_eq!(provenance_edges(&pool, claim).await, 0, "{phase} (iii)");
         if rotated {
             assert_eq!(k_holders(&pool).await, 0, "no K holder minted");
         }
@@ -449,7 +467,8 @@ async fn provenance_refuses_an_author_resolving_to_the_registered_agent(pool: Pg
     let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
     let claim = viewer_fixture::seed_public_claim(&pool, owner, "provenance target N").await;
     let (status, body) = provenance(
-        &superuser_state(&pool),
+        &pool,
+        owner,
         claim,
         serde_json::json!([{ "name": "Ada Lovelace" }, { "name": "Some Name" }]),
     )

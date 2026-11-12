@@ -204,6 +204,9 @@ impl HostAllowlist {
 /// - **Unix socket**: rmcp's Host check is disabled, matching the absent guard
 ///   layer: a unix socket has no DNS-rebinding surface.
 ///
+/// The request-body cap is [`crate::http_listener::MAX_REQUEST_BODY_BYTES`],
+/// set here explicitly rather than inherited from rmcp's default.
+///
 /// rmcp's own `allowed_origins` stays empty (its "not checked" setting):
 /// [`host_guard_middleware`] already refuses any `Origin` outside the
 /// allowlist, and rmcp's form needs scheme-qualified entries the allowlist
@@ -212,7 +215,8 @@ impl HostAllowlist {
 pub fn streamable_http_server_config(
     tcp_allowlist: Option<&HostAllowlist>,
 ) -> StreamableHttpServerConfig {
-    let config = StreamableHttpServerConfig::default();
+    let config = StreamableHttpServerConfig::default()
+        .with_max_request_body_bytes(crate::http_listener::MAX_REQUEST_BODY_BYTES);
     match tcp_allowlist {
         Some(allowlist) => config.with_allowed_hosts(allowlist.rmcp_allowed_hosts()),
         None => config.disable_allowed_hosts(),

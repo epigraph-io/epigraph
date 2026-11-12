@@ -12,15 +12,25 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn create_test_router(pool: PgPool) -> Router {
+/// Carries a `ScopedPool`: `get_cross_source_matches` and `list_candidates`
+/// read on `AppState::read_as`, which refuses (500) on a state built without
+/// one rather than fall back to the unstamped raw pool.
+async fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
         require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
         ..ApiConfig::default()
     };
+    let scoped = epigraph_db::ScopedPool::connect(
+        &database_url_of(&pool),
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool over the test database");
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let mut state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    state.scoped = Some(scoped);
     create_router(state)
 }
 
@@ -118,7 +128,7 @@ async fn get(router: &Router, path: &str) -> axum::http::Response<axum::body::Bo
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn returns_404_when_claim_missing(pool: PgPool) {
-    let router = create_test_router(pool);
+    let router = create_test_router(pool).await;
     let bogus = Uuid::new_v4();
     let resp = get(
         &router,
@@ -132,7 +142,7 @@ async fn returns_404_when_claim_missing(pool: PgPool) {
 async fn returns_empty_arrays_when_claim_has_no_matches(pool: PgPool) {
     let agent = insert_agent(&pool).await;
     let claim = insert_claim(&pool, agent).await;
-    let router = create_test_router(pool);
+    let router = create_test_router(pool).await;
 
     let resp = get(
         &router,
@@ -192,7 +202,7 @@ async fn returns_corroborates_edges_and_pending_candidates(pool: PgPool) {
     .await
     .unwrap();
 
-    let router = create_test_router(pool);
+    let router = create_test_router(pool).await;
     let resp = get(&router, &format!("/api/v1/claims/{a}/cross_source_matches")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
@@ -759,7 +769,7 @@ async fn list_candidates_returns_pending_with_excerpts(pool: PgPool) {
     .await
     .unwrap();
 
-    let router = create_test_router(pool);
+    let router = create_test_router(pool).await;
     let resp = get_anonymous(&router, "/api/v1/match_candidates?status=pending&limit=100").await;
     assert_eq!(
         resp.status(),
@@ -1951,7 +1961,7 @@ async fn cross_source_matches_requires_claims_read_like_list_candidates(pool: Pg
     let agent = insert_agent(&pool).await;
     let claim = insert_claim(&pool, agent).await;
     let absent = Uuid::new_v4();
-    let router = create_test_router(pool);
+    let router = create_test_router(pool).await;
 
     let write_only = decide_bearer_token_with_scopes(
         Uuid::new_v4(),

@@ -78,7 +78,11 @@ const REGISTER: &[(&str, usize)] = &[
     // `challenge.rs` (1) is gone: `submit_challenge`'s `claim.challenged`
     // event moved into the challenge's stamped transaction through
     // `EventRepository::publish_or_log_conn` (backlog 2f2eeaea).
-    ("claims.rs", 3),
+    // 3 before the claim visibility controls folded `create_claim_core`'s
+    // AUTHORED / HAS_TRACE / DERIVED_FROM writes into one loop. A
+    // group-visible claim's edge errors are now logged (`tracing::warn!`);
+    // the public claim's pool call is the one `let _` left.
+    ("claims.rs", 1),
     ("community.rs", 1),
     ("conflicts.rs", 2),
     // 5 before batch W12b moved `forget_convention`'s REFUTES edge onto the

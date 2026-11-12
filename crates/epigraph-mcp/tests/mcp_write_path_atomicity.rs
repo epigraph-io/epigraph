@@ -102,6 +102,8 @@ fn submit_params_with_evidence(content: &str, evidence: &str) -> SubmitClaimPara
         // file and would otherwise make an arm's outcome depend on whatever else
         // happens to be embedded in the fixture database.
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -111,6 +113,8 @@ fn memorize_params(content: &str) -> MemorizeParams {
         confidence: Some(0.7),
         tags: Some(vec!["write-path-atomicity".to_string()]),
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -484,7 +488,12 @@ async fn an_author_with_no_live_writable_membership_is_refused_before_anything_i
              here means the process is relying on the session bypassing RLS.",
         );
     assert!(
-        err.message.contains("no live writable group membership"),
+        // Since the claim visibility controls, the write-time visibility
+        // resolution (`default_decl_for_author`, before the transaction) meets
+        // the revoked personal group first and names it; either refusal names
+        // the cause.
+        err.message.contains("no live writable group membership")
+            || err.message.contains("holds only REVOKED membership"),
         "the refusal must name the cause — the author has no writable group — rather than \
          surfacing a 42501 from whichever statement ran first; got: {}",
         err.message

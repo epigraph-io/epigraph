@@ -138,6 +138,7 @@ async fn ingest_document_stores_a_verifying_v1_signature_on_every_claim(pool: Pg
         &viewer,
         &extraction("document"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("document ingests");
@@ -153,6 +154,7 @@ async fn ingest_document_spine_stores_a_verifying_v1_signature_on_every_claim(po
         &viewer,
         &extraction("spine"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingests");
@@ -190,6 +192,7 @@ async fn a_converged_atom_is_not_signed_over(pool: PgPool) {
         &viewer,
         &extraction("converge"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("document ingests");

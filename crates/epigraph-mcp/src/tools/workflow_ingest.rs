@@ -123,6 +123,11 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // Supersede SPEC K12a: a `supersedes` relationship is the act's alone.
     epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
         .map_err(invalid_params)?;
+    // Workflow authors are name-derived only: an `agent_id` (a document-ingest
+    // field on the shared `AuthorEntry`, backlog 94cc12db) is refused rather
+    // than silently ignored.
+    epigraph_ingest::common::schema::refuse_author_agent_ids(&extraction.source.authors)
+        .map_err(invalid_params)?;
     // H3 (batch H-b): the submitter is recorded by THIS entry point, never
     // taken from the caller's metadata; see `tools::workflow_authority`.
     let caller = server.write_identity(auth, viewer).await?;

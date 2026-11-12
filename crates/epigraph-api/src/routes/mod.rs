@@ -46,6 +46,8 @@ pub mod belief;
 pub mod challenge;
 #[cfg(feature = "db")]
 pub mod claim_context;
+#[cfg(feature = "db")]
+pub mod claim_visibility;
 pub mod claims;
 #[cfg(feature = "db")]
 pub mod claims_batch_get;
@@ -235,6 +237,32 @@ pub(crate) async fn finish_scoped_read(
         );
         crate::errors::ApiError::InternalError {
             message: "Failed to finish the scoped read".to_string(),
+        }
+    })
+}
+
+/// Open a viewer-stamped read for `handler`: the acquire half of
+/// [`finish_scoped_read`], with the same error shape.
+///
+/// `AppState::read_as`'s refusal reason is internal design prose aimed at
+/// whoever built the `AppState`, so it goes to the operator's log and the
+/// client gets an opaque 500. Converted handlers before this one spelled the
+/// mapping out inline; it is the same twelve lines in each.
+#[cfg(feature = "db")]
+pub(crate) async fn open_scoped_read<'a>(
+    state: &'a AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedRead<'a>, crate::errors::ApiError> {
+    state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = handler,
+            "could not acquire a viewer-stamped connection"
+        );
+        crate::errors::ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
         }
     })
 }
@@ -511,6 +539,20 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/mass-functions/:id/unretract",
             post(bba_retract::unretract_bba),
+        )
+        // Claim visibility controls (migration 206,
+        // docs/tenancy/claim-visibility-controls.md).
+        .route(
+            "/api/v1/claims/publicize",
+            post(claim_visibility::publicize_claims),
+        )
+        .route(
+            "/api/v1/claims/share-with-team",
+            post(claim_visibility::share_claims_with_team),
+        )
+        .route(
+            "/api/v1/agents/me/default-group",
+            put(claim_visibility::set_default_group),
         )
         .route(
             "/api/v1/frames/:id/conflict-batch",
@@ -817,6 +859,9 @@ pub fn create_router_with_extensions(
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
         .route("/api/v1/agents", get(agents::list_agents))
+        // Name search (find_agent): registered before `/api/v1/agents/:id`
+        // for readability; axum's router prefers the static segment anyway.
+        .route("/api/v1/agents/search", get(agents::search_agents))
         .route("/agents/:id", get(agents::get_agent))
         .route("/api/v1/agents/:id", get(agents::get_agent))
         .route("/agents/:id/reputation", get(agents::get_agent_reputation))

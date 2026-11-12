@@ -55,6 +55,8 @@ async fn memorize_with_tags_populates_claims_labels() {
         confidence: Some(0.7),
         tags: Some(vec!["backlog".to_string(), "alt-set-extension".to_string()]),
         novelty_threshold: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     };
 
     tools::memory::memorize(&server, &viewer, params, None)
@@ -103,6 +105,8 @@ async fn memorize_resubmit_accumulates_labels() {
             confidence: Some(0.7),
             tags: Some(vec!["one".to_string()]),
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -118,6 +122,8 @@ async fn memorize_resubmit_accumulates_labels() {
             confidence: Some(0.7),
             tags: Some(vec!["two".to_string()]),
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -160,6 +166,8 @@ async fn memorize_without_tags_leaves_labels_empty() {
             confidence: Some(0.7),
             tags: None,
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

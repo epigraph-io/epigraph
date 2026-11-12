@@ -496,6 +496,8 @@ fn inline_doc(doi: &str) -> epigraph_mcp::types::IngestDocumentInlineParams {
             "relationships": []
         }))
         .expect("extraction"),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -505,6 +507,8 @@ fn memorize_params(content: &str) -> epigraph_mcp::types::MemorizeParams {
         confidence: Some(0.7),
         tags: Some(vec![]),
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -928,10 +932,11 @@ async fn el8_log(pool: &PgPool) -> Vec<(String, i32, Vec<Uuid>, serde_json::Valu
 
 /// An elevated tool call through the real `call_tool` is recorded ONCE before
 /// its result returns: surface `mcp:get_claim`, the call's id-shaped argument,
-/// the token's jti, one row in the result, and no subject for a public row.
+/// the token's jti, the claim and its author as the result's rows, and no
+/// subject for a public row.
 /// A call whose result is B's private claim (the MCP read is stamped from the
 /// elevated viewer, so the arm widens it and the row is served) is recorded
-/// too, against B's group, with its one row: the access is visible to B.
+/// too, against B's group, with its rows: the access is visible to B.
 ///
 /// Verified to fail with `call_tool` returning the tool's result without
 /// recording it (no row).
@@ -961,7 +966,11 @@ async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPoo
     assert_eq!(log.len(), 1, "{log:?}");
     let (surface, rows, groups, args) = &log[0];
     assert_eq!(surface, "mcp:get_claim");
-    assert_eq!(*rows, 1, "one row in the result");
+    // Two id-bearing objects: the claim and its `authored_by.agent` (P, who
+    // filed it). P is a registered human operator, bound to itself, which is
+    // not an operator, so `authored_by.human` is null and not counted. The
+    // recorder counts every nested row object.
+    assert_eq!(*rows, 2, "the claim and its author in the result");
     assert!(
         groups.is_empty(),
         "a public row names no subject: {groups:?}"
@@ -979,7 +988,12 @@ async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPoo
     );
     let log = el8_log(&pool).await;
     assert_eq!(log.len(), 2, "{log:?}");
-    assert_eq!(log[1].1, 1, "the served row is counted: {log:?}");
+    // Served, B's claim carries the same two id-bearing objects as the public
+    // one above: the claim and its `authored_by.agent`.
+    assert_eq!(
+        log[1].1, 2,
+        "the served claim and its author are counted: {log:?}"
+    );
     assert_eq!(log[1].2, vec![b_group], "the access is recorded for B");
 }
 

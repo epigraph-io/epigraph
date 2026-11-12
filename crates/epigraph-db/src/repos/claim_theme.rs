@@ -76,9 +76,12 @@ pub const THEME_OVERVIEW_PAGE_MAX: i64 = 200;
 pub struct ThemeOverviewRow {
     pub id: Uuid,
     /// Stored label. NOT viewer-derived: for a theme with members the viewer
-    /// cannot read it may summarise their text (`scripts/label_themes_llm.py`
-    /// samples members with no visibility predicate; the label residual on
-    /// `D-PR16-theme-cluster-viewer-scope`). Cut to 200 characters.
+    /// cannot read it may summarise their text (the theme scripts that name
+    /// themes and clusters sample members with no visibility predicate,
+    /// except claims the bug-report intake group owns, which none of them
+    /// samples: `scripts/theme_lib.py::not_intake_owned` lists every such
+    /// path; the label residual on `D-PR16-theme-cluster-viewer-scope`). Cut
+    /// to 200 characters.
     pub label: String,
     /// Current claims assigned to this theme that the viewer can read. `>= 1`.
     pub member_count: i64,

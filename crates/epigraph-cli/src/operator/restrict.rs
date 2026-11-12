@@ -357,7 +357,10 @@ fn classify_claim(c: &ClaimRow, target: Uuid, allow_non_world: bool) -> Result<b
     Ok(true)
 }
 
-async fn sealed_of(conn: &mut PgConnection, ids: &[Uuid]) -> anyhow::Result<BTreeSet<Uuid>> {
+pub(super) async fn sealed_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeSet<Uuid>> {
     let v: Vec<Uuid> = sqlx::query_scalar(
         "SELECT DISTINCT claim_id FROM claim_encryption WHERE claim_id = ANY($1)",
     )
@@ -529,7 +532,7 @@ pub(super) async fn pinned_of(
     Ok(v.into_iter().map(|u| u.to_string()).collect())
 }
 
-fn evidence_ids(s: &Snapshot) -> Vec<Uuid> {
+pub(super) fn evidence_ids(s: &Snapshot) -> Vec<Uuid> {
     s.keys()
         .filter(|(t, _)| t == "evidence")
         .filter_map(|(_, pk)| Uuid::parse_str(pk).ok())
@@ -546,7 +549,7 @@ pub struct EdgeEnds {
     pub target_state: (Uuid, String),
 }
 
-async fn edge_ends(
+pub(super) async fn edge_ends(
     conn: &mut PgConnection,
     ids: &[Uuid],
 ) -> anyhow::Result<BTreeMap<String, EdgeEnds>> {
@@ -601,7 +604,7 @@ pub fn meet(s: &(Uuid, String), t: &(Uuid, String)) -> Option<Tenancy> {
 
 /// The groups a reader must belong to ALL of to read a row: none for a public
 /// row, the owner (and the co-owner) for a group row.
-fn reader_groups(t: &Tenancy) -> BTreeSet<Uuid> {
+pub(super) fn reader_groups(t: &Tenancy) -> BTreeSet<Uuid> {
     if t.visibility == "public" {
         BTreeSet::new()
     } else {
@@ -734,7 +737,7 @@ pub async fn fetch_evidence_edges(
 /// The current state of exactly `keys`: what `fetch_attached` returns for
 /// `claims`, plus any edge key it does not return (an evidence-endpoint edge),
 /// read by id. A key that no longer resolves is absent.
-async fn states_of(
+pub(super) async fn states_of(
     conn: &mut PgConnection,
     specs: &[TableSpec],
     claims: &[Uuid],
@@ -775,14 +778,20 @@ async fn states_of(
     Ok(out)
 }
 
-fn edge_ids(keys: &BTreeSet<RowKey>) -> Vec<Uuid> {
+pub(super) fn edge_ids(keys: &BTreeSet<RowKey>) -> Vec<Uuid> {
     keys.iter()
         .filter(|(t, _)| t == "edges")
         .filter_map(|(_, pk)| Uuid::parse_str(pk).ok())
         .collect()
 }
 
-fn record_of(spec: &TableSpec, key: &RowKey, claim: Uuid, st: &RowState, after: bool) -> Record {
+pub(super) fn record_of(
+    spec: &TableSpec,
+    key: &RowKey,
+    claim: Uuid,
+    st: &RowState,
+    after: bool,
+) -> Record {
     Record {
         table: key.0.clone(),
         id: spec.id_json(&key.1),
@@ -797,7 +806,7 @@ fn record_of(spec: &TableSpec, key: &RowKey, claim: Uuid, st: &RowState, after: 
     }
 }
 
-fn claim_record(c: &ClaimRow, after: bool, neighbour: bool) -> Record {
+pub(super) fn claim_record(c: &ClaimRow, after: bool, neighbour: bool) -> Record {
     Record {
         table: "claims".into(),
         id: json!(c.id.to_string()),
@@ -812,7 +821,7 @@ fn claim_record(c: &ClaimRow, after: bool, neighbour: bool) -> Record {
     }
 }
 
-fn spec_of<'a>(specs: &'a [TableSpec], table: &str) -> &'a TableSpec {
+pub(super) fn spec_of<'a>(specs: &'a [TableSpec], table: &str) -> &'a TableSpec {
     tables::spec(specs, table).expect("attached rows come only from specs")
 }
 
@@ -948,7 +957,7 @@ pub(super) async fn operator_details(conn: &mut PgConnection) -> anyhow::Result<
     }))
 }
 
-async fn write_audit(
+pub(super) async fn write_audit(
     conn: &mut PgConnection,
     event_type: &str,
     operator: Uuid,

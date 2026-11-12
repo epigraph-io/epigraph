@@ -17,8 +17,7 @@ use epigraph_core::{
 };
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
-    AgentRepository, ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository,
-    ReasoningTraceRepository,
+    ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
 use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
 use epigraph_ingest::document::schema::ByteSpan;
@@ -182,6 +181,8 @@ pub async fn ingest_document(
     // `papers` row. The core re-derives (and re-checks) the same set.
     ingest_claim_labels(&extraction, &doi)?;
     refuse_lineage_relationships(&extraction)?;
+    refuse_bad_author_ids(&extraction)?;
+    let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -215,9 +216,18 @@ pub async fn ingest_document(
         )
     })?;
 
-    preflight_write_authority(server, &viewer, "ingest_document", auth).await?;
+    preflight_write_authority(
+        server,
+        &viewer,
+        "ingest_document",
+        auth,
+        &extraction.source.authors,
+        &doi,
+        choice,
+    )
+    .await?;
     if params.wait.unwrap_or(false) {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
@@ -238,7 +248,7 @@ pub async fn ingest_document(
     // request's token, not a borrow of it.
     let auth = auth.cloned();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref()).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 doi = doi_log,
@@ -282,18 +292,41 @@ async fn preflight_write_authority(
     viewer: &epigraph_db::visibility::Viewer,
     tool_name: &'static str,
     auth: Option<&epigraph_auth::AuthContext>,
+    authors: &[epigraph_ingest::common::schema::AuthorEntry],
+    doi: &str,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<(), McpError> {
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
-    let mut tx = begin_ingest_tx(server, author, tool_name).await?;
+    // The visibility too: a refused team is reported here, not after `queued`.
+    let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
+    let mut tx = begin_ingest_tx(server, author, tool_name, resolution.grant()).await?;
     // The OWNER group, not merely "some writable group": the same read-only
     // check the walk itself makes (`IngestTx::owner_decl`), so an author whose
     // owner-group membership is revoked or read-only, an unbound author once
     // armed (OPL01), and a linked agent whose link is not acting (OPL02) are
     // refused HERE, to the caller, instead of being told `queued` over a task
     // that writes nothing.
-    tx.owner_decl(agent_id, tool_name).await?;
-    // Nothing was written on it; dropping it rolls back.
+    tx.owner_decl(agent_id, tool_name, &resolution).await?;
+    // Every explicit `source.authors[].agent_id` names an agent that may
+    // author (backlog 94cc12db), on the same connection the walk will use, so
+    // an unknown or system id is refused to the caller BEFORE the eager
+    // `papers` row, not in the detached task's log. On a re-ingest (the row
+    // exists) the name-derived authors an `agent_id` replaces are retracted
+    // here too, inside this transaction, so an author this caller cannot
+    // retract is refused now rather than in the task.
+    let existing_paper = find_paper_by_document_key(&server.pool, doi)
+        .await?
+        .map(|p| p.id);
+    crate::tools::ingest_authors::preflight_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        existing_paper,
+    )
+    .await?;
+    // Nothing is kept from it; dropping it rolls back (the retractions too).
     drop(tx);
     Ok(())
 }
@@ -310,12 +343,14 @@ pub async fn ingest_document_inline(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let wait = params.wait.unwrap_or(false);
+    let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
     // Before any write, for the reason given in `ingest_document` above.
     ingest_claim_labels(&extraction, &doi)?;
     refuse_lineage_relationships(&extraction)?;
+    refuse_bad_author_ids(&extraction)?;
 
     // Same detached-task ownership requirement, the same refusals (an elevated
     // request first, before the detach downgrades it) and the same
@@ -328,9 +363,18 @@ pub async fn ingest_document_inline(
         )
     })?;
 
-    preflight_write_authority(server, &viewer, "ingest_document_inline", auth).await?;
+    preflight_write_authority(
+        server,
+        &viewer,
+        "ingest_document_inline",
+        auth,
+        &extraction.source.authors,
+        &doi,
+        choice,
+    )
+    .await?;
     if wait {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
@@ -343,7 +387,7 @@ pub async fn ingest_document_inline(
     // request's token, not a borrow of it.
     let auth = auth.cloned();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref()).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
                 doi = doi_log,
@@ -377,8 +421,9 @@ async fn ingest_in_request(
     extraction: &DocumentExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
     doi: &str,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_document(server, viewer, extraction, auth)
+    do_ingest_document(server, viewer, extraction, auth, choice)
         .await
         .map_err(|e| McpError {
             code: e.code,
@@ -398,6 +443,15 @@ async fn ingest_in_request(
 fn refuse_lineage_relationships(extraction: &DocumentExtraction) -> Result<(), McpError> {
     epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
         .map_err(invalid_params)
+}
+
+/// Refuse a document whose `source.authors[].agent_id` is malformed, on a
+/// placeholder name, or repeated (backlog 94cc12db): a caller payload error,
+/// before any write, on every document entry point. Whether each id names an
+/// agent that may author is checked on a connection: in the handlers'
+/// preflight and again in the walk (`tools::ingest_authors`).
+fn refuse_bad_author_ids(extraction: &DocumentExtraction) -> Result<(), McpError> {
+    crate::tools::ingest_authors::parse_explicit_author_ids(&extraction.source.authors).map(|_| ())
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the
@@ -564,7 +618,30 @@ pub async fn ingest_document_spine(
     params: IngestDocumentSpineParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    do_ingest_document_spine(server, viewer, &params.extraction, auth).await
+    let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
+    do_ingest_document_spine(server, viewer, &params.extraction, auth, choice).await
+}
+
+/// Parse an ingest's `visibility` / `group_id` (docs/tenancy/claim-visibility-controls.md).
+fn parse_ingest_visibility(
+    visibility: Option<&str>,
+    group_id: Option<&str>,
+) -> Result<epigraph_core::VisibilityChoice, McpError> {
+    epigraph_core::VisibilityChoice::parse_str(visibility, group_id).map_err(invalid_params)
+}
+
+/// Resolve an ingest's visibility for its author: whose the claims are, and
+/// the team-write grant to stamp (D-V3). Pure definer reads on the pool. The
+/// home group stays `IngestTx::owner_decl`'s read-only resolution.
+async fn resolve_ingest_visibility(
+    server: &EpiGraphMcpFull,
+    agent_id: Uuid,
+    choice: epigraph_core::VisibilityChoice,
+) -> Result<epigraph_db::ChoiceResolution, McpError> {
+    let mut conn = server.pool.acquire().await.map_err(internal_error)?;
+    ClaimRepository::resolve_visibility_choice(&mut conn, agent_id, choice)
+        .await
+        .map_err(crate::claim_helper::visibility_caller_error)
 }
 
 /// Core ingestion logic factored out so integration tests can drive a parsed
@@ -807,12 +884,20 @@ impl IngestTx<'_> {
         &mut self,
         agent_id: Uuid,
         tool_name: &'static str,
+        resolution: &epigraph_db::ChoiceResolution,
     ) -> Result<epigraph_core::TenancyDecl, McpError> {
         let tx = match self {
             Self::Privileged(tx) => {
-                return ClaimRepository::default_decl_for_author(tx, agent_id)
+                let home = ClaimRepository::default_decl_for_author(tx, agent_id)
                     .await
-                    .map_err(crate::errors::db_caller_error);
+                    .map_err(crate::errors::db_caller_error)?
+                    .owner_group_bind()
+                    .ok_or_else(|| {
+                        crate::errors::internal_error_text(format!(
+                            "{tool_name}: the author's home group did not resolve"
+                        ))
+                    })?;
+                return Ok(resolution.decl(home));
             }
             Self::Stamped(tx) => tx,
         };
@@ -906,7 +991,38 @@ impl IngestTx<'_> {
                  refused. Nothing was written"
             )));
         }
-        Ok(epigraph_core::TenancyDecl::public(group))
+        // 6. The caller's visibility (docs/tenancy/claim-visibility-controls.md).
+        //    The home group checked above owns a private or public ingest. A
+        //    TEAM ingest is owned by the team, so the trigger's writer scope and
+        //    077's WITH CHECK are asked again of the team, on this transaction
+        //    (begun with the D-V3 grant when the author writes it through its
+        //    human).
+        if let Some(team) = resolution.team() {
+            epigraph_db::AgentRepository::require_writer_authority(
+                tx,
+                agent_id,
+                Some(agent_id),
+                team,
+            )
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+            let team_writable =
+                epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, team)
+                    .await
+                    .map_err(|e| {
+                        crate::errors::internal_error_logged(
+                            format!("{tool_name}: team writable-group check"),
+                            e,
+                        )
+                    })?;
+            if !team_writable {
+                return Err(refuse(format!(
+                    "the ingesting agent ({agent_id}) cannot write team {team} on this \
+                     transaction. Nothing was written"
+                )));
+            }
+        }
+        Ok(resolution.decl(group))
     }
 }
 
@@ -914,6 +1030,7 @@ async fn begin_ingest_tx<'p>(
     server: &'p EpiGraphMcpFull,
     author: crate::write_identity::WriteIdentity,
     tool_name: &'static str,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
 ) -> Result<IngestTx<'p>, McpError> {
     if server.scoped.is_none() {
         if let Some(reason) = server.privileged_pool {
@@ -932,7 +1049,7 @@ async fn begin_ingest_tx<'p>(
         }
     }
     Ok(IngestTx::Stamped(
-        crate::claim_helper::begin_author_stamped_tx(server, author, tool_name).await?,
+        crate::claim_helper::begin_author_stamped_tx_for(server, author, tool_name, grant).await?,
     ))
 }
 
@@ -957,12 +1074,75 @@ struct PlanEdgeForDs {
     relationship: String,
 }
 
+/// A plan edge the planner emitted as an author's attribution of one of the
+/// document's claims (`author_placeholder -asserts-> claim`, resolved by the
+/// walk to the author's agent). The walk writes it with the ingest-written
+/// marker (`epigraph_db::ingest_written`), naming its write identity, and
+/// only when its target is a claim THIS walk persisted (in `id_map`); no
+/// other plan edge carries one.
+fn is_author_attribution(edge: &epigraph_ingest::common::plan::PlannedEdge) -> bool {
+    edge.source_type == "author_placeholder"
+        && edge.relationship == "asserts"
+        && edge.target_type == "claim"
+}
+
+/// The canonical document ingest. Every claim it CREATES is written with
+/// `choice`; claims it converges onto keep their own tenancy.
+///
+/// `choice` is required, with no defaulted wrapper (operator ruling,
+/// 2026-11-10: the claims of a paper an agent ingests go to its team, never
+/// silently public). The MCP tools pass what the caller named, and
+/// [`epigraph_core::VisibilityChoice::Default`] when it named nothing, which
+/// resolves D-V1: the author's default team if still writable, else its
+/// human's under the same condition, else its only writable team, else
+/// private. The operator `ingest-document` CLI does the same from its
+/// `--visibility` / `--group-id` flags. A test harness that needs a public
+/// paper passes [`epigraph_core::VisibilityChoice::Public`].
+///
+/// `choice` scopes the CLAIMS only. The `papers` row (title, DOI, journal),
+/// the author agents and the `processed_by` stamp carry no tenancy and stay
+/// world-readable whatever `choice` is. See
+/// docs/tenancy/claim-visibility-controls.md section 3.1 and
+/// docs/tenancy/papers-tenancy-followup.md.
 pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<CallToolResult, McpError> {
+    do_ingest_document_reporting(server, viewer, extraction, auth, choice)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Where an ingest put the claims it created: what
+/// [`do_ingest_document_reporting`] actually resolved and wrote with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestTenancy {
+    /// `"team"`, `"private"` or `"public"`.
+    pub visibility: &'static str,
+    /// The owning group of every claim the ingest created.
+    pub owner_group_id: Uuid,
+    /// D-V1's note when a default fell back to private.
+    pub note: Option<String>,
+}
+
+/// [`do_ingest_document`], also returning the [`IngestTenancy`] its new claims
+/// were written with, so a synchronous caller (the operator `ingest-document`
+/// CLI) can tell its operator where the paper's claims landed. The response
+/// itself is unchanged (spec section 3.1).
+///
+/// # Errors
+/// Every error of [`do_ingest_document`].
+#[allow(clippy::too_many_lines)]
+pub async fn do_ingest_document_reporting(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    choice: epigraph_core::VisibilityChoice,
+) -> Result<(CallToolResult, IngestTenancy), McpError> {
     // D9 writer-side verbatim re-verification: when the extraction carries
     // `source_text`, every span-backed paragraph's stored `text` must equal the
     // bytes its span points at. Fail closed before any DB write so paraphrase
@@ -976,6 +1156,7 @@ pub async fn do_ingest_document(
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
     refuse_lineage_relationships(extraction)?;
+    refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -1044,13 +1225,16 @@ pub async fn do_ingest_document(
     // `papers` stays on the pool: it has no row-level security, and
     // `ensure_paper_node` already created the row synchronously before this
     // task was spawned, so the call above is an idempotent read of it.
-    let mut tx = begin_ingest_tx(server, author, "ingest_document").await?;
+    let resolution = resolve_ingest_visibility(server, author.agent_id(), choice).await?;
+    let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
-    // Each author gets a deterministic ed25519 keypair via
-    // `did_key_for_author` — same name (or ORCID, when present in the
-    // extraction) maps to the same agent across papers, which is how
-    // co-authorship lights up in the graph. Affiliations and roles are
+    // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
+    // Every other author gets a deterministic ed25519 keypair via
+    // `did_key_for_author` — same name maps to the same agent across papers,
+    // which is how co-authorship lights up in the graph — and is never
+    // attached to another agent that merely shares the name (those are
+    // reported as `candidates`; see `tools::ingest_authors`). Affiliations and roles are
     // not yet first-class on Agent and remain in the extraction JSON
     // pending an AgentRepository properties surface.
     let mut author_responses = Vec::new();
@@ -1116,93 +1300,51 @@ pub async fn do_ingest_document(
     } else {
         &extraction.source.authors
     };
-    // Migration 148: a document never names a system identity as its author.
-    // The legacy public-constant key is refused before the lookup (so it is
-    // never adopted, and never re-minted after a rotation), and an author that
-    // resolves to a REGISTERED system agent under any other key is skipped
-    // after it. One registry read per document, and none without authors.
-    let registered_system_agents = if authors.is_empty() {
-        Vec::new()
-    } else {
-        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut tx)
-            .await
-            .map_err(internal_error)?
-    };
-    for (idx, author) in authors.iter().enumerate() {
-        // Empty or placeholder name: no agent, no `authored` edge. Same original
-        // `idx` the planner skipped, so `author_agent_map` stays aligned.
-        if author.is_placeholder() {
-            if !author.name.trim().is_empty() {
-                tracing::warn!(
-                    paper = %paper_title,
-                    name = %author.name,
-                    author_index = idx,
-                    "ingest_document: dropping placeholder author name"
-                );
-            }
-            continue;
+    // Explicit `agent_id`s, the name-derived default, migration 148's
+    // system-identity skips and the per-author report: `tools::ingest_authors`.
+    let resolved = crate::tools::ingest_authors::resolve_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        paper_id,
+        "ingest_document",
+        &paper_title,
+    )
+    .await?;
+    // The document's authors as THIS walk resolved them, in the extraction's
+    // order: written into every ingest record, and on the record of a claim
+    // this walk creates, the claim's primary authors (`ClaimIngestRecord::
+    // authors`), fixed at creation whatever a later ingest adds.
+    let mut recorded_authors: Vec<(usize, Uuid)> =
+        resolved.iter().map(|r| (r.idx, r.agent_id)).collect();
+    recorded_authors.sort_by_key(|(idx, _)| *idx);
+    let recorded_authors: Vec<Uuid> = recorded_authors.into_iter().map(|(_, a)| a).collect();
+    for r in resolved {
+        let author = &authors[r.idx];
+        let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+            &mut tx,
+            edge_key,
+            "ingest_document",
+            agent_id,
+            r.agent_id,
+            "agent",
+            paper_id,
+            "paper",
+            "authored",
+            Some(crate::tools::ingest_authors::authored_edge_properties(
+                &r, author, agent_id,
+            )),
+        )
+        .await
+        .map_err(internal_error)?;
+        // The plan's per-claim `asserts` edges come from this map: an author
+        // the ingester does not speak for is not in it, so it gets `authored`
+        // only (`tools::ingest_authors`, the explicit-author rule).
+        if r.asserts {
+            author_agent_map.insert(r.idx, r.agent_id);
         }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
-            tracing::warn!(
-                target: "ingest.authors",
-                author_index = idx,
-                "skipping an author whose name derives a system agent's legacy key: a document \
-                 cannot name a system identity as its author (migration 148)"
-            );
-            continue;
-        }
-        let agent_uuid: Uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(&mut *tx, &pub_key_bytes)
-                .await
-                .map_err(internal_error)?
-        {
-            let id: Uuid = existing.id.into();
-            if registered_system_agents.contains(&id) {
-                tracing::warn!(
-                    target: "ingest.authors",
-                    author_index = idx,
-                    "skipping an author that resolves to a registered system agent: a document \
-                     cannot name a system identity as its author (migration 148)"
-                );
-                continue;
-            }
-            id
-        } else {
-            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create_conn(&mut tx, &author_agent)
-                .await
-                .map_err(internal_error)?;
-            created.id.into()
-        };
-        let (_row, _was_created) =
-            EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                &mut tx,
-                edge_key,
-                agent_uuid,
-                "agent",
-                paper_id,
-                "paper",
-                "authored",
-                Some(serde_json::json!({
-                    // The ORIGINAL extraction index: it can have gaps where a
-                    // placeholder author was dropped ([Unknown, Alice] gives Alice
-                    // position 1 and no edge position 0).
-                    "position": idx,
-                    "role": author.roles.first().map_or("author", String::as_str),
-                    "affiliations": author.affiliations,
-                })),
-                None,
-                None,
-            )
-            .await
-            .map_err(internal_error)?;
-        author_agent_map.insert(idx, agent_uuid);
-        author_responses.push(AuthorResponse {
-            agent_id: agent_uuid.to_string(),
-            name: author.name.clone(),
-        });
+        author_responses.push(r.report);
     }
 
     // ── 4. Walk planned claims: dedup → claim/trace/evidence/embed ──
@@ -1231,7 +1373,9 @@ pub async fn do_ingest_document(
     // revoked in its personal one passed that check, and
     // `default_decl_for_author`'s mint path then revived the revoked admin
     // membership inside this transaction. See `owner_decl`.
-    let decl = tx.owner_decl(agent_id, "ingest_document").await?;
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document", &resolution)
+        .await?;
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
@@ -1289,21 +1433,34 @@ pub async fn do_ingest_document(
                 .map_err(internal_error)?;
         }
         if resolved_to_existing {
-            let (_row, _was_created) =
-                EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                    &mut tx,
-                    edge_key,
-                    paper_id,
-                    "paper",
-                    persisted_id,
-                    "claim",
-                    "asserts",
-                    Some(planned.properties.clone()),
-                    None,
-                    None,
-                )
-                .await
-                .map_err(internal_error)?;
+            let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+                &mut tx,
+                edge_key,
+                "ingest_document",
+                agent_id,
+                paper_id,
+                "paper",
+                persisted_id,
+                "claim",
+                "asserts",
+                Some(planned.properties.clone()),
+            )
+            .await
+            .map_err(internal_error)?;
+            // The ingest record: this walk converged on an existing claim.
+            epigraph_db::ClaimIngestRepository::record_signed_conn(
+                &mut tx,
+                edge_key,
+                paper_id,
+                persisted_id,
+                agent_id,
+                false,
+                &recorded_authors,
+                "ingest_document",
+                &pipeline_version,
+            )
+            .await
+            .map_err(internal_error)?;
             id_map.insert(planned.id, persisted_id);
             claim_ids.push(persisted_id.to_string());
             dedup_count += 1;
@@ -1369,21 +1526,35 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _was_created) =
-            EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                &mut tx,
-                edge_key,
-                paper_id,
-                "paper",
-                persisted_id,
-                "claim",
-                "asserts",
-                Some(planned.properties.clone()),
-                None,
-                None,
-            )
-            .await
-            .map_err(internal_error)?;
+        let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+            &mut tx,
+            edge_key,
+            "ingest_document",
+            agent_id,
+            paper_id,
+            "paper",
+            persisted_id,
+            "claim",
+            "asserts",
+            Some(planned.properties.clone()),
+        )
+        .await
+        .map_err(internal_error)?;
+
+        // The ingest record: this walk CREATED the claim.
+        epigraph_db::ClaimIngestRepository::record_signed_conn(
+            &mut tx,
+            edge_key,
+            paper_id,
+            persisted_id,
+            agent_id,
+            true,
+            &recorded_authors,
+            "ingest_document",
+            &pipeline_version,
+        )
+        .await
+        .map_err(internal_error)?;
 
         embed_queue.push((persisted_id, planned.content.clone()));
 
@@ -1440,20 +1611,40 @@ pub async fn do_ingest_document(
             continue;
         }
 
-        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
-            &mut tx,
-            edge_key,
-            src,
-            &src_type,
-            tgt,
-            &edge.target_type,
-            &edge.relationship,
-            Some(edge.properties.clone()),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
+        // An author's attribution is an ingest-written edge (the card and
+        // the provenance reads trust it by its marker); every other plan edge
+        // is written without the marker, a smuggled one dropped.
+        let (row, was_created) =
+            if is_author_attribution(edge) && id_map.contains_key(&edge.target_id) {
+                epigraph_db::create_ingest_written_edge_if_absent_conn(
+                    &mut tx,
+                    edge_key,
+                    "ingest_document",
+                    agent_id,
+                    src,
+                    &src_type,
+                    tgt,
+                    &edge.target_type,
+                    &edge.relationship,
+                    Some(edge.properties.clone()),
+                )
+                .await
+            } else {
+                EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                    &mut tx,
+                    edge_key,
+                    src,
+                    &src_type,
+                    tgt,
+                    &edge.target_type,
+                    &edge.relationship,
+                    Some(epigraph_db::without_ingest_marker(edge.properties.clone())),
+                    None,
+                    None,
+                )
+                .await
+            }
+            .map_err(internal_error)?;
         relationships_created += usize::from(was_created);
 
         // The edge's DS factor is wired AFTER the walk commits (step 6), on its
@@ -1510,57 +1701,58 @@ pub async fn do_ingest_document(
     //
     // On the unstamped pool this half was refused at `claim_frames` on BOTH
     // schema configurations, so `claims_ds_wired` was never non-zero there.
-    let (claims_ds_wired, ds_frame_id) = match begin_ingest_tx(server, author, "ingest_document_ds")
-        .await
-    {
-        Ok(mut ds_tx) => {
-            for e in &wired_edges {
-                ds_auto::auto_wire_edge_if_epistemic(
-                    &mut ds_tx,
-                    viewer,
-                    e.was_created,
-                    e.edge_id,
-                    e.source_id,
-                    &e.source_type,
-                    e.target_id,
-                    &e.target_type,
-                    &e.relationship,
-                    agent_id,
-                )
-                .await;
-            }
-            let wired = if ds_entries.is_empty() {
-                (None, None)
-            } else {
-                match ds_auto::auto_wire_ds_batch(&mut ds_tx, viewer, &ds_entries, agent_id).await {
-                    Ok((fid, count)) => (Some(count), Some(fid.to_string())),
+    let (claims_ds_wired, ds_frame_id) =
+        match begin_ingest_tx(server, author, "ingest_document_ds", resolution.grant()).await {
+            Ok(mut ds_tx) => {
+                for e in &wired_edges {
+                    ds_auto::auto_wire_edge_if_epistemic(
+                        &mut ds_tx,
+                        viewer,
+                        e.was_created,
+                        e.edge_id,
+                        e.source_id,
+                        &e.source_type,
+                        e.target_id,
+                        &e.target_type,
+                        &e.relationship,
+                        agent_id,
+                    )
+                    .await;
+                }
+                let wired = if ds_entries.is_empty() {
+                    (None, None)
+                } else {
+                    match ds_auto::auto_wire_ds_batch(&mut ds_tx, viewer, &ds_entries, agent_id)
+                        .await
+                    {
+                        Ok((fid, count)) => (Some(count), Some(fid.to_string())),
+                        Err(e) => {
+                            tracing::warn!("ds auto-wire batch failed: {e}");
+                            (None, None)
+                        }
+                    }
+                };
+                match ds_tx.commit().await {
+                    Ok(()) => wired,
                     Err(e) => {
-                        tracing::warn!("ds auto-wire batch failed: {e}");
+                        tracing::warn!(
+                            paper_id = %paper_id,
+                            "ingest_document ds wiring could not commit: {e}. The document is \
+                             stored; its atoms carry no BBA until a recompute reaches them"
+                        );
                         (None, None)
                     }
                 }
-            };
-            match ds_tx.commit().await {
-                Ok(()) => wired,
-                Err(e) => {
-                    tracing::warn!(
-                        paper_id = %paper_id,
-                        "ingest_document ds wiring could not commit: {e}. The document is \
-                         stored; its atoms carry no BBA until a recompute reaches them"
-                    );
-                    (None, None)
-                }
             }
-        }
-        Err(e) => {
-            tracing::warn!(
-                paper_id = %paper_id,
-                "ingest_document ds wiring skipped: {}. The document is stored and intact",
-                e.message
-            );
-            (None, None)
-        }
-    };
+            Err(e) => {
+                tracing::warn!(
+                    paper_id = %paper_id,
+                    "ingest_document ds wiring skipped: {}. The document is stored and intact",
+                    e.message
+                );
+                (None, None)
+            }
+        };
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
@@ -1578,12 +1770,22 @@ pub async fn do_ingest_document(
         });
     }
 
-    success_json(&IngestDocumentResponse {
+    let tenancy = IngestTenancy {
+        visibility: resolution.label(),
+        owner_group_id: decl.owner_group_bind().ok_or_else(|| {
+            crate::errors::internal_error_text(
+                "ingest_document: the claims' owner group did not resolve",
+            )
+        })?,
+        note: resolution.note(),
+    };
+    let result = success_json(&IngestDocumentResponse {
         paper_id: paper_id.to_string(),
         paper_title,
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
+        ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
@@ -1593,7 +1795,8 @@ pub async fn do_ingest_document(
         converged_claims_unlabelled: converged_unlabelled,
         converged_claims_caller_labels_withheld: caller_labels_withheld,
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
-    })
+    })?;
+    Ok((result, tenancy))
 }
 
 /// Convert a DOI into a slug form safe for use as a URL path segment or
@@ -1938,31 +2141,36 @@ async fn persist_planned_claim(
         return Ok((planned.id, !was_new, was_new.then_some(agent_id)));
     }
 
-    // Atom: `create` dedupes on content_hash and returns the existing row.
-    // `persisted_id != planned.id` catches a hash collision against some other
-    // claim; `trace_id.is_some()` catches genuine atom convergence, where the
-    // earlier ingestion already wrote the provenance we must not overwrite.
+    // Atom: content-addressed, so `create` dedupes on content_hash and
+    // returns the existing row. Whether THIS call created the row is what its
+    // INSERT reports (`create_signed_reporting_conn`), never inferred from the
+    // row: an existing row is resolved to, never rewritten (no
+    // `set_properties`, no trace or evidence hung on it) and never recorded as
+    // this ingest's creation, whoever filed it and whether or not it has a
+    // trace.
     //
-    // `agent_id != agent_id` is the third convergence signal, and the one the
-    // other two miss: an existing TRACE-LESS atom written by ANOTHER author.
-    // Workflow operation atoms are exactly that — content-addressed with the same
-    // `atom_id` derivation, authored by the ingest-system agent, and carrying no
-    // trace. Treated as new, the walk would `set_properties` over that author's
-    // row (replacing its workflow metadata with this document's level/section)
-    // and hang this paper's trace and evidence on it; on a stamped transaction
-    // those writes are refused by `claims_tenancy`'s WITH CHECK and — before
-    // this signal existed — took the whole document down with them. MEASURED on
-    // a cleanly-migrated schema: a document whose atom converged onto a workflow
-    // operation atom wrote nothing (`processed_by=0 doc_claims=0`). Another
-    // author's claim is resolved to, never rewritten.
-    let persisted = ClaimRepository::create_signed_conn(&mut *conn, claim, decl, Some(signer_id))
-        .await
-        .map_err(internal_error)?;
+    // The inferred signals this replaces each missed a case. "It has a trace"
+    // missed a trace-less row; "another author wrote it" missed the SAME
+    // agent's trace-less row: a workflow operation atom written as the
+    // caller's own agent (same `atom_id` derivation, no trace), or a claim
+    // the agent filed directly without one. Treated as new, the walk
+    // overwrote that row's workflow metadata with this document's
+    // level/section (breaking step versioning), hung this paper's trace on
+    // it, and recorded `created_claim: true`, so the agent's own claim read as
+    // the document's literature. On a stamped transaction such writes onto
+    // another author's row were also refused by `claims_tenancy`'s WITH CHECK,
+    // which took the whole document down (measured before the author signal
+    // existed). `persisted_id != planned.id` still catches a hash collision
+    // against some other claim.
+    let (persisted, inserted) =
+        ClaimRepository::create_signed_reporting_conn(&mut *conn, claim, decl, Some(signer_id))
+            .await
+            .map_err(internal_error)?;
     let persisted_id: Uuid = persisted.id.into();
     let persisted_author: Uuid = persisted.agent_id.into();
     Ok((
         persisted_id,
-        persisted_id != planned.id || persisted.trace_id.is_some() || persisted_author != agent_id,
+        !inserted || persisted_id != planned.id,
         Some(persisted_author),
     ))
 }
@@ -1994,12 +2202,16 @@ const fn level_label(level: u8) -> &'static str {
 ///
 /// Ordering guarantee: the builder iterates sections then paragraphs in
 /// extraction order, so `new_paragraph_paths` is in document order.
+///
+/// `choice` is required, for the reason [`do_ingest_document`] gives: every
+/// spine node it CREATES is written with it.
 #[allow(clippy::too_many_lines)]
 pub async fn do_ingest_document_spine(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<CallToolResult, McpError> {
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
@@ -2010,6 +2222,7 @@ pub async fn do_ingest_document_spine(
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
     refuse_lineage_relationships(extraction)?;
+    refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -2075,7 +2288,9 @@ pub async fn do_ingest_document_spine(
     // edges had committed, and the owner-group read was blind and minted on
     // every call. This path is synchronous, so the refusal now reaches the
     // caller, and it leaves nothing behind.
-    let mut tx = begin_ingest_tx(server, author, "ingest_document_spine").await?;
+    let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
+    let mut tx =
+        begin_ingest_tx(server, author, "ingest_document_spine", resolution.grant()).await?;
 
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
@@ -2134,93 +2349,50 @@ pub async fn do_ingest_document_spine(
     } else {
         &extraction.source.authors
     };
-    // Migration 148: a document never names a system identity as its author.
-    // The legacy public-constant key is refused before the lookup (so it is
-    // never adopted, and never re-minted after a rotation), and an author that
-    // resolves to a REGISTERED system agent under any other key is skipped
-    // after it. One registry read per document, and none without authors.
-    let registered_system_agents = if authors.is_empty() {
-        Vec::new()
-    } else {
-        epigraph_db::SystemAgentRepository::registered_agent_ids(&mut tx)
-            .await
-            .map_err(internal_error)?
-    };
-    for (idx, author) in authors.iter().enumerate() {
-        // Empty or placeholder name: no agent, no `authored` edge. Same original
-        // `idx` the planner skipped, so `author_agent_map` stays aligned.
-        if author.is_placeholder() {
-            if !author.name.trim().is_empty() {
-                tracing::warn!(
-                    paper = %paper_title,
-                    name = %author.name,
-                    author_index = idx,
-                    "ingest_document_spine: dropping placeholder author name"
-                );
-            }
-            continue;
-        }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
-        if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
-            tracing::warn!(
-                target: "ingest.authors",
-                author_index = idx,
-                "skipping an author whose name derives a system agent's legacy key: a document \
-                 cannot name a system identity as its author (migration 148)"
-            );
-            continue;
-        }
-        let agent_uuid: Uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(&mut *tx, &pub_key_bytes)
-                .await
-                .map_err(internal_error)?
-        {
-            let id: Uuid = existing.id.into();
-            if registered_system_agents.contains(&id) {
-                tracing::warn!(
-                    target: "ingest.authors",
-                    author_index = idx,
-                    "skipping an author that resolves to a registered system agent: a document \
-                     cannot name a system identity as its author (migration 148)"
-                );
-                continue;
-            }
-            id
-        } else {
-            let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            AgentRepository::create_conn(&mut tx, &author_agent)
-                .await
-                .map_err(internal_error)?
-                .id
-                .into()
-        };
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+    // Explicit `agent_id`s, the name-derived default, migration 148's
+    // system-identity skips and the per-author report: `tools::ingest_authors`.
+    let resolved = crate::tools::ingest_authors::resolve_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        paper_id,
+        "ingest_document_spine",
+        &paper_title,
+    )
+    .await?;
+    // The document's authors as THIS walk resolved them, in the extraction's
+    // order: written into every ingest record, and on the record of a claim
+    // this walk creates, the claim's primary authors (`ClaimIngestRecord::
+    // authors`), fixed at creation whatever a later ingest adds.
+    let mut recorded_authors: Vec<(usize, Uuid)> =
+        resolved.iter().map(|r| (r.idx, r.agent_id)).collect();
+    recorded_authors.sort_by_key(|(idx, _)| *idx);
+    let recorded_authors: Vec<Uuid> = recorded_authors.into_iter().map(|(_, a)| a).collect();
+    for r in resolved {
+        let author = &authors[r.idx];
+        let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
             &mut tx,
             edge_key,
-            agent_uuid,
+            "ingest_document_spine",
+            agent_id,
+            r.agent_id,
             "agent",
             paper_id,
             "paper",
             "authored",
-            Some(serde_json::json!({
-                // The ORIGINAL extraction index: it can have gaps where a
-                // placeholder author was dropped ([Unknown, Alice] gives Alice
-                // position 1 and no edge position 0).
-                "position": idx,
-                "role": author.roles.first().map_or("author", String::as_str),
-                "affiliations": author.affiliations,
-            })),
-            None,
-            None,
+            Some(crate::tools::ingest_authors::authored_edge_properties(
+                &r, author, agent_id,
+            )),
         )
         .await
         .map_err(internal_error)?;
-        author_agent_map.insert(idx, agent_uuid);
-        author_responses.push(AuthorResponse {
-            agent_id: agent_uuid.to_string(),
-            name: author.name.clone(),
-        });
+        // As in `do_ingest_document`: `asserts` only from an author the
+        // ingester speaks for.
+        if r.asserts {
+            author_agent_map.insert(r.idx, r.agent_id);
+        }
+        author_responses.push(r.report);
     }
 
     // ── 3. Walk claims: levels 0–2 only ──
@@ -2239,7 +2411,9 @@ pub async fn do_ingest_document_spine(
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
     // Hoisted, as above, and through the same never-minting helper.
-    let decl = tx.owner_decl(agent_id, "ingest_document_spine").await?;
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document_spine", &resolution)
+        .await?;
     for planned in &plan.claims {
         if planned.level == 3 {
             continue;
@@ -2300,17 +2474,31 @@ pub async fn do_ingest_document_spine(
         }
 
         if resolved_to_existing {
-            let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+            let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
                 &mut tx,
                 edge_key,
+                "ingest_document_spine",
+                agent_id,
                 paper_id,
                 "paper",
                 persisted_id,
                 "claim",
                 "asserts",
                 Some(planned.properties.clone()),
-                None,
-                None,
+            )
+            .await
+            .map_err(internal_error)?;
+            // The ingest record: this walk converged on an existing claim.
+            epigraph_db::ClaimIngestRepository::record_signed_conn(
+                &mut tx,
+                edge_key,
+                paper_id,
+                persisted_id,
+                agent_id,
+                false,
+                &recorded_authors,
+                "ingest_document_spine",
+                &pipeline_version,
             )
             .await
             .map_err(internal_error)?;
@@ -2377,17 +2565,32 @@ pub async fn do_ingest_document_spine(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
             &mut tx,
             edge_key,
+            "ingest_document_spine",
+            agent_id,
             paper_id,
             "paper",
             persisted_id,
             "claim",
             "asserts",
             Some(planned.properties.clone()),
-            None,
-            None,
+        )
+        .await
+        .map_err(internal_error)?;
+
+        // The ingest record: this walk CREATED the claim.
+        epigraph_db::ClaimIngestRepository::record_signed_conn(
+            &mut tx,
+            edge_key,
+            paper_id,
+            persisted_id,
+            agent_id,
+            true,
+            &recorded_authors,
+            "ingest_document_spine",
+            &pipeline_version,
         )
         .await
         .map_err(internal_error)?;
@@ -2434,19 +2637,36 @@ pub async fn do_ingest_document_spine(
             continue;
         }
 
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
-            &mut tx,
-            edge_key,
-            src,
-            &src_type,
-            tgt,
-            &edge.target_type,
-            &edge.relationship,
-            Some(edge.properties.clone()),
-            None,
-            None,
-        )
-        .await
+        // As the document walk: only an author's attribution is marked.
+        let (_row, _) = if is_author_attribution(edge) && id_map.contains_key(&edge.target_id) {
+            epigraph_db::create_ingest_written_edge_if_absent_conn(
+                &mut tx,
+                edge_key,
+                "ingest_document_spine",
+                agent_id,
+                src,
+                &src_type,
+                tgt,
+                &edge.target_type,
+                &edge.relationship,
+                Some(edge.properties.clone()),
+            )
+            .await
+        } else {
+            EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                &mut tx,
+                edge_key,
+                src,
+                &src_type,
+                tgt,
+                &edge.target_type,
+                &edge.relationship,
+                Some(epigraph_db::without_ingest_marker(edge.properties.clone())),
+                None,
+                None,
+            )
+            .await
+        }
         .map_err(internal_error)?;
     }
 
@@ -2485,6 +2705,7 @@ pub async fn do_ingest_document_spine(
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
+        ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
         paragraphs_embedded: queued,
@@ -2539,7 +2760,7 @@ mod tests {
         // ingested under PIPELINE_VERSION_BASE. Edges enforce target existence, so
         // create a real agent first.
         let agent_a = epigraph_core::Agent::new([7u8; 32], Some("test-agent-a".to_string()));
-        let agent_a_id: Uuid = AgentRepository::create(&pool, &agent_a)
+        let agent_a_id: Uuid = epigraph_db::AgentRepository::create(&pool, &agent_a)
             .await
             .expect("create agent a")
             .id
@@ -2572,7 +2793,7 @@ mod tests {
         // Insert a `processed_by` edge with the matching pipeline (different
         // target so it isn't deduped by the (source,target,relationship) key).
         let agent_b = epigraph_core::Agent::new([8u8; 32], Some("test-agent-b".to_string()));
-        let agent_b_id: Uuid = AgentRepository::create(&pool, &agent_b)
+        let agent_b_id: Uuid = epigraph_db::AgentRepository::create(&pool, &agent_b)
             .await
             .expect("create agent b")
             .id
@@ -2923,12 +3144,14 @@ mod tests {
             name: "Lawrence J. Gitman".to_string(),
             affiliations: Vec::new(),
             roles: Vec::new(),
+            agent_id: None,
         }];
         let mut b = src("Overview");
         b.authors = vec![epigraph_ingest::common::schema::AuthorEntry {
             name: "Amit Shah".to_string(),
             affiliations: Vec::new(),
             roles: Vec::new(),
+            agent_id: None,
         }];
         assert_ne!(
             resolve_doi(&extraction_of(a)),
@@ -2946,6 +3169,7 @@ mod tests {
                     name: (*n).to_string(),
                     affiliations: Vec::new(),
                     roles: Vec::new(),
+                    agent_id: None,
                 })
                 .collect();
             resolve_doi(&extraction_of(s))

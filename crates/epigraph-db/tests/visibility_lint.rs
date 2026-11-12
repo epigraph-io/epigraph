@@ -782,6 +782,33 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          maintenance role (ADS02) and the table's own trigger audits the change.",
     ),
     (
+        "bug_report.rs",
+        "list_mine_conn",
+        "READ through migration 207's principal-bound app-callable definer \
+         `epigraph_my_bug_reports` on the requester's STAMPED connection: only the stamped \
+         principal's own intake reports (no caller-supplied id or group), filtered in the \
+         definer by the unforgeable `bug_report.submitted` marker, the claim's author and the \
+         configured intake group; the viewer is spent on the stamp.",
+    ),
+    (
+        "bug_report.rs",
+        "preflight_conn",
+        "READ through migration 207's principal-bound app-callable definer \
+         `epigraph_bug_report_preflight` on the reporter's STAMPED connection: it takes no \
+         argument, reads the principal from the stamped session, writes nothing and answers \
+         nothing but the write's own refusal (or a pass) for that principal; the viewer is \
+         spent on the stamp.",
+    ),
+    (
+        "bug_report.rs",
+        "submit_conn",
+        "WRITE through migration 207's principal-bound app-callable definer \
+         `epigraph_submit_bug_report` on the reporter's STAMPED connection: the definer takes the \
+         author from the stamped session and the owner group from the instance's settings row, \
+         never from an argument, and answers only the new row's id and timestamp. Nothing is \
+         read back to the caller; the viewer is spent on the stamp.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \
@@ -1810,7 +1837,79 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          asking about the claims it reused before it writes an edge to any of them; an id \
          missing from the answer exists but is invisible to the stamp and refuses the ingest. \
          The answer is never returned to a caller (the caller-filtered read is \
-         `tenancy_of_conn`, which takes a viewer).",
+         `tenancy_of_conn`, which takes a viewer). The claim visibility controls add two \
+         callers of the same shape, each on its caller-STAMPED transaction and each about ids \
+         it already holds: `ClaimRepository::write_tenancy_report` (below) and MCP \
+         `resolve_backlog_item`'s read of the original it resolves.",
+    ),
+    (
+        "claim_visibility.rs",
+        "writable_teams",
+        "READ through migration 206's app-callable definer `epigraph_writable_teams(agent)`: \
+         the TEAM groups one agent may write into (own writer/admin membership or its live \
+         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column; \
+         the definer answers the same on any connection, so there is nothing for a viewer to \
+         narrow.",
+    ),
+    (
+        "claim_visibility.rs",
+        "default_group_of",
+        "READ through 206's definer `epigraph_default_group(agent)`: one group id \
+         (`agents.default_group_id`, else the live human's). A preference about the agent, not \
+         a corpus row; validated by the caller against `writable_teams`.",
+    ),
+    (
+        "claim_visibility.rs",
+        "human_default_group_of",
+        "READ through 206's definer `epigraph_default_group` applied to 149's app-callable \
+         definer `epigraph_human_of(agent, true)`: one group id, the live human's \
+         `agents.default_group_id`. A preference about the agent's human, not a corpus row; \
+         validated by the caller against `writable_teams` (D-V1's second link).",
+    ),
+    (
+        "claim_visibility.rs",
+        "resolve_visibility_choice",
+        "Composes `writable_teams`, `default_group_of` and `human_default_group_of` (all \
+         definers) into the write-time \
+         visibility decision for one author. Reads no corpus row; the decision is enforced by \
+         the claims trigger and policies on the WRITE's stamped transaction.",
+    ),
+    (
+        "claim_visibility.rs",
+        "resolve_write_decl",
+        "`default_decl_for_author` (the home group, definer answer) plus \
+         `resolve_visibility_choice`. Declares a write's tenancy; reads no corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
+        "write_tenancy_report",
+        "READ of ONE claim's `visibility, owner_group_id` through `tenancy_on_session_conn`, for \
+         the id the same request just wrote or matched, on that write's caller-STAMPED \
+         transaction (API create_claim_core and submit_packet, MCP claim_tenancy_report): \
+         row security on the stamped connection is the filter, and only the caller's own \
+         claim's tenancy is reported back to it.",
+    ),
+    (
+        "claim_visibility.rs",
+        "set_default_group_conn",
+        "WRITE through 206's definer `epigraph_set_default_group`: the STAMPED session \
+         principal's own `agents.default_group_id`, authority checked in the body (VIS01 / \
+         VIS02) and audited. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "publicize_conn",
+        "WRITE through 206's definer `epigraph_publicize_claims` on a STAMPED transaction: the \
+         definer classifies every id against the session's own readable groups (an unreadable \
+         id is `not_found`) and the principal's live admin memberships, all or nothing, and \
+         audits. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "share_with_team_conn",
+        "WRITE through 206's definer `epigraph_share_claims_with_team` on a STAMPED \
+         transaction: as `publicize_conn`, classified against the session's readable groups, \
+         the principal's home group and its writable teams, all or nothing, audited.",
     ),
     (
         "security_event.rs",
@@ -1883,6 +1982,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          it gates, so row security on that connection still applies; the residual it leaves \
          (lineage members split across tenancies out of band) is stated on the function. \
          Returns workflow ids only, never content.",
+    ),
+    (
+        "agent_lookup.rs",
+        "author_nodes",
+        "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \
+         the document ingest's explicit-author check, plus migration 148's `system_agents` \
+         registry (no row security, app-readable). `agents_identity` is USING (true) and \
+         GET /api/v1/agents/:id answers for any id: no tenancy columns, nothing to filter.",
+    ),
+    (
+        "agent_lookup.rs",
+        "disclosed_roles",
+        "READ through migration 198's `epigraph_disclosed_role_assignments` SECURITY DEFINER \
+         function, the agent-lookup card's only reader of `role_assignments` (FORCE RLS, holder \
+         only). The function decides in its body, on the SESSION: non-elevating roles for any \
+         agent (a subset of 123's public projection), any role of the session principal itself, \
+         everything on a privileged session. No tenancy columns; nothing for a Viewer to add.",
+    ),
+    (
+        "agent_lookup.rs",
+        "exact_name_candidates",
+        "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
+         equality, excluding migration 148's `system_agents` rows (no row security): the \
+         document ingest's same-name author candidates. `agents_identity` is USING (true), only \
+         the public identity columns are returned and no ORCID / ROR tier is used, so no fact \
+         depends on the caller and there is nothing for a Viewer to add.",
     ),
     (
         "system_agent.rs",
@@ -2288,6 +2413,25 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorised by edges_tenancy's WITH CHECK.",
     ),
     (
+        "countersign.rs",
+        "countersign_conn",
+        "WRITE. Calls migration 208's epigraph_countersign_authorship definer on the CALLER's \
+         stamped transaction; the definer reads the caller from the session principal and acts \
+         only on authorship rows naming the caller (or an agent it is the live operator of), \
+         returning only those rows' ids. It reads nothing for display.",
+    ),
+    (
+        "claim_ingest.rs",
+        "record_signed_conn",
+        "WRITE. The document walk's paper -ingested_claim-> claim record (which ingest created \
+         the claim, and every later one), on the ingest's own transaction, deduplicated on \
+         (paper, claim, properties->>'ingested_by'). Its dedup probe on edges is the same \
+         VISIBILITY-EXEMPT write-path read as create_processed_by_stamp_if_absent_conn (it \
+         must see an existing record whoever asks, or a re-run writes a duplicate); the INSERT \
+         goes through EdgeRepository::create_signed_conn and is authorised by edges_tenancy's \
+         WITH CHECK.",
+    ),
+    (
         "edge.rs",
         "create_processed_by_stamp_if_absent_conn",
         "WRITE. The paper -processed_by-> agent pipeline stamp on the ingest's own transaction, \
@@ -2480,6 +2624,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_signed_reporting_conn",
+        "WRITE. create_signed_conn's body, also returning whether THIS call inserted the row (the document walk decides whether it created an atom from that, never from the row): the same dedup probes and INSERT; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
+    ),
+    (
+        "claim.rs",
         "create_with_id_if_absent_signed_conn",
         "WRITE. The signed twin of the unsigned form above it (backlog 4ff87716): the same INSERT plus the claim's v1 signature and signer_id, gated by v1_claim_signature_to_store; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
     ),
@@ -2487,6 +2636,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "edge.rs",
         "create_if_absent_including_retracted_signed_conn",
         "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_absent_for_ingest_principal_signed_conn",
+        "WRITE. The document ingest's per-principal dedup and signed INSERT (one row of a fact per \
+         ingest principal): the shared create-if-absent primitive with a VISIBILITY-EXEMPT \
+         write-path probe that also reads the marker's principal, plus the attestation columns; \
+         the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "ingest_written.rs",
+        "create_ingest_written_edge_if_absent_conn",
+        "WRITE. The document ingest's marked writer: \
+         create_if_absent_for_ingest_principal_signed_conn (a VISIBILITY-EXEMPT dedup probe and \
+         INSERT, one row of a fact per ingest principal, authorised by edges_tenancy's WITH \
+         CHECK on the walk's stamped transaction) with the ingest-written marker added and \
+         migration 198's transaction-local declaration set around that INSERT only. Reads \
+         nothing a viewer could filter; the walk spends its viewer on the stamp.",
+    ),
+    (
+        "ingest_written.rs",
+        "declare_ingest_written",
+        "SESSION SETTING. Sets or clears migration 198's transaction-local declaration \
+         (set_config(..., true)) on the caller's connection; touches no table, so there is \
+         nothing a viewer could filter. Called only around the document ingest record's own \
+         INSERT.",
     ),
     (
         "edge.rs",
@@ -2776,6 +2951,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
          itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
          `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "agent.rs",
+        "speaks_for",
+        "READ, no SQL of its own: `humans_of(agents, live)` (above) plus an id comparison, \
+         answering whether a writer IS an agent or operates it through a live binding (the \
+         authority rule for an agent-sourced asserts/authored edge). Identity data, not \
+         tenant content.",
     ),
     (
         "derivation_scope.rs",

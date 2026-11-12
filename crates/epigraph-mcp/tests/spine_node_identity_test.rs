@@ -146,12 +146,24 @@ async fn two_documents_sharing_a_section_heading_get_distinct_spine_nodes(pool: 
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
 
-    do_ingest_document(&server, &viewer, &alpha(), None)
-        .await
-        .expect("alpha ingests");
-    do_ingest_document(&server, &viewer, &beta(), None)
-        .await
-        .expect("beta ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &alpha(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("alpha ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &beta(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("beta ingests");
 
     // Level 1: the shared section heading.
     let section_nodes = claims_with_content(&pool, SHARED_SECTION).await;
@@ -198,12 +210,24 @@ async fn shared_atom_text_still_converges_to_a_single_node(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
 
-    do_ingest_document(&server, &viewer, &alpha(), None)
-        .await
-        .expect("alpha ingests");
-    do_ingest_document(&server, &viewer, &beta(), None)
-        .await
-        .expect("beta ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &alpha(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("alpha ingests");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &beta(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("beta ingests");
 
     let atom_nodes = claims_with_content(&pool, SHARED_ATOM).await;
     assert_eq!(
@@ -240,18 +264,30 @@ async fn reingesting_the_same_document_reuses_its_spine_nodes(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
 
-    do_ingest_document(&server, &viewer, &alpha(), None)
-        .await
-        .expect("first ingest");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &alpha(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("first ingest");
     let count_after_first: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
         .fetch_one(&pool)
         .await
         .expect("count");
     let section_first = claims_with_content(&pool, SHARED_SECTION).await;
 
-    do_ingest_document(&server, &viewer, &alpha(), None)
-        .await
-        .expect("second ingest");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &alpha(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("second ingest");
     let count_after_second: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
         .fetch_one(&pool)
         .await
@@ -284,12 +320,19 @@ async fn spine_path_also_scopes_structural_nodes_per_document(pool: PgPool) {
         &fixture::public_viewer(&pool).await,
         &alpha(),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("alpha spine ingests");
-    do_ingest_document_spine(&server, &fixture::public_viewer(&pool).await, &beta(), None)
-        .await
-        .expect("beta spine ingests");
+    do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &beta(),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("beta spine ingests");
 
     let section_nodes = claims_with_content(&pool, SHARED_SECTION).await;
     assert_eq!(

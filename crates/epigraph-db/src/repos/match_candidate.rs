@@ -501,7 +501,10 @@ impl MatchCandidateRepo {
 
     /// [`Self::list`] on a caller-supplied connection: the form a request
     /// reaches through `ScopedPool::read_as`, so the session's row security
-    /// agrees with the predicate. The pool form delegates here.
+    /// agrees with the predicate. The pool form delegates here. The repo's own
+    /// pool is unstamped: under FORCEd row security on the application role,
+    /// the joins to `claims` admit public claims only, and every candidate
+    /// naming one of the viewer's own group-private claims vanishes.
     ///
     /// # Errors
     /// As [`Self::list`].

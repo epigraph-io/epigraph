@@ -219,6 +219,8 @@ async fn submit_claim_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
             reasoning: None,
             labels: vec![],
             novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -254,6 +256,8 @@ async fn memorize_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
             confidence: Some(0.7),
             tags: None,
             novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -359,6 +363,7 @@ async fn ingest_document_signs_its_evidence_under_v1(pool: PgPool) {
         &viewer,
         &ingest_extraction("document"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("document ingests");
@@ -376,6 +381,7 @@ async fn ingest_document_spine_signs_its_evidence_under_v1(pool: PgPool) {
         &viewer,
         &ingest_extraction("spine"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingests");

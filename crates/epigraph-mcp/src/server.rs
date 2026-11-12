@@ -97,10 +97,17 @@ pub struct EpiGraphMcpFull {
     /// [`Self::with_generated_signer_identity`] on rung 4. Defaulting strict
     /// means no embedding caller can widen the gate by omission.
     pub(crate) signer_identity_declared: bool,
-    /// Per-session memoization of auth-lineage principals already linked via an
-    /// `OPERATED_BY` edge, so `call_tool` writes that edge at most once per
-    /// distinct `auth.agent_id` per session (a fast in-memory short-circuit; the
-    /// DB `create_if_not_exists` is the actual dedup authority). Empty at boot.
+    /// Memo of auth-lineage principals already linked via an `OPERATED_BY`
+    /// edge, so `call_tool` writes that edge at most once per distinct
+    /// `auth.agent_id` (a fast in-memory short-circuit; the DB
+    /// `create_if_not_exists` is the actual dedup authority). Empty at boot.
+    ///
+    /// Per PROCESS on the HTTP listener: [`SessionFactory::session`] shares it
+    /// with every session, because rmcp 3.x runs the factory once per REQUEST
+    /// on the stateless 2026-07-28 path, where a per-session memo would be
+    /// empty on every call. A principal is inserted only after its edge
+    /// write succeeds, so a failed write is retried on the next call; an edge
+    /// deleted after a success is not rewritten until the process restarts.
     pub(crate) seen_auth_lineage: Arc<Mutex<HashSet<uuid::Uuid>>>,
     /// Write-authorization gate — the MCP twin of `epigraph_api::AppState`'s
     /// `policy_gate` field, and injected for the same reason.
@@ -336,8 +343,9 @@ impl EpiGraphMcpFull {
 ///
 /// # Why this exists (backlog F1, `da432f25`)
 ///
-/// rmcp's streamable-HTTP transport calls its factory closure once per SESSION,
-/// and `main` used to build each session's server with
+/// rmcp's streamable-HTTP transport calls its factory closure once per SESSION
+/// (and, since rmcp 3.x, once per REQUEST on the stateless 2026-07-28 path,
+/// which makes the sharing below matter more), and `main` used to build each session's server with
 /// [`EpiGraphMcpFull::new_shared_with_federation`], which gives every server a
 /// fresh, EMPTY `agent_db_id` cell. So [`EpiGraphMcpFull::agent_id`]'s
 /// resolution — which ends in PR-09's `ensure_personal_group` call on the
@@ -366,12 +374,17 @@ impl EpiGraphMcpFull {
 /// a revocation made before the process started either: since migration 105
 /// the provisioning function refuses a revoked row instead of restoring it.
 ///
-/// # What is per-session, and stays so
+/// # What is shared besides the cell
 ///
-/// Only `seen_auth_lineage`, the `OPERATED_BY` memo, whose doc makes it
-/// per-session; [`Self::session`] resets it. Everything else a session server
-/// holds is either immutable configuration or an `Arc` the old constructor
-/// already shared (`signer`, `embedder`, `federation`, the `ScopedPool`).
+/// `seen_auth_lineage`, the `OPERATED_BY` memo, is shared too. It used to be
+/// reset per session, which on rmcp 2.x meant one edge round trip per
+/// principal per session. rmcp 3.x builds a fresh server for EVERY stateless
+/// 2026-07-28 request, so a per-session memo would be empty on every call and
+/// each tool call would first await the signer lookup, a pool connection and
+/// the `OPERATED_BY` upsert. Shared, that happens once per principal per
+/// process. Everything else a session server holds is either immutable
+/// configuration or an `Arc` the old constructor already shared (`signer`,
+/// `embedder`, `federation`, the `ScopedPool`).
 ///
 /// # A cost, stated
 ///
@@ -393,13 +406,12 @@ impl SessionFactory {
         Self { template }
     }
 
-    /// A server for one new session: a clone of the template that SHARES its
-    /// `agent_db_id` cell and starts with an empty `OPERATED_BY` memo.
+    /// A server for one new session (or, on rmcp 3.x's stateless 2026-07-28
+    /// path, one request): a clone of the template that SHARES its
+    /// `agent_db_id` cell and its `OPERATED_BY` memo.
     #[must_use]
     pub fn session(&self) -> EpiGraphMcpFull {
-        let mut srv = self.template.clone();
-        srv.seen_auth_lineage = Arc::new(Mutex::new(HashSet::new()));
-        srv
+        self.template.clone()
     }
 }
 
@@ -599,8 +611,9 @@ impl EpiGraphMcpFull {
     ///
     /// Semantics:
     /// - `principal == None` -> no-op (nothing to attribute).
-    /// - Memoized per session via `seen_auth_lineage`: a principal already linked
-    ///   in this session short-circuits before touching the DB. The DB
+    /// - Memoized via `seen_auth_lineage` (per process on the HTTP listener, see
+    ///   its field doc): a principal already linked short-circuits before
+    ///   touching the DB. The DB
     ///   `create_if_not_exists` is the true idempotency authority (exactly one
     ///   edge across processes); the set is only a fast in-memory guard.
     /// - **Best-effort**: any failure (e.g. a stale `principal` that no longer
@@ -616,7 +629,7 @@ impl EpiGraphMcpFull {
         let Some(principal) = principal else {
             return;
         };
-        // Fast per-session short-circuit (lock released before any await on the DB).
+        // Fast in-memory short-circuit (lock released before any await on the DB).
         let already_seen = { self.seen_auth_lineage.lock().await.contains(&principal) };
         if already_seen {
             return;
@@ -1400,7 +1413,47 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state and `source_urls`: the URLs of the evidence attached to it (empty when none)."
+        description = "Find a person, an LLM agent or a system identity by NAME (or by exact ORCID / ROR id). Case-, accent- and punctuation-folded (Jean-Pierre = jean pierre, O'Brien = OBrien); an ORCID matches with or without hyphens or the orcid.org prefix; ranked orcid/ror > exact > prefix (of the name or one of its words) > similar (trigram), then oldest first. Display names collide (many agents share a name), so each result carries what tells them apart: id, display_name, kind (human / llm_agent / system / role / ingest_author / unknown, derived from evidence you may see: a registered human (shown to that human, admins, and everyone when it holds a disclosed role), an LLM model on a visible profile, a binding to a human, the system registry, the document ingest's name-derived author key), kind_evidence, roles (open assignments of non-elevating, non-audit roles, plus your own), orcid / ror_id (when the profile is visible to you), operator_human (the human the agent is currently bound to, {id, display_name}, shown to every reader: its live operator link, else its unrevoked client allowance; null once the link is retired or the allowance revoked; never read from an OPERATED_BY edge; the agent's model and prompt are not on the card), created_at, and counts (authored_papers: papers it has an authorship of that is not awaiting its countersignature (a name-derived author is never countersigned and never pending); pending_authored_papers: papers an ingester named it on, awaiting its countersignature, where it has no other authorship; asserted_claims: claims it filed, plus each claim an ingest that named it as an author attributes to it, that ingest's authorship, paper assertion and attribution all written by ingests of the same principal, so another ingest of the same DOI that does not name it credits it with nothing; each paper and claim counted once; only in-force edges carrying the document ingest's ingest-written marker count, which no other writer can set, so an edge written by any other path never counts whatever its shape, and edges ingested before the marker existed do not count until backfilled; computed only over what you can read, capped at 10000 with capped=true), plus tier and score. kind and role filters apply before the limit; candidates_truncated=true means more than 200 agents matched, so narrow the name. Matches display_name as written (a display_name that is an email address matches like any name); never searches properties or contact fields (full_name, email, affiliations). Same rules as GET /api/v1/agents/search."
+    )]
+    async fn find_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::FindAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::find_agent(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Look up one agent by id (for example the agent_id of a claim, to name who filed it). Returns the same card as find_agent: id, display_name, kind and kind_evidence, roles, orcid / ror_id (visible profiles only), operator_human (the human it is currently bound to, shown to every reader; null once its link is retired), created_at and counts computed over what you can read. An id with no agent is an invalid_params error (agent <id> not found), as get_claim reports a missing claim."
+    )]
+    async fn get_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::GetAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::get_agent(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Countersign an authorship another ingester named you on: confirm or decline it. When an ingest names an author it neither is nor operates, that authorship is the ingester's word, marked pending_countersign (query_paper, get_claim's pending_authors, the agent card's pending_authored_papers). Only the named agent itself, or its live human operator (its operator link while not retired, else its unrevoked client allowance; pass agent_id), may act on it. confirm: the naming stops being pending everywhere (the card counts the paper under authored_papers, get_claim lists you as a primary author where that ingest recorded you, query_paper clears the flag); the ingester's asserts it never wrote for you are not added, so asserted_claims does not move. decline: the naming is retracted and is never shown again; it never stops your own later ingest of the document. The signed edge is not edited: the decision is recorded beside it, and every act is audited. Returns {paper_id, decision, changed: [{edge_id, ingested_by, outcome}]}; nothing pending (never pending, already confirmed or declined) returns changed: [] with a message and writes nothing. Refused, with nothing written, for anyone else."
+    )]
+    async fn countersign_authorship(
+        &self,
+        Parameters(params): Parameters<crate::types::CountersignAuthorshipParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::countersign_authorship(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state, `source_urls`: the URLs of the evidence attached to it (empty when none), and `authored_by`, tagged by `source`. `source: \"agent\"` (the filer is the author: no readable creation record names a document, e.g. a claim stated directly, or one a document later repeated): `agent` {id, display_name} that filed it; `human` {id, display_name}, the human the agent was bound to WHEN IT FILED the claim (its operator link from creation until retirement, else the client allowance in force then; null when bound to none then, e.g. a claim filed after the link was retired, and on a human's own claim), shown to every reader and never inferred from an OPERATED_BY edge; `prompt_snapshot` {snapshot_id, model, prompt_hash, started_at} it was running at the claim's created_at, shown only to the agent's linked human and to admins (prompt text is never included). `source: \"literature\"` (the document ingest recorded, when the claim was created, that a document's ingest created it; never decided from a bare asserts edge or from content): `paper` {paper {id, doi, title}, authors [{id, display_name, position, role, affiliations, pending_countersign: false}] (the claim's primary authors: the ones the creating ingest recorded when it created the claim, each on that ingest's own authorship of the document; a later ingest of the same document never changes them, and another ingest's authorship never makes a recorded author primary), pending_authors [{..., pending_countersign: true, named_by {id, display_name}}] (named by an ingester, not yet countersigned, never primary: a person a stranger's ingest named is pending on the stranger's claim even when the person really authored the document), added_authors [{..., added_by {id, display_name}}] (added to the document by a later ingest that also recorded this claim, never primary), authors_truncated; only the ingests that recorded this claim through the document contribute authors, each author once}, and `ingested_by` {agent, human, prompt_snapshot} (the agent that ran the creating ingest, under the same rules; never an author). Both carry `corroborated_by` (every other document you can read whose ingest recorded the claim, same shape as `paper`, at most 10, never authors of the claim), `corroborated_by_truncated`, `ingesters` [{agent, human (bound at the time of that ingest), paper_id, created_claim, recorded_at}] (every ingest you can read, the creating one included) and `ingesters_truncated`. A part you may not see is null, exactly as a part that does not exist."
     )]
     async fn get_claim(
         &self,
@@ -1584,6 +1637,48 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Make team or private claims PUBLIC (readable by every authenticated agent). Only a live ADMIN of each claim's owning group may do this; a plain writer, a reader or an operated agent acting for an admin is refused. Sealed (encrypted) claims are refused. All or nothing: if any claim is not found, not readable, sealed or not yours to publish, nothing changes and the error lists each refused claim. The owner group stays the same. The claims' unpinned evidence and reasoning traces become public with them, and edges between claims that are now public become public too. An edge someone declared group-only, and evidence an operator hid, stay as they were. Requires a reason, recorded with your identity in a claim.publicized audit event. Returns {results: [{claim_id, outcome: publicized | already_public}]}."
+    )]
+    async fn publicize_claims(
+        &self,
+        Parameters(params): Parameters<PublicizeClaimsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::publicize_claims(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Move PRIVATE claims (owned by your home group: your personal group, or your operator's) into a team you write, so the team's members can read them. Visibility stays group-only; publicize_claims publishes. You must have written each claim, or be an admin of your home group, and you (or your human operator) need a live writer or admin membership of the team. Public and team claims are refused. All or nothing, and audited (claim.shared_with_team, with your reason). Evidence and traces move with the claims. Returns {results: [{claim_id, outcome: shared}]}."
+    )]
+    async fn share_claims_with_team(
+        &self,
+        Parameters(params): Parameters<ShareClaimsWithTeamParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::share_claims_with_team(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Set the team your claim writes go to when they name no visibility (submit_claim, memorize, batch_submit_claims, ingest_document*). It must be a team you, or your human operator, may write. Omit group_id to clear it. With no default, a write goes to your only team, else private. Your operated agents use your default when they have none of their own. Audited (agent.default_group_set). Returns {agent_id, default_group_id, writable_teams: [{group_id, via: own | operator}]}."
+    )]
+    async fn set_default_group(
+        &self,
+        Parameters(params): Parameters<SetDefaultGroupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::set_default_group(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}. All-or-nothing: the resolution claim, its justifies edges and the original's 'resolved' label commit together on one transaction with the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)'s write authority, or nothing is written and the call fails (a retry is safe). An original owned by a group the calling agent cannot write (another agent's claim) is refused that way, unless the token carries claims:admin: then the resolution claim is still yours, in your own group, and only the original's 'resolved' label is written through the AUDITED ADMIN PATH (recorded with you as principal, plus a security_events claims.admin_write audit row; it requires a live claims:admin grant on your token's own client record). On an --allow-unauthenticated-http listener the injected context carries claims:admin but no client record, so a claim owned by a group this server cannot write is refused there (ADM02) with nothing written. Only the resolution claim's embedding runs after commit, best-effort."
     )]
     async fn resolve_backlog_item(
@@ -1600,6 +1695,33 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::claims::resolve_backlog_item(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Report a bug to the platform operators, whether or not you can read their backlog. WRITE-ONLY: the report is filed as ONE claim authored by you (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), owned by the instance's bug-intake group and visible only to that group, so you cannot read it back with get_claim, recall or any query; list_my_bug_reports shows your own reports and their labels. Labels: backlog, bug-report, intake, plus severity:<x> and component:<x> when given (triage decides everything after that). The answer is always {claim_id, submitted_at} and nothing else: there is no dedup, no similarity check and no hint about other reports, so filing something already reported is harmless. Refused with nothing written when the instance has no intake configured, when you are not an agent bound to a human operator (or are a system agent), when the title or description is empty or a field is too long (title 200 characters, description and repro 20480 bytes, evidence 51200 bytes), or when you have filed too many reports in the last hour or day. Never put secrets in a report."
+    )]
+    async fn submit_bug_report(
+        &self,
+        Parameters(params): Parameters<crate::types::SubmitBugReportParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::bug_report::submit_bug_report(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "List the bug reports YOU filed with submit_bug_report, newest first: claim_id, title, submitted_at, the report's current labels (how triage has classified it so far), resolved and is_current. Only your own reports filed through the intake are listed, never anything else in the intake group. A report the operators moved out of the intake group is no longer listed. Refused on a listener with no authenticated principal. limit defaults to 50, at most 200."
+    )]
+    async fn list_my_bug_reports(
+        &self,
+        Parameters(params): Parameters<crate::types::ListMyBugReportsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::bug_report::list_my_bug_reports(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1801,7 +1923,7 @@ impl EpiGraphMcpFull {
     // ── Ingestion ──
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms; the path must be inside the server's working directory). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Same writer and same ASYNCHRONOUS contract as ingest_document_inline (read it): a write-authority refusal is a synchronous error with nothing written; otherwise the call returns {status: 'queued', paper_id, document_key} and the all-or-nothing walk runs in the background, where any failure (verbatim guard, malformed axis, a rejected row) reaches only the server log. Confirm it landed by query_paper(document_key)'s claim_count rising, not by the paper existing. Pass wait: true (preferred for a single document) to run the walk in the request instead: the call then returns the walk's own result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, so a failed walk is reported to you rather than only logged; that result's `doi` field is the document_key. Re-runs converge on existing nodes, so retrying is safe."
+        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms; the path must be inside the server's working directory). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Same writer and same ASYNCHRONOUS contract as ingest_document_inline (read it): a write-authority refusal is a synchronous error with nothing written; otherwise the call returns {status: 'queued', paper_id, document_key} and the all-or-nothing walk runs in the background, where any failure (verbatim guard, malformed axis, a rejected row) reaches only the server log. Confirm it landed by query_paper(document_key)'s claim_count rising, not by the paper existing. Pass wait: true (preferred for a single document) to run the walk in the request instead: the call then returns the walk's own result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, so a failed walk is reported to you rather than only logged; that result's `doi` field is the document_key. Re-runs converge on existing nodes, so retrying is safe. AUTHORS: source.authors[].agent_id (optional, a UUID e.g. from find_agent) makes that author exactly that existing agent. Its authored -> paper edge always comes from it; its asserts edges onto the document's claims are written only when that agent is you (your write identity) or an agent you are the human operator of. Naming anyone else records the authorship as YOUR word (attribution pending_countersign; the edge carries ingested_by = you): they get the authored edge and NO asserts edge, and their agent card and query_paper show that authorship as PENDING, never as theirs (the named agent, or its live operator, confirms or declines it with countersign_authorship). Refused before any write: an unknown id, a system identity, a role node, an id on a placeholder name, the same id twice, an id that is another entry's name-derived node, and a replacement (below) this server cannot make. Without agent_id an author is the name-derived author node (reused, or created), never another agent that shares the name; but when THIS ingester attached an agent_id for that same spelling on an earlier run, that agent stays the author (kept_attached); another ingester's attachment, pending or not, is not kept and is only listed in also_at_position; a name-derived author an operator removed from the paper is never credited again (retracted_name_key, no asserts). Each ingester's naming is its own authored row: re-attaching an agent YOU already named pending keeps your row pending (pending_ingested_by = you) and writes no asserts, and another ingester's row never changes yours (naming someone you do not speak for is pending even when they authored the document themselves; naming yourself or an agent you operate asserts even when someone else named them pending). attribution confirmed means your own earlier non-pending attachment, re-named now that you no longer speak for the agent: it stays as written and adds no asserts. Re-ingesting with agent_id and the entry's SAME spelling REPLACES the entry's name-derived author on this document, never adds the agent beside it: its authored edge and its asserts edges onto this document's claims are retracted (a claim another of its papers asserts keeps its edge) and the entry reports it in replaced. Those edges are administrative (an agent's edges belong to no writer), so this server REFUSES that replacement before writing anything and says so; the operator ingest-document CLI, which runs on the maintenance connection, performs it. So in the two-phase flow give the same agent_id on BOTH the ingest_document_spine call and the ingest_document_inline call: a spine call without it attaches the name-derived author, which this server cannot replace afterwards (a later call without agent_id keeps an author attached by agent_id). Any other author already at the same position (a differently spelled entry's name-derived author included: the agent is then ADDED beside it) is left alone and listed in also_at_position. The result's authors[] reports each author: {agent_id, name, position, status: explicit|matched|created|ambiguous, action: attached_given|kept_attached|retracted_name_key|reused_name_key|created_name_key, attribution: name_derived|caller|operated_by_caller|confirmed|pending_countersign, asserts_claims, pending_ingested_by (pending), display_name (explicit), replaced {agent_id, authored_edges_retracted, asserts_edges_retracted}, also_at_position [agent ids], candidates [{agent_id, display_name, tier, created_at}] and candidates_truncated (ambiguous: other agents with the same folded name; to make one of them the author, re-ingest with its agent_id and the same spelling through the operator ingest-document CLI; this server refuses that replacement)}; the result's ingested_by is this call's ingesting agent, shown apart from the authors. Every claim the walk writes or converges on gets a paper -ingested_claim-> claim record naming the ingester and whether this ingest CREATED the claim. Pass wait=true to receive authors[]; the queued acknowledgement has none."
     )]
     async fn ingest_document(
         &self,
@@ -1828,7 +1950,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: the nodes are authored by the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked. On any error (including a refusal because that agent cannot write the owning group: an operator revoked the membership, it is read-only, or the agent is not bound to an operator where binding is enforced) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. An optional top-level `labels` array on the extraction (e.g. a stage tag) is applied to every node this call writes, in addition to the document's own doi: label. A node another author already wrote is reused, never rewritten, and never gets your caller `labels` (only the doi: label); converged_claims_caller_labels_withheld counts those, and converged_claims_unlabelled counts reused nodes you could not give any of this document's labels (doi: and caller `labels`) because their owner group is one you cannot write."
+        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: the nodes are authored by the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked. On any error (including a refusal because that agent cannot write the owning group: an operator revoked the membership, it is read-only, or the agent is not bound to an operator where binding is enforced) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. An optional top-level `labels` array on the extraction (e.g. a stage tag) is applied to every node this call writes, in addition to the document's own doi: label. A node another author already wrote is reused, never rewritten, and never gets your caller `labels` (only the doi: label); converged_claims_caller_labels_withheld counts those, and converged_claims_unlabelled counts reused nodes you could not give any of this document's labels (doi: and caller `labels`) because their owner group is one you cannot write. AUTHORS: source.authors[].agent_id (optional, a UUID e.g. from find_agent) makes that author exactly that existing agent. Its authored -> paper edge always comes from it; its asserts edges onto the document's claims are written only when that agent is you (your write identity) or an agent you are the human operator of. Naming anyone else records the authorship as YOUR word (attribution pending_countersign; the edge carries ingested_by = you): they get the authored edge and NO asserts edge, and their agent card and query_paper show that authorship as PENDING, never as theirs (the named agent, or its live operator, confirms or declines it with countersign_authorship). Refused before any write: an unknown id, a system identity, a role node, an id on a placeholder name, the same id twice, an id that is another entry's name-derived node, and a replacement (below) this server cannot make. Without agent_id an author is the name-derived author node (reused, or created), never another agent that shares the name; but when THIS ingester attached an agent_id for that same spelling on an earlier run, that agent stays the author (kept_attached); another ingester's attachment, pending or not, is not kept and is only listed in also_at_position; a name-derived author an operator removed from the paper is never credited again (retracted_name_key, no asserts). Each ingester's naming is its own authored row: re-attaching an agent YOU already named pending keeps your row pending (pending_ingested_by = you) and writes no asserts, and another ingester's row never changes yours (naming someone you do not speak for is pending even when they authored the document themselves; naming yourself or an agent you operate asserts even when someone else named them pending). attribution confirmed means your own earlier non-pending attachment, re-named now that you no longer speak for the agent: it stays as written and adds no asserts. Re-ingesting with agent_id and the entry's SAME spelling REPLACES the entry's name-derived author on this document, never adds the agent beside it: its authored edge and its asserts edges onto this document's claims are retracted (a claim another of its papers asserts keeps its edge) and the entry reports it in replaced. Those edges are administrative (an agent's edges belong to no writer), so this server REFUSES that replacement before writing anything and says so; the operator ingest-document CLI, which runs on the maintenance connection, performs it. So in the two-phase flow give the same agent_id on BOTH the ingest_document_spine call and the ingest_document_inline call: a spine call without it attaches the name-derived author, which this server cannot replace afterwards (a later call without agent_id keeps an author attached by agent_id). Any other author already at the same position (a differently spelled entry's name-derived author included: the agent is then ADDED beside it) is left alone and listed in also_at_position. The result's authors[] reports each author: {agent_id, name, position, status: explicit|matched|created|ambiguous, action: attached_given|kept_attached|retracted_name_key|reused_name_key|created_name_key, attribution: name_derived|caller|operated_by_caller|confirmed|pending_countersign, asserts_claims, pending_ingested_by (pending), display_name (explicit), replaced {agent_id, authored_edges_retracted, asserts_edges_retracted}, also_at_position [agent ids], candidates [{agent_id, display_name, tier, created_at}] and candidates_truncated (ambiguous: other agents with the same folded name; to make one of them the author, re-ingest with its agent_id and the same spelling through the operator ingest-document CLI; this server refuses that replacement)}; the result's ingested_by is this call's ingesting agent, shown apart from the authors. Every claim the walk writes or converges on gets a paper -ingested_claim-> claim record naming the ingester and whether this ingest CREATED the claim."
     )]
     async fn ingest_document_spine(
         &self,
@@ -1844,7 +1966,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously. Every claim is authored by the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked; if that agent cannot write the owning group (an operator revoked the membership, it is read-only, or the agent is not bound to an operator where binding is enforced) the call returns an error and writes nothing. It then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. WAIT MODE (preferred for a single document): pass wait: true and the call runs that same walk in the request, after the same write-authority check, and returns the walk's own result (claims_ingested, claims_skipped_dedup, relationships_created, ...) instead of {status: 'queued'}; a failed walk (verbatim-guard mismatch, malformed axis, a rejected row) is returned to you as an error with no claims or edges written, and retrying is safe. The wait-mode result's `doi` field is the document_key to query and label with. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and never gets your caller `labels` (only this document's doi: label); if its owner group is one you cannot write it gets none of this document's labels (doi: and caller `labels`). An optional top-level `labels` array on the extraction (e.g. a stage tag) is applied to every claim this call writes, in addition to the doi: label; a label containing an unexpanded shell variable (`$`) is refused synchronously, before anything is written. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest rather than silently falling back to binary (detached, only the server log shows it; with wait: true it is returned to you as an error)."
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously. Every claim is authored by the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked; if that agent cannot write the owning group (an operator revoked the membership, it is read-only, or the agent is not bound to an operator where binding is enforced) the call returns an error and writes nothing. It then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. WAIT MODE (preferred for a single document): pass wait: true and the call runs that same walk in the request, after the same write-authority check, and returns the walk's own result (claims_ingested, claims_skipped_dedup, relationships_created, ...) instead of {status: 'queued'}; a failed walk (verbatim-guard mismatch, malformed axis, a rejected row) is returned to you as an error with no claims or edges written, and retrying is safe. The wait-mode result's `doi` field is the document_key to query and label with. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and never gets your caller `labels` (only this document's doi: label); if its owner group is one you cannot write it gets none of this document's labels (doi: and caller `labels`). An optional top-level `labels` array on the extraction (e.g. a stage tag) is applied to every claim this call writes, in addition to the doi: label; a label containing an unexpanded shell variable (`$`) is refused synchronously, before anything is written. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest rather than silently falling back to binary (detached, only the server log shows it; with wait: true it is returned to you as an error). AUTHORS: source.authors[].agent_id (optional, a UUID e.g. from find_agent) makes that author exactly that existing agent. Its authored -> paper edge always comes from it; its asserts edges onto the document's claims are written only when that agent is you (your write identity) or an agent you are the human operator of. Naming anyone else records the authorship as YOUR word (attribution pending_countersign; the edge carries ingested_by = you): they get the authored edge and NO asserts edge, and their agent card and query_paper show that authorship as PENDING, never as theirs (the named agent, or its live operator, confirms or declines it with countersign_authorship). Refused before any write: an unknown id, a system identity, a role node, an id on a placeholder name, the same id twice, an id that is another entry's name-derived node, and a replacement (below) this server cannot make. Without agent_id an author is the name-derived author node (reused, or created), never another agent that shares the name; but when THIS ingester attached an agent_id for that same spelling on an earlier run, that agent stays the author (kept_attached); another ingester's attachment, pending or not, is not kept and is only listed in also_at_position; a name-derived author an operator removed from the paper is never credited again (retracted_name_key, no asserts). Each ingester's naming is its own authored row: re-attaching an agent YOU already named pending keeps your row pending (pending_ingested_by = you) and writes no asserts, and another ingester's row never changes yours (naming someone you do not speak for is pending even when they authored the document themselves; naming yourself or an agent you operate asserts even when someone else named them pending). attribution confirmed means your own earlier non-pending attachment, re-named now that you no longer speak for the agent: it stays as written and adds no asserts. Re-ingesting with agent_id and the entry's SAME spelling REPLACES the entry's name-derived author on this document, never adds the agent beside it: its authored edge and its asserts edges onto this document's claims are retracted (a claim another of its papers asserts keeps its edge) and the entry reports it in replaced. Those edges are administrative (an agent's edges belong to no writer), so this server REFUSES that replacement before writing anything and says so; the operator ingest-document CLI, which runs on the maintenance connection, performs it. So in the two-phase flow give the same agent_id on BOTH the ingest_document_spine call and the ingest_document_inline call: a spine call without it attaches the name-derived author, which this server cannot replace afterwards (a later call without agent_id keeps an author attached by agent_id). Any other author already at the same position (a differently spelled entry's name-derived author included: the agent is then ADDED beside it) is left alone and listed in also_at_position. The result's authors[] reports each author: {agent_id, name, position, status: explicit|matched|created|ambiguous, action: attached_given|kept_attached|retracted_name_key|reused_name_key|created_name_key, attribution: name_derived|caller|operated_by_caller|confirmed|pending_countersign, asserts_claims, pending_ingested_by (pending), display_name (explicit), replaced {agent_id, authored_edges_retracted, asserts_edges_retracted}, also_at_position [agent ids], candidates [{agent_id, display_name, tier, created_at}] and candidates_truncated (ambiguous: other agents with the same folded name; to make one of them the author, re-ingest with its agent_id and the same spelling through the operator ingest-document CLI; this server refuses that replacement)}; the result's ingested_by is this call's ingesting agent, shown apart from the authors. Every claim the walk writes or converges on gets a paper -ingested_claim-> claim record naming the ingester and whether this ingest CREATED the claim. Pass wait=true to receive authors[]; the queued acknowledgement has none."
     )]
     async fn ingest_document_inline(
         &self,
@@ -1939,7 +2061,9 @@ impl EpiGraphMcpFull {
 
     // ── Paper Queries (3 tools) ──
 
-    #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]
+    #[tool(
+        description = "Look up a paper by its DOI, returning its title, claim_count, the ingests of it, and ONE ingest's own authors and claims. Every ingester of a document writes its own record of it, so a listing is always one ingest (ingested_by): that ingest's authors next to that ingest's claims, never another's. ingests[] names every ingest {ingested_by, asserted_claim_count, first_written_at}, oldest first, at most ten (ingests_truncated); pass ingested_by to list another one (default: the first). authors[] lists only that ingest's authorships in force (an author the operator replaced is gone), in the document's author order: {agent_id, name, position, pending_countersign, ingested_by}. pending_countersign=true marks an author the ingester named without being or operating them: the ingester's word (ingested_by names it), not the person's authorship. claims[] is one page (limit, offset, has_more) of that ingest's claims, each with created_claim (true: THIS ingest created the claim, so its document's authors are its primary authors; false: the ingest found the claim already there). A claim the ingest asserted stays listed, with is_current=false, after a supersede or duplicate mark. Authors and claims are read only as the document ingest wrote them; asserted_claim_count counts the listed ingest's claims, and claim_count is the larger of the claims any ingest of the paper asserts and the claims labelled doi:<doi> (a presence signal for a partial ingest, not provenance)."
+    )]
     async fn query_paper(
         &self,
         Parameters(params): Parameters<QueryPaperParams>,
@@ -2035,13 +2159,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow."
+        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow. A workflow you cannot read returns no executions, exactly like an unknown id."
     )]
     async fn get_workflow_executions(
         &self,
         Parameters(params): Parameters<GetWorkflowExecutionsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::workflows::get_workflow_executions(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflows::get_workflow_executions(self, viewer, params).await
     }
 
     #[tool(
@@ -2107,7 +2234,7 @@ impl EpiGraphMcpFull {
     // variants independently of its workflow root.
 
     #[tool(
-        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. Thesis, phase and step claims are scoped to this canonical_name, so texts another workflow already uses do not conflict; operation atoms are shared across workflows and documents by text. Within one workflow, do not reuse the thesis text as a phase summary (phase text is the summary, or the title when the summary is empty): the two would resolve to the same claim. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, an agent acting for it through a live operator link, a live writer of the workflow's owner group, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter, and a re-ingest of a workflow you cannot read (a group plan outside your groups) returns no workflow_id; a new generation of a lineage you cannot read is refused without naming it. Every write admitted over HTTP through the submitter, operator or owner-group writer arm is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves are authored by the acting agent). A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and every new generation is checked against exactly the row it links as parent. A new generation links to its parent: the parent_canonical_name row at generation - 1 when it exists, otherwise (no parent named, or this same lineage named at a missing generation) the highest existing generation of this canonical_name below it. A generation above 0 with no steps is refused (invalid params, nothing written), and so is an extraction with no thesis and no phases at any generation; steps under an unrecognised key are ignored and count as no steps. Generation 0 with a thesis and no steps is accepted (the store_workflow scaffold). A lineage with no recorded submitter (created before batch H-b) admits over HTTP only a live writer of its owner group or the audited claims:admin path to add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves are authored by the acting agent too. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none. TENANCY (VISIBILITY): the workflow row, every claim the call creates and their executes edges take one tenancy. By default a NEW workflow is PRIVATE to its owner group: your one team group if you hold a live writer or admin membership of exactly one, else your own default group (your personal group, or your operator's for an operated agent); a new generation keeps its lineage's visibility (a public lineage stays public, in its group when you write it, else in your own group; a group lineage stays in its group, which you must write). To choose, pass tenancy={\"visibility\":\"group\",\"owner_group_id\":G} (readable only by live members of G) or tenancy={\"visibility\":\"public\",\"owner_group_id\":G} (readable by everyone, owned by G: the ONLY way to publish a new workflow); either way the calling agent ITSELF must hold a live writer or admin membership of G (its operator's membership does not count), otherwise the call is refused and nothing is written. Declaring public on a new generation of a group-private lineage is refused. Claims the plan reuses keep their own tenancy and are listed in the response's reused_items ({claim_id, visibility, owner_group_id}), on a re-ingest too; reused_items is present only when tenancy is given. A plan that reuses an existing claim private to a group you do not yourself write is refused and writes nothing; on a re-ingest (nothing is written) such a claim is listed with a null tenancy. A re-ingest of an existing (canonical_name, generation) writes nothing at all, not even the goal embedding. embed=false (default true) embeds nothing: no claim or goal text is sent to the embedding provider."
+        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. Thesis, phase and step claims are scoped to this canonical_name, so texts another workflow already uses do not conflict; operation atoms are shared across workflows and documents by text. Within one workflow, do not reuse the thesis text as a phase summary (phase text is the summary, or the title when the summary is empty): the two would resolve to the same claim. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, an agent acting for it through a live operator link, a live writer of the workflow's owner group, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter, and a re-ingest of a workflow you cannot read (a group plan outside your groups) returns no workflow_id; a new generation of a lineage you cannot read is refused without naming it. Every write admitted over HTTP through the submitter, operator or owner-group writer arm is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves are authored by the acting agent). A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and every new generation is checked against exactly the row it links as parent. A new generation links to its parent: the parent_canonical_name row at generation - 1 when it exists, otherwise (no parent named, or this same lineage named at a missing generation) the highest existing generation of this canonical_name below it. A generation above 0 with no steps is refused (invalid params, nothing written), and so is an extraction with no thesis and no phases at any generation; steps under an unrecognised key are ignored and count as no steps. Generation 0 with a thesis and no steps is accepted (the store_workflow scaffold). A lineage with no recorded submitter (created before batch H-b) admits over HTTP only a live writer of its owner group or the audited claims:admin path to add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves are authored by the acting agent too. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none. TENANCY (VISIBILITY): the workflow row, every claim the call creates and their executes edges take one tenancy. By default a NEW workflow is PRIVATE to its owner group: your one team group if you hold a live writer or admin membership of exactly one, else your own default group (your personal group, or your operator's for an operated agent); a new generation keeps its lineage's visibility (a public lineage stays public, in its group when you write it, else in your own group; a group lineage stays in its group, which you must write). To choose, pass tenancy={\"visibility\":\"group\",\"owner_group_id\":G} (readable only by live members of G) or tenancy={\"visibility\":\"public\",\"owner_group_id\":G} (readable by everyone, owned by G: the ONLY way to publish a new workflow); either way the calling agent ITSELF must hold a live writer or admin membership of G (its operator's membership does not count), otherwise the call is refused and nothing is written. Declaring public on a new generation of a group-private lineage is refused. Claims the plan reuses keep their own tenancy and are listed in the response's reused_items ({claim_id, visibility, owner_group_id}), on a re-ingest too; reused_items is present only when tenancy is given. A plan that reuses an existing claim private to a group you do not yourself write is refused and writes nothing; on a re-ingest (nothing is written) such a claim is listed with a null tenancy. A re-ingest of an existing (canonical_name, generation) writes nothing at all, not even the goal embedding. embed=false (default true) embeds nothing: no claim or goal text is sent to the embedding provider. AUTHORS: workflow authors are resolved by name only; source.authors[].agent_id, which the shared author schema lists for document ingest, is refused here (invalid params, nothing written)."
     )]
     async fn ingest_workflow(
         &self,
@@ -2844,7 +2971,7 @@ impl EpiGraphMcpFull {
 // Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
 // can be wrapped with durable event emission. Mirrors the macro's expansion
 // for `list_tools` and `get_tool` verbatim — see
-// `rmcp-macros/src/tool_handler.rs` (2.2.0) for the canonical body.
+// `rmcp-macros/src/tool_handler.rs` (3.9.0) for the canonical body.
 //
 // `call_tool` is the single chokepoint for every MCP tool invocation. We
 // emit one `tool.invoked` event per call (closes #61's tool.invoked
@@ -2852,8 +2979,8 @@ impl EpiGraphMcpFull {
 // emission is fire-and-forget; a failed event publish must not break tool
 // dispatch.
 impl ServerHandler for EpiGraphMcpFull {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(Self::server_instructions(self.read_only))
     }
 
@@ -2861,7 +2988,7 @@ impl ServerHandler for EpiGraphMcpFull {
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         // For HTTP requests, the Bearer middleware (`auth::bearer_auth_middleware`)
         // inserts an `AuthContext` into request.extensions; rmcp's
         // `StreamableHttpService` forwards those into `context.extensions` via
@@ -2999,6 +3126,7 @@ impl ServerHandler for EpiGraphMcpFull {
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
+                    .map(rmcp::model::CallToolResponse::from)
                     .map_err(crate::errors::internal_error);
             }
 
@@ -3086,8 +3214,9 @@ impl ServerHandler for EpiGraphMcpFull {
         // THIS MCP agent acted on behalf of that principal
         // (`mcp_agent --OPERATED_BY--> auth.agent_id`, prov:actedOnBehalfOf).
         // `auth.agent_id == None`, or stdio (no `Parts` -> `auth_owned == None`),
-        // writes NO edge. Best-effort + per-session memoized inside the helper;
-        // borrow `auth_owned` here (it is MOVED just below into `context`).
+        // writes NO edge. Best-effort + memoized inside the helper (per process
+        // on the HTTP listener; see `seen_auth_lineage`); borrow `auth_owned`
+        // here (it is MOVED just below into `context`).
         self.record_auth_lineage(auth_owned.as_ref().and_then(|a| a.agent_id))
             .await;
 
@@ -3114,15 +3243,32 @@ impl ServerHandler for EpiGraphMcpFull {
         .await;
         match (elevated, recording) {
             (Some(viewer), Some((tool, arguments, jti))) => {
+                // An elevated call is recorded from its COMPLETE result. rmcp
+                // 3.x lets a tool answer with an intermediate result instead
+                // (`InputRequired` / `Task`); no kernel tool does, and one that
+                // did would leave nothing whole to record, so it is withheld
+                // (and the refusal recorded) rather than passed through
+                // unrecorded.
+                let complete = match result {
+                    Ok(rmcp::model::CallToolResponse::Complete(r)) => Ok(r),
+                    Ok(_) => Err(McpError::internal_error(
+                        "an elevated tool call must complete in one round trip; \
+                         the intermediate result is withheld"
+                            .to_string(),
+                        None,
+                    )),
+                    Err(e) => Err(e),
+                };
                 crate::elevated_access::record_elevated_call(
                     self,
                     &viewer,
                     &tool,
                     arguments.as_ref(),
                     jti,
-                    result,
+                    complete,
                 )
                 .await
+                .map(rmcp::model::CallToolResponse::from)
             }
             _ => result,
         }
@@ -3150,11 +3296,13 @@ impl ServerHandler for EpiGraphMcpFull {
             None => None,
         };
         let tools = self.manifest_for(http, auth.as_ref()).await;
-        Ok(rmcp::model::ListToolsResult {
-            tools,
-            meta: None,
-            next_cursor: None,
-        })
+        // The manifest is per caller (above), so it carries no cache hints of
+        // its own: rmcp fills the absent ones with `ttlMs: 0` and
+        // `cacheScope: "private"` for peers on protocol 2026-07-28 or later
+        // (`ServerResult::fill_missing_cache_hints`), and omits them for
+        // older peers. A `Public` scope would let a shared cache serve one
+        // caller's manifest to another.
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -3401,9 +3549,70 @@ mod session_factory_tests {
             "every session must share the template's agent_db_id cell"
         );
         assert!(
-            !Arc::ptr_eq(&a.seen_auth_lineage, &b.seen_auth_lineage),
-            "the OPERATED_BY memo is per-session by contract"
+            Arc::ptr_eq(&a.seen_auth_lineage, &b.seen_auth_lineage),
+            "every session must share the template's OPERATED_BY memo: on rmcp 3.x's \
+             stateless 2026-07-28 path the factory runs once per REQUEST"
         );
+    }
+
+    /// Behavioural: a principal one session has linked is NOT re-linked by a
+    /// new session. rmcp 3.x runs the factory once per request on the
+    /// stateless 2026-07-28 path, so a per-session memo would put
+    /// `record_auth_lineage`'s database round trip (the signer lookup, a pool
+    /// connection and the `OPERATED_BY` upsert) in front of every such tool
+    /// call.
+    ///
+    /// The pool points at a listener that accepts and never answers, so any
+    /// database access hangs until the 30 s acquire timeout; the memo hit
+    /// must return well inside 5 s.
+    ///
+    /// Mutation: make `SessionFactory::session` give each session a fresh
+    /// `seen_auth_lineage` -> the second call goes to the database and this
+    /// test times out.
+    #[tokio::test]
+    async fn a_principal_linked_in_one_session_is_not_relinked_by_the_next() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent listener");
+        let addr = silent.local_addr().expect("local addr");
+        let accepted = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = silent.accept().await {
+                held.push(conn);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_lazy(&format!("postgres://nobody:nothing@{addr}/none"))
+            .expect("a lazy pool never connects at construction");
+        let signer = Arc::new(AgentSigner::from_bytes(&[0x5Eu8; 32]).expect("signer"));
+        let embedder = Arc::new(McpEmbedder::new(pool.clone(), None));
+        let sessions = SessionFactory::new(EpiGraphMcpFull::new_shared_with_federation(
+            pool,
+            signer,
+            embedder,
+            false,
+            crate::federation::SharedFederation::empty(),
+            None,
+        ));
+
+        let principal = uuid::Uuid::new_v4();
+        // What a successful `record_auth_lineage` leaves behind in session one.
+        sessions
+            .session()
+            .seen_auth_lineage
+            .lock()
+            .await
+            .insert(principal);
+
+        let next = sessions.session();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            next.record_auth_lineage(Some(principal)),
+        )
+        .await
+        .expect("an already-linked principal must short-circuit, not reach the database");
+        accepted.abort();
     }
 
     /// Behavioural: once one session has resolved the agent, a NEW session
