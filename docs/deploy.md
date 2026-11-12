@@ -2548,9 +2548,10 @@ epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
 - **Who**: the source is `--from-group` or, without it, the operator's
   personal group. The rows are private, so the source is held to the same
   rule as the target: an active `team` or `community` group the operator is a
-  live admin of, or the operator's OWN personal group. Another person's
-  personal group and an operated agent's are refused as `--from-group` even
-  when the operator administers them. The target must be another group that
+  live admin of, or the OWN personal group of an operator who is a registered
+  human operator. Another person's personal group and an operated agent's are
+  refused as `--from-group` even when the operator administers them, and an
+  operated agent passed as `--operator` cannot move its own group's rows. The target must be another group that
   passes the same rule (the one `regroup-claims` applies). `--visibility
   group` is required and `--catch-up` is refused.
 - **Public input is refused**: a public generation holds its lineage

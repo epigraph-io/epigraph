@@ -3674,6 +3674,42 @@ async fn a_private_move_refuses_another_persons_or_an_agents_personal_group_as_s
         assert!(!m.exists(), "case {i}");
     }
     assert_eq!(snapshot(&pool).await, before, "nothing is written");
+    // The operated agent as --operator, with no --from-group: the default
+    // source is the agent's own personal group, which is not a registered
+    // human operator's own group, so it is refused just the same.
+    make_admin(&pool, fx.target, agent).await;
+    let before = snapshot(&pool).await;
+    let file = names_file(&dir, &["zeta-agent"]);
+    let m = dir.join("agent.jsonl");
+    let (target, agent_s) = (fx.target.to_string(), agent.to_string());
+    let mut args = vec![
+        "reown-workflows",
+        "--canonical-names-file",
+        file.to_str().unwrap(),
+        "--target-group",
+        &target,
+        "--operator",
+        &agent_s,
+        "--manifest-out",
+        m.to_str().unwrap(),
+        "--apply",
+        "--confirm-count",
+        "1",
+        "--ruling",
+        RULING,
+        "--reason",
+        "an operated agent moving its own group's private rows",
+    ];
+    args.extend(PRIVATE.iter().copied());
+    let r = run_op(&pool, &args).await;
+    assert_eq!(r.code, 1, "default source: {}", r.show());
+    assert!(
+        r.stderr.contains("not the operator's own personal group"),
+        "default source: {}",
+        r.show()
+    );
+    assert!(!m.exists());
+    assert_eq!(snapshot(&pool).await, before, "nothing is written");
     // The operator's own personal group, named explicitly, is a source.
     narrowed(&pool, &fx, &dir).await;
     let m = dir.join("own.jsonl");
