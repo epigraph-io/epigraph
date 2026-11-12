@@ -3698,6 +3698,84 @@ async fn a_private_move_refuses_another_persons_or_an_agents_personal_group_as_s
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The hand-off rule lets a private row change hands only when the SOURCE (or
+/// the target) owns it. A third group's private claim K with an edge to the
+/// moving step S1: the edge is K's group's, co-owned by the source, and the
+/// move would make it (K's group, co-owner target), a tuple that still
+/// requires every group the old one did with the source replaced by the
+/// target. Only the source-owner guard holds it, since the owner is K's group:
+/// the lineage is HELD naming the edge, and the edge is untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_move_holds_a_third_groups_edge_even_when_its_image_is_kept(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    narrowed(&pool, &fx, &dir).await;
+    let e = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let k = claim(
+            &mut m,
+            fx.operator,
+            fx.stranger_group,
+            "group",
+            0,
+            "a third group's note",
+        )
+        .await;
+        edge(&mut m, (k, "claim"), (fx.s1, "claim"), "supports").await
+    };
+    let prior = (fx.stranger_group, "group".to_string(), Some(fx.src));
+    assert_eq!(edge_tenancy(&pool, e).await, prior, "the trigger's meet");
+    let before = snapshot(&pool).await;
+    let m = dir.join("private.jsonl");
+    let dry = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        None,
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(&dry.stdout, "HELD-LINEAGE\talpha\t", &[&e.to_string()]),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        dry.show()
+    );
+    let r = run_names(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        &["alpha", "beta"],
+        fx.target,
+        None,
+        Some("1"),
+        PRIVATE,
+    )
+    .await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert_eq!(edge_tenancy(&pool, e).await, prior);
+    for w in [fx.w_a0, fx.w_a1] {
+        assert_eq!(
+            tenancy(&pool, "workflows", w).await,
+            (fx.src, "group".to_string())
+        );
+    }
+    let rev = reverse(&pool, &m, true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(snapshot(&pool).await, before);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Public input is reown-workflows' public act, never a private move's: a
 /// public lineage is HELD (`public`), and so is a private lineage whose
 /// unshared plan claim is public (the plan would split). Nothing is written,
