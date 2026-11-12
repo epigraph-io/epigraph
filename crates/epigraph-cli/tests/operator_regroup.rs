@@ -2433,6 +2433,125 @@ async fn sealed_evidence_holds_its_claim_in_the_move_and_in_the_reversal(pool: P
     assert_eq!(row(&pool, "evidence", fx.ev_b).await, grp(fx.dst));
 }
 
+/// An active key epoch 0 for `group` (the seals' foreign key).
+async fn key_epoch(pool: &PgPool, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+        &[group],
+    )
+    .await;
+}
+
+async fn seal_version(pool: &PgPool, cv: Uuid, claim: Uuid, group: Uuid) {
+    exec(
+        pool,
+        "INSERT INTO claim_version_encryption (claim_version_id, claim_id, group_id, epoch, \
+                                               encrypted_content) \
+         VALUES ($1, $2, $3, 0, ''::bytea)",
+        &[cv, claim, group],
+    )
+    .await;
+}
+
+/// A claim with a sealed VERSION (`claim_version_encryption`) and no
+/// `claim_encryption` row is held as sealed: the version row would follow the
+/// claim away from the group that keys its ciphertext. A version sealed under
+/// the target after the act holds the claim in the reversal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_claim_version_holds_its_claim_in_the_move_and_in_the_reversal(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let g = fx.operator_group;
+    seal_version(&pool, fx.cv_a, fx.a, fx.src).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains("PLAN: 1 requested, 0 eligible, 1 held, 0 already ('group', target)"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        has_line(
+            &dry.stdout,
+            "HELD\t",
+            &[&fx.a.to_string(), "sealed", "claim_version_encryption"]
+        ),
+        "{}",
+        dry.show()
+    );
+    let held = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &dir.join("held.jsonl"),
+            apply_count: Some(0),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(held.code, 3, "{}", held.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(fx.src));
+    assert_eq!(row(&pool, "claim_versions", fx.cv_a).await, grp(fx.src));
+
+    // Unsealed, A moves; its version sealed under the target since holds the
+    // reversal.
+    exec(
+        &pool,
+        "DELETE FROM claim_version_encryption WHERE claim_version_id = $1",
+        &[fx.cv_a],
+    )
+    .await;
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    key_epoch(&pool, g).await;
+    seal_version(&pool, fx.cv_a, fx.a, g).await;
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        has_line(
+            &rv.stdout,
+            "HELD\t",
+            &[&fx.a.to_string(), "claim_version_encryption"]
+        ),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(g));
+    assert_eq!(row(&pool, "claim_versions", fx.cv_a).await, grp(g));
+}
+
 /// An evidence edge from B's evidence to the evidence of a claim S2 that is
 /// not in the manifest: the neighbour watch sees only claim endpoints, so S2
 /// moving on to H after the act is invisible to it, and the edge itself is

@@ -16,8 +16,10 @@
 //! `('group', TARGET)` counts as done, so a re-run resumes. Every other listed
 //! claim is HELD with its reason: a public claim (`public-claim`: regroup never
 //! touches public input; that is `restrict-claims`' job), a claim of another
-//! group (`not-in-source`), a sealed claim (`sealed`: its ciphertext is the
-//! source group's).
+//! group (`not-in-source`), a sealed claim (`sealed`: a `claim_encryption`
+//! row, or a `claim_version_encryption` row on one of its versions, whose
+//! version row would follow the claim; the ciphertext is keyed to the group
+//! that sealed it).
 //!
 //! A claim is also HELD, WHOLE, when a row it carries would not follow it
 //! cleanly, so a claim is never moved partially:
@@ -144,7 +146,8 @@
 //! the state this run left it; a recorded row that is in neither its prior nor
 //! its post state (nor the meet a partial reversal leaves an edge on), a row
 //! written after the act (the cascade would carry it into the source), a
-//! neighbour that moved since, evidence sealed since, or an edge whose
+//! neighbour that moved since, a claim, claim version or evidence row sealed
+//! since, or an edge whose
 //! recorded tuple would be WIDER than the exact meet of its endpoints after
 //! the restore (an endpoint the neighbour watch does not cover moved: a
 //! foreign claim's evidence, a node), HOLDS the claim. An edge is put back on
@@ -162,9 +165,8 @@ use super::manifest::{self, Record, Sink, Writer};
 use super::reown::{counter_delta, counter_violations, BatchError};
 use super::restrict::{
     claim_record, edge_ends, edge_ids, evidence_ids, fetch_evidence_edges, is_outsider_challenge,
-    meet, narrows, operator_details, pinned_of, reader_groups, record_of, sealed_of, sha256_file,
-    sha256_hex, spec_of, states_of, unenforced_reasons, write_audit, write_rows, EdgeEnds,
-    RowState,
+    meet, narrows, operator_details, pinned_of, reader_groups, record_of, sha256_file, sha256_hex,
+    spec_of, states_of, unenforced_reasons, write_audit, write_rows, EdgeEnds, RowState,
 };
 use super::tables::{
     self, app_readable, app_readable_as, fetch_attached, fetch_claims, xact_counters, Attached,
@@ -252,7 +254,11 @@ pub enum Hold {
         owner: Uuid,
         visibility: String,
     },
-    Sealed,
+    /// The claim is sealed: `seal` is `claim_encryption` (the claim itself)
+    /// or `claim_version_encryption` (one of its versions).
+    Sealed {
+        seal: &'static str,
+    },
     SealedEvidence {
         id: String,
     },
@@ -288,7 +294,7 @@ impl Hold {
             Self::NotFound => "not-found",
             Self::PublicClaim { .. } => "public-claim",
             Self::NotInSource { .. } => "not-in-source",
-            Self::Sealed => "sealed",
+            Self::Sealed { .. } => "sealed",
             Self::SealedEvidence { .. } => "sealed-evidence",
             Self::PublicRow { .. } => "public-row",
             Self::ThirdGroup { .. } => "third-group",
@@ -312,9 +318,10 @@ impl fmt::Display for Hold {
                 f,
                 "the claim is ({owner}, {visibility}), not ('group', source)"
             ),
-            Self::Sealed => write!(
+            Self::Sealed { seal } => write!(
                 f,
-                "the claim is sealed (claim_encryption): its ciphertext is the source group's"
+                "the claim is sealed ({seal}): its ciphertext is keyed to the group that sealed \
+                 it, so the row would move where no target member can decrypt it"
             ),
             Self::SealedEvidence { id } => write!(
                 f,
@@ -904,6 +911,41 @@ async fn sealed_evidence_of(
     Ok(v.into_iter().map(|u| u.to_string()).collect())
 }
 
+/// The claims among `ids` that are sealed, with the table that seals them: a
+/// `claim_encryption` row (the claim itself), or else a
+/// `claim_version_encryption` row (one of its versions; the version row
+/// follows the claim, away from the group that keys its ciphertext).
+/// `reown-workflows`' private move holds the same set.
+async fn sealed_claims_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeMap<Uuid, &'static str>> {
+    let mut out = BTreeMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    for (seal, sql) in [
+        (
+            "claim_encryption",
+            "SELECT DISTINCT claim_id FROM claim_encryption WHERE claim_id = ANY($1)",
+        ),
+        (
+            "claim_version_encryption",
+            "SELECT DISTINCT claim_id FROM claim_version_encryption WHERE claim_id = ANY($1)",
+        ),
+    ] {
+        let v: Vec<Uuid> = sqlx::query_scalar(sql)
+            .bind(ids)
+            .fetch_all(&mut *conn)
+            .await
+            .with_context(|| format!("reading {seal}"))?;
+        for id in v {
+            out.entry(id).or_insert(seal);
+        }
+    }
+    Ok(out)
+}
+
 /// The tables every batch (apply and reverse) holds `SHARE ROW EXCLUSIVE` on
 /// for its duration: the derived tables with no key to claims
 /// (`tables::unkeyed_tables`), plus `edges` and `harvester_fragments`.
@@ -1209,7 +1251,9 @@ async fn run_batch(
         .await?;
     let locked = fetch_claims(conn, batch, true).await?;
     tables::lock_unkeyed_tables(conn, ctx.unkeyed).await?;
-    let sealed = sealed_of(conn, batch).await?;
+    // The claims are locked FOR UPDATE above, so no seal of either kind (a
+    // foreign key onto `claims`) can land on one before this batch commits.
+    let sealed = sealed_claims_of(conn, batch).await?;
 
     let by_id: BTreeMap<Uuid, &ClaimRow> = locked.iter().map(|r| (r.id, r)).collect();
     let mut cands: BTreeSet<Uuid> = BTreeSet::new();
@@ -1220,7 +1264,9 @@ async fn run_batch(
         };
         match classify_claim(c, ctx.source, ctx.target) {
             Ok(false) => out.already += 1,
-            Ok(true) if sealed.contains(id) => out.held.push((*id, Hold::Sealed)),
+            Ok(true) if sealed.contains_key(id) => {
+                out.held.push((*id, Hold::Sealed { seal: sealed[id] }))
+            }
             Ok(true) => {
                 cands.insert(*id);
             }
@@ -1726,7 +1772,7 @@ async fn pre_pass(
     let (mut eligible, mut already, mut held) = (Vec::new(), Vec::new(), Vec::new());
     for chunk in ids.chunks(5000) {
         let rows = fetch_claims(conn, chunk, false).await?;
-        let sealed = sealed_of(conn, chunk).await?;
+        let sealed = sealed_claims_of(conn, chunk).await?;
         let by_id: BTreeMap<Uuid, &ClaimRow> = rows.iter().map(|r| (r.id, r)).collect();
         let mut cands = BTreeSet::new();
         for id in chunk {
@@ -1736,7 +1782,9 @@ async fn pre_pass(
             };
             match classify_claim(c, ctx.source, ctx.target) {
                 Ok(false) => already.push(*id),
-                Ok(true) if sealed.contains(id) => held.push((*id, Hold::Sealed)),
+                Ok(true) if sealed.contains_key(id) => {
+                    held.push((*id, Hold::Sealed { seal: sealed[id] }))
+                }
                 Ok(true) => {
                     cands.insert(*id);
                 }
@@ -2166,7 +2214,7 @@ async fn reverse_batch(
     let ids: Vec<Uuid> = batch.iter().map(|(id, _)| *id).collect();
     let locked = fetch_claims(conn, &ids, true).await?;
     tables::lock_unkeyed_tables(conn, rc.unkeyed).await?;
-    let sealed = sealed_of(conn, &ids).await?;
+    let sealed = sealed_claims_of(conn, &ids).await?;
     let now: BTreeMap<Uuid, &ClaimRow> = locked.iter().map(|c| (c.id, c)).collect();
     let prior_claims: BTreeMap<Uuid, &Record> = res.claims.iter().map(|(i, r)| (*i, r)).collect();
 
@@ -2207,10 +2255,14 @@ async fn reverse_batch(
             ));
             continue;
         }
-        if sealed.contains(id) {
+        if let Some(seal) = sealed.get(id) {
             out.held.push((
                 *id,
-                "the claim has been sealed since; its ciphertext is the target's".into(),
+                format!(
+                    "the claim has been sealed since the run ({seal}); its ciphertext is not \
+                     the source group's, so restoring it would leave it undecryptable; not \
+                     reversing"
+                ),
             ));
             continue;
         }
