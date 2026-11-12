@@ -897,6 +897,9 @@ async fn schema_contract_tenancy_bookkeeping_tables(pool: PgPool) {
 async fn agents_tenancy_columns_are_intact(pool: PgPool) {
     let expected: &[(&str, &str, &str)] = &[
         ("default_group_id", "uuid", "YES"),
+        // 209: NOT NULL, so "no private default" is `false`, never an unknown
+        // that a `WHERE default_private` reader would skip either way.
+        ("default_private", "boolean", "NO"),
         ("key_kind", "character varying", "NO"),
         ("profile_visibility", "character varying", "NO"),
     ];

@@ -404,6 +404,11 @@ async fn agents_identity_columns_are_not_app_updatable(pool: PgPool) {
         "role",
         "state",
         "metadata",
+        // Where the agent's future claims land when a write names no
+        // visibility (206, 209): written only through the audited definers
+        // `epigraph_set_default_group` / `epigraph_set_agent_default_group`.
+        "default_group_id",
+        "default_private",
     ] {
         let r = sqlx::query(&format!("UPDATE agents SET {col} = {col} WHERE id = $1"))
             .bind(agent)

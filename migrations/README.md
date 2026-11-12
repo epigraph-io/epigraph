@@ -2619,6 +2619,32 @@ restart.
   claim write that names no visibility); undo only after rolling every such
   binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **209**: public `agent_default_private` (operator ruling 2026-11-12;
+  `docs/tenancy/claim-visibility-controls.md` section 7). Adds
+  `agents.default_private boolean NOT NULL DEFAULT false` with the CHECK
+  `agents_default_private_or_group` (never set together with
+  `default_group_id`), and two SECURITY DEFINER functions on 172's form,
+  owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
+  `epigraph_app`: the read `epigraph_default_private(uuid)` and the write
+  `epigraph_set_agent_default_group(uuid, uuid, boolean)` (a team, private,
+  or clear, for the session principal itself or, as a registered live human
+  operator, for an agent it holds a LIVE non-retired operator link to; VIS05
+  refuses anyone else; one `agent.default_group_set` row per call attributed
+  to the caller). Re-states 206's `epigraph_set_default_group(uuid)` to
+  delegate to it (same signature, refusals and one audit row; it now clears
+  a private default when it sets a team). Registered in `tenancy_backfill.rs`
+  (`DEFERRED_DEFINER_FUNCTIONS` and the grant register). Pinned by
+  `epigraph-mcp/tests/claim_visibility_controls_app_role.rs` Part D,
+  `epigraph-api/tests/claim_visibility_http.rs`,
+  `epigraph-cli/tests/operator_set_default_group.rs` and
+  `epigraph-db/tests/agent_default_private_undo.rs`. Undo:
+  `docs/runbooks/209-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 209, restoring 206's setter body byte for byte); it LOSES
+  every private default. Checked before claiming: no migration on main, open
+  PR or origin branch carries a `209`. **Deploy order:** migrate and roll out
+  the 209 binary together (a 206..208 binary ignores `default_private`), then
+  set private defaults; undo only after rolling every 209 binary back.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
