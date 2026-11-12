@@ -294,11 +294,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "publicize_claims",
         &["ClaimRepository::publicize_conn"],
     ),
+    // The two default-group handlers (206's `me`, 209's `:id`) pass their
+    // viewer to `set_default_for`, which spends it on `write_as` and calls 209's
+    // setter definer on that stamped transaction; the definer decides whether
+    // the caller is the agent or its live operator. `writable_teams` reports
+    // the agent's teams back.
     (
         "claim_visibility.rs",
-        "set_default_group",
+        "set_default_for",
         &[
-            "ClaimRepository::set_default_group_conn",
+            "ClaimRepository::set_agent_default_conn",
             "ClaimRepository::writable_teams",
         ],
     ),

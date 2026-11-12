@@ -1904,10 +1904,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_visibility.rs",
-        "set_default_group_conn",
-        "WRITE through 206's definer `epigraph_set_default_group`: the STAMPED session \
-         principal's own `agents.default_group_id`, authority checked in the body (VIS01 / \
-         VIS02) and audited. The viewer is spent on the stamp.",
+        "set_agent_default_conn",
+        "WRITE through 209's definer `epigraph_set_agent_default_group` on a STAMPED \
+         transaction: one agent's `default_group_id` / `default_private`, authority decided in the \
+         body from the stamped principal (the agent itself, or its registered live human operator \
+         through a live, non-retired operator link; VIS01 / VIS02 / VIS05), audited. The viewer \
+         is spent on the stamp.",
     ),
     (
         "claim_visibility.rs",

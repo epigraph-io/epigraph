@@ -99,29 +99,45 @@ pub async fn share_claims_with_team(
     respond(outcomes)
 }
 
-/// `set_default_group`: the caller's default team (D-V1), or clear it.
+/// `set_default_group`: the default of the caller, or (`agent_id`, migration
+/// 209) of an agent the caller operates through a live operator link: a team,
+/// private, or clear.
 ///
 /// # Errors
-/// `INVALID_PARAMS` for a malformed id; `INVALID_REQUEST` for a group that is
-/// not one of the caller's writable teams.
+/// `INVALID_PARAMS` for a malformed id or a group together with `private`;
+/// `INVALID_REQUEST` for a group that is not one of the agent's writable teams,
+/// or a caller that is neither the agent nor its live human operator.
 pub async fn set_default_group(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: SetDefaultGroupParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let group = match params.group_id.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(s) => Some(
-            Uuid::parse_str(s)
-                .map_err(|_| invalid_params(format!("group_id {s:?} is not a uuid")))?,
-        ),
+    let uuid_of = |field: &str, raw: Option<&str>| -> Result<Option<Uuid>, McpError> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(s) => Uuid::parse_str(s)
+                .map(Some)
+                .map_err(|_| invalid_params(format!("{field} {s:?} is not a uuid"))),
+        }
+    };
+    let group = uuid_of("group_id", params.group_id.as_deref())?;
+    let target = uuid_of("agent_id", params.agent_id.as_deref())?;
+    let setting = match (group, params.private.unwrap_or(false)) {
+        (Some(_), true) => {
+            return Err(invalid_params(
+                "a default is a team (group_id) or private, not both",
+            ))
+        }
+        (Some(g), false) => epigraph_db::DefaultGroupSetting::Team(g),
+        (None, true) => epigraph_db::DefaultGroupSetting::Private,
+        (None, false) => epigraph_db::DefaultGroupSetting::Clear,
     };
     let caller = server.write_identity(auth, viewer).await?;
-    let agent = caller.agent_id();
+    let agent = target.unwrap_or_else(|| caller.agent_id());
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "set_default_group").await?;
-    epigraph_db::ClaimRepository::set_default_group_conn(&mut tx, group)
+    let set_by = epigraph_db::ClaimRepository::set_agent_default_conn(&mut tx, agent, setting)
         .await
         .map_err(visibility_caller_error)?;
     let teams = epigraph_db::ClaimRepository::writable_teams(&mut tx, agent)
@@ -130,7 +146,9 @@ pub async fn set_default_group(
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "agent_id": agent.to_string(),
-        "default_group_id": group.map(|g| g.to_string()),
+        "default_group_id": setting.group().map(|g| g.to_string()),
+        "default_private": setting.private(),
+        "set_by": set_by,
         "writable_teams": teams
             .into_iter()
             .map(|(g, via)| serde_json::json!({"group_id": g.to_string(), "via": via}))

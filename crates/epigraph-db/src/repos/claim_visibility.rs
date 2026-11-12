@@ -166,6 +166,38 @@ pub struct VisibilityActOutcome {
     pub outcome: String,
 }
 
+/// What [`ClaimRepository::set_agent_default_conn`] sets an agent's default to
+/// (migration 209).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultGroupSetting {
+    /// A team the agent may write (its own writer/admin membership or its live
+    /// human's), checked when it is set and again at every write.
+    Team(Uuid),
+    /// Private: a write that names no visibility lands in the agent's home
+    /// group, ahead of its human's default team and of the single-team
+    /// fallback.
+    Private,
+    /// Neither: the agent inherits its live human's default again.
+    Clear,
+}
+
+impl DefaultGroupSetting {
+    /// The team, if it is one.
+    #[must_use]
+    pub const fn group(self) -> Option<Uuid> {
+        match self {
+            Self::Team(g) => Some(g),
+            Self::Private | Self::Clear => None,
+        }
+    }
+
+    /// `true` for [`Self::Private`].
+    #[must_use]
+    pub const fn private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+}
+
 /// The user-facing word for a stored `(visibility, owner)` pair.
 fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
     match visibility {
@@ -180,7 +212,8 @@ fn label_of(visibility: Visibility, owner: Uuid, home: Uuid) -> &'static str {
 fn map_vis_error(e: sqlx::Error) -> DbError {
     if let sqlx::Error::Database(db) = &e {
         let msg = db.message();
-        if msg.starts_with("VIS01") || msg.starts_with("VIS02") {
+        // VIS05 (209): neither the agent itself nor its live human operator.
+        if msg.starts_with("VIS01") || msg.starts_with("VIS02") || msg.starts_with("VIS05") {
             return DbError::Refused {
                 kind: RefusalKind::Authority,
                 message: msg.to_string(),
@@ -195,7 +228,8 @@ fn map_vis_error(e: sqlx::Error) -> DbError {
         // A claim changed under the act after it was classified (migration
         // 206, "DECIDED ON THE ROWS IT WRITES"); nothing was changed and a
         // retry classifies the new state.
-        if msg.starts_with("VIS04") {
+        // VIS06 (209): the default's row did not move; nothing was changed.
+        if msg.starts_with("VIS04") || msg.starts_with("VIS06") {
             return DbError::Refused {
                 kind: RefusalKind::State,
                 message: msg.to_string(),
@@ -590,23 +624,35 @@ impl ClaimRepository {
         })
     }
 
-    /// Set (or, with `None`, clear) the session principal's default team.
-    /// `conn` must be stamped as that principal. Audited by the definer.
+    /// Set `agent`'s default (a team, private, or clear) through migration
+    /// 209's definer `epigraph_set_agent_default_group`, as the session
+    /// principal on `conn` (which must be stamped). The definer admits the
+    /// agent itself (`"self"`) or the registered live human operator holding a
+    /// live, non-retired operator link to it (`"operator"`), checks a team
+    /// against the AGENT's writable teams, and writes one
+    /// `agent.default_group_set` audit row attributed to the caller. Returns
+    /// how the caller was admitted.
     ///
     /// # Errors
-    /// `DbError::Refused` (`Authority`) without a principal or for a group that
-    /// is not one of the principal's writable teams; `DbError::QueryFailed`
+    /// `DbError::Refused`: `Authority` without a principal (VIS01), for a team
+    /// the agent may not write (VIS02), or for a caller that is neither the
+    /// agent nor its live operator (VIS05); `State` if the row did not move
+    /// (VIS06). Nothing is changed on any of them. `DbError::QueryFailed`
     /// otherwise.
-    pub async fn set_default_group_conn(
+    pub async fn set_agent_default_conn(
         conn: &mut PgConnection,
-        group: Option<Uuid>,
-    ) -> Result<(), DbError> {
-        sqlx::query("SELECT public.epigraph_set_default_group($1)")
-            .bind(group)
-            .execute(&mut *conn)
-            .await
-            .map_err(map_vis_error)?;
-        Ok(())
+        agent: Uuid,
+        setting: DefaultGroupSetting,
+    ) -> Result<String, DbError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT public.epigraph_set_agent_default_group($1, $2, $3)",
+        )
+        .bind(agent)
+        .bind(setting.group())
+        .bind(setting.private())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_vis_error)
     }
 
     /// Publish group-visible claims (group -> public), as the session principal

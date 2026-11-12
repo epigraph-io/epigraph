@@ -554,6 +554,11 @@ pub fn create_router_with_extensions(
             "/api/v1/agents/me/default-group",
             put(claim_visibility::set_default_group),
         )
+        // Migration 209: an operator sets the default of an agent it operates.
+        .route(
+            "/api/v1/agents/:id/default-group",
+            put(claim_visibility::set_agent_default_group),
+        )
         .route(
             "/api/v1/frames/:id/conflict-batch",
             post(belief::conflict_batch),

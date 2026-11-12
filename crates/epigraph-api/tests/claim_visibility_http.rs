@@ -1,7 +1,8 @@
 //! The HTTP half of the claim visibility controls
 //! (docs/tenancy/claim-visibility-controls.md, migration 206) on the
 //! APPLICATION ROLE: `POST /api/v1/claims` (plain tier),
-//! `POST /api/v1/claims/publicize` and `PUT /api/v1/agents/me/default-group`,
+//! `POST /api/v1/claims/publicize`, `PUT /api/v1/agents/me/default-group` and
+//! (migration 209) `PUT /api/v1/agents/:id/default-group`,
 //! each on a transaction stamped from the caller as `epigraph_app`
 //! (`connect_downgraded_for_tests`). The raw `db_pool` is the harness
 //! superuser, used only to seed and to read state back.
@@ -340,4 +341,127 @@ async fn a_rest_resubmit_reports_the_stored_private_tenancy_and_the_note(pool: P
         "{body}"
     );
     assert_eq!(tenancy(&pool, id).await, ("group".to_string(), home));
+}
+
+/// Migration 209 over REST. A human operator sets the agent it operates
+/// PRIVATE through `PUT /api/v1/agents/:id/default-group`, and the agent's
+/// write that names no visibility then resolves to the operator's personal
+/// group although the operator's own default is the team. A human
+/// operator that does not operate the agent gets 403 and changes nothing; a
+/// group together with `private` is a 400; a `null` body clears; and
+/// `PUT /api/v1/agents/me/default-group` takes `private` for the caller itself.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_sets_its_agents_default_private_over_rest(pool: PgPool) {
+    let (addr, _stop) = spawn_app_with(&pool, true).await;
+    let ndi = team(&pool, "http-ndi").await;
+    let (human, human_home) = fixture::seed_human_operator(&pool, "http-def-human").await;
+    let (stranger, _) = fixture::seed_human_operator(&pool, "http-def-stranger").await;
+    let (crew, _) = fixture::seed_agent_with_group(&pool, "http-def-crew").await;
+    add_member(&pool, ndi, human, "writer").await;
+    add_member(&pool, ndi, stranger, "admin").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
+            .await
+            .expect("live link");
+    }
+    let default_of = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<Uuid>, bool)>(
+                "SELECT default_group_id, default_private FROM agents WHERE id = $1",
+            )
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("default")
+        }
+    };
+    let path = format!("/api/v1/agents/{crew}/default-group");
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::PUT,
+        "/api/v1/agents/me/default-group",
+        human,
+        json!({"group_id": ndi}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::PUT,
+        &path,
+        stranger,
+        json!({"private": true}),
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "a human operator that does not operate it: {body}"
+    );
+    assert_eq!(default_of(crew).await, (None, false));
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::PUT,
+        &path,
+        human,
+        json!({"group_id": ndi, "private": true}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::PUT,
+        &path,
+        human,
+        json!({"private": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["agent_id"], crew.to_string(), "{body}");
+    assert_eq!(body["set_by"], "operator", "{body}");
+    assert_eq!(body["default_private"], true, "{body}");
+    assert_eq!(default_of(crew).await, (None, true));
+
+    // An operated agent writes over stdio only (its HTTP token is refused), so
+    // the default the REST route set is checked where every surface's write
+    // resolves it: `resolve_write_decl` with no visibility named. The MCP
+    // app-role suite (Part D) writes the claim and checks who can read it.
+    let resolved = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::ClaimRepository::resolve_write_decl(
+            &mut conn,
+            crew,
+            epigraph_core::VisibilityChoice::Default,
+        )
+        .await
+        .expect("resolve")
+    };
+    assert_eq!(resolved.resolved, "private");
+    assert_eq!(resolved.home_group, human_home);
+    assert_eq!(
+        resolved.decl,
+        epigraph_core::TenancyDecl::group(human_home),
+        "private to the operator's personal group, not the operator's default team"
+    );
+
+    let (status, body) = send(addr, reqwest::Method::PUT, &path, human, Value::Null).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(default_of(crew).await, (None, false), "a null body clears");
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::PUT,
+        "/api/v1/agents/me/default-group",
+        human,
+        json!({"private": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["set_by"], "self", "{body}");
+    assert_eq!(default_of(human).await, (None, true));
 }
