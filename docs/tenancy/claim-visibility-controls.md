@@ -3,6 +3,8 @@
 Status: built, 2026-11-05. Branch `feat/claim-visibility-controls`. Owner decisions D-V1..D-V5 are
 recorded at the end (section 6), and the build follows them. Migration 206; `epigraph-db`
 `repos/claim_visibility.rs`; MCP `tools/visibility.rs`; HTTP `routes/claim_visibility.rs`.
+Extended 2026-11-12 by migration 209 (section 7): an agent's default can be **private**, and a
+live human operator can set the default of an agent it operates.
 
 ## 1. Problem
 
@@ -125,6 +127,11 @@ unstamped connection. The document ingest calls it directly, because its `owner_
   `default_group_of`, then `human_default_group_of`), else the single writable team. An explicit
   `Team(None)` that finds no single team is refused (`Input`), because the caller asked for a
   team. `Default` falls back to private, with a note.
+* `Default` only, since migration 209 (section 7): a **private default** is checked first. If the
+  agent's own `default_private` is set, the write is `TenancyDecl::group(H)`. If the agent has no
+  usable default team of its own and its live human's `default_private` is set, the same. Either
+  beats the human's default team and the single-team fallback. The response carries a
+  `visibility_note` that says the default was private.
 
 Resolution runs **before** the author-stamped transaction opens. When the author writes the team
 only through its human (`via = 'operator'`, D-V3), the result carries a `TeamWriteGrant`. Only
@@ -345,16 +352,18 @@ job (another session), not this one.
 ### 4.4 Surfaces
 
 * MCP `publicize_claims {claim_ids: [..≤500], reason}`, `share_claims_with_team {claim_ids,
-  group_id, reason}` and `set_default_group {group_id?}`. All need `claims:write`
+  group_id, reason}` and `set_default_group {group_id?, private?, agent_id?}` (the last two since
+  209, section 7.3). All need `claims:write`
   (`scope_map.rs`). Each runs on the caller's own stamped transaction (`begin_author_stamped_tx`)
   and calls the definer.
-* REST `POST /api/v1/claims/publicize`, `POST /api/v1/claims/share-with-team` and
-  `PUT /api/v1/agents/me/default-group`, with the same bodies and the `claims:write` scope, on
+* REST `POST /api/v1/claims/publicize`, `POST /api/v1/claims/share-with-team`,
+  `PUT /api/v1/agents/me/default-group` and (209) `PUT /api/v1/agents/:id/default-group`, with
+  the same bodies and the `claims:write` scope, on
   `AppState::write_as`. Refusals map by kind: 400 input, 403 authority, 409 state. A claim the
   caller cannot read is 404, exactly as a missing one.
 
 Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
-`set_default_group_conn`.
+`set_agent_default_conn` (209; it replaced 206's `set_default_group_conn`).
 
 ## 5. Tests (app role, `ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 
@@ -411,7 +420,8 @@ now measures the stamped structural edges), and the explicit-`public` fixtures.
   no default. A default write **never** falls back to public. `default_group_id` (062) was
   unused. Migration 206 adds `epigraph_set_default_group`, served as MCP `set_default_group`
   and REST `PUT /api/v1/agents/me/default-group`, validated against the same team list and
-  audited (`agent.default_group_set`).
+  audited (`agent.default_group_set`). Amended 2026-11-12 (section 7): a default can also be
+  private, which beats every team in this chain.
 * **D-V2 who may publicize: team admins only.** It takes the caller's **own** live `admin`
   membership of the claim's owning group. An operated agent does not inherit its human's admin
   role for this act. There is no second approver, and every publicize writes a
@@ -436,3 +446,144 @@ now measures the stamped structural edges), and the explicit-`public` fixtures.
   2026-11-05: an epiclaw-host packet that names no `visibility` lands private in the human's
   group, and is refused where the host has no membership and only the legacy policies
   admitted it (§3.6). The host changes, not the default.
+
+## 7. A private default, set by the agent or by its live operator (migration 209, 2026-11-12)
+
+### 7.1 The ruling
+
+Operator ruling, 2026-11-12. The operator wants his own default team to be NDI. The agents he
+operates must not inherit it: the epiclaw container agents, the recorder, and the stdio MCP
+agents. Under section 3.2 they would. An operated agent writes every team its human writes
+(D-V3). So once the human sets a default team, or writes only one team, a write by one of those
+agents that names no visibility lands in that team, and every member of the team can read it.
+The ruling: "epiclaw defaults to my private group". A write by an agent that names no visibility
+lands PRIVATE in its home group unless the agent asks for a team. For an operated agent, the
+home group is its operator's personal group (`default_decl_for_author` → `operator_group_id`).
+
+### 7.2 Representation and resolution
+
+`agents.default_private boolean NOT NULL DEFAULT false`, beside 062's `default_group_id`, with
+`CHECK (NOT default_private OR default_group_id IS NULL)` (`agents_default_private_or_group`).
+The three states are:
+
+| `default_group_id` | `default_private` | meaning                                           |
+|--------------------|-------------------|---------------------------------------------------|
+| NULL               | false             | no default of its own: inherit the live human's    |
+| T                  | false             | team T (checked writable at every write, as 206)  |
+| NULL               | true              | private                                           |
+
+Why not a sentinel in `default_group_id`. The FK rules out a made-up id. The only real group that
+could mean "private" is the home group itself, and a home group is never one of
+`epigraph_writable_teams`. Any reader that does not know the convention would therefore treat it
+as a stale team, skip it, and fall through to the human's default team. That reader could be
+206's resolver, an old binary during the rollout, or a later caller. Falling through is the leak
+the ruling closes. The home group also moves when the operator link changes. Why not a
+`default_visibility` text column: D-V1 says a default never resolves to public, and a boolean
+cannot be widened into one.
+
+The app role has no UPDATE on either column (118's column grant). The definers below are the
+only writers.
+
+Resolution (`ClaimRepository::resolve_visibility_choice`, `Default` only):
+
+1. The agent's own `default_private` (`epigraph_default_private(agent)`): private.
+2. The agent's own default team, if still writable (206).
+3. Only when 2 found nothing usable: the live human's `default_private`
+   (`epigraph_default_private(epigraph_human_of(agent, true))`): private. A human that defaults
+   to private passes that on to agents that set nothing.
+4. The live human's default team, if writable (206).
+5. The single writable team (206).
+6. Private, with D-V1's note (206).
+
+An explicit visibility always wins. `private`, `public`, `team` with a `group_id`, and `team`
+without one all ignore a private default. `team` without a `group_id` resolves through steps 2,
+4 and 5, because the caller asked for a team.
+
+### 7.3 Who may set it, and the surfaces
+
+`epigraph_set_agent_default_group(p_agent uuid, p_group uuid, p_private boolean) RETURNS text`
+is a SECURITY DEFINER on 172's form, owned by `epigraph_maintenance` and granted to
+`epigraph_app`. It reads the caller from `epigraph_principal_id()` and admits:
+
+* `self`: the principal is `p_agent`;
+* `operator`: the principal is a registered live human operator (`epigraph_is_human_operator`)
+  holding a **live, non-retired** `operator_links` row for `p_agent`.
+
+Anyone else gets `VIS05` (42501) with nothing changed. The refusal does not say whether the agent
+exists. A retired link confers nothing (107 section 7). Neither does a 149 author-binding
+allowance, which binds an agent's writes to a human without a link. Such an agent can still set
+its own default.
+
+A team must be one of `epigraph_writable_teams(p_agent)`, checked for the agent, not the caller
+(`VIS02`). A team and `private` together are refused (`VIS03`).
+
+Each call writes one `security_events` row, `agent.default_group_set`. Its `agent_id` is the
+caller, as 077's `security_events_append` requires. Its `details` hold `target_agent_id`, `via`,
+`operator_id` (when `via = operator`), `previous`, `previous_private`, `default_group_id`,
+`default_private`, `migration: 209` and `session_user`. The UPDATE must move exactly the one
+locked row, or the call raises `VIS06` instead of auditing a change that did not happen.
+
+206's `epigraph_set_default_group(uuid)` keeps its signature and now delegates to the new
+function for the principal. It therefore clears a private default when it sets a team (the CHECK
+requires that), and it still writes exactly one audit row.
+
+Surfaces, all on the caller's stamped transaction (the CLI stamps `--operator`):
+
+* REST `PUT /api/v1/agents/me/default-group` and `PUT /api/v1/agents/:id/default-group`. The
+  body is `{"group_id": T}`, `{"private": true}`, or `{}` / `{"group_id": null}` / `null` to
+  clear. Both a group and `private` is a 400. Refusals are 403. The response is `{agent_id,
+  default_group_id, default_private, set_by: self | operator, writable_teams}`.
+* MCP `set_default_group {group_id?, private?, agent_id?}`, with the same response.
+* `epigraph-operator set-default-group --operator <human> --agent <id> [--agent <id> ...]
+  (--group <id> | --private | --clear) [--apply]` on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN`. Without
+  `--apply` it is a dry run that executes the definer and rolls back, so a refusal shows before
+  anything is committed. All listed agents are set in ONE transaction: one refused agent refuses
+  them all (exit 1). The audit row's `session_user` names the maintenance login.
+
+### 7.4 What changes for existing callers
+
+* **Nothing changes until someone sets `private`.** Every existing agent migrates to
+  `default_private = false`, which is 206's behaviour exactly. An agent with no default of its
+  own still inherits its human's team (tested).
+* **An agent whose default is private, or whose live human's is,** now lands a no-visibility
+  write private in its home group. Before, it landed in its own or its human's default team, or
+  in its only team. Its writes also carry a `visibility_note` saying the default was private. A
+  workflow that relied on those writes being readable by team members must name the team on the
+  write (`visibility: "team"`, with or without `group_id`) or move the claims later with
+  `share_claims_with_team`.
+* **206's setter now clears a private default** when it sets a team or clears. An old binary's
+  `set_default_group` therefore undoes a private default the operator set. Deploy the binary
+  together with the migration.
+* **Deploy order.** Apply 209, roll out the binary, and only then set private defaults. A 206..208
+  binary ignores `default_private` and would still send those agents' writes to the human's
+  default team. Undo is `docs/runbooks/209-undo.sql`. It **loses** every private default, so
+  those agents inherit the human's team again.
+* **Response shape.** The default-group responses gain `default_private` and `set_by`. MCP
+  `set_default_group` gains the optional `private` and `agent_id`. Existing callers that send
+  only `group_id` are unaffected.
+* **Audit readers.** 209's `agent.default_group_set` rows name the target in
+  `details.target_agent_id`, and `agent_id` is the caller. For a self-set those are the same
+  agent, as 206's rows were. For an operator-set, `agent_id` is the operator.
+
+### 7.5 Tests
+
+`epigraph-mcp/tests/claim_visibility_controls_app_role.rs` Part D (application role):
+
+* the human's default is NDI and the agent is set private by its operator, so the agent's
+  no-visibility write lands in the operator's personal group, an NDI reader cannot read it, and
+  one audit row is written with the previous and new values;
+* an unset agent still inherits the human's team, where the human writes two teams so the
+  single-team fallback cannot explain it;
+* private beats the single-team fallback;
+* an explicit `team` (with and without a group) and `public` beat a private default;
+* a stranger human operator, a sibling agent and an unknown agent id are refused with nothing
+  changed or audited, and the agent can set and clear its own default;
+* a retired link is refused, and the same operator on a live link is admitted;
+* a team must be writable by the agent, and the CHECK refuses both values at once;
+* 206's setter clears a private default and audits once.
+
+Also: `epigraph-api/tests/claim_visibility_http.rs` (both REST routes),
+`epigraph-cli/tests/operator_set_default_group.rs` (the CLI against a NOSUPERUSER maintenance
+login: dry run, apply, all-or-nothing refusal, foreign operator), and
+`epigraph-db/tests/agent_default_private_undo.rs` (the undo returns the catalog below 209 and
+restores 206's setter body byte for byte).
