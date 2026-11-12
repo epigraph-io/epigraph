@@ -2545,13 +2545,14 @@ epigraph-operator reown-workflows ... --manifest-out private-move-1.jsonl --appl
 epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
 ```
 
-- **Who**: the source is `--from-group` (the operator must be a live admin of
-  it) or, without it, the operator's personal group. The target must be
-  another group: an active `team` or `community` group the operator
-  administers, or the operator's OWN personal group (the rule
-  `regroup-claims` applies; never another person's personal group nor an
-  operated agent's). `--visibility group` is required and `--catch-up` is
-  refused.
+- **Who**: the source is `--from-group` or, without it, the operator's
+  personal group. The rows are private, so the source is held to the same
+  rule as the target: an active `team` or `community` group the operator is a
+  live admin of, or the operator's OWN personal group. Another person's
+  personal group and an operated agent's are refused as `--from-group` even
+  when the operator administers them. The target must be another group that
+  passes the same rule (the one `regroup-claims` applies). `--visibility
+  group` is required and `--catch-up` is refused.
 - **Public input is refused**: a public generation holds its lineage
   (`PublicInput`). An unshared public plan claim, or a public row a moving
   claim carries, holds its lineage as a hand-off, and an `--apply` then exits
@@ -2563,10 +2564,17 @@ epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
   An edge from a moved row to one that stays in its group becomes co-owned by
   both groups, readable only by a member of both (`CO-OWNED-EDGE`).
 - **Held whole**: a private row a third group owns, an edge whose new tuple
-  would drop a group its current one requires, and an edge to a group-private
+  would drop a group its current one requires, an edge to a group-private
   frame, context, perspective, community or reasoning trace that does not move
   (the edges trigger counts such a node as public, so the edge would go to the
-  target naming a node the target cannot read).
+  target naming a node the target cannot read), and a SEALED row: a plan claim
+  with a `claim_encryption` row or a sealed version
+  (`claim_version_encryption`), evidence of one with an `evidence_encryption`
+  row, or a moving edge with an `edge_encryption` row. A move does not re-key
+  ciphertext, and ciphertext never leaves the group it is keyed to, so the
+  `HELD-LINEAGE` line reads `<claim|evidence|edge> <id> is sealed (<table>,
+  keyed to group <group>)` and an `--apply` exits 3. Each batch re-plans under
+  its locks, so a seal that lands after the dry run holds too.
 - **Invariants per batch**: the public act's (every row's end state, the row
   census, the unstamped view, the atlas epoch), plus what a session reading
   ONLY the source and one reading ONLY the target read among the batch's rows,
@@ -2588,6 +2596,12 @@ records refuses the plan from the moment the move commits until its pins
 record the target. A non-member principal the client uses to prove that
 outsiders see nothing must NOT be a member of the target.
 
+Operator ruling, 2026-11-12: the pinned procurement pipeline moves, private,
+from the team group that runs it to the consultancy team group. In the steps
+below `<source>` is the team group that holds the pipeline now and `<target>`
+is the consultancy team group. The operator must be a live admin of both, and
+both must be active `team` or `community` groups (see **Who** above).
+
 0. Build the lineage list from what the client has pinned, not from memory:
    every pinned root and every child generation a root names. A root that
    names its children only in its own content (no `executes` or `variant_of`
@@ -2599,15 +2613,23 @@ outsiders see nothing must NOT be a member of the target.
    the dry run's `ELIGIBLE-WORKFLOW-ROWS` (generations, not lineages).
 1. Before the move, add the reader principal's agent to the target group
    (`epigraph-operator group-member add --group <target> --agent <reader agent>
-   --role reader --reason "<why>" --apply`; an operated agent is a member only
-   where its operator writes). Check the non-member principal is not in the
+   --role <role per operator ruling> --reason "<why>" --apply`). The role is
+   the operator's ruling, not this runbook's: the target group's membership
+   policy may admit new members as writers only, and an operated agent is a
+   member only where its operator writes. Check the non-member principal is not in the
    target (`epigraph-operator group-roster --group <target>`). If the client
    publishes new generations, its publishing agent needs a writer membership
    of the target too.
-2. Dry run the move. Stop on any `HELD-LINEAGE`, `LEFT-CLAIM` or
-   `SHARED-SPLIT` line for the pipeline's lineages: a claim left in the
-   source keeps the source as its owner, so an owner-group check refuses the
-   plan, and the reader would still need the source.
+2. Dry run the move (`--from-group <source> --target-group <target>
+   --from-visibility group --visibility group`). Stop on any `HELD-LINEAGE`,
+   `LEFT-CLAIM` or `SHARED-SPLIT` line for the pipeline's lineages, and on a
+   sealed hold in particular (a `HELD-LINEAGE` line reading `... is sealed
+   (claim_encryption | claim_version_encryption | evidence_encryption |
+   edge_encryption, keyed to group <source>)`): a claim left in the source
+   keeps the source as its owner, so an owner-group check refuses the plan,
+   and the reader would still need the source; a sealed row's lineage cannot
+   move with this tool (it does not re-key ciphertext) and needs its own
+   ruling.
 3. Pause the client's pinned schedules for these lineages (or pick a window
    with no fire), then apply with the dry run's count.
 4. Verify a plan fetch AS the reader principal for each pinned generation:
