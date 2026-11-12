@@ -1490,6 +1490,22 @@ async fn the_206_setter_clears_a_private_default_and_audits_once(pool: PgPool) {
     set_default(&pool, &s, crew, None, None, true)
         .await
         .expect("private");
+    // Counted on `agent_id` (the caller, here the agent itself), not on 209's
+    // `target_agent_id`, so a second, 206-shaped row would be counted too.
+    let rows_of = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM security_events \
+                  WHERE event_type = 'agent.default_group_set' AND agent_id = $1",
+            )
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+    let before = rows_of(crew).await;
     let v = viewer(&pool, crew).await;
     let mut tx = s.scoped.begin_as(&v).await.expect("stamped tx");
     let got: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_set_default_group($1)")
@@ -1500,5 +1516,52 @@ async fn the_206_setter_clears_a_private_default_and_audits_once(pool: PgPool) {
     tx.commit().await.expect("commit");
     assert_eq!(got, Some(f.ndi));
     assert_eq!(default_of(&pool, crew).await, (Some(f.ndi), false));
+    assert_eq!(
+        rows_of(crew).await - before,
+        1,
+        "exactly one row for one call"
+    );
     assert_eq!(default_audit(&pool, crew).await.len(), 2);
+}
+
+/// The operator arm needs BOTH a live link AND a LIVE registered human
+/// operator. Revoking a human operator (122's
+/// `epigraph_revoke_human_operator`) leaves its operator links live, so the
+/// link alone would still admit it: the `epigraph_is_human_operator` check is
+/// what refuses a revoked human. Calibrated: the same human and link are
+/// admitted before the revocation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_human_operator_cannot_set_its_agents_default(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (human, _) = fixture::seed_human_operator(&pool, "def-revoked-human").await;
+    let crew = crew_of(&pool, human, "def-crew-of-revoked").await;
+    set_default(&pool, &s, human, Some(crew), None, true)
+        .await
+        .expect("CALIBRATION: a live human with a live link");
+    assert_eq!(default_of(&pool, crew).await, (None, true));
+
+    let revoked: bool = sqlx::query_scalar(
+        "SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, 'test: revoked')",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("revoke the human operator");
+    assert!(revoked);
+    let live_link: bool =
+        sqlx::query_scalar("SELECT NOT retired FROM operator_links WHERE agent_id = $1")
+            .bind(crew)
+            .fetch_one(&pool)
+            .await
+            .expect("link");
+    assert!(
+        live_link,
+        "PREMISE: revoking the human leaves the link live"
+    );
+
+    let err = set_default(&pool, &s, human, Some(crew), None, false)
+        .await
+        .expect_err("a revoked human operator");
+    assert!(err.message.contains("VIS05"), "{err:?}");
+    assert_eq!(default_of(&pool, crew).await, (None, true), "unchanged");
 }

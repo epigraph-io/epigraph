@@ -5,9 +5,9 @@
 //! through 209, the undo leaves the `public` catalog (relations, columns,
 //! functions with body, owner and ACL, policies, triggers, constraints)
 //! exactly as it was below 209, and a second run changes nothing. Because the
-//! catalog compares function bodies by md5, this also pins that the undo
-//! restores 206's `epigraph_set_default_group` body byte for byte, which 209
-//! re-states.
+//! catalog compares whole function definitions by md5, this also pins that
+//! the undo restores 206's `epigraph_set_default_group` byte for byte
+//! (body, SECURITY DEFINER and pinned `search_path`), which 209 re-states.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -42,7 +42,10 @@ async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
 }
 
 /// The `public` catalog by name: relations, `agents` columns, functions (body,
-/// owner and ACL), policies, triggers and constraints.
+/// owner and ACL), policies, triggers and constraints. A function is hashed
+/// by its whole definition (`pg_get_functiondef`: SECURITY DEFINER, the pinned
+/// `search_path`, volatility and body), not its body alone, so an undo that
+/// restored 206's body without its definer attributes would be caught.
 async fn catalog(pool: &PgPool) -> BTreeSet<String> {
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT 'rel ' || c.relname || ' ' || c.relkind::text \
@@ -53,7 +56,9 @@ async fn catalog(pool: &PgPool) -> BTreeSet<String> {
           WHERE a.attrelid = 'public.agents'::regclass AND a.attnum > 0 AND NOT a.attisdropped \
          UNION ALL \
          SELECT 'fn ' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
-                || md5(p.prosrc) || ' ' || p.proowner::regrole::text || ' ' \
+                || CASE WHEN p.prokind IN ('f', 'p') THEN md5(pg_get_functiondef(p.oid)) \
+                        ELSE md5(p.prosrc) END \
+                || ' ' || p.proowner::regrole::text || ' ' \
                 || COALESCE(p.proacl::text, '-') \
            FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace \
          UNION ALL \

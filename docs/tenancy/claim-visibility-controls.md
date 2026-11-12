@@ -579,6 +579,7 @@ Surfaces, all on the caller's stamped transaction (the CLI stamps `--operator`):
 * a stranger human operator, a sibling agent and an unknown agent id are refused with nothing
   changed or audited, and the agent can set and clear its own default;
 * a retired link is refused, and the same operator on a live link is admitted;
+* a human operator revoked after linking (its link stays live) is refused;
 * a team must be writable by the agent, and the CHECK refuses both values at once;
 * 206's setter clears a private default and audits once.
 
@@ -586,4 +587,6 @@ Also: `epigraph-api/tests/claim_visibility_http.rs` (both REST routes),
 `epigraph-cli/tests/operator_set_default_group.rs` (the CLI against a NOSUPERUSER maintenance
 login: dry run, apply, all-or-nothing refusal, foreign operator), and
 `epigraph-db/tests/agent_default_private_undo.rs` (the undo returns the catalog below 209 and
-restores 206's setter body byte for byte).
+restores 206's setter byte for byte, hashed by `pg_get_functiondef`, so SECURITY DEFINER and
+the pinned `search_path` count). `app_role_table_lockdown.rs` pins that the application role has
+no UPDATE on `default_group_id` or `default_private` (42501).
