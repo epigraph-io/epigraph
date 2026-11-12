@@ -5,7 +5,10 @@
 //! Spec and owner decisions D-V1..D-V5: `docs/tenancy/claim-visibility-controls.md`.
 //! Database half: migration 206 (`epigraph_writable_teams`,
 //! `epigraph_default_group`, `epigraph_set_default_group`,
-//! `epigraph_publicize_claims`, `epigraph_share_claims_with_team`).
+//! `epigraph_publicize_claims`, `epigraph_share_claims_with_team`) and
+//! migration 209 (`agents.default_private`, `epigraph_default_private`,
+//! `epigraph_set_agent_default_group`: a private default, and an operator
+//! setting the default of an agent it operates).
 //!
 //! # Where this sits relative to `default_decl_for_author`
 //!
@@ -325,6 +328,38 @@ impl ClaimRepository {
         .await?)
     }
 
+    /// `agents.default_private` of `agent` itself (migration 209's definer
+    /// `epigraph_default_private`); `false` for an unknown agent.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails or migration 209 is absent.
+    pub async fn default_private_of(conn: &mut PgConnection, agent: Uuid) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_default_private($1)")
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// `agents.default_private` of `agent`'s live human
+    /// (`epigraph_human_of(agent, true)`); `false` with no live human. For a
+    /// human it is its own flag again.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails or migration 209 is absent.
+    pub async fn human_default_private_of(
+        conn: &mut PgConnection,
+        agent: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT public.epigraph_default_private(public.epigraph_human_of($1, true))",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     /// Resolve a caller-facing write's [`VisibilityChoice`] for `agent`.
     ///
     /// * `Public`: `('public', home)`, today's answer, byte for byte.
@@ -339,6 +374,12 @@ impl ClaimRepository {
     ///   lands PRIVATE with a note, and an explicit `Team(None)` is refused,
     ///   because the caller asked for a team and no single team is implied.
     ///   Never public.
+    /// * `Default` only (migration 209, operator ruling 2026-11-12): a PRIVATE
+    ///   default comes first. The agent's own `default_private`, else, when the
+    ///   agent has no usable default team of its own, its live human's. It
+    ///   wins over the human's default team and over the single-team fallback.
+    ///   An explicit `Team(None)` asked for a team and still resolves through
+    ///   the team chain.
     ///
     /// Run it on any connection: every read is a definer.
     ///
@@ -414,6 +455,15 @@ impl ClaimRepository {
                 }
             }
             VisibilityChoice::Team(None) | VisibilityChoice::Default => {
+                // 209: a PRIVATE default beats every team below it, the
+                // single-team fallback included, but only for a write that
+                // names no visibility. An explicit `team` asked for a team.
+                let by_default = choice == VisibilityChoice::Default;
+                if by_default && Self::default_private_of(&mut *conn, agent).await? {
+                    return Ok(Self::private_by_default(
+                        "this agent's own default is private",
+                    ));
+                }
                 let teams = Self::writable_teams(&mut *conn, agent).await?;
                 let writable =
                     |d: Option<Uuid>| d.and_then(|d| teams.iter().find(|(t, _)| *t == d));
@@ -424,6 +474,13 @@ impl ClaimRepository {
                 // would let a stale own default hide a valid human default.
                 let mut picked = writable(Self::default_group_of(&mut *conn, agent).await?);
                 if picked.is_none() {
+                    // The agent has no usable default team of its own, so its
+                    // live human's default decides, private included (209).
+                    if by_default && Self::human_default_private_of(&mut *conn, agent).await? {
+                        return Ok(Self::private_by_default(
+                            "the default of this agent's live human is private",
+                        ));
+                    }
                     picked = writable(Self::human_default_group_of(&mut *conn, agent).await?);
                 }
                 let picked = picked.or_else(|| (teams.len() == 1).then(|| &teams[0]));
@@ -457,6 +514,18 @@ impl ClaimRepository {
                     )),
                 })
             }
+        }
+    }
+
+    /// A no-visibility write that a private default (209) sent home.
+    fn private_by_default(why: &str) -> ChoiceResolution {
+        ChoiceResolution::Home {
+            public: false,
+            note: Some(format!(
+                "no visibility was named and {why}, so this is PRIVATE (readable only by your \
+                 home group). share_claims_with_team moves it into a team and publicize_claims \
+                 publishes it"
+            )),
         }
     }
 
