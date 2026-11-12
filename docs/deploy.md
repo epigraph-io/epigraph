@@ -2433,8 +2433,14 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 ```
 
 - **Who**: `--operator` must be a registered human operator and a live admin
-  of both groups. The target must be an active `team` or `community` group;
-  neither group may be the world or seed group, and they must differ.
+  of both groups. The target must be an active `team` or `community` group,
+  or the operator's OWN personal group (the group carrying
+  `did:epigraph:personal:<operator>`, created by the operator). Another
+  person's personal group is refused, and so is the personal group of an
+  agent the operator operates, even when the operator administers it: that
+  group is the agent's, and the ownership model moves an operated agent's
+  claims out of it (`reown-linked`), never into it. Neither group may be the
+  world or seed group, and they must differ.
 - **Eligible**: a claim that is `('group', <source>)` and not sealed. A claim
   already `('group', <target>)` counts as done, so a re-run resumes. A public
   claim (`public-claim`) and another group's claim (`not-in-source`) are held.

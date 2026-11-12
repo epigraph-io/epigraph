@@ -156,6 +156,19 @@ async fn team_group(pool: &PgPool, label: &str, admin: Uuid) -> Uuid {
     g
 }
 
+/// Make `agent` a live admin of `group` (a row the fixture adds directly).
+async fn admin_of(pool: &PgPool, group: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed admin membership");
+}
+
 async fn evidence(pool: &PgPool, claim: Uuid, text: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -1021,6 +1034,10 @@ async fn bad_groups_and_unauthorized_operators_are_refused(pool: PgPool) {
         let (agent, _) = fixture::seed_human_operator(&pool, "stranger").await;
         team_group(&pool, "stranger team", agent).await
     };
+    // Another person's personal group, which the operator ADMINISTERS: so its
+    // refusal can only come from whose group it is, not from the admin check.
+    let (_, stranger_personal) = fixture::seed_human_operator(&pool, "stranger person").await;
+    admin_of(&pool, stranger_personal, fx.operator).await;
     let (robot, _) = fixture::seed_agent_with_group(&pool, "robot").await;
     let robot_src = team_group(&pool, "robot src", robot).await;
     let robot_dst = team_group(&pool, "robot dst", robot).await;
@@ -1028,9 +1045,9 @@ async fn bad_groups_and_unauthorized_operators_are_refused(pool: PgPool) {
         (fx.src, fx.src, fx.operator, "is the source group"),
         (
             fx.src,
-            fx.operator_group,
+            stranger_personal,
             fx.operator,
-            "not a team or community",
+            "not the operator's own personal group",
         ),
         (
             stranger_team,
@@ -1070,6 +1087,145 @@ async fn bad_groups_and_unauthorized_operators_are_refused(pool: PgPool) {
     }
     assert_same(&before, &after, "refusals");
     assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// The operator's OWN personal group is a target (operator ruling,
+/// 2026-11-12: legacy workflow claims a team holds go private to the person
+/// whose lineages supersede them). A and B move into it with everything that
+/// follows them; B's edge to S, which stays in SRC, is co-owned by both; a
+/// reader of the personal group reads them and a SRC-only reader does not;
+/// the reversal puts every row back byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operators_own_personal_group_is_a_target_and_the_move_reverses_exactly(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a, fx.b]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let g = fx.operator_group;
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: g,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(2),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!("target_group={g} (personal)")),
+        "{}",
+        r.show()
+    );
+    for c in [fx.a, fx.b] {
+        assert_eq!(row(&pool, "claims", c).await, grp(g), "claim {c}");
+    }
+    for (t, id) in [
+        ("evidence", fx.ev_a),
+        ("reasoning_traces", fx.trace_a),
+        ("mass_functions", fx.mf_a),
+        ("claim_versions", fx.cv_a),
+        ("harvester_fragments", fx.frag_a),
+        ("evidence", fx.ev_b),
+    ] {
+        assert_eq!(row(&pool, t, id).await, grp(g), "{t} {id}");
+    }
+    assert_eq!(
+        edge(&pool, fx.e_bs).await,
+        (g, "group".to_string(), Some(fx.src)),
+        "an edge to a claim that stays in SRC is co-owned by both groups"
+    );
+    assert_eq!(
+        reads_as(&pool, &[g], "claims", &[fx.a, fx.b]).await,
+        sorted(vec![fx.a, fx.b])
+    );
+    assert!(reads_as(&pool, &[fx.src], "claims", &[fx.a, fx.b])
+        .await
+        .is_empty());
+    assert!(reads_as(&pool, &[], "claims", &[fx.a, fx.b])
+        .await
+        .is_empty());
+    let audit = audit_rows(&pool).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0].2["target_group_id"], g.to_string());
+    assert_eq!(audit[0].2["target_group_kind"], "personal");
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "a move into the operator's personal group, then its reversal",
+    );
+}
+
+/// A run into a personal group that is not the operator's own.
+async fn refused_personal_target(pool: &PgPool, fx: &Fx, target: Uuid) {
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let before = snapshot(pool, false).await;
+    for apply_count in [None, Some(1)] {
+        let mf = dir.join(format!("m-{apply_count:?}.jsonl"));
+        let r = regroup(
+            pool,
+            Regroup {
+                ids: &ids,
+                src: fx.src,
+                dst: target,
+                operator: fx.operator,
+                manifest: &mf,
+                apply_count,
+                extra: &[],
+            },
+        )
+        .await;
+        assert_eq!(r.code, 1, "{}", r.show());
+        assert!(
+            r.stderr.contains("not the operator's own personal group"),
+            "{}",
+            r.show()
+        );
+        assert!(!mf.exists());
+    }
+    assert_same(&before, &snapshot(pool, false).await, "a refused target");
+    assert!(audit_rows(pool).await.is_empty());
+}
+
+/// Another person's personal group is refused, even though the operator is
+/// a live admin of it: a regroup never puts claims in a group that is someone
+/// else's own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_persons_personal_group_is_refused_even_to_its_admin(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (_, theirs) = fixture::seed_human_operator(&pool, "another person").await;
+    admin_of(&pool, theirs, fx.operator).await;
+    refused_personal_target(&pool, &fx, theirs).await;
+}
+
+/// An agent the operator OPERATES (a live operator link) has its own personal
+/// group, and the operator is made a live admin of it: still refused. That
+/// group is the agent's, where the agent's own writes land and which the
+/// agent administers; migration 107's ownership model moves an operated
+/// agent's claims OUT of it into the operator's group (`reown-linked`), never
+/// into it. "The operator's own personal group" is the one carrying the
+/// operator's personal did_key, created by the operator.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agents_personal_group_is_refused_even_to_its_operator(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (agent, agents_group) = fixture::seed_agent_with_group(&pool, "operated agent").await;
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(agent)
+        .bind(fx.operator)
+        .execute(&pool)
+        .await
+        .expect("link the agent to the operator");
+    admin_of(&pool, agents_group, fx.operator).await;
+    refused_personal_target(&pool, &fx, agents_group).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -120,8 +120,11 @@
 //!
 //! On the maintenance DSN (as every verb), with `--operator` a REGISTERED
 //! human operator (`epigraph_is_human_operator`) who is a live admin of BOTH
-//! groups. The target must be an active `team` or `community` group; neither
-//! group may be the world or seed group; source and target differ. There is no
+//! groups. The target must be an active `team` or `community` group, or the
+//! operator's OWN personal group (the one carrying the operator's personal
+//! did_key, created by the operator; never another person's, nor an operated
+//! agent's: see [`check_private_target`]); neither group may be the world or
+//! seed group; source and target differ. There is no
 //! other operator identity: `restrict-claims` authorizes by the target's
 //! admin, and this verb adds the source's admin and the human registry.
 //!
@@ -650,13 +653,66 @@ fn node_end<'e>(nodes: &NodeTypes, e: &'e EdgeEnds) -> Option<(&'e Pair, &'e Pai
     }
 }
 
+/// The target of a group-to-group move, checked: an active group the
+/// operator is a live admin of ([`super::restrict::check_target`], which also
+/// refuses the world and seed groups), of kind `team` or `community`, or the
+/// operator's OWN personal group. Returns its kind.
+///
+/// "Own" is [`super::operator_group`]'s test: the group carrying
+/// `did:epigraph:personal:<operator>` and created by the operator, and the
+/// operator is a registered human operator. Every other personal group is
+/// refused whoever administers it: another person's, and an OPERATED agent's
+/// (its own writes land there and it administers it; the ownership model
+/// moves an operated agent's claims out of it into the operator's group,
+/// `reown-linked`, never into it).
+///
+/// # Errors
+/// The target is missing, world or seed, not active, not administered by the
+/// operator, of another kind, or a personal group that is not the operator's
+/// own.
+pub async fn check_private_target(
+    conn: &mut PgConnection,
+    target: Uuid,
+    operator: Uuid,
+) -> anyhow::Result<String> {
+    let kind = super::restrict::check_target(conn, target, operator).await?;
+    match kind.as_str() {
+        "team" | "community" => Ok(kind),
+        "personal" => {
+            let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
+                .bind(operator)
+                .fetch_one(&mut *conn)
+                .await
+                .context("reading the human-operator registry")?;
+            let own = if human {
+                super::operator_group(conn, operator).await.ok()
+            } else {
+                None
+            };
+            if own != Some(target) {
+                bail!(
+                    "--target-group {target} is a personal group that is not the operator's own \
+                     personal group (did:epigraph:personal:{operator}, created by the operator, \
+                     a registered human operator); refusing: claims move into a team or \
+                     community group, or into the operator's own personal group only"
+                );
+            }
+            Ok(kind)
+        }
+        other => bail!(
+            "--target-group {target} is kind {other}, not a team or community group nor the \
+             operator's own personal group; refusing"
+        ),
+    }
+}
+
 /// The source and target groups and the operator, checked. Returns the
 /// target's kind.
 ///
 /// # Errors
-/// Either group is missing, world or seed; the target is not an active team
-/// or community group; the operator is not a registered human operator or not
-/// a live admin of both groups.
+/// Either group is missing, world or seed; the target is not one
+/// [`check_private_target`] accepts; the operator is not a registered human
+/// operator or not a live admin of both groups.
 pub async fn check_groups(
     conn: &mut PgConnection,
     source: Uuid,
@@ -689,10 +745,7 @@ pub async fn check_groups(
              a person's act)"
         );
     }
-    let kind = super::restrict::check_target(conn, target, operator).await?;
-    if kind != "team" && kind != "community" {
-        bail!("--target-group {target} is kind {kind}, not a team or community group; refusing");
-    }
+    let kind = check_private_target(conn, target, operator).await?;
     let admin: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM group_memberships \
                          WHERE group_id = $1 AND agent_id = $2 AND role = 'admin' \

@@ -837,7 +837,8 @@ enum Command {
         #[arg(long)]
         source_group: Uuid,
         /// The group the claims move into: an active team or community group
-        /// of which `--operator` is a live admin.
+        /// of which `--operator` is a live admin, or the operator's OWN
+        /// personal group (never another person's, nor an operated agent's).
         #[arg(long)]
         target_group: Uuid,
         /// The operator (a registered human operator's agent id) the act is

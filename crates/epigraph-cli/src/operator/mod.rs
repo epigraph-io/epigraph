@@ -23,8 +23,8 @@
 //!   manifest exactly.
 //! * `regroup-claims` — move listed claims that are group-private in one
 //!   group, and every row that follows only them, to another team or
-//!   community group, keeping `group` visibility and never making anything
-//!   public (see [`regroup`]). `reown-reverse` reverses its manifest exactly.
+//!   community group or to the operator's own personal group, keeping `group`
+//!   visibility and never making anything public (see [`regroup`]). `reown-reverse` reverses its manifest exactly.
 //! * `reown-workflows` — move listed workflow lineages (every generation, the
 //!   plan claims they execute, the rows those carry, and their plan edges) out
 //!   of a source group into a TEAM group the operator administers, keeping
