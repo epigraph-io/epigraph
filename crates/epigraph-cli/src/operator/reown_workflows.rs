@@ -2403,7 +2403,8 @@ async fn workflow_tenancy(
 /// `evidence` (evidence id -> its claim) with an `evidence_encryption` row,
 /// and a moving edge with an `edge_encryption` row. The ciphertext stays keyed
 /// to its group whatever the row's tuple becomes (`regroup-claims` holds the
-/// same claims and evidence, `Hold::Sealed`/`Hold::SealedEvidence`).
+/// same set: `Hold::Sealed` for a claim or version seal,
+/// `Hold::SealedEvidence`, and `Hold::SealedEdge` for an edge it would re-tuple).
 async fn sealed_holds(
     conn: &mut PgConnection,
     claims: &[Uuid],
