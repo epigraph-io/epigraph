@@ -382,9 +382,10 @@ async fn test_create_evidence_linked_to_claim(pool: PgPool) {
     let original_content = evidence.raw_content.clone();
 
     // Act: Create evidence
-    let created_evidence = EvidenceRepository::create(&pool, &evidence)
-        .await
-        .expect("Evidence creation should succeed");
+    let created_evidence =
+        EvidenceRepository::create(&pool, &evidence, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .expect("Evidence creation should succeed");
 
     // Assert
     assert_eq!(created_evidence.claim_id, created_claim.id);
@@ -434,7 +435,7 @@ async fn test_retrieve_evidence_by_claim_id(pool: PgPool) {
             Some(content),
             created_claim.id,
         );
-        EvidenceRepository::create(&pool, &evidence)
+        EvidenceRepository::create(&pool, &evidence, epigraph_db::EvidenceEdge::supports(None))
             .await
             .expect("Evidence creation should succeed");
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -852,7 +853,9 @@ async fn test_foreign_key_constraints_enforced(pool: PgPool) {
     let fake_claim_id = ClaimId::new();
     let evidence = create_test_evidence(created_agent.id, fake_claim_id);
 
-    let evidence_result = EvidenceRepository::create(&pool, &evidence).await;
+    let evidence_result =
+        EvidenceRepository::create(&pool, &evidence, epigraph_db::EvidenceEdge::supports(None))
+            .await;
     assert!(
         evidence_result.is_err(),
         "Evidence with non-existent claim should fail"
@@ -876,9 +879,10 @@ async fn test_delete_claim_cascades_to_evidence(pool: PgPool) {
 
     // Create evidence for the claim
     let evidence = create_test_evidence(created_agent.id, created_claim.id);
-    let created_evidence = EvidenceRepository::create(&pool, &evidence)
-        .await
-        .expect("Evidence creation should succeed");
+    let created_evidence =
+        EvidenceRepository::create(&pool, &evidence, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .expect("Evidence creation should succeed");
 
     // Verify evidence exists
     let evidence_before = EvidenceRepository::get_by_id(&pool, &viewer, created_evidence.id)
@@ -1118,9 +1122,10 @@ async fn test_delete_evidence(pool: PgPool) {
     let created_claim = result.claim;
 
     let evidence = create_test_evidence(created_agent.id, created_claim.id);
-    let created_evidence = EvidenceRepository::create(&pool, &evidence)
-        .await
-        .expect("Evidence creation should succeed");
+    let created_evidence =
+        EvidenceRepository::create(&pool, &evidence, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .expect("Evidence creation should succeed");
 
     // Act: Delete evidence
     let deleted = EvidenceRepository::delete(&pool, &viewer, created_evidence.id)

@@ -2645,6 +2645,27 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **211**: public `bug_report_evidence_edge` (backlog 2d60f619; the Atlas
+  leaf view draws stored `evidence -> claim` edges only, so every evidence
+  write stores one). Redefines 207's SECURITY DEFINER
+  `epigraph_submit_bug_report` with ONE added statement: after the evidence
+  INSERT, a `supports` edge from that evidence row to the report's claim,
+  inside a transaction-local search_path window (206's pattern; without it
+  the `edges` triggers' unqualified helpers raise 42883 under the definer's
+  `pg_catalog, pg_temp` path). The edge is owned like the evidence and the
+  claim (the intake group, `group`), so it discloses nothing the evidence
+  row does not. Owner and EXECUTE grant re-asserted as 209 does. It writes
+  no data on migrate and only redefines a function body, so its order
+  against `210` (another branch) does not matter. Pinned by
+  `epigraph-db/tests/bug_report_intake.rs`
+  (`the_reports_evidence_carries_a_private_supports_edge`) and the SQL arm
+  of `epigraph-db/tests/evidence_insert_writes_claim_edge.rs`; the edge is
+  registered `Unsigned` in `edge_writer_signing_ratchet.rs` (the definer
+  holds no key). Undo: re-apply 207's definition of the function. Checked
+  before claiming: no migration on main, open PR or origin branch carries a
+  `211`. **Deploy order:** migrate with the binary of this change; an older
+  binary is unaffected (the function's signature is unchanged).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

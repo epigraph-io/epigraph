@@ -2094,6 +2094,12 @@ impl ClaimRepository {
     /// disjunct and the result is unchanged; it becomes load-bearing exactly
     /// when the endpoints are private.
     ///
+    /// # Provenance-only evidence does not ground
+    ///
+    /// The same exclusion as [`Self::has_grounded_evidence`] (derivation rows
+    /// and memorize stamps), spelled here separately; each reader has its own
+    /// test in `grounding_excludes_provenance_evidence.rs`.
+    ///
     /// **The edge marker is defense in depth and is NOT what the acceptance
     /// test proves**, which is stated rather than left for a reader to assume.
     /// Because 070 makes the edge inherit, a private claim's grounding edge is
@@ -2129,6 +2135,13 @@ impl ClaimRepository {
                     AND e.source_type IN ('paper', 'evidence', 'analysis')
                     AND e.relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                     /* {EDGE_VISIBILITY:e} */
+                    AND NOT EXISTS (
+                        SELECT 1 FROM evidence pe
+                        WHERE e.source_type = 'evidence'
+                          AND pe.id = e.source_id
+                          AND (pe.properties ? 'derived_from_claim'
+                               OR pe.properties->>'source' = 'mcp-memorize')
+                    )
               )
               /* {VISIBILITY:c} */
             ORDER BY similarity DESC
@@ -8030,6 +8043,25 @@ impl ClaimRepository {
     /// - `evidence --SUPPORTS-->       claim` (either spelling, `SUPPORTS` or `supports`)
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
+    ///
+    /// # Provenance-only evidence does not ground
+    ///
+    /// Since backlog 2d60f619 every evidence row carries its stored
+    /// `evidence -> claim` edge, including two kinds of row that are
+    /// bookkeeping, not evidence, and are excluded here (and in
+    /// [`Self::grounded_neighborhood`], which spells the same rule):
+    ///
+    /// * a DERIVATION row (`properties ? 'derived_from_claim'`,
+    ///   `EvidenceRepository::record_derivation_conn`): its text is the parent
+    ///   claim's, so it is claim-to-claim propagation by this function's own
+    ///   rule;
+    /// * a MEMORIZE stamp (`properties->>'source' = 'mcp-memorize'`): its text
+    ///   is "stored via MCP memorize tool", the claim's author remembering it.
+    ///
+    /// Before 2d60f619 neither had an edge, so neither grounded; this keeps it
+    /// so. Caller-supplied evidence text (`submit_claim`'s `evidence_data`, a
+    /// packet's evidence, an ingested passage) still grounds, as packet
+    /// evidence always did.
     pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -8044,6 +8076,13 @@ impl ClaimRepository {
                   AND source_type IN ('paper', 'evidence', 'analysis')
                   AND relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                   /* {EDGE_VISIBILITY:edges} */
+                  AND NOT EXISTS (
+                      SELECT 1 FROM evidence pe
+                      WHERE edges.source_type = 'evidence'
+                        AND pe.id = edges.source_id
+                        AND (pe.properties ? 'derived_from_claim'
+                             OR pe.properties->>'source' = 'mcp-memorize')
+                  )
             )
             "#,
             2,

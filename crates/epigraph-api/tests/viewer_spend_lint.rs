@@ -409,10 +409,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["derivation_scope::retain_for_cache"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
-    // The signed REFUTES edge write runs on a transaction stamped with the
-    // caller's viewer (`if let Ok(mut tx) = state.write_as(&viewer, ..)`,
-    // passed as `&mut tx`): the edge trigger and WITH CHECK decide the write,
-    // as for create_edge.
+    // The refuting evidence and its signed `refutes` edge (backlog 2d60f619)
+    // are ONE write on a transaction stamped with the caller's viewer
+    // (`state.write_as(&viewer, ..)`, passed as `&mut *tx`): the evidence and
+    // edge triggers and WITH CHECK decide the write, as for create_edge.
     (
         "conventions.rs",
         "forget_convention",
@@ -420,7 +420,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::create",
             "AgentRepository::get_by_public_key",
             "ClaimRepository::update_truth_value",
-            "EdgeRepository::create_signed_conn",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
@@ -1369,7 +1368,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",
-            "EdgeRepository::create_signed_conn",
+            // The evidence's `supports` edge (backlog 2d60f619), on the same
+            // stamped claim-write transaction.
+            "EvidenceRepository::link_to_claims_signed_conn",
             "sqlx::query(?).execute",
             "sqlx::query(?).execute",
             "sqlx::query(?).execute",

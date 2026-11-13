@@ -726,6 +726,10 @@ async fn write_submission(
             .source_url
             .as_deref()
             .or_else(|| EvidenceRepository::source_url_of(&evidence_with_sig.evidence_type)),
+        // The evidence's own edge to the claim, in this transaction (backlog
+        // 2d60f619). A submission's evidence supports its claim: its BBA is
+        // built with `supports: true`.
+        epigraph_db::EvidenceEdge::supports(Some(edge_key)),
     )
     .await
     .map_err(internal_error)?;
@@ -1575,6 +1579,9 @@ pub async fn update_with_evidence(
             .source_url
             .as_deref()
             .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+        // The evidence's edge to the claim, in this transaction, in the
+        // direction its BBA is filed (`supports` / `refutes`, backlog 2d60f619).
+        epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.supports),
     )
     .await
     .map_err(internal_error)?;

@@ -255,9 +255,13 @@ pub async fn memorize(
         ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
+        EvidenceRepository::create(
+            &mut *tx,
+            &evidence,
+            epigraph_db::EvidenceEdge::supports(Some(server.edge_signing_key().await?)),
+        )
+        .await
+        .map_err(internal_error)?;
         ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;

@@ -1212,9 +1212,16 @@ pub async fn report_workflow_outcome(
             .await
             .map_err(internal_error)?;
 
-    EvidenceRepository::create(&mut *tx, &evidence)
-        .await
-        .map_err(internal_error)?;
+    // The evidence's edge to the workflow claim, in this transaction, in the
+    // direction its BBA is filed below (`success` supports, a failure refutes;
+    // backlog 2d60f619).
+    EvidenceRepository::create(
+        &mut *tx,
+        &evidence,
+        epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.success),
+    )
+    .await
+    .map_err(internal_error)?;
 
     let before = claim.truth_value.value();
 

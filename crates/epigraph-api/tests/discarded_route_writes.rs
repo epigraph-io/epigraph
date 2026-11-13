@@ -90,7 +90,11 @@ const REGISTER: &[(&str, usize)] = &[
     // Ok(tx)` / `.is_ok()` before `let _ = tx.commit()`), a form this register
     // does not see (module doc): lowered because the `let _ =` write is gone,
     // not because the error now propagates.
-    ("conventions.rs", 4),
+    // 4 -> 3 (backlog 2d60f619): `learn_convention`'s `let _ =` SUPPORTS edge
+    // is gone; the evidence write itself now writes that edge in its own
+    // transaction (`EvidenceRepository::link_to_claims_signed_conn`), and its
+    // error propagates.
+    ("conventions.rs", 3),
     ("crud.rs", 2),
     ("gaps.rs", 1),
     ("perspective.rs", 1),
@@ -103,8 +107,9 @@ const REGISTER: &[(&str, usize)] = &[
 
 /// Ceiling on the total, so growth fails structurally even if a row and the
 /// total were raised together.
-/// 46 until U024 removed four of `belief.rs`'s rows.
-const HIGH_WATER: usize = 42;
+/// 46 until U024 removed four of `belief.rs`'s rows; 42 until backlog
+/// 2d60f619 removed `learn_convention`'s.
+const HIGH_WATER: usize = 41;
 
 fn routes_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes")
