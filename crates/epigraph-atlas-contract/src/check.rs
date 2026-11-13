@@ -1,20 +1,52 @@
 //! The schema test helper for real responses (feature `check`).
 //!
 //! W10's route tests call [`check_level_body`] on every level body a route
-//! serves, and [`check_not_found`] plus [`assert_indistinguishable`] on the
-//! answer a non-member gets. Each check runs the language-neutral JSON
-//! Schema, the strict types with [`LevelDocument::validate`], and the gzip
-//! budget, and reports every failure it finds.
+//! serves, with the map and level the request was for, and
+//! [`check_not_found`] plus [`assert_indistinguishable`] on the answer a
+//! non-member gets. Each check runs the language-neutral JSON Schema, the
+//! strict types with [`LevelDocument::validate`], and the gzip budget, and
+//! reports every failure it finds.
 
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
-use crate::{LevelDocument, BUDGET_GZIP_BYTES, SCHEMA_ID};
+pub use crate::gzip_len;
+use crate::{LevelDocument, MapScope, BUDGET_GZIP_BYTES, SCHEMA_ID};
+
+/// What the request was for, as the test knows it: never read back from the
+/// body under test. A route that answers with another map's level (a team's
+/// leaf to a public viewer, or another team's) or another level fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expected {
+    /// The map the viewer asked for: `Public`, or `Team` with its group.
+    pub map_scope: MapScope,
+    pub map_group_id: Option<Uuid>,
+    /// The level the viewer asked for.
+    pub level_id: Uuid,
+}
+
+impl Expected {
+    /// A level of the public map.
+    pub fn public(level_id: Uuid) -> Self {
+        Expected {
+            map_scope: MapScope::Public,
+            map_group_id: None,
+            level_id,
+        }
+    }
+
+    /// A level of one team's map.
+    pub fn team(group_id: Uuid, level_id: Uuid) -> Self {
+        Expected {
+            map_scope: MapScope::Team,
+            map_group_id: Some(group_id),
+            level_id,
+        }
+    }
+}
 
 /// The contract directory: `services/explorer/contract/atlas_level/v1`.
 pub fn contract_dir() -> PathBuf {
@@ -93,13 +125,6 @@ pub fn def_errors(def: &str, doc: &Value) -> Vec<String> {
         .collect()
 }
 
-/// gzip size (flate2's default level) of `bytes`.
-pub fn gzip_len(bytes: &[u8]) -> usize {
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(bytes).expect("gzip into a Vec");
-    enc.finish().expect("gzip into a Vec").len()
-}
-
 /// gzip size of a document's compact serialisation, the form that is
 /// stored and served.
 pub fn compact_gzip_len(doc: &Value) -> usize {
@@ -107,9 +132,10 @@ pub fn compact_gzip_len(doc: &Value) -> usize {
 }
 
 /// Check one served level body: JSON, the schema, the strict types and
-/// [`LevelDocument::validate`], and the budget on the bytes as served.
-/// Returns the decoded document, or every failure found.
-pub fn check_level_body(body: &[u8]) -> Result<LevelDocument, Vec<String>> {
+/// [`LevelDocument::validate`], that it is the map and level `expected`
+/// names, and the budget on the bytes as served. Returns the decoded
+/// document, or every failure found.
+pub fn check_level_body(body: &[u8], expected: &Expected) -> Result<LevelDocument, Vec<String>> {
     let value: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return Err(vec![format!("not JSON: {e}")]),
@@ -120,6 +146,7 @@ pub fn check_level_body(body: &[u8]) -> Result<LevelDocument, Vec<String>> {
             if let Err(v) = doc.validate() {
                 errors.extend(v.0.into_iter().map(|e| format!("invariant {e}")));
             }
+            errors.extend(viewer_errors(&doc, expected));
             Some(doc)
         }
         Err(e) => {
@@ -139,6 +166,28 @@ pub fn check_level_body(body: &[u8]) -> Result<LevelDocument, Vec<String>> {
     }
 }
 
+/// Whether the document is the map and level the request was for.
+fn viewer_errors(doc: &LevelDocument, expected: &Expected) -> Vec<String> {
+    let (scope, group, level) = match doc {
+        LevelDocument::Group(g) => (g.map_scope, g.map_group_id, g.level_id),
+        LevelDocument::Leaf(l) => (l.map_scope, l.map_group_id, l.level_id),
+    };
+    let mut errors = Vec::new();
+    if (scope, group) != (expected.map_scope, expected.map_group_id) {
+        errors.push(format!(
+            "viewer: the body is the {scope:?} map {group:?}, the request was for the {:?} map {:?}",
+            expected.map_scope, expected.map_group_id
+        ));
+    }
+    if level != expected.level_id {
+        errors.push(format!(
+            "viewer: the body is level {level}, the request was for {}",
+            expected.level_id
+        ));
+    }
+    errors
+}
+
 /// Which side answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
@@ -150,7 +199,8 @@ pub enum Side {
 
 /// Check the answer for a level the viewer may not see: a 404 whose body is
 /// exactly the closed not-found shape (no level key, no count, no name) and,
-/// on the kernel side, echoes only the id that was asked for.
+/// on the kernel side, names only the id that was asked for, in both
+/// `message` and `details.id`.
 pub fn check_not_found(
     side: Side,
     status: u16,
@@ -173,11 +223,17 @@ pub fn check_not_found(
         Side::Bff => "bff_not_found",
     };
     errors.extend(def_errors(def, &value));
-    if side == Side::Kernel && value["details"]["id"] != json!(requested_id) {
-        errors.push(format!(
-            "details.id {} is not the requested id {requested_id}",
-            value["details"]["id"]
-        ));
+    if side == Side::Kernel {
+        if value["details"]["id"] != json!(requested_id) {
+            errors.push(format!(
+                "details.id {} is not the requested id {requested_id}",
+                value["details"]["id"]
+            ));
+        }
+        let message = format!("atlas_level with ID {requested_id} not found");
+        if value["message"] != json!(message) {
+            errors.push(format!("message {} is not `{message}`", value["message"]));
+        }
     }
     if errors.is_empty() {
         Ok(())

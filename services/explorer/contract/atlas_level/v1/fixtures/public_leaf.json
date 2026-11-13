@@ -545,9 +545,9 @@
   ],
   "edges": [
     {
-      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
+      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -555,31 +555,31 @@
     {
       "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
+      "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
       "target": "37e3644a-f521-4ae5-bba6-492242946154",
-      "relationship": "asserted",
+      "relationship": "asserts",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "63799578-3b40-451f-8193-7739472677a2",
+      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -587,79 +587,79 @@
     {
       "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
       "target": "59906e55-65f2-49b5-a088-abee85c82a73",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
+      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
       "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "63799578-3b40-451f-8193-7739472677a2",
-      "target": "940914b3-07e0-48be-9993-3271803f5a86",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "relationship": "asserted",
+      "target": "346837d0-230e-47dd-923d-0077a2e1dc43",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
-      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
-      "relationship": "asserted",
+      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
-      "target": "782a4535-648a-4751-becb-b006ca131aeb",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
-      "target": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
-      "relationship": "asserted",
+      "target": "940914b3-07e0-48be-9993-3271803f5a86",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "63799578-3b40-451f-8193-7739472677a2",
+      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
+      "relationship": "asserts",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
+      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
+      "relationship": "asserts",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
+      "target": "782a4535-648a-4751-becb-b006ca131aeb",
+      "relationship": "authored",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "63799578-3b40-451f-8193-7739472677a2",
+      "target": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+      "relationship": "asserts",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
       "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -667,31 +667,31 @@
     {
       "source": "63799578-3b40-451f-8193-7739472677a2",
       "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "2e09a762-bc56-41a3-bcce-26775e3f1467",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
+      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "relationship": "AUTHORED",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -699,7 +699,7 @@
     {
       "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -707,63 +707,63 @@
     {
       "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "63799578-3b40-451f-8193-7739472677a2",
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "63799578-3b40-451f-8193-7739472677a2",
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
+      "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
       "target": "8805a464-fda7-4b35-8b56-9144dba0d70e",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
+      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "63799578-3b40-451f-8193-7739472677a2",
+      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
+      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "relationship": "authored",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -771,7 +771,7 @@
     {
       "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -779,63 +779,63 @@
     {
       "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
       "target": "e1c7a78d-fe42-4ccd-a530-65d525198961",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
-      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
-      "target": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
-      "relationship": "asserted",
+      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "63799578-3b40-451f-8193-7739472677a2",
-      "target": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
-      "target": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
-      "relationship": "asserted",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "none"
-    },
-    {
-      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
-      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "relationship": "asserted",
+      "target": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
-      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
-      "relationship": "asserted",
+      "target": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
+      "target": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
+      "relationship": "authored",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
+      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "relationship": "AUTHORED",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
+      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "relationship": "AUTHORED",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
       "target": "633f6781-f5c8-4376-8fef-154169e497f3",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -843,23 +843,23 @@
     {
       "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
+      "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
       "target": "41e53f33-6127-467d-83f8-84e858376184",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
+      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
@@ -867,1429 +867,1499 @@
     {
       "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
       "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
-      "relationship": "asserted",
+      "relationship": "authored",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
+      "source": "d860a44b-8369-4d58-80cf-2bc1b0bfe569",
       "target": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "fbcbefee-7a88-46f6-8811-b68009f7a45a",
+      "source": "63799578-3b40-451f-8193-7739472677a2",
       "target": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
-      "relationship": "asserted",
+      "relationship": "asserts",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
-      "source": "6bcf80a6-9777-4412-8b1f-c72813832e0f",
+      "source": "3a1effa1-fc44-4b8a-9d57-3e860544cdb7",
       "target": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
-      "relationship": "asserted",
+      "relationship": "AUTHORED",
       "sign": 0,
       "flow_weight": 0.0,
       "flow_basis": "none"
     },
     {
       "source": "8e4cccba-2506-472e-a53c-4d84dc8f87a3",
-      "target": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "relationship": "supports",
+      "target": "633f6781-f5c8-4376-8fef-154169e497f3",
+      "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.4677,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "8e4cccba-2506-472e-a53c-4d84dc8f87a3",
-      "target": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1615,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "5dbb5958-678c-4e66-a90b-d0c4d5f56193",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3345,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "5dbb5958-678c-4e66-a90b-d0c4d5f56193",
-      "target": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1189,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "ac9751df-df67-4077-af13-baa8e84f3e32",
-      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.6461,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "ac9751df-df67-4077-af13-baa8e84f3e32",
-      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.8086,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "a24a511e-01f5-4f31-b1c2-1b3f433ae5c7",
-      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.2698,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "a24a511e-01f5-4f31-b1c2-1b3f433ae5c7",
-      "target": "940914b3-07e0-48be-9993-3271803f5a86",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.4217,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "d79ca9d5-91c9-487e-a1d7-b6b10f3899d8",
-      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.2342,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "d79ca9d5-91c9-487e-a1d7-b6b10f3899d8",
-      "target": "2e09a762-bc56-41a3-bcce-26775e3f1467",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.2038,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "823c641a-3ade-462e-bc7e-9126b5ffd6b6",
-      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.9144,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "823c641a-3ade-462e-bc7e-9126b5ffd6b6",
-      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1043,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "823c641a-3ade-462e-bc7e-9126b5ffd6b6",
-      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "relationship": "refutes",
-      "sign": -1,
       "flow_weight": 0.6542,
       "flow_basis": "exact"
     },
     {
-      "source": "823c641a-3ade-462e-bc7e-9126b5ffd6b6",
+      "source": "8e4cccba-2506-472e-a53c-4d84dc8f87a3",
       "target": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
-      "relationship": "supports",
+      "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.3061,
+      "flow_weight": 0.4571,
       "flow_basis": "exact"
     },
     {
-      "source": "c52e9d70-8da6-4eb7-9f1d-cf265cecbfc1",
-      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.822,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "c52e9d70-8da6-4eb7-9f1d-cf265cecbfc1",
+      "source": "5dbb5958-678c-4e66-a90b-d0c4d5f56193",
       "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1052,
+      "flow_weight": 0.672,
       "flow_basis": "exact"
     },
     {
-      "source": "2f3bee38-c13d-47e0-961c-12c86165619c",
-      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "source": "5dbb5958-678c-4e66-a90b-d0c4d5f56193",
+      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.6653,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "5dbb5958-678c-4e66-a90b-d0c4d5f56193",
+      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3577,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "ac9751df-df67-4077-af13-baa8e84f3e32",
+      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1556,
+      "flow_weight": 0.1994,
       "flow_basis": "exact"
     },
     {
-      "source": "2f3bee38-c13d-47e0-961c-12c86165619c",
-      "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3981,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "c826e901-cd7f-4584-af67-ef514ddf7211",
-      "target": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1452,
-      "flow_basis": "exact"
-    },
-    {
-      "source": "c826e901-cd7f-4584-af67-ef514ddf7211",
-      "target": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "source": "ac9751df-df67-4077-af13-baa8e84f3e32",
+      "target": "782a4535-648a-4751-becb-b006ca131aeb",
       "relationship": "supports",
       "sign": 1,
       "flow_weight": 0.7124,
       "flow_basis": "exact"
     },
     {
-      "source": "c9dd34c5-399e-481b-a234-18312a37f28b",
-      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
+      "source": "ac9751df-df67-4077-af13-baa8e84f3e32",
+      "target": "940914b3-07e0-48be-9993-3271803f5a86",
       "relationship": "supports",
       "sign": 1,
       "flow_weight": 0.6429,
       "flow_basis": "exact"
     },
     {
-      "source": "c9dd34c5-399e-481b-a234-18312a37f28b",
-      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "source": "a24a511e-01f5-4f31-b1c2-1b3f433ae5c7",
+      "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8862,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "a24a511e-01f5-4f31-b1c2-1b3f433ae5c7",
+      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1534,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "a24a511e-01f5-4f31-b1c2-1b3f433ae5c7",
+      "target": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.3605,
+      "flow_weight": 0.4321,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d79ca9d5-91c9-487e-a1d7-b6b10f3899d8",
+      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.6648,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d79ca9d5-91c9-487e-a1d7-b6b10f3899d8",
+      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4984,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d79ca9d5-91c9-487e-a1d7-b6b10f3899d8",
+      "target": "41e53f33-6127-467d-83f8-84e858376184",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8866,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d79ca9d5-91c9-487e-a1d7-b6b10f3899d8",
+      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.261,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "823c641a-3ade-462e-bc7e-9126b5ffd6b6",
+      "target": "782a4535-648a-4751-becb-b006ca131aeb",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3256,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "823c641a-3ade-462e-bc7e-9126b5ffd6b6",
+      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6801,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c52e9d70-8da6-4eb7-9f1d-cf265cecbfc1",
+      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.645,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c52e9d70-8da6-4eb7-9f1d-cf265cecbfc1",
+      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.33,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c52e9d70-8da6-4eb7-9f1d-cf265cecbfc1",
+      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4364,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c52e9d70-8da6-4eb7-9f1d-cf265cecbfc1",
+      "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3961,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "2f3bee38-c13d-47e0-961c-12c86165619c",
+      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.2393,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "2f3bee38-c13d-47e0-961c-12c86165619c",
+      "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3289,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "2f3bee38-c13d-47e0-961c-12c86165619c",
+      "target": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1692,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "2f3bee38-c13d-47e0-961c-12c86165619c",
+      "target": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8107,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c826e901-cd7f-4584-af67-ef514ddf7211",
+      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6516,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c826e901-cd7f-4584-af67-ef514ddf7211",
+      "target": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6103,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9dd34c5-399e-481b-a234-18312a37f28b",
+      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1636,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9dd34c5-399e-481b-a234-18312a37f28b",
+      "target": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5565,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9dd34c5-399e-481b-a234-18312a37f28b",
+      "target": "e1c7a78d-fe42-4ccd-a530-65d525198961",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.5926,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9dd34c5-399e-481b-a234-18312a37f28b",
+      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.5582,
       "flow_basis": "exact"
     },
     {
       "source": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "target": "782a4535-648a-4751-becb-b006ca131aeb",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.6008,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "target": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.2401,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "target": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.3769,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
-      "target": "8805a464-fda7-4b35-8b56-9144dba0d70e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0518,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
-      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1643,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.133,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "37e3644a-f521-4ae5-bba6-492242946154",
-      "target": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.4653,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "37e3644a-f521-4ae5-bba6-492242946154",
-      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.4892,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "37e3644a-f521-4ae5-bba6-492242946154",
-      "target": "633f6781-f5c8-4376-8fef-154169e497f3",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.3292,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "target": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3393,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.5186,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.3397,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.3904,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.3185,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.4531,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "59906e55-65f2-49b5-a088-abee85c82a73",
-      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.0439,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "59906e55-65f2-49b5-a088-abee85c82a73",
-      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.0442,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "59906e55-65f2-49b5-a088-abee85c82a73",
-      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.0325,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0838,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-      "target": "37e3644a-f521-4ae5-bba6-492242946154",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.0868,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
-      "target": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
-      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
-      "target": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "940914b3-07e0-48be-9993-3271803f5a86",
-      "target": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3704,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "940914b3-07e0-48be-9993-3271803f5a86",
-      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.3654,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "940914b3-07e0-48be-9993-3271803f5a86",
-      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.4428,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
       "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "relationship": "supports",
+      "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1413,
+      "flow_weight": 0.4278,
       "flow_basis": "proxy"
     },
     {
-      "source": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
+      "source": "d224b061-1cde-454f-a327-2f3d06a4f544",
       "target": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2546,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d224b061-1cde-454f-a327-2f3d06a4f544",
+      "target": "8805a464-fda7-4b35-8b56-9144dba0d70e",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4906,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.151,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1136,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0589,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "37e3644a-f521-4ae5-bba6-492242946154",
+      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1487,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "37e3644a-f521-4ae5-bba6-492242946154",
+      "target": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3984,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "target": "782a4535-648a-4751-becb-b006ca131aeb",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6456,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3004,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.5552,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "target": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.6012,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "target": "37e3644a-f521-4ae5-bba6-492242946154",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.4355,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "target": "2e09a762-bc56-41a3-bcce-26775e3f1467",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.3942,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0547,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0841,
+      "flow_weight": 0.0299,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0629,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+      "target": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2285,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+      "target": "41e53f33-6127-467d-83f8-84e858376184",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.1594,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.2078,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "346837d0-230e-47dd-923d-0077a2e1dc43",
+      "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "346837d0-230e-47dd-923d-0077a2e1dc43",
+      "target": "41e53f33-6127-467d-83f8-84e858376184",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "940914b3-07e0-48be-9993-3271803f5a86",
+      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4204,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "940914b3-07e0-48be-9993-3271803f5a86",
+      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.4656,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "940914b3-07e0-48be-9993-3271803f5a86",
+      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5898,
       "flow_basis": "proxy"
     },
     {
       "source": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "target": "8805a464-fda7-4b35-8b56-9144dba0d70e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.162,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5c48dac8-3271-4134-a27b-6701e76dc498",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1362,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5c48dac8-3271-4134-a27b-6701e76dc498",
-      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.1024,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5c48dac8-3271-4134-a27b-6701e76dc498",
-      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.0531,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "782a4535-648a-4751-becb-b006ca131aeb",
-      "target": "37e3644a-f521-4ae5-bba6-492242946154",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0815,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "782a4535-648a-4751-becb-b006ca131aeb",
-      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.0752,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "782a4535-648a-4751-becb-b006ca131aeb",
-      "target": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.2016,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
-      "target": "782a4535-648a-4751-becb-b006ca131aeb",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1852,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
-      "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0862,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
-      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.1593,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "target": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0425,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "target": "37e3644a-f521-4ae5-bba6-492242946154",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0308,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "target": "2e09a762-bc56-41a3-bcce-26775e3f1467",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0279,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.5067,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "288a0652-ce56-46a8-a6cf-40a079c5264c",
       "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.2766,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.5827,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2e09a762-bc56-41a3-bcce-26775e3f1467",
-      "target": "59906e55-65f2-49b5-a088-abee85c82a73",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5486,
+      "flow_weight": 0.0996,
       "flow_basis": "proxy"
     },
     {
-      "source": "2e09a762-bc56-41a3-bcce-26775e3f1467",
-      "target": "41e53f33-6127-467d-83f8-84e858376184",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.3827,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2e09a762-bc56-41a3-bcce-26775e3f1467",
-      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.499,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.0508,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "target": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.1043,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "target": "41e53f33-6127-467d-83f8-84e858376184",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.0468,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1481,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3046,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.1216,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.257,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.3606,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.007,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "source": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
       "target": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0107,
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.1519,
       "flow_basis": "proxy"
     },
     {
-      "source": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "source": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
       "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0141,
+      "flow_weight": 0.2,
       "flow_basis": "proxy"
     },
     {
-      "source": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "source": "5c48dac8-3271-4134-a27b-6701e76dc498",
       "target": "59906e55-65f2-49b5-a088-abee85c82a73",
-      "relationship": "supports",
+      "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.271,
+      "flow_weight": 0.0455,
       "flow_basis": "proxy"
     },
     {
-      "source": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "source": "5c48dac8-3271-4134-a27b-6701e76dc498",
       "target": "41e53f33-6127-467d-83f8-84e858376184",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.2956,
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.0497,
       "flow_basis": "proxy"
     },
     {
-      "source": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "source": "5c48dac8-3271-4134-a27b-6701e76dc498",
       "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.1186,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "782a4535-648a-4751-becb-b006ca131aeb",
+      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2303,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "782a4535-648a-4751-becb-b006ca131aeb",
+      "target": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.1301,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "782a4535-648a-4751-becb-b006ca131aeb",
+      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.7055,
+      "flow_weight": 0.0751,
       "flow_basis": "proxy"
     },
     {
-      "source": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
-      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.6131,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
-      "target": "59906e55-65f2-49b5-a088-abee85c82a73",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3464,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
-      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.1999,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "8805a464-fda7-4b35-8b56-9144dba0d70e",
+      "source": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
       "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.0797,
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.1511,
       "flow_basis": "proxy"
     },
     {
-      "source": "8805a464-fda7-4b35-8b56-9144dba0d70e",
+      "source": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
       "target": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0586,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1707,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "211421dc-eca3-419a-a8ce-209df8ca9017",
+      "target": "940914b3-07e0-48be-9993-3271803f5a86",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0138,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "211421dc-eca3-419a-a8ce-209df8ca9017",
+      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.0152,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "288a0652-ce56-46a8-a6cf-40a079c5264c",
+      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.3196,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "288a0652-ce56-46a8-a6cf-40a079c5264c",
+      "target": "37e3644a-f521-4ae5-bba6-492242946154",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5938,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "288a0652-ce56-46a8-a6cf-40a079c5264c",
+      "target": "346837d0-230e-47dd-923d-0077a2e1dc43",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0309,
+      "flow_weight": 0.52,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2e09a762-bc56-41a3-bcce-26775e3f1467",
+      "target": "41e53f33-6127-467d-83f8-84e858376184",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.5256,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2e09a762-bc56-41a3-bcce-26775e3f1467",
+      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.42,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2e09a762-bc56-41a3-bcce-26775e3f1467",
+      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.3126,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.056,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "target": "e1c7a78d-fe42-4ccd-a530-65d525198961",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0763,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "target": "940914b3-07e0-48be-9993-3271803f5a86",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0918,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.2944,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3417,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.1918,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
+      "target": "940914b3-07e0-48be-9993-3271803f5a86",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.163,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
+      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.2448,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
+      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2298,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "target": "711350ec-507e-4ec5-81bf-71b82c35ee52",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.0104,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.0074,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0083,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.2863,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2979,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1dd91b46-f4bf-40dd-a749-73b752520f25",
+      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.6997,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+      "target": "d224b061-1cde-454f-a327-2f3d06a4f544",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.6313,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5492,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4197,
       "flow_basis": "proxy"
     },
     {
       "source": "8805a464-fda7-4b35-8b56-9144dba0d70e",
-      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.09,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0311,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "target": "940914b3-07e0-48be-9993-3271803f5a86",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0213,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0235,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.0324,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "target": "37e3644a-f521-4ae5-bba6-492242946154",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.0601,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "target": "346837d0-230e-47dd-923d-0077a2e1dc43",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0527,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "target": "41e53f33-6127-467d-83f8-84e858376184",
-      "relationship": "corroborates",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.3451,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "target": "e1c7a78d-fe42-4ccd-a530-65d525198961",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.4704,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
-      "target": "940914b3-07e0-48be-9993-3271803f5a86",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.5658,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
       "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.4077,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
-      "target": "1dd91b46-f4bf-40dd-a749-73b752520f25",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.4732,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
-      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.2656,
+      "flow_weight": 0.0478,
       "flow_basis": "proxy"
     },
     {
-      "source": "e1c7a78d-fe42-4ccd-a530-65d525198961",
-      "target": "940914b3-07e0-48be-9993-3271803f5a86",
-      "relationship": "elaborates",
-      "sign": 1,
-      "flow_weight": 0.2202,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "e1c7a78d-fe42-4ccd-a530-65d525198961",
-      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3307,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "e1c7a78d-fe42-4ccd-a530-65d525198961",
-      "target": "024fd22c-663a-4439-a5d6-c0aeccb4648e",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.3105,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "711350ec-507e-4ec5-81bf-71b82c35ee52",
-      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.1227,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "711350ec-507e-4ec5-81bf-71b82c35ee52",
-      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.1371,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
-      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.2247,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
-      "target": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.2338,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
-      "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.5491,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
-      "target": "d224b061-1cde-454f-a327-2f3d06a4f544",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
-      "target": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
-      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.0,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
-      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.2984,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
+      "source": "8805a464-fda7-4b35-8b56-9144dba0d70e",
       "target": "37e3644a-f521-4ae5-bba6-492242946154",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.5312,
+      "flow_weight": 0.085,
       "flow_basis": "proxy"
     },
     {
-      "source": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "source": "8805a464-fda7-4b35-8b56-9144dba0d70e",
+      "target": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.0985,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
       "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.1694,
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0567,
       "flow_basis": "proxy"
     },
     {
-      "source": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "target": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.0789,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "source": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
       "target": "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-      "relationship": "elaborates",
+      "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0652,
+      "flow_weight": 0.0218,
       "flow_basis": "proxy"
     },
     {
-      "source": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "source": "945b86e9-c966-4468-8b33-74d91f18c4c5",
       "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
-      "relationship": "supports",
+      "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.6635,
+      "flow_weight": 0.0557,
       "flow_basis": "proxy"
     },
     {
-      "source": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "source": "945b86e9-c966-4468-8b33-74d91f18c4c5",
       "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.0194,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "target": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0356,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2313,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
-      "source": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
-      "target": "59906e55-65f2-49b5-a088-abee85c82a73",
+      "source": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "target": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "target": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.3519,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.4215,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.6025,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.4268,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "target": "8805a464-fda7-4b35-8b56-9144dba0d70e",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4481,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.4243,
+      "flow_weight": 0.5047,
       "flow_basis": "proxy"
     },
     {
-      "source": "633f6781-f5c8-4376-8fef-154169e497f3",
-      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.6481,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "633f6781-f5c8-4376-8fef-154169e497f3",
-      "target": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.7519,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "633f6781-f5c8-4376-8fef-154169e497f3",
-      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.6181,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "target": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
-      "relationship": "decomposes_to",
-      "sign": 1,
-      "flow_weight": 0.1631,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "target": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.1953,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "33395036-3935-42d8-8db5-1bd3552677fc",
-      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.2792,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "41e53f33-6127-467d-83f8-84e858376184",
-      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.4112,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "41e53f33-6127-467d-83f8-84e858376184",
-      "target": "8805a464-fda7-4b35-8b56-9144dba0d70e",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.4317,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "41e53f33-6127-467d-83f8-84e858376184",
-      "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.4862,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "source": "e1c7a78d-fe42-4ccd-a530-65d525198961",
       "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
-      "relationship": "decomposes_to",
+      "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.6472,
+      "flow_weight": 0.3682,
       "flow_basis": "proxy"
     },
     {
-      "source": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "source": "e1c7a78d-fe42-4ccd-a530-65d525198961",
       "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5185,
+      "flow_weight": 0.295,
       "flow_basis": "proxy"
     },
     {
-      "source": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "source": "e1c7a78d-fe42-4ccd-a530-65d525198961",
       "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.6328,
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.36,
       "flow_basis": "proxy"
     },
     {
-      "source": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "source": "711350ec-507e-4ec5-81bf-71b82c35ee52",
       "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "relationship": "supports",
+      "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0822,
+      "flow_weight": 0.0735,
       "flow_basis": "proxy"
     },
     {
-      "source": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "source": "711350ec-507e-4ec5-81bf-71b82c35ee52",
       "target": "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.2554,
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.2282,
       "flow_basis": "proxy"
     },
     {
-      "source": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "source": "711350ec-507e-4ec5-81bf-71b82c35ee52",
       "target": "e1c7a78d-fe42-4ccd-a530-65d525198961",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.1597,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
+      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.559,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
+      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1788,
+      "flow_weight": 0.4217,
       "flow_basis": "proxy"
     },
     {
-      "source": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
-      "target": "5bc171cb-6018-494c-a270-db04a559a6ed",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.6449,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
-      "target": "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.4865,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
+      "source": "5bedc90c-3600-4507-bfd6-cf289c631ad1",
       "target": "2b066125-1711-4bb2-9fa3-5984225fa5a0",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.6725,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
+      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.7758,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
-      "source": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
-      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
-      "relationship": "refutes",
-      "sign": -1,
-      "flow_weight": 0.3333,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
+      "source": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
       "target": "41e53f33-6127-467d-83f8-84e858376184",
-      "relationship": "contradicts",
-      "sign": -1,
-      "flow_weight": 0.377,
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
-      "source": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "source": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
+      "target": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
       "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0052,
+      "flow_weight": 0.2014,
       "flow_basis": "proxy"
     },
     {
-      "source": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "source": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
       "target": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
-      "relationship": "supports",
-      "sign": 1,
-      "flow_weight": 0.0076,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
-      "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-      "relationship": "cites",
-      "sign": 0,
-      "flow_weight": 0.0153,
-      "flow_basis": "proxy"
-    },
-    {
-      "source": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
-      "target": "37e3644a-f521-4ae5-bba6-492242946154",
-      "relationship": "refutes",
+      "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2993,
+      "flow_weight": 0.2974,
       "flow_basis": "proxy"
     },
     {
-      "source": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
+      "source": "864623c4-0645-4262-a5ab-cc8f1246c4f2",
+      "target": "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.5952,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "target": "37e3644a-f521-4ae5-bba6-492242946154",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.0939,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
       "target": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2645,
+      "flow_weight": 0.083,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "48b7e3b9-22cf-410d-923e-4df6316e6bbd",
+      "target": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.1621,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "target": "288a0652-ce56-46a8-a6cf-40a079c5264c",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.3978,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3721,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+      "target": "782a4535-648a-4751-becb-b006ca131aeb",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.3978,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "633f6781-f5c8-4376-8fef-154169e497f3",
+      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2632,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "633f6781-f5c8-4376-8fef-154169e497f3",
+      "target": "41e53f33-6127-467d-83f8-84e858376184",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7349,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "633f6781-f5c8-4376-8fef-154169e497f3",
+      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.6369,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "target": "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.1444,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1829,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33395036-3935-42d8-8db5-1bd3552677fc",
+      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.2657,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "41e53f33-6127-467d-83f8-84e858376184",
+      "target": "e1c7a78d-fe42-4ccd-a530-65d525198961",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.4022,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "41e53f33-6127-467d-83f8-84e858376184",
+      "target": "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+      "relationship": "SUPPORTS",
+      "sign": 1,
+      "flow_weight": 0.2585,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.7814,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "target": "41e53f33-6127-467d-83f8-84e858376184",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3475,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+      "target": "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.6325,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1497,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0854,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e567ce83-b55d-42e4-b90a-baa363ab6e43",
+      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1341,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
+      "target": "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.3581,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
+      "target": "211421dc-eca3-419a-a8ce-209df8ca9017",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.5654,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
+      "target": "2831a6a0-3e0d-4f4d-84f3-fe625ae8b101",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4261,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
+      "target": "5c48dac8-3271-4134-a27b-6701e76dc498",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5796,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
+      "target": "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.3345,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
+      "target": "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.3135,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "target": "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0087,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "target": "2e09a762-bc56-41a3-bcce-26775e3f1467",
+      "relationship": "CORROBORATES",
+      "sign": 1,
+      "flow_weight": 0.0085,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a34f5cf0-82fa-48e6-a4fe-cfe9a7106da9",
+      "target": "945b86e9-c966-4468-8b33-74d91f18c4c5",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0149,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
+      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "relationship": "CONTRADICTS",
+      "sign": -1,
+      "flow_weight": 0.3557,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
+      "target": "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5795,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
+      "target": "782a4535-648a-4751-becb-b006ca131aeb",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5719,
       "flow_basis": "proxy"
     }
   ],
   "outgoing": [
     {
       "target": {
-        "level_id": "0651c1c7-dc57-4200-9805-c269e9132b38",
-        "theme_id": "644b1460-5494-4d76-b0ee-17f1646e6ff9",
-        "name": "Corimar vepralin",
-        "depth": 1
-      },
-      "count": 8,
-      "net_sign": 0,
-      "sources": [
-        "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
-        "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
-        "41e53f33-6127-467d-83f8-84e858376184",
-        "33395036-3935-42d8-8db5-1bd3552677fc",
-        "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
-        "940914b3-07e0-48be-9993-3271803f5a86"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "98b658e1-9bd7-451b-86c1-f4d45965997f",
-        "theme_id": "6a4b453e-f2c3-4f52-ba85-0a0f0a2bec32",
-        "name": "Taimlin opqua zensel issel cordeltor",
+        "level_id": "90d46ad0-7792-4a77-8f02-745cb063bf80",
+        "theme_id": "95d75e61-04b1-474b-a472-5553d8a8900a",
+        "name": "Thifo existhi taka riexbel belquari",
         "depth": 3
       },
-      "count": 5,
-      "net_sign": 0,
-      "sources": [
-        "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
-        "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-        "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
-        "e1c7a78d-fe42-4ccd-a530-65d525198961"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "a7df68bd-e365-4545-ab47-a661cf70c7d0",
-        "theme_id": "045cc96d-10d0-4515-99cc-3a40c957d2a8",
-        "name": "Miul pradun",
-        "depth": 4
-      },
-      "count": 17,
-      "net_sign": 0,
-      "sources": [
-        "59906e55-65f2-49b5-a088-abee85c82a73",
-        "2e09a762-bc56-41a3-bcce-26775e3f1467",
-        "1dd91b46-f4bf-40dd-a749-73b752520f25",
-        "37e3644a-f521-4ae5-bba6-492242946154",
-        "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-        "2b066125-1711-4bb2-9fa3-5984225fa5a0",
-        "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
-        "9ffbc945-6ead-4a10-ad5b-18cd860a7a45"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "91037a1b-732d-4d3f-a04a-ddcd31ede68c",
-        "theme_id": "045cc96d-10d0-4515-99cc-3a40c957d2a8",
-        "name": "Focor quami neroop onne",
-        "depth": 1
-      },
-      "count": 14,
+      "count": 20,
       "net_sign": 1,
       "sources": [
-        "1dd91b46-f4bf-40dd-a749-73b752520f25",
-        "62d68da0-2a45-48e0-ba2f-a27a48499b75",
-        "024fd22c-663a-4439-a5d6-c0aeccb4648e",
+        "711350ec-507e-4ec5-81bf-71b82c35ee52",
+        "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+        "8805a464-fda7-4b35-8b56-9144dba0d70e"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "d11d36ef-9bba-4892-8bc5-95cdfa742620",
+        "theme_id": "e784435e-97f0-4e23-9596-3b56ea8aa3e9",
+        "name": "Arlinri onqua corthiri rimi dunne",
+        "depth": 1
+      },
+      "count": 9,
+      "net_sign": 0,
+      "sources": [
+        "211421dc-eca3-419a-a8ce-209df8ca9017"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "c0f99cbf-3cbf-406d-bd65-b84445f0935c",
+        "theme_id": "a9fcffb2-4bd7-4aea-8731-2116db56496e",
+        "name": "Linarbel fone praarbel exsa",
+        "depth": 4
+      },
+      "count": 27,
+      "net_sign": 1,
+      "sources": [
         "33395036-3935-42d8-8db5-1bd3552677fc",
-        "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+        "c70d8787-b2f4-46b9-a3e2-d6f472004e58",
+        "1bdc8c85-4082-4b3d-bbb6-0f2372f2e2a6",
+        "59906e55-65f2-49b5-a088-abee85c82a73",
+        "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+        "e567ce83-b55d-42e4-b90a-baa363ab6e43",
         "211421dc-eca3-419a-a8ce-209df8ca9017",
         "9ffbc945-6ead-4a10-ad5b-18cd860a7a45"
       ]
     },
     {
       "target": {
-        "level_id": "95963b56-ea8a-43e9-91c4-67d2e705e1e6",
-        "theme_id": "644b1460-5494-4d76-b0ee-17f1646e6ff9",
-        "name": "Rolinfo zenlin linquafo cordelmi corfodel",
+        "level_id": "b7eb6a9d-3d91-49ab-9121-fd96983df888",
+        "theme_id": "95d75e61-04b1-474b-a472-5553d8a8900a",
+        "name": null,
         "depth": 4
       },
-      "count": 13,
+      "count": 14,
       "net_sign": 1,
       "sources": [
-        "59906e55-65f2-49b5-a088-abee85c82a73"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "efca509a-9424-4066-b5e6-046fb023e011",
-        "theme_id": "045cc96d-10d0-4515-99cc-3a40c957d2a8",
-        "name": "Existhi taka",
-        "depth": 0
-      },
-      "count": 10,
-      "net_sign": 0,
-      "sources": [
+        "864623c4-0645-4262-a5ab-cc8f1246c4f2",
+        "5c48dac8-3271-4134-a27b-6701e76dc498",
+        "782a4535-648a-4751-becb-b006ca131aeb",
+        "1dd91b46-f4bf-40dd-a749-73b752520f25",
+        "288a0652-ce56-46a8-a6cf-40a079c5264c",
+        "2e09a762-bc56-41a3-bcce-26775e3f1467",
+        "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+        "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+        "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+        "59906e55-65f2-49b5-a088-abee85c82a73",
         "024fd22c-663a-4439-a5d6-c0aeccb4648e"
       ]
     },
     {
       "target": {
-        "level_id": "2825d5fc-188f-4d7a-a05b-edafa93bc87f",
-        "theme_id": "6a4b453e-f2c3-4f52-ba85-0a0f0a2bec32",
+        "level_id": "99250add-e09c-409b-9b16-386daa17a5d8",
+        "theme_id": "95d75e61-04b1-474b-a472-5553d8a8900a",
+        "name": "Imar prais dunpra belar",
+        "depth": 4
+      },
+      "count": 7,
+      "net_sign": 1,
+      "sources": [
+        "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+        "211421dc-eca3-419a-a8ce-209df8ca9017"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "651852dd-78de-45d5-951c-18fb7cb8cee1",
+        "theme_id": "95d75e61-04b1-474b-a472-5553d8a8900a",
         "name": null,
-        "depth": 2
-      },
-      "count": 20,
-      "net_sign": 1,
-      "sources": [
-        "59906e55-65f2-49b5-a088-abee85c82a73",
-        "346837d0-230e-47dd-923d-0077a2e1dc43",
-        "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
-        "5bedc90c-3600-4507-bfd6-cf289c631ad1",
-        "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-        "940914b3-07e0-48be-9993-3271803f5a86",
-        "5bc171cb-6018-494c-a270-db04a559a6ed",
-        "8805a464-fda7-4b35-8b56-9144dba0d70e",
-        "c70d8787-b2f4-46b9-a3e2-d6f472004e58"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "2a099c9d-79b3-497b-a5f4-4a8fa502c814",
-        "theme_id": "12c83d26-2486-4957-a028-86f132328746",
-        "name": "Thidel arlinri onqua corthiri",
-        "depth": 2
-      },
-      "count": 20,
-      "net_sign": -1,
-      "sources": [
-        "633f6781-f5c8-4376-8fef-154169e497f3",
-        "346837d0-230e-47dd-923d-0077a2e1dc43",
-        "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
-        "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
-        "59906e55-65f2-49b5-a088-abee85c82a73",
-        "5bc171cb-6018-494c-a270-db04a559a6ed",
-        "864623c4-0645-4262-a5ab-cc8f1246c4f2",
-        "1dd91b46-f4bf-40dd-a749-73b752520f25",
-        "33395036-3935-42d8-8db5-1bd3552677fc"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "6275e5fa-8c4b-44ce-b86c-a715702d5543",
-        "theme_id": "6a4b453e-f2c3-4f52-ba85-0a0f0a2bec32",
-        "name": "Nedelon veul arbeldun nezen arbel",
-        "depth": 2
-      },
-      "count": 27,
-      "net_sign": 1,
-      "sources": [
-        "288a0652-ce56-46a8-a6cf-40a079c5264c",
-        "e810c7e3-fe6e-4bbf-833d-51aa11087a2c",
-        "633f6781-f5c8-4376-8fef-154169e497f3",
-        "782a4535-648a-4751-becb-b006ca131aeb",
-        "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
-        "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
-        "37e3644a-f521-4ae5-bba6-492242946154"
-      ]
-    },
-    {
-      "target": {
-        "level_id": "1e2abb1e-b4bb-47d2-8c9d-cb97538e3566",
-        "theme_id": "644b1460-5494-4d76-b0ee-17f1646e6ff9",
-        "name": "Veim duncorar",
         "depth": 3
       },
-      "count": 16,
+      "count": 7,
+      "net_sign": 1,
+      "sources": [
+        "5c48dac8-3271-4134-a27b-6701e76dc498"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "71b8f860-a14e-4260-afea-d5e04ea8f3b6",
+        "theme_id": "e784435e-97f0-4e23-9596-3b56ea8aa3e9",
+        "name": "Torthivor rori thive lintorzen delthiro",
+        "depth": 3
+      },
+      "count": 15,
       "net_sign": 0,
       "sources": [
-        "288a0652-ce56-46a8-a6cf-40a079c5264c",
-        "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+        "8d8c4db9-9a3c-4242-92d5-961dd5b2ef35",
+        "2b066125-1711-4bb2-9fa3-5984225fa5a0",
+        "abd8db89-3e23-4742-bf28-9cf4967a0a8b",
+        "346837d0-230e-47dd-923d-0077a2e1dc43",
         "945b86e9-c966-4468-8b33-74d91f18c4c5",
-        "4365d324-140b-4f22-b4a9-037c1e2e1ae6",
+        "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "117a6aa3-410b-45ac-b8d9-9d62b37bcc82",
+        "theme_id": "95d75e61-04b1-474b-a472-5553d8a8900a",
+        "name": "Prabelsel exmidel",
+        "depth": 4
+      },
+      "count": 17,
+      "net_sign": 1,
+      "sources": [
+        "9ffbc945-6ead-4a10-ad5b-18cd860a7a45",
+        "41e53f33-6127-467d-83f8-84e858376184",
+        "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+        "8805a464-fda7-4b35-8b56-9144dba0d70e",
+        "024fd22c-663a-4439-a5d6-c0aeccb4648e"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "d5e24882-8680-49c3-96b2-88ac21f5a692",
+        "theme_id": "e784435e-97f0-4e23-9596-3b56ea8aa3e9",
+        "name": "Belrine roqua foopul delthi",
+        "depth": 2
+      },
+      "count": 17,
+      "net_sign": 1,
+      "sources": [
+        "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+        "33395036-3935-42d8-8db5-1bd3552677fc",
+        "8805a464-fda7-4b35-8b56-9144dba0d70e",
+        "e6454e8d-1679-4be9-8175-0f9970b4f1c3",
+        "a74b8a11-4f1a-43c5-81c2-acdf12a48134",
+        "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+        "3a0a5fae-2496-4b77-87d2-8df1f576daf2",
+        "2b066125-1711-4bb2-9fa3-5984225fa5a0"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "d7ba507d-efb0-4b42-b235-70daa56dfb58",
+        "theme_id": "95d75e61-04b1-474b-a472-5553d8a8900a",
+        "name": "Oprodel vemika onexdun zensellin forisa",
+        "depth": 3
+      },
+      "count": 25,
+      "net_sign": 0,
+      "sources": [
         "b3c7e8d7-bfa6-4c37-81dd-303ac5220bf7",
-        "211421dc-eca3-419a-a8ce-209df8ca9017"
+        "5bc171cb-6018-494c-a270-db04a559a6ed",
+        "288a0652-ce56-46a8-a6cf-40a079c5264c",
+        "33395036-3935-42d8-8db5-1bd3552677fc",
+        "f5da1c91-3f8a-49e2-a177-c28d9cd1eab2",
+        "b667c01e-ad8b-4990-90e9-47aa7ac7f52e",
+        "2b03e01f-c56d-4cfd-8d5e-2d9c3a2253f0",
+        "133c2ed1-cfa5-4c94-8c42-22094804fe2c",
+        "6f2fc39f-2f29-40ea-9741-931caae5fe1a",
+        "7c9e2c01-c8d4-40a1-8e01-7a7642c5b07a",
+        "41e53f33-6127-467d-83f8-84e858376184"
       ]
     }
   ]

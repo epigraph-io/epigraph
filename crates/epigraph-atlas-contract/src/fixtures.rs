@@ -13,8 +13,10 @@
 //!
 //! The worst-case builders ([`worst_case_leaf`], [`worst_case_group`]) are
 //! not written to disk. They fill every array to its cap and every string to
-//! its maximum length with high-entropy text, and the budget test proves
-//! that even they fit.
+//! its maximum length with random Latin, Greek, Cyrillic and CJK text, and
+//! the budget test shows that they fit. Text that compresses worse than that
+//! can still exceed the budget, which is why producers store through
+//! [`crate::LevelDocument::to_stored_json`].
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -25,6 +27,10 @@ use crate::{
     MAX_GROUP_BUNDLES, MAX_GROUP_CHILDREN, MAX_GROUP_TARGETS, MAX_LABEL_CHARS, MAX_LEAF_EDGES,
     MAX_LEAF_NODES, MAX_LEAF_OUTGOING, MAX_NAME_CHARS, MAX_RELATIONSHIP_CHARS, SCHEMA_VERSION,
 };
+
+/// The synthetic team group every team fixture belongs to. Route tests that
+/// replay a team fixture expect this map ([`crate::check::Expected::team`]).
+pub const FIXTURE_TEAM_GROUP_ID: Uuid = Uuid::from_u128(0x5e5e_0000_0000_4000_8000_0000_0000_7ea0);
 
 /// SplitMix64: a fixed, dependency-free stream.
 pub struct Rng(u64);
@@ -161,7 +167,7 @@ struct Frame {
 
 fn frame(rng: &mut Rng, map_scope: MapScope, hierarchy: Hierarchy, depth: u8) -> Frame {
     let map_group_id = match map_scope {
-        MapScope::Team => Some(rng.uuid()),
+        MapScope::Team => Some(FIXTURE_TEAM_GROUP_ID),
         MapScope::Public => None,
     };
     let theme_id = rng.uuid();
@@ -291,17 +297,24 @@ fn group_level(
     }
 }
 
+/// Claim-to-claim relationship names as the `edges` table spells them, both
+/// casings included: the view must not assume lower case.
 const CLAIM_RELATIONSHIPS: &[(&str, i8)] = &[
     ("supports", 1),
     ("supports", 1),
-    ("supports", 1),
+    ("SUPPORTS", 1),
     ("corroborates", 1),
+    ("CORROBORATES", 1),
     ("elaborates", 1),
     ("decomposes_to", 1),
     ("cites", 0),
     ("contradicts", -1),
+    ("CONTRADICTS", -1),
     ("refutes", -1),
 ];
+
+/// Agent-to-claim relationship names in use: no belief flow.
+const AGENT_RELATIONSHIPS: &[&str] = &["AUTHORED", "authored", "asserts"];
 
 /// A leaf: claims, the agents that asserted them and their evidence, with
 /// `per_claim` claim-to-claim links per claim and `n_outgoing` outside
@@ -362,15 +375,21 @@ fn leaf_level(
             edges.push(e);
         }
     };
-    // Each claim was asserted by one agent: no belief flow.
-    for c in &claims {
-        let a = &agents[rng.below(agents.len())];
+    // Each claim was asserted or authored by one agent: no belief flow.
+    // The first agents take the first claims, so every agent is in the leaf
+    // because of a claim (design §7 step 3).
+    for (i, c) in claims.iter().enumerate() {
+        let a = &agents[if i < agents.len() {
+            i
+        } else {
+            rng.below(agents.len())
+        }];
         push(
             &mut edges,
             Edge {
                 source: a.id,
                 target: c.id,
-                relationship: "asserted".into(),
+                relationship: AGENT_RELATIONSHIPS[rng.below(AGENT_RELATIONSHIPS.len())].into(),
                 sign: 0,
                 flow_weight: 0.0,
                 flow_basis: FlowBasis::None,
@@ -387,7 +406,14 @@ fn leaf_level(
                 Edge {
                     source: ev.id,
                     target: c.id,
-                    relationship: if opposing { "refutes" } else { "supports" }.into(),
+                    relationship: if opposing {
+                        "refutes"
+                    } else if rng.chance(0.3) {
+                        "SUPPORTS"
+                    } else {
+                        "supports"
+                    }
+                    .into(),
                     sign: if opposing { -1 } else { 1 },
                     flow_weight: r4(0.05 + 0.9 * rng.unit()),
                     flow_basis: FlowBasis::Exact,
@@ -577,10 +603,16 @@ pub fn dense_text(rng: &mut Rng, n: usize) -> String {
         .collect()
 }
 
-/// A relationship of the maximum length with random letters.
+/// A relationship of the maximum length: a random letter, then random
+/// letters of both cases, digits and `_`.
 fn dense_relationship(rng: &mut Rng) -> String {
+    const LETTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const TAIL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
     (0..MAX_RELATIONSHIP_CHARS)
-        .map(|_| (b'a' + rng.below(26) as u8) as char)
+        .map(|i| {
+            let set = if i == 0 { LETTERS } else { TAIL };
+            set[rng.below(set.len())] as char
+        })
         .collect()
 }
 

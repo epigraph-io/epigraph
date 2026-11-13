@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:epigraph:atlas-level:v1",
   "title": "Atlas nested level, schema v1",
-  "description": "One Atlas level below a theme: a group level (named children and aggregated cross-group link bundles) or a leaf (at most 100 nodes with precomputed positions, belief-flow edges and outgoing links). Stored as one jsonb document per (map, hierarchy, level) and served as is. Every object is closed: a key not listed here fails validation. Budget: the compact serialisation is at most 150000 bytes gzip-compressed. The caps below are set so that the largest document they allow still fits when its text is no less compressible than random Latin, Greek, Cyrillic and CJK characters; a route test still measures every served body. Positions are in a unit frame: x and y in [-1, 1], r in (0, 1].",
+  "description": "One Atlas level below a theme: a group level (named children and aggregated cross-group link bundles) or a leaf (at most 100 nodes with precomputed positions, belief-flow edges and outgoing links). Stored as one jsonb document per (map, hierarchy, level). Served filtered for the viewer: the kernel route drops every leaf node the viewer's own session cannot read, with its edges and outgoing sources, and any agent or evidence node left with no edge to a claim; with no claim left it answers not-found. Counts pass through as stored. The document holds claim text and LLM names, so it is assembled on the prod box; off-box stages produce only ids, positions and weights. Every object is closed: a key not listed here fails validation. Budget: the compact serialisation is at most 150000 bytes gzip-compressed. The caps below keep the largest document they allow inside it when its text is no less compressible than random Latin, Greek, Cyrillic and CJK characters, but they do not guarantee it: producers measure every stored document and a route test measures every served body. Positions are in a unit frame: x and y in [-1, 1], r in (0, 1].",
   "oneOf": [
     { "$ref": "#/$defs/group_level" },
     { "$ref": "#/$defs/leaf_level" }
@@ -162,7 +162,7 @@
           "$ref": "#/$defs/nullable_unit_interval"
         },
         "betp": {
-          "description": "The claim's cached pignistic probability; the proxy flow of its outgoing claim edges is computed from it.",
+          "description": "The claim's BetP, from a role-aware belief read (never a compound's folded cache); null where that read gives none. The proxy flow of its outgoing claim edges is computed from it.",
           "$ref": "#/$defs/nullable_unit_interval"
         }
       }
@@ -180,7 +180,7 @@
       }
     },
     "edge": {
-      "description": "A link between two nodes of the leaf, pointing the way belief flows. flow_basis exact: evidence to claim, the stored mass. proxy: claim to claim, link strength times the source claim's BetP, which the view labels an estimate. none: no belief flow (an agent's authorship, for example), so weight 0 and sign 0.",
+      "description": "A link between two nodes of the leaf, pointing the way belief flows. The endpoint kinds fix flow_basis. exact: every evidence-to-claim edge, the stored mass. proxy: every claim-to-claim edge, link strength times the source claim's BetP, which the view labels an estimate. none: every other pair (an agent's authorship, for example), so weight 0 and sign 0. Stored edges repeating one (source, target, relationship) collapse into one edge with the largest flow_weight among them.",
       "type": "object",
       "additionalProperties": false,
       "required": ["source", "target", "relationship", "sign", "flow_weight", "flow_basis"],
@@ -188,8 +188,9 @@
         "source": { "$ref": "#/$defs/uuid" },
         "target": { "$ref": "#/$defs/uuid" },
         "relationship": {
+          "description": "The stored relationship name, unnormalised: both casings are in use (AUTHORED and authored), so the view compares names case-insensitively.",
           "type": "string",
-          "pattern": "^[a-z][a-z_]*$",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
           "maxLength": 32
         },
         "sign": { "$ref": "#/$defs/sign" },

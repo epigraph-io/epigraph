@@ -9,25 +9,44 @@
 //!   and evidence with precomputed positions, the belief-flow edges among
 //!   them, and the links that leave the leaf, aggregated by target group.
 //!
-//! The layout builder writes the document, the layout store keeps it as one
-//! `jsonb` row next to a `schema_version` column, and the kernel route and
-//! the Explorer BFF serve it unchanged. The language-neutral contract is the
-//! JSON Schema at `services/explorer/contract/atlas_level/v1/schema.json`.
-//! It sits under `services/explorer` because the Explorer is a standalone
-//! crate that cannot read outside its own directory, while the kernel can.
-//! The fixtures next to it are written by [`fixtures`].
+//! The layout builder writes the document and the layout store keeps it as
+//! one `jsonb` row next to a `schema_version` column.
+//!
+//! **What is served is the stored document filtered for the viewer**
+//! (design §5: "the serving path still filters by the viewer (RLS), so a
+//! member never sees a row their own session cannot read"). The kernel
+//! route reads the stored document, then calls
+//! [`LevelDocument::for_viewer`] with what the viewer's own session can
+//! read. That drops every node the viewer cannot read, with its edges and
+//! its `outgoing` sources. A `None` result is answered with the same
+//! not-found body as an absent level. The Explorer BFF serves the kernel's
+//! answer as it comes. Group levels carry no claim rows and are served as
+//! stored. A claim that leaves the team only changes their counts and names
+//! after the next rebuild, which the per-team epoch of design §5 triggers.
+//!
+//! **The document holds claim text** (`label`) and LLM names, so it is
+//! assembled on the prod box. Off-box stages (design §2) produce only ids,
+//! positions and weights.
+//!
+//! The language-neutral contract is the JSON Schema at
+//! `services/explorer/contract/atlas_level/v1/schema.json`. It sits under
+//! `services/explorer` because the Explorer is a standalone crate that
+//! cannot read outside its own directory, while the kernel can. The
+//! fixtures next to it are written by [`fixtures`].
 //!
 //! These types are the kernel's side of that contract. Deserialising is
 //! strict: an unknown key anywhere is an error, and so is a missing key,
-//! nullable ones included. [`LevelDocument::validate`] checks everything
-//! the schema checks, plus what a JSON Schema cannot express: references
-//! between parts of the document, and which flow basis each edge may have.
-//! The crate's tests prove that the strict types with `validate` and the
-//! schema agree, and that the largest document the caps allow fits
-//! [`BUDGET_GZIP_BYTES`] when its text is no less compressible than random
-//! multi-script text. `validate` does not measure size: a producer that
-//! needs the budget enforced measures the compressed body itself (as
-//! [`check::check_level_body`] does).
+//! nullable ones included. [`LevelDocument::validate`] checks everything the
+//! schema checks. It also checks what a JSON Schema cannot express:
+//! references between parts of the document, and which flow basis each
+//! edge has. The crate's tests prove that the strict types with `validate`
+//! agree with the schema. They also show that the largest document the caps
+//! allow fits [`BUDGET_GZIP_BYTES`] when its text is no less compressible
+//! than random Latin, Greek, Cyrillic and CJK text. Text that compresses
+//! worse (characters from the astral planes, for example) can exceed it.
+//! So the caps do not guarantee the budget: [`LevelDocument::validate`]
+//! does not measure size, and a producer stores what
+//! [`LevelDocument::to_stored_json`] returns, which does measure it.
 //!
 //! With the `check` feature, [`check`] validates a served body against the
 //! schema and the budget. Route tests call it on real responses.
@@ -112,17 +131,39 @@ pub enum ChildKind {
     Leaf,
 }
 
-/// Where an edge's `flow_weight` comes from.
+/// Where an edge's `flow_weight` comes from. The endpoint kinds fix it, so a
+/// producer cannot leave out a belief flow by marking the edge `none`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
-    /// Evidence to claim: the stored mass.
+    /// Evidence to claim, always: the stored mass.
     Exact,
-    /// Claim to claim: link strength times the source claim's BetP. The view
-    /// labels it an estimate.
+    /// Claim to claim, always: link strength times the source claim's BetP.
+    /// The view labels it an estimate. A link with no belief direction
+    /// (`cites`) is still `proxy`, with sign 0.
     Proxy,
-    /// No belief flow (an agent's authorship, for example): weight 0, sign 0.
+    /// Every other pair of kinds (an agent's authorship, for example): no
+    /// belief flow, so weight 0 and sign 0.
     None,
+}
+
+impl FlowBasis {
+    /// The basis an edge between these node kinds must carry.
+    pub fn for_kinds(source: NodeKind, target: NodeKind) -> Self {
+        match (source, target) {
+            (NodeKind::Evidence, NodeKind::Claim) => FlowBasis::Exact,
+            (NodeKind::Claim, NodeKind::Claim) => FlowBasis::Proxy,
+            _ => FlowBasis::None,
+        }
+    }
+}
+
+/// The three kinds of leaf node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NodeKind {
+    Claim,
+    Agent,
+    Evidence,
 }
 
 /// An ancestor of a level, from the theme root down to the parent.
@@ -196,7 +237,11 @@ pub struct ClaimNode {
     /// The colour value, as at the region and theme levels.
     #[serde(deserialize_with = "Option::deserialize")]
     pub truth_value: Option<f64>,
-    /// The cached pignistic probability; proxy flows are computed from it.
+    /// The claim's BetP, which proxy flows are computed from. It comes from
+    /// a role-aware belief read (the `no_role_blind_belief_reads` ratchet),
+    /// never from a compound's folded cache, and is `None` where that read
+    /// gives no value. Whether the leaf carries it at all is open for an
+    /// operator ruling: the existing Atlas routes serve no belief value.
     #[serde(deserialize_with = "Option::deserialize")]
     pub betp: Option<f64>,
 }
@@ -228,11 +273,11 @@ impl Node {
         }
     }
 
-    fn kind_str(&self) -> &'static str {
+    pub fn kind(&self) -> NodeKind {
         match self {
-            Node::Claim(_) => "claim",
-            Node::Agent(_) => "agent",
-            Node::Evidence(_) => "evidence",
+            Node::Claim(_) => NodeKind::Claim,
+            Node::Agent(_) => NodeKind::Agent,
+            Node::Evidence(_) => NodeKind::Evidence,
         }
     }
 
@@ -245,11 +290,18 @@ impl Node {
 }
 
 /// A link between two nodes of a leaf, pointing the way belief flows.
+///
+/// The `edges` table keeps one row per submission (migration 018 dropped
+/// its triple-uniqueness), so one (source, target, relationship) can have
+/// several rows. The builder collapses them into one edge with the largest
+/// `flow_weight` among them: a resubmission is not more support.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edge {
     pub source: Uuid,
     pub target: Uuid,
+    /// The stored relationship name, unnormalised: both `AUTHORED` and
+    /// `authored` are in use, so the view compares names case-insensitively.
     pub relationship: String,
     /// 1 supporting, -1 opposing, 0 no belief direction.
     pub sign: i8,
@@ -351,6 +403,24 @@ impl std::fmt::Display for Violations {
 
 impl std::error::Error for Violations {}
 
+/// gzip size (flate2's default level) of `bytes`: the measure of
+/// [`BUDGET_GZIP_BYTES`].
+pub fn gzip_len(bytes: &[u8]) -> usize {
+    use std::io::Write as _;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(bytes).expect("gzip into a Vec");
+    enc.finish().expect("gzip into a Vec").len()
+}
+
+/// Whether `s` is a relationship name the contract accepts: an ASCII letter,
+/// then letters, digits or `_`, at most [`MAX_RELATIONSHIP_CHARS`] long.
+/// Both casings are in use (`AUTHORED`, `authored`).
+pub fn is_relationship_name(s: &str) -> bool {
+    s.len() <= MAX_RELATIONSHIP_CHARS
+        && s.starts_with(|c: char| c.is_ascii_alphabetic())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Parse a body strictly and validate it: the producer-side check, with no
 /// JSON Schema validator.
 pub fn parse_and_validate(body: &[u8]) -> Result<LevelDocument, Violations> {
@@ -395,6 +465,90 @@ impl LevelDocument {
                 switch: &l.switch,
             },
         }
+    }
+
+    /// The compact JSON a producer stores: the document validated, then
+    /// measured against [`BUDGET_GZIP_BYTES`]. The caps alone do not bound
+    /// the compressed size (see the crate doc), so this measures it.
+    pub fn to_stored_json(&self) -> Result<Vec<u8>, Violations> {
+        self.validate()?;
+        let body =
+            serde_json::to_vec(self).map_err(|e| Violations(vec![format!("encode: {e}")]))?;
+        let n = gzip_len(&body);
+        if n > BUDGET_GZIP_BYTES {
+            return Err(Violations(vec![format!(
+                "budget: {n} gzip bytes exceed {BUDGET_GZIP_BYTES}"
+            )]));
+        }
+        Ok(body)
+    }
+
+    /// The document as served to one viewer (design §5), given whether the
+    /// viewer's own session can read each node (claims, agents and
+    /// evidence alike; evidence has its own row security).
+    ///
+    /// A group level is returned as stored. From a leaf, in this order:
+    /// 1. every node the viewer cannot read is dropped;
+    /// 2. so is every edge with a dropped end;
+    /// 3. so is every agent or evidence node left with no edge to a kept
+    ///    claim, since an isolated one would show where a hidden claim was;
+    /// 4. dropped nodes leave every `outgoing[].sources`, and an `outgoing`
+    ///    entry left with no source is dropped.
+    ///
+    /// Counts and signs pass through as stored: they are aggregates the
+    /// team's map already shows, and `count >= sources.len()` still holds.
+    /// `None` means no claim is left, and the route answers with the same
+    /// not-found body as for an absent level. The result of a valid
+    /// document is valid.
+    pub fn for_viewer(&self, readable: impl Fn(Uuid) -> bool) -> Option<LevelDocument> {
+        let leaf = match self {
+            LevelDocument::Group(_) => return Some(self.clone()),
+            LevelDocument::Leaf(l) => l,
+        };
+        let readable: BTreeSet<Uuid> = leaf
+            .nodes
+            .iter()
+            .map(Node::id)
+            .filter(|id| readable(*id))
+            .collect();
+        let claims: BTreeSet<Uuid> = leaf
+            .nodes
+            .iter()
+            .filter(|n| n.kind() == NodeKind::Claim && readable.contains(&n.id()))
+            .map(Node::id)
+            .collect();
+        if claims.is_empty() {
+            return None;
+        }
+        let edges: Vec<&Edge> = leaf
+            .edges
+            .iter()
+            .filter(|e| readable.contains(&e.source) && readable.contains(&e.target))
+            .collect();
+        let anchored: BTreeSet<Uuid> = edges
+            .iter()
+            .flat_map(|e| {
+                let to_claim = claims.contains(&e.source) || claims.contains(&e.target);
+                to_claim
+                    .then_some([e.source, e.target])
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        let kept: BTreeSet<Uuid> = readable
+            .iter()
+            .copied()
+            .filter(|id| claims.contains(id) || anchored.contains(id))
+            .collect();
+        let mut out = leaf.clone();
+        out.nodes.retain(|n| kept.contains(&n.id()));
+        out.edges
+            .retain(|e| kept.contains(&e.source) && kept.contains(&e.target));
+        for o in &mut out.outgoing {
+            o.sources.retain(|s| kept.contains(s));
+        }
+        out.outgoing.retain(|o| !o.sources.is_empty());
+        Some(LevelDocument::Leaf(out))
     }
 
     /// Every rule of schema v1 that the types do not already enforce, plus
@@ -588,10 +742,10 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
     check_max("/edges", l.edges.len(), MAX_LEAF_EDGES, v);
     check_max("/outgoing", l.outgoing.len(), MAX_LEAF_OUTGOING, v);
 
-    let mut kinds: BTreeMap<Uuid, &'static str> = BTreeMap::new();
+    let mut kinds: BTreeMap<Uuid, NodeKind> = BTreeMap::new();
     for (i, n) in l.nodes.iter().enumerate() {
         let p = format!("/nodes/{i}");
-        if kinds.insert(n.id(), n.kind_str()).is_some() {
+        if kinds.insert(n.id(), n.kind()).is_some() {
             v.push(format!("{p}/id: duplicate node"));
         }
         let (label, x, y) = n.label_xy();
@@ -614,6 +768,7 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
     }
 
     let mut triples = BTreeSet::new();
+    let mut anchored = BTreeSet::new();
     for (i, e) in l.edges.iter().enumerate() {
         let p = format!("/edges/{i}");
         let src = kinds.get(&e.source).copied();
@@ -627,15 +782,9 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
         if e.source == e.target {
             v.push(format!("{p}: a self-loop"));
         }
-        let rel_ok = !e.relationship.is_empty()
-            && e.relationship.len() <= MAX_RELATIONSHIP_CHARS
-            && e.relationship.starts_with(|c: char| c.is_ascii_lowercase())
-            && e.relationship
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c == '_');
-        if !rel_ok {
+        if !is_relationship_name(&e.relationship) {
             v.push(format!(
-                "{p}/relationship: not a snake_case name of 1..={MAX_RELATIONSHIP_CHARS}"
+                "{p}/relationship: not a name of 1..={MAX_RELATIONSHIP_CHARS} letters, digits or _"
             ));
         }
         if !triples.insert((e.source, e.target, e.relationship.clone())) {
@@ -645,26 +794,31 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
         }
         check_sign(&format!("{p}/sign"), e.sign, v);
         check_unit(&format!("{p}/flow_weight"), e.flow_weight, v);
-        match e.flow_basis {
-            FlowBasis::Exact => {
-                if src.is_some_and(|k| k != "evidence") || dst.is_some_and(|k| k != "claim") {
-                    v.push(format!(
-                        "{p}/flow_basis: exact flow runs from evidence to a claim"
-                    ));
-                }
+        if let (Some(s), Some(t)) = (src, dst) {
+            let want = FlowBasis::for_kinds(s, t);
+            if e.flow_basis != want {
+                v.push(format!(
+                    "{p}/flow_basis: an edge from {s:?} to {t:?} has basis {want:?}, not {:?}",
+                    e.flow_basis
+                ));
             }
-            FlowBasis::Proxy => {
-                if src.is_some_and(|k| k != "claim") || dst.is_some_and(|k| k != "claim") {
-                    v.push(format!(
-                        "{p}/flow_basis: proxy flow runs from a claim to a claim"
-                    ));
-                }
+            if s == NodeKind::Claim || t == NodeKind::Claim {
+                anchored.insert(e.source);
+                anchored.insert(e.target);
             }
-            FlowBasis::None => {
-                if e.flow_weight != 0.0 || e.sign != 0 {
-                    v.push(format!("{p}: an edge with no flow has weight 0 and sign 0"));
-                }
-            }
+        }
+        if e.flow_basis == FlowBasis::None && (e.flow_weight != 0.0 || e.sign != 0) {
+            v.push(format!("{p}: an edge with no flow has weight 0 and sign 0"));
+        }
+    }
+    // Agents and evidence are in a leaf because they assert, author or back
+    // its claims (design §7 step 3). One with no edge to a claim would show
+    // where a claim the viewer cannot read was.
+    for (i, n) in l.nodes.iter().enumerate() {
+        if n.kind() != NodeKind::Claim && !anchored.contains(&n.id()) {
+            v.push(format!(
+                "/nodes/{i}: an agent or evidence node with no edge to a claim"
+            ));
         }
     }
 

@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::check::{
-    check_level_body, check_not_found, compact_gzip_len, contract_dir, schema, schema_errors, Side,
+    check_level_body, check_not_found, compact_gzip_len, contract_dir, schema, schema_errors,
+    Expected, Side,
 };
-use crate::fixtures::{self, Rng};
+use crate::fixtures::{self, Rng, FIXTURE_TEAM_GROUP_ID};
 use crate::*;
 
 fn fixture_dir() -> std::path::PathBuf {
@@ -30,6 +31,27 @@ const LEVEL_STEMS: &[&str] = &[
     "team_leaf_dense",
     "public_leaf",
 ];
+
+/// What a request for a fixture asks for, from the generator and the
+/// fixture's name, never from the committed file under test.
+fn expected(stem: &str) -> Expected {
+    let level_id = fixtures::level_fixtures()
+        .into_iter()
+        .find(|(s, _)| *s == stem)
+        .unwrap_or_else(|| panic!("no fixture {stem}"))
+        .1
+        .level_id();
+    if stem.starts_with("public_") {
+        Expected::public(level_id)
+    } else {
+        Expected::team(FIXTURE_TEAM_GROUP_ID, level_id)
+    }
+}
+
+/// `check_level_body` on a fixture-shaped body, for the fixture's request.
+fn check_as(stem: &str, body: &[u8]) -> Result<LevelDocument, Vec<String>> {
+    check_level_body(body, &expected(stem))
+}
 
 /// The verdict of the strict types plus `validate`.
 fn types_accept(v: &Value) -> Result<(), String> {
@@ -181,7 +203,7 @@ fn fixtures_are_current() {
 #[test]
 fn every_fixture_validates() {
     for stem in LEVEL_STEMS {
-        if let Err(e) = check_level_body(&read_fixture(stem)) {
+        if let Err(e) = check_as(stem, &read_fixture(stem)) {
             panic!("{stem}: {e:#?}");
         }
     }
@@ -241,8 +263,23 @@ fn fixtures_cover_the_cases() {
         panic!("team_leaf_dense is a leaf")
     };
     assert_eq!(dense.nodes.len(), MAX_LEAF_NODES);
-    let kinds: BTreeSet<_> = dense.nodes.iter().map(|n| n.kind_str()).collect();
+    let kinds: BTreeSet<_> = dense.nodes.iter().map(Node::kind).collect();
     assert_eq!(kinds.len(), 3, "claim, agent and evidence nodes");
+    // Real relationship names, in both casings.
+    let rels: BTreeSet<&str> = dense
+        .edges
+        .iter()
+        .map(|e| e.relationship.as_str())
+        .collect();
+    for r in [
+        "AUTHORED",
+        "authored",
+        "SUPPORTS",
+        "supports",
+        "decomposes_to",
+    ] {
+        assert!(rels.contains(r), "{r} in {rels:?}");
+    }
     for basis in [FlowBasis::Exact, FlowBasis::Proxy, FlowBasis::None] {
         assert!(
             dense.edges.iter().any(|e| e.flow_basis == basis),
@@ -286,11 +323,14 @@ fn every_level_fixture_is_in_budget() {
 }
 
 /// The largest documents the caps allow (every array full, every string at
-/// its maximum length in dense multi-script text, full-precision numbers)
-/// pass the contract and fit the budget, so any valid document does: the
-/// budget is checked, not assumed.
+/// its maximum length in random Latin, Greek, Cyrillic and CJK text,
+/// full-precision numbers) pass the contract and fit the budget. This bounds
+/// documents whose text is at least that compressible, which real names and
+/// claim text are by far. It does not bound every valid document:
+/// `astral_text_can_exceed_the_budget_and_storage_refuses_it` shows one that
+/// does not fit.
 #[test]
-fn worst_case_documents_the_schema_allows_are_in_budget() {
+fn worst_case_multiscript_documents_are_in_budget() {
     for (what, doc) in [
         ("leaf", fixtures::worst_case_leaf()),
         ("group", fixtures::worst_case_group()),
@@ -309,9 +349,11 @@ fn worst_case_documents_the_schema_allows_are_in_budget() {
             }
         }
         let body = serde_json::to_vec(&doc).unwrap();
-        if let Err(e) = check_level_body(&body) {
+        let want = Expected::team(FIXTURE_TEAM_GROUP_ID, doc.level_id());
+        if let Err(e) = check_level_body(&body, &want) {
             panic!("worst-case {what} is not a valid document: {e:#?}");
         }
+        assert_eq!(doc.to_stored_json().expect("storable"), body);
         let n = crate::check::gzip_len(&body);
         eprintln!(
             "worst-case {what}: {} raw bytes, {n} gzip bytes, {} headroom",
@@ -336,14 +378,21 @@ fn probe_documents() -> Vec<Value> {
         let mut v = read_value(stem);
         let nodes = arr(&v["nodes"]);
         let mut kept: Vec<Value> = nodes.iter().take(keep_claims).cloned().collect();
+        let claim_ids: BTreeSet<String> = kept.iter().map(|n| id(&n["id"])).collect();
+        // An agent and an evidence node with an edge to a kept claim.
         for kind in ["agent", "evidence"] {
-            kept.push(
-                nodes
-                    .iter()
-                    .find(|n| n["kind"] == json!(kind))
-                    .unwrap()
-                    .clone(),
-            );
+            let n = nodes
+                .iter()
+                .find(|n| {
+                    n["kind"] == json!(kind)
+                        && arr(&v["edges"]).iter().any(|e| {
+                            id(&e["source"]) == id(&n["id"])
+                                && claim_ids.contains(&id(&e["target"]))
+                        })
+                })
+                .unwrap_or_else(|| panic!("{stem}: no {kind} backs one of the first claims"))
+                .clone();
+            kept.push(n);
         }
         let ids: BTreeSet<String> = kept.iter().map(|n| id(&n["id"])).collect();
         let edges: Vec<Value> = arr(&v["edges"])
@@ -537,7 +586,7 @@ fn extra_private_field_is_rejected() {
     for (stem, mutate) in cases {
         let mut v = read_value(stem);
         mutate(&mut v);
-        let errs = check_level_body(&serde_json::to_vec(&v).unwrap())
+        let errs = check_as(stem, &serde_json::to_vec(&v).unwrap())
             .expect_err("an extra field must fail the contract");
         assert!(
             errs.iter().any(|e| e.starts_with("schema")),
@@ -554,7 +603,7 @@ fn extra_private_field_is_rejected() {
 fn missing_flow_basis_is_rejected() {
     let mut v = read_value("team_leaf_dense");
     v["edges"][0].as_object_mut().unwrap().remove("flow_basis");
-    let errs = check_level_body(&serde_json::to_vec(&v).unwrap())
+    let errs = check_as("team_leaf_dense", &serde_json::to_vec(&v).unwrap())
         .expect_err("an edge without its exact/proxy flag must fail");
     assert!(errs.iter().any(|e| e.contains("flow_basis")), "{errs:#?}");
     assert!(errs.iter().any(|e| e.starts_with("schema")), "{errs:#?}");
@@ -569,7 +618,7 @@ fn a_document_over_budget_is_rejected() {
     let mut rng = Rng::new(7);
     body.extend((0..1_000_000).map(|_| b" \n\t\r"[rng.below(4)]));
     assert!(crate::check::gzip_len(&body) > BUDGET_GZIP_BYTES);
-    let errs = check_level_body(&body).expect_err("over budget");
+    let errs = check_as("team_leaf_dense", &body).expect_err("over budget");
     assert_eq!(errs.len(), 1, "only the budget fails: {errs:#?}");
     assert!(errs[0].starts_with("budget"), "{errs:#?}");
 }
@@ -645,12 +694,16 @@ fn invariants_catch_what_the_schema_cannot() {
         ("team_leaf_dense", "/edges/0/target: not a node", |v| {
             v["edges"][0]["target"] = json!("00000000-0000-4000-8000-0000000000aa");
         }),
-        ("team_leaf_dense", "exact flow runs from evidence", |v| {
-            let i = (0..)
-                .find(|&i| v["edges"][i]["flow_basis"] == json!("proxy"))
-                .unwrap();
-            v["edges"][i]["flow_basis"] = json!("exact");
-        }),
+        (
+            "team_leaf_dense",
+            "from Claim to Claim has basis Proxy, not Exact",
+            |v| {
+                let i = (0..)
+                    .find(|&i| v["edges"][i]["flow_basis"] == json!("proxy"))
+                    .unwrap();
+                v["edges"][i]["flow_basis"] = json!("exact");
+            },
+        ),
         ("team_leaf_dense", "/nodes/1/id: duplicate node", |v| {
             v["nodes"][1]["id"] = v["nodes"][0]["id"].clone();
         }),
@@ -748,4 +801,406 @@ fn invariants_enforce_the_schema_rules() {
         .unwrap_err()
         .contains("no flow has weight 0"));
     assert!(!schema_errors(&leaf).is_empty());
+}
+
+// ---- relationship names, flow basis, node anchoring --------------------------------
+
+/// The `edges` table spells relationships in both casings (`AUTHORED` and
+/// `authored`, `SUPPORTS` and `supports`, `OPERATED_BY`, `DERIVED_FROM`).
+/// Both the schema and the types accept every such name and reject what is
+/// not a name.
+#[test]
+fn relationship_names_in_both_casings_are_accepted() {
+    let with = |rel: &str| {
+        let mut v = read_value("team_leaf_dense");
+        let i = (0..)
+            .find(|&i| v["edges"][i]["flow_basis"] == json!("proxy"))
+            .unwrap();
+        v["edges"][i]["relationship"] = json!(rel);
+        v
+    };
+    for rel in [
+        "AUTHORED",
+        "SUPPORTS",
+        "CORROBORATES",
+        "OPERATED_BY",
+        "DERIVED_FROM",
+        "decomposes_to",
+        "rel2",
+        &"Q".repeat(MAX_RELATIONSHIP_CHARS),
+    ] {
+        let v = with(rel);
+        assert!(schema_errors(&v).is_empty(), "schema rejects {rel}");
+        types_accept(&v).unwrap_or_else(|e| panic!("types reject {rel}: {e}"));
+    }
+    for rel in [
+        "has space",
+        "1abc",
+        "_lead",
+        "a-b",
+        "dé",
+        &"Q".repeat(MAX_RELATIONSHIP_CHARS + 1),
+    ] {
+        let v = with(rel);
+        assert!(!schema_errors(&v).is_empty(), "schema accepts {rel}");
+        assert!(types_accept(&v).is_err(), "types accept {rel}");
+    }
+}
+
+/// The endpoint kinds fix an edge's flow basis, so a producer cannot drop a
+/// belief flow (and the exact/proxy label the view needs) by marking the
+/// edge `none` with weight 0 and sign 0. Each mutation is schema-valid.
+#[test]
+fn flow_basis_is_fixed_by_the_endpoint_kinds() {
+    let v = read_value("team_leaf_dense");
+    let kind_of = |id: &Value| {
+        v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| &n["id"] == id)
+            .map(|n| n["kind"].as_str().unwrap().to_string())
+            .unwrap()
+    };
+    let find = |src: &str, dst: &str| {
+        (0..)
+            .find(|&i| {
+                kind_of(&v["edges"][i]["source"]) == src && kind_of(&v["edges"][i]["target"]) == dst
+            })
+            .unwrap()
+    };
+    let cases = [
+        (
+            find("evidence", "claim"),
+            "none",
+            "from Evidence to Claim has basis Exact",
+        ),
+        (
+            find("claim", "claim"),
+            "none",
+            "from Claim to Claim has basis Proxy",
+        ),
+        (
+            find("agent", "claim"),
+            "proxy",
+            "from Agent to Claim has basis None",
+        ),
+        (
+            find("agent", "claim"),
+            "exact",
+            "from Agent to Claim has basis None",
+        ),
+    ];
+    for (i, basis, expected) in cases {
+        let mut m = v.clone();
+        m["edges"][i]["flow_basis"] = json!(basis);
+        if basis == "none" {
+            m["edges"][i]["flow_weight"] = json!(0.0);
+            m["edges"][i]["sign"] = json!(0);
+        }
+        assert!(
+            schema_errors(&m).is_empty(),
+            "{basis} at {i} is schema-valid"
+        );
+        let err = types_accept(&m).expect_err(expected);
+        assert!(err.contains(expected), "wanted `{expected}` in `{err}`");
+    }
+}
+
+/// An agent or evidence node is in a leaf only because it backs one of the
+/// leaf's claims. One with no edge to a claim fails, and the error names it.
+#[test]
+fn an_agent_or_evidence_node_with_no_claim_edge_is_rejected() {
+    for kind in ["agent", "evidence"] {
+        let mut v = read_value("public_leaf");
+        let (i, nid) = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n["kind"] == json!(kind))
+            .map(|(i, n)| (i, n["id"].clone()))
+            .unwrap();
+        v["edges"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|e| e["source"] != nid && e["target"] != nid);
+        assert!(schema_errors(&v).is_empty());
+        let err = types_accept(&v).expect_err(kind);
+        assert!(
+            err.contains(&format!(
+                "/nodes/{i}: an agent or evidence node with no edge to a claim"
+            )),
+            "{kind}: {err}"
+        );
+    }
+}
+
+// ---- serving: filtered for the viewer, tied to the request ----------------------------
+
+fn leaf_of(doc: &LevelDocument) -> &LeafLevel {
+    match doc {
+        LevelDocument::Leaf(l) => l,
+        LevelDocument::Group(_) => panic!("a leaf"),
+    }
+}
+
+/// For many seeded random subsets of readable nodes, the served leaf is a
+/// valid document that passes the served-body check, holds only readable
+/// nodes, no edge or outgoing source to a dropped node, no isolated agent
+/// or evidence, and the stored counts and signs.
+#[test]
+fn every_leaf_filtered_for_a_viewer_is_valid() {
+    let mut rng = Rng::new(0xF117_E400);
+    let (mut some, mut none) = (0, 0);
+    for stem in ["team_leaf_dense", "public_leaf"] {
+        let stored: LevelDocument = serde_json::from_slice(&read_fixture(stem)).unwrap();
+        let s = leaf_of(&stored);
+        for round in 0..48 {
+            // From nothing readable to everything.
+            let p = round as f64 / 47.0;
+            let readable: BTreeSet<uuid::Uuid> = s
+                .nodes
+                .iter()
+                .map(Node::id)
+                .filter(|_| rng.chance(p))
+                .collect();
+            let Some(served) = stored.for_viewer(|id| readable.contains(&id)) else {
+                assert!(
+                    s.nodes
+                        .iter()
+                        .all(|n| n.kind() != NodeKind::Claim || !readable.contains(&n.id())),
+                    "{stem} round {round}: None although a claim is readable"
+                );
+                none += 1;
+                continue;
+            };
+            some += 1;
+            let body = serde_json::to_vec(&served).unwrap();
+            if let Err(e) = check_as(stem, &body) {
+                panic!("{stem} round {round}: {e:#?}");
+            }
+            let l = leaf_of(&served);
+            let ids: BTreeSet<_> = l.nodes.iter().map(Node::id).collect();
+            assert!(
+                ids.is_subset(&readable),
+                "{stem} round {round}: unreadable node"
+            );
+            // Every readable claim is kept.
+            for n in &s.nodes {
+                if n.kind() == NodeKind::Claim && readable.contains(&n.id()) {
+                    assert!(ids.contains(&n.id()), "{stem} round {round}: claim dropped");
+                }
+            }
+            // Edges: exactly the stored edges whose ends are both kept.
+            let want: Vec<&Edge> = s
+                .edges
+                .iter()
+                .filter(|e| ids.contains(&e.source) && ids.contains(&e.target))
+                .collect();
+            assert_eq!(l.edges.iter().collect::<Vec<_>>(), want);
+            // Outgoing: stored counts and signs, sources cut to kept nodes.
+            for o in &l.outgoing {
+                let so = s
+                    .outgoing
+                    .iter()
+                    .find(|x| x.target.level_id == o.target.level_id)
+                    .unwrap();
+                assert_eq!((o.count, o.net_sign), (so.count, so.net_sign));
+                let cut: Vec<_> = so
+                    .sources
+                    .iter()
+                    .filter(|x| ids.contains(x))
+                    .copied()
+                    .collect();
+                assert_eq!(o.sources, cut);
+            }
+            let kept_targets = l.outgoing.len();
+            let live_targets = s
+                .outgoing
+                .iter()
+                .filter(|o| o.sources.iter().any(|x| ids.contains(x)))
+                .count();
+            assert_eq!(kept_targets, live_targets, "{stem} round {round}: outgoing");
+        }
+    }
+    assert!(some > 60 && none > 0, "some {some}, none {none}");
+}
+
+/// The cases the random rounds may not pin down, each on its own.
+#[test]
+fn for_viewer_drops_what_would_show_a_hidden_claim() {
+    let stored: LevelDocument = serde_json::from_slice(&read_fixture("public_leaf")).unwrap();
+    let s = leaf_of(&stored);
+    let all = |_: uuid::Uuid| true;
+    assert_eq!(
+        stored.for_viewer(all),
+        Some(stored.clone()),
+        "all readable: as stored"
+    );
+    assert_eq!(
+        stored.for_viewer(|_| false),
+        None,
+        "nothing readable: not found"
+    );
+    let claims: BTreeSet<_> = s
+        .nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::Claim)
+        .map(Node::id)
+        .collect();
+    assert_eq!(
+        stored.for_viewer(|id| !claims.contains(&id)),
+        None,
+        "agents and evidence alone: not found"
+    );
+
+    // Hide every claim one agent backs, except a claim it does not back: the
+    // agent, readable itself, is dropped with its edges.
+    let agent = s
+        .nodes
+        .iter()
+        .find(|n| n.kind() == NodeKind::Agent)
+        .unwrap()
+        .id();
+    let backed: BTreeSet<_> = s
+        .edges
+        .iter()
+        .filter(|e| e.source == agent)
+        .map(|e| e.target)
+        .collect();
+    assert!(!backed.is_empty() && backed.len() < claims.len());
+    let served = stored.for_viewer(|id| !backed.contains(&id)).unwrap();
+    let l = leaf_of(&served);
+    assert!(
+        l.nodes.iter().all(|n| n.id() != agent),
+        "the isolated agent is dropped"
+    );
+    assert!(l
+        .edges
+        .iter()
+        .all(|e| e.source != agent && e.target != agent));
+    served.validate().unwrap();
+
+    // One outgoing entry whose sources are all hidden is dropped; the
+    // others keep their stored count.
+    let o0: BTreeSet<_> = s.outgoing[0].sources.iter().copied().collect();
+    let served = stored.for_viewer(|id| !o0.contains(&id)).unwrap();
+    let l = leaf_of(&served);
+    assert!(l
+        .outgoing
+        .iter()
+        .all(|o| o.target.level_id != s.outgoing[0].target.level_id));
+    served.validate().unwrap();
+
+    // A group level is served as stored.
+    let group: LevelDocument = serde_json::from_slice(&read_fixture("team_theme_root")).unwrap();
+    assert_eq!(group.for_viewer(|_| false), Some(group.clone()));
+}
+
+/// The served-body check ties the body to the request: a level of another
+/// map, or another level, fails even though it is a valid document.
+#[test]
+fn the_body_must_be_the_map_and_level_requested() {
+    let team = read_fixture("team_leaf_dense");
+    let level = expected("team_leaf_dense").level_id;
+    check_level_body(&team, &Expected::team(FIXTURE_TEAM_GROUP_ID, level)).unwrap();
+    let other_team = uuid::Uuid::from_u128(0x0123_4567_89ab_4cde_8f01_2345_6789_abcd);
+    for (what, want) in [
+        ("a public viewer", Expected::public(level)),
+        ("another team", Expected::team(other_team, level)),
+        (
+            "another level",
+            Expected::team(FIXTURE_TEAM_GROUP_ID, expected("public_leaf").level_id),
+        ),
+    ] {
+        let errs = check_level_body(&team, &want).expect_err(what);
+        assert!(
+            !errs.is_empty() && errs.iter().all(|e| e.starts_with("viewer")),
+            "{what}: {errs:#?}"
+        );
+    }
+    let public = read_fixture("public_leaf");
+    let errs = check_level_body(
+        &public,
+        &Expected::team(FIXTURE_TEAM_GROUP_ID, expected("public_leaf").level_id),
+    )
+    .expect_err("a public level for a team request");
+    assert!(errs.iter().all(|e| e.starts_with("viewer")), "{errs:#?}");
+}
+
+#[test]
+fn the_kernel_not_found_message_names_the_requested_id() {
+    let kernel = read_value("non_member_kernel");
+    let id = kernel["body"]["details"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut b = kernel["body"].clone();
+    b["message"] = json!("atlas_level with ID 00000000-0000-4000-8000-0000000000ff not found");
+    let body = serde_json::to_vec(&b).unwrap();
+    let errs = check_not_found(Side::Kernel, 404, &body, &id).expect_err("another id");
+    assert!(errs.iter().any(|e| e.starts_with("message")), "{errs:#?}");
+}
+
+// ---- storage measures the budget ------------------------------------------------------
+
+/// Text from the astral planes compresses worse than the multi-script text
+/// the caps were sized on: a document valid by schema and types can then
+/// exceed the budget. `validate` accepts it (it does not measure size);
+/// `to_stored_json`, the producer's path, refuses it.
+#[test]
+fn astral_text_can_exceed_the_budget_and_storage_refuses_it() {
+    let mut rng = Rng::new(0xA57A_1000);
+    let mut astral = |n: usize| -> String {
+        (0..n)
+            .map(|_| char::from_u32(0x1_0000 + rng.below(0xF_0000) as u32).unwrap())
+            .collect()
+    };
+    let LevelDocument::Leaf(mut l) = fixtures::worst_case_leaf() else {
+        panic!("a leaf")
+    };
+    l.name = Some(astral(MAX_NAME_CHARS));
+    for b in &mut l.breadcrumbs {
+        b.name = Some(astral(MAX_NAME_CHARS));
+    }
+    for n in &mut l.nodes {
+        if let Node::Claim(c) = n {
+            c.label = astral(MAX_LABEL_CHARS);
+        }
+    }
+    for o in &mut l.outgoing {
+        o.target.name = Some(astral(MAX_NAME_CHARS));
+    }
+    let doc = LevelDocument::Leaf(l);
+    doc.validate().expect("valid by the types");
+    let body = serde_json::to_vec(&doc).unwrap();
+    assert!(schema_errors(&serde_json::from_slice(&body).unwrap()).is_empty());
+    let n = gzip_len(&body);
+    assert!(n > BUDGET_GZIP_BYTES, "{n} gzip bytes");
+    let err = doc.to_stored_json().expect_err("over budget");
+    assert!(err.to_string().starts_with("budget"), "{err}");
+}
+
+#[test]
+fn stored_json_is_the_compact_fixture() {
+    for (stem, doc) in fixtures::level_fixtures() {
+        let stored = doc
+            .to_stored_json()
+            .unwrap_or_else(|e| panic!("{stem}: {e}"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stored).unwrap(),
+            read_value(stem),
+            "{stem}"
+        );
+    }
+    // An invalid document is refused before it is measured.
+    let mut v = read_value("public_leaf");
+    v["outgoing"][0]["count"] = json!(0);
+    let doc: LevelDocument = serde_json::from_value(v).unwrap();
+    assert!(doc
+        .to_stored_json()
+        .unwrap_err()
+        .to_string()
+        .contains("count is 0"));
 }
