@@ -1175,6 +1175,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "evidence.rs",
+        "link_to_claims_signed_conn",
+        "WRITE (backlog 2d60f619): the evidence row's `evidence -> claim` edge, inside the \
+         caller's evidence-write transaction (or the maintenance backfill's batch). It delegates \
+         to EdgeRepository::create_if_absent_including_retracted_signed_conn, itself exempt here, \
+         and returns only the edge id it wrote or found. The edge's tenancy is the edges \
+         trigger's meet of its endpoints, so there is nothing for a viewer to filter.",
+    ),
+    (
+        "evidence.rs",
         "same_tenancy_duplicate",
         "READ inside an evidence write's own transaction (migration 171, backlog 12b68201): the \
          owner and visibility of the row the caller just wrote, an advisory lock, then whether \
