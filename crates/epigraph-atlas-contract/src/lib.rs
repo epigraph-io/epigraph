@@ -138,23 +138,20 @@ pub enum ChildKind {
 pub enum FlowBasis {
     /// Evidence to claim, always: the stored mass.
     Exact,
-    /// Claim to claim, always: link strength times the source claim's
-    /// belief, which the view labels an estimate. The builder (backlog W7)
-    /// computes it at build time, never from a served field: no leaf node
-    /// carries a belief value. Its belief read of the source claim must be
-    /// both:
-    /// - **role-aware** (the `no_role_blind_belief_reads` ratchet: a
-    ///   compound's cached belief is not derived from its atoms), and
-    /// - **scoped to the map's audience**: folded only from the BBAs that
-    ///   audience can read (public BBAs for the public map; public and the
-    ///   team's own for a team map). The cached claim BetP folds every
-    ///   non-retracted BBA whatever group owns it, so it must not be used:
-    ///   a weight can reveal the belief it was built from (exactly, when a
-    ///   relationship's strength is a known constant), so a public claim with
-    ///   team-private evidence would put that private mass on the public map.
+    /// Claim to claim, always: the link's strength times its sign, and
+    /// nothing else, which the view labels an estimate. With the sign in
+    /// its own field, `flow_weight` is strength × |sign|, so `sign ×
+    /// flow_weight` is the signed flow. There is **no belief factor of any
+    /// kind**: not the source or target claim's BetP, belief, plausibility
+    /// or `truth_value`, so no served weight can be divided back into a
+    /// belief. The builder (backlog W7) reads no belief to compute it: the
+    /// strength comes from the link (its edge row) alone, never from a BBA
+    /// or a belief fold. What keeps the weight to the map's audience is the
+    /// edge-row filter on [`Edge`]: only rows that audience can read are
+    /// drawn, before repeated rows are collapsed.
     ///
     /// A link with no belief direction (`cites`) is still `proxy`, with
-    /// sign 0.
+    /// sign 0 and so weight 0.
     Proxy,
     /// Every other pair of kinds (an agent's authorship, for example): no
     /// belief flow, so weight 0 and sign 0.

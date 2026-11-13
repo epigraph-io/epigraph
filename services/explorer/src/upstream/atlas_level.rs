@@ -59,9 +59,9 @@ pub enum ChildKind {
 }
 
 /// `exact` (evidence to claim, the stored mass), `proxy` (claim to claim,
-/// strength times the source's belief, computed by the kernel's layout
-/// builder at build time, never from a served field, from a belief read that
-/// is role-aware and scoped to the map's audience: shown as an estimate) or
+/// the link's strength times its sign and nothing else, with no belief
+/// factor of any kind, so it can never be divided back into a belief: shown
+/// as an estimate; `cites` has sign 0 and so weight 0) or
 /// `none` (no belief flow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
