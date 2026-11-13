@@ -197,6 +197,10 @@ def test_apply_then_reverse_is_byte_identical(db, seed_agent, tmp_path):
     export, result, manifest = tmp_path / "export", tmp_path / "r.json", tmp_path / "m.json"
 
     _run(["export", "--database-url", TEST_DSN, "--cap", str(CAP), "--out", str(export)])
+    npz = sorted(export.glob("*.npz"))
+    assert len(npz) == 2
+    # embeddings approximate claim content: the export is owner-only, whatever the umask
+    assert all(f.stat().st_mode & 0o077 == 0 for f in npz)
     _run(["compute", "--from", str(export), "--out", str(result)])
     _run(["apply", "--database-url", TEST_DSN, "--from", str(result),
           "--manifest", str(manifest)])

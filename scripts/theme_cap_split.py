@@ -260,6 +260,8 @@ def export(conn, out_dir, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_id
         ids, x = load_members(conn, theme_id)
         conn.rollback()
         core.write_theme_npz(out_dir / f"{theme_id}.npz", ids, x)
+        # Embeddings are approximately invertible to claim content: owner-only.
+        os.chmod(out_dir / f"{theme_id}.npz", 0o600)
         index["themes"].append({"theme_id": theme_id, "current": members,
                                 "embedded": embedded, "retired": retired})
     (out_dir / "export.json").write_text(json.dumps(index, indent=1))
