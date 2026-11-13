@@ -184,6 +184,21 @@ the affected targets run, then restored and `touch`ed):
 | `resolve_tree` skips the W3 re-check | `a_leaf_that_fits_is_left_alone`, `a_leaf_w3_finds_over_the_cap_is_split_into_minted_leaves`, `every_leaf_of_a_team_map_fits_the_cap_as_w3_counts`, `a_second_apply_over_unchanged_input_reproduces_every_group_id` |
 | export numbers attachments per claim | `attachments_are_numbered_per_theme_by_kind_then_id`, `export_weights_match_what_w3_counts` |
 | the binary's cap check removed | `the_binary_refuses_a_bad_map_or_cap_before_connecting` |
+| Python: clustering skipped (every split by claim-id position) | `test_the_tree_follows_the_embeddings` |
+| documents stored without `to_stored_json` and a child `r` of 0 | `every_document_validates_and_chains_to_its_parent`, `stored_level_documents_validate_against_the_contract` |
+
+Not mutation-proved (each asserts a direct property, with no separate code
+path to break): `labels_are_cut_to_the_contract_length`,
+`placeholder_positions_stay_inside_the_contract_ranges`,
+`test_shared_evidence_counts_once_and_unshared_evidence_splits`,
+`test_export_reader_refuses_a_truncated_embedding_file`,
+`the_writer_reproduces_the_committed_export_bytes`,
+`a_tree_for_another_map_or_hierarchy_is_refused`,
+`map_keys_round_trip_and_refuse_other_spellings`.
+
+The committed fixture's result is exact k-means output (30 points, no UMAP)
+under CI's pins (`tests/requirements-ci.txt`: numpy 1.26.4, scikit-learn
+1.8.0, umap-learn 0.5.11), the versions it was generated with.
 
 **Not tested end to end**: an export from a database, computed by the
 Python core and applied back. The build hosts have no numpy, and each DB test
