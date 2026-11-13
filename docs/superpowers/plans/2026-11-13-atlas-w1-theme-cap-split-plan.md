@@ -28,8 +28,14 @@ cap. The largest part keeps the theme id, and the split can be reversed exactly.
    (`n <= 100`) skip UMAP and cluster the normalised vectors.
 4. Run k-means with `k = max(2, ceil(n / cap))`, `random_state=seed`.
 5. Merge any cluster under `min_part` (default `cap // 20`) into its nearest cluster centroid.
-6. If fewer than two parts remain (for example, identical embeddings), fall back to equal chunks
-   by claim id. This guarantees termination, because every recursive call is strictly smaller.
+   If that leaves one group (a theme just over the cap whose second cluster is a small separated
+   subtopic), retry k-means on the same reduction with up to four larger k, which splits the
+   dominant cluster by its own geometry and folds the small one in whole. If every k still merges
+   to one group, keep the first k's clusters unmerged.
+6. Only when the vectors cannot be told apart (identical embeddings) cut into equal chunks by
+   claim id. Every such cut is counted (`id_chunk_cuts`, in the result file, the plan report and
+   each part's `split_id_chunk_cuts`). Every recursive call is strictly smaller, so this
+   terminates.
 7. Recurse into every part over the cap.
 8. Order the final parts by size, descending, then by smallest claim id. Part 0 is the largest
    and keeps the theme id.
@@ -50,7 +56,9 @@ The off-box rule (design §2) allows ids and embeddings only.
 
 1. **Validate the result against the live DB.** For each theme, the union of its parts must be
    exactly the theme's current embedded members, the parts must be disjoint, and each part must
-   be at or under the cap. Any drift refuses the whole apply, and nothing is written.
+   be at or under the cap. Any drift refuses the whole apply, and nothing is written. The
+   result's cap is enforced, and a result whose cap is over `apply --cap` (default 2000) is
+   refused before the database is read.
 2. **Kept part.** Part 0 keeps the theme id. New parts get new `claim_themes` rows. Members
    move with `AND theme_id = parent`, and the rowcount must match.
 3. **Recompute.** `claim_count` and `centroid` are recomputed per part, as in `split_theme.py`.
@@ -74,8 +82,9 @@ The off-box rule (design §2) allows ids and embeddings only.
 1. For each new part, its current members must equal the manifest's moved ids. Otherwise the
    reverse refuses, unless `--allow-drift`, which moves every current member back to the parent.
 2. Move the members back and delete the new rows.
-3. Restore the parent row from the snapshot through `jsonb_populate_record`, over every column
-   `information_schema` lists. The column list is not hard-coded.
+3. Restore the parent row from the snapshot through `jsonb_populate_record`, over the columns
+   `information_schema` lists that the snapshot holds. The column list is not hard-coded, and a
+   column added after the apply keeps its current value.
 4. A manifest whose new rows do not exist (an apply that never committed, or one already
    reversed) is a no-op when the parent row equals its snapshot.
 
@@ -96,9 +105,9 @@ The usage text names `MAINTENANCE_DATABASE_URL`.
 | Criterion | Proven by |
 |-----------|-----------|
 | A dry run lists every theme over the cap with its proposed parts | `test_plan_lists_every_over_cap_theme_with_part_sizes` (DB) |
-| The apply leaves no theme over ~2,000 | `test_blobs_split_under_cap_without_cutting_a_blob` and `test_degenerate_identical_embeddings_terminate_under_cap` (core); `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id` (DB); `test_apply_refuses_when_unembedded_members_push_kept_part_over_cap` (DB) |
+| The apply leaves no theme over ~2,000 | `test_blobs_split_under_cap_without_cutting_a_blob`, `test_a_small_separated_cluster_stays_whole_just_over_the_cap`, `test_the_split_follows_umap_structure_not_raw_kmeans` and `test_degenerate_identical_embeddings_terminate_under_cap` (core); `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id`, `test_apply_refuses_when_unembedded_members_push_kept_part_over_cap`, `test_apply_refuses_an_over_cap_theme_it_cannot_split` and `test_apply_refuses_a_result_whose_cap_is_over_its_own` (DB) |
 | Ids stay stable for kept parts | `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id`; `test_split_is_deterministic_and_input_order_free` |
-| The split is reversible | `test_apply_then_reverse_is_byte_identical` (every `claim_themes` row in full, plus an md5 of the `(id, theme_id)` projection of `claims`); `test_reverse_refuses_drift_unless_allowed` |
+| The split is reversible | `test_apply_then_reverse_is_byte_identical` (every `claim_themes` row in full, plus an md5 of the `(id, theme_id)` projection of `claims`); `test_reverse_refuses_drift_unless_allowed`; `test_reverse_keeps_a_column_added_after_the_apply` |
 | Off-box: ids and embeddings only | `test_compute_runs_without_db_driver` (subprocess with `psycopg2` and `theme_lib` blocked); `test_no_claim_text_reaches_any_output` |
 
 ## Limits
@@ -112,4 +121,7 @@ The usage text names `MAINTENANCE_DATABASE_URL`.
   `theme_id` but have no embedding. They stay in the kept part and do not count
   (`test_the_cap_counts_current_members_only`).
 - **Unembedded current members.** These stay in the kept part. If they push it over the cap, the
-  apply refuses.
+  apply refuses, and so does a theme whose embedded members fit in one part or that has none:
+  any theme the result names that would stay over the cap refuses the whole apply. Run plan and
+  apply in small `--theme-id` batches on a large corpus, and leave such themes out until they
+  are embedded.
