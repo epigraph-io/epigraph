@@ -921,6 +921,9 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
         .chain(HARVESTER_173)
         .copied()
         .chain(std::iter::once("workflows"))
+        // Plus migration 210's Atlas team-map tables (backlog 77f4bf09): new
+        // tables declared at creation, so there is nothing to backfill.
+        .chain(["atlas_map_epochs", "atlas_map_runs", "atlas_map_levels"])
         .collect();
     assert_eq!(
         observed, expected,

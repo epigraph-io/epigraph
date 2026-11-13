@@ -722,6 +722,11 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
     // that migration, on the same precedent.
     "workflows",
+    // Atlas team maps (210, backlog 77f4bf09): created with tenancy columns
+    // and FORCEd by that migration, on the same precedent.
+    "atlas_map_epochs",
+    "atlas_map_runs",
+    "atlas_map_levels",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
