@@ -9,6 +9,12 @@
 //! kernel's `epigraph-atlas-contract` crate holds the producer-side types
 //! and writes the fixtures next to the schema.
 //!
+//! What the BFF gets from the kernel route is already filtered for the
+//! viewer: the kernel drops every leaf node the viewer's session cannot
+//! read, with its edges and outgoing sources (`LevelDocument::for_viewer`
+//! in the kernel crate), and answers not-found when no claim is left. The
+//! BFF serves that answer as it comes.
+//!
 //! These types mirror that crate field for field. The Explorer cannot
 //! depend on a kernel crate (its own workspace, lockfile and Docker
 //! context), so the mirror is tied to the contract by a test instead:
@@ -115,6 +121,9 @@ pub struct ClaimNode {
     pub x: f64,
     pub y: f64,
     pub truth_value: Option<f64>,
+    /// From a role-aware belief read, never a compound's folded cache. This
+    /// is the one Atlas body that carries a belief value (the region and
+    /// theme routes carry none); whether it stays is open for a ruling.
     pub betp: Option<f64>,
 }
 
@@ -143,11 +152,15 @@ impl Node {
     }
 }
 
-/// A link between two nodes of a leaf, pointing the way belief flows.
+/// A link between two nodes of a leaf, pointing the way belief flows. The
+/// endpoint kinds fix `flow_basis`: evidence to claim is `exact`, claim to
+/// claim is `proxy`, every other pair is `none`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Edge {
     pub source: Uuid,
     pub target: Uuid,
+    /// As stored, in either casing (`AUTHORED`, `supports`): compare it
+    /// case-insensitively.
     pub relationship: String,
     pub sign: i8,
     pub flow_weight: f64,
