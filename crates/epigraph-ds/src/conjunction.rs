@@ -493,12 +493,12 @@ fn settle(p: &Prepared, state: u64) -> Option<u64> {
     }
     let mut open_pos = None;
     let mut open_count = 0;
-    for pos in 0..p.n() {
+    for (pos, &holds) in p.holds.iter().enumerate() {
         let l = get(state, pos);
-        if l == Prepared::fails(p.holds[pos]) {
+        if l == Prepared::fails(holds) {
             return Some(state & !NOT_ALL);
         }
-        if l != p.holds[pos] {
+        if l != holds {
             open_count += 1;
             open_pos = Some(pos);
         }

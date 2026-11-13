@@ -577,11 +577,7 @@ impl SecurityEventFilter {
         }
 
         // Check failures only
-        if self.failures_only && !event.is_failure() {
-            return false;
-        }
-
-        true
+        !self.failures_only || event.is_failure()
     }
 }
 
