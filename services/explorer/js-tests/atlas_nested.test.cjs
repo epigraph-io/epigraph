@@ -20,6 +20,14 @@ const previewLevels = () =>
     .filter(Boolean)
     .map((l) => JSON.parse(l));
 const manifest = () => fs.readFileSync(path.join(CONTRACT, 'preview', 'manifest.json'), 'utf8');
+/** The data-atlas-maps value the preview page renders from the manifest. */
+const pageMaps = () => {
+  const m = JSON.parse(manifest());
+  return {
+    schema_version: 1,
+    maps: m.maps.map((x) => Object.assign({}, x, { level_url: '/bff/atlas/preview/maps/' + x.key + '/' })),
+  };
+};
 
 const edge = (o) => Object.assign({ source: 'a', target: 'b', relationship: 'supports', sign: 1, flow_weight: 0.5, flow_basis: 'proxy' }, o);
 
@@ -218,6 +226,9 @@ test('a fetched level is checked against the map and level asked for', () => {
   assert.match(N.levelProblem(doc, { levelId: '00000000-0000-4000-8000-000000000001', map: team }), /another level/);
   assert.match(N.levelProblem(doc, { levelId: doc.level_id, map: team, kind: 'group' }), /kind/);
   assert.match(N.levelProblem(Object.assign({}, doc, { schema_version: 2 }), { map: team }), /newer/);
+  // The same level id in the other hierarchy is another level.
+  assert.equal(N.levelProblem(doc, { levelId: doc.level_id, map: team, hierarchy: doc.hierarchy }), null);
+  assert.match(N.levelProblem(doc, { levelId: doc.level_id, map: team, hierarchy: N.otherHierarchy(doc.hierarchy) }), /other grouping/);
   const p = fixture('public_leaf');
   assert.equal(N.levelProblem(p, { levelId: p.level_id, map: pub }), null);
   assert.match(N.levelProblem(p, { levelId: p.level_id, map: team }), /another map/);
@@ -253,8 +264,8 @@ test('bundles resolve to a sibling or a listed target; a stub flies to a target 
   assert.ok(followed > 20);
 });
 
-test('the map picker reads the preview manifest and finds each theme root', () => {
-  const maps = N.parseMaps(manifest());
+test('the map picker reads the page map list and finds each theme root', () => {
+  const maps = N.parseMaps(JSON.stringify(pageMaps()));
   assert.deepEqual(maps.map((m) => m.scope), ['team', 'public']);
   const levels = new Map(previewLevels().map((d) => [d.level_id, d]));
   for (const m of maps) {
@@ -271,5 +282,49 @@ test('the map picker reads the preview manifest and finds each theme root', () =
   assert.deepEqual(N.parseMaps('not json'), []);
   assert.deepEqual(N.parseMaps(null), []);
   // A team map without its group id is dropped.
-  assert.deepEqual(N.parseMaps({ maps: [{ key: 'x', scope: 'team', group_id: null, themes: [] }] }), []);
+  assert.deepEqual(N.parseMaps({ schema_version: 1, maps: [{ key: 'x', scope: 'team', group_id: null, level_url: '/x/', themes: [] }] }), []);
+  // The bare manifest (no version, no URLs) is not a map list.
+  assert.deepEqual(N.parseMaps(manifest()), []);
+});
+
+test('a level is fetched through its own map URL, naming the hierarchy', () => {
+  const maps = N.parseMaps(pageMaps());
+  const [team, pub] = maps;
+  const id = '0f0e0d0c-0b0a-4900-8800-000000000001';
+  assert.equal(N.levelUrl(team, 'meaning', id), '/bff/atlas/preview/maps/team/meaning/' + id);
+  assert.equal(N.levelUrl(pub, 'links', id), '/bff/atlas/preview/maps/public/links/' + id);
+  // One group id on two maps, or in two hierarchies, is four requests and
+  // four cache entries, never one.
+  const urls = new Set();
+  const keys = new Set();
+  for (const m of maps) {
+    for (const h of ['meaning', 'links']) {
+      urls.add(N.levelUrl(m, h, id));
+      keys.add(N.levelKey(m, h, id));
+    }
+  }
+  assert.equal(urls.size, 4);
+  assert.equal(keys.size, 4);
+  // Nothing outside the contract's hierarchies, and no non-UUID id.
+  assert.equal(N.levelUrl(team, 'Meaning', id), null);
+  assert.equal(N.levelUrl(team, 'meaning', '../x'), null);
+  assert.equal(N.levelUrl(null, 'meaning', id), null);
+});
+
+test('a map with no usable level URL is dropped', () => {
+  const one = (patch) => {
+    const v = pageMaps();
+    v.maps = [Object.assign({}, v.maps[0], patch)];
+    return N.parseMaps(v);
+  };
+  assert.equal(one({}).length, 1);
+  for (const bad of [undefined, '', '/', 'https://evil.example/', '//evil.example/', '/a', '/a?b/', '/a#b/', '/a\\b/', '/a b/']) {
+    assert.deepEqual(one({ level_url: bad }), [], String(bad));
+  }
+  // Two entries with one key: the second is dropped.
+  const v = pageMaps();
+  v.maps[1].key = v.maps[0].key;
+  assert.equal(N.parseMaps(v).length, 1);
+  // Another version is not read.
+  assert.deepEqual(N.parseMaps(Object.assign(pageMaps(), { schema_version: 2 })), []);
 });

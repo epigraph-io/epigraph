@@ -15,6 +15,7 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 pub mod atlas_contract;
+pub mod atlas_maps;
 
 use std::collections::HashMap;
 

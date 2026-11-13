@@ -3,8 +3,9 @@
 //! An opt-in way to try the nested Atlas levels with no database and no
 //! kernel: `epigraph-explorer --atlas-fixture-preview <port | loopback-ip:port>`
 //! serves the committed synthetic level documents
-//! (`contract/atlas_level/v1/preview/` and the contract fixtures) by level id,
-//! and a preview page that draws them.
+//! (`contract/atlas_level/v1/preview/` and the contract fixtures) by map,
+//! hierarchy and level id, as the real route will
+//! ([`crate::atlas_maps`]), and a preview page that draws them.
 //!
 //! It cannot be switched on by accident in production:
 //! - off unless the flag is on the command line (no environment variable
@@ -18,8 +19,10 @@
 //!   response carries `x-atlas-preview: synthetic-fixtures`.
 //!
 //! The data is compiled in, so the binary needs nothing else to run. Bodies are
-//! served exactly as committed: the store indexes each document by its
-//! `level_id` and never re-encodes it.
+//! served exactly as committed: the store indexes each document by its map,
+//! hierarchy and `level_id`, and never re-encodes it. A level asked for under
+//! another map or hierarchy gets the contract's not-found body, so the
+//! preview cannot hide a client that leaves either out.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -32,9 +35,14 @@ use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
+use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+use crate::atlas_maps::{
+    hierarchy_segment, level_path, parse_hierarchy, AtlasMap, AtlasMapTheme, AtlasMaps, Roots,
+    ATLAS_MAPS_SCHEMA_VERSION,
+};
 use crate::auth::PageCtx;
 use crate::config::{
     Config, ConfigError, ENV_API_URL, ENV_FRAME_ANCESTORS, ENV_INSECURE_COOKIES, ENV_PORT,
@@ -42,7 +50,7 @@ use crate::config::{
 };
 use crate::error::{self, AppError};
 use crate::state::AppState;
-use crate::upstream::atlas_level::AtlasLevel;
+use crate::upstream::atlas_level::{AtlasLevel, MapScope};
 use crate::view::render;
 use crate::{assets, security};
 
@@ -51,9 +59,10 @@ pub const FLAG: &str = "--atlas-fixture-preview";
 /// The header every preview response carries.
 pub const PREVIEW_HEADER: &str = "x-atlas-preview";
 pub const PREVIEW_HEADER_VALUE: &str = "synthetic-fixtures";
-/// The page and the level route.
+/// The page, and the prefix of the level route: a map's `level_url` is
+/// `MAPS_PREFIX<map key>/`, and a level is `<level_url><hierarchy>/<id>`.
 pub const PAGE_PATH: &str = "/atlas/preview";
-pub const LEVEL_PREFIX: &str = "/bff/atlas/preview/level/";
+pub const MAPS_PREFIX: &str = "/bff/atlas/preview/maps/";
 /// A loopback port nothing listens on: the preview never calls the API, and
 /// if a future change made it try, the call fails instead of reaching one.
 const DEAD_API_URL: &str = "http://127.0.0.1:9";
@@ -156,17 +165,49 @@ pub fn config(addr: SocketAddr) -> Result<Config, PreviewError> {
     Ok(Config::from_lookup(|k| vars.get(k).cloned())?)
 }
 
-/// The embedded level documents, by level id, served as committed.
+/// The generated manifest (`manifest.json`): the maps without their URLs,
+/// which depend on where the preview is mounted.
+#[derive(Debug, Deserialize)]
+struct Manifest {
+    maps: Vec<ManifestMap>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestMap {
+    key: String,
+    scope: MapScope,
+    group_id: Option<Uuid>,
+    label: String,
+    themes: Vec<ManifestTheme>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestTheme {
+    theme_id: Uuid,
+    label: Option<String>,
+    claim_count: u32,
+    roots: Roots,
+}
+
+/// A stored level's address: (map key, hierarchy segment, level id).
+type LevelKey = (String, &'static str, Uuid);
+
+/// The embedded level documents, by map, hierarchy and level id, served as
+/// committed.
 #[derive(Debug)]
 pub struct PreviewStore {
-    levels: HashMap<Uuid, &'static str>,
+    maps: Vec<ManifestMap>,
+    levels: HashMap<LevelKey, &'static str>,
 }
 
 impl PreviewStore {
     /// Index the compiled-in documents. Each must decode as a v1 level (the
-    /// mirror types), and ids must be unique; the committed data is checked
-    /// by the contract crate's tests, so a failure here is a build defect.
+    /// mirror types) of a manifest map, and addresses must be unique; the
+    /// committed data is checked by the contract crate's tests, so a failure
+    /// here is a build defect.
     pub fn embedded() -> Self {
+        let manifest: Manifest =
+            serde_json::from_str(MANIFEST).expect("the embedded preview manifest decodes");
         let docs = PREVIEW_LEVELS
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -175,20 +216,40 @@ impl PreviewStore {
         for body in docs {
             let doc: AtlasLevel =
                 serde_json::from_str(body).expect("an embedded preview level decodes");
-            let id = match &doc {
-                AtlasLevel::Group(g) => g.level_id,
-                AtlasLevel::Leaf(l) => l.level_id,
+            let (id, scope, group, hierarchy) = match &doc {
+                AtlasLevel::Group(g) => (g.level_id, g.map_scope, g.map_group_id, g.hierarchy),
+                AtlasLevel::Leaf(l) => (l.level_id, l.map_scope, l.map_group_id, l.hierarchy),
             };
+            let map = manifest
+                .maps
+                .iter()
+                .find(|m| m.scope == scope && m.group_id == group)
+                .unwrap_or_else(|| panic!("embedded preview level {id} is on no manifest map"));
+            let key = (map.key.clone(), hierarchy_segment(hierarchy), id);
             assert!(
-                levels.insert(id, body).is_none(),
+                levels.insert(key, body).is_none(),
                 "embedded preview level {id} is duplicated"
             );
         }
-        PreviewStore { levels }
+        PreviewStore {
+            maps: manifest.maps,
+            levels,
+        }
     }
 
-    pub fn get(&self, id: Uuid) -> Option<&'static str> {
-        self.levels.get(&id).copied()
+    /// The level stored at (map key, hierarchy segment, id), if any.
+    pub fn get(&self, map: &str, hierarchy: &str, id: Uuid) -> Option<&'static str> {
+        let h = parse_hierarchy(hierarchy).map(hierarchy_segment)?;
+        self.levels.get(&(map.to_string(), h, id)).copied()
+    }
+
+    /// Where the preview serves level `id` (under `MAPS_PREFIX`, with no
+    /// base path), if it holds it.
+    pub fn path_of(&self, id: Uuid) -> Option<String> {
+        self.levels.keys().find(|k| k.2 == id).map(|(map, h, id)| {
+            let h = parse_hierarchy(h).expect("a stored hierarchy segment parses");
+            level_path(&format!("{MAPS_PREFIX}{map}/"), h, *id)
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -199,9 +260,34 @@ impl PreviewStore {
         self.levels.is_empty()
     }
 
-    /// The maps and theme roots the page offers (`data-atlas-maps`).
-    pub fn manifest(&self) -> &'static str {
-        MANIFEST
+    /// The map list the page carries in `data-atlas-maps`: the manifest's
+    /// maps, each with its level URL under `maps_prefix` (the browser-visible
+    /// `MAPS_PREFIX`).
+    pub fn atlas_maps(&self, maps_prefix: &str) -> AtlasMaps {
+        AtlasMaps {
+            schema_version: ATLAS_MAPS_SCHEMA_VERSION,
+            maps: self
+                .maps
+                .iter()
+                .map(|m| AtlasMap {
+                    key: m.key.clone(),
+                    scope: m.scope,
+                    group_id: m.group_id,
+                    label: m.label.clone(),
+                    level_url: format!("{maps_prefix}{}/", m.key),
+                    themes: m
+                        .themes
+                        .iter()
+                        .map(|t| AtlasMapTheme {
+                            theme_id: t.theme_id,
+                            label: t.label.clone(),
+                            claim_count: t.claim_count,
+                            roots: t.roots.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -209,8 +295,7 @@ impl PreviewStore {
 #[template(path = "atlas/preview.html")]
 struct PreviewPage {
     ctx: PageCtx,
-    level_prefix: String,
-    maps_json: &'static str,
+    maps_json: String,
     level_count: usize,
 }
 
@@ -223,7 +308,10 @@ pub fn router(state: AppState, store: Arc<PreviewStore>) -> Router {
         .route("/health", get(health))
         .route("/static/{*path}", get(assets::serve))
         .route(PAGE_PATH, get(page))
-        .route(&format!("{LEVEL_PREFIX}{{id}}"), get(level))
+        .route(
+            &format!("{MAPS_PREFIX}{{map}}/{{hierarchy}}/{{id}}"),
+            get(level),
+        )
         .fallback(|| async { AppError::NotFound("page".into()) })
         .layer(Extension(store))
         .layer(from_fn_with_state(state.clone(), error::render_errors))
@@ -256,21 +344,21 @@ async fn page(
     let links = &state.links;
     render(&PreviewPage {
         ctx: PageCtx::new(links.clone(), links.path(PAGE_PATH), false),
-        level_prefix: links.path(LEVEL_PREFIX),
-        maps_json: store.manifest(),
+        maps_json: store.atlas_maps(&links.path(MAPS_PREFIX)).to_attr(),
         level_count: store.len(),
     })
 }
 
-/// One level by id, as committed; an absent or malformed id gets the
-/// contract's BFF not-found body (the same for both).
+/// One level by map, hierarchy and id, as committed. An unknown map or
+/// hierarchy, an absent or malformed id, and a real id asked for under
+/// another map or hierarchy all get the contract's BFF not-found body.
 async fn level(
-    Path(id): Path<String>,
+    Path((map, hierarchy, id)): Path<(String, String, String)>,
     Extension(store): Extension<Arc<PreviewStore>>,
 ) -> Result<Response, AppError> {
     let body = Uuid::parse_str(&id)
         .ok()
-        .and_then(|id| store.get(id))
+        .and_then(|id| store.get(&map, &hierarchy, id))
         .ok_or_else(|| AppError::NotFound("atlas level".into()))?;
     Ok((
         [

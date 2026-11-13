@@ -1,6 +1,7 @@
 //! The Atlas fixture preview (`--atlas-fixture-preview`, backlog W11): off by
 //! default, loopback only, serving the committed synthetic levels byte for
-//! byte, and mounting nothing that reaches the API.
+//! byte by map, hierarchy and id, and mounting nothing that reaches the API.
+//! Also the `data-atlas-maps` helper W10's page tests use.
 
 mod common;
 
@@ -12,10 +13,13 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use common::atlas_contract::{check_level_body, check_not_found, fixture_value, Expected, Side};
+use common::atlas_maps::{attr_value, check_atlas_maps_attr};
+use epigraph_explorer::atlas_maps::{level_path, AtlasMaps};
 use epigraph_explorer::atlas_preview::{
-    self, parse_bind, preview_bind, PreviewError, PreviewStore, FLAG, LEVEL_PREFIX, PAGE_PATH,
+    self, parse_bind, preview_bind, PreviewError, PreviewStore, FLAG, MAPS_PREFIX, PAGE_PATH,
     PREVIEW_HEADER, PREVIEW_HEADER_VALUE,
 };
+use epigraph_explorer::upstream::atlas_level::{Hierarchy, MapScope};
 use epigraph_explorer::AppState;
 use serde_json::Value;
 use tower::ServiceExt;
@@ -84,6 +88,18 @@ fn manifest() -> Value {
         .unwrap()
 }
 
+/// The map list the preview page carries, checked with the W10 helper.
+async fn page_maps(router: &Router) -> AtlasMaps {
+    let page = get(router, PAGE_PATH).await;
+    assert_eq!(page.status, StatusCode::OK);
+    let raw = attr_value(&page.text(), "data-atlas-maps").expect("the page carries the map list");
+    check_atlas_maps_attr(&raw).unwrap_or_else(|e| panic!("data-atlas-maps: {e:#?}"))
+}
+
+fn hierarchy(v: &Value) -> Hierarchy {
+    serde_json::from_value(v.clone()).unwrap()
+}
+
 fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
@@ -104,7 +120,7 @@ async fn the_preview_is_off_by_default() {
     // itself serves.
     let preview = preview_router();
     let (id, _) = committed_lines().into_iter().next().unwrap();
-    let level = format!("{LEVEL_PREFIX}{id}");
+    let level = PreviewStore::embedded().path_of(id).unwrap();
     assert_eq!(get(&preview, &level).await.status, StatusCode::OK);
     assert_eq!(get(&preview, PAGE_PATH).await.status, StatusCode::OK);
 
@@ -222,29 +238,30 @@ fn the_preview_refuses_a_non_loopback_bind() {
 async fn the_preview_serves_every_reachable_level_byte_for_byte_and_valid() {
     let router = preview_router();
     let lines = committed_lines();
-    let m = manifest();
-    let mut queue: VecDeque<(Uuid, Expected)> = VecDeque::new();
-    for map in m["maps"].as_array().unwrap() {
-        let group = map["group_id"]
-            .as_str()
-            .map(|g| Uuid::parse_str(g).unwrap());
-        for t in map["themes"].as_array().unwrap() {
-            for h in ["meaning", "links"] {
-                let id = Uuid::parse_str(t["roots"][h].as_str().unwrap()).unwrap();
-                let want = match group {
+    // Driven by the page's own map list, as the client is: each map's
+    // level_url, the hierarchy the client knows, and the level id.
+    let maps = page_maps(&router).await;
+    let mut queue: VecDeque<(String, Hierarchy, Uuid, Expected)> = VecDeque::new();
+    for map in &maps.maps {
+        for t in &map.themes {
+            for (h, id) in [
+                (Hierarchy::Meaning, t.roots.meaning),
+                (Hierarchy::Links, t.roots.links),
+            ] {
+                let want = match map.group_id {
                     Some(g) => Expected::team(g, id),
                     None => Expected::public(id),
                 };
-                queue.push_back((id, want));
+                queue.push_back((map.level_url.clone(), h, id, want));
             }
         }
     }
     let mut seen = BTreeSet::new();
-    while let Some((id, want)) = queue.pop_front() {
+    while let Some((url, h, id, want)) = queue.pop_front() {
         if !seen.insert(id) {
             continue;
         }
-        let res = get(&router, &format!("{LEVEL_PREFIX}{id}")).await;
+        let res = get(&router, &level_path(&url, h, id)).await;
         assert_eq!(res.status, StatusCode::OK, "{id}");
         assert_eq!(res.header("content-type"), Some("application/json"));
         assert_eq!(res.header(PREVIEW_HEADER), Some(PREVIEW_HEADER_VALUE));
@@ -257,13 +274,22 @@ async fn the_preview_serves_every_reachable_level_byte_for_byte_and_valid() {
             panic!("{id}: {e:#?}");
         }
         let v: Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(
+            hierarchy(&v["hierarchy"]),
+            h,
+            "{id} is in the hierarchy asked for"
+        );
         let next = |s: &str| Expected {
             level_id: Uuid::parse_str(s).unwrap(),
             ..want
         };
+        // The switch names its own hierarchy; everything else stays in this one.
+        let sw = next(v["switch"]["level_id"].as_str().unwrap());
         queue.push_back((
-            next(v["switch"]["level_id"].as_str().unwrap()).level_id,
-            next(v["switch"]["level_id"].as_str().unwrap()),
+            url.clone(),
+            hierarchy(&v["switch"]["hierarchy"]),
+            sw.level_id,
+            sw,
         ));
         let mut ids: Vec<&str> = Vec::new();
         for c in v["children"].as_array().into_iter().flatten() {
@@ -277,7 +303,7 @@ async fn the_preview_serves_every_reachable_level_byte_for_byte_and_valid() {
         }
         for s in ids {
             let e = next(s);
-            queue.push_back((e.level_id, e));
+            queue.push_back((url.clone(), h, e.level_id, e));
         }
     }
     assert_eq!(
@@ -288,7 +314,7 @@ async fn the_preview_serves_every_reachable_level_byte_for_byte_and_valid() {
 }
 
 #[tokio::test]
-async fn the_preview_serves_the_contract_fixtures_by_id() {
+async fn the_preview_serves_the_contract_fixtures_under_their_map_and_hierarchy() {
     let router = preview_router();
     for stem in [
         "team_theme_root",
@@ -297,8 +323,14 @@ async fn the_preview_serves_the_contract_fixtures_by_id() {
         "public_leaf",
     ] {
         let v = fixture_value(stem);
-        let id = v["level_id"].as_str().unwrap();
-        let res = get(&router, &format!("{LEVEL_PREFIX}{id}")).await;
+        let id = Uuid::parse_str(v["level_id"].as_str().unwrap()).unwrap();
+        let map = if v["map_scope"] == "public" {
+            "public"
+        } else {
+            "team"
+        };
+        let url = format!("{MAPS_PREFIX}{map}/");
+        let res = get(&router, &level_path(&url, hierarchy(&v["hierarchy"]), id)).await;
         assert_eq!(res.status, StatusCode::OK, "{stem}");
         let committed = std::fs::read_to_string(format!(
             "{}/contract/atlas_level/v1/fixtures/{stem}.json",
@@ -314,17 +346,61 @@ async fn the_preview_404s_an_unknown_id_with_the_contract_body() {
     let router = preview_router();
     let want = fixture_value("non_member_bff");
     let mut bodies = Vec::new();
-    for id in [
+    // A real level of each map, asked for under the other map or the other
+    // hierarchy, is not found: the preview tells (map, hierarchy, id) apart
+    // as the real route must, though its ids happen to be unique.
+    let store = PreviewStore::embedded();
+    let lines = committed_lines();
+    let mut misaddressed = Vec::new();
+    for scope in [MapScope::Team, MapScope::Public] {
+        let (id, line) = lines
+            .iter()
+            .find(|(_, l)| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                v["map_scope"] == serde_json::to_value(scope).unwrap()
+            })
+            .unwrap();
+        let v: Value = serde_json::from_str(line).unwrap();
+        let (own, other) = if scope == MapScope::Team {
+            ("team", "public")
+        } else {
+            ("public", "team")
+        };
+        let h = hierarchy(&v["hierarchy"]);
+        let other_h = match h {
+            Hierarchy::Meaning => Hierarchy::Links,
+            Hierarchy::Links => Hierarchy::Meaning,
+        };
+        let right = level_path(&format!("{MAPS_PREFIX}{own}/"), h, *id);
+        assert_eq!(store.path_of(*id).as_deref(), Some(right.as_str()));
+        assert_eq!(get(&router, &right).await.status, StatusCode::OK, "{right}");
+        misaddressed.push((
+            id.to_string(),
+            level_path(&format!("{MAPS_PREFIX}{other}/"), h, *id),
+        ));
+        misaddressed.push((
+            id.to_string(),
+            level_path(&format!("{MAPS_PREFIX}{own}/"), other_h, *id),
+        ));
+        misaddressed.push((id.to_string(), format!("{MAPS_PREFIX}nomap/meaning/{id}")));
+        misaddressed.push((id.to_string(), format!("{MAPS_PREFIX}{own}/Meaning/{id}")));
+    }
+    let mut cases: Vec<(String, String)> = [
         Uuid::new_v4().to_string(),
         "not-a-uuid".to_string(),
         "..%2F..%2Fetc".to_string(),
-    ] {
-        let res = get(&router, &format!("{LEVEL_PREFIX}{id}")).await;
+    ]
+    .into_iter()
+    .map(|id| (id.clone(), format!("{MAPS_PREFIX}team/meaning/{id}")))
+    .collect();
+    cases.extend(misaddressed);
+    for (id, path) in cases {
+        let res = get(&router, &path).await;
         if let Err(e) = check_not_found(Side::Bff, res.status.as_u16(), &res.body, &id) {
-            panic!("{id}: {e:#?}");
+            panic!("{path}: {e:#?}");
         }
         let body: Value = serde_json::from_slice(&res.body).unwrap();
-        assert_eq!(body, want["body"], "{id}");
+        assert_eq!(body, want["body"], "{path}");
         assert_eq!(res.header(PREVIEW_HEADER), Some(PREVIEW_HEADER_VALUE));
         bodies.push(res.body);
     }
@@ -344,14 +420,22 @@ async fn the_preview_page_carries_the_banner_and_no_inline_script() {
     assert!(body.contains("class=\"atlas-preview-banner\""), "{body}");
     assert!(body.contains("Preview: synthetic fixture data."));
     assert!(body.contains("data-atlas-mode=\"preview\""));
-    assert!(body.contains(&format!("data-level-prefix=\"{LEVEL_PREFIX}\"")));
-    // The manifest rides in an attribute (escaped), not in a script.
-    let root = manifest()["maps"][0]["themes"][0]["roots"]["meaning"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(body.contains("data-atlas-maps=\""));
-    assert!(body.contains(&root));
+    // No page-wide level prefix: a level is fetched through its map's URL.
+    assert!(!body.contains("data-level-prefix"));
+    // The map list rides in an attribute (escaped), not in a script, and
+    // passes the helper W10's page must pass, with one URL per map.
+    let maps = page_maps(&router).await;
+    let m = manifest();
+    assert_eq!(maps.maps.len(), m["maps"].as_array().unwrap().len());
+    for (got, want) in maps.maps.iter().zip(m["maps"].as_array().unwrap()) {
+        assert_eq!(got.key, want["key"].as_str().unwrap());
+        assert_eq!(got.level_url, format!("{MAPS_PREFIX}{}/", got.key));
+        assert_eq!(
+            serde_json::to_value(&got.themes).unwrap(),
+            want["themes"],
+            "the themes are the manifest's"
+        );
+    }
     for (i, _) in body.match_indices("<script") {
         let tag = &body[i..i + body[i..].find('>').unwrap()];
         assert!(tag.contains(" src=\"") && tag.contains(" defer"), "{tag}");
@@ -404,4 +488,117 @@ async fn the_preview_mounts_no_upstream_route() {
             "{path}"
         );
     }
+}
+
+// ---- the data-atlas-maps helper (what W10's page must pass) ----------------------
+
+type Mutate = Box<dyn Fn(&mut Value)>;
+
+/// The map list helper accepts the preview page's list and refuses every list
+/// a client could not address unambiguously or read safely.
+#[tokio::test]
+async fn the_map_list_helper_refuses_an_ambiguous_or_unsafe_list() {
+    let router = preview_router();
+    let good: Value = serde_json::to_value(page_maps(&router).await).unwrap();
+    assert!(check_atlas_maps_attr(&good.to_string()).is_ok());
+    assert_eq!(good["maps"].as_array().unwrap().len(), 2);
+
+    let bad = |f: &dyn Fn(&mut Value)| {
+        let mut v = good.clone();
+        f(&mut v);
+        check_atlas_maps_attr(&v.to_string())
+    };
+    let cases: Vec<(&str, Mutate)> = vec![
+        (
+            "no level_url",
+            Box::new(|v| {
+                v["maps"][0].as_object_mut().unwrap().remove("level_url");
+            }),
+        ),
+        (
+            "a page-wide prefix field",
+            Box::new(|v| v["level_prefix"] = "/x/".into()),
+        ),
+        (
+            "an absolute level_url",
+            Box::new(|v| v["maps"][0]["level_url"] = "https://evil.example/".into()),
+        ),
+        (
+            "a protocol-relative level_url",
+            Box::new(|v| v["maps"][0]["level_url"] = "//evil.example/".into()),
+        ),
+        (
+            "a level_url with a query",
+            Box::new(|v| v["maps"][0]["level_url"] = "/a?b=/".into()),
+        ),
+        (
+            "a level_url with no trailing slash",
+            Box::new(|v| v["maps"][0]["level_url"] = "/a".into()),
+        ),
+        (
+            "two maps on one level_url",
+            Box::new(|v| {
+                v["maps"][1]["level_url"] = v["maps"][0]["level_url"].clone();
+            }),
+        ),
+        (
+            "a repeated key",
+            Box::new(|v| v["maps"][1]["key"] = v["maps"][0]["key"].clone()),
+        ),
+        (
+            "a team map with no group",
+            Box::new(|v| v["maps"][0]["group_id"] = Value::Null),
+        ),
+        (
+            "a public map with a group",
+            Box::new(|v| {
+                v["maps"][1]["group_id"] = v["maps"][0]["group_id"].clone();
+            }),
+        ),
+        (
+            "two public maps",
+            Box::new(|v| {
+                let mut p = v["maps"][1].clone();
+                p["key"] = "public2".into();
+                p["level_url"] = "/p2/".into();
+                v["maps"].as_array_mut().unwrap().push(p);
+            }),
+        ),
+        (
+            "two maps for one team",
+            Box::new(|v| {
+                let mut t = v["maps"][0].clone();
+                t["key"] = "team2".into();
+                t["level_url"] = "/t2/".into();
+                v["maps"].as_array_mut().unwrap().push(t);
+            }),
+        ),
+        (
+            "a theme listed twice",
+            Box::new(|v| {
+                let t = v["maps"][0]["themes"][0].clone();
+                v["maps"][0]["themes"].as_array_mut().unwrap().push(t);
+            }),
+        ),
+        (
+            "one root for both hierarchies",
+            Box::new(|v| {
+                v["maps"][0]["themes"][0]["roots"]["links"] =
+                    v["maps"][0]["themes"][0]["roots"]["meaning"].clone();
+            }),
+        ),
+        (
+            "another version",
+            Box::new(|v| v["schema_version"] = 2.into()),
+        ),
+        (
+            "a belief key",
+            Box::new(|v| v["maps"][0]["themes"][0]["betp"] = 0.5.into()),
+        ),
+    ];
+    for (what, f) in cases {
+        assert!(bad(&*f).is_err(), "{what} must be refused");
+    }
+    // A theme named on no map yet is allowed (null label).
+    assert!(bad(&|v| v["maps"][0]["themes"][0]["label"] = Value::Null).is_ok());
 }

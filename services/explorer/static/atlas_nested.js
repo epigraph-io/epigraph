@@ -175,7 +175,7 @@
 
   /**
    * Why a fetched body is not the level asked for, or null when it is.
-   * `want` = {levelId, map, kind?}.
+   * `want` = {levelId, map, hierarchy, kind?}.
    */
   function levelProblem(doc, want) {
     if (!doc || typeof doc !== 'object') return 'The level could not be read.';
@@ -183,6 +183,7 @@
     if (doc.kind !== 'group' && doc.kind !== 'leaf') return 'The level could not be read.';
     if (want && want.levelId && doc.level_id !== want.levelId) return 'The answer was for another level.';
     if (want && want.map && !mapMatches(doc, want.map)) return 'This level belongs to another map.';
+    if (want && want.hierarchy && doc.hierarchy !== want.hierarchy) return 'The answer was for the other grouping.';
     if (want && want.kind && doc.kind !== want.kind) return 'The level is not the kind its parent said.';
     return null;
   }
@@ -255,12 +256,29 @@
     return ids;
   }
 
-  // ---- maps (a shell input the contract does not define) -------------------
+  // ---- maps (the data-atlas-maps shell input) ------------------------------
+
+  /** The data-atlas-maps version this page reads (contract/atlas_maps/v1). */
+  const MAPS_SCHEMA_VERSION = 1;
 
   /**
-   * The maps a viewer may pick, from the page's data-atlas-maps JSON, or []
-   * when it is absent or malformed. Each map: {key, scope, group_id, label,
-   * themes: [{theme_id, label, claim_count, roots: {meaning, links}}]}.
+   * A same-origin path prefix from the shell, or null: it starts with one
+   * '/', ends with '/', and has no query, fragment or backslash.
+   */
+  function localPrefix(v) {
+    if (typeof v !== 'string' || v.length < 2) return null;
+    if (v.charAt(0) !== '/' || v.charAt(1) === '/' || v.charAt(v.length - 1) !== '/') return null;
+    if (/[?#\\\s]/.test(v)) return null;
+    return v;
+  }
+
+  /**
+   * The maps a viewer may pick, from the page's data-atlas-maps JSON
+   * (contract/atlas_maps/v1/schema.json), or [] when it is absent, malformed
+   * or another version. Each map: {key, scope, group_id, label, level_url,
+   * themes: [{theme_id, label, claim_count, roots: {meaning, links}}]}. A map
+   * with no usable level_url is dropped: a level is always fetched through
+   * its own map's URL, never a page-wide one.
    */
   function parseMaps(raw) {
     let body;
@@ -269,12 +287,17 @@
     } catch (e) {
       return [];
     }
+    if (!body || body.schema_version !== MAPS_SCHEMA_VERSION) return [];
     const out = [];
-    for (const m of (body && Array.isArray(body.maps) && body.maps) || []) {
+    const keys = new Set();
+    for (const m of (Array.isArray(body.maps) && body.maps) || []) {
       if (!m || (m.scope !== 'team' && m.scope !== 'public')) continue;
       const group = m.scope === 'team' ? uuid(m.group_id) : null;
       if (m.scope === 'team' && !group) continue;
-      if (typeof m.key !== 'string' || !m.key) continue;
+      if (m.scope === 'public' && m.group_id !== null) continue;
+      if (typeof m.key !== 'string' || !m.key || keys.has(m.key)) continue;
+      const levelUrl = localPrefix(m.level_url);
+      if (!levelUrl) continue;
       const themes = [];
       for (const t of Array.isArray(m.themes) ? m.themes : []) {
         const id = uuid(t && t.theme_id);
@@ -282,14 +305,30 @@
         if (!id || !uuid(roots.meaning) || !uuid(roots.links)) continue;
         themes.push({
           theme_id: id,
-          label: typeof t.label === 'string' ? t.label : '',
+          label: typeof t.label === 'string' && t.label ? t.label : null,
           claim_count: Math.max(0, finite(t.claim_count, 0)),
           roots: { meaning: roots.meaning, links: roots.links },
         });
       }
-      out.push({ key: m.key, scope: m.scope, group_id: group, label: typeof m.label === 'string' ? m.label : m.key, themes });
+      keys.add(m.key);
+      out.push({ key: m.key, scope: m.scope, group_id: group, label: typeof m.label === 'string' ? m.label : m.key, level_url: levelUrl, themes });
     }
     return out;
+  }
+
+  /**
+   * The URL of one level: its map's level_url, then the hierarchy, then the
+   * level id. A level is (map, hierarchy, group id), so all three are in the
+   * request and the server reads one row. Null when any part is unusable.
+   */
+  function levelUrl(map, hierarchy, levelId) {
+    if (!map || !localPrefix(map.level_url) || HIERARCHIES.indexOf(hierarchy) < 0 || !uuid(levelId)) return null;
+    return map.level_url + hierarchy + '/' + levelId;
+  }
+
+  /** The level cache key: the same three parts as the request. */
+  function levelKey(map, hierarchy, levelId) {
+    return (map ? map.key : '') + '|' + hierarchy + '|' + levelId;
   }
 
   /** A theme's root level on `map` in `hierarchy`, or null. */
@@ -326,7 +365,11 @@
     shouldLoad,
     maxZoom,
     chainIds,
+    MAPS_SCHEMA_VERSION,
+    localPrefix,
     parseMaps,
+    levelUrl,
+    levelKey,
     rootFor,
   };
 });

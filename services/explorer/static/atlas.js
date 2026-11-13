@@ -20,12 +20,14 @@
  * - Deep links: selecting a claim writes #c-<32 hex> with replaceState;
  *   #t-… prototype links are resolved here, through a claim key only.
  * - Nested levels (backlog W11): below a theme, when the page carries
- *   data-atlas-maps (the maps the viewer may pick and each theme's root level
- *   per hierarchy) and data-level-prefix, a theme opens onto its nested group
- *   levels and leaf subgraphs (contract atlas_level v1), drawn in the same
- *   world inside the theme's circle, at their precomputed positions with no
- *   client simulation. The rules (flow styles, switch, placement) live in
- *   atlas_nested.js. Without those attributes themes behave as before.
+ *   data-atlas-maps (contract atlas_maps v1: the maps the viewer may pick,
+ *   each with its own level URL and each theme's name, count and root level
+ *   per hierarchy on that map), a theme opens onto its nested group levels
+ *   and leaf subgraphs (contract atlas_level v1), drawn in the same world
+ *   inside the theme's circle, at their precomputed positions with no client
+ *   simulation. Every level request names the map, the hierarchy and the
+ *   level. The rules (flow styles, switch, placement, addressing) live in
+ *   atlas_nested.js. Without the attribute themes behave as before.
  * - Safety: untrusted strings reach the DOM only through textContent or
  *   setAttribute on non-URL attributes. Local URLs from data must pass
  *   localPath; the only external link is a DOI that passes doiHref. No
@@ -133,7 +135,6 @@
   }
   const MODE = root.getAttribute('data-atlas-mode');
   const PREVIEW = MODE === 'preview';
-  cfg.level = localPath(root.getAttribute('data-level-prefix'));
   cfg.claimPage = localPath(root.getAttribute('data-claim-page-prefix'));
   const NESTED = window.AtlasNested || null;
 
@@ -877,9 +878,16 @@
     return NESTED.rootFor(NS.map, theme.id, NS.hierarchy);
   }
 
-  /** GET one level (cached per map); a body for another map or level is refused. */
-  function fetchLevel(id, kind) {
-    const key = NS.map.key + '|' + id;
+  /**
+   * GET one level of the picked map in `hierarchy`, through that map's own
+   * level URL (cached per map, hierarchy and id); a body for another map,
+   * hierarchy or level is refused.
+   */
+  function fetchLevel(id, kind, hierarchy) {
+    const map = NS.map;
+    const url = NESTED.levelUrl(map, hierarchy, id);
+    if (!url) return Promise.reject(new FetchError(0, 'bad_level', 'The level could not be read.'));
+    const key = NESTED.levelKey(map, hierarchy, id);
     const hit = NS.docs.get(key);
     if (hit) {
       NS.docs.delete(key);
@@ -890,9 +898,8 @@
         return doc;
       });
     }
-    const map = NS.map;
-    const p = getJSON(cfg.level + encodeURIComponent(id)).then((doc) => {
-      const problem = NESTED.levelProblem(doc, { levelId: id, map });
+    const p = getJSON(url).then((doc) => {
+      const problem = NESTED.levelProblem(doc, { levelId: id, map, hierarchy });
       if (problem) throw new FetchError(0, 'bad_level', problem);
       return doc;
     });
@@ -920,6 +927,7 @@
         return makeNode(p.kind, {
           id: p.id,
           levelId: p.id,
+          hierarchy: doc.hierarchy,
           label: NESTED.displayName(c),
           placeholder: NESTED.isPlaceholder(c),
           value: num(c.claim_count) || 0,
@@ -967,7 +975,7 @@
     theme.state = 'loading';
     redraw();
     try {
-      attachLevel(theme, await fetchLevel(id, 'group'));
+      attachLevel(theme, await fetchLevel(id, 'group', NS.hierarchy));
     } catch (e) {
       theme.state = isAbort(e) ? 'idle' : 'error';
       theme.error = e.message;
@@ -981,7 +989,7 @@
     node.state = 'loading';
     redraw();
     try {
-      attachLevel(node, await fetchLevel(node.levelId, node.kind));
+      attachLevel(node, await fetchLevel(node.levelId, node.kind, node.hierarchy));
     } catch (e) {
       node.state = isAbort(e) ? 'idle' : 'error';
       node.error = e.message;
@@ -1019,7 +1027,7 @@
     }
     let docs;
     try {
-      docs = await Promise.all(ids.map((id) => (id === doc.level_id ? doc : fetchLevel(id, 'group'))));
+      docs = await Promise.all(ids.map((id) => (id === doc.level_id ? doc : fetchLevel(id, 'group', doc.hierarchy))));
     } catch (e) {
       if (!isAbort(e)) setNotice(e.message);
       return null;
@@ -1038,8 +1046,12 @@
     return cur;
   }
 
-  /** Follow a cross-group link: fly to `target` ({level_id, theme_id}), in this theme or another. */
-  async function goToLevel(target) {
+  /**
+   * Follow a cross-group link: fly to `target` ({level_id, theme_id}), in
+   * this theme or another. A link stays in the hierarchy of the level that
+   * lists it (`hierarchy`).
+   */
+  async function goToLevel(target, hierarchy) {
     const theme = S.themesById.get(target.theme_id);
     if (!theme) {
       setNotice('That group is in a theme that is not on this map yet.');
@@ -1047,7 +1059,7 @@
     }
     let doc;
     try {
-      doc = await fetchLevel(target.level_id, null);
+      doc = await fetchLevel(target.level_id, null, hierarchy);
     } catch (e) {
       if (!isAbort(e)) setNotice(e.message);
       return;
@@ -1085,7 +1097,7 @@
     }
     let doc;
     try {
-      doc = await fetchLevel(target.level_id, null);
+      doc = await fetchLevel(target.level_id, null, target.hierarchy);
     } catch (e) {
       if (!isAbort(e)) setNotice(e.message);
       return;
@@ -1149,7 +1161,7 @@
 
   function initNested() {
     NS.maps = NESTED ? NESTED.parseMaps(root.getAttribute('data-atlas-maps')) : [];
-    NS.on = Boolean(NESTED && cfg.level && NS.maps.length);
+    NS.on = Boolean(NESTED && NS.maps.length);
     if (!NS.on) return;
     NS.map = NS.maps[0];
     if (dom.mapSelect && dom.mapPicker) {
@@ -1290,7 +1302,7 @@
         const ey = it.sy + Math.sin(angle) * reach;
         const d = Math.hypot(ex - ax, ey - ay) || 1;
         pts = curvePoints(ax + ((ex - ax) / d) * ar, ay + ((ey - ay) / d) * ar, ex, ey);
-        fly = () => goToLevel(to);
+        fly = () => goToLevel(to, node.doc.hierarchy);
         if (named) labels.push({ x: ex, y: ey, text: '→ ' + NESTED.displayName(to) + ' · ' + (b.count || 0), angle });
       }
       ctx.lineWidth = width;
@@ -1390,7 +1402,7 @@
       labels.push({ x: ex, y: ey, text: '→ ' + NESTED.displayName(to) + ' · ' + (o.count || 0), angle });
       const pts = [];
       for (let i = 0; i <= 4; i++) pts.push([px + (ex - px) * (i / 4), py + (ey - py) * (i / 4)]);
-      S.curves.push({ pts, fly: () => goToLevel(to), nested: true });
+      S.curves.push({ pts, fly: () => goToLevel(to, node.doc.hierarchy), nested: true });
     }
   }
 
@@ -1430,7 +1442,7 @@
       const lu = el('ul', 'atlas__list');
       for (const o of out) {
         const li = el('li');
-        li.appendChild(button('atlas__item', NESTED.displayName(o.to) + ' · ' + (o.count || 0), () => goToLevel(o.to)));
+        li.appendChild(button('atlas__item', NESTED.displayName(o.to) + ' · ' + (o.count || 0), () => goToLevel(o.to, doc.hierarchy)));
         lu.appendChild(li);
       }
       ls.appendChild(lu);
