@@ -142,6 +142,20 @@ async fn force_edge(pool: &PgPool, id: Uuid, owner: Uuid, co_owner: Option<Uuid>
     assert_eq!(n, 1);
 }
 
+/// Force an evidence row public (070 re-stamps it only on the next evidence
+/// INSERT for its claim, which the test makes before this).
+async fn force_evidence_public(pool: &PgPool, id: Uuid, world: Uuid) {
+    let n =
+        sqlx::query("UPDATE evidence SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(world)
+            .execute(pool)
+            .await
+            .expect("force evidence public")
+            .rows_affected();
+    assert_eq!(n, 1);
+}
+
 async fn force_evidence(pool: &PgPool, id: Uuid, owner: Uuid) {
     let n =
         sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
@@ -399,6 +413,16 @@ async fn a_high_degree_agent_appears_once(pool: PgPool) {
 /// drawn, an evidence-to-evidence edge of T's among them (the calibration that
 /// the map is not just empty).
 ///
+/// The public map's own arms: rows of T hung on public nodes the public map
+/// draws (an edge between two public claims, an evidence row on a public
+/// claim, an edge between a public evidence row and a public claim's filer)
+/// are on T's map and never on the public one. Without them every private row
+/// the public map must drop is already dropped by the claims filter.
+///
+/// A public evidence row whose `claim_id` is U's claim, reached through a
+/// public edge to a public claim, is drawn on both maps, and the read never
+/// carries U's claim id for it.
+///
 /// The same answer for the bypass viewer (the nightly), for a scoped viewer who
 /// is a member of BOTH T and U (whose own splice admits U's rows), on the
 /// superuser pool and on a stamped `epigraph_app` connection.
@@ -412,12 +436,28 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
 
     let tc = claims(&pool, f_t, "group", t, 2).await;
     let (t1, t2) = (tc[0], tc[1]);
-    let p1 = claims(&pool, f_p, "public", world, 1).await[0];
+    let pc = claims(&pool, f_p, "public", world, 2).await;
+    let (p1, p2) = (pc[0], pc[1]);
     let u1 = claims(&pool, f_u, "group", u, 1).await[0];
 
     let ev_t1 = evidence(&pool, t1, 1).await[0];
     let ev_p = evidence(&pool, p1, 1).await[0];
+    // T's evidence on a public claim (migration 110's hidden evidence). Forced
+    // after the last evidence INSERT on p1, which would re-publish it.
+    let ev_tp = evidence(&pool, p1, 1).await[0];
+    force_evidence(&pool, ev_tp, t).await;
     let ev_u1 = evidence(&pool, u1, 1).await[0];
+    // A public evidence row of U's claim, forced after the last evidence
+    // INSERT on u1 and reached on these maps only through a public edge.
+    let ev_x = evidence(&pool, u1, 1).await[0];
+    force_evidence_public(&pool, ev_x, world).await;
+    let e_xp = edge(
+        &pool,
+        LeafNode::evidence(ev_x),
+        LeafNode::claim(p1),
+        "supports",
+    )
+    .await;
     // U's evidence on T's claim, linked by claim_id AND by an edge stamped T
     // before the evidence moved to U.
     let ev_u = evidence(&pool, t1, 1).await[0];
@@ -466,6 +506,18 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     )
     .await;
     force_edge(&pool, e_ee_co, t, Some(u)).await;
+    // T's edges between nodes the PUBLIC map draws: claim to claim (the read's
+    // second statement) and evidence to agent (its fifth).
+    let e_pp_t = edge(&pool, LeafNode::claim(p1), LeafNode::claim(p2), "supports").await;
+    force_edge(&pool, e_pp_t, t, None).await;
+    let e_pa_t = edge(
+        &pool,
+        LeafNode::evidence(ev_p),
+        LeafNode::agent(f_p),
+        "cites",
+    )
+    .await;
+    force_edge(&pool, e_pa_t, t, None).await;
 
     // Calibration: the stamps the scope rests on.
     let stamp: Vec<(Uuid, String, Uuid, Option<Uuid>)> = sqlx::query_as(
@@ -484,22 +536,51 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
             "edge {id}"
         );
     }
+    let public_edge: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT visibility::text, co_owner_group_id FROM edges WHERE id = $1")
+            .bind(e_xp)
+            .fetch_one(&pool)
+            .await
+            .expect("stamp of the public edge");
+    assert_eq!(public_edge, ("public".to_string(), None));
+    let ev_stamps: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        "SELECT id, visibility::text, owner_group_id FROM evidence WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(vec![ev_tp, ev_x, ev_u])
+    .fetch_all(&pool)
+    .await
+    .expect("evidence stamps");
+    for (id, vis, owner) in &ev_stamps {
+        let want = if *id == ev_tp {
+            ("group", t)
+        } else if *id == ev_x {
+            ("public", world)
+        } else {
+            ("group", u)
+        };
+        assert_eq!((vis.as_str(), *owner), want, "evidence {id}");
+    }
 
-    let input = [u1, p1, t2, t1];
+    let input = [u1, p2, p1, t2, t1];
     let team_nodes: BTreeSet<LeafNode> = BTreeSet::from([
         LeafNode::claim(t1),
         LeafNode::claim(t2),
         LeafNode::claim(p1),
+        LeafNode::claim(p2),
         LeafNode::agent(f_t),
         LeafNode::agent(f_p),
         LeafNode::agent(a_y),
         LeafNode::evidence(ev_t1),
         LeafNode::evidence(ev_p),
+        LeafNode::evidence(ev_tp),
+        LeafNode::evidence(ev_x),
     ]);
     let public_nodes: BTreeSet<LeafNode> = BTreeSet::from([
         LeafNode::claim(p1),
+        LeafNode::claim(p2),
         LeafNode::agent(f_p),
         LeafNode::evidence(ev_p),
+        LeafNode::evidence(ev_x),
     ]);
     let never_edges = BTreeSet::from([e_tp_u, e_co, e_ax, e_evu, e_up, e_ea_u, e_ee_co]);
     let never_ids = [u1, ev_u, ev_u1, f_u, a_x];
@@ -511,7 +592,7 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         let stored = stored_ids(set);
         assert_eq!(
             stored,
-            BTreeSet::from([e_tt, e_ay, e_ee_t]),
+            BTreeSet::from([e_tt, e_ay, e_ee_t, e_pp_t, e_pa_t, e_xp]),
             "{who}: team map stored edges"
         );
         assert!(stored.is_disjoint(&never_edges), "{who}");
@@ -533,13 +614,19 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
             BTreeSet::from([
                 (LeafNode::agent(f_t), LeafNode::claim(t1), filer.clone()),
                 (LeafNode::agent(f_t), LeafNode::claim(t2), filer.clone()),
-                (LeafNode::agent(f_p), LeafNode::claim(p1), filer),
+                (LeafNode::agent(f_p), LeafNode::claim(p1), filer.clone()),
+                (LeafNode::agent(f_p), LeafNode::claim(p2), filer),
                 (
                     LeafNode::evidence(ev_t1),
                     LeafNode::claim(t1),
                     attached.clone()
                 ),
-                (LeafNode::evidence(ev_p), LeafNode::claim(p1), attached),
+                (
+                    LeafNode::evidence(ev_p),
+                    LeafNode::claim(p1),
+                    attached.clone()
+                ),
+                (LeafNode::evidence(ev_tp), LeafNode::claim(p1), attached),
             ]),
             "{who}"
         );
@@ -552,12 +639,42 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
 
     let public_set = fits(build(&pool, &system, AtlasMap::Public, &input).await);
     let nodes: BTreeSet<LeafNode> = public_set.nodes.iter().copied().collect();
+    assert!(
+        !nodes.contains(&LeafNode::evidence(ev_tp)),
+        "T's evidence on a public claim is not on the public map"
+    );
     assert_eq!(nodes, public_nodes, "public map nodes");
     assert_eq!(public_set.counts.unreadable_claims, 3);
+    let public_stored = stored_ids(&public_set);
     assert!(
-        stored_ids(&public_set).is_empty(),
-        "no stored edge is public here"
+        !public_stored.contains(&e_pp_t),
+        "T's edge between two public claims is not on the public map"
     );
+    assert!(
+        !public_stored.contains(&e_pa_t),
+        "T's edge between a public evidence row and a public filer is not on the public map"
+    );
+    assert_eq!(
+        public_stored,
+        BTreeSet::from([e_xp]),
+        "public map stored edges"
+    );
+
+    // The read itself never carries U's claim id for the public evidence row
+    // it reached through an edge, on either map.
+    for (map, who) in [(AtlasMap::Team(t), "team"), (AtlasMap::Public, "public")] {
+        let rows = read(&pool, &system, map, &input).await;
+        assert_eq!(
+            rows.evidence.get(&ev_x),
+            Some(&None),
+            "{who}: ev_x is read, without its claim id"
+        );
+        for (ev, claim) in &rows.evidence {
+            if let Some(c) = claim {
+                assert!(rows.claims.contains_key(c), "{who}: {ev} names claim {c}");
+            }
+        }
+    }
 
     // A member of both teams.
     let (m, _) = fixture::seed_agent_with_group(&pool, "leaf-both").await;
