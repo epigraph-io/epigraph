@@ -380,3 +380,13 @@ test('a claim link finds the fetched leaf that draws the claim, or nothing', () 
   const g = levels.find((d) => d.kind === 'group');
   assert.equal(N.findClaimLeaf([g], g.children[0].id), null);
 });
+
+test('a map count is labelled as stored on the map, not as what the viewer can read', () => {
+  assert.equal(N.countLabel(8, true), '8 claims on this map');
+  assert.equal(N.countLabel(1, true), '1 claim on this map');
+  assert.equal(N.countLabel(1200, true), (1200).toLocaleString() + ' claims on this map');
+  assert.doesNotMatch(N.countLabel(8, true), /you can read/);
+  // The viewer's own layout counts keep their words.
+  assert.equal(N.countLabel(8, false), '8 claims you can read');
+  assert.equal(N.countLabel(undefined, true), '0 claims on this map');
+});

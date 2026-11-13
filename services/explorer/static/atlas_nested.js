@@ -239,6 +239,18 @@
     return out;
   }
 
+  /**
+   * A claim count's words. A map's counts (a theme on a map, a group, a leaf)
+   * are stored when the map is built, and the server then drops what the
+   * viewer cannot read, so they say "on this map", never "you can read".
+   * Live counts from the viewer's own layout keep "you can read".
+   */
+  function countLabel(n, stored) {
+    const v = Math.max(0, Math.round(finite(n, 0)));
+    const noun = v === 1 ? ' claim' : ' claims';
+    return v.toLocaleString() + noun + (stored ? ' on this map' : ' you can read');
+  }
+
   /** Whether a node `screenR` px in radius should fetch its children. */
   function shouldLoad(screenR, viewMin) {
     return finite(screenR, 0) >= finite(viewMin, 1) * LOAD_FRACTION;
@@ -415,6 +427,7 @@
     shouldLoad,
     maxZoom,
     chainIds,
+    countLabel,
     findClaimLeaf,
     MAPS_SCHEMA_VERSION,
     localPrefix,

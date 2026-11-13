@@ -2137,8 +2137,11 @@
     unavailable(section(null), message, retry);
   }
 
-  function countText(n) {
-    const v = num(n) || 0;
+  /** A node's claim count; a map's stored counts are not "you can read" (countLabel). */
+  function countText(node) {
+    const stored = node.kind === 'group' || node.kind === 'leaf' || (node.kind === 'theme' && NS.on);
+    if (NESTED) return NESTED.countLabel(node.value, stored);
+    const v = num(node.value) || 0;
     return v.toLocaleString() + (v === 1 ? ' claim you can read' : ' claims you can read');
   }
 
@@ -2151,7 +2154,7 @@
       dom.panelBody.appendChild(el('p', 'small muted', 'This theme is not on the map you picked.'));
       return;
     }
-    if (node.kind !== 'root' && node.kind !== 'unplaced') dom.panelBody.appendChild(el('p', 'small muted', countText(node.value)));
+    if (node.kind !== 'root' && node.kind !== 'unplaced') dom.panelBody.appendChild(el('p', 'small muted', countText(node)));
     if (node.state === 'error') unavailable(section(null), node.error, () => retryNode(node));
     const kids = node.children || [];
     if (node.kind !== 'root' && node.children === null && node.state !== 'error') {
