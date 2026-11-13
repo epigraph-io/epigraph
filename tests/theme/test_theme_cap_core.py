@@ -90,6 +90,35 @@ def test_a_small_separated_cluster_stays_whole_just_over_the_cap():
     assert core.split_to_cap(ids, x, cap=400, seed=42) == parts
 
 
+def _moons(n=300, dim=32, seed=5, noise=0.03):
+    """Two interleaved half-circles: no straight cut separates them, so k-means
+    on the raw (normalised) vectors mixes them, while k-means in UMAP's space,
+    whose neighbour graph keeps each moon connected, does not."""
+    rng = np.random.RandomState(seed)
+    t0, t1 = rng.uniform(0, np.pi, size=n), rng.uniform(0, np.pi, size=n)
+    pts = np.vstack([np.c_[np.cos(t0), np.sin(t0)], np.c_[1 - np.cos(t1), 0.5 - np.sin(t1)]])
+    pts += noise * rng.normal(size=pts.shape)
+    x = np.zeros((2 * n, dim), dtype=np.float32)
+    x[:, 0] = 10.0  # a shared offset, so normalising barely bends the moons
+    x[:, 1:3] = pts
+    x[:, 3:] = noise * rng.normal(size=(2 * n, dim - 3))
+    ids = [_uuid(rng) for _ in range(2 * n)]
+    return ids, x, {c: int(i >= n) for i, c in enumerate(ids)}
+
+
+def test_the_split_follows_umap_structure_not_raw_kmeans():
+    """UMAP is the method the backlog item names. Without it (k-means on the
+    normalised vectors alone) each part holds roughly a quarter of the other
+    moon; with it each part is exactly one moon."""
+    ids, x, moon_of = _moons()
+
+    parts = core.split_to_cap(ids, x, cap=400, seed=42)
+
+    assert len(parts) == 2
+    assert [len({moon_of[c] for c in p}) for p in parts] == [1, 1], \
+        [[sum(moon_of[c] == m for c in p) for m in (0, 1)] for p in parts]
+
+
 def test_degenerate_identical_embeddings_terminate_under_cap():
     ids = [str(uuid.UUID(int=i + 1)) for i in range(151)]
     x = np.ones((151, 8), dtype=np.float32)
