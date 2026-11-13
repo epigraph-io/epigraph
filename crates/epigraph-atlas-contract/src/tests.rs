@@ -1536,3 +1536,225 @@ fn stored_json_is_the_compact_fixture() {
         .to_string()
         .contains("count is 0"));
 }
+
+// ---- the preview hierarchy -------------------------------------------------------
+
+mod preview_set {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use super::*;
+    use crate::preview::{self, Preview, HIERARCHIES};
+
+    fn preview_dir() -> std::path::PathBuf {
+        contract_dir().join("preview")
+    }
+
+    /// What a request for a preview level asks for, from the generator's map
+    /// table, never from the document under test.
+    fn expected_for(p: &Preview, map: usize, level_id: Uuid) -> Expected {
+        let m = &p.maps[map];
+        match m.group_id {
+            Some(g) => Expected::team(g, level_id),
+            None => Expected::public(level_id),
+        }
+    }
+
+    /// The committed preview files are exactly what the generator writes now,
+    /// and they sit apart from the contract fixtures (whose own test pins
+    /// that directory's exact file set).
+    #[test]
+    fn preview_files_are_current() {
+        let dir = preview_dir();
+        let files = preview::preview_files();
+        if std::env::var_os("ATLAS_CONTRACT_BLESS").is_some() {
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, body) in &files {
+                std::fs::write(dir.join(name), body).unwrap();
+            }
+        }
+        let expected: BTreeSet<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        let on_disk: BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            on_disk, expected,
+            "preview files differ from the generator's set"
+        );
+        for (name, body) in &files {
+            let committed = std::fs::read_to_string(dir.join(name)).unwrap();
+            assert!(
+                committed == *body,
+                "preview {name} is stale; rerun with ATLAS_CONTRACT_BLESS=1"
+            );
+        }
+    }
+
+    /// Every committed preview line passes the contract (schema, invariants,
+    /// budget) for the map the generator put it on.
+    #[test]
+    fn every_preview_level_passes_the_contract() {
+        let p = preview::preview();
+        let committed =
+            std::fs::read_to_string(preview_dir().join("levels.jsonl")).expect("levels.jsonl");
+        let lines: Vec<&str> = committed.lines().collect();
+        assert_eq!(lines.len(), p.levels.len());
+        for ((map, doc), line) in p.levels.iter().zip(lines) {
+            let want = expected_for(&p, *map, doc.level_id());
+            if let Err(e) = check_level_body(line.as_bytes(), &want) {
+                panic!("preview level {}: {e:#?}", doc.level_id());
+            }
+        }
+    }
+
+    /// Every link a viewer can click in the preview lands on a level of the
+    /// set, on the same map: breadcrumbs are the real parent chain, each
+    /// switch leads to the other hierarchy of the same map and theme (and
+    /// back), and every bundle, target and outgoing link resolves. Every
+    /// level is reachable from a manifest root.
+    #[test]
+    fn preview_links_resolve() {
+        let p = preview::preview();
+        let by_id: BTreeMap<Uuid, (usize, &LevelDocument)> = p
+            .levels
+            .iter()
+            .map(|(m, d)| (d.level_id(), (*m, d)))
+            .collect();
+        assert_eq!(by_id.len(), p.levels.len(), "level ids are unique");
+        let env = |d: &LevelDocument| match d {
+            LevelDocument::Group(g) => (
+                g.hierarchy,
+                g.theme_id,
+                g.depth,
+                g.name.clone(),
+                g.needs_naming,
+            ),
+            LevelDocument::Leaf(l) => (
+                l.hierarchy,
+                l.theme_id,
+                l.depth,
+                l.name.clone(),
+                l.needs_naming,
+            ),
+        };
+        let crumbs = |d: &LevelDocument| match d {
+            LevelDocument::Group(g) => (g.breadcrumbs.clone(), g.switch.clone()),
+            LevelDocument::Leaf(l) => (l.breadcrumbs.clone(), l.switch.clone()),
+        };
+        let resolve = |map: usize, t: &LinkTarget, what: &str| {
+            let (m, d) = by_id
+                .get(&t.level_id)
+                .unwrap_or_else(|| panic!("{what}: target {} is not in the set", t.level_id));
+            assert_eq!(*m, map, "{what}: target on another map");
+            let (_, theme, depth, name, _) = env(d);
+            assert_eq!(
+                (t.theme_id, t.depth, &t.name),
+                (theme, depth, &name),
+                "{what}"
+            );
+        };
+
+        // child -> parent, from the group levels' children.
+        let mut parent: BTreeMap<Uuid, Uuid> = BTreeMap::new();
+        let mut cross_theme = 0;
+        let mut unnamed = 0;
+        for (map, doc) in &p.levels {
+            let (hier, theme, depth, _, _) = env(doc);
+            let (_, sw) = crumbs(doc);
+            let (sm, twin) = by_id
+                .get(&sw.level_id)
+                .expect("the switch target is in the set");
+            assert_eq!(*sm, *map, "switch stays on the map");
+            let (th, tt, _, _, _) = env(twin);
+            assert_eq!(
+                (th, tt),
+                (hier.other(), theme),
+                "switch: other hierarchy, same theme"
+            );
+            assert_eq!(
+                crumbs(twin).1.level_id,
+                doc.level_id(),
+                "the twin switches back"
+            );
+            match doc {
+                LevelDocument::Group(g) => {
+                    for c in &g.children {
+                        assert!(parent.insert(c.id, g.level_id).is_none(), "one parent");
+                        let (cm, cd) = by_id.get(&c.id).expect("every child is a level");
+                        assert_eq!(*cm, *map);
+                        let kind_ok = matches!(
+                            (c.kind, cd),
+                            (ChildKind::Group, LevelDocument::Group(_))
+                                | (ChildKind::Leaf, LevelDocument::Leaf(_))
+                        );
+                        assert!(kind_ok, "child {} kind matches its document", c.id);
+                        let (ch, ct, cdep, cname, cnn) = env(cd);
+                        assert_eq!((ch, ct, cdep), (hier, theme, depth + 1));
+                        assert_eq!((&c.name, c.needs_naming), (&cname, cnn));
+                        if c.needs_naming {
+                            unnamed += 1;
+                        }
+                    }
+                    for t in &g.targets {
+                        resolve(*map, t, "group target");
+                        if t.theme_id != theme {
+                            cross_theme += 1;
+                        }
+                    }
+                }
+                LevelDocument::Leaf(l) => {
+                    for o in &l.outgoing {
+                        resolve(*map, &o.target, "leaf outgoing");
+                        if o.target.theme_id != theme {
+                            cross_theme += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Breadcrumbs are the parent chain, root first.
+        for (_, doc) in &p.levels {
+            let mut chain = Vec::new();
+            let mut cur = doc.level_id();
+            while let Some(up) = parent.get(&cur) {
+                chain.push(*up);
+                cur = *up;
+            }
+            chain.reverse();
+            let got: Vec<Uuid> = crumbs(doc).0.iter().map(|b| b.level_id).collect();
+            assert_eq!(got, chain, "breadcrumbs of {}", doc.level_id());
+            for b in crumbs(doc).0 {
+                let (_, _, depth, name, _) = env(by_id[&b.level_id].1);
+                assert_eq!((b.depth, &b.name), (depth, &name));
+            }
+        }
+        // Every level hangs under a manifest root of its map and hierarchy.
+        let mut roots = BTreeSet::new();
+        for (m, map) in p.maps.iter().enumerate() {
+            for t in &map.themes {
+                for (h, hier) in HIERARCHIES.iter().enumerate() {
+                    let (rm, rd) = by_id[&t.roots[h]];
+                    assert_eq!(rm, m);
+                    let (rh, rt, rdep, _, _) = env(rd);
+                    assert_eq!((rh, rt, rdep), (*hier, t.theme_id, 0));
+                    roots.insert(t.roots[h]);
+                }
+            }
+        }
+        for (_, doc) in &p.levels {
+            let top = crumbs(doc).0.first().map_or(doc.level_id(), |b| b.level_id);
+            assert!(roots.contains(&top), "{} is reachable", doc.level_id());
+        }
+        assert!(cross_theme > 0, "some link leads to the other theme");
+        assert!(unnamed > 0, "some group awaits a name");
+        let biggest = p
+            .levels
+            .iter()
+            .filter_map(|(_, d)| match d {
+                LevelDocument::Leaf(l) => Some(l.nodes.len()),
+                _ => None,
+            })
+            .max();
+        assert_eq!(biggest, Some(MAX_LEAF_NODES), "one leaf is full");
+    }
+}
