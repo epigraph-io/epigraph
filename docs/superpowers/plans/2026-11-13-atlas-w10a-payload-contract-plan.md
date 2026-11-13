@@ -95,10 +95,10 @@ positions and weights.
   `flow_basis`. The endpoint kinds fix the basis, so a producer cannot drop a belief
   flow by marking it `none`:
   - `exact`: every evidence-to-claim edge, from the stored mass;
-  - `proxy`: every claim-to-claim edge, strength × the source claim's belief, which the
-    view labels an estimate (a `cites` edge too, with sign 0). W7 computes it at build
-    time, not from a served field, from a belief read of the source claim that is
-    role-aware and scoped to the map's audience (see "No belief value" below);
+  - `proxy`: every claim-to-claim edge, the link's strength × its sign and nothing
+    else, which the view labels an estimate. `flow_weight` is strength × |sign| and
+    `sign` the direction, so a `cites` edge (sign 0) weighs 0. No belief factor of any
+    kind enters it (see "No belief value" below);
   - `none`: every other pair, such as an agent's authorship, so weight 0 and sign 0.
 - `relationship` is the stored name, unnormalised: `^[A-Za-z][A-Za-z0-9_]*$`, at most
   32 characters. The `edges` table uses both casings (`AUTHORED` and `authored`,
@@ -131,16 +131,13 @@ positions and weights.
   kernel types. (The Explorer mirror ignores unknown keys by its own rule, so on the
   BFF side the schema check in `check_level_body` is what rejects it.) The Explorer's banned-key list (`BELIEF_KEYS`, shared by
   `assert_no_belief_keys` on the existing routes and the contract tests) covers both.
-- Proxy flow weights still need the source claim's belief. W7 reads it at build time
-  and stores only the resulting `flow_weight`. That read must be:
-  - role-aware (the `no_role_blind_belief_reads` ratchet, which is about compound vs
-    atom role), and
-  - scoped to the map's audience: folded only from the BBAs that audience can read
-    (public BBAs for the public map; public and the team's own for a team map). The
-    cached claim BetP folds every non-retracted BBA whatever group owns it, so it
-    must not be used. A weight can reveal the belief it was built from, so a public
-    claim with team-private evidence would otherwise put that private mass on the
-    public map.
+- Proxy flow weights carry no belief either. A claim-to-claim `flow_weight` is the
+  link's strength × its sign, with no BetP, belief, plausibility or `truth_value`
+  factor of either claim, so a served weight can never be divided back into a belief.
+  W7 reads no belief to compute it: the strength comes from the link's own edge row,
+  never from a BBA or a belief fold. What keeps a weight to the map's audience is the
+  W8 edge-row filter (only rows the audience can read are drawn, before the collapse),
+  not a scoped belief read.
 - `truth_value` stays, as the colour value only, so colour means the same at every
   level. It is not purely authored: writers that fold evidence also persist
   `truth_value = clamped(pignistic_prob)` as a mirror of the cache at write time
@@ -176,6 +173,7 @@ positions and weights.
 | Served filtered for the viewer | `every_leaf_filtered_for_a_viewer_is_valid` (96 seeded readable subsets of the two leaves), `for_viewer_drops_what_would_show_a_hidden_claim` (kernel). |
 | serde types ↔ schema | `schema_and_types_agree_on_every_mutation`: in small probe documents cut from the fixtures (both level kinds, both map scopes, every node kind and flow basis), at every key, drop it, add an unknown key beside it, and replace its value 7 ways; the schema's verdict must equal the strict serde and invariant verdict. Also `fixtures_round_trip_through_the_types` (kernel) and `the_mirror_round_trips_every_fixture` (explorer). |
 | No belief value | `the_contract_carries_no_belief_value`, `a_leaf_claim_node_carrying_betp_is_rejected` (kernel); `no_schema_or_fixture_key_carries_belief`, `the_helper_rejects_betp_on_a_leaf_claim` (explorer). |
+| No belief factor in proxy weights | `proxy_weights_are_link_strength_times_sign_only`, `proxy_weights_ignore_every_claim_value` (kernel, on the generator; §5). |
 | Negative cases | `extra_private_field_is_rejected`, `missing_flow_basis_is_rejected`, `non_member_body_leaks_no_shape`, `the_kernel_not_found_message_names_the_requested_id`, `invariants_catch_what_the_schema_cannot`, `invariants_enforce_the_schema_rules`, `flow_basis_is_fixed_by_the_endpoint_kinds`, `an_agent_or_evidence_node_with_no_claim_edge_is_rejected`, `relationship_names_in_both_casings_are_accepted` (kernel); `the_helper_rejects_an_extra_private_field`, `the_helper_rejects_an_edge_without_its_exact_or_proxy_flag`, `the_helper_rejects_a_dangling_reference`, `the_not_found_answer_leaks_no_shape` (explorer). |
 
 Each new test is shown to fail on a mutated contract:
@@ -193,19 +191,25 @@ Each new test is shown to fail on a mutated contract:
   `betp`, and a document carrying one fails validation. Adding it back is a later
   schema version, after the evidence-edge backfill lands. `schema_version` stays 1:
   this PR is unmerged, so v1 was never published.
-- **Proxy flow weights are computed at build time.** W7 reads the source claim's
-  belief while building the leaf, role-aware and scoped to the map's audience (§2),
-  and stores only `flow_weight`.
-- **Open for the operator: a proxy weight can carry the BetP this ruling removes.**
-  `flow_weight = strength × BetP(source)`. If W7 makes strength a per-relationship
-  constant, then BetP(source) = `flow_weight / strength(relationship)` to four
-  decimal places, and every served edge names its relationship. The audience scoping
-  above keeps this from being a tenancy leak: the public map could only reveal belief
-  folded from public BBAs, a team map only belief its members can read. What is left
-  is whether serving that belief before its evidence is shown is within the ruling.
-  The options are to accept it, to make proxy weights `strength` alone (sign carried
-  by `sign`), or to quantise them. Nothing computes real proxy weights before W7, so
-  the contract is unchanged until this is decided.
+- **Proxy flow weights carry no belief factor.** A claim-to-claim `flow_weight` is
+  the link's strength × its sign only: no BetP, belief or `truth_value` of either
+  claim, so a served weight can never be divided back into a belief. With the sign in
+  its own field, `flow_weight` is strength × |sign|, so a `cites` link weighs 0.
+  Evidence-to-claim edges keep their exact stored mass (`flow_basis` `exact`). This
+  replaces design §2's "link strength × the source claim's BetP" and the same words in
+  W7's backlog text. It also settles the question an earlier revision left open (a
+  weight built as strength × BetP could be divided back into the BetP): there is no
+  BetP in the weight to recover. The fixture generator follows the rule, and two
+  contract tests pin it:
+  - `proxy_weights_are_link_strength_times_sign_only`: over the committed leaves and
+    32 seeded ones, every proxy edge's sign matches its relationship, a `cites` link
+    weighs exactly 0, and every other one a strength in (0, 1]. A belief factor
+    breaks it both ways: a claim with no belief zeroes a signed link, and a `cites`
+    link picks up its source's belief.
+  - `proxy_weights_ignore_every_claim_value`: two seeded leaves identical except for
+    every claim's `truth_value` have identical edges. The contract has no other
+    belief input to vary, so W7 must carry the real invariance test: changing a
+    source claim's BBAs leaves its proxy weights unchanged.
 - **Evidence draws only stored edges** (a ruling on the storage items, recorded here
   because the `exact` basis rests on it). There is no derived `evidence_for` edge: a
   leaf's evidence nodes and `exact` edges come from stored evidence→claim edges. Making
@@ -219,3 +223,17 @@ contract before this change. Three mutation probes of the new code also go red:
 - the kernel claim node opened to unknown keys: `a_leaf_claim_node_carrying_betp_is_rejected`,
   `extra_private_field_is_rejected` and `schema_and_types_agree_on_every_mutation`;
 - the schema given an optional `betp` property: all four new tests.
+
+How the proxy-weight rule is proven (each probe restored afterwards):
+- `proxy_weights_are_link_strength_times_sign_only` failed against the fixtures
+  committed before this change (`team_leaf_dense /edges/124 (cites): a link with no
+  direction weighs 0`).
+- The generator's old formula put back (strength × a per-claim belief): the same
+  test fails on the seeded leaves, on a `cites` link. A belief factor on directed
+  links only fails it too (`weight 0 is not a strength in (0, 1]`, from a claim with
+  no belief). Strength alone, sign ignored, fails it on a `cites` link.
+- The weight multiplied by the source claim's `truth_value`:
+  `proxy_weights_ignore_every_claim_value` fails (`/edges/70`).
+- The regenerated fixtures equal the old ones, compared as parsed JSON, except for
+  the `flow_weight` of proxy edges (421 in `team_leaf_dense`, 127 in `public_leaf`);
+  the group and not-found fixtures are byte-identical.
