@@ -158,6 +158,7 @@
     switchBox: q('hierarchy-switch'),
     switchButtons: Array.from(root.querySelectorAll('[data-role="hierarchy"]')),
     leafLegend: q('leaf-legend'),
+    themeDashKey: q('theme-dash-key'),
   };
   if (!dom.canvas || !dom.stage || (!cfg.layout && !PREVIEW)) return;
   const ctx = dom.canvas.getContext('2d');
@@ -1229,6 +1230,9 @@
     NS.on = Boolean(NESTED && NS.maps.length);
     if (!NS.on) return;
     NS.map = NS.maps[0];
+    // Lay the leaf legend out now (still invisible), so showing it later
+    // never resizes the canvas; without a map list it takes no row at all.
+    if (dom.leafLegend) dom.leafLegend.hidden = false;
     if (dom.mapSelect && dom.mapPicker) {
       for (const m of NS.maps) {
         const o = el('option', null, m.label);
@@ -1873,6 +1877,9 @@
     if (!dom.caption || dom.caption.textContent !== S.caption) setCaption(S.caption);
     if (dom.leafLegend && dom.leafLegend.classList.contains('atlas__legend--off') === NS.leafShown) {
       dom.leafLegend.classList.toggle('atlas__legend--off', !NS.leafShown);
+      // In the leaf view, dashed means an estimate; the theme-level
+      // "dashed: contradicts or refutes" key would say otherwise.
+      if (dom.themeDashKey) dom.themeDashKey.classList.toggle('atlas__key--off', NS.leafShown);
     }
     if (S.flight || NS.animate) redraw();
   }

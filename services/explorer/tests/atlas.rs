@@ -455,6 +455,22 @@ async fn atlas_page_signed_in_is_a_shell_without_inline_script_or_style() {
     assert!(body.contains(r#"data-layout-url="/explorer/bff/atlas/layout""#));
     assert!(body.contains(r#"data-resolve-prefix="/explorer/bff/atlas/resolve/""#));
     assert!(body.contains(r#"data-themes-url="/explorer/bff/themes""#));
+    // With no map list the page lays out as before: the nested leaf legend
+    // takes no row (hidden, not just invisible) and the controls are hidden.
+    assert!(!body.contains("data-atlas-maps"));
+    let legend = body
+        .find(r#"data-role="leaf-legend""#)
+        .expect("the leaf legend is in the page");
+    let tag = &body[body[..legend].rfind('<').unwrap()..legend + body[legend..].find('>').unwrap()];
+    assert!(
+        tag.contains(" hidden"),
+        "the leaf legend takes no row: {tag}"
+    );
+    for role in ["map-picker", "hierarchy-switch"] {
+        let at = body.find(&format!(r#"data-role="{role}""#)).unwrap();
+        let end = at + body[at..].find('>').unwrap();
+        assert!(body[at..end].contains(" hidden"), "{role} is hidden");
+    }
     assert!(res
         .header("content-security-policy")
         .unwrap()
@@ -2580,6 +2596,23 @@ fn atlas_js_nested_claim_links_never_invent_a_node() {
     assert!(nested.contains("NESTED.findClaimLeaf("));
     assert!(!nested.contains("makeNode("), "no stand-in node");
     assert!(!nested.contains("cfg.themeClaims"), "no claim-list read");
+}
+
+/// The leaf legend is un-hidden only once the page has a map list, and in
+/// the leaf view the theme-level "dashed" key steps aside, so the two legends
+/// never say different things about a dashed line.
+#[test]
+fn atlas_js_leaf_legend_rows_only_with_a_map_list() {
+    let js = include_str!("../static/atlas.js");
+    let start = js.find("function initNested(").expect("initNested");
+    let init = &js[start..start + js[start..].find("\n  }\n").unwrap()];
+    let gate = init.find("if (!NS.on) return;").expect("the map-list gate");
+    let shown = init
+        .find("dom.leafLegend.hidden = false")
+        .expect("initNested un-hides the leaf legend");
+    assert!(gate < shown, "only after the map-list gate");
+    assert_eq!(js.matches("leafLegend.hidden = false").count(), 1);
+    assert!(js.contains("dom.themeDashKey.classList.toggle('atlas__key--off', NS.leafShown)"));
 }
 
 /// A `--token: #rrggbb;` from a stylesheet, in the light or the dark theme.

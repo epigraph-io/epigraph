@@ -362,8 +362,10 @@
   display: none;
 }
 
-/* The leaf legend keeps its space when off, so the canvas never resizes. */
-.atlas__legend--off {
+/* The leaf legend keeps its space when off, so the canvas never resizes;
+   the theme-level dashed key steps aside in the leaf view the same way. */
+.atlas__legend--off,
+.atlas__key--off {
   visibility: hidden;
 }
 
