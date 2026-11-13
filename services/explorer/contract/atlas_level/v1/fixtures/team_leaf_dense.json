@@ -1805,7 +1805,7 @@
       "target": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.1637,
+      "flow_weight": 0.4215,
       "flow_basis": "proxy"
     },
     {
@@ -1813,7 +1813,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.348,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -1821,7 +1821,7 @@
       "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.326,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -1829,7 +1829,7 @@
       "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.3856,
+      "flow_weight": 0.9925,
       "flow_basis": "proxy"
     },
     {
@@ -1837,7 +1837,7 @@
       "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2638,
+      "flow_weight": 0.6791,
       "flow_basis": "proxy"
     },
     {
@@ -1845,7 +1845,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.3145,
+      "flow_weight": 0.8096,
       "flow_basis": "proxy"
     },
     {
@@ -1853,7 +1853,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0764,
+      "flow_weight": 0.5791,
       "flow_basis": "proxy"
     },
     {
@@ -1861,7 +1861,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.127,
+      "flow_weight": 0.9626,
       "flow_basis": "proxy"
     },
     {
@@ -1869,7 +1869,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0945,
+      "flow_weight": 0.7161,
       "flow_basis": "proxy"
     },
     {
@@ -1877,7 +1877,7 @@
       "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0698,
+      "flow_weight": 0.5294,
       "flow_basis": "proxy"
     },
     {
@@ -1885,7 +1885,7 @@
       "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.068,
+      "flow_weight": 0.5156,
       "flow_basis": "proxy"
     },
     {
@@ -1893,7 +1893,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.1185,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -1901,7 +1901,7 @@
       "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.3693,
+      "flow_weight": 0.5073,
       "flow_basis": "proxy"
     },
     {
@@ -1909,7 +1909,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.7048,
+      "flow_weight": 0.9682,
       "flow_basis": "proxy"
     },
     {
@@ -1917,7 +1917,7 @@
       "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.6039,
+      "flow_weight": 0.8295,
       "flow_basis": "proxy"
     },
     {
@@ -1925,7 +1925,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.3761,
+      "flow_weight": 0.5166,
       "flow_basis": "proxy"
     },
     {
@@ -1933,7 +1933,7 @@
       "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.7152,
+      "flow_weight": 0.9825,
       "flow_basis": "proxy"
     },
     {
@@ -1941,7 +1941,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.3762,
+      "flow_weight": 0.8691,
       "flow_basis": "proxy"
     },
     {
@@ -1949,7 +1949,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.267,
+      "flow_weight": 0.6168,
       "flow_basis": "proxy"
     },
     {
@@ -1957,7 +1957,7 @@
       "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3815,
+      "flow_weight": 0.8812,
       "flow_basis": "proxy"
     },
     {
@@ -1965,7 +1965,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2913,
+      "flow_weight": 0.6728,
       "flow_basis": "proxy"
     },
     {
@@ -1973,7 +1973,7 @@
       "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3864,
+      "flow_weight": 0.8925,
       "flow_basis": "proxy"
     },
     {
@@ -1981,7 +1981,7 @@
       "target": "65722717-54d8-48bb-917e-d1f87054f291",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2217,
+      "flow_weight": 0.5121,
       "flow_basis": "proxy"
     },
     {
@@ -1989,7 +1989,7 @@
       "target": "22af1509-24a2-46d1-810d-a16853a20927",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.1983,
+      "flow_weight": 0.3303,
       "flow_basis": "proxy"
     },
     {
@@ -1997,7 +1997,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4176,
+      "flow_weight": 0.6955,
       "flow_basis": "proxy"
     },
     {
@@ -2005,7 +2005,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4364,
+      "flow_weight": 0.7267,
       "flow_basis": "proxy"
     },
     {
@@ -2013,7 +2013,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2367,
+      "flow_weight": 0.3942,
       "flow_basis": "proxy"
     },
     {
@@ -2021,7 +2021,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.4097,
+      "flow_weight": 0.6822,
       "flow_basis": "proxy"
     },
     {
@@ -2029,7 +2029,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.8319,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2037,7 +2037,7 @@
       "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.7861,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2045,7 +2045,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.8441,
+      "flow_weight": 0.9785,
       "flow_basis": "proxy"
     },
     {
@@ -2053,7 +2053,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.7651,
+      "flow_weight": 0.8868,
       "flow_basis": "proxy"
     },
     {
@@ -2061,7 +2061,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.6154,
+      "flow_weight": 0.7134,
       "flow_basis": "proxy"
     },
     {
@@ -2069,7 +2069,7 @@
       "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.3053,
+      "flow_weight": 0.3539,
       "flow_basis": "proxy"
     },
     {
@@ -2077,7 +2077,7 @@
       "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.2303,
+      "flow_weight": 0.3028,
       "flow_basis": "proxy"
     },
     {
@@ -2085,7 +2085,7 @@
       "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.4551,
+      "flow_weight": 0.5984,
       "flow_basis": "proxy"
     },
     {
@@ -2093,7 +2093,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.6961,
+      "flow_weight": 0.9152,
       "flow_basis": "proxy"
     },
     {
@@ -2101,7 +2101,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.36,
+      "flow_weight": 0.4734,
       "flow_basis": "proxy"
     },
     {
@@ -2109,7 +2109,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.4211,
+      "flow_weight": 0.5536,
       "flow_basis": "proxy"
     },
     {
@@ -2117,7 +2117,7 @@
       "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.6636,
+      "flow_weight": 0.8725,
       "flow_basis": "proxy"
     },
     {
@@ -2125,7 +2125,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.287,
+      "flow_weight": 0.358,
       "flow_basis": "proxy"
     },
     {
@@ -2133,7 +2133,7 @@
       "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.3299,
+      "flow_weight": 0.4116,
       "flow_basis": "proxy"
     },
     {
@@ -2141,7 +2141,7 @@
       "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.4052,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2149,7 +2149,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.7563,
+      "flow_weight": 0.9436,
       "flow_basis": "proxy"
     },
     {
@@ -2157,7 +2157,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.5837,
+      "flow_weight": 0.7282,
       "flow_basis": "proxy"
     },
     {
@@ -2165,7 +2165,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.0587,
+      "flow_weight": 0.9876,
       "flow_basis": "proxy"
     },
     {
@@ -2173,7 +2173,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.0424,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2181,7 +2181,7 @@
       "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0429,
+      "flow_weight": 0.722,
       "flow_basis": "proxy"
     },
     {
@@ -2189,7 +2189,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0252,
+      "flow_weight": 0.4235,
       "flow_basis": "proxy"
     },
     {
@@ -2197,7 +2197,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0216,
+      "flow_weight": 0.3642,
       "flow_basis": "proxy"
     },
     {
@@ -2205,7 +2205,7 @@
       "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0499,
+      "flow_weight": 0.8393,
       "flow_basis": "proxy"
     },
     {
@@ -2213,7 +2213,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.6908,
+      "flow_weight": 0.7856,
       "flow_basis": "proxy"
     },
     {
@@ -2221,7 +2221,7 @@
       "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.4194,
+      "flow_weight": 0.4769,
       "flow_basis": "proxy"
     },
     {
@@ -2229,7 +2229,7 @@
       "target": "548eb762-8e47-468b-8ee7-ab1112059548",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.5237,
+      "flow_weight": 0.5955,
       "flow_basis": "proxy"
     },
     {
@@ -2237,7 +2237,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.7224,
+      "flow_weight": 0.8214,
       "flow_basis": "proxy"
     },
     {
@@ -2245,7 +2245,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.3706,
+      "flow_weight": 0.4214,
       "flow_basis": "proxy"
     },
     {
@@ -2253,7 +2253,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.7984,
+      "flow_weight": 0.9079,
       "flow_basis": "proxy"
     },
     {
@@ -2261,7 +2261,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.1623,
+      "flow_weight": 0.4237,
       "flow_basis": "proxy"
     },
     {
@@ -2269,7 +2269,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.28,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2277,7 +2277,7 @@
       "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2703,
+      "flow_weight": 0.7058,
       "flow_basis": "proxy"
     },
     {
@@ -2285,7 +2285,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1826,
+      "flow_weight": 0.4768,
       "flow_basis": "proxy"
     },
     {
@@ -2293,7 +2293,7 @@
       "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.156,
+      "flow_weight": 0.4073,
       "flow_basis": "proxy"
     },
     {
@@ -2301,7 +2301,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2168,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2309,7 +2309,7 @@
       "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.3267,
+      "flow_weight": 0.5098,
       "flow_basis": "proxy"
     },
     {
@@ -2317,7 +2317,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.4932,
+      "flow_weight": 0.7695,
       "flow_basis": "proxy"
     },
     {
@@ -2325,7 +2325,7 @@
       "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4956,
+      "flow_weight": 0.7732,
       "flow_basis": "proxy"
     },
     {
@@ -2333,7 +2333,7 @@
       "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2697,
+      "flow_weight": 0.4208,
       "flow_basis": "proxy"
     },
     {
@@ -2341,7 +2341,7 @@
       "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.5668,
+      "flow_weight": 0.8843,
       "flow_basis": "proxy"
     },
     {
@@ -2349,7 +2349,7 @@
       "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5876,
+      "flow_weight": 0.9168,
       "flow_basis": "proxy"
     },
     {
@@ -2357,7 +2357,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.1864,
+      "flow_weight": 0.5008,
       "flow_basis": "proxy"
     },
     {
@@ -2365,7 +2365,7 @@
       "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1171,
+      "flow_weight": 0.3146,
       "flow_basis": "proxy"
     },
     {
@@ -2373,7 +2373,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.3578,
+      "flow_weight": 0.9616,
       "flow_basis": "proxy"
     },
     {
@@ -2381,7 +2381,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.1158,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2389,7 +2389,7 @@
       "target": "bb67a745-92e9-4590-bb2d-d779f31143df",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3222,
+      "flow_weight": 0.8658,
       "flow_basis": "proxy"
     },
     {
@@ -2397,7 +2397,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0538,
+      "flow_weight": 0.3871,
       "flow_basis": "proxy"
     },
     {
@@ -2405,7 +2405,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0898,
+      "flow_weight": 0.6463,
       "flow_basis": "proxy"
     },
     {
@@ -2413,7 +2413,7 @@
       "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.1033,
+      "flow_weight": 0.7437,
       "flow_basis": "proxy"
     },
     {
@@ -2421,7 +2421,7 @@
       "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1385,
+      "flow_weight": 0.9974,
       "flow_basis": "proxy"
     },
     {
@@ -2429,7 +2429,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0584,
+      "flow_weight": 0.4207,
       "flow_basis": "proxy"
     },
     {
@@ -2437,7 +2437,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0704,
+      "flow_weight": 0.507,
       "flow_basis": "proxy"
     },
     {
@@ -2445,7 +2445,7 @@
       "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.2491,
+      "flow_weight": 0.3467,
       "flow_basis": "proxy"
     },
     {
@@ -2453,7 +2453,7 @@
       "target": "548eb762-8e47-468b-8ee7-ab1112059548",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2599,
+      "flow_weight": 0.3617,
       "flow_basis": "proxy"
     },
     {
@@ -2461,7 +2461,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.6249,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2469,7 +2469,7 @@
       "target": "548eb762-8e47-468b-8ee7-ab1112059548",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.3366,
+      "flow_weight": 0.4684,
       "flow_basis": "proxy"
     },
     {
@@ -2477,7 +2477,7 @@
       "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2515,
+      "flow_weight": 0.3501,
       "flow_basis": "proxy"
     },
     {
@@ -2485,7 +2485,7 @@
       "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4401,
+      "flow_weight": 0.6125,
       "flow_basis": "proxy"
     },
     {
@@ -2493,7 +2493,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.8172,
+      "flow_weight": 0.8379,
       "flow_basis": "proxy"
     },
     {
@@ -2501,7 +2501,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.9273,
+      "flow_weight": 0.9507,
       "flow_basis": "proxy"
     },
     {
@@ -2509,7 +2509,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.3415,
+      "flow_weight": 0.3502,
       "flow_basis": "proxy"
     },
     {
@@ -2517,7 +2517,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.87,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2525,7 +2525,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.6863,
+      "flow_weight": 0.7037,
       "flow_basis": "proxy"
     },
     {
@@ -2533,7 +2533,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.7557,
+      "flow_weight": 0.7748,
       "flow_basis": "proxy"
     },
     {
@@ -2541,7 +2541,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0306,
+      "flow_weight": 0.6936,
       "flow_basis": "proxy"
     },
     {
@@ -2549,7 +2549,7 @@
       "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.0438,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2557,7 +2557,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.0341,
+      "flow_weight": 0.7726,
       "flow_basis": "proxy"
     },
     {
@@ -2565,7 +2565,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.0408,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2573,7 +2573,7 @@
       "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0403,
+      "flow_weight": 0.915,
       "flow_basis": "proxy"
     },
     {
@@ -2581,7 +2581,7 @@
       "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0267,
+      "flow_weight": 0.6063,
       "flow_basis": "proxy"
     },
     {
@@ -2589,7 +2589,7 @@
       "target": "f27838c0-c344-4232-b544-472b4303099d",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.3637,
+      "flow_weight": 0.7937,
       "flow_basis": "proxy"
     },
     {
@@ -2597,7 +2597,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3146,
+      "flow_weight": 0.6864,
       "flow_basis": "proxy"
     },
     {
@@ -2605,7 +2605,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2131,
+      "flow_weight": 0.4651,
       "flow_basis": "proxy"
     },
     {
@@ -2613,7 +2613,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.3482,
+      "flow_weight": 0.7597,
       "flow_basis": "proxy"
     },
     {
@@ -2621,7 +2621,7 @@
       "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4426,
+      "flow_weight": 0.9657,
       "flow_basis": "proxy"
     },
     {
@@ -2629,7 +2629,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.3516,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2637,7 +2637,7 @@
       "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1865,
+      "flow_weight": 0.5687,
       "flow_basis": "proxy"
     },
     {
@@ -2645,7 +2645,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1928,
+      "flow_weight": 0.5879,
       "flow_basis": "proxy"
     },
     {
@@ -2653,7 +2653,7 @@
       "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.1934,
+      "flow_weight": 0.5897,
       "flow_basis": "proxy"
     },
     {
@@ -2661,7 +2661,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3029,
+      "flow_weight": 0.9237,
       "flow_basis": "proxy"
     },
     {
@@ -2669,7 +2669,7 @@
       "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2327,
+      "flow_weight": 0.7098,
       "flow_basis": "proxy"
     },
     {
@@ -2677,7 +2677,7 @@
       "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1671,
+      "flow_weight": 0.5097,
       "flow_basis": "proxy"
     },
     {
@@ -2685,7 +2685,7 @@
       "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.0116,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2693,7 +2693,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0115,
+      "flow_weight": 0.548,
       "flow_basis": "proxy"
     },
     {
@@ -2701,7 +2701,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0096,
+      "flow_weight": 0.4572,
       "flow_basis": "proxy"
     },
     {
@@ -2709,7 +2709,7 @@
       "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0206,
+      "flow_weight": 0.98,
       "flow_basis": "proxy"
     },
     {
@@ -2717,7 +2717,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0206,
+      "flow_weight": 0.9813,
       "flow_basis": "proxy"
     },
     {
@@ -2725,7 +2725,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.0124,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2733,7 +2733,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.2752,
+      "flow_weight": 0.5384,
       "flow_basis": "proxy"
     },
     {
@@ -2741,7 +2741,7 @@
       "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1599,
+      "flow_weight": 0.3127,
       "flow_basis": "proxy"
     },
     {
@@ -2749,7 +2749,7 @@
       "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4386,
+      "flow_weight": 0.858,
       "flow_basis": "proxy"
     },
     {
@@ -2757,7 +2757,7 @@
       "target": "bb67a745-92e9-4590-bb2d-d779f31143df",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2747,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2765,7 +2765,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2703,
+      "flow_weight": 0.5288,
       "flow_basis": "proxy"
     },
     {
@@ -2773,7 +2773,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.181,
+      "flow_weight": 0.8347,
       "flow_basis": "proxy"
     },
     {
@@ -2781,7 +2781,7 @@
       "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1903,
+      "flow_weight": 0.8778,
       "flow_basis": "proxy"
     },
     {
@@ -2789,7 +2789,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2113,
+      "flow_weight": 0.9745,
       "flow_basis": "proxy"
     },
     {
@@ -2797,7 +2797,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1474,
+      "flow_weight": 0.6799,
       "flow_basis": "proxy"
     },
     {
@@ -2805,7 +2805,7 @@
       "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2041,
+      "flow_weight": 0.9415,
       "flow_basis": "proxy"
     },
     {
@@ -2813,7 +2813,7 @@
       "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0768,
+      "flow_weight": 0.3541,
       "flow_basis": "proxy"
     },
     {
@@ -2821,7 +2821,7 @@
       "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1232,
+      "flow_weight": 0.3904,
       "flow_basis": "proxy"
     },
     {
@@ -2829,7 +2829,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.2883,
+      "flow_weight": 0.9134,
       "flow_basis": "proxy"
     },
     {
@@ -2837,7 +2837,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2041,
+      "flow_weight": 0.6467,
       "flow_basis": "proxy"
     },
     {
@@ -2845,7 +2845,7 @@
       "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2049,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2853,7 +2853,7 @@
       "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1148,
+      "flow_weight": 0.3637,
       "flow_basis": "proxy"
     },
     {
@@ -2861,7 +2861,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.1852,
+      "flow_weight": 0.5867,
       "flow_basis": "proxy"
     },
     {
@@ -2869,7 +2869,7 @@
       "target": "65722717-54d8-48bb-917e-d1f87054f291",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0435,
+      "flow_weight": 0.4762,
       "flow_basis": "proxy"
     },
     {
@@ -2877,7 +2877,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0837,
+      "flow_weight": 0.9164,
       "flow_basis": "proxy"
     },
     {
@@ -2885,7 +2885,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0825,
+      "flow_weight": 0.9038,
       "flow_basis": "proxy"
     },
     {
@@ -2893,7 +2893,7 @@
       "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0897,
+      "flow_weight": 0.9828,
       "flow_basis": "proxy"
     },
     {
@@ -2901,7 +2901,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0739,
+      "flow_weight": 0.8096,
       "flow_basis": "proxy"
     },
     {
@@ -2909,7 +2909,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0627,
+      "flow_weight": 0.6863,
       "flow_basis": "proxy"
     },
     {
@@ -2917,7 +2917,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5513,
+      "flow_weight": 0.9558,
       "flow_basis": "proxy"
     },
     {
@@ -2925,7 +2925,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.418,
+      "flow_weight": 0.7247,
       "flow_basis": "proxy"
     },
     {
@@ -2933,7 +2933,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.2287,
+      "flow_weight": 0.3965,
       "flow_basis": "proxy"
     },
     {
@@ -2941,7 +2941,7 @@
       "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.2224,
+      "flow_weight": 0.3856,
       "flow_basis": "proxy"
     },
     {
@@ -2949,7 +2949,7 @@
       "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2788,
+      "flow_weight": 0.4834,
       "flow_basis": "proxy"
     },
     {
@@ -2957,7 +2957,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.802,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -2965,7 +2965,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4984,
+      "flow_weight": 0.5654,
       "flow_basis": "proxy"
     },
     {
@@ -2973,7 +2973,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.5244,
+      "flow_weight": 0.5948,
       "flow_basis": "proxy"
     },
     {
@@ -2981,7 +2981,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.7484,
+      "flow_weight": 0.849,
       "flow_basis": "proxy"
     },
     {
@@ -2989,7 +2989,7 @@
       "target": "8df9ff68-7100-4216-ba86-3e168a252511",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2994,
+      "flow_weight": 0.3397,
       "flow_basis": "proxy"
     },
     {
@@ -2997,7 +2997,7 @@
       "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.8353,
+      "flow_weight": 0.9475,
       "flow_basis": "proxy"
     },
     {
@@ -3005,7 +3005,7 @@
       "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.3391,
+      "flow_weight": 0.7783,
       "flow_basis": "proxy"
     },
     {
@@ -3013,7 +3013,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.2822,
+      "flow_weight": 0.6478,
       "flow_basis": "proxy"
     },
     {
@@ -3021,7 +3021,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.3118,
+      "flow_weight": 0.7156,
       "flow_basis": "proxy"
     },
     {
@@ -3029,7 +3029,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3433,
+      "flow_weight": 0.7879,
       "flow_basis": "proxy"
     },
     {
@@ -3037,7 +3037,7 @@
       "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2463,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3045,7 +3045,7 @@
       "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.395,
+      "flow_weight": 0.9067,
       "flow_basis": "proxy"
     },
     {
@@ -3053,7 +3053,7 @@
       "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.7909,
+      "flow_weight": 0.8311,
       "flow_basis": "proxy"
     },
     {
@@ -3061,7 +3061,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4377,
+      "flow_weight": 0.4599,
       "flow_basis": "proxy"
     },
     {
@@ -3069,7 +3069,7 @@
       "target": "260aa5ef-347e-434d-ac96-77e045e874be",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.839,
+      "flow_weight": 0.8817,
       "flow_basis": "proxy"
     },
     {
@@ -3077,7 +3077,7 @@
       "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.8736,
+      "flow_weight": 0.918,
       "flow_basis": "proxy"
     },
     {
@@ -3085,7 +3085,7 @@
       "target": "8df9ff68-7100-4216-ba86-3e168a252511",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.4154,
+      "flow_weight": 0.4365,
       "flow_basis": "proxy"
     },
     {
@@ -3093,7 +3093,7 @@
       "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.9133,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3101,7 +3101,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.3333,
+      "flow_weight": 0.6065,
       "flow_basis": "proxy"
     },
     {
@@ -3109,7 +3109,7 @@
       "target": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.3248,
+      "flow_weight": 0.591,
       "flow_basis": "proxy"
     },
     {
@@ -3117,7 +3117,7 @@
       "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4322,
+      "flow_weight": 0.7865,
       "flow_basis": "proxy"
     },
     {
@@ -3125,7 +3125,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.3734,
+      "flow_weight": 0.6796,
       "flow_basis": "proxy"
     },
     {
@@ -3133,7 +3133,7 @@
       "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.504,
+      "flow_weight": 0.9171,
       "flow_basis": "proxy"
     },
     {
@@ -3141,7 +3141,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.502,
+      "flow_weight": 0.6968,
       "flow_basis": "proxy"
     },
     {
@@ -3149,7 +3149,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.3468,
+      "flow_weight": 0.4814,
       "flow_basis": "proxy"
     },
     {
@@ -3157,7 +3157,7 @@
       "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.4963,
+      "flow_weight": 0.6889,
       "flow_basis": "proxy"
     },
     {
@@ -3165,7 +3165,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.3782,
+      "flow_weight": 0.5249,
       "flow_basis": "proxy"
     },
     {
@@ -3173,7 +3173,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.3782,
+      "flow_weight": 0.5249,
       "flow_basis": "proxy"
     },
     {
@@ -3181,7 +3181,7 @@
       "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.7168,
+      "flow_weight": 0.9948,
       "flow_basis": "proxy"
     },
     {
@@ -3189,7 +3189,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.3417,
+      "flow_weight": 0.8706,
       "flow_basis": "proxy"
     },
     {
@@ -3197,7 +3197,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.2449,
+      "flow_weight": 0.6241,
       "flow_basis": "proxy"
     },
     {
@@ -3205,7 +3205,7 @@
       "target": "260aa5ef-347e-434d-ac96-77e045e874be",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.2702,
+      "flow_weight": 0.6883,
       "flow_basis": "proxy"
     },
     {
@@ -3213,7 +3213,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2212,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3221,7 +3221,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.3095,
+      "flow_weight": 0.7887,
       "flow_basis": "proxy"
     },
     {
@@ -3229,7 +3229,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.2083,
+      "flow_weight": 0.5306,
       "flow_basis": "proxy"
     },
     {
@@ -3237,7 +3237,7 @@
       "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3229,
+      "flow_weight": 0.3973,
       "flow_basis": "proxy"
     },
     {
@@ -3245,7 +3245,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.6621,
+      "flow_weight": 0.8146,
       "flow_basis": "proxy"
     },
     {
@@ -3253,7 +3253,7 @@
       "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.2693,
+      "flow_weight": 0.3313,
       "flow_basis": "proxy"
     },
     {
@@ -3261,7 +3261,7 @@
       "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.2943,
+      "flow_weight": 0.3621,
       "flow_basis": "proxy"
     },
     {
@@ -3269,7 +3269,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2792,
+      "flow_weight": 0.3436,
       "flow_basis": "proxy"
     },
     {
@@ -3277,7 +3277,7 @@
       "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.6983,
+      "flow_weight": 0.8592,
       "flow_basis": "proxy"
     },
     {
@@ -3285,7 +3285,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.107,
+      "flow_weight": 0.7819,
       "flow_basis": "proxy"
     },
     {
@@ -3293,7 +3293,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1114,
+      "flow_weight": 0.8146,
       "flow_basis": "proxy"
     },
     {
@@ -3301,7 +3301,7 @@
       "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0966,
+      "flow_weight": 0.7058,
       "flow_basis": "proxy"
     },
     {
@@ -3309,7 +3309,7 @@
       "target": "f27838c0-c344-4232-b544-472b4303099d",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1043,
+      "flow_weight": 0.7624,
       "flow_basis": "proxy"
     },
     {
@@ -3317,7 +3317,7 @@
       "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0906,
+      "flow_weight": 0.6625,
       "flow_basis": "proxy"
     },
     {
@@ -3325,7 +3325,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0721,
+      "flow_weight": 0.5272,
       "flow_basis": "proxy"
     },
     {
@@ -3333,7 +3333,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2767,
+      "flow_weight": 0.4558,
       "flow_basis": "proxy"
     },
     {
@@ -3341,7 +3341,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2008,
+      "flow_weight": 0.3307,
       "flow_basis": "proxy"
     },
     {
@@ -3349,7 +3349,7 @@
       "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.1868,
+      "flow_weight": 0.3077,
       "flow_basis": "proxy"
     },
     {
@@ -3357,7 +3357,7 @@
       "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.5215,
+      "flow_weight": 0.859,
       "flow_basis": "proxy"
     },
     {
@@ -3365,7 +3365,7 @@
       "target": "65722717-54d8-48bb-917e-d1f87054f291",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.5403,
+      "flow_weight": 0.89,
       "flow_basis": "proxy"
     },
     {
@@ -3373,7 +3373,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.39,
+      "flow_weight": 0.6424,
       "flow_basis": "proxy"
     },
     {
@@ -3381,7 +3381,7 @@
       "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2767,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3389,7 +3389,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.3097,
+      "flow_weight": 0.5877,
       "flow_basis": "proxy"
     },
     {
@@ -3397,7 +3397,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.3571,
+      "flow_weight": 0.6778,
       "flow_basis": "proxy"
     },
     {
@@ -3405,7 +3405,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.3686,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3413,7 +3413,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2886,
+      "flow_weight": 0.5478,
       "flow_basis": "proxy"
     },
     {
@@ -3421,7 +3421,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2362,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3429,7 +3429,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.517,
+      "flow_weight": 0.5506,
       "flow_basis": "proxy"
     },
     {
@@ -3437,7 +3437,7 @@
       "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4954,
+      "flow_weight": 0.5276,
       "flow_basis": "proxy"
     },
     {
@@ -3445,7 +3445,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.6468,
+      "flow_weight": 0.6889,
       "flow_basis": "proxy"
     },
     {
@@ -3453,7 +3453,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.4574,
+      "flow_weight": 0.4871,
       "flow_basis": "proxy"
     },
     {
@@ -3461,7 +3461,7 @@
       "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.4438,
+      "flow_weight": 0.4726,
       "flow_basis": "proxy"
     },
     {
@@ -3469,7 +3469,7 @@
       "target": "22af1509-24a2-46d1-810d-a16853a20927",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.5977,
+      "flow_weight": 0.6366,
       "flow_basis": "proxy"
     },
     {
@@ -3477,7 +3477,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0192,
+      "flow_weight": 0.8186,
       "flow_basis": "proxy"
     },
     {
@@ -3485,7 +3485,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0171,
+      "flow_weight": 0.7282,
       "flow_basis": "proxy"
     },
     {
@@ -3493,7 +3493,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0089,
+      "flow_weight": 0.3777,
       "flow_basis": "proxy"
     },
     {
@@ -3501,7 +3501,7 @@
       "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0211,
+      "flow_weight": 0.8993,
       "flow_basis": "proxy"
     },
     {
@@ -3509,7 +3509,7 @@
       "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0083,
+      "flow_weight": 0.3523,
       "flow_basis": "proxy"
     },
     {
@@ -3517,7 +3517,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.0226,
+      "flow_weight": 0.9629,
       "flow_basis": "proxy"
     },
     {
@@ -3525,7 +3525,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.3308,
+      "flow_weight": 0.3668,
       "flow_basis": "proxy"
     },
     {
@@ -3533,7 +3533,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.595,
+      "flow_weight": 0.6597,
       "flow_basis": "proxy"
     },
     {
@@ -3541,7 +3541,7 @@
       "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.5083,
+      "flow_weight": 0.5636,
       "flow_basis": "proxy"
     },
     {
@@ -3549,7 +3549,7 @@
       "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.672,
+      "flow_weight": 0.7451,
       "flow_basis": "proxy"
     },
     {
@@ -3557,7 +3557,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.6289,
+      "flow_weight": 0.6973,
       "flow_basis": "proxy"
     },
     {
@@ -3565,7 +3565,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.7971,
+      "flow_weight": 0.8838,
       "flow_basis": "proxy"
     },
     {
@@ -3573,7 +3573,7 @@
       "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.12,
+      "flow_weight": 0.4047,
       "flow_basis": "proxy"
     },
     {
@@ -3581,7 +3581,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1663,
+      "flow_weight": 0.5608,
       "flow_basis": "proxy"
     },
     {
@@ -3589,7 +3589,7 @@
       "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2706,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3597,7 +3597,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1363,
+      "flow_weight": 0.4596,
       "flow_basis": "proxy"
     },
     {
@@ -3605,7 +3605,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.2372,
+      "flow_weight": 0.7998,
       "flow_basis": "proxy"
     },
     {
@@ -3613,7 +3613,7 @@
       "target": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1946,
+      "flow_weight": 0.6561,
       "flow_basis": "proxy"
     },
     {
@@ -3621,7 +3621,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.773,
       "flow_basis": "proxy"
     },
     {
@@ -3629,7 +3629,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.4896,
       "flow_basis": "proxy"
     },
     {
@@ -3637,7 +3637,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.4485,
       "flow_basis": "proxy"
     },
     {
@@ -3645,7 +3645,7 @@
       "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.3892,
       "flow_basis": "proxy"
     },
     {
@@ -3653,7 +3653,7 @@
       "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.8992,
       "flow_basis": "proxy"
     },
     {
@@ -3661,7 +3661,7 @@
       "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.7886,
       "flow_basis": "proxy"
     },
     {
@@ -3669,7 +3669,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.5307,
+      "flow_weight": 0.8592,
       "flow_basis": "proxy"
     },
     {
@@ -3677,7 +3677,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.196,
+      "flow_weight": 0.3173,
       "flow_basis": "proxy"
     },
     {
@@ -3685,7 +3685,7 @@
       "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4369,
+      "flow_weight": 0.7073,
       "flow_basis": "proxy"
     },
     {
@@ -3693,7 +3693,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.4454,
+      "flow_weight": 0.7211,
       "flow_basis": "proxy"
     },
     {
@@ -3701,7 +3701,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.5679,
+      "flow_weight": 0.9193,
       "flow_basis": "proxy"
     },
     {
@@ -3709,7 +3709,7 @@
       "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2339,
+      "flow_weight": 0.3786,
       "flow_basis": "proxy"
     },
     {
@@ -3717,7 +3717,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.5007,
+      "flow_weight": 0.9737,
       "flow_basis": "proxy"
     },
     {
@@ -3725,7 +3725,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.1609,
+      "flow_weight": 0.3129,
       "flow_basis": "proxy"
     },
     {
@@ -3733,7 +3733,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2438,
+      "flow_weight": 0.4741,
       "flow_basis": "proxy"
     },
     {
@@ -3741,7 +3741,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2188,
+      "flow_weight": 0.4255,
       "flow_basis": "proxy"
     },
     {
@@ -3749,7 +3749,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.4539,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3757,7 +3757,7 @@
       "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.3257,
+      "flow_weight": 0.6333,
       "flow_basis": "proxy"
     },
     {
@@ -3765,7 +3765,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4412,
+      "flow_weight": 0.6964,
       "flow_basis": "proxy"
     },
     {
@@ -3773,7 +3773,7 @@
       "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2825,
+      "flow_weight": 0.446,
       "flow_basis": "proxy"
     },
     {
@@ -3781,7 +3781,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2744,
+      "flow_weight": 0.4332,
       "flow_basis": "proxy"
     },
     {
@@ -3789,7 +3789,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.4604,
+      "flow_weight": 0.7268,
       "flow_basis": "proxy"
     },
     {
@@ -3797,7 +3797,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.5866,
+      "flow_weight": 0.9259,
       "flow_basis": "proxy"
     },
     {
@@ -3805,7 +3805,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.3952,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3813,7 +3813,7 @@
       "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5683,
+      "flow_weight": 0.8271,
       "flow_basis": "proxy"
     },
     {
@@ -3821,7 +3821,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.514,
+      "flow_weight": 0.7481,
       "flow_basis": "proxy"
     },
     {
@@ -3829,7 +3829,7 @@
       "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.3993,
+      "flow_weight": 0.5812,
       "flow_basis": "proxy"
     },
     {
@@ -3837,7 +3837,7 @@
       "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.2441,
+      "flow_weight": 0.3553,
       "flow_basis": "proxy"
     },
     {
@@ -3845,7 +3845,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.5284,
+      "flow_weight": 0.769,
       "flow_basis": "proxy"
     },
     {
@@ -3853,7 +3853,7 @@
       "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.2828,
+      "flow_weight": 0.4116,
       "flow_basis": "proxy"
     },
     {
@@ -3861,7 +3861,7 @@
       "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2263,
+      "flow_weight": 0.4556,
       "flow_basis": "proxy"
     },
     {
@@ -3869,7 +3869,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3039,
+      "flow_weight": 0.612,
       "flow_basis": "proxy"
     },
     {
@@ -3877,7 +3877,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1613,
+      "flow_weight": 0.3249,
       "flow_basis": "proxy"
     },
     {
@@ -3885,7 +3885,7 @@
       "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.3504,
+      "flow_weight": 0.7055,
       "flow_basis": "proxy"
     },
     {
@@ -3893,7 +3893,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.4748,
+      "flow_weight": 0.9561,
       "flow_basis": "proxy"
     },
     {
@@ -3901,7 +3901,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.3661,
+      "flow_weight": 0.9932,
       "flow_basis": "proxy"
     },
     {
@@ -3909,7 +3909,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2283,
+      "flow_weight": 0.6193,
       "flow_basis": "proxy"
     },
     {
@@ -3917,7 +3917,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.329,
+      "flow_weight": 0.8926,
       "flow_basis": "proxy"
     },
     {
@@ -3925,7 +3925,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2068,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -3933,7 +3933,7 @@
       "target": "bb67a745-92e9-4590-bb2d-d779f31143df",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.3017,
+      "flow_weight": 0.8184,
       "flow_basis": "proxy"
     },
     {
@@ -3941,7 +3941,7 @@
       "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.3029,
+      "flow_weight": 0.8218,
       "flow_basis": "proxy"
     },
     {
@@ -3957,7 +3957,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.4737,
       "flow_basis": "proxy"
     },
     {
@@ -3965,7 +3965,7 @@
       "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.5124,
       "flow_basis": "proxy"
     },
     {
@@ -3973,7 +3973,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.6037,
       "flow_basis": "proxy"
     },
     {
@@ -3989,7 +3989,7 @@
       "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.7213,
       "flow_basis": "proxy"
     },
     {
@@ -3997,7 +3997,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1068,
+      "flow_weight": 0.4813,
       "flow_basis": "proxy"
     },
     {
@@ -4005,7 +4005,7 @@
       "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0798,
+      "flow_weight": 0.3596,
       "flow_basis": "proxy"
     },
     {
@@ -4013,7 +4013,7 @@
       "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.1533,
+      "flow_weight": 0.6905,
       "flow_basis": "proxy"
     },
     {
@@ -4021,7 +4021,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.21,
+      "flow_weight": 0.9459,
       "flow_basis": "proxy"
     },
     {
@@ -4029,7 +4029,7 @@
       "target": "22af1509-24a2-46d1-810d-a16853a20927",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1241,
+      "flow_weight": 0.5589,
       "flow_basis": "proxy"
     },
     {
@@ -4037,7 +4037,7 @@
       "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1737,
+      "flow_weight": 0.7824,
       "flow_basis": "proxy"
     },
     {
@@ -4045,7 +4045,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.8246,
+      "flow_weight": 0.9369,
       "flow_basis": "proxy"
     },
     {
@@ -4053,7 +4053,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.7646,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4061,7 +4061,7 @@
       "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3895,
+      "flow_weight": 0.4426,
       "flow_basis": "proxy"
     },
     {
@@ -4069,7 +4069,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.4923,
+      "flow_weight": 0.5594,
       "flow_basis": "proxy"
     },
     {
@@ -4077,7 +4077,7 @@
       "target": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.3657,
+      "flow_weight": 0.4156,
       "flow_basis": "proxy"
     },
     {
@@ -4085,7 +4085,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.7702,
+      "flow_weight": 0.8751,
       "flow_basis": "proxy"
     },
     {
@@ -4093,7 +4093,7 @@
       "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0814,
+      "flow_weight": 0.5446,
       "flow_basis": "proxy"
     },
     {
@@ -4101,7 +4101,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0956,
+      "flow_weight": 0.6395,
       "flow_basis": "proxy"
     },
     {
@@ -4109,7 +4109,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.1454,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4117,7 +4117,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0814,
+      "flow_weight": 0.5443,
       "flow_basis": "proxy"
     },
     {
@@ -4125,7 +4125,7 @@
       "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.0743,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4133,7 +4133,7 @@
       "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.1758,
+      "flow_weight": 0.3514,
       "flow_basis": "proxy"
     },
     {
@@ -4141,7 +4141,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.4068,
+      "flow_weight": 0.8133,
       "flow_basis": "proxy"
     },
     {
@@ -4149,7 +4149,7 @@
       "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.3886,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4157,7 +4157,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4492,
+      "flow_weight": 0.8979,
       "flow_basis": "proxy"
     },
     {
@@ -4165,7 +4165,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.3152,
+      "flow_weight": 0.6302,
       "flow_basis": "proxy"
     },
     {
@@ -4173,7 +4173,7 @@
       "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2606,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4181,7 +4181,7 @@
       "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1432,
+      "flow_weight": 0.7042,
       "flow_basis": "proxy"
     },
     {
@@ -4189,7 +4189,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.1574,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4197,7 +4197,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.1013,
+      "flow_weight": 0.4984,
       "flow_basis": "proxy"
     },
     {
@@ -4205,7 +4205,7 @@
       "target": "548eb762-8e47-468b-8ee7-ab1112059548",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1879,
+      "flow_weight": 0.9242,
       "flow_basis": "proxy"
     },
     {
@@ -4213,7 +4213,7 @@
       "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1812,
+      "flow_weight": 0.8914,
       "flow_basis": "proxy"
     },
     {
@@ -4221,7 +4221,7 @@
       "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.1952,
+      "flow_weight": 0.9603,
       "flow_basis": "proxy"
     },
     {
@@ -4229,7 +4229,7 @@
       "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1067,
+      "flow_weight": 0.5986,
       "flow_basis": "proxy"
     },
     {
@@ -4237,7 +4237,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.0896,
+      "flow_weight": 0.5028,
       "flow_basis": "proxy"
     },
     {
@@ -4245,7 +4245,7 @@
       "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0953,
+      "flow_weight": 0.5349,
       "flow_basis": "proxy"
     },
     {
@@ -4253,7 +4253,7 @@
       "target": "65722717-54d8-48bb-917e-d1f87054f291",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1643,
+      "flow_weight": 0.9221,
       "flow_basis": "proxy"
     },
     {
@@ -4261,7 +4261,7 @@
       "target": "548eb762-8e47-468b-8ee7-ab1112059548",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.1702,
+      "flow_weight": 0.9552,
       "flow_basis": "proxy"
     },
     {
@@ -4269,7 +4269,7 @@
       "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.1011,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4277,7 +4277,7 @@
       "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.4002,
+      "flow_weight": 0.8868,
       "flow_basis": "proxy"
     },
     {
@@ -4285,7 +4285,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.4022,
+      "flow_weight": 0.8912,
       "flow_basis": "proxy"
     },
     {
@@ -4293,7 +4293,7 @@
       "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.235,
+      "flow_weight": 0.5207,
       "flow_basis": "proxy"
     },
     {
@@ -4301,7 +4301,7 @@
       "target": "22af1509-24a2-46d1-810d-a16853a20927",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2271,
+      "flow_weight": 0.5031,
       "flow_basis": "proxy"
     },
     {
@@ -4309,7 +4309,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.1467,
+      "flow_weight": 0.3252,
       "flow_basis": "proxy"
     },
     {
@@ -4317,7 +4317,7 @@
       "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.1565,
+      "flow_weight": 0.3468,
       "flow_basis": "proxy"
     },
     {
@@ -4325,7 +4325,7 @@
       "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2357,
+      "flow_weight": 0.6442,
       "flow_basis": "proxy"
     },
     {
@@ -4333,7 +4333,7 @@
       "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2236,
+      "flow_weight": 0.611,
       "flow_basis": "proxy"
     },
     {
@@ -4341,7 +4341,7 @@
       "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2134,
+      "flow_weight": 0.5832,
       "flow_basis": "proxy"
     },
     {
@@ -4349,7 +4349,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.3191,
+      "flow_weight": 0.872,
       "flow_basis": "proxy"
     },
     {
@@ -4357,7 +4357,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.1479,
+      "flow_weight": 0.4041,
       "flow_basis": "proxy"
     },
     {
@@ -4365,7 +4365,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2224,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4373,7 +4373,7 @@
       "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3026,
+      "flow_weight": 0.7394,
       "flow_basis": "proxy"
     },
     {
@@ -4381,7 +4381,7 @@
       "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2037,
+      "flow_weight": 0.4977,
       "flow_basis": "proxy"
     },
     {
@@ -4389,7 +4389,7 @@
       "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.3889,
+      "flow_weight": 0.9505,
       "flow_basis": "proxy"
     },
     {
@@ -4397,7 +4397,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2196,
+      "flow_weight": 0.5368,
       "flow_basis": "proxy"
     },
     {
@@ -4405,7 +4405,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1544,
+      "flow_weight": 0.3772,
       "flow_basis": "proxy"
     },
     {
@@ -4413,7 +4413,7 @@
       "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.1931,
+      "flow_weight": 0.4719,
       "flow_basis": "proxy"
     },
     {
@@ -4421,7 +4421,7 @@
       "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.1032,
+      "flow_weight": 0.3492,
       "flow_basis": "proxy"
     },
     {
@@ -4429,7 +4429,7 @@
       "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.2169,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4437,7 +4437,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.276,
+      "flow_weight": 0.9338,
       "flow_basis": "proxy"
     },
     {
@@ -4445,7 +4445,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2468,
+      "flow_weight": 0.8348,
       "flow_basis": "proxy"
     },
     {
@@ -4453,7 +4453,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2769,
+      "flow_weight": 0.9366,
       "flow_basis": "proxy"
     },
     {
@@ -4461,7 +4461,7 @@
       "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0997,
+      "flow_weight": 0.3373,
       "flow_basis": "proxy"
     },
     {
@@ -4469,7 +4469,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4181,
+      "flow_weight": 0.8879,
       "flow_basis": "proxy"
     },
     {
@@ -4477,7 +4477,7 @@
       "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.2471,
+      "flow_weight": 0.5247,
       "flow_basis": "proxy"
     },
     {
@@ -4485,7 +4485,7 @@
       "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.3782,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4493,7 +4493,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.3495,
+      "flow_weight": 0.7423,
       "flow_basis": "proxy"
     },
     {
@@ -4501,7 +4501,7 @@
       "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.4251,
+      "flow_weight": 0.9028,
       "flow_basis": "proxy"
     },
     {
@@ -4509,7 +4509,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2268,
+      "flow_weight": 0.4816,
       "flow_basis": "proxy"
     },
     {
@@ -4517,7 +4517,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.7593,
+      "flow_weight": 0.7752,
       "flow_basis": "proxy"
     },
     {
@@ -4525,7 +4525,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.7865,
+      "flow_weight": 0.8031,
       "flow_basis": "proxy"
     },
     {
@@ -4533,7 +4533,7 @@
       "target": "8df9ff68-7100-4216-ba86-3e168a252511",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.6699,
+      "flow_weight": 0.684,
       "flow_basis": "proxy"
     },
     {
@@ -4541,7 +4541,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.5386,
+      "flow_weight": 0.55,
       "flow_basis": "proxy"
     },
     {
@@ -4549,7 +4549,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.6931,
+      "flow_weight": 0.7076,
       "flow_basis": "proxy"
     },
     {
@@ -4557,7 +4557,7 @@
       "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.6107,
+      "flow_weight": 0.6236,
       "flow_basis": "proxy"
     },
     {
@@ -4565,7 +4565,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2634,
+      "flow_weight": 0.9289,
       "flow_basis": "proxy"
     },
     {
@@ -4573,7 +4573,7 @@
       "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1883,
+      "flow_weight": 0.6639,
       "flow_basis": "proxy"
     },
     {
@@ -4581,7 +4581,7 @@
       "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2648,
+      "flow_weight": 0.9338,
       "flow_basis": "proxy"
     },
     {
@@ -4589,7 +4589,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.1111,
+      "flow_weight": 0.3918,
       "flow_basis": "proxy"
     },
     {
@@ -4597,7 +4597,7 @@
       "target": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.2694,
+      "flow_weight": 0.9498,
       "flow_basis": "proxy"
     },
     {
@@ -4605,7 +4605,7 @@
       "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1462,
+      "flow_weight": 0.5156,
       "flow_basis": "proxy"
     },
     {
@@ -4613,7 +4613,7 @@
       "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.7189,
       "flow_basis": "proxy"
     },
     {
@@ -4621,7 +4621,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.4695,
       "flow_basis": "proxy"
     },
     {
@@ -4629,7 +4629,7 @@
       "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.3434,
       "flow_basis": "proxy"
     },
     {
@@ -4637,7 +4637,7 @@
       "target": "260aa5ef-347e-434d-ac96-77e045e874be",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.8886,
       "flow_basis": "proxy"
     },
     {
@@ -4645,7 +4645,7 @@
       "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.5087,
       "flow_basis": "proxy"
     },
     {
@@ -4653,7 +4653,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.867,
       "flow_basis": "proxy"
     },
     {
@@ -4661,7 +4661,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.6519,
+      "flow_weight": 0.743,
       "flow_basis": "proxy"
     },
     {
@@ -4669,7 +4669,7 @@
       "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.5154,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4677,7 +4677,7 @@
       "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.583,
+      "flow_weight": 0.6645,
       "flow_basis": "proxy"
     },
     {
@@ -4685,7 +4685,7 @@
       "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.6117,
+      "flow_weight": 0.6971,
       "flow_basis": "proxy"
     },
     {
@@ -4693,7 +4693,7 @@
       "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.4827,
+      "flow_weight": 0.5501,
       "flow_basis": "proxy"
     },
     {
@@ -4701,7 +4701,7 @@
       "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.8436,
+      "flow_weight": 0.9614,
       "flow_basis": "proxy"
     },
     {
@@ -4709,7 +4709,7 @@
       "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.6311,
+      "flow_weight": 0.6855,
       "flow_basis": "proxy"
     },
     {
@@ -4717,7 +4717,7 @@
       "target": "22af1509-24a2-46d1-810d-a16853a20927",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.8254,
+      "flow_weight": 0.8966,
       "flow_basis": "proxy"
     },
     {
@@ -4725,7 +4725,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.4883,
+      "flow_weight": 0.5304,
       "flow_basis": "proxy"
     },
     {
@@ -4733,7 +4733,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.7286,
+      "flow_weight": 0.7915,
       "flow_basis": "proxy"
     },
     {
@@ -4741,7 +4741,7 @@
       "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.6798,
+      "flow_weight": 0.7384,
       "flow_basis": "proxy"
     },
     {
@@ -4749,7 +4749,7 @@
       "target": "791f7c41-0acc-4c41-a557-c82c198e94be",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.6937,
+      "flow_weight": 0.7536,
       "flow_basis": "proxy"
     },
     {
@@ -4757,7 +4757,7 @@
       "target": "f27838c0-c344-4232-b544-472b4303099d",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0111,
+      "flow_weight": 0.9045,
       "flow_basis": "proxy"
     },
     {
@@ -4765,7 +4765,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0063,
+      "flow_weight": 0.5113,
       "flow_basis": "proxy"
     },
     {
@@ -4773,7 +4773,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.005,
+      "flow_weight": 0.4065,
       "flow_basis": "proxy"
     },
     {
@@ -4781,7 +4781,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0093,
+      "flow_weight": 0.7601,
       "flow_basis": "proxy"
     },
     {
@@ -4789,7 +4789,7 @@
       "target": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.0048,
+      "flow_weight": 0.3862,
       "flow_basis": "proxy"
     },
     {
@@ -4797,7 +4797,7 @@
       "target": "65722717-54d8-48bb-917e-d1f87054f291",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.0092,
+      "flow_weight": 0.7451,
       "flow_basis": "proxy"
     },
     {
@@ -4805,7 +4805,7 @@
       "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.9393,
       "flow_basis": "proxy"
     },
     {
@@ -4813,7 +4813,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.4508,
       "flow_basis": "proxy"
     },
     {
@@ -4821,7 +4821,7 @@
       "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.3858,
       "flow_basis": "proxy"
     },
     {
@@ -4829,7 +4829,7 @@
       "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.7877,
       "flow_basis": "proxy"
     },
     {
@@ -4837,7 +4837,7 @@
       "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.8901,
       "flow_basis": "proxy"
     },
     {
@@ -4845,7 +4845,7 @@
       "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0,
+      "flow_weight": 0.7434,
       "flow_basis": "proxy"
     },
     {
@@ -4853,7 +4853,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.2171,
+      "flow_weight": 0.3731,
       "flow_basis": "proxy"
     },
     {
@@ -4861,7 +4861,7 @@
       "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.2738,
+      "flow_weight": 0.4705,
       "flow_basis": "proxy"
     },
     {
@@ -4869,7 +4869,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4418,
+      "flow_weight": 0.7592,
       "flow_basis": "proxy"
     },
     {
@@ -4877,7 +4877,7 @@
       "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.5159,
+      "flow_weight": 0.8865,
       "flow_basis": "proxy"
     },
     {
@@ -4885,7 +4885,7 @@
       "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4309,
+      "flow_weight": 0.7404,
       "flow_basis": "proxy"
     },
     {
@@ -4893,7 +4893,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5155,
+      "flow_weight": 0.8859,
       "flow_basis": "proxy"
     },
     {
@@ -4901,7 +4901,7 @@
       "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.8001,
+      "flow_weight": 0.9704,
       "flow_basis": "proxy"
     },
     {
@@ -4909,7 +4909,7 @@
       "target": "65722717-54d8-48bb-917e-d1f87054f291",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.4754,
+      "flow_weight": 0.5766,
       "flow_basis": "proxy"
     },
     {
@@ -4917,7 +4917,7 @@
       "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.7412,
+      "flow_weight": 0.8989,
       "flow_basis": "proxy"
     },
     {
@@ -4925,7 +4925,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.7551,
+      "flow_weight": 0.9158,
       "flow_basis": "proxy"
     },
     {
@@ -4933,7 +4933,7 @@
       "target": "260aa5ef-347e-434d-ac96-77e045e874be",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.5214,
+      "flow_weight": 0.6324,
       "flow_basis": "proxy"
     },
     {
@@ -4941,7 +4941,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.4848,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4949,7 +4949,7 @@
       "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.8554,
+      "flow_weight": 0.9398,
       "flow_basis": "proxy"
     },
     {
@@ -4957,7 +4957,7 @@
       "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
       "relationship": "corroborates",
       "sign": 1,
-      "flow_weight": 0.6214,
+      "flow_weight": 0.6827,
       "flow_basis": "proxy"
     },
     {
@@ -4965,7 +4965,7 @@
       "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.7103,
+      "flow_weight": 0.7804,
       "flow_basis": "proxy"
     },
     {
@@ -4973,7 +4973,7 @@
       "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
       "relationship": "cites",
       "sign": 0,
-      "flow_weight": 0.527,
+      "flow_weight": 0.0,
       "flow_basis": "proxy"
     },
     {
@@ -4981,7 +4981,7 @@
       "target": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.7938,
+      "flow_weight": 0.8721,
       "flow_basis": "proxy"
     },
     {
@@ -4989,7 +4989,7 @@
       "target": "a83e0326-4310-4364-aef7-e47105769ecc",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.444,
+      "flow_weight": 0.4879,
       "flow_basis": "proxy"
     },
     {
@@ -4997,7 +4997,7 @@
       "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5688,
+      "flow_weight": 0.7986,
       "flow_basis": "proxy"
     },
     {
@@ -5005,7 +5005,7 @@
       "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
       "relationship": "contradicts",
       "sign": -1,
-      "flow_weight": 0.508,
+      "flow_weight": 0.7132,
       "flow_basis": "proxy"
     },
     {
@@ -5013,7 +5013,7 @@
       "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
       "relationship": "CORROBORATES",
       "sign": 1,
-      "flow_weight": 0.2426,
+      "flow_weight": 0.3406,
       "flow_basis": "proxy"
     },
     {
@@ -5021,7 +5021,7 @@
       "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.2202,
+      "flow_weight": 0.3092,
       "flow_basis": "proxy"
     },
     {
@@ -5029,7 +5029,7 @@
       "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.4539,
+      "flow_weight": 0.6373,
       "flow_basis": "proxy"
     },
     {
@@ -5037,7 +5037,7 @@
       "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.6358,
+      "flow_weight": 0.8927,
       "flow_basis": "proxy"
     },
     {
@@ -5045,7 +5045,7 @@
       "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0541,
+      "flow_weight": 0.4454,
       "flow_basis": "proxy"
     },
     {
@@ -5053,7 +5053,7 @@
       "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
       "relationship": "SUPPORTS",
       "sign": 1,
-      "flow_weight": 0.0663,
+      "flow_weight": 0.5461,
       "flow_basis": "proxy"
     },
     {
@@ -5061,7 +5061,7 @@
       "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.0618,
+      "flow_weight": 0.5095,
       "flow_basis": "proxy"
     },
     {
@@ -5069,7 +5069,7 @@
       "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.1162,
+      "flow_weight": 0.9573,
       "flow_basis": "proxy"
     },
     {
@@ -5077,7 +5077,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0701,
+      "flow_weight": 0.5777,
       "flow_basis": "proxy"
     },
     {
@@ -5085,7 +5085,7 @@
       "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.0964,
+      "flow_weight": 0.7941,
       "flow_basis": "proxy"
     },
     {
@@ -5093,7 +5093,7 @@
       "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1009,
+      "flow_weight": 0.5346,
       "flow_basis": "proxy"
     },
     {
@@ -5101,7 +5101,7 @@
       "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1362,
+      "flow_weight": 0.7215,
       "flow_basis": "proxy"
     },
     {
@@ -5109,7 +5109,7 @@
       "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1831,
+      "flow_weight": 0.9697,
       "flow_basis": "proxy"
     },
     {
@@ -5117,7 +5117,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "decomposes_to",
       "sign": 1,
-      "flow_weight": 0.1836,
+      "flow_weight": 0.9726,
       "flow_basis": "proxy"
     },
     {
@@ -5125,7 +5125,7 @@
       "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
       "relationship": "CONTRADICTS",
       "sign": -1,
-      "flow_weight": 0.066,
+      "flow_weight": 0.3493,
       "flow_basis": "proxy"
     },
     {
@@ -5133,7 +5133,7 @@
       "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.1145,
+      "flow_weight": 0.6064,
       "flow_basis": "proxy"
     },
     {
@@ -5141,7 +5141,7 @@
       "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.5706,
+      "flow_weight": 0.782,
       "flow_basis": "proxy"
     },
     {
@@ -5149,7 +5149,7 @@
       "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
       "relationship": "supports",
       "sign": 1,
-      "flow_weight": 0.5098,
+      "flow_weight": 0.6987,
       "flow_basis": "proxy"
     },
     {
@@ -5157,7 +5157,7 @@
       "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.3685,
+      "flow_weight": 0.505,
       "flow_basis": "proxy"
     },
     {
@@ -5165,7 +5165,7 @@
       "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
       "relationship": "refutes",
       "sign": -1,
-      "flow_weight": 0.5386,
+      "flow_weight": 0.7382,
       "flow_basis": "proxy"
     },
     {
@@ -5173,7 +5173,7 @@
       "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.4527,
+      "flow_weight": 0.6203,
       "flow_basis": "proxy"
     },
     {
@@ -5181,7 +5181,7 @@
       "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
       "relationship": "elaborates",
       "sign": 1,
-      "flow_weight": 0.5325,
+      "flow_weight": 0.7298,
       "flow_basis": "proxy"
     }
   ],

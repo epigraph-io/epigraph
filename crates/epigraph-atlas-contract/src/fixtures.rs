@@ -319,35 +319,42 @@ const AGENT_RELATIONSHIPS: &[&str] = &["AUTHORED", "authored", "asserts"];
 /// A leaf: claims, the agents that asserted them and their evidence, with
 /// `per_claim` claim-to-claim links per claim and `n_outgoing` outside
 /// target groups.
+///
+/// `truth` maps each claim's drawn `truth_value` before it is stored (the
+/// identity for the committed fixtures). A test can change every claim's
+/// colour value this way without moving the seeded stream, and so show that
+/// no edge weight depends on it.
 fn leaf_level(
     rng: &mut Rng,
     f: Frame,
     (n_claims, n_agents, n_evidence): (usize, usize, usize),
     per_claim: usize,
     n_outgoing: usize,
+    truth: fn(Option<f64>) -> Option<f64>,
 ) -> LeafLevel {
     let pos = |rng: &mut Rng| (r4(rng.unit() * 1.9 - 0.95), r4(rng.unit() * 1.9 - 0.95));
-    // Each claim's belief, as the builder reads it at build time (role-aware,
-    // and folded only from BBAs the map's audience can read). It only feeds
-    // the proxy flow weights below: no node carries it.
-    let (claims, belief): (Vec<ClaimNode>, Vec<Option<f64>>) = (0..n_claims)
+    let claims: Vec<ClaimNode> = (0..n_claims)
         .map(|_| {
             let (x, y) = pos(rng);
-            let b = r4(rng.unit());
+            // An earlier generator drew a per-claim belief here and below.
+            // Proxy weights no longer use one, but the draws stay so every
+            // other value in the committed fixtures is unchanged.
+            let _ = rng.unit();
             let node = ClaimNode {
                 id: rng.uuid(),
                 label: claim_label(rng),
                 x,
                 y,
-                truth_value: if rng.chance(0.05) {
+                truth_value: truth(if rng.chance(0.05) {
                     None
                 } else {
                     Some(r4(rng.unit()))
-                },
+                }),
             };
-            (node, if rng.chance(0.05) { None } else { Some(b) })
+            let _ = rng.chance(0.05);
+            node
         })
-        .unzip();
+        .collect();
     let agents: Vec<PlainNode> = (0..n_agents)
         .map(|i| {
             let (x, y) = pos(rng);
@@ -424,8 +431,11 @@ fn leaf_level(
             );
         }
     }
-    // Claims to claims: link strength times the source's belief.
-    for (c, b) in claims.iter().zip(&belief) {
+    // Claims to claims: the link's strength times its sign, and nothing
+    // else. `flow_weight` is the magnitude (strength × |sign|) and `sign`
+    // the direction, so a `cites` link (sign 0) weighs 0. No belief value of
+    // either claim enters it.
+    for c in &claims {
         for _ in 0..per_claim {
             let t = &claims[rng.below(claims.len())];
             let (rel, sign) = CLAIM_RELATIONSHIPS[rng.below(CLAIM_RELATIONSHIPS.len())];
@@ -437,7 +447,7 @@ fn leaf_level(
                     target: t.id,
                     relationship: rel.into(),
                     sign,
-                    flow_weight: r4(strength * b.unwrap_or(0.0)),
+                    flow_weight: r4(strength * f64::from(sign.unsigned_abs())),
                     flow_basis: FlowBasis::Proxy,
                 },
             );
@@ -509,14 +519,29 @@ pub fn team_group_deep() -> LevelDocument {
 pub fn team_leaf_dense() -> LevelDocument {
     let mut rng = Rng::new(0xA71A_5003);
     let f = frame(&mut rng, MapScope::Team, Hierarchy::Meaning, 5);
-    LevelDocument::Leaf(leaf_level(&mut rng, f, (72, 10, 18), 6, 30))
+    LevelDocument::Leaf(leaf_level(&mut rng, f, (72, 10, 18), 6, 30, |t| t))
 }
 
 /// A leaf of the public map.
 pub fn public_leaf() -> LevelDocument {
     let mut rng = Rng::new(0xA71A_5004);
     let f = frame(&mut rng, MapScope::Public, Hierarchy::Links, 3);
-    LevelDocument::Leaf(leaf_level(&mut rng, f, (45, 5, 10), 3, 10))
+    LevelDocument::Leaf(leaf_level(&mut rng, f, (45, 5, 10), 3, 10, |t| t))
+}
+
+/// A leaf built the way the committed leaf fixtures are, from any seed, with
+/// `truth` applied to every claim's drawn `truth_value`. For the contract's
+/// own tests of the generator's weight rule.
+#[cfg(test)]
+pub(crate) fn seeded_leaf(seed: u64, truth: fn(Option<f64>) -> Option<f64>) -> LeafLevel {
+    let mut rng = Rng::new(seed);
+    let scope = if seed.is_multiple_of(2) {
+        MapScope::Team
+    } else {
+        MapScope::Public
+    };
+    let f = frame(&mut rng, scope, Hierarchy::Links, 3);
+    leaf_level(&mut rng, f, (40, 6, 10), 4, 8, truth)
 }
 
 /// The kernel's answer to a viewer who is not a member of the level's map,

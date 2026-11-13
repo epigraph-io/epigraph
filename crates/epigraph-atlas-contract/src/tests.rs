@@ -1051,6 +1051,120 @@ fn flow_basis_is_fixed_by_the_endpoint_kinds() {
     }
 }
 
+/// The sign a claim-to-claim relationship carries, stated here apart from
+/// the generator's own table: opposing links -1, `cites` 0, the rest +1.
+fn claim_link_sign(relationship: &str) -> i8 {
+    match relationship.to_ascii_lowercase().as_str() {
+        "contradicts" | "refutes" => -1,
+        "cites" => 0,
+        _ => 1,
+    }
+}
+
+/// The leaves the weight-rule tests look at: the committed leaf fixtures
+/// and 32 more seeded leaves built the same way.
+fn leaves_to_check() -> Vec<(String, LeafLevel)> {
+    let committed = ["team_leaf_dense", "public_leaf"].into_iter().map(|s| {
+        let LevelDocument::Leaf(l) = serde_json::from_slice(&read_fixture(s)).unwrap() else {
+            panic!("{s} is a leaf")
+        };
+        (s.to_string(), l)
+    });
+    let seeded = (0..32u64).map(|i| {
+        let seed = 0xA71A_7000 + i;
+        (
+            format!("seed {seed:#x}"),
+            fixtures::seeded_leaf(seed, |t| t),
+        )
+    });
+    committed.chain(seeded).collect()
+}
+
+/// A claim-to-claim (proxy) weight is the link's strength times its sign and
+/// nothing else, with no belief factor, so no served weight can be divided
+/// back into a belief. With the sign in its own field, `flow_weight` is
+/// strength × |sign|: 0 exactly when the link has no direction (`cites`),
+/// otherwise the strength, in (0, 1]. A belief factor breaks this both ways:
+/// a claim with no belief value would zero a signed link, and a `cites` link
+/// would carry its source's belief.
+///
+/// This pins the rule on what the generator produces; it cannot see where a
+/// builder's weight comes from. The builder's own test (backlog W7) must show
+/// that changing a source claim's BBAs leaves its proxy weights unchanged.
+#[test]
+fn proxy_weights_are_link_strength_times_sign_only() {
+    let (mut directed, mut undirected) = (0, 0);
+    for (name, leaf) in leaves_to_check() {
+        for (i, e) in leaf.edges.iter().enumerate() {
+            if e.flow_basis != FlowBasis::Proxy {
+                continue;
+            }
+            let at = format!("{name} /edges/{i} ({})", e.relationship);
+            assert_eq!(e.sign, claim_link_sign(&e.relationship), "{at}: sign");
+            if e.sign == 0 {
+                undirected += 1;
+                assert_eq!(
+                    e.flow_weight, 0.0,
+                    "{at}: a link with no direction weighs 0"
+                );
+            } else {
+                directed += 1;
+                assert!(
+                    e.flow_weight > 0.0 && e.flow_weight <= 1.0,
+                    "{at}: weight {} is not a strength in (0, 1]",
+                    e.flow_weight
+                );
+            }
+        }
+    }
+    assert!(
+        directed > 100 && undirected > 10,
+        "{directed} directed, {undirected} cites links"
+    );
+}
+
+/// Two leaves identical except for every claim's `truth_value` (the colour
+/// value, the only belief-like value a leaf claim carries) have identical
+/// edges, proxy weights included.
+#[test]
+fn proxy_weights_ignore_every_claim_value() {
+    let variants: [fn(Option<f64>) -> Option<f64>; 2] = [|_| Some(1.0), |_| None];
+    for seed in (0..16u64).map(|i| 0xA71A_7100 + i) {
+        let base = fixtures::seeded_leaf(seed, |t| t);
+        for (v, truth) in variants.into_iter().enumerate() {
+            let other = fixtures::seeded_leaf(seed, truth);
+            let tv = |l: &LeafLevel| -> Vec<Option<f64>> {
+                l.nodes
+                    .iter()
+                    .filter_map(|n| match n {
+                        Node::Claim(c) => Some(c.truth_value),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            assert_ne!(
+                tv(&base),
+                tv(&other),
+                "seed {seed:#x} variant {v}: truth values differ"
+            );
+            assert!(other.edges.iter().any(|e| e.flow_basis == FlowBasis::Proxy));
+            for (i, (o, b)) in other.edges.iter().zip(&base.edges).enumerate() {
+                assert_eq!(o, b, "seed {seed:#x} variant {v}: /edges/{i}");
+            }
+            let mut same = other.clone();
+            for (n, b) in same.nodes.iter_mut().zip(&base.nodes) {
+                if let (Node::Claim(c), Node::Claim(bc)) = (n, b) {
+                    c.truth_value = bc.truth_value;
+                }
+            }
+            assert!(
+                same == base,
+                "seed {seed:#x} variant {v}: only truth values differ"
+            );
+        }
+    }
+}
+
 /// An agent or evidence node is in a leaf only because it backs one of the
 /// leaf's claims. One with no edge to a claim fails, and the error names it.
 #[test]
