@@ -689,6 +689,33 @@ pub fn fallback_split(
     Ok(LeafIndex::new(rows).split(part, cap))
 }
 
+/// Each drawable claim of `rows` and its agents and evidence after the
+/// per-claim cap, the claim itself left out: exactly the nodes
+/// [`assemble_leaf`] adds for that claim, whatever else the leaf holds. A
+/// leaf's node count is its claims plus the DISTINCT nodes of these lists.
+///
+/// The "by meaning" hierarchy (Atlas W4) exports these, renumbered, so the
+/// off-box clustering weighs a group exactly as [`assemble_leaf`] counts it.
+/// Every list has at most `cap - 1` nodes, so every claim alone fits.
+///
+/// # Errors
+/// `DbError::InvalidData` for a cap of 0.
+pub fn claim_attachments(
+    rows: &LeafRows,
+    cap: usize,
+) -> Result<BTreeMap<Uuid, Vec<LeafNode>>, DbError> {
+    check_cap(cap)?;
+    let index = LeafIndex::new(rows);
+    Ok(rows
+        .claims
+        .keys()
+        .map(|&c| {
+            let (nodes, _) = index.claim_nodes(c, cap);
+            (c, nodes.into_iter().skip(1).collect())
+        })
+        .collect())
+}
+
 /// [`assemble_leaf`], and when the leaf is over the cap, every
 /// [`fallback_split`] part assembled: the leaves of `part`, each within `cap`.
 /// Empty when no claim of `part` is drawable.
@@ -1102,6 +1129,49 @@ mod tests {
             (3, 2, 1, 6)
         );
         assert_attached(&set);
+    }
+
+    #[test]
+    fn claim_attachments_are_what_assembly_counts_for_each_claim() {
+        // Claim 1: the shared filer, its own two evidence rows, a second
+        // author. Claim 2: the filer and 150 evidence rows (cut to 98).
+        let mut rows = rows_with(2, 0);
+        for k in 0..2 {
+            attach(&mut rows, id(700 + k), id(1));
+        }
+        for k in 0..150 {
+            attach(&mut rows, id(10_000 + k), id(2));
+        }
+        rows.agents.insert(id(2000));
+        rows.edges.push(edge(
+            9,
+            LeafNode::agent(id(2000)),
+            LeafNode::claim(id(1)),
+            "AUTHORED",
+        ));
+        let att = claim_attachments(&rows, 100).unwrap();
+        assert_eq!(
+            att[&id(1)],
+            vec![
+                LeafNode::agent(id(1000)),
+                LeafNode::agent(id(2000)),
+                LeafNode::evidence(id(700)),
+                LeafNode::evidence(id(701)),
+            ]
+        );
+        assert_eq!(att[&id(2)].len(), 99, "the per-claim cap: 1 + 99 = 100");
+        // For every subset, claims + distinct attachments is assembly's count.
+        for part in [vec![id(1)], vec![id(2)], vec![id(1), id(2)]] {
+            let distinct: BTreeSet<LeafNode> =
+                part.iter().flat_map(|c| att[c].iter().copied()).collect();
+            let counted = match assemble_leaf(&rows, &part, 100).unwrap() {
+                LeafOutcome::Fits(set) => set.counts.nodes,
+                LeafOutcome::NeedsSplit(n) => n.counts.nodes,
+                LeafOutcome::Empty { .. } => 0,
+            };
+            assert_eq!(part.len() + distinct.len(), counted, "{part:?}");
+        }
+        assert!(claim_attachments(&rows, 0).is_err());
     }
 
     #[test]
