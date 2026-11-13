@@ -98,6 +98,55 @@ The Atlas draws on a canvas with a few d3 modules (`d3-color`,
 and served from this origin like every other asset, so the CSP stays
 `script-src 'self'`.
 
+### Atlas nested levels and the fixture preview
+
+Below a theme the Atlas can open onto nested group levels and leaf subgraphs (the
+`atlas_level` v1 contract in `contract/atlas_level/v1/`). The page needs two inputs
+the contract does not define:
+- `data-atlas-maps`: the maps the viewer may pick and each theme's root level per
+  hierarchy;
+- `data-level-prefix`: the URL prefix that serves one level by id.
+
+`/atlas` does not carry them yet, since the level routes are backlog W10, so its
+themes behave as before. The drawing rules live in `static/atlas_nested.js`. They are
+pure functions, tested with `node --test js-tests/atlas_nested.test.cjs` (no
+dependencies).
+
+**Fixture preview.** To try the nested levels with no API and no database:
+
+```sh
+# from services/explorer; the one argument is the port (always 127.0.0.1)
+cargo run --release --locked -- --atlas-fixture-preview 8097
+# or, with a built binary
+epigraph-explorer --atlas-fixture-preview 8097
+```
+
+Then open `http://127.0.0.1:8097/atlas/preview`. On a remote host, forward the port
+first: `ssh -L 8097:127.0.0.1:8097 <host>`.
+
+What it serves:
+- The synthetic preview set in `contract/atlas_level/v1/preview/`: two maps, three
+  theme trees per hierarchy, and one 100-node leaf.
+- The contract fixtures, by id.
+- All of it compiled into the binary and served byte for byte.
+
+Its guards:
+- **Off by default.** Only the command-line flag turns it on; no environment variable
+  does.
+- **Loopback only.** It refuses any address that is not an IP-literal loopback (a bare
+  port means `127.0.0.1:<port>`, and `[::1]:<port>` also works). `0.0.0.0`, LAN
+  addresses and host names are refused, with exit code 2.
+- **No real routes.** It mounts only `/atlas/preview`, `/bff/atlas/preview/level/{id}`,
+  `/health` and `/static/*`. No page or BFF route that calls the API exists in it, and
+  its API URL is a dead loopback port.
+- **Clearly marked.** It logs a warning at start, the page carries a banner, and every
+  response carries `x-atlas-preview: synthetic-fixtures`.
+
+To regenerate the preview set after changing the generator
+(`crates/epigraph-atlas-contract/src/preview.rs`), run
+`ATLAS_CONTRACT_BLESS=1 cargo test -p epigraph-atlas-contract _are_current` from the
+repository root.
+
 ## Configuration
 
 All configuration comes from environment variables, read once at startup
