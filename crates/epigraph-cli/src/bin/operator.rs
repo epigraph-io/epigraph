@@ -63,6 +63,9 @@
 //!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
 //!          --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
 //!     epigraph-operator reverse-ingest-markers --manifest backfill-1.jsonl [--apply]
+//!     epigraph-operator backfill-evidence-edges [--batch-size N] [--max-batches N] \
+//!         [--apply --confirm-count N --manifest-out ev-edges-1.jsonl --reason TEXT]
+//!     epigraph-operator reverse-evidence-edges --manifest ev-edges-1.jsonl [--apply]
 //!     epigraph-operator register-system-agent --role legacy-ingest --create-agent \
 //!         --reason TEXT [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
@@ -124,9 +127,9 @@
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
-    confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation, group_role, hide,
-    human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows, restrict,
-    retire_link, reverse, system_agent, team_group,
+    confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation, evidence_edges,
+    group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows,
+    restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -1095,6 +1098,54 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Write the stored `evidence -> claim` edge every evidence row lacks
+    /// (backlog 2d60f619), through the same writer every evidence insert
+    /// calls: `supports`, or `refutes` where the row's BBAs argue against its
+    /// claim. Rows with any edge to their claim (any relationship, any state)
+    /// and SEALED rows are left alone and counted. Dry run (default) is
+    /// read-only. Reversed by `reverse-evidence-edges --manifest`.
+    BackfillEvidenceEdges {
+        /// Perform the writes. Without it, the census only (read-only).
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's `to_write`, repeated back.
+        #[arg(long)]
+        confirm_count: Option<u64>,
+        /// Where to write the undo manifest (must not exist). Required under
+        /// `--apply`; fsynced before each batch's commit.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// Why (manifest and audit row). Required under `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Evidence rows per transaction.
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+        /// Stop after this many batches; a re-run (new manifest) continues.
+        #[arg(long)]
+        max_batches: Option<usize>,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// `statement_timeout` for the read-only census.
+        #[arg(long, default_value = "10min")]
+        statement_timeout: String,
+    },
+    /// Reverse a `backfill-evidence-edges` run from its manifest: delete
+    /// exactly the edges it wrote, each only while it still runs from the
+    /// recorded evidence to the recorded claim with the recorded
+    /// relationship. Dry run rolls back.
+    ReverseEvidenceEdges {
+        /// The run's manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Commit. Without it, every batch is rolled back.
+        #[arg(long)]
+        apply: bool,
+        /// `lock_timeout` for each batch.
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
     /// Remove an explicit list of `frames` rows (test or probe frames), with
     /// the rows that cascade from them, refusing any frame a real claim or
     /// another row still depends on. Audited. Exit 3: at least one listed
@@ -1439,6 +1490,33 @@ async fn main_inner() -> anyhow::Result<i32> {
             creation_records: !*no_creation_records,
         };
         backfill_markers::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
+    // backfill-evidence-edges' options, likewise refused before any connection.
+    let evidence_edges_opts = if let Command::BackfillEvidenceEdges {
+        apply,
+        confirm_count,
+        manifest_out,
+        reason,
+        batch_size,
+        max_batches,
+        lock_timeout,
+        statement_timeout,
+    } = &cli.command
+    {
+        let o = evidence_edges::Options {
+            apply: *apply,
+            confirm_count: *confirm_count,
+            manifest_out: manifest_out.clone(),
+            reason: reason.clone(),
+            batch_size: *batch_size,
+            max_batches: *max_batches,
+            lock_timeout: lock_timeout.clone(),
+            statement_timeout: statement_timeout.clone(),
+        };
+        evidence_edges::validate(&o)?;
         Some(o)
     } else {
         None
@@ -2510,6 +2588,28 @@ async fn main_inner() -> anyhow::Result<i32> {
         } => {
             backfill_markers::reverse(&mut conn, &manifest, apply, &lock_timeout, &mut stdout)
                 .await?;
+            Ok(0)
+        }
+        Command::BackfillEvidenceEdges { .. } => {
+            let opts = evidence_edges_opts.expect("built above");
+            let report =
+                evidence_edges::run(&mut conn, &opts, &db.session_user, &mut stdout).await?;
+            Ok(if report.batch_failure.is_none() { 0 } else { 2 })
+        }
+        Command::ReverseEvidenceEdges {
+            manifest,
+            apply,
+            lock_timeout,
+        } => {
+            evidence_edges::reverse(
+                &mut conn,
+                &manifest,
+                apply,
+                &lock_timeout,
+                &db.session_user,
+                &mut stdout,
+            )
+            .await?;
             Ok(0)
         }
         Command::RestrictClaims { claims_file, .. } => {

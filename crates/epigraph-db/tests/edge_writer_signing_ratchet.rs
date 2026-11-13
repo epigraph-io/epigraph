@@ -273,8 +273,10 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // `EdgeRepository` twins: unsigned only when a caller passes no key, and both
 // of its callers pass the walk's key.
 // 50: the bug-report intake's evidence -> claim edge (migration 211, backlog
-// 2d60f619), a database function with no key.
-const UNSIGNED_SITES_HIGH_WATER: usize = 50;
+// 2d60f619), a database function with no key. 51: the evidence -> claim edge
+// backfill (`epigraph-operator backfill-evidence-edges`), on the maintenance
+// DSN with no key.
+const UNSIGNED_SITES_HIGH_WATER: usize = 51;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -464,6 +466,15 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-cli/src/operator/backfill_markers.rs",
         "batch_records",
+        1,
+        Unsigned(NO_KEY_CLI),
+    ),
+    // The evidence -> claim edge backfill (backlog 2d60f619): the older
+    // evidence rows' edges, written on the maintenance DSN through the same
+    // writer every evidence insert calls, with no key.
+    site(
+        "crates/epigraph-cli/src/operator/evidence_edges.rs",
+        "apply_batch",
         1,
         Unsigned(NO_KEY_CLI),
     ),
