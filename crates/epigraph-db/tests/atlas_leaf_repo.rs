@@ -393,8 +393,11 @@ async fn a_high_degree_agent_appears_once(pool: PgPool) {
 /// names a claim of team U. Never drawn: U's claim, its evidence and filer, an
 /// evidence row of U on T's claim (reached by `claim_id` and by an edge), a
 /// claim-to-claim edge owned by U, an edge co-owned by T and U, and an
-/// authorship edge owned by U that is the only path to its agent. T's own and
-/// public rows are drawn (the calibration that the map is not just empty).
+/// authorship edge owned by U that is the only path to its agent, and an
+/// evidence-to-agent edge owned by U and an evidence-to-evidence edge co-owned
+/// by T and U between nodes the map does draw. T's own and public rows are
+/// drawn, an evidence-to-evidence edge of T's among them (the calibration that
+/// the map is not just empty).
 ///
 /// The same answer for the bypass viewer (the nightly), for a scoped viewer who
 /// is a member of BOTH T and U (whose own splice admits U's rows), on the
@@ -436,6 +439,33 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     force_edge(&pool, e_ax, u, None).await;
     let e_ay = edge(&pool, LeafNode::agent(a_y), LeafNode::claim(t1), "AUTHORED").await;
     let e_up = edge(&pool, LeafNode::claim(u1), LeafNode::claim(p1), "supports").await;
+    // Edges among agent and evidence nodes the team map draws (the read's
+    // fifth statement): one of T's is drawn, one owned by U and one co-owned
+    // by T and U are not.
+    let e_ee_t = edge(
+        &pool,
+        LeafNode::evidence(ev_p),
+        LeafNode::evidence(ev_t1),
+        "cites",
+    )
+    .await;
+    force_edge(&pool, e_ee_t, t, None).await;
+    let e_ea_u = edge(
+        &pool,
+        LeafNode::evidence(ev_t1),
+        LeafNode::agent(f_t),
+        "cites",
+    )
+    .await;
+    force_edge(&pool, e_ea_u, u, None).await;
+    let e_ee_co = edge(
+        &pool,
+        LeafNode::evidence(ev_t1),
+        LeafNode::evidence(ev_p),
+        "cites",
+    )
+    .await;
+    force_edge(&pool, e_ee_co, t, Some(u)).await;
 
     // Calibration: the stamps the scope rests on.
     let stamp: Vec<(Uuid, String, Uuid, Option<Uuid>)> = sqlx::query_as(
@@ -471,7 +501,7 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         LeafNode::agent(f_p),
         LeafNode::evidence(ev_p),
     ]);
-    let never_edges = BTreeSet::from([e_tp_u, e_co, e_ax, e_evu, e_up]);
+    let never_edges = BTreeSet::from([e_tp_u, e_co, e_ax, e_evu, e_up, e_ea_u, e_ee_co]);
     let never_ids = [u1, ev_u, ev_u1, f_u, a_x];
 
     let check_team = |set: &LeafNodeSet, who: &str| {
@@ -481,7 +511,7 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         let stored = stored_ids(set);
         assert_eq!(
             stored,
-            BTreeSet::from([e_tt, e_ay]),
+            BTreeSet::from([e_tt, e_ay, e_ee_t]),
             "{who}: team map stored edges"
         );
         assert!(stored.is_disjoint(&never_edges), "{who}");
