@@ -802,8 +802,15 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
 /// second statement) and an evidence-to-agent edge (its fifth), each owned by A
 /// and co-owned by B. A's own edge between the same claims (no co-owner) is the
 /// calibration: on A's map only, so A's map is not just empty of group edges.
+///
+/// Public edges are drawn on every map, one from each edge read: the stored
+/// evidence-to-claim edge `ed` (the second statement) and an evidence-to-agent
+/// edge `pub_ea` (the fifth), both left as the tenancy trigger stamps them.
+///
 /// A co-owned edge as the tenancy trigger stamps it, between a claim of A and a
-/// claim of B, is on no map either.
+/// claim of B, is on no map either, but only because each map lacks one of its
+/// endpoints (A's map has no claim of B, B's none of A, C's and the public map
+/// neither). It shows the endpoint filter, not the edge predicate.
 ///
 /// Built the way the nightly builds (bypass viewer), then on a stamped
 /// `epigraph_app` connection for a member of A alone, a member of B alone and
@@ -830,21 +837,29 @@ async fn a_co_owned_edge_is_on_no_single_team_map(pool: PgPool) {
     let a_cc = edge(&pool, LeafNode::claim(p2), LeafNode::claim(p1), "refutes").await;
     force_edge(&pool, a_cc, a, None).await;
     let co_ab = edge(&pool, LeafNode::claim(a1), LeafNode::claim(b1), "supports").await;
+    // Public: its evidence is on a public claim and an agent has no tenancy.
+    let pub_ea = edge(
+        &pool,
+        LeafNode::evidence(ev),
+        LeafNode::agent(f),
+        "supports",
+    )
+    .await;
 
     // Calibration: the stamps the test rests on.
     let stamps: Vec<(Uuid, String, Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT id, visibility::text, owner_group_id, co_owner_group_id FROM edges \
           WHERE id = ANY($1)",
     )
-    .bind(vec![co_cc, co_ea, a_cc, co_ab, ed])
+    .bind(vec![co_cc, co_ea, a_cc, co_ab, ed, pub_ea])
     .fetch_all(&pool)
     .await
     .expect("stamps");
-    assert_eq!(stamps.len(), 5);
+    assert_eq!(stamps.len(), 6);
     for (id, vis, owner, co) in &stamps {
         let want = if *id == a_cc {
             ("group", a, None)
-        } else if *id == ed {
+        } else if *id == ed || *id == pub_ea {
             ("public", world, None)
         } else {
             ("group", a, Some(b))
@@ -868,16 +883,26 @@ async fn a_co_owned_edge_is_on_no_single_team_map(pool: PgPool) {
             AtlasMap::Team(a),
             "A",
             with(Some(LeafNode::claim(a1))),
-            BTreeSet::from([ed, a_cc]),
+            BTreeSet::from([ed, pub_ea, a_cc]),
         ),
         (
             AtlasMap::Team(b),
             "B",
             with(Some(LeafNode::claim(b1))),
-            BTreeSet::from([ed]),
+            BTreeSet::from([ed, pub_ea]),
         ),
-        (AtlasMap::Team(c), "C", with(None), BTreeSet::from([ed])),
-        (AtlasMap::Public, "public", with(None), BTreeSet::from([ed])),
+        (
+            AtlasMap::Team(c),
+            "C",
+            with(None),
+            BTreeSet::from([ed, pub_ea]),
+        ),
+        (
+            AtlasMap::Public,
+            "public",
+            with(None),
+            BTreeSet::from([ed, pub_ea]),
+        ),
     ];
     let never = BTreeSet::from([co_cc, co_ea, co_ab]);
     let mut built = Vec::new();
