@@ -27,8 +27,10 @@ What apply writes, per theme:
   * `claim_count` and `centroid` are recomputed from each part's members, as
     split_theme.py does (`centroid_3072` too when the parent had one).
   * Lineage in `properties`: the parent's properties are copied, and
-    `split_of`, `split_part`, `split_path`, `split_run`, `split_method` and
-    `split_cap` are set. `split_path` extends the parent's, so
+    `split_of`, `split_part`, `split_path`, `split_run`, `split_method`,
+    `split_cap` and `split_id_chunk_cuts` are set (the last counts cuts that
+    followed claim-id order because the vectors were identical; plan reports
+    it too, so a dry run shows when a split did not follow the embeddings). `split_path` extends the parent's, so
     `(cluster_run_id, cluster_id, split_path)` stays a unique key when a part
     of an earlier split is split again; the earlier `split_of`/`split_part`
     are kept in `split_history`.
@@ -237,14 +239,15 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
     report = []
     for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
         ids, x = load_members(conn, theme_id)
-        parts = core.split_to_cap(ids, x, cap=cap, seed=seed)
+        parts, stats = core.split_to_cap_with_stats(ids, x, cap=cap, seed=seed)
         conn.rollback()  # end the read transaction between themes
-        result["themes"].append({"theme_id": theme_id, "parts": parts})
+        result["themes"].append({"theme_id": theme_id, "parts": parts, **stats})
         unembedded = members - embedded
         report.append({
             "theme_id": theme_id, "current": members, "embedded": embedded,
             "unembedded": unembedded, "retired": retired,
             "part_sizes": [len(p) for p in parts],
+            "id_chunk_cuts": stats["id_chunk_cuts"],
             "kept_part_with_unembedded": (len(parts[0]) if parts else 0) + unembedded,
             "reaches_cap": bool(parts) and len(parts[0]) + unembedded <= cap,
         })
@@ -293,14 +296,16 @@ def _parent_path(props):
     return []
 
 
-def _part_properties(props, parent_id, part, path, run, cap):
+def _part_properties(props, parent_id, part, path, run, cap, id_chunk_cuts):
     history = list(props.get("split_history") or [])
     if "split_of" in props:
         history.append({k: props[k] for k in ("split_of", "split_part", "split_run")
                         if k in props})
+    # `split_id_chunk_cuts` > 0: some cut of this theme's split followed claim-id
+    # order, not the embeddings (its vectors were identical). Set per split.
     return dict(props, split_of=parent_id, split_part=part, split_path=path, split_run=run,
                 split_method=SPLIT_METHOD, split_cap=cap, split_history=history,
-                needs_naming=True)
+                split_id_chunk_cuts=id_chunk_cuts, needs_naming=True)
 
 
 def _recompute(cur, theme_id, with_3072):
@@ -363,7 +368,8 @@ def apply_result(conn, result, manifest_path):
                 for i, part_members in enumerate(parts):
                     path = base + [i]
                     label = part_label(snapshot.get("label"), path)
-                    pprops = json.dumps(_part_properties(props, parent, i, path, run, cap))
+                    pprops = json.dumps(_part_properties(props, parent, i, path, run, cap,
+                                                         int(entry.get("id_chunk_cuts", 0))))
                     if i == 0:
                         cur.execute("UPDATE claim_themes SET label = %s, description = '', "
                                     "properties = %s::jsonb, updated_at = now() WHERE id = %s",
@@ -540,7 +546,8 @@ def main(argv=None):
         _write_json_new(args.out, result)
         print(json.dumps({"status": "computed", "result_file": args.out, "cap": result["cap"],
                           "themes": [{"theme_id": t["theme_id"],
-                                      "part_sizes": [len(x) for x in t["parts"]]}
+                                      "part_sizes": [len(x) for x in t["parts"]],
+                                      "id_chunk_cuts": t.get("id_chunk_cuts", 0)}
                                      for t in result["themes"]]}))
         return 0
 
@@ -553,6 +560,8 @@ def main(argv=None):
             labels = theme_labels(conn, [r["theme_id"] for r in report])
             for r in report:
                 flag = "" if r["reaches_cap"] else "  NOT UNDER CAP (unembedded members)"
+                if r["id_chunk_cuts"]:
+                    flag += f"  ID-ORDER CUTS: {r['id_chunk_cuts']} (identical vectors)"
                 print(f"  {r['theme_id']}  {r['current']:>6} -> {r['part_sizes']}"
                       f"  ({labels.get(r['theme_id'], '?')}){flag}", file=sys.stderr)
             print(json.dumps({"status": "dry-run", "cap": args.cap, "result_file": out,

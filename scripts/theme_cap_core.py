@@ -19,7 +19,8 @@ It also owns the two files that cross the box boundary:
     unicode) and `embeddings` (float32), plus an `export.json` index. Both load
     with `allow_pickle=False`, so a file that comes back from another host
     cannot run code when it is read;
-  * a result: JSON naming each theme's parts as lists of claim ids.
+  * a result: JSON naming each theme's parts as lists of claim ids, and
+    `id_chunk_cuts` (see split_to_cap_with_stats).
 """
 import json
 import math
@@ -93,26 +94,57 @@ def _chunks(n, cap):
     return [np.arange(bounds[i], bounds[i + 1]) for i in range(k)]
 
 
-def _split(x, cap, seed, min_part):
+# How many larger k to try when merging the small clusters leaves one group.
+K_RETRIES = 4
+
+
+def _cluster(coords, k0, seed, min_part):
+    """Two or more groups of `coords` (index arrays), by k-means.
+
+    Tries k0, then up to K_RETRIES larger k (bounded by the number of distinct
+    points), merging clusters under `min_part` each time. A theme just over
+    the cap gets k0 = 2; when one of its two clusters is a small separated
+    subtopic, the merge folds it back and leaves ONE group, and a larger k
+    instead splits the dominant cluster by its own geometry. If every k still
+    merges to one group, the clusters of k0 are kept unmerged. Returns [] only
+    when the coordinates cannot be told apart."""
+    distinct = _distinct(coords)
+    if distinct < 2:
+        return []
+    k_max = min(distinct, k0 + K_RETRIES)
+    first = None
+    for k in range(min(k0, distinct), k_max + 1):
+        labels = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(coords)
+        if first is None:
+            first = labels
+        groups = _merge_small(labels, coords, min_part)
+        if len(groups) >= 2:
+            return groups
+    return [np.flatnonzero(first == c) for c in np.unique(first)]
+
+
+def _split(x, cap, seed, min_part, stats):
     """Index arrays (into x) of parts each at most `cap`. Every recursive call
-    is on a strictly smaller set, so this terminates."""
+    is on a strictly smaller set, so this terminates.
+
+    `stats["id_chunk_cuts"]` counts the cuts made by claim-id position rather
+    than by embedding. That happens only when a set's vectors are identical
+    (nothing to separate), never because clustering found a small cluster."""
     n = len(x)
     if n <= cap:
         return [np.arange(n)]
     k = max(2, math.ceil(n / cap))
-    if _distinct(normalize(x)) < 2:
-        groups = []  # nothing to separate: every member is the same vector
-    else:
-        coords = _reduce(x, seed)
-        labels = KMeans(n_clusters=k, n_init=10, random_state=seed).fit_predict(coords)
-        groups = _merge_small(labels, coords, min_part)
+    groups = []
+    if _distinct(normalize(x)) >= 2:
+        groups = _cluster(_reduce(x, seed), k, seed, min_part)
     if len(groups) < 2:
-        # Nothing to separate (e.g. identical embeddings): cut by position,
-        # which is claim-id order because split_to_cap sorted the input.
+        # Nothing to separate (identical embeddings): cut by position, which is
+        # claim-id order because split_to_cap sorted the input.
+        stats["id_chunk_cuts"] += 1
         groups = _chunks(n, cap)
     parts = []
     for g in groups:
-        parts.extend(g[sub] for sub in _split(x[g], cap, seed, min_part))
+        parts.extend(g[sub] for sub in _split(x[g], cap, seed, min_part, stats))
     return parts
 
 
@@ -134,8 +166,17 @@ def split_to_cap(ids, embeddings, cap=DEFAULT_CAP, seed=DEFAULT_SEED, min_part=N
 
     Returns a list of lists of claim ids, ordered by `order_parts`.
     """
+    return split_to_cap_with_stats(ids, embeddings, cap, seed, min_part)[0]
+
+
+def split_to_cap_with_stats(ids, embeddings, cap=DEFAULT_CAP, seed=DEFAULT_SEED, min_part=None):
+    """`split_to_cap`, plus a stats dict: `id_chunk_cuts` is how many cuts fell
+    back to claim-id order because the vectors could not be told apart. The
+    plan report and the part properties carry it, so a dry run shows when a
+    split did not follow the embeddings."""
     if cap < 1:
         raise ValueError("cap must be at least 1")
+    stats = {"id_chunk_cuts": 0}
     ids = [str(i) for i in ids]
     x = np.asarray(embeddings, dtype=np.float32)
     if x.ndim != 2 or len(x) != len(ids):
@@ -143,14 +184,14 @@ def split_to_cap(ids, embeddings, cap=DEFAULT_CAP, seed=DEFAULT_SEED, min_part=N
     if len(set(ids)) != len(ids):
         raise ValueError("claim ids must be unique")
     if not ids:
-        return []
+        return [], stats
     order = sorted(range(len(ids)), key=ids.__getitem__)
     ids = [ids[i] for i in order]
     x = x[order]
     if min_part is None:
         min_part = max(1, cap // 20)
-    parts = _split(x, cap, seed, min_part)
-    return order_parts([[ids[i] for i in p] for p in parts])
+    parts = _split(x, cap, seed, min_part, stats)
+    return order_parts([[ids[i] for i in p] for p in parts]), stats
 
 
 def validate_parts(members, parts, cap):
@@ -196,5 +237,6 @@ def compute_export_dir(export_dir, cap=None, seed=None):
     for entry in index["themes"]:
         theme_id = str(entry["theme_id"])
         ids, x = read_theme_npz(export_dir / f"{theme_id}.npz")
-        themes.append({"theme_id": theme_id, "parts": split_to_cap(ids, x, cap=cap, seed=seed)})
+        parts, stats = split_to_cap_with_stats(ids, x, cap=cap, seed=seed)
+        themes.append({"theme_id": theme_id, "parts": parts, **stats})
     return {"format": RESULT_FORMAT, "cap": cap, "seed": seed, "themes": themes}

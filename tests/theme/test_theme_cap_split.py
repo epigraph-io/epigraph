@@ -169,6 +169,7 @@ def test_apply_leaves_no_theme_over_cap_and_largest_keeps_id(db, seed_agent, tmp
         assert (props["split_of"], props["split_part"], props["split_path"]) == (theme, part, [part])
         assert (props["cluster_run_id"], props["cluster_id"]) == (RUN_ID, 7)
         assert props["split_run"] == manifest["split_run"]
+        assert props["split_id_chunk_cuts"] == 0
 
 
 def test_resplit_keeps_earlier_lineage_and_a_unique_path(db, seed_agent, tmp_path):
@@ -285,6 +286,23 @@ def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, seed_
 
     assert _snapshot(db) == before
     assert not (tmp_path / "m.json").exists()
+
+
+def test_plan_and_parts_record_an_id_order_cut(db, seed_agent, tmp_path):
+    """Members with identical vectors can only be cut by claim id. The dry run
+    and the written parts both say so, so it is countable on a real corpus."""
+    theme, _, _ = _theme(db, seed_agent, (45,))  # one seeded group: identical embeddings
+
+    result, report = S.plan(db, cap=CAP)
+    assert report[0]["id_chunk_cuts"] >= 1 and report[0]["part_sizes"] == [23, 22]
+    S.apply_result(db, result, tmp_path / "m.json")
+
+    with db.cursor() as cur:
+        cur.execute("SELECT properties FROM claim_themes")
+        props = [r[0] for r in cur.fetchall()]
+    db.rollback()
+    assert len(props) == 2
+    assert all(p["split_id_chunk_cuts"] == report[0]["id_chunk_cuts"] for p in props)
 
 
 def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):

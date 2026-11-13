@@ -63,12 +63,40 @@ def test_split_is_deterministic_and_input_order_free(blobs_split):
     assert again == parts
 
 
+def _uuid(rng):
+    return str(uuid.UUID(int=rng.randint(0, 2**62) << 64 | rng.randint(0, 2**62)))
+
+
+def test_a_small_separated_cluster_stays_whole_just_over_the_cap():
+    """A theme just over the cap gets k = 2. When one of the two clusters is a
+    small separated subtopic (under cap // 20), merging it back leaves one
+    group; the split must then split the dominant cluster by its geometry, not
+    cut the whole theme into halves by claim id (each a random sample of it)."""
+    rng = np.random.RandomState(0)
+    dim = 64
+    core_c, out_c = rng.normal(size=dim), rng.normal(size=dim)
+    x = np.vstack([core_c + 0.3 * rng.normal(size=(412, dim)),
+                   out_c + 0.05 * rng.normal(size=(12, dim))]).astype(np.float32)
+    ids = [_uuid(rng) for _ in range(len(x))]
+    outliers = set(ids[412:])
+
+    parts, stats = core.split_to_cap_with_stats(ids, x, cap=400, seed=42)
+
+    assert len(parts) >= 2 and all(len(p) <= 400 for p in parts)
+    assert sorted(c for p in parts for c in p) == sorted(ids)
+    holding = [len(outliers & set(p)) for p in parts]
+    assert sorted(holding)[-1] == len(outliers), f"the separated cluster was cut: {holding}"
+    assert stats == {"id_chunk_cuts": 0}, "an id-order cut ran on separable embeddings"
+    assert core.split_to_cap(ids, x, cap=400, seed=42) == parts
+
+
 def test_degenerate_identical_embeddings_terminate_under_cap():
     ids = [str(uuid.UUID(int=i + 1)) for i in range(151)]
     x = np.ones((151, 8), dtype=np.float32)
 
-    parts = core.split_to_cap(ids, x, cap=50, seed=42)
+    parts, stats = core.split_to_cap_with_stats(ids, x, cap=50, seed=42)
 
+    assert stats["id_chunk_cuts"] >= 1, "identical vectors can only be cut by id"
     assert all(len(p) <= 50 for p in parts)
     assert sorted(c for p in parts for c in p) == sorted(ids)
     assert core.split_to_cap(ids, x, cap=50, seed=42) == parts
