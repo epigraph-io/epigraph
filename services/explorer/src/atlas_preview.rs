@@ -133,11 +133,22 @@ pub fn parse_bind(v: &str) -> Result<SocketAddr, PreviewError> {
         v.parse::<SocketAddr>()
             .map_err(|_| PreviewError::BadAddress(v.to_string()))?
     };
+    check_bind(addr).map_err(|e| match e {
+        PreviewError::NotLoopback(_) => PreviewError::NotLoopback(v.to_string()),
+        PreviewError::PortZero(_) => PreviewError::PortZero(v.to_string()),
+        other => other,
+    })
+}
+
+/// The bind rule itself: an IP loopback address and a non-zero port. Both
+/// `parse_bind` and [`serve`] apply it, so no caller of `serve` can bind
+/// anything else.
+pub fn check_bind(addr: SocketAddr) -> Result<SocketAddr, PreviewError> {
     if !is_loopback(addr.ip()) {
-        return Err(PreviewError::NotLoopback(v.to_string()));
+        return Err(PreviewError::NotLoopback(addr.to_string()));
     }
     if addr.port() == 0 {
-        return Err(PreviewError::PortZero(v.to_string()));
+        return Err(PreviewError::PortZero(addr.to_string()));
     }
     Ok(addr)
 }
@@ -375,6 +386,8 @@ pub async fn serve(
     addr: SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    // Checked again here, not only when parsing the flag, before anything binds.
+    let addr = check_bind(addr)?;
     let config = config(addr)?;
     let state = AppState::new(config)?;
     let store = Arc::new(PreviewStore::embedded());

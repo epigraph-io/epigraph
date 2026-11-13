@@ -16,8 +16,8 @@ use common::atlas_contract::{check_level_body, check_not_found, fixture_value, E
 use common::atlas_maps::{attr_value, check_atlas_maps_attr};
 use epigraph_explorer::atlas_maps::{level_path, AtlasMaps};
 use epigraph_explorer::atlas_preview::{
-    self, parse_bind, preview_bind, PreviewError, PreviewStore, FLAG, MAPS_PREFIX, PAGE_PATH,
-    PREVIEW_HEADER, PREVIEW_HEADER_VALUE,
+    self, check_bind, parse_bind, preview_bind, PreviewError, PreviewStore, FLAG, MAPS_PREFIX,
+    PAGE_PATH, PREVIEW_HEADER, PREVIEW_HEADER_VALUE,
 };
 use epigraph_explorer::upstream::atlas_level::{Hierarchy, MapScope};
 use epigraph_explorer::AppState;
@@ -226,6 +226,38 @@ fn the_preview_refuses_a_non_loopback_bind() {
     assert_eq!(c.api_url.host_str(), Some("127.0.0.1"));
     assert_eq!(c.api_url.port(), Some(9));
     assert!(c.dev_bearer.is_none() && c.client_id.is_none());
+}
+
+/// `serve` itself refuses a non-loopback or port-0 address before it binds,
+/// whatever its caller parsed: the guard is not only in argument parsing.
+#[tokio::test]
+async fn serve_refuses_a_non_loopback_address_before_binding() {
+    for bad in [
+        "0.0.0.0:8097",
+        "[::]:8097",
+        "192.168.1.20:8097",
+        "127.0.0.1:0",
+    ] {
+        let addr: SocketAddr = bad.parse().unwrap();
+        assert!(check_bind(addr).is_err(), "{bad}");
+        // A shutdown that never fires: had it bound, this would serve forever.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            atlas_preview::serve(addr, std::future::pending()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{bad}: serve bound and ran instead of refusing"));
+        let err = res.expect_err(bad);
+        let e = err
+            .downcast_ref::<PreviewError>()
+            .unwrap_or_else(|| panic!("{bad}: {err:#}"));
+        assert!(
+            matches!(e, PreviewError::NotLoopback(_) | PreviewError::PortZero(_)),
+            "{bad}: {e}"
+        );
+    }
+    assert!(check_bind("127.0.0.1:8097".parse().unwrap()).is_ok());
+    assert!(check_bind("[::1]:8097".parse().unwrap()).is_ok());
 }
 
 // ---- serving ---------------------------------------------------------------------
