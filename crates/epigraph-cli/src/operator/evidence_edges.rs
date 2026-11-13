@@ -60,7 +60,10 @@
 //!
 //! `reverse-evidence-edges --manifest <file>` deletes exactly the edges the
 //! manifest names, and only while each still runs from the recorded evidence
-//! to the recorded claim with the recorded relationship. Every edge line is
+//! to the recorded claim with the recorded relationship, AND nobody has built
+//! on it since: an edge that was retracted, or that keys an edge-keyed BBA
+//! (`mass_functions.perspective_id`), is kept and counted, so a reversal never
+//! drops a retraction record nor leaves a BBA keyed on a deleted edge. Every edge line is
 //! reversed, committed batch or not: a batch whose COMMIT landed before the
 //! process died has no `committed_batch` line, and a line whose batch rolled
 //! back names an edge that does not exist and deletes nothing. A dry run
@@ -115,7 +118,6 @@ async fn unlock(conn: &mut PgConnection) {
         .execute(&mut *conn)
         .await;
 }
-
 
 /// The run's options.
 #[derive(Debug, Clone)]
@@ -860,7 +862,26 @@ pub struct ReverseReport {
     /// Recorded edges already gone, or no longer between the recorded
     /// endpoints with the recorded relationship: left alone.
     pub not_matched: u64,
+    /// Recorded edges still between the recorded endpoints, but built on
+    /// since the backfill: retracted (`valid_to` set), or the key of an
+    /// edge-keyed BBA (`mass_functions.perspective_id`). Left alone, so a
+    /// reversal never drops a retraction record nor dangles a BBA.
+    pub kept_in_use: u64,
 }
+
+/// The reversal's identity match: the recorded edge, still between the
+/// recorded endpoints with the recorded relationship.
+const REVERSE_MATCH: &str = "\
+    e.id = m.id \
+    AND e.source_type = 'evidence' AND e.source_id = m.src \
+    AND e.target_type = 'claim' AND e.target_id = m.tgt \
+    AND e.relationship = m.rel";
+
+/// A matched edge nobody has built on since: still in force and keying no BBA
+/// (retracted or not).
+const REVERSE_UNUSED: &str = "\
+    e.valid_to IS NULL \
+    AND NOT EXISTS (SELECT 1 FROM public.mass_functions mf WHERE mf.perspective_id = e.id)";
 
 /// Delete exactly the edges a run's manifest names (see the module doc).
 ///
@@ -910,14 +931,23 @@ async fn reverse_locked(
         let src: Vec<Uuid> = chunk.iter().map(|l| l.evidence).collect();
         let tgt: Vec<Uuid> = chunk.iter().map(|l| l.claim).collect();
         let rel: Vec<String> = chunk.iter().map(|l| l.relationship.clone()).collect();
-        let deleted = sqlx::query(
+        let in_use: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM public.edges e \
+               JOIN unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[]) AS m(id, src, tgt, rel) \
+                 ON {REVERSE_MATCH} \
+              WHERE NOT ({REVERSE_UNUSED})"
+        ))
+        .bind(&ids)
+        .bind(&src)
+        .bind(&tgt)
+        .bind(&rel)
+        .fetch_one(&mut *tx)
+        .await?;
+        let deleted = sqlx::query(&format!(
             "DELETE FROM public.edges e \
               USING unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[]) AS m(id, src, tgt, rel) \
-              WHERE e.id = m.id \
-                AND e.source_type = 'evidence' AND e.source_id = m.src \
-                AND e.target_type = 'claim' AND e.target_id = m.tgt \
-                AND e.relationship = m.rel",
-        )
+              WHERE {REVERSE_MATCH} AND {REVERSE_UNUSED}"
+        ))
         .bind(&ids)
         .bind(&src)
         .bind(&tgt)
@@ -925,8 +955,10 @@ async fn reverse_locked(
         .execute(&mut *tx)
         .await?
         .rows_affected();
+        let in_use = u64::try_from(in_use).unwrap_or(0);
         r.deleted += deleted;
-        r.not_matched += chunk.len() as u64 - deleted;
+        r.kept_in_use += in_use;
+        r.not_matched += (chunk.len() as u64).saturating_sub(deleted + in_use);
         if apply {
             if !audited && deleted > 0 {
                 sqlx::query(
@@ -949,7 +981,8 @@ async fn reverse_locked(
     }
     writeln!(
         out,
-        "{}: {} recorded edge(s); {} deleted; {} already gone or changed (left alone)",
+        "{}: {} recorded edge(s); {} deleted; {} already gone or changed (left alone); {} \
+         retracted or carrying a BBA since (kept)",
         if apply {
             "REVERSED"
         } else {
@@ -957,7 +990,8 @@ async fn reverse_locked(
         },
         r.recorded,
         r.deleted,
-        r.not_matched
+        r.not_matched,
+        r.kept_in_use
     )?;
     Ok(r)
 }

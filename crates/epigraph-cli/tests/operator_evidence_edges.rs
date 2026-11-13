@@ -642,3 +642,93 @@ async fn an_applied_run_or_reversal_refuses_while_another_holds_the_lock(pool: P
     assert_eq!(edges_snapshot(&pool).await, applied, "nothing deleted");
 }
 
+/// A reversal keeps a backfilled edge that was built on after the apply:
+/// one retracted since (its retraction record), one that keys an edge-keyed
+/// BBA since (`mass_functions.perspective_id`, which would dangle).
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_keeps_an_edge_retracted_or_keyed_by_a_bba_since(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let m = scratch("m.jsonl");
+    let run = run_op(
+        &pool,
+        &[
+            "backfill-evidence-edges",
+            "--apply",
+            "--confirm-count",
+            "2",
+            "--manifest-out",
+            p(&m),
+            "--reason",
+            "then built on",
+        ],
+    )
+    .await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let edge_from = |ev: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM edges WHERE source_id = $1")
+                .bind(ev)
+                .fetch_one(&pool)
+                .await
+                .expect("the backfilled edge")
+        }
+    };
+    let retracted = edge_from(fx.missing_public).await;
+    let keyed = edge_from(fx.missing_group).await;
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(retracted)
+        .execute(&pool)
+        .await
+        .expect("retract");
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("ev-edge-reverse-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("frame");
+    let author: Uuid = sqlx::query_scalar("SELECT id FROM agents LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("an agent");
+    // An edge-keyed BBA's perspective row has the edge's id (`auto_wire_ds_for_edge`).
+    epigraph_db::PerspectiveRepository::ensure_edge_perspective(&pool, keyed, Some(author))
+        .await
+        .expect("the edge's perspective row");
+    sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+                                     combination_method, source_strength, evidence_type, \
+                                     locality_tag) \
+         VALUES ($1, $2, $3, $4, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb, 'edge_factor', 0.8, \
+                 'derived_support', 'cross')",
+    )
+    .bind(fx.group_claim)
+    .bind(frame)
+    .bind(author)
+    .bind(keyed)
+    .execute(&pool)
+    .await
+    .expect("an edge-keyed BBA");
+    let built_on = edges_snapshot(&pool).await;
+
+    let r = run_op(
+        &pool,
+        &["reverse-evidence-edges", "--manifest", p(&m), "--apply"],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(
+            "REVERSED: 2 recorded edge(s); 0 deleted; 0 already gone or changed (left alone); \
+             2 retracted or carrying a BBA since (kept)"
+        ),
+        "{}",
+        r.show()
+    );
+    assert_eq!(
+        edges_snapshot(&pool).await,
+        built_on,
+        "both built-on edges are kept"
+    );
+}
