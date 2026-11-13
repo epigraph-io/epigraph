@@ -17,6 +17,7 @@ pub mod analysis;
 pub mod atlas_layout;
 pub mod atlas_leaf;
 pub mod atlas_map;
+pub mod atlas_meaning;
 pub mod atom_axiom;
 pub mod authored_by;
 pub mod authorization_code;
@@ -134,14 +135,15 @@ pub use atlas_layout::{
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
 };
 pub use atlas_leaf::{
-    assemble_leaf, fallback_split, resolve_with_fallback, AtlasLeafRepository, CappedClaim,
-    LeafCounts, LeafEdge, LeafEdgeOrigin, LeafNode, LeafNodeKind, LeafNodeSet, LeafOutcome,
-    LeafRows, NeedsSplit, SplitReason, StoredLeafEdge, ATLAS_LEAF_NODE_CAP,
+    assemble_leaf, claim_attachments, fallback_split, resolve_with_fallback, AtlasLeafRepository,
+    CappedClaim, LeafCounts, LeafEdge, LeafEdgeOrigin, LeafNode, LeafNodeKind, LeafNodeSet,
+    LeafOutcome, LeafRows, NeedsSplit, SplitReason, StoredLeafEdge, ATLAS_LEAF_NODE_CAP,
     DERIVED_FILER_RELATIONSHIP,
 };
 pub use atlas_map::{
     AtlasHierarchy, AtlasMap, AtlasMapRepository, LevelDoc, MapEpochs, MapLevel, NewMapRun,
 };
+pub use atlas_meaning::{AtlasMeaningRepository, ThemeMembers};
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
     LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
