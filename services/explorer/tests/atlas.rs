@@ -2467,6 +2467,33 @@ fn atlas_js_never_parses_strings_as_code_or_html() {
     assert!(!include_str!("../static/atlas.css").trim().is_empty());
 }
 
+/// The nested-level rendering rules are pure: no DOM, no fetch, no code or
+/// markup parsing, no belief figure, so `js-tests/` can run them under
+/// node:test and the canvas reads them as data only.
+#[test]
+fn atlas_nested_js_is_pure_and_safe() {
+    let js = include_str!("../static/atlas_nested.js");
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.",
+        "window.",
+        "fetch(",
+        "XMLHttpRequest",
+        "eval(",
+        "new Function",
+        ".style.",
+        ".belief",
+        "pignistic",
+        "betp",
+    ] {
+        assert!(!js.contains(banned), "atlas_nested.js must not use {banned}");
+    }
+    assert!(js.contains("'use strict'"));
+    assert!(epigraph_explorer::assets::find("atlas_nested.js").is_some());
+}
+
 /// A `--token: #rrggbb;` from a stylesheet, in the light or the dark theme.
 fn css_hex(css: &str, name: &str, dark: bool) -> [f64; 3] {
     let split = css
