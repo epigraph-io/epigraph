@@ -153,6 +153,9 @@ fn walk<'v>(v: &'v Value, f: &mut dyn FnMut(Option<&'v str>, &'v Value)) {
     }
 }
 
+/// The region and theme routes carry no belief value. `betp` is listed
+/// because the nested-level contract (`upstream::atlas_level`) gives leaf
+/// claim nodes that key: it must not leak into these routes unnoticed.
 fn assert_no_belief_keys(v: &Value) {
     walk(v, &mut |k, _| {
         if let Some(k) = k {
@@ -162,7 +165,8 @@ fn assert_no_belief_keys(v: &Value) {
                     "plausibility",
                     "pignistic_prob",
                     "epistemic",
-                    "mean_betp"
+                    "mean_betp",
+                    "betp"
                 ]
                 .contains(&k),
                 "a body carries `{k}`"
