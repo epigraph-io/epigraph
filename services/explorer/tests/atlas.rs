@@ -2551,6 +2551,37 @@ fn atlas_js_theme_claim_reads_are_gated_by_the_map_list() {
     assert!(reads >= 2, "loadTheme and followThemeKey read theme claims");
 }
 
+/// A search hit or `#c-` link inside a nested theme never lands on the old
+/// stand-in claim node ("Not among the closest N" at the theme's rim): with a
+/// map list, `goToResolved` hands off to `goToNestedClaim` first, which flies
+/// to the fetched leaf that draws the claim or frames the theme and says so.
+#[test]
+fn atlas_js_nested_claim_links_never_invent_a_node() {
+    let js = include_str!("../static/atlas.js");
+    let start = js
+        .find("async function goToResolved(")
+        .expect("goToResolved");
+    let body = &js[start..start + js[start..].find("\n  }\n").expect("its end")];
+    let gate = body
+        .find("if (NS.on)")
+        .expect("goToResolved checks for nesting");
+    let hand = body.find("goToNestedClaim(").expect("and hands off");
+    let stand_in = body
+        .find("Not among the closest")
+        .expect("the old stand-in path");
+    assert!(
+        gate < hand && hand < stand_in,
+        "the nested hand-off comes first"
+    );
+    let start = js
+        .find("async function goToNestedClaim(")
+        .expect("goToNestedClaim");
+    let nested = &js[start..start + js[start..].find("\n  }\n").expect("its end")];
+    assert!(nested.contains("NESTED.findClaimLeaf("));
+    assert!(!nested.contains("makeNode("), "no stand-in node");
+    assert!(!nested.contains("cfg.themeClaims"), "no claim-list read");
+}
+
 /// A `--token: #rrggbb;` from a stylesheet, in the light or the dark theme.
 fn css_hex(css: &str, name: &str, dark: bool) -> [f64; 3] {
     let split = css

@@ -362,3 +362,21 @@ test('the picked map names, counts and opens a theme; off the map it opens onto 
   assert.equal(N.themeOpens(true, maps[0], second), 'nested');
   assert.equal(N.themeOpens(true, maps[1], second), 'nothing');
 });
+
+test('a claim link finds the fetched leaf that draws the claim, or nothing', () => {
+  const levels = previewLevels();
+  const leaves = levels.filter((d) => d.kind === 'leaf');
+  const leaf = leaves[3];
+  const claim = leaf.nodes.find((n) => n.kind === 'claim');
+  const agent = leaf.nodes.find((n) => n.kind === 'agent');
+  assert.equal(N.findClaimLeaf(levels, claim.id), leaf);
+  // Only fetched leaves count: without it, there is no answer to invent.
+  assert.equal(N.findClaimLeaf(levels.filter((d) => d !== leaf), claim.id), null);
+  // An agent or evidence node is not a claim, and a non-id finds nothing.
+  assert.equal(N.findClaimLeaf(levels, agent.id), null);
+  assert.equal(N.findClaimLeaf(levels, 'c-' + claim.id), null);
+  assert.equal(N.findClaimLeaf([], claim.id), null);
+  // Group levels never answer, even if a child shared the id.
+  const g = levels.find((d) => d.kind === 'group');
+  assert.equal(N.findClaimLeaf([g], g.children[0].id), null);
+});

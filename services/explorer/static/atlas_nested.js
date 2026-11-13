@@ -251,6 +251,22 @@
     return Math.max(baseMax, (finite(viewMin, 1) / (2.2 * r)) * 4);
   }
 
+  /**
+   * The leaf, among already-fetched level documents, that draws claim
+   * `claimId` as a claim node, or null. The contract has no claim-to-leaf
+   * lookup, so a search hit or a #c- link inside a nested theme lands on its
+   * leaf only when that leaf has been fetched; otherwise the caller says so
+   * instead of inventing a place for it.
+   */
+  function findClaimLeaf(docs, claimId) {
+    if (!uuid(claimId)) return null;
+    for (const d of docs || []) {
+      if (!d || d.kind !== 'leaf') continue;
+      if ((d.nodes || []).some((n) => n && n.kind === 'claim' && n.id === claimId)) return d;
+    }
+    return null;
+  }
+
   /** The ids to fetch to attach a level under its theme: its ancestors, then itself. */
   function chainIds(doc) {
     const ids = (doc.breadcrumbs || []).map((b) => uuid(b.level_id)).filter(Boolean);
@@ -399,6 +415,7 @@
     shouldLoad,
     maxZoom,
     chainIds,
+    findClaimLeaf,
     MAPS_SCHEMA_VERSION,
     localPrefix,
     parseMaps,

@@ -883,6 +883,8 @@
     map: null,
     hierarchy: 'meaning',
     docs: new Map(),
+    /** The fetched documents by the same key as `docs`, once they arrive. */
+    resolved: new Map(),
     minR: Infinity,
     animate: false,
     leafShown: false,
@@ -916,13 +918,18 @@
     const p = getJSON(url).then((doc) => {
       const problem = NESTED.levelProblem(doc, { levelId: id, map, hierarchy });
       if (problem) throw new FetchError(0, 'bad_level', problem);
+      if (NS.docs.get(key) === p) NS.resolved.set(key, doc);
       return doc;
     });
     p.catch(() => {
       if (NS.docs.get(key) === p) NS.docs.delete(key);
     });
     NS.docs.set(key, p);
-    while (NS.docs.size > LEVEL_CACHE) NS.docs.delete(NS.docs.keys().next().value);
+    while (NS.docs.size > LEVEL_CACHE) {
+      const old = NS.docs.keys().next().value;
+      NS.docs.delete(old);
+      NS.resolved.delete(old);
+    }
     return p.then((doc) => {
       const problem = NESTED.levelProblem(doc, { levelId: id, kind });
       if (problem) throw new FetchError(0, 'bad_level', problem);
@@ -959,6 +966,7 @@
         const n = entries.get(p.id);
         return makeNode('lnode', {
           id: p.id,
+          key: p.kind === 'claim' ? 'c-' + simple(p.id) : null,
           sub: p.kind,
           label: n.label || '',
           truth: p.kind === 'claim' ? num(n.truth_value) : null,
@@ -2066,7 +2074,7 @@
 
   function writeHash(node) {
     const base = location.pathname + location.search;
-    if (node && node.kind === 'claim' && uuid(node.id)) {
+    if (node && (node.kind === 'claim' || (node.kind === 'lnode' && node.sub === 'claim')) && uuid(node.id)) {
       history.replaceState(null, '', base + '#c-' + simple(node.id));
     } else if (location.hash) {
       history.replaceState(null, '', base);
@@ -2508,6 +2516,10 @@
       setNotice('This claim is not on the map yet.');
       return;
     }
+    if (NS.on) {
+      await goToNestedClaim(theme, claimId);
+      return;
+    }
     let pages = 0;
     let claim = (theme.children || []).find((c) => c.id === claimId);
     while (!claim && theme.next && pages < FIND_PAGES - 1) {
@@ -2529,6 +2541,32 @@
       theme.children = (theme.children || []).concat([claim]);
     }
     select(claim, true);
+  }
+
+  /**
+   * A claim inside a nested theme: fly to the leaf that draws it when that
+   * leaf has been fetched on this map and hierarchy; otherwise frame the
+   * theme and say so. Never a stand-in node: the contract has no
+   * claim-to-leaf lookup yet (W10 hand-off).
+   */
+  async function goToNestedClaim(theme, claimId) {
+    if (theme.offMap) {
+      select(theme, true);
+      setNotice('That claim’s theme is not on the map you picked.');
+      return;
+    }
+    const prefix = NESTED.levelKey(NS.map, NS.hierarchy, '');
+    const leaves = [];
+    for (const [k, d] of NS.resolved) if (k.startsWith(prefix) && d.theme_id === theme.id) leaves.push(d);
+    const doc = NESTED.findClaimLeaf(leaves, claimId);
+    const leaf = doc ? await attachChain(theme, doc) : null;
+    const node = leaf && leaf.childById ? leaf.childById.get(claimId) : null;
+    if (node) {
+      select(node, true);
+      return;
+    }
+    select(theme, true);
+    setNotice('That claim is in this theme, in a group that is not open yet: zoom in to find it.');
   }
 
   async function followClaim(id) {
