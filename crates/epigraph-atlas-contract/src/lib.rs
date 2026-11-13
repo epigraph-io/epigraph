@@ -140,10 +140,21 @@ pub enum FlowBasis {
     Exact,
     /// Claim to claim, always: link strength times the source claim's
     /// belief, which the view labels an estimate. The builder (backlog W7)
-    /// computes it at build time from a role-aware belief read of the source
-    /// claim (the `no_role_blind_belief_reads` ratchet), never from a served
-    /// field: no leaf node carries a belief value. A link with no belief
-    /// direction (`cites`) is still `proxy`, with sign 0.
+    /// computes it at build time, never from a served field: no leaf node
+    /// carries a belief value. Its belief read of the source claim must be
+    /// both:
+    /// - **role-aware** (the `no_role_blind_belief_reads` ratchet: a
+    ///   compound's cached belief is not derived from its atoms), and
+    /// - **scoped to the map's audience**: folded only from the BBAs that
+    ///   audience can read (public BBAs for the public map; public and the
+    ///   team's own for a team map). The cached claim BetP folds every
+    ///   non-retracted BBA whatever group owns it, so it must not be used:
+    ///   a weight can reveal the belief it was built from (exactly, when a
+    ///   relationship's strength is a known constant), so a public claim with
+    ///   team-private evidence would put that private mass on the public map.
+    ///
+    /// A link with no belief direction (`cites`) is still `proxy`, with
+    /// sign 0.
     Proxy,
     /// Every other pair of kinds (an agent's authorship, for example): no
     /// belief flow, so weight 0 and sign 0.
@@ -295,10 +306,20 @@ impl Node {
 
 /// A link between two nodes of a leaf, pointing the way belief flows.
 ///
+/// **Only edge rows the map's audience can read** (backlog W8): an edge row
+/// has its own visibility and owner and co-owner groups, apart from its
+/// endpoints. The public map draws public rows only. A team map draws public
+/// rows and the rows that team owns or co-owns, so a row co-owned by two
+/// teams is drawn on both teams' maps. Two readable endpoints do not make a
+/// row readable, and a served edge carries no row id or visibility, so
+/// [`LevelDocument::for_viewer`] cannot check this: the builder must.
+///
 /// The `edges` table keeps one row per submission (migration 018 dropped
 /// its triple-uniqueness), so one (source, target, relationship) can have
-/// several rows. The builder collapses them into one edge with the largest
-/// `flow_weight` among them: a resubmission is not more support.
+/// several rows. After the audience filter above, the builder collapses
+/// them into one edge with the largest `flow_weight` among them: a
+/// resubmission is not more support. Filtering first matters: otherwise an
+/// unreadable row's larger weight would win the collapse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edge {
@@ -499,8 +520,15 @@ impl LevelDocument {
     /// 4. dropped nodes leave every `outgoing[].sources`, and an `outgoing`
     ///    entry left with no source is dropped.
     ///
+    /// Edges are kept by their endpoints only. Whether each edge row is
+    /// readable by the map's audience is settled when the builder draws the
+    /// leaf (see [`Edge`]); a served edge carries nothing to check it by.
+    ///
     /// Counts and signs pass through as stored: they are aggregates the
     /// team's map already shows, and `count >= sources.len()` still holds.
+    /// So when a source is dropped, `count` and `net_sign` still include its
+    /// links until the next rebuild. Recomputing them would need per-source
+    /// counts, which v1 does not carry.
     /// `None` means no claim is left, and the route answers with the same
     /// not-found body as for an absent level. The result of a valid
     /// document is valid.

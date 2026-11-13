@@ -327,8 +327,9 @@ fn leaf_level(
     n_outgoing: usize,
 ) -> LeafLevel {
     let pos = |rng: &mut Rng| (r4(rng.unit() * 1.9 - 0.95), r4(rng.unit() * 1.9 - 0.95));
-    // Each claim's belief, as the builder reads it role-aware at build time.
-    // It only feeds the proxy flow weights below: no node carries it.
+    // Each claim's belief, as the builder reads it at build time (role-aware,
+    // and folded only from BBAs the map's audience can read). It only feeds
+    // the proxy flow weights below: no node carries it.
     let (claims, belief): (Vec<ClaimNode>, Vec<Option<f64>>) = (0..n_claims)
         .map(|_| {
             let (x, y) = pos(rng);

@@ -60,8 +60,9 @@ pub enum ChildKind {
 
 /// `exact` (evidence to claim, the stored mass), `proxy` (claim to claim,
 /// strength times the source's belief, computed by the kernel's layout
-/// builder at build time from a role-aware read, never from a served field:
-/// shown as an estimate) or `none` (no belief flow).
+/// builder at build time, never from a served field, from a belief read that
+/// is role-aware and scoped to the map's audience: shown as an estimate) or
+/// `none` (no belief flow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
