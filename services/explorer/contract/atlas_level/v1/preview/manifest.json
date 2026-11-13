@@ -7,7 +7,7 @@
       "scope": "team",
       "themes": [
         {
-          "claim_count": 65,
+          "claim_count": 128,
           "label": "Exarbel delimsel dunbel rineon",
           "roots": {
             "links": "e6b42770-1c68-45df-85c4-526fc61720c0",
@@ -16,11 +16,11 @@
           "theme_id": "16274307-4094-4ffe-9d3a-ca90b0c6dfc0"
         },
         {
-          "claim_count": 65,
+          "claim_count": 77,
           "label": "Ulquaim dunquaon thitorka",
           "roots": {
-            "links": "13333a6d-61b6-401e-a77b-9ee251531907",
-            "meaning": "ea3f25c0-f02a-4660-99e0-fa9ff3a2ec6f"
+            "links": "b5c7080a-cd43-4e5a-a5e0-eb4b11fdaa4c",
+            "meaning": "de94b29e-889c-41e5-9774-181b8ee379d1"
           },
           "theme_id": "f2e61f91-282b-4773-b154-0ab04a53de2a"
         }
@@ -33,11 +33,11 @@
       "scope": "public",
       "themes": [
         {
-          "claim_count": 71,
+          "claim_count": 70,
           "label": "Exarbel delimsel dunbel rineon",
           "roots": {
-            "links": "ccfa033d-f3b8-49e0-a2d3-f2ae42ffb1e3",
-            "meaning": "3bc3d8cb-5749-41b9-bd05-16c157c5bcb6"
+            "links": "288b1324-ac76-434a-a549-d5c12892f2c9",
+            "meaning": "1cbba61c-ae34-4396-a253-077d6e7cc931"
           },
           "theme_id": "16274307-4094-4ffe-9d3a-ca90b0c6dfc0"
         }

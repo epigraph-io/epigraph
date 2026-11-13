@@ -1745,6 +1745,21 @@ mod preview_set {
             let top = crumbs(doc).0.first().map_or(doc.level_id(), |b| b.level_id);
             assert!(roots.contains(&top), "{} is reachable", doc.level_id());
         }
+        // A theme holds the same claims whichever way it is grouped, and the
+        // manifest's count is that total.
+        for map in &p.maps {
+            for t in &map.themes {
+                for root in t.roots {
+                    match by_id[&root].1 {
+                        LevelDocument::Group(g) => {
+                            let sum: u32 = g.children.iter().map(|c| c.claim_count).sum();
+                            assert_eq!(sum, t.claim_count, "theme {} root {root}", t.theme_id);
+                        }
+                        LevelDocument::Leaf(_) => panic!("a theme root is a group"),
+                    }
+                }
+            }
+        }
         assert!(cross_theme > 0, "some link leads to the other theme");
         assert!(unnamed > 0, "some group awaits a name");
         let biggest = p

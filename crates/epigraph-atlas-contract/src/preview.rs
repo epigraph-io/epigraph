@@ -17,7 +17,10 @@
 //! - bundle targets and leaf outgoing targets are real levels of the same map
 //!   and hierarchy, outside the level, one of them in the other theme when
 //!   the map has two;
-//! - one team leaf is a full 100-node leaf, the size of `team_leaf_dense`.
+//! - a leaf and its twin in the other hierarchy hold the same number of
+//!   claims, so a theme's count is the same whichever way it is grouped;
+//! - one team leaf (and its twin) is a full 100-node leaf, the size of
+//!   `team_leaf_dense`.
 //!
 //! It is not part of the contract: no route serves it outside the preview,
 //! and the files live in `contract/atlas_level/v1/preview/`, apart from the
@@ -87,7 +90,7 @@ struct Sk {
     /// Claims under it (for a leaf, the claim nodes it will hold).
     claim_count: u32,
     /// For a leaf: (claims, agents, evidence) and links per claim.
-    leaf_shape: Option<((usize, usize, usize), usize)>,
+    leaf_shape: Option<LeafShape>,
     parent: Option<usize>,
     children: Vec<usize>,
     /// Its place in the parent's unit circle (the root: none).
@@ -112,15 +115,21 @@ fn child_kinds(depth: u8) -> &'static [ChildKind] {
     }
 }
 
-/// The dense leaf: the team map's first theme, by meaning, the root's first
-/// leaf.
-fn is_dense(map: usize, theme: usize, hierarchy: Hierarchy, path: &[usize]) -> bool {
-    map == 0 && theme == 0 && hierarchy == Hierarchy::Meaning && path == [2]
+/// The dense leaf: the team map's first theme, the root's first leaf (in both
+/// hierarchies).
+fn is_dense(map: usize, theme: usize, path: &[usize]) -> bool {
+    map == 0 && theme == 0 && path == [2]
 }
+
+/// A leaf's (claims, agents, evidence) and links per claim.
+type LeafShape = ((usize, usize, usize), usize);
 
 struct Builder {
     rng: Rng,
     sk: Vec<Sk>,
+    /// Leaf shapes by (map, theme, path), shared by the twins of the two
+    /// hierarchies.
+    shapes: std::collections::BTreeMap<(usize, usize, Vec<usize>), LeafShape>,
 }
 
 impl Builder {
@@ -152,9 +161,13 @@ impl Builder {
             Some(n) => (Some(n), false),
             None => self.naming(&path),
         };
+        let key = (map, theme, path.clone());
+        let known = self.shapes.get(&key).copied();
         let leaf_shape = (kind == ChildKind::Leaf).then(|| {
-            if is_dense(map, theme, hierarchy, &path) {
+            if is_dense(map, theme, &path) {
                 ((72, 10, 18), 6)
+            } else if let Some(shape) = known {
+                shape
             } else {
                 // Small, so the committed set stays a few hundred KB.
                 let claims = self.rng.range(6, 12);
@@ -163,6 +176,9 @@ impl Builder {
                 ((claims, agents, evidence), 2)
             }
         });
+        if let Some(shape) = leaf_shape {
+            self.shapes.insert(key, shape);
+        }
         let idx = self.sk.len();
         self.sk.push(Sk {
             id: self.rng.uuid(),
@@ -330,6 +346,7 @@ pub fn preview() -> Preview {
     let mut b = Builder {
         rng: Rng::new(0xA71A_7001),
         sk: Vec::new(),
+        shapes: Default::default(),
     };
     let theme_ids: Vec<Uuid> = (0..2).map(|_| b.rng.uuid()).collect();
     let theme_labels: Vec<String> = (0..2).map(|_| group_name(&mut b.rng)).collect();
