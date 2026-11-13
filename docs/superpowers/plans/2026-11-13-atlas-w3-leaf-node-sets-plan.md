@@ -210,9 +210,13 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   claim-to-claim edge and an evidence-to-agent edge between public nodes,
   owned by A and co-owned by B, are on none of A's map, B's map, C's map or
   the public map, though both endpoints are nodes of every one. A's own edge
-  between the same claims is on A's map only (calibration), and a co-owned
-  edge as the trigger stamps it, between a claim of A and a claim of B, is on
-  no map. Then the audience rule itself: on a stamped `epigraph_app`
+  between the same claims is on A's map only (calibration). Two public edges,
+  as the trigger stamps them, are on all four maps: an evidence-to-claim edge
+  (the claim-edge read) and an evidence-to-agent edge (the agent/evidence-edge
+  read). A co-owned edge as the trigger stamps it, between a claim of A and a
+  claim of B, is on no map, but only because no map draws both of its
+  endpoints; it shows the endpoint filter, not the edge predicate. Then the
+  audience rule itself: on a stamped `epigraph_app`
   connection, where row security applies, a member of A alone and a member of
   both each build exactly the bypass A map, and a member of B alone and a
   member of both exactly the bypass B map. Every stamp is checked.
@@ -272,6 +276,7 @@ After the rulings, each run alone and restored:
 | claim-edge read alone: `owner = T OR co_owner = T` | the same two, the same assertions |
 | agent/evidence-edge read alone: `owner = T` | the same two, the same assertions |
 | agent/evidence-edge read alone: `owner = T OR co_owner = T` | the same two, the same assertions |
+| agent/evidence-edge read: public arm replaced by `false` | `a_co_owned_edge_is_on_no_single_team_map` ("A: stored edges": the public evidence-to-agent edge is missing). It survived every test before that edge was seeded |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint` (every new function that takes
 a connection takes and splices a viewer), `pool_read_lint`, `viewer_ratchet`.
@@ -286,7 +291,7 @@ W3 writes no edge, so `edge_writer_signing_ratchet` is not affected.
 | a node from outside the team's readable set never appears | `another_teams_private_rows_never_appear` (DB, team map, public map, multi-team scoped viewer) |
 | (brief) a high-degree agent appears once | `a_high_degree_agent_appears_once` (DB) |
 | (brief) identical across runs | `the_node_set_is_identical_across_runs` (DB) |
-| (ruling) a co-owned edge is on no single-team map, and every member of a team builds exactly that team's map under row security | `a_co_owned_edge_is_on_no_single_team_map` (DB) |
+| (ruling) a co-owned edge is on no single-team map, a team's own edge with no co-owner is on its map, a public edge is on every map where both endpoints are drawable, and every member of a team builds exactly that team's map under row security | `a_co_owned_edge_is_on_no_single_team_map` (DB) |
 | (ruling) evidence is drawn only through a stored edge | `evidence_joins_only_through_a_stored_edge_and_only_the_filer_edge_is_derived`, `unlinked_evidence_counts_rows_no_stored_edge_links_to_the_leaf` (unit); `another_teams_private_rows_never_appear` (DB) |
 
 ## Needs prod measurement (the orchestrator's)
