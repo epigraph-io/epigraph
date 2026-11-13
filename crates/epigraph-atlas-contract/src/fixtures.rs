@@ -316,45 +316,71 @@ const CLAIM_RELATIONSHIPS: &[(&str, i8)] = &[
 /// Agent-to-claim relationship names in use: no belief flow.
 const AGENT_RELATIONSHIPS: &[&str] = &["AUTHORED", "authored", "asserts"];
 
+/// Maps over a leaf claim's drawn values, applied before the generator uses
+/// them.
+#[derive(Clone, Copy)]
+pub(crate) struct ClaimValues {
+    /// Over the drawn `truth_value` (the colour value the leaf serves).
+    pub truth: fn(Option<f64>) -> Option<f64>,
+    /// Over the drawn belief (which the leaf does not serve).
+    pub belief: fn(Option<f64>) -> Option<f64>,
+}
+
+impl ClaimValues {
+    /// Every value as drawn: what the committed fixtures use.
+    pub const AS_DRAWN: Self = Self {
+        truth: |t| t,
+        belief: |b| b,
+    };
+}
+
 /// A leaf: claims, the agents that asserted them and their evidence, with
 /// `per_claim` claim-to-claim links per claim and `n_outgoing` outside
 /// target groups.
 ///
-/// `truth` maps each claim's drawn `truth_value` before it is stored (the
-/// identity for the committed fixtures). A test can change every claim's
-/// colour value this way without moving the seeded stream, and so show that
-/// no edge weight depends on it.
+/// `vary` maps each claim's drawn values before they are used (the identity
+/// for the committed fixtures): its `truth_value`, which the leaf serves as
+/// the colour value, and its belief, which the leaf never serves. A test can
+/// change either for every claim without moving the seeded stream, and so
+/// show that no edge weight depends on it.
+///
+/// Returns the leaf and each claim's belief, in claim order.
 fn leaf_level(
     rng: &mut Rng,
     f: Frame,
     (n_claims, n_agents, n_evidence): (usize, usize, usize),
     per_claim: usize,
     n_outgoing: usize,
-    truth: fn(Option<f64>) -> Option<f64>,
-) -> LeafLevel {
+    vary: ClaimValues,
+) -> (LeafLevel, Vec<Option<f64>>) {
     let pos = |rng: &mut Rng| (r4(rng.unit() * 1.9 - 0.95), r4(rng.unit() * 1.9 - 0.95));
-    let claims: Vec<ClaimNode> = (0..n_claims)
+    // Each claim's belief: the value a builder could fold from the claim's
+    // BBAs, or read as its cached BetP. A leaf claim carries none (contract
+    // v1), and no weight below may use it. It is drawn and kept only so the
+    // generator's tests can change it and show that no weight moves (the
+    // draws are where an earlier generator made them, so every value in the
+    // committed fixtures is unchanged).
+    let (claims, belief): (Vec<ClaimNode>, Vec<Option<f64>>) = (0..n_claims)
         .map(|_| {
             let (x, y) = pos(rng);
-            // An earlier generator drew a per-claim belief here and below.
-            // Proxy weights no longer use one, but the draws stay so every
-            // other value in the committed fixtures is unchanged.
-            let _ = rng.unit();
+            let b = r4(rng.unit());
             let node = ClaimNode {
                 id: rng.uuid(),
                 label: claim_label(rng),
                 x,
                 y,
-                truth_value: truth(if rng.chance(0.05) {
+                truth_value: (vary.truth)(if rng.chance(0.05) {
                     None
                 } else {
                     Some(r4(rng.unit()))
                 }),
             };
-            let _ = rng.chance(0.05);
-            node
+            (
+                node,
+                (vary.belief)(if rng.chance(0.05) { None } else { Some(b) }),
+            )
         })
-        .collect();
+        .unzip();
     let agents: Vec<PlainNode> = (0..n_agents)
         .map(|i| {
             let (x, y) = pos(rng);
@@ -479,7 +505,7 @@ fn leaf_level(
         .chain(agents.into_iter().map(Node::Agent))
         .chain(evidence.into_iter().map(Node::Evidence))
         .collect();
-    LeafLevel {
+    let leaf = LeafLevel {
         schema_version: SCHEMA_VERSION,
         map_scope: f.map_scope,
         map_group_id: f.map_group_id,
@@ -495,7 +521,8 @@ fn leaf_level(
         nodes,
         edges,
         outgoing,
-    }
+    };
+    (leaf, belief)
 }
 
 /// A team map's theme root, by meaning: about 40 children and their
@@ -519,21 +546,22 @@ pub fn team_group_deep() -> LevelDocument {
 pub fn team_leaf_dense() -> LevelDocument {
     let mut rng = Rng::new(0xA71A_5003);
     let f = frame(&mut rng, MapScope::Team, Hierarchy::Meaning, 5);
-    LevelDocument::Leaf(leaf_level(&mut rng, f, (72, 10, 18), 6, 30, |t| t))
+    LevelDocument::Leaf(leaf_level(&mut rng, f, (72, 10, 18), 6, 30, ClaimValues::AS_DRAWN).0)
 }
 
 /// A leaf of the public map.
 pub fn public_leaf() -> LevelDocument {
     let mut rng = Rng::new(0xA71A_5004);
     let f = frame(&mut rng, MapScope::Public, Hierarchy::Links, 3);
-    LevelDocument::Leaf(leaf_level(&mut rng, f, (45, 5, 10), 3, 10, |t| t))
+    LevelDocument::Leaf(leaf_level(&mut rng, f, (45, 5, 10), 3, 10, ClaimValues::AS_DRAWN).0)
 }
 
 /// A leaf built the way the committed leaf fixtures are, from any seed, with
-/// `truth` applied to every claim's drawn `truth_value`. For the contract's
-/// own tests of the generator's weight rule.
+/// `vary` applied to every claim's drawn values, and each claim's belief (in
+/// claim order), which the leaf does not carry. For the contract's own tests
+/// of the generator's weight rule.
 #[cfg(test)]
-pub(crate) fn seeded_leaf(seed: u64, truth: fn(Option<f64>) -> Option<f64>) -> LeafLevel {
+pub(crate) fn seeded_leaf(seed: u64, vary: ClaimValues) -> (LeafLevel, Vec<Option<f64>>) {
     let mut rng = Rng::new(seed);
     let scope = if seed.is_multiple_of(2) {
         MapScope::Team
@@ -541,7 +569,7 @@ pub(crate) fn seeded_leaf(seed: u64, truth: fn(Option<f64>) -> Option<f64>) -> L
         MapScope::Public
     };
     let f = frame(&mut rng, scope, Hierarchy::Links, 3);
-    leaf_level(&mut rng, f, (40, 6, 10), 4, 8, truth)
+    leaf_level(&mut rng, f, (40, 6, 10), 4, 8, vary)
 }
 
 /// The kernel's answer to a viewer who is not a member of the level's map,

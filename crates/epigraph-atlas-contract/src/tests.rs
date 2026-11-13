@@ -9,7 +9,7 @@ use crate::check::{
     check_level_body, check_not_found, compact_gzip_len, contract_dir, schema, schema_errors,
     Expected, Side,
 };
-use crate::fixtures::{self, Rng, FIXTURE_TEAM_GROUP_ID};
+use crate::fixtures::{self, ClaimValues, Rng, FIXTURE_TEAM_GROUP_ID};
 use crate::*;
 
 fn fixture_dir() -> std::path::PathBuf {
@@ -945,6 +945,7 @@ fn invariants_enforce_the_schema_rules() {
         .unwrap_err()
         .contains("no flow has weight 0"));
     assert!(!schema_errors(&leaf).is_empty());
+
 }
 
 // ---- relationship names, flow basis, node anchoring --------------------------------
@@ -1074,7 +1075,7 @@ fn leaves_to_check() -> Vec<(String, LeafLevel)> {
         let seed = 0xA71A_7000 + i;
         (
             format!("seed {seed:#x}"),
-            fixtures::seeded_leaf(seed, |t| t),
+            fixtures::seeded_leaf(seed, ClaimValues::AS_DRAWN).0,
         )
     });
     committed.chain(seeded).collect()
@@ -1084,13 +1085,16 @@ fn leaves_to_check() -> Vec<(String, LeafLevel)> {
 /// nothing else, with no belief factor, so no served weight can be divided
 /// back into a belief. With the sign in its own field, `flow_weight` is
 /// strength × |sign|: 0 exactly when the link has no direction (`cites`),
-/// otherwise the strength, in (0, 1]. A belief factor breaks this both ways:
-/// a claim with no belief value would zero a signed link, and a `cites` link
-/// would carry its source's belief.
+/// otherwise the strength, in (0, 1].
 ///
-/// This pins the rule on what the generator produces; it cannot see where a
-/// builder's weight comes from. The builder's own test (backlog W7) must show
-/// that changing a source claim's BBAs leaves its proxy weights unchanged.
+/// This pins the shape of the rule (sign, `cites` = 0, range), not the
+/// absence of a belief factor: a factor that stays in (0, 1] (a belief with a
+/// non-zero default for claims that have none, say) passes it.
+/// `proxy_weights_ignore_every_claim_value` is the test that catches a
+/// weight depending on a claim's belief. Neither can see where a builder's
+/// weight comes from: the builder's own test (backlog W7) must show that
+/// changing a source claim's BBAs, or its cached BetP, leaves its proxy
+/// weights unchanged.
 #[test]
 fn proxy_weights_are_link_strength_times_sign_only() {
     let (mut directed, mut undirected) = (0, 0);
@@ -1123,33 +1127,74 @@ fn proxy_weights_are_link_strength_times_sign_only() {
     );
 }
 
-/// Two leaves identical except for every claim's `truth_value` (the colour
-/// value, the only belief-like value a leaf claim carries) have identical
-/// edges, proxy weights included.
+/// Two leaves identical except for every claim's belief (the value a builder
+/// could fold from its BBAs, which the leaf does not serve) or every claim's
+/// `truth_value` (the colour value it does serve) have identical edges,
+/// proxy weights included. Each variant sets the value to 1 for every claim
+/// (which moves a factor such as `0.5 + 0.5 × belief`) and to none for every
+/// claim (which moves a factor that defaults a missing belief, such as
+/// `belief.unwrap_or(0.5)`).
+///
+/// It sees only values the generator holds per claim; a factor drawn from
+/// anywhere else passes it, and it cannot see a builder's source. The
+/// builder's own test (backlog W7) carries the real invariance.
 #[test]
 fn proxy_weights_ignore_every_claim_value() {
-    let variants: [fn(Option<f64>) -> Option<f64>; 2] = [|_| Some(1.0), |_| None];
+    let to_one: fn(Option<f64>) -> Option<f64> = |_| Some(1.0);
+    let to_none: fn(Option<f64>) -> Option<f64> = |_| None;
+    let variants = [
+        (
+            "belief = 1",
+            ClaimValues {
+                belief: to_one,
+                ..ClaimValues::AS_DRAWN
+            },
+        ),
+        (
+            "belief = none",
+            ClaimValues {
+                belief: to_none,
+                ..ClaimValues::AS_DRAWN
+            },
+        ),
+        (
+            "truth_value = 1",
+            ClaimValues {
+                truth: to_one,
+                ..ClaimValues::AS_DRAWN
+            },
+        ),
+        (
+            "truth_value = none",
+            ClaimValues {
+                truth: to_none,
+                ..ClaimValues::AS_DRAWN
+            },
+        ),
+    ];
+    let truth_values = |l: &LeafLevel| -> Vec<Option<f64>> {
+        l.nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Claim(c) => Some(c.truth_value),
+                _ => None,
+            })
+            .collect()
+    };
     for seed in (0..16u64).map(|i| 0xA71A_7100 + i) {
-        let base = fixtures::seeded_leaf(seed, |t| t);
-        for (v, truth) in variants.into_iter().enumerate() {
-            let other = fixtures::seeded_leaf(seed, truth);
-            let tv = |l: &LeafLevel| -> Vec<Option<f64>> {
-                l.nodes
-                    .iter()
-                    .filter_map(|n| match n {
-                        Node::Claim(c) => Some(c.truth_value),
-                        _ => None,
-                    })
-                    .collect()
-            };
-            assert_ne!(
-                tv(&base),
-                tv(&other),
-                "seed {seed:#x} variant {v}: truth values differ"
+        let (base, base_belief) = fixtures::seeded_leaf(seed, ClaimValues::AS_DRAWN);
+        assert!(base.edges.iter().any(|e| e.flow_basis == FlowBasis::Proxy));
+        for (v, vary) in variants {
+            let (other, other_belief) = fixtures::seeded_leaf(seed, vary);
+            // Exactly the one value the variant names differs.
+            let beliefs_differ = base_belief != other_belief;
+            let truths_differ = truth_values(&base) != truth_values(&other);
+            assert!(
+                beliefs_differ != truths_differ && beliefs_differ == v.starts_with("belief"),
+                "seed {seed:#x} {v}: beliefs differ {beliefs_differ}, truth values {truths_differ}"
             );
-            assert!(other.edges.iter().any(|e| e.flow_basis == FlowBasis::Proxy));
             for (i, (o, b)) in other.edges.iter().zip(&base.edges).enumerate() {
-                assert_eq!(o, b, "seed {seed:#x} variant {v}: /edges/{i}");
+                assert_eq!(o, b, "seed {seed:#x} {v}: /edges/{i}");
             }
             let mut same = other.clone();
             for (n, b) in same.nodes.iter_mut().zip(&base.nodes) {
@@ -1157,10 +1202,7 @@ fn proxy_weights_ignore_every_claim_value() {
                     c.truth_value = bc.truth_value;
                 }
             }
-            assert!(
-                same == base,
-                "seed {seed:#x} variant {v}: only truth values differ"
-            );
+            assert!(same == base, "seed {seed:#x} {v}: only claim values differ");
         }
     }
 }
