@@ -160,11 +160,36 @@ validates; the export writer reproduces the committed export bytes.
   `apply_refuses_a_forged_group_id`;
 - `retired_and_unembedded_claims_are_not_members`.
 
-**Fail on old code** (mutations, each run then restored): a shared node
-counted once per claim; the per-claim cap dropped from `claim_attachments`;
-members unsorted in the id hash; the map predicate removed from the member
-read; the `is_current` filter dropped; single-child groups allowed; the apply
-id check removed; the W3 re-check skipped.
+- `the_binary_refuses_a_bad_map_or_cap_before_connecting` (no DB).
+
+**Fail on old code** (measured on the branch: each mutation applied alone,
+the affected targets run, then restored and `touch`ed):
+
+| Mutation | Tests that went red |
+|---|---|
+| Python: weight summed per claim (a shared node counted per claim) | `test_every_leaf_weight_is_within_the_cap`, `test_a_shared_agent_counts_once_per_group`, `test_committed_fixture_reproduces_the_committed_result`, `test_compute_runs_without_db_driver` |
+| Python: members unsorted in the id | `test_a_group_id_depends_only_on_its_members`, `test_ids_match_the_golden_vector` |
+| Python: a root under the cap still split | `test_a_theme_under_the_cap_is_one_root_leaf`, `test_a_shared_agent_counts_once_per_group` |
+| Python: input not sorted by id | `test_rerun_reproduces_every_group_id` |
+| Python: validate skips the id check | `test_validate_tree_refuses_a_malformed_tree[forged_id]` |
+| Python: validate allows a single child | `test_validate_tree_refuses_a_malformed_tree[single_child]` |
+| `claim_attachments` without the per-claim cap | `claim_attachments_are_what_assembly_counts_for_each_claim` (unit only: no DB fixture has a claim with more than 99 attachments) |
+| member read without the map predicate | 8 of 10 DB tests, among them `a_team_map_never_holds_another_teams_claim`, `the_public_map_holds_only_public_claims` |
+| member read without `is_current` | `a_team_map_never_holds_another_teams_claim`, `retired_and_unembedded_claims_are_not_members` |
+| `leaf_membership` without the map predicate | `leaf_membership_reads_back_every_claim` |
+| group id hashed over reversed members | `ids_match_the_golden_vector`, `the_committed_result_passes_the_rust_tree_check` |
+| `check_tree` without the id mint check | `check_tree_refuses_each_malformed_tree`, `apply_refuses_a_forged_group_id` |
+| `check_tree` allows a single child | `check_tree_refuses_each_malformed_tree` |
+| `check_tree` without the member cover check | `check_tree_refuses_each_malformed_tree`, `a_team_map_never_holds_another_teams_claim`, `apply_refuses_a_result_whose_members_drifted` |
+| `resolve_tree` skips the W3 re-check | `a_leaf_that_fits_is_left_alone`, `a_leaf_w3_finds_over_the_cap_is_split_into_minted_leaves`, `every_leaf_of_a_team_map_fits_the_cap_as_w3_counts`, `a_second_apply_over_unchanged_input_reproduces_every_group_id` |
+| export numbers attachments per claim | `attachments_are_numbered_per_theme_by_kind_then_id`, `export_weights_match_what_w3_counts` |
+| the binary's cap check removed | `the_binary_refuses_a_bad_map_or_cap_before_connecting` |
+
+**Not tested end to end**: an export from a database, computed by the
+Python core and applied back. The build hosts have no numpy, and each DB test
+database is thrown away, so the two halves meet through the committed fixture
+instead (the Rust writer reproduces the Python export bytes; the Python
+result passes the Rust tree check).
 
 ## "Done when" → proof
 
