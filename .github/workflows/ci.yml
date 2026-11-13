@@ -173,8 +173,19 @@ jobs:
         # gate does the same between steps (purge_test_executables).
         run: |
           df -h /
-          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
+          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
+          # target/debug/deps. The regex keeps build scripts (build_script_*,
+          # no -<hash> suffix), which cargo would otherwise re-run.
+          if [ -d target/debug/deps ]; then
+            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
+          if [ -d target/debug/build ]; then
+            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
+              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
           df -h /
       - name: Test (epigraph-db, parallel within package)
         # Packages still run SEQUENTIALLY -- one cargo invocation at a time --
@@ -249,8 +260,19 @@ jobs:
         # gate does the same between steps (purge_test_executables).
         run: |
           df -h /
-          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
+          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
+          # target/debug/deps. The regex keeps build scripts (build_script_*,
+          # no -<hash> suffix), which cargo would otherwise re-run.
+          if [ -d target/debug/deps ]; then
+            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
+          if [ -d target/debug/build ]; then
+            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
+              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
           df -h /
       - name: Test (epigraph-api, serialized)
         run: cargo test -p epigraph-api --locked -- --test-threads=1
@@ -264,8 +286,19 @@ jobs:
         # gate does the same between steps (purge_test_executables).
         run: |
           df -h /
-          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
+          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
+          # target/debug/deps. The regex keeps build scripts (build_script_*,
+          # no -<hash> suffix), which cargo would otherwise re-run.
+          if [ -d target/debug/deps ]; then
+            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
+          if [ -d target/debug/build ]; then
+            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
+              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
           df -h /
       - name: Test (epigraph-engine, serialized)
         run: cargo test -p epigraph-engine --locked -- --test-threads=1
@@ -279,8 +312,19 @@ jobs:
         # gate does the same between steps (purge_test_executables).
         run: |
           df -h /
-          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
+          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
+          # target/debug/deps. The regex keeps build scripts (build_script_*,
+          # no -<hash> suffix), which cargo would otherwise re-run.
+          if [ -d target/debug/deps ]; then
+            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
+          if [ -d target/debug/build ]; then
+            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
+              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
           df -h /
       - name: Test (epigraph-mcp, serialized)
         # claim_helper_tests adds a temporary CHECK constraint on `edges`
@@ -296,8 +340,19 @@ jobs:
         # gate does the same between steps (purge_test_executables).
         run: |
           df -h /
-          find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-            ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
+          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
+          # target/debug/deps. The regex keeps build scripts (build_script_*,
+          # no -<hash> suffix), which cargo would otherwise re-run.
+          if [ -d target/debug/deps ]; then
+            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
+          if [ -d target/debug/build ]; then
+            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
+              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
+              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          fi
           df -h /
       - name: Test (epigraph-embeddings, serialized)
         # pgvector tests use #[sqlx::test] which races with parallel siblings
