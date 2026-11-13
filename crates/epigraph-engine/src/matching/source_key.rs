@@ -54,10 +54,7 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
         return true;
     }
     let both_non_paper = a.paper_doi.is_none() && b.paper_doi.is_none();
-    if (both_non_paper || cfg.include_agent_id) && a.agent_id == b.agent_id {
-        return true;
-    }
-    false
+    (both_non_paper || cfg.include_agent_id) && a.agent_id == b.agent_id
 }
 
 /// Look up a claim's [`SourceKey`] by querying its row, resolving the paper
