@@ -137,7 +137,7 @@ pub use atlas_leaf::{
     assemble_leaf, fallback_split, resolve_with_fallback, AtlasLeafRepository, CappedClaim,
     LeafCounts, LeafEdge, LeafEdgeOrigin, LeafNode, LeafNodeKind, LeafNodeSet, LeafOutcome,
     LeafRows, NeedsSplit, SplitReason, StoredLeafEdge, ATLAS_LEAF_NODE_CAP,
-    DERIVED_EVIDENCE_RELATIONSHIP, DERIVED_FILER_RELATIONSHIP,
+    DERIVED_FILER_RELATIONSHIP,
 };
 pub use atlas_map::{
     AtlasHierarchy, AtlasMap, AtlasMapRepository, LevelDoc, MapEpochs, MapLevel, NewMapRun,

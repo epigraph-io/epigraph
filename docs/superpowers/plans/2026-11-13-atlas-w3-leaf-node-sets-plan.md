@@ -7,6 +7,21 @@ Backlog item W3 bd6f0a02 (epic 8fa0282d). Design:
 Stacked on W2 (PR #803, migration 210, `AtlasMapRepository`). W3 adds no
 migration and does not change 210.
 
+## Operator rulings 2026-11-13
+
+Two rulings on the first review of this PR change the plan below; the
+sections that follow already reflect them.
+
+- **Evidence is drawn only through a stored edge.** No edge is derived from
+  `evidence.claim_id`. A leaf draws the stored evidence-to-claim edges, under
+  the relationship names stored on them (`supports` and `SUPPORTS` both occur
+  today). The evidence filing paths will require at least one claim and write
+  that edge, and existing evidence gets a backfill; both are backlog
+  2d60f619, a separate PR. Until it lands, an evidence row whose only link to
+  the leaf is its `claim_id` is not a node: the W10a contract requires every
+  evidence node to have an edge to a claim, so the row is left out and counted
+  in the builder-internal `LeafCounts::unlinked_evidence`.
+
 ## What this item delivers
 
 Given a candidate leaf (a list of claim ids from the W4 or W5 hierarchy
@@ -44,8 +59,9 @@ relationship name, unnormalised. W3 does not depend on the W10a crate.
 claims, read once:
 - `claims`: the candidate claims the map may draw, each with its filer
   (`claims.agent_id`, when that agent row exists);
-- `evidence`: drawable evidence rows reached from those claims, each with its
-  `claim_id`;
+- `evidence`: drawable evidence rows reached from those claims (by
+  `claim_id` or through an edge), each with its `claim_id` when that claim is
+  one of `claims`;
 - `agents`: agents reached through an authorship edge (the `agents` table has no
   tenancy: 077's `agents_identity` is `USING (true)`; the read only drops
   dangling ids, since edges carry no FK);
@@ -58,8 +74,10 @@ claims, read once:
   edge: `agent -> claim` with a relationship in
   `claim_ingest::AGENT_SOURCE_AUTHORSHIP`, or `claim -> agent` in
   `AGENT_TARGET_AUTHORSHIP`, both compared lower-cased;
-- evidence joins through `evidence.claim_id` or any drawable stored edge
-  between it and the claim, in either direction;
+- evidence joins only through a drawable stored edge between it and the claim,
+  in either direction, under its stored relationship name. A row whose only
+  link is its `claim_id` is not a node; it is counted in
+  `counts.unlinked_evidence` (builder-internal);
 - once the node set is fixed, every drawable stored edge whose two endpoints are
   both in it (matched on kind and id) is an edge of the leaf. Edges to claims
   outside the leaf are left to the outgoing-links stage.
@@ -69,14 +87,11 @@ relationship, origin, sorted), `capped` (per-claim truncations) and `counts`.
 - Stored edges repeating one (source, target, relationship) collapse into one
   edge carrying every stored edge id, sorted, so W7 can take the largest weight
   among them (the W10a rule).
-- A column link with no stored edge between the same two nodes gets a DERIVED
-  edge, so every agent and evidence node has an edge to a claim (a W10a
-  invariant): a filer becomes `agent -asserts-> claim` (the stored spelling of
-  the same fact), and `evidence.claim_id` becomes `evidence -evidence_for->
-  claim`. `evidence_for` is a new name, chosen because `supports` would preset a
-  sign that W7 must take from the stored mass. The origin marks it derived, so
-  W7 and the view can tell it from a stored edge. This spelling is an open
-  question for the operator.
+- Every agent and evidence node has an edge to a claim (a W10a invariant).
+  Evidence has one by construction, since it joins only through a stored edge.
+  A filer with no stored authorship edge to its claim gets the one DERIVED
+  edge, `agent -asserts-> claim` (the stored spelling of the same fact); the
+  origin marks it derived, so W7 and the view can tell it from a stored edge.
 - Everything is built from ordered collections (`BTreeMap`, `BTreeSet`), so the
   output depends on the input set, never on input order or SQL row order.
 
@@ -85,7 +100,8 @@ relationship, origin, sorted), `capped` (per-claim truncations) and `counts`.
    (1 + agents + evidence > cap) keeps a deterministic prefix: its filer, then
    its other agents by id, then its evidence by id, `cap - 1` in all. The cut is
    recorded as `CappedClaim { claim, kept_agents, kept_evidence, total_agents,
-   total_evidence }`. This is what guarantees termination: every claim alone
+   total_evidence }`, where evidence means the rows a stored edge links to the
+   claim. This is what guarantees termination: every claim alone
    fits, so a split always makes progress.
 2. **Count** = |claims| + |distinct agents| + |distinct evidence| over the
    capped attachments. A shared agent or evidence row counts once.
@@ -137,11 +153,16 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   graphs; the parts cover every readable claim exactly once, in id order, every
   part re-assembles to `Fits`, each claim's capped evidence is in its part.
 - every agent and evidence node has an edge to a claim, after capping and after
-  splitting, derived edges included: not a test of its own but the
-  `assert_attached` helper, which the count, cap, split and derived-edge tests
-  call on every leaf they assemble.
+  splitting: not a test of its own but the `assert_attached` helper, which the
+  count, cap, split and edge tests call on every leaf they assemble.
 - `duplicate_stored_edges_collapse_and_keep_every_id`.
-- `derived_edges_stand_in_only_where_no_stored_edge_does`.
+- `evidence_joins_only_through_a_stored_edge_and_only_the_filer_edge_is_derived`:
+  a row attached by `claim_id` alone is no node and gets no edge; rows linked
+  by a stored edge in either direction are nodes; the filer edge is the only
+  derived one.
+- `unlinked_evidence_counts_rows_no_stored_edge_links_to_the_leaf`: a row cut
+  by the per-claim cap is capped, not unlinked; a row linked only to a claim in
+  another part is unlinked in the part that lacks that claim.
 - `a_zero_cap_is_refused_and_no_drawable_claim_is_empty`.
 
 **DB tests** (`crates/epigraph-db/tests/atlas_leaf_repo.rs`):
@@ -195,7 +216,7 @@ targets run, then restored and `touch`ed). Measured on the pushed branch:
 | per-claim cap removed | `a_claim_with_more_evidence_...`, `fallback_split_...` (unit); `every_leaf_..._fits_the_cap` (DB) |
 | collapsed edge ids left unsorted | `duplicate_stored_edges_collapse_and_keep_every_id` (unit only: the read already sorts edges by id, so the DB path cannot see it) |
 | fallback split walks input order | `fallback_split_...` (unit); `the_node_set_is_identical_across_runs` (DB) |
-| derived edges removed | 4 unit; `another_teams_private_rows_never_appear` |
+| derived filer edges removed (re-run after the rulings) | 4 unit; `another_teams_private_rows_never_appear` |
 | public map binds the nil uuid as its team | none: an equivalent mutant (no row is owned by the nil group), recorded, not a gap |
 | public map lets team rows in, team map unchanged (claims read) | `another_teams_private_rows_never_appear` (public map nodes) |
 
@@ -213,6 +234,13 @@ ids), each run alone against the DB target and restored:
 
 Before the scope test seeded rows of T on public nodes, the first three
 mutations, applied together, left every test green.
+
+After the rulings, each run alone and restored:
+
+| Mutation | Tests that went red |
+|---|---|
+| evidence joins by `claim_id` again (the `by_claim_id` rows also inserted as linked evidence) | `evidence_joins_only_through_a_stored_edge_...`, `unlinked_evidence_counts_...`, `fallback_split_...` (unit); `another_teams_private_rows_never_appear` ("team map nodes": the bare rows are drawn) |
+| the fifth statement reads edges among every evidence row, not only those an edge reached | none: an equivalent mutant (the assembly drops an edge whose endpoint is not a node; the filter only narrows the read), recorded, not a gap |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint` (every new function that takes
 a connection takes and splices a viewer), `pool_read_lint`, `viewer_ratchet`.
@@ -232,6 +260,6 @@ W3 writes no edge, so `edge_writer_signing_ratchet` is not affected.
 
 - The distribution of evidence rows and of agents per claim (how often the
   per-claim cap bites).
-- The share of evidence rows with a stored evidence-to-claim edge (how many
-  derived `evidence_for` edges a leaf carries).
+- The share of evidence rows with a stored evidence-to-claim edge, which is
+  how much evidence leaves draw until the backfill (backlog 2d60f619) lands.
 - The read's timing over a theme of about 2,000 claims.

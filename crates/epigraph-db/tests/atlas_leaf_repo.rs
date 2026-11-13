@@ -1,7 +1,8 @@
 //! Atlas leaf node sets (Atlas W3, backlog bd6f0a02): every leaf holds at most
 //! 100 nodes (claims, agents and evidence counted together), a leaf that
 //! agents or evidence push over the cap asks for a re-split, a high-degree
-//! agent is one node, a row outside the map's readable set never appears, and
+//! agent is one node, a row outside the map's readable set never appears,
+//! evidence is a node only through a stored edge to a claim of the leaf, and
 //! the node set does not depend on input or row order.
 //!
 //! Every read runs the way the nightly build runs it: a transaction opened by
@@ -23,7 +24,7 @@ use std::collections::BTreeSet;
 use epigraph_db::repos::atlas_leaf::{
     fallback_split, resolve_with_fallback, AtlasLeafRepository, LeafEdgeOrigin, LeafNode,
     LeafNodeKind, LeafNodeSet, LeafOutcome, LeafRows, SplitReason, ATLAS_LEAF_NODE_CAP,
-    DERIVED_EVIDENCE_RELATIONSHIP, DERIVED_FILER_RELATIONSHIP,
+    DERIVED_FILER_RELATIONSHIP,
 };
 use epigraph_db::repos::atlas_map::AtlasMap;
 use epigraph_db::{AtlasMapRepository, ScopedPool, SessionGucMode, Viewer};
@@ -95,8 +96,10 @@ async fn claims(pool: &PgPool, filer: Uuid, visibility: &str, owner: Uuid, n: i3
     .expect("seed claims")
 }
 
-/// `n` evidence rows on `claim`; 070 stamps the claim's tenancy on them.
-async fn evidence(pool: &PgPool, claim: Uuid, n: i32) -> Vec<Uuid> {
+/// `n` evidence rows on `claim` by `claim_id` ONLY, with no stored edge to it
+/// (most evidence today, until the evidence-edge backfill); 070 stamps the
+/// claim's tenancy on them.
+async fn bare_evidence(pool: &PgPool, claim: Uuid, n: i32) -> Vec<Uuid> {
     sqlx::query_scalar(
         "INSERT INTO evidence (claim_id, evidence_type, content_hash) \
          SELECT $1, 'document', decode(md5(random()::text) || md5(random()::text), 'hex') \
@@ -108,6 +111,38 @@ async fn evidence(pool: &PgPool, claim: Uuid, n: i32) -> Vec<Uuid> {
     .fetch_all(pool)
     .await
     .expect("seed evidence")
+}
+
+/// `n` evidence rows on `claim`, each also linked to it by a stored
+/// `evidence -> claim` edge, spelled `supports` and `SUPPORTS` in turn (both
+/// spellings are stored today); 070 stamps each edge from its endpoints.
+/// Returns `(evidence, edge)` pairs.
+async fn linked_evidence(pool: &PgPool, claim: Uuid, n: i32) -> Vec<(Uuid, Uuid)> {
+    let ev = bare_evidence(pool, claim, n).await;
+    let mut pairs: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         SELECT u.ev, 'evidence', $2, 'claim', \
+                CASE WHEN u.o % 2 = 0 THEN 'SUPPORTS' ELSE 'supports' END \
+           FROM unnest($1::uuid[]) WITH ORDINALITY AS u(ev, o) \
+         RETURNING source_id, id",
+    )
+    .bind(&ev)
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("seed evidence edges");
+    pairs.sort_unstable_by_key(|&(e, _)| ev.iter().position(|x| *x == e));
+    assert_eq!(pairs.len(), ev.len());
+    pairs
+}
+
+/// [`linked_evidence`], the evidence ids only.
+async fn evidence(pool: &PgPool, claim: Uuid, n: i32) -> Vec<Uuid> {
+    linked_evidence(pool, claim, n)
+        .await
+        .into_iter()
+        .map(|(e, _)| e)
+        .collect()
 }
 
 /// A stored edge, tenancy as 070's trigger stamps it from the endpoints.
@@ -428,6 +463,10 @@ async fn a_high_degree_agent_appears_once(pool: PgPool) {
 /// drawn, an evidence-to-evidence edge of T's among them (the calibration that
 /// the map is not just empty).
 ///
+/// Evidence is a node only through a stored edge to a claim of the leaf: an
+/// evidence row attached by `claim_id` alone, one of T's and one public, is no
+/// node on either map and is counted in `unlinked_evidence`.
+///
 /// The public map's own arms: rows of T hung on public nodes the public map
 /// draws (an edge between two public claims, an evidence row on a public
 /// claim, an edge between a public evidence row and a public claim's filer)
@@ -455,16 +494,17 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     let (p1, p2) = (pc[0], pc[1]);
     let u1 = claims(&pool, f_u, "group", u, 1).await[0];
 
-    let ev_t1 = evidence(&pool, t1, 1).await[0];
-    let ev_p = evidence(&pool, p1, 1).await[0];
-    // T's evidence on a public claim (migration 110's hidden evidence). Forced
-    // after the last evidence INSERT on p1, which would re-publish it.
-    let ev_tp = evidence(&pool, p1, 1).await[0];
+    let (ev_t1, ed_t1) = linked_evidence(&pool, t1, 1).await[0];
+    let (ev_p, ed_p) = linked_evidence(&pool, p1, 1).await[0];
+    // T's evidence on a public claim (migration 110's hidden evidence), its
+    // edge stamped public before the row was hidden. Forced after the last
+    // evidence INSERT on p1, which would re-publish it.
+    let (ev_tp, ed_tp) = linked_evidence(&pool, p1, 1).await[0];
     force_evidence(&pool, ev_tp, t).await;
-    let ev_u1 = evidence(&pool, u1, 1).await[0];
+    let (ev_u1, ed_u1) = linked_evidence(&pool, u1, 1).await[0];
     // A public evidence row of U's claim, forced after the last evidence
     // INSERT on u1 and reached on these maps only through a public edge.
-    let ev_x = evidence(&pool, u1, 1).await[0];
+    let ev_x = bare_evidence(&pool, u1, 1).await[0];
     force_evidence_public(&pool, ev_x, world).await;
     let e_xp = edge(
         &pool,
@@ -475,7 +515,7 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     .await;
     // U's evidence on T's claim, linked by claim_id AND by an edge stamped T
     // before the evidence moved to U.
-    let ev_u = evidence(&pool, t1, 1).await[0];
+    let ev_u = bare_evidence(&pool, t1, 1).await[0];
     let e_evu = edge(
         &pool,
         LeafNode::evidence(ev_u),
@@ -484,6 +524,9 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     )
     .await;
     force_evidence(&pool, ev_u, u).await;
+    // Evidence attached by claim_id alone: one of T's, one public.
+    let ev_bare_t = bare_evidence(&pool, t2, 1).await[0];
+    let ev_bare_p = bare_evidence(&pool, p2, 1).await[0];
 
     let e_tt = edge(&pool, LeafNode::claim(t1), LeafNode::claim(t2), "supports").await;
     let e_tp_u = edge(&pool, LeafNode::claim(t1), LeafNode::claim(p1), "supports").await;
@@ -539,42 +582,52 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         "SELECT id, visibility::text, owner_group_id, co_owner_group_id FROM edges \
           WHERE id = ANY($1) ORDER BY id",
     )
-    .bind(vec![e_tt, e_ay, e_evu, e_up])
+    .bind(vec![e_tt, e_ay, e_evu, e_up, ed_t1, ed_u1])
     .fetch_all(&pool)
     .await
     .expect("stamps");
+    assert_eq!(stamp.len(), 6);
     for (id, vis, owner, co) in &stamp {
-        let want = if *id == e_up { u } else { t };
+        let want = if *id == e_up || *id == ed_u1 { u } else { t };
         assert_eq!(
             (vis.as_str(), *owner, *co),
             ("group", want, None),
             "edge {id}"
         );
     }
-    let public_edge: (String, Option<Uuid>) =
-        sqlx::query_as("SELECT visibility::text, co_owner_group_id FROM edges WHERE id = $1")
-            .bind(e_xp)
-            .fetch_one(&pool)
+    let public_edges: Vec<(String, Option<Uuid>)> =
+        sqlx::query_as("SELECT visibility::text, co_owner_group_id FROM edges WHERE id = ANY($1)")
+            .bind(vec![e_xp, ed_p, ed_tp])
+            .fetch_all(&pool)
             .await
-            .expect("stamp of the public edge");
-    assert_eq!(public_edge, ("public".to_string(), None));
+            .expect("stamps of the public edges");
+    assert_eq!(public_edges, vec![("public".to_string(), None); 3]);
     let ev_stamps: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
         "SELECT id, visibility::text, owner_group_id FROM evidence WHERE id = ANY($1) ORDER BY id",
     )
-    .bind(vec![ev_tp, ev_x, ev_u])
+    .bind(vec![ev_tp, ev_x, ev_u, ev_bare_t, ev_bare_p])
     .fetch_all(&pool)
     .await
     .expect("evidence stamps");
+    assert_eq!(ev_stamps.len(), 5);
     for (id, vis, owner) in &ev_stamps {
-        let want = if *id == ev_tp {
+        let want = if *id == ev_tp || *id == ev_bare_t {
             ("group", t)
-        } else if *id == ev_x {
+        } else if *id == ev_x || *id == ev_bare_p {
             ("public", world)
         } else {
             ("group", u)
         };
         assert_eq!((vis.as_str(), *owner), want, "evidence {id}");
     }
+    let bare_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = ANY($1) OR target_id = ANY($1)",
+    )
+    .bind(vec![ev_bare_t, ev_bare_p])
+    .fetch_one(&pool)
+    .await
+    .expect("edges of the bare evidence");
+    assert_eq!(bare_edges, 0, "the bare evidence rows have no stored edge");
 
     let input = [u1, p2, p1, t2, t1];
     let team_nodes: BTreeSet<LeafNode> = BTreeSet::from([
@@ -597,25 +650,28 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         LeafNode::evidence(ev_p),
         LeafNode::evidence(ev_x),
     ]);
-    let never_edges = BTreeSet::from([e_tp_u, e_co, e_ax, e_evu, e_up, e_ea_u, e_ee_co]);
-    let never_ids = [u1, ev_u, ev_u1, f_u, a_x];
+    let never_edges = BTreeSet::from([e_tp_u, e_co, e_ax, e_evu, e_up, e_ea_u, e_ee_co, ed_u1]);
+    let never_ids = [u1, ev_u, ev_u1, f_u, a_x, ev_bare_t, ev_bare_p];
 
     let check_team = |set: &LeafNodeSet, who: &str| {
         let nodes: BTreeSet<LeafNode> = set.nodes.iter().copied().collect();
         assert_eq!(nodes, team_nodes, "{who}: team map nodes");
         assert_eq!(set.counts.unreadable_claims, 1, "{who}");
+        assert_eq!(
+            set.counts.unlinked_evidence, 2,
+            "{who}: T's and the public bare evidence rows are counted"
+        );
         let stored = stored_ids(set);
         assert_eq!(
             stored,
-            BTreeSet::from([e_tt, e_ay, e_ee_t, e_pp_t, e_pa_t, e_xp]),
+            BTreeSet::from([e_tt, e_ay, e_ee_t, e_pp_t, e_pa_t, e_xp, ed_t1, ed_p, ed_tp]),
             "{who}: team map stored edges"
         );
         assert!(stored.is_disjoint(&never_edges), "{who}");
         for n in &set.nodes {
             assert!(!never_ids.contains(&n.id), "{who}: {n:?} must not be drawn");
         }
-        // Every non-claim node keeps an edge to a claim (derived where no
-        // stored edge links it).
+        // The filer is the only derived edge; evidence keeps its stored one.
         let derived: BTreeSet<(LeafNode, LeafNode, String)> = set
             .edges
             .iter()
@@ -623,7 +679,6 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
             .map(|e| (e.source, e.target, e.relationship.clone()))
             .collect();
         let filer = DERIVED_FILER_RELATIONSHIP.to_string();
-        let attached = DERIVED_EVIDENCE_RELATIONSHIP.to_string();
         assert_eq!(
             derived,
             BTreeSet::from([
@@ -631,17 +686,6 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
                 (LeafNode::agent(f_t), LeafNode::claim(t2), filer.clone()),
                 (LeafNode::agent(f_p), LeafNode::claim(p1), filer.clone()),
                 (LeafNode::agent(f_p), LeafNode::claim(p2), filer),
-                (
-                    LeafNode::evidence(ev_t1),
-                    LeafNode::claim(t1),
-                    attached.clone()
-                ),
-                (
-                    LeafNode::evidence(ev_p),
-                    LeafNode::claim(p1),
-                    attached.clone()
-                ),
-                (LeafNode::evidence(ev_tp), LeafNode::claim(p1), attached),
             ]),
             "{who}"
         );
@@ -660,6 +704,10 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     );
     assert_eq!(nodes, public_nodes, "public map nodes");
     assert_eq!(public_set.counts.unreadable_claims, 3);
+    assert_eq!(
+        public_set.counts.unlinked_evidence, 1,
+        "the public bare evidence row is counted, T's is not read"
+    );
     let public_stored = stored_ids(&public_set);
     assert!(
         !public_stored.contains(&e_pp_t),
@@ -671,7 +719,7 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     );
     assert_eq!(
         public_stored,
-        BTreeSet::from([e_xp]),
+        BTreeSet::from([e_xp, ed_p]),
         "public map stored edges"
     );
 
@@ -731,7 +779,7 @@ async fn retracted_edges_are_never_drawn(pool: PgPool) {
     let map = AtlasMap::Team(t);
     let cs = claims(&pool, f, "group", t, 2).await;
     let (c1, c2) = (cs[0], cs[1]);
-    let e1 = evidence(&pool, c1, 1).await[0];
+    let (e1, e_e1) = linked_evidence(&pool, c1, 1).await[0];
 
     let e_cc = edge(&pool, LeafNode::claim(c1), LeafNode::claim(c2), "supports").await;
     let e_ef = edge(&pool, LeafNode::evidence(e1), LeafNode::agent(f), "cites").await;
@@ -748,8 +796,8 @@ async fn retracted_edges_are_never_drawn(pool: PgPool) {
     let live = fits(build(&pool, &system, map, &cs).await);
     assert_eq!(
         stored_ids(&live),
-        BTreeSet::from([e_cc, e_ef, r_cc, r_ar, r_ef]),
-        "calibration: in force, all five are drawn"
+        BTreeSet::from([e_e1, e_cc, e_ef, r_cc, r_ar, r_ef]),
+        "calibration: in force, all six are drawn"
     );
     assert!(of_kind(&live, LeafNodeKind::Agent).contains(&a_r));
 
@@ -765,7 +813,7 @@ async fn retracted_edges_are_never_drawn(pool: PgPool) {
         !stored.contains(&r_ef),
         "a retracted evidence-to-agent edge"
     );
-    assert_eq!(stored, BTreeSet::from([e_cc, e_ef]));
+    assert_eq!(stored, BTreeSet::from([e_e1, e_cc, e_ef]));
     let nodes: BTreeSet<LeafNode> = set.nodes.iter().copied().collect();
     assert_eq!(
         nodes,

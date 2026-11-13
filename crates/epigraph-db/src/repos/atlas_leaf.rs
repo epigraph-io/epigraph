@@ -56,8 +56,13 @@
 //! * an agent: the claim's filer (`claims.agent_id`), or the credited end of a
 //!   drawable authorship edge to or from the claim
 //!   ([`crate::repos::claim_ingest::credited_agent_end`]);
-//! * evidence: a drawable evidence row whose `claim_id` is the claim, or that a
-//!   drawable edge links to the claim in either direction.
+//! * evidence: a drawable evidence row that a drawable STORED edge links to the
+//!   claim, in either direction, under the relationship name stored on it
+//!   (`supports` and `SUPPORTS` both occur). An evidence row whose only link to
+//!   the leaf is its `claim_id` is NOT a node, since the W10a contract requires
+//!   every evidence node to have an edge to a claim and no edge is derived for
+//!   evidence. It is counted in [`LeafCounts::unlinked_evidence`] until the
+//!   evidence-edge backfill (backlog 2d60f619) gives it a stored edge.
 //!
 //! Every drawable stored edge whose two endpoints (kind and id) are both nodes
 //! of the leaf is an edge of the leaf. Edges to claims outside the leaf belong
@@ -79,10 +84,11 @@
 //! unnormalised. Stored edges repeating one (source, target, relationship)
 //! collapse into one [`LeafEdge`] carrying every stored edge id, so W7 can take
 //! the largest weight among them. The contract wants every agent and evidence
-//! node to have an edge to a claim of the leaf; a column link with no stored
-//! edge behind it therefore becomes a DERIVED edge ([`LeafEdgeOrigin`]): a
-//! filer `agent -asserts-> claim` ([`DERIVED_FILER_RELATIONSHIP`]) and an
-//! `evidence -evidence_for-> claim` ([`DERIVED_EVIDENCE_RELATIONSHIP`]).
+//! node to have an edge to a claim of the leaf. Evidence has one by
+//! construction (it joins only through a stored edge). A filer with no stored
+//! authorship edge to its claim gets the one DERIVED edge ([`LeafEdgeOrigin`]):
+//! `agent -asserts-> claim` ([`DERIVED_FILER_RELATIONSHIP`]) from
+//! `claims.agent_id`.
 //!
 //! Three contract rules this node set does NOT yet enforce; W7/W10, which
 //! assemble the served level document, must:
@@ -122,11 +128,6 @@ pub const ATLAS_LEAF_NODE_CAP: usize = 100;
 /// The relationship of a derived filer edge (`agent -> claim` from
 /// `claims.agent_id`): the stored spelling of the same fact.
 pub const DERIVED_FILER_RELATIONSHIP: &str = "asserts";
-
-/// The relationship of a derived attachment edge (`evidence -> claim` from
-/// `evidence.claim_id`). Deliberately not `supports`, which would preset a
-/// sign that W7 takes from the stored mass.
-pub const DERIVED_EVIDENCE_RELATIONSHIP: &str = "evidence_for";
 
 /// A node kind, spelled as the W10a contract and `edges.source_type` spell it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -216,12 +217,14 @@ pub struct LeafRows {
     /// The candidate claims the map may draw, each with its filer
     /// (`claims.agent_id`), `None` when that id names no agent row.
     pub claims: BTreeMap<Uuid, Option<Uuid>>,
-    /// Drawable evidence rows reached from the claims, each with its
-    /// `claim_id` when that claim is one of `claims`, `None` otherwise (an
-    /// evidence row reached only through an edge, whose own claim the map
-    /// cannot draw or the leaf does not hold). The id of a claim outside
-    /// `claims` is never carried here, so a builder that logs or stores these
-    /// rows cannot leak another team's claim id.
+    /// Drawable evidence rows reached from the claims, by `claim_id` or
+    /// through an edge, each with its `claim_id` when that claim is one of
+    /// `claims`, `None` otherwise (an evidence row reached only through an
+    /// edge, whose own claim the map cannot draw or the leaf does not hold).
+    /// Only a row a stored edge links to a claim of the leaf becomes a node;
+    /// the others are counted ([`LeafCounts::unlinked_evidence`]). The id of
+    /// a claim outside `claims` is never carried here, so a builder that logs
+    /// or stores these rows cannot leak another team's claim id.
     pub evidence: BTreeMap<Uuid, Option<Uuid>>,
     /// Agent rows reached from the claims (filers and edge endpoints).
     pub agents: BTreeSet<Uuid>,
@@ -238,9 +241,6 @@ pub enum LeafEdgeOrigin {
     /// Derived from `claims.agent_id`: the filer, with no stored authorship
     /// edge between it and the claim.
     Filer,
-    /// Derived from `evidence.claim_id`, with no stored edge between the
-    /// evidence row and the claim.
-    EvidenceClaimId,
 }
 
 impl LeafEdgeOrigin {
@@ -274,6 +274,8 @@ pub struct CappedClaim {
     pub kept_agents: usize,
     pub kept_evidence: usize,
     pub total_agents: usize,
+    /// The evidence a stored edge links to the claim; a row attached by
+    /// `claim_id` alone is not counted here ([`LeafCounts::unlinked_evidence`]).
     pub total_evidence: usize,
 }
 
@@ -285,7 +287,7 @@ pub struct LeafCounts {
     pub evidence: usize,
     /// `claims + agents + evidence`.
     pub nodes: usize,
-    /// Collapsed edges among the nodes, derived ones included.
+    /// Collapsed edges among the nodes, derived filer edges included.
     pub edges: usize,
     pub cap: usize,
     /// Requested ids the map may not draw.
@@ -296,6 +298,16 @@ pub struct LeafCounts {
     pub unreadable_claims: usize,
     /// Claims whose attachments were cut ([`CappedClaim`]).
     pub capped_claims: usize,
+    /// Drawable evidence rows attached by `claim_id` to a claim of the leaf
+    /// that no stored edge links to any claim of the leaf, so they are not
+    /// nodes. A row the per-claim cap cut is in [`Self::capped_claims`], not
+    /// here.
+    ///
+    /// BUILDER-INTERNAL: not part of the served level document (the W10a
+    /// contract has no field for it). It counts only rows this map may draw,
+    /// so a build log or run metric may carry it; it measures what the
+    /// evidence-edge backfill (backlog 2d60f619) still has to link.
+    pub unlinked_evidence: usize,
 }
 
 /// A leaf that fits: its nodes and edges, sorted.
@@ -357,12 +369,13 @@ struct LeafIndex<'r> {
     rows: &'r LeafRows,
     /// claim -> its agents: the filer first, then the others by id.
     agents_of: BTreeMap<Uuid, Vec<Uuid>>,
-    /// claim -> its evidence, by id.
+    /// claim -> the evidence a stored edge links to it, by id.
     evidence_of: BTreeMap<Uuid, Vec<Uuid>>,
+    /// claim -> the evidence whose `claim_id` it is, by id (not nodes by
+    /// themselves; [`LeafCounts::unlinked_evidence`]).
+    by_claim_id: BTreeMap<Uuid, Vec<Uuid>>,
     /// Unordered (agent, claim) pairs a stored authorship edge already links.
     authorship_pairs: BTreeSet<(Uuid, Uuid)>,
-    /// Unordered (evidence, claim) pairs a stored edge already links.
-    evidence_pairs: BTreeSet<(Uuid, Uuid)>,
 }
 
 impl<'r> LeafIndex<'r> {
@@ -370,12 +383,12 @@ impl<'r> LeafIndex<'r> {
         let mut agents: BTreeMap<Uuid, BTreeSet<Uuid>> = BTreeMap::new();
         let mut evidence: BTreeMap<Uuid, BTreeSet<Uuid>> = BTreeMap::new();
         let mut authorship_pairs = BTreeSet::new();
-        let mut evidence_pairs = BTreeSet::new();
 
+        let mut by_claim_id: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
         for (&ev, &claim) in &rows.evidence {
             let Some(claim) = claim else { continue };
             if rows.claims.contains_key(&claim) {
-                evidence.entry(claim).or_default().insert(ev);
+                by_claim_id.entry(claim).or_default().push(ev);
             }
         }
         for e in &rows.edges {
@@ -406,11 +419,9 @@ impl<'r> LeafIndex<'r> {
                 }
                 (LeafNodeKind::Evidence, LeafNodeKind::Claim) => {
                     evidence.entry(e.target.id).or_default().insert(e.source.id);
-                    evidence_pairs.insert((e.source.id, e.target.id));
                 }
                 (LeafNodeKind::Claim, LeafNodeKind::Evidence) => {
                     evidence.entry(e.source.id).or_default().insert(e.target.id);
-                    evidence_pairs.insert((e.target.id, e.source.id));
                 }
                 _ => {}
             }
@@ -436,8 +447,8 @@ impl<'r> LeafIndex<'r> {
             rows,
             agents_of,
             evidence_of,
+            by_claim_id,
             authorship_pairs,
-            evidence_pairs,
         }
     }
 
@@ -482,8 +493,8 @@ impl<'r> LeafIndex<'r> {
     }
 
     /// The edges among `nodes`: stored edges collapsed by (source, target,
-    /// relationship), then the derived filer and attachment edges no stored
-    /// edge already shows.
+    /// relationship), then the derived filer edges no stored authorship edge
+    /// already shows.
     fn edges_among(&self, nodes: &BTreeSet<LeafNode>) -> Vec<LeafEdge> {
         let mut out: BTreeMap<(LeafNode, LeafNode, String), LeafEdgeOrigin> = BTreeMap::new();
         for e in &self.rows.edges {
@@ -514,15 +525,6 @@ impl<'r> LeafIndex<'r> {
                 }
             }
         }
-        for n in nodes.iter().filter(|n| n.kind == LeafNodeKind::Evidence) {
-            if let Some(&Some(claim)) = self.rows.evidence.get(&n.id) {
-                let c = LeafNode::claim(claim);
-                if nodes.contains(&c) && !self.evidence_pairs.contains(&(n.id, claim)) {
-                    out.entry((*n, c, DERIVED_EVIDENCE_RELATIONSHIP.to_string()))
-                        .or_insert(LeafEdgeOrigin::EvidenceClaimId);
-                }
-            }
-        }
         out.into_iter()
             .map(|((source, target, relationship), origin)| LeafEdge {
                 source,
@@ -544,6 +546,24 @@ impl<'r> LeafIndex<'r> {
             .collect();
         let unreadable = asked.len() - drawable.len();
         (drawable, unreadable)
+    }
+
+    /// The evidence attached by `claim_id` to one of `claims` that no stored
+    /// edge links to any of them.
+    fn unlinked_evidence(&self, claims: &BTreeSet<Uuid>) -> usize {
+        let linked: BTreeSet<Uuid> = claims
+            .iter()
+            .filter_map(|c| self.evidence_of.get(c))
+            .flatten()
+            .copied()
+            .collect();
+        claims
+            .iter()
+            .filter_map(|c| self.by_claim_id.get(c))
+            .flatten()
+            .filter(|ev| !linked.contains(ev))
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     fn assemble(&self, part: &[Uuid], cap: usize) -> LeafOutcome {
@@ -569,6 +589,7 @@ impl<'r> LeafIndex<'r> {
             cap,
             unreadable_claims,
             capped_claims: capped.len(),
+            unlinked_evidence: self.unlinked_evidence(&claims),
         };
         if nodes.len() > cap {
             return LeafOutcome::NeedsSplit(NeedsSplit {
@@ -694,11 +715,13 @@ impl AtlasLeafRepository {
     /// 1. the drawable candidate claims and their filers;
     /// 2. the drawable edges touching them whose other end is a claim, an
     ///    agent or an evidence row;
-    /// 3. the drawable evidence rows of those claims or at the end of those
-    ///    edges;
+    /// 3. the drawable evidence rows at the end of those edges, or attached
+    ///    to those claims by `claim_id` (counted, not drawn, unless an edge
+    ///    links them);
     /// 4. the agent rows at the end of those edges (no tenancy; drops ids that
     ///    name no agent);
-    /// 5. the drawable edges among those agents and evidence rows.
+    /// 5. the drawable edges among those agents and the evidence rows of 3
+    ///    an edge reached.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if a statement fails.
@@ -783,7 +806,8 @@ impl AtlasLeafRepository {
             }
         }
 
-        // 3. Evidence: attached by claim_id, or at the end of an edge.
+        // 3. Evidence: at the end of an edge (a node), or attached by
+        //    claim_id (counted when no stored edge links it).
         let sql = viewer.splice(
             "SELECT ev.id, ev.claim_id \
                FROM evidence ev \
@@ -794,10 +818,10 @@ impl AtlasLeafRepository {
                 /* {VISIBILITY:ev} */",
             4,
         );
-        let edge_evidence: Vec<Uuid> = edge_evidence.into_iter().collect();
+        let edge_evidence_ids: Vec<Uuid> = edge_evidence.iter().copied().collect();
         let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql)
             .bind(&claim_list)
-            .bind(&edge_evidence)
+            .bind(&edge_evidence_ids)
             .bind(team);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
@@ -823,8 +847,13 @@ impl AtlasLeafRepository {
             agents.extend(found);
         }
 
-        // 5. Edges among the agents and evidence rows.
-        let others: Vec<Uuid> = agents.iter().chain(evidence.keys()).copied().collect();
+        // 5. Edges among the agents and the evidence rows an edge reached
+        //    (the only evidence that can be a node).
+        let others: Vec<Uuid> = agents
+            .iter()
+            .chain(evidence.keys().filter(|ev| edge_evidence.contains(ev)))
+            .copied()
+            .collect();
         let sql = viewer.splice(
             "SELECT e.id, e.source_type::text, e.source_id, e.target_type::text, e.target_id, \
                     e.relationship::text \
@@ -944,8 +973,22 @@ mod tests {
         }
     }
 
+    /// Evidence `ev` on `claim`: its `claim_id` and a stored `evidence ->
+    /// claim` edge, spelled `supports` and `SUPPORTS` in turn (both spellings
+    /// are stored today).
+    fn attach(rows: &mut LeafRows, ev: Uuid, claim: Uuid) {
+        rows.evidence.insert(ev, Some(claim));
+        let n = rows.edges.len() as u64;
+        rows.edges.push(StoredLeafEdge {
+            id: Uuid::from_u64_pair(u64::MAX, n),
+            source: LeafNode::evidence(ev),
+            target: LeafNode::claim(claim),
+            relationship: if n % 2 == 0 { "supports" } else { "SUPPORTS" }.to_string(),
+        });
+    }
+
     /// `n` claims with ids 1..=n, all filed by agent 1000, each with
-    /// `per_claim` evidence rows of its own.
+    /// `per_claim` evidence rows of its own, each linked by a stored edge.
     fn rows_with(n: u128, per_claim: u128) -> LeafRows {
         let mut rows = LeafRows::default();
         rows.agents.insert(id(1000));
@@ -953,8 +996,7 @@ mod tests {
             rows.requested.insert(id(c));
             rows.claims.insert(id(c), Some(id(1000)));
             for k in 0..per_claim {
-                rows.evidence
-                    .insert(id(10_000 + c * 1_000 + k), Some(id(c)));
+                attach(&mut rows, id(10_000 + c * 1_000 + k), id(c));
             }
         }
         rows
@@ -1048,7 +1090,7 @@ mod tests {
 
         // One more evidence row: 101.
         let mut over = rows.clone();
-        over.evidence.insert(id(9_999), Some(id(1)));
+        attach(&mut over, id(9_999), id(1));
         match assemble_leaf(&over, &all(&over), 100).unwrap() {
             LeafOutcome::NeedsSplit(n) => {
                 assert_eq!(n.reason, SplitReason::NodeCap);
@@ -1122,6 +1164,11 @@ mod tests {
                     r.below(4)
                 };
                 for _ in 0..k {
+                    let ev = r.uuid();
+                    attach(&mut rows, ev, c);
+                }
+                // Sometimes a row attached by claim_id alone: no node.
+                if r.below(5) == 0 {
                     rows.evidence.insert(r.uuid(), Some(c));
                 }
                 if i > 0 && r.below(3) == 0 {
@@ -1224,12 +1271,30 @@ mod tests {
         );
     }
 
+    fn evidence_nodes(set: &LeafNodeSet) -> BTreeSet<Uuid> {
+        set.nodes
+            .iter()
+            .filter(|n| n.kind == LeafNodeKind::Evidence)
+            .map(|n| n.id)
+            .collect()
+    }
+
+    /// Evidence is a node only through a stored edge to a claim of the leaf,
+    /// in either direction and under its stored spelling; a row attached by
+    /// `claim_id` alone is no node and no edge, and is counted in
+    /// `unlinked_evidence`. The filer is the only derived edge, and only
+    /// where no stored authorship edge stands.
     #[test]
-    fn derived_edges_stand_in_only_where_no_stored_edge_does() {
-        let mut rows = rows_with(2, 1);
-        // Claim 2's filer also has a stored authorship edge, and claim 2's
-        // evidence a stored edge: neither gets a derived twin.
-        let ev2 = id(10_000 + 2_000);
+    fn evidence_joins_only_through_a_stored_edge_and_only_the_filer_edge_is_derived() {
+        let mut rows = rows_with(3, 0);
+        let (bare, linked, reversed) = (id(501), id(502), id(503));
+        // Claim 1: a row attached by claim_id alone.
+        rows.evidence.insert(bare, Some(id(1)));
+        // Claim 2: a row with a stored `evidence -> claim` edge.
+        rows.evidence.insert(linked, Some(id(2)));
+        // Claim 3: a row whose claim is not the leaf's, linked by a stored
+        // `claim -> evidence` edge.
+        rows.evidence.insert(reversed, None);
         rows.edges = vec![
             edge(
                 1,
@@ -1239,12 +1304,31 @@ mod tests {
             ),
             edge(
                 2,
-                LeafNode::evidence(ev2),
+                LeafNode::evidence(linked),
                 LeafNode::claim(id(2)),
                 "refutes",
             ),
+            edge(
+                3,
+                LeafNode::claim(id(3)),
+                LeafNode::evidence(reversed),
+                "cites",
+            ),
         ];
         let set = fits(assemble_leaf(&rows, &all(&rows), 100).unwrap());
+        assert_eq!(
+            evidence_nodes(&set),
+            BTreeSet::from([linked, reversed]),
+            "the bare row is no node"
+        );
+        assert_eq!(set.counts.unlinked_evidence, 1);
+        assert!(
+            set.edges
+                .iter()
+                .all(|e| e.source != LeafNode::evidence(bare)
+                    && e.target != LeafNode::evidence(bare)),
+            "no edge is made for the bare row"
+        );
         let derived: Vec<(LeafNode, LeafNode, &str)> = set
             .edges
             .iter()
@@ -1260,13 +1344,61 @@ mod tests {
                     DERIVED_FILER_RELATIONSHIP
                 ),
                 (
-                    LeafNode::evidence(id(10_000 + 1_000)),
-                    LeafNode::claim(id(1)),
-                    DERIVED_EVIDENCE_RELATIONSHIP
+                    LeafNode::agent(id(1000)),
+                    LeafNode::claim(id(3)),
+                    DERIVED_FILER_RELATIONSHIP
                 ),
             ]
         );
         assert_attached(&set);
+
+        // Claim 1 alone: no evidence node at all.
+        let one = fits(assemble_leaf(&rows, &[id(1)], 100).unwrap());
+        assert_eq!((one.counts.evidence, one.counts.unlinked_evidence), (0, 1));
+    }
+
+    /// `unlinked_evidence` counts the rows attached by `claim_id` to a claim
+    /// of THIS leaf that no stored edge links to any claim of this leaf. A row
+    /// the per-claim cap cut is capped, not unlinked; a row linked only to a
+    /// claim in another part is unlinked in the part that lacks that claim.
+    #[test]
+    fn unlinked_evidence_counts_rows_no_stored_edge_links_to_the_leaf() {
+        // Claim 1: 12 linked rows, 4 of them cut at a cap of 10, and two
+        // bare rows.
+        let mut rows = rows_with(1, 12);
+        rows.evidence.insert(id(601), Some(id(1)));
+        rows.evidence.insert(id(602), Some(id(1)));
+        let set = fits(assemble_leaf(&rows, &all(&rows), 10).unwrap());
+        assert_eq!(set.capped.len(), 1);
+        assert_eq!(
+            (set.capped[0].kept_evidence, set.capped[0].total_evidence),
+            (8, 12)
+        );
+        assert_eq!(set.counts.unlinked_evidence, 2, "the cut rows are capped");
+
+        // Claim 2 joins; a row on claim 1 by claim_id is linked to claim 2.
+        let mut rows = rows_with(2, 0);
+        let elsewhere = id(600);
+        rows.evidence.insert(elsewhere, Some(id(1)));
+        rows.edges.push(edge(
+            7,
+            LeafNode::evidence(elsewhere),
+            LeafNode::claim(id(2)),
+            "supports",
+        ));
+        let both = fits(assemble_leaf(&rows, &[id(1), id(2)], 100).unwrap());
+        assert_eq!(evidence_nodes(&both), BTreeSet::from([elsewhere]));
+        assert_eq!(both.counts.unlinked_evidence, 0);
+        let first = fits(assemble_leaf(&rows, &[id(1)], 100).unwrap());
+        assert_eq!(
+            (first.counts.evidence, first.counts.unlinked_evidence),
+            (0, 1)
+        );
+        let second = fits(assemble_leaf(&rows, &[id(2)], 100).unwrap());
+        assert_eq!(
+            (second.counts.evidence, second.counts.unlinked_evidence),
+            (1, 0)
+        );
     }
 
     #[test]
