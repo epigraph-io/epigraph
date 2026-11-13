@@ -1134,7 +1134,9 @@ enum Command {
     /// Reverse a `backfill-evidence-edges` run from its manifest: delete
     /// exactly the edges it wrote, each only while it still runs from the
     /// recorded evidence to the recorded claim with the recorded
-    /// relationship. Dry run rolls back.
+    /// relationship and nobody has built on it since (an edge retracted, or
+    /// keying an edge-keyed BBA, is kept and counted). An applied reversal
+    /// holds the backfill's advisory lock. Dry run rolls back.
     ReverseEvidenceEdges {
         /// The run's manifest.
         #[arg(long)]
