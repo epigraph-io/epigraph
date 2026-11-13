@@ -84,6 +84,19 @@
 //! filer `agent -asserts-> claim` ([`DERIVED_FILER_RELATIONSHIP`]) and an
 //! `evidence -evidence_for-> claim` ([`DERIVED_EVIDENCE_RELATIONSHIP`]).
 //!
+//! Three contract rules this node set does NOT yet enforce; W7/W10, which
+//! assemble the served level document, must:
+//!
+//! * **direction**: a [`LeafEdge`] points the way its stored row points; the
+//!   contract's edge points the way belief flows, so a stored `claim ->
+//!   evidence` row must be re-oriented before its `exact` basis applies;
+//! * **relationship spelling**: the contract requires `^[A-Za-z][A-Za-z0-9_]*$`
+//!   and at most 32 characters, while `edges.relationship` is `varchar(100)`
+//!   with only a non-empty check; the name is passed through unchecked, so a
+//!   name outside the pattern must be dropped or mapped before validation;
+//! * **edge limit**: the contract allows at most 1,024 edges per leaf.
+//!   [`LeafCounts::edges`] reports the count; nothing here splits on it.
+//!
 //! # Determinism
 //!
 //! Every output is built from ordered collections, so it depends on the SET of
@@ -239,6 +252,12 @@ impl LeafEdgeOrigin {
 }
 
 /// One edge of a leaf, pointing the way the stored row points.
+///
+/// NOT yet the W10a contract's direction: the contract's `edge` points "the
+/// way belief flows" (evidence to claim for its `exact` basis), and a stored
+/// `claim -> evidence` row is emitted here as claim to evidence. W7 (flow
+/// weights) or W10 (the level document) re-orients; see the module
+/// documentation's contract gaps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafEdge {
     pub source: LeafNode,
