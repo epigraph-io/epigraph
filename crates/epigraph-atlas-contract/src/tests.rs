@@ -612,6 +612,42 @@ const BELIEF_KEYS: &[&str] = &[
     "betp",
 ];
 
+/// The string literals of the `BELIEF_KEYS` array in a Rust source.
+fn belief_keys_in(src: &str) -> Vec<String> {
+    let start = src
+        .find("BELIEF_KEYS: &[&str] = &[")
+        .expect("the source defines BELIEF_KEYS");
+    let body = &src[start..];
+    let body = &body[body.find('[').unwrap()..];
+    let body = &body[body[1..].find('[').unwrap() + 1..];
+    let body = &body[..body.find("];").expect("BELIEF_KEYS ends with `];`")];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(String::from)
+        .collect()
+}
+
+/// The Explorer keeps its own copy of the banned-key list (it builds
+/// standalone and cannot depend on this crate), used by
+/// `assert_no_belief_keys` on the region and theme routes and by its
+/// contract tests. The kernel can read the Explorer's tree, so it ties the
+/// two copies: a key added to one list and not the other fails here.
+#[test]
+fn the_explorer_bans_the_same_belief_keys() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../services/explorer/tests/common/atlas_contract.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let explorer: BTreeSet<String> = belief_keys_in(&src).into_iter().collect();
+    let kernel: BTreeSet<String> = BELIEF_KEYS.iter().map(|k| k.to_string()).collect();
+    assert!(kernel.contains("betp"), "the kernel list bans betp");
+    assert_eq!(
+        explorer, kernel,
+        "services/explorer/tests/common/atlas_contract.rs BELIEF_KEYS differs from the kernel's"
+    );
+}
+
 /// Every object key in `v`, and every string listed under a `required`.
 fn keys_in(v: &Value, out: &mut BTreeSet<String>) {
     match v {
