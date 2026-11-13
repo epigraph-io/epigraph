@@ -1,0 +1,33 @@
+[package]
+name = "epigraph-atlas-contract"
+description = "The Atlas nested-level payload contract (schema v1): serde types, invariants, and a schema/budget checker for tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Compiles `check` (the JSON Schema validator for served bodies) and
+# `fixtures` (the seeded fixture generator) for other crates' tests, such as
+# the W10 route tests. Producers (the layout builder, the routes) depend on
+# this crate WITHOUT the feature: they need the types, `validate()`,
+# `to_stored_json()` (which measures the gzip budget, hence flate2 always)
+# and `for_viewer()`, not a JSON Schema validator. This crate's own unit
+# tests compile both modules without the feature, through the
+# dev-dependencies below.
+check = ["dep:jsonschema"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+# default-features = false: the defaults resolve remote `$ref`s over HTTP
+# (reqwest + rustls with aws-lc-rs). The schema has no remote reference.
+jsonschema = { version = "0.61", default-features = false, optional = true }
+flate2 = "1"
+
+[dev-dependencies]
+jsonschema = { version = "0.61", default-features = false }
+
+[lints]
+workspace = true

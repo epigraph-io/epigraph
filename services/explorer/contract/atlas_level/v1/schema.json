@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:epigraph:atlas-level:v1",
+  "title": "Atlas nested level, schema v1",
+  "description": "One Atlas level below a theme: a group level (named children and aggregated cross-group link bundles) or a leaf (at most 100 nodes with precomputed positions, belief-flow edges and outgoing links). Stored as one jsonb document per (map, hierarchy, level). Served filtered for the viewer: the kernel route drops every leaf node the viewer's own session cannot read, with its edges and outgoing sources, and any agent or evidence node left with no edge to a claim; with no claim left it answers not-found. Counts pass through as stored. The document holds claim text and LLM names, so it is assembled on the prod box; off-box stages produce only ids, positions and weights. Every object is closed: a key not listed here fails validation. Budget: the compact serialisation is at most 150000 bytes gzip-compressed. The caps below keep the largest document they allow inside it when its text is no less compressible than random Latin, Greek, Cyrillic and CJK characters, but they do not guarantee it: producers measure every stored document and a route test measures every served body. Positions are in a unit frame: x and y in [-1, 1], r in (0, 1].",
+  "oneOf": [
+    { "$ref": "#/$defs/group_level" },
+    { "$ref": "#/$defs/leaf_level" }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "nullable_uuid": {
+      "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }]
+    },
+    "name": {
+      "description": "An LLM-assessed group name, generated only from text every viewer of the map can read. Null until the group is first named.",
+      "anyOf": [
+        { "type": "string", "minLength": 1, "maxLength": 120 },
+        { "type": "null" }
+      ]
+    },
+    "label": {
+      "description": "A node label: claim text clipped to 160 characters, an agent's display name, or an evidence title.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "unit_interval": { "type": "number", "minimum": 0, "maximum": 1 },
+    "nullable_unit_interval": {
+      "anyOf": [{ "$ref": "#/$defs/unit_interval" }, { "type": "null" }]
+    },
+    "coord": { "type": "number", "minimum": -1, "maximum": 1 },
+    "depth": {
+      "description": "0 is the theme root of a hierarchy.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16
+    },
+    "count": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "hierarchy": {
+      "description": "meaning: groups of claims with similar embeddings. links: communities of densely interlinked claims.",
+      "enum": ["meaning", "links"]
+    },
+    "sign": {
+      "description": "1 supporting, -1 opposing (contradicts, refutes), 0 no belief direction.",
+      "enum": [-1, 0, 1]
+    },
+    "breadcrumb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level_id", "name", "depth"],
+      "properties": {
+        "level_id": { "$ref": "#/$defs/uuid" },
+        "name": { "$ref": "#/$defs/name" },
+        "depth": { "$ref": "#/$defs/depth" }
+      }
+    },
+    "switch": {
+      "description": "The meaning/links switch: the counterpart level in the other hierarchy for the same theme. Which level is chosen (best overlap, or the other hierarchy's root) is the builder's choice; it is always in the other hierarchy.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hierarchy", "level_id"],
+      "properties": {
+        "hierarchy": { "$ref": "#/$defs/hierarchy" },
+        "level_id": { "$ref": "#/$defs/uuid" }
+      }
+    },
+    "link_target": {
+      "description": "A group a link leads to, enough to fly to it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level_id", "theme_id", "name", "depth"],
+      "properties": {
+        "level_id": { "$ref": "#/$defs/uuid" },
+        "theme_id": { "$ref": "#/$defs/uuid" },
+        "name": { "$ref": "#/$defs/name" },
+        "depth": { "$ref": "#/$defs/depth" }
+      }
+    },
+    "envelope_rules": {
+      "allOf": [
+        {
+          "description": "A team map names its team group; the public map names none.",
+          "if": {
+            "properties": { "map_scope": { "const": "team" } },
+            "required": ["map_scope"]
+          },
+          "then": { "properties": { "map_group_id": { "$ref": "#/$defs/uuid" } } },
+          "else": { "properties": { "map_group_id": { "type": "null" } } }
+        },
+        { "$ref": "#/$defs/unnamed_needs_naming" },
+        {
+          "description": "The switch leads to the other hierarchy.",
+          "if": {
+            "properties": { "hierarchy": { "const": "meaning" } },
+            "required": ["hierarchy"]
+          },
+          "then": {
+            "properties": {
+              "switch": { "properties": { "hierarchy": { "const": "links" } } }
+            }
+          },
+          "else": {
+            "properties": {
+              "switch": { "properties": { "hierarchy": { "const": "meaning" } } }
+            }
+          }
+        }
+      ]
+    },
+    "unnamed_needs_naming": {
+      "description": "A group with no name yet is flagged for naming.",
+      "if": {
+        "properties": { "name": { "type": "null" } },
+        "required": ["name"]
+      },
+      "then": { "properties": { "needs_naming": { "const": true } } }
+    },
+    "child": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "name", "needs_naming", "claim_count", "x", "y", "r"],
+      "properties": {
+        "id": { "$ref": "#/$defs/uuid" },
+        "kind": { "enum": ["group", "leaf"] },
+        "name": { "$ref": "#/$defs/name" },
+        "needs_naming": { "type": "boolean" },
+        "claim_count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "x": { "$ref": "#/$defs/coord" },
+        "y": { "$ref": "#/$defs/coord" },
+        "r": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      },
+      "allOf": [{ "$ref": "#/$defs/unnamed_needs_naming" }]
+    },
+    "bundle": {
+      "description": "All links from one child to one target group, aggregated. The target is a sibling child or an entry of targets.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "target", "count", "net_sign"],
+      "properties": {
+        "source": { "$ref": "#/$defs/uuid" },
+        "target": { "$ref": "#/$defs/uuid" },
+        "count": { "$ref": "#/$defs/count" },
+        "net_sign": { "$ref": "#/$defs/sign" }
+      }
+    },
+    "claim_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A claim of the leaf. It carries no belief value (no BetP): v1 leaves are drawn before the evidence behind each claim is filed as stored edges, so a served BetP would rest on evidence the leaf cannot show. A later schema version may add one.",
+      "required": ["kind", "id", "label", "x", "y", "truth_value"],
+      "properties": {
+        "kind": { "const": "claim" },
+        "id": { "$ref": "#/$defs/uuid" },
+        "label": { "$ref": "#/$defs/label" },
+        "x": { "$ref": "#/$defs/coord" },
+        "y": { "$ref": "#/$defs/coord" },
+        "truth_value": {
+          "description": "The colour value, as at the region and theme levels. Colour only: never an input to a flow weight.",
+          "$ref": "#/$defs/nullable_unit_interval"
+        }
+      }
+    },
+    "plain_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "label", "x", "y"],
+      "properties": {
+        "kind": { "enum": ["agent", "evidence"] },
+        "id": { "$ref": "#/$defs/uuid" },
+        "label": { "$ref": "#/$defs/label" },
+        "x": { "$ref": "#/$defs/coord" },
+        "y": { "$ref": "#/$defs/coord" }
+      }
+    },
+    "edge": {
+      "description": "A link between two nodes of the leaf, pointing the way belief flows. The endpoint kinds fix flow_basis. exact: every evidence-to-claim edge, the stored mass. proxy: every claim-to-claim edge, the link's strength times its sign and nothing else, which the view labels an estimate. flow_weight is strength times the absolute sign (sign carries the direction), so a cites link, with sign 0, weighs 0. No belief value of any kind (no BetP, belief or truth_value of either claim) enters it, so a served weight can never be divided back into a belief; the layout builder reads no belief to compute it, only the strength of the link's own edge row. none: every other pair (an agent's authorship, for example), so weight 0 and sign 0. The builder draws an edge only from edge rows visible to the map's audience (public rows for the public map; public rows and rows the team owns or co-owns for a team map), and only then collapses stored rows repeating one (source, target, relationship) into one edge with the largest flow_weight among them.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "target", "relationship", "sign", "flow_weight", "flow_basis"],
+      "properties": {
+        "source": { "$ref": "#/$defs/uuid" },
+        "target": { "$ref": "#/$defs/uuid" },
+        "relationship": {
+          "description": "The stored relationship name, unnormalised: both casings are in use (AUTHORED and authored), so the view compares names case-insensitively.",
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
+          "maxLength": 32
+        },
+        "sign": { "$ref": "#/$defs/sign" },
+        "flow_weight": { "$ref": "#/$defs/unit_interval" },
+        "flow_basis": { "enum": ["exact", "proxy", "none"] }
+      },
+      "allOf": [
+        {
+          "description": "An edge with no flow has weight 0 and sign 0.",
+          "if": {
+            "properties": { "flow_basis": { "const": "none" } },
+            "required": ["flow_basis"]
+          },
+          "then": {
+            "properties": { "flow_weight": { "const": 0 }, "sign": { "const": 0 } }
+          }
+        },
+        {
+          "description": "A proxy edge weighs strength times the absolute sign, so with sign 0 it weighs 0.",
+          "if": {
+            "properties": { "flow_basis": { "const": "proxy" }, "sign": { "const": 0 } },
+            "required": ["flow_basis", "sign"]
+          },
+          "then": { "properties": { "flow_weight": { "const": 0 } } }
+        }
+      ]
+    },
+    "outgoing": {
+      "description": "All links leaving the leaf for one target group, aggregated; sources are the leaf nodes they leave from.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "count", "net_sign", "sources"],
+      "properties": {
+        "target": { "$ref": "#/$defs/link_target" },
+        "count": { "$ref": "#/$defs/count" },
+        "net_sign": { "$ref": "#/$defs/sign" },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/uuid" }
+        }
+      }
+    },
+    "group_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "kind", "map_scope", "map_group_id", "hierarchy", "theme_id",
+        "run_id", "level_id", "depth", "name", "needs_naming", "breadcrumbs", "switch",
+        "children", "bundles", "targets"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "kind": { "const": "group" },
+        "map_scope": { "enum": ["team", "public"] },
+        "map_group_id": { "$ref": "#/$defs/nullable_uuid" },
+        "hierarchy": { "$ref": "#/$defs/hierarchy" },
+        "theme_id": { "$ref": "#/$defs/uuid" },
+        "run_id": { "$ref": "#/$defs/uuid" },
+        "level_id": { "$ref": "#/$defs/uuid" },
+        "depth": { "$ref": "#/$defs/depth" },
+        "name": { "$ref": "#/$defs/name" },
+        "needs_naming": { "type": "boolean" },
+        "breadcrumbs": {
+          "description": "Ancestors from the theme root down to the parent; one per depth.",
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/breadcrumb" }
+        },
+        "switch": { "$ref": "#/$defs/switch" },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/child" }
+        },
+        "bundles": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": { "$ref": "#/$defs/bundle" }
+        },
+        "targets": {
+          "description": "Groups outside this level that a bundle leads to, each listed once.",
+          "type": "array",
+          "maxItems": 160,
+          "items": { "$ref": "#/$defs/link_target" }
+        }
+      },
+      "allOf": [{ "$ref": "#/$defs/envelope_rules" }]
+    },
+    "leaf_level": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "kind", "map_scope", "map_group_id", "hierarchy", "theme_id",
+        "run_id", "level_id", "depth", "name", "needs_naming", "breadcrumbs", "switch",
+        "nodes", "edges", "outgoing"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "kind": { "const": "leaf" },
+        "map_scope": { "enum": ["team", "public"] },
+        "map_group_id": { "$ref": "#/$defs/nullable_uuid" },
+        "hierarchy": { "$ref": "#/$defs/hierarchy" },
+        "theme_id": { "$ref": "#/$defs/uuid" },
+        "run_id": { "$ref": "#/$defs/uuid" },
+        "level_id": { "$ref": "#/$defs/uuid" },
+        "depth": { "$ref": "#/$defs/depth" },
+        "name": { "$ref": "#/$defs/name" },
+        "needs_naming": { "type": "boolean" },
+        "breadcrumbs": {
+          "description": "Ancestors from the theme root down to the parent; one per depth.",
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/breadcrumb" }
+        },
+        "switch": { "$ref": "#/$defs/switch" },
+        "nodes": {
+          "description": "Claims, agents and evidence, counted together.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "oneOf": [{ "$ref": "#/$defs/claim_node" }, { "$ref": "#/$defs/plain_node" }]
+          }
+        },
+        "edges": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/edge" }
+        },
+        "outgoing": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/outgoing" }
+        }
+      },
+      "allOf": [{ "$ref": "#/$defs/envelope_rules" }]
+    },
+    "kernel_not_found": {
+      "description": "The kernel's answer for a level that is absent, unreadable, or in a map the viewer is not a member of: one body for all three, with no level shape.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "message", "details"],
+      "properties": {
+        "error": { "const": "NotFound" },
+        "message": { "type": "string", "pattern": "^atlas_level with ID [^ ]+ not found$" },
+        "details": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entity", "id"],
+          "properties": {
+            "entity": { "const": "atlas_level" },
+            "id": { "type": "string" }
+          }
+        }
+      }
+    },
+    "bff_not_found": {
+      "description": "The Explorer BFF's answer for the same three cases.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "message"],
+      "properties": {
+        "error": { "const": "not_found" },
+        "message": { "const": "We could not find that atlas level." }
+      }
+    }
+  }
+}
