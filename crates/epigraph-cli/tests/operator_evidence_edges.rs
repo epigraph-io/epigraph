@@ -567,7 +567,11 @@ async fn the_census_counts_a_doubly_sealed_row_once_and_names_provenance_rows(po
     .execute(&pool)
     .await
     .expect("derivation row");
-    assert_eq!(missing(&pool).await.len(), 2, "control: both rows lack an edge");
+    assert_eq!(
+        missing(&pool).await.len(),
+        2,
+        "control: both rows lack an edge"
+    );
 
     let run = run_op(&pool, &["backfill-evidence-edges"]).await;
     assert_eq!(run.code, 0, "{}", run.show());
@@ -576,7 +580,11 @@ async fn the_census_counts_a_doubly_sealed_row_once_and_names_provenance_rows(po
         "to_write: 1",
         "ground the claim): 1",
     ] {
-        assert!(run.stdout.contains(line), "missing {line:?}:\n{}", run.show());
+        assert!(
+            run.stdout.contains(line),
+            "missing {line:?}:\n{}",
+            run.show()
+        );
     }
 }
 

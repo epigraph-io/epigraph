@@ -97,7 +97,10 @@ async fn seed(pool: &PgPool, tag: &str) -> Fx {
     .fetch_one(pool)
     .await
     .expect("count");
-    assert_eq!(derivation_edges, 1, "control: the derivation row has its edge");
+    assert_eq!(
+        derivation_edges, 1,
+        "control: the derivation row has its edge"
+    );
 
     // The shape `memorize` writes: a testimony whose source is the tool.
     let stamp: Uuid = sqlx::query_scalar(
