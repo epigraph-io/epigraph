@@ -2497,6 +2497,39 @@ fn atlas_nested_js_is_pure_and_safe() {
     assert!(epigraph_explorer::assets::find("atlas_nested.js").is_some());
 }
 
+/// The nested levels draw the served positions: their code in atlas.js runs
+/// no force simulation or collision pass (design §6 allows at most a 300 ms
+/// settle; it uses none), and takes placement and edge styles from the tested
+/// rules in atlas_nested.js rather than computing its own.
+#[test]
+fn atlas_js_nested_levels_run_no_layout() {
+    let js = include_str!("../static/atlas.js");
+    let start = js
+        .find("// ---- nested levels (W11)")
+        .expect("the nested section");
+    let end = start
+        + js[start..]
+            .find("// ---- drawing ----")
+            .expect("the drawing section follows");
+    let nested = &js[start..end];
+    for banned in ["forceSimulation", "collide(", ".tick("] {
+        assert!(
+            !nested.contains(banned),
+            "nested code must not use {banned}"
+        );
+    }
+    for needed in [
+        "NESTED.leafPositions(",
+        "NESTED.placeChildren(",
+        "NESTED.edgeStyle(",
+        "NESTED.particleFractions(",
+        "NESTED.switchTarget(",
+        "NESTED.levelProblem(",
+    ] {
+        assert!(nested.contains(needed), "nested code uses {needed}");
+    }
+}
+
 /// A `--token: #rrggbb;` from a stylesheet, in the light or the dark theme.
 fn css_hex(css: &str, name: &str, dark: bool) -> [f64; 3] {
     let split = css

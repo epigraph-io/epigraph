@@ -16,7 +16,9 @@
   <span class="atlas__key"><span class="atlas__ramp"></span>fill: authored truth value, low to high; grey = none</span>
   <span class="atlas__key"><span class="atlas__swatch atlas__swatch--critical"></span>dashed: contradicts or refutes</span>
 </div>
-<div class="atlas__legend atlas__legend--leaf small muted" data-role="leaf-legend" hidden>
+{#- Always laid out (only its visibility changes), so showing it never
+    resizes the canvas. -#}
+<div class="atlas__legend atlas__legend--leaf atlas__legend--off small muted" data-role="leaf-legend">
   <span class="atlas__key"><span class="atlas__line atlas__line--exact"></span>solid: evidence, its stored mass</span>
   <span class="atlas__key"><span class="atlas__line atlas__line--proxy"></span>dashed: estimate (link strength × sign, no belief)</span>
   <span class="atlas__key"><span class="atlas__line atlas__line--oppose"></span>red: contradicts or refutes</span>
