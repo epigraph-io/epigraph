@@ -204,8 +204,12 @@ pub struct LeafRows {
     /// (`claims.agent_id`), `None` when that id names no agent row.
     pub claims: BTreeMap<Uuid, Option<Uuid>>,
     /// Drawable evidence rows reached from the claims, each with its
-    /// `claim_id`.
-    pub evidence: BTreeMap<Uuid, Uuid>,
+    /// `claim_id` when that claim is one of `claims`, `None` otherwise (an
+    /// evidence row reached only through an edge, whose own claim the map
+    /// cannot draw or the leaf does not hold). The id of a claim outside
+    /// `claims` is never carried here, so a builder that logs or stores these
+    /// rows cannot leak another team's claim id.
+    pub evidence: BTreeMap<Uuid, Option<Uuid>>,
     /// Agent rows reached from the claims (filers and edge endpoints).
     pub agents: BTreeSet<Uuid>,
     /// Drawable stored edges among those claims, agents and evidence rows.
@@ -266,6 +270,10 @@ pub struct LeafCounts {
     pub edges: usize,
     pub cap: usize,
     /// Requested ids the map may not draw.
+    ///
+    /// BUILDER-INTERNAL: never serve it, log it or store it in a run row. On a
+    /// team map it counts the other teams' claims a candidate leaf named,
+    /// which is itself a fact about rows this map's readers cannot see.
     pub unreadable_claims: usize,
     /// Claims whose attachments were cut ([`CappedClaim`]).
     pub capped_claims: usize,
@@ -319,7 +327,7 @@ pub enum LeafOutcome {
     NeedsSplit(NeedsSplit),
     /// No requested claim is drawable on this map: no leaf (the W10a contract
     /// requires at least one node). `unreadable_claims` requested ids were
-    /// dropped.
+    /// dropped; builder-internal, as [`LeafCounts::unreadable_claims`].
     Empty { unreadable_claims: usize },
 }
 
@@ -346,6 +354,7 @@ impl<'r> LeafIndex<'r> {
         let mut evidence_pairs = BTreeSet::new();
 
         for (&ev, &claim) in &rows.evidence {
+            let Some(claim) = claim else { continue };
             if rows.claims.contains_key(&claim) {
                 evidence.entry(claim).or_default().insert(ev);
             }
@@ -487,7 +496,7 @@ impl<'r> LeafIndex<'r> {
             }
         }
         for n in nodes.iter().filter(|n| n.kind == LeafNodeKind::Evidence) {
-            if let Some(&claim) = self.rows.evidence.get(&n.id) {
+            if let Some(&Some(claim)) = self.rows.evidence.get(&n.id) {
                 let c = LeafNode::claim(claim);
                 if nodes.contains(&c) && !self.evidence_pairs.contains(&(n.id, claim)) {
                     out.entry((*n, c, DERIVED_EVIDENCE_RELATIONSHIP.to_string()))
@@ -774,7 +783,14 @@ impl AtlasLeafRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let evidence: BTreeMap<Uuid, Uuid> = q.fetch_all(&mut *conn).await?.into_iter().collect();
+        // A claim_id outside the drawable candidate claims is dropped here
+        // (`LeafRows::evidence`): it may name another team's claim.
+        let evidence: BTreeMap<Uuid, Option<Uuid>> = q
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|(ev, claim): (Uuid, Uuid)| (ev, claims.contains_key(&claim).then_some(claim)))
+            .collect();
 
         // 4. Agents at the end of an edge: `agents` is readable by every
         //    session (077's agents_identity), so this only drops dangling ids.
@@ -918,7 +934,8 @@ mod tests {
             rows.requested.insert(id(c));
             rows.claims.insert(id(c), Some(id(1000)));
             for k in 0..per_claim {
-                rows.evidence.insert(id(10_000 + c * 1_000 + k), id(c));
+                rows.evidence
+                    .insert(id(10_000 + c * 1_000 + k), Some(id(c)));
             }
         }
         rows
@@ -961,7 +978,7 @@ mod tests {
         // 3 claims, one shared filer, one evidence row on claim 1 that an edge
         // also links to claims 2 and 3, and a second agent authoring two.
         let mut rows = rows_with(3, 0);
-        rows.evidence.insert(id(500), id(1));
+        rows.evidence.insert(id(500), Some(id(1)));
         rows.agents.insert(id(2000));
         rows.edges = vec![
             edge(
@@ -1012,7 +1029,7 @@ mod tests {
 
         // One more evidence row: 101.
         let mut over = rows.clone();
-        over.evidence.insert(id(9_999), id(1));
+        over.evidence.insert(id(9_999), Some(id(1)));
         match assemble_leaf(&over, &all(&over), 100).unwrap() {
             LeafOutcome::NeedsSplit(n) => {
                 assert_eq!(n.reason, SplitReason::NodeCap);
@@ -1086,7 +1103,7 @@ mod tests {
                     r.below(4)
                 };
                 for _ in 0..k {
-                    rows.evidence.insert(r.uuid(), c);
+                    rows.evidence.insert(r.uuid(), Some(c));
                 }
                 if i > 0 && r.below(3) == 0 {
                     let other = claims[r.below(i as u64) as usize];
