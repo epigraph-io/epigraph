@@ -87,13 +87,55 @@ So:
 Out of scope, recorded for the operator:
 - **Claim INSERT and DELETE** do not bump. New claims appear the next night
   (design §2, "Freshness").
-- **Edges and evidence tenancy changes** do not bump. Edges follow their
-  endpoint claims through 070's cascade in the same statement, whose claim keys
-  bump. A direct edge re-tenancy is a residual.
-- **Co-owners.** Claims have no co-owner. An edge co-owner narrows reading (an
-  intersection), so the task's "if co-owners grant reading" does not apply.
+- ~~Edges and evidence tenancy changes do not bump~~ and ~~co-owners do not
+  apply~~: both superseded by revision 2 below.
 
 197's `atlas_layout_epoch` and its triggers are untouched.
+
+## Revision 2 (after review)
+
+The review found two gaps in the first revision, and both are fixed in 210.
+
+1. **Edges and evidence re-tenanted on their own bumped nothing.**
+   `epigraph-operator hide-evidence` turns public evidence private and leaves
+   its claim alone. 070 also honours an explicit `('group', G)` edge between
+   two public claims. Either way, every map that drew the row stayed current.
+   - Row-level `AFTER UPDATE` triggers on `edges` and `evidence` follow 197's
+     shape: no column list, and a `WHEN` on the whole signature
+     (`'public'`, or `('group', owner[, co_owner])`).
+   - An edge's keys include its co-owner.
+   - An edge that gains a co-owner is a departure from its owner, because the
+     owner's members outside the co-owner lose it. So whole signatures are
+     compared, not key sets.
+2. **One counter could not tell an arrival from a departure.**
+   - `atlas_map_epochs` now holds `n` (any arrival or departure) and `left_n`
+     (a departure to somewhere not public). Each has the `xid8` of the
+     transaction that last bumped it.
+   - Runs record all four counters.
+   - `MapLevel` reports `current` (no `n` moved, and no level missing) and
+     `nothing_left` (no `left_n` moved).
+   - Publicizing moves no `left_n`, so no map goes dark. A share-with-team only
+     makes the team's map not current.
+   - W10 picks the serving policy.
+
+**At most once per counter per map per transaction.** The `xid8` markers
+replace the per-statement rule. They are needed because 070's cascade
+re-tenants a moved claim's evidence and edges inside the claims statement,
+which fires the new row triggers. The claims trigger sorts first and bumps
+first, so the cascaded rows find their keys already bumped. A GUC marker would
+be forgeable by any session holding the DSN; the markers live on the epochs
+row, which only the definers write. A `ROLLBACK TO SAVEPOINT` reverts the row
+version together with its marker.
+
+The rest of the review:
+- **Build snapshot.** `begin_build_snapshot` sets REPEATABLE READ itself and
+  refuses a connection that is not in such a transaction.
+- **Deleted levels.** `current` also compares the run's stored level count
+  with `level_count`, so a theme delete that cascades levels away is visible.
+- **Housekeeping.** Added `docs/runbooks/210-undo.sql` (pinned by
+  `atlas_map_undo.rs`) and the README entry.
+- **Boot check.** The API's `assert_tenancy_triggers_armed` gains a
+  marker-gated 210 tier.
 
 ## Repo layer (`repos/atlas_map.rs`, all SQL there, non-macro `sqlx::query`)
 
