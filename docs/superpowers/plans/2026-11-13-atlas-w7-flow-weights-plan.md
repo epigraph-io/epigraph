@@ -174,10 +174,38 @@ The read runs on the build's snapshot transaction
 - `contradicts_and_refutes_carry_negative_sign_and_the_engine_factor`;
 - `cites_weighs_zero_even_with_a_stored_strength`;
 - `both_spellings_collapse_into_one_lower_cased_edge`;
-- `an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it`.
+- `an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it`;
+- `a_frame_or_hypothesis_index_the_audience_cannot_read_is_not_used` (added
+  after the first probe run showed nothing seeded another team's frame or
+  index row).
 
-**Fail on the old code.** Each mutation applied, the tests run, then
-restored; the table records what went red (filled in after the run).
+**Fail on the old code.** Each mutation applied to the committed tree, the
+unit tests and the DB target run (`--no-fail-fast`), then restored and
+`touch`ed. Measured on the pushed branch:
+
+| Mutation | Tests that went red |
+|---|---|
+| strength read × (0.5 + 0.5·source BetP) (never 0) | `proxy_weights_do_not_move_when_any_belief_moves`, `cites_weighs_zero_...` |
+| the same, with the invariance test's calibration asserts deleted | `proxy_weights_do_not_move_...` at "a proxy weight moved with a belief" |
+| × (0.5 + 0.5·target BetP), with and without calibration | the same two; without calibration, the invariance assertion |
+| × source `truth_value` / 0.5 (exactly 1 on the fixture), with and without calibration | `proxy_weights_do_not_move_...` at the invariance assertion only |
+| × (0.5 + 0.5·source belief) / 0.625 (exactly 1 on the fixture) | `proxy_weights_do_not_move_...` |
+| × the edge-keyed BBA's `source_strength` / 0.5 | `proxy_weights_do_not_move_...`, `both_spellings_collapse_...` |
+| `× |sign|` dropped | unit `a_proxy_weight_is_strength_times_abs_sign_...`; `cites_weighs_zero_...` |
+| fallback gives opposing links 0 (the SQL factor table's value) | 3 unit; `contradicts_and_refutes_...`, `proxy_weights_do_not_move_...` |
+| opposing links get sign +1 | 2 unit; `contradicts_and_refutes_...`, `proxy_weights_do_not_move_...` |
+| mass read: `mass_functions` map predicate removed | `a_mass_row_the_audience_cannot_read_does_not_contribute` |
+| mass read: `frames` map predicate removed | `a_frame_or_hypothesis_index_...` |
+| mass read: `claim_frames` map predicate removed | `a_frame_or_hypothesis_index_...` |
+| mass read: `retracted_at IS NULL` removed | `exact_masses_on_a_fixture_with_known_bbas` |
+| frames of any size read (`< 2` instead of `!= 2`) | 2 unit; `exact_masses_...` |
+| the claim's hypothesis index ignored | unit `the_exact_mass_reads_...`; `exact_masses_...` |
+| several rows aggregate by min, not max | unit `evidence_edges_take_...`; `exact_masses_...`, `a_frame_or_hypothesis_index_...` |
+| relationship not lower-cased | 3 unit; 4 DB tests incl. `every_weighted_edge_passes_contract_validation` |
+| a re-collapse keeps the first edge, not the largest | `both_spellings_collapse_into_one_lower_cased_edge` |
+| no usable mass gives `exact` with weight 0 (an invented mass) | unit `evidence_edges_take_...`; `a_mass_row_...`, `an_evidence_edge_with_no_readable_mass_...` |
+| the stored strength ignored (fallback always) | 2 unit; `both_spellings_collapse_...`, `proxy_weights_do_not_move_...` |
+| strength read: `co_owner_group_id IS NULL` dropped | none: an equivalent mutant (the read only re-reads ids W3's audience-filtered read returned), recorded, not a gap |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint`, `bba_retract_read_lint`,
 `pool_read_lint`, `viewer_ratchet`, `no_role_blind_belief_reads`. W7 writes
@@ -191,7 +219,7 @@ no edge, so `edge_writer_signing_ratchet` is not affected.
 | tests on a fixture with known masses | `exact_masses_on_a_fixture_with_known_bbas` (DB), the mass unit tests |
 | contradicting and refuting links carry negative sign | `contradicts_and_refutes_carry_negative_sign_and_the_engine_factor` (DB) |
 | (ruling) no belief factor in a proxy weight | `proxy_weights_do_not_move_when_any_belief_moves` (DB) and its mutation probes |
-| (brief) a mass row the audience cannot read does not contribute | `a_mass_row_the_audience_cannot_read_does_not_contribute` (DB) |
+| (brief) a mass row the audience cannot read does not contribute | `a_mass_row_the_audience_cannot_read_does_not_contribute`, `a_frame_or_hypothesis_index_the_audience_cannot_read_is_not_used` (DB) |
 | (brief) `cites` weighs 0 | `cites_weighs_zero_even_with_a_stored_strength` (DB) |
 
 ## Needs prod measurement (the orchestrator's)
