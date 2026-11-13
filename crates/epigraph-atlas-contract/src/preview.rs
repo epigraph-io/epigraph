@@ -20,7 +20,11 @@
 //! - a leaf and its twin in the other hierarchy hold the same number of
 //!   claims, so a theme's count is the same whichever way it is grouped;
 //! - one team leaf (and its twin) is a full 100-node leaf, the size of
-//!   `team_leaf_dense`.
+//!   `team_leaf_dense`;
+//! - a link target or breadcrumb that points at a level awaiting (re)naming
+//!   carries a null name (those objects have no `needs_naming` flag), so a
+//!   stale name never shows on a stub or a breadcrumb;
+//! - every link target is in the hierarchy of the level that lists it.
 //!
 //! It is not part of the contract: no route serves it outside the preview,
 //! and the files live in `contract/atlas_level/v1/preview/`, apart from the
@@ -292,12 +296,25 @@ impl Builder {
         out
     }
 
+    /// The name a link or breadcrumb to `j` carries: null while `j` awaits
+    /// (re)naming. `link_target` and `breadcrumb` have no `needs_naming`
+    /// flag, so a stale name there would show where the level itself shows
+    /// the placeholder.
+    fn shown_name(&self, j: usize) -> Option<String> {
+        let t = &self.sk[j];
+        if t.needs_naming {
+            None
+        } else {
+            t.name.clone()
+        }
+    }
+
     fn link_target(&self, j: usize, themes: &[Uuid]) -> LinkTarget {
         let t = &self.sk[j];
         LinkTarget {
             level_id: t.id,
             theme_id: themes[t.theme],
-            name: t.name.clone(),
+            name: self.shown_name(j),
             depth: t.depth,
         }
     }
@@ -320,7 +337,7 @@ impl Builder {
                 .into_iter()
                 .map(|a| Breadcrumb {
                     level_id: self.sk[a].id,
-                    name: self.sk[a].name.clone(),
+                    name: self.shown_name(a),
                     depth: self.sk[a].depth,
                 })
                 .collect(),

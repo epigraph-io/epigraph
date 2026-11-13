@@ -1641,15 +1641,29 @@ mod preview_set {
             LevelDocument::Group(g) => (g.breadcrumbs.clone(), g.switch.clone()),
             LevelDocument::Leaf(l) => (l.breadcrumbs.clone(), l.switch.clone()),
         };
-        let resolve = |map: usize, t: &LinkTarget, what: &str| {
+        // A link or breadcrumb carries the level's name, or null while the
+        // level awaits (re)naming: it has no needs_naming flag of its own.
+        let shown = |name: Option<String>, needs_naming: bool| {
+            if needs_naming {
+                None
+            } else {
+                name
+            }
+        };
+        let stale_hidden = std::cell::Cell::new(0);
+        let resolve = |map: usize, hier: Hierarchy, t: &LinkTarget, what: &str| {
             let (m, d) = by_id
                 .get(&t.level_id)
                 .unwrap_or_else(|| panic!("{what}: target {} is not in the set", t.level_id));
             assert_eq!(*m, map, "{what}: target on another map");
-            let (_, theme, depth, name, _) = env(d);
+            let (th, theme, depth, name, nn) = env(d);
+            assert_eq!(th, hier, "{what}: target in another hierarchy");
+            if nn && name.is_some() {
+                stale_hidden.set(stale_hidden.get() + 1);
+            }
             assert_eq!(
                 (t.theme_id, t.depth, &t.name),
-                (theme, depth, &name),
+                (theme, depth, &shown(name, nn)),
                 "{what}"
             );
         };
@@ -1696,7 +1710,7 @@ mod preview_set {
                         }
                     }
                     for t in &g.targets {
-                        resolve(*map, t, "group target");
+                        resolve(*map, hier, t, "group target");
                         if t.theme_id != theme {
                             cross_theme += 1;
                         }
@@ -1704,7 +1718,7 @@ mod preview_set {
                 }
                 LevelDocument::Leaf(l) => {
                     for o in &l.outgoing {
-                        resolve(*map, &o.target, "leaf outgoing");
+                        resolve(*map, hier, &o.target, "leaf outgoing");
                         if o.target.theme_id != theme {
                             cross_theme += 1;
                         }
@@ -1724,8 +1738,11 @@ mod preview_set {
             let got: Vec<Uuid> = crumbs(doc).0.iter().map(|b| b.level_id).collect();
             assert_eq!(got, chain, "breadcrumbs of {}", doc.level_id());
             for b in crumbs(doc).0 {
-                let (_, _, depth, name, _) = env(by_id[&b.level_id].1);
-                assert_eq!((b.depth, &b.name), (depth, &name));
+                let (_, _, depth, name, nn) = env(by_id[&b.level_id].1);
+                if nn && name.is_some() {
+                    stale_hidden.set(stale_hidden.get() + 1);
+                }
+                assert_eq!((b.depth, &b.name), (depth, &shown(name, nn)));
             }
         }
         // Every level hangs under a manifest root of its map and hierarchy.
@@ -1762,6 +1779,10 @@ mod preview_set {
         }
         assert!(cross_theme > 0, "some link leads to the other theme");
         assert!(unnamed > 0, "some group awaits a name");
+        assert!(
+            stale_hidden.get() > 0,
+            "some link or breadcrumb points at a stale-named level"
+        );
         let biggest = p
             .levels
             .iter()
