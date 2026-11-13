@@ -2645,6 +2645,47 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **210**: public `atlas_team_layout` (Atlas W2; backlog 77f4bf09, design
+  `docs/superpowers/specs/2026-11-12-atlas-nested-groups-and-subgraph-view-design.md`).
+  Per-team Atlas map storage beside 197's public-only tables. A map is a team
+  or community group's (`('group', T)`, read by T's members) or the public
+  map (`('public', world)`, read by every session, an unstamped one
+  included). Three tier-A tables, each with no-default tenancy columns,
+  074's require-tenancy trigger, 115's owner guard plus a visibility guard,
+  the standard `<table>_tenancy` policy (ENABLEd and FORCEd) and 115's
+  restrictive `<table>_delete_owner`: `atlas_map_epochs` (per map, `n` and
+  `left_n` with the `xid8` of the transaction that last bumped each),
+  `atlas_map_runs` (one build of one map, unfinished until `finished_at`,
+  recording the map's and the public map's four counters) and
+  `atlas_map_levels` (one opaque `jsonb` document per (run, hierarchy in
+  {meaning, links}, group id) with `schema_version`, `parent_group_id`,
+  `theme_id` (FK to `claim_themes` ON DELETE CASCADE) and `level`; the
+  primary key makes a level one probe, and a composite FK pins each level to
+  its run's tenancy). The application role holds SELECT only. Staleness: the
+  statement-level `claims_atlas_map_stale` (transition tables, beside 070's
+  cascade) and the row-level `edges_atlas_map_stale` and
+  `evidence_atlas_map_stale` (AFTER UPDATE, no column list, `WHEN` the
+  signature changed) call the definer `epigraph_atlas_map_bump`: `n` for
+  every key of a row's old and new signature (world for public, else the
+  owner and an edge's co-owner), `left_n` for the old keys unless the row
+  went public, team/community and world keys only, at most once per counter
+  per map per transaction (the stored `xid8` markers, which the cascade's
+  nested edge and evidence updates then find already set). All four
+  functions are on 172's `pg_catalog, pg_temp` form, owned by
+  `epigraph_maintenance`, EXECUTE revoked from PUBLIC. 197's epoch and
+  triggers are untouched. Registered in every tier-A ratchet (the four
+  FORCE-set copies, the tenancy counts, the delete census, the elevation
+  census, the materialization register). Pinned by
+  `epigraph-db/tests/atlas_map_repo.rs` and `atlas_map_undo.rs`. Undo:
+  `docs/runbooks/210-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 210); it LOSES every stored map. Checked before claiming:
+  no migration on main or an open PR head carries a `210`. **Deploy order:**
+  migrate before or with a binary that lists the three tables in
+  `FORCE_PROTECTED_SET` (173's order); creating the `claims`, `edges` and
+  `evidence` triggers needs their locks within the 3 s `lock_timeout`, so on
+  a busy table it may need a rerun. Undo only after rolling back every binary
+  that reads the tables. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
