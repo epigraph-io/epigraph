@@ -1171,6 +1171,36 @@ const MIGRATION_173_MARKERS: &[&str] = &[
     "epigraph_fragment_audit_reports_follow",
 ];
 
+/// The triggers **migration 210** (per-team Atlas maps) adds, as
+/// `(relation, trigger)`: the require-tenancy root trigger of each of its three
+/// tables, and the three staleness triggers on `claims`, `edges` and
+/// `evidence`. A dropped or disabled staleness trigger is the silent case: a
+/// claim, edge or evidence row leaves a team's or the public map's readable
+/// set, no epoch moves, and a stored map that still holds it keeps reporting
+/// itself current and departure-free.
+///
+/// Required **only when one of [`MIGRATION_210_MARKERS`] exists**, for the
+/// reasons [`TENANCY_TRIGGERS_089`] gives.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_210: &[(&str, &str)] = &[
+    ("atlas_map_epochs", "atlas_map_epochs_require_tenancy"),
+    ("atlas_map_runs", "atlas_map_runs_require_tenancy"),
+    ("atlas_map_levels", "atlas_map_levels_require_tenancy"),
+    ("claims", "claims_atlas_map_stale"),
+    ("edges", "edges_atlas_map_stale"),
+    ("evidence", "evidence_atlas_map_stale"),
+];
+
+/// The markers that migration 210 has run: the three functions its staleness
+/// triggers use. Any one present means 210 ran; its documented undo
+/// (`docs/runbooks/210-undo.sql`) drops all three.
+#[cfg(feature = "db")]
+const MIGRATION_210_MARKERS: &[&str] = &[
+    "epigraph_atlas_map_bump",
+    "epigraph_atlas_map_stale",
+    "epigraph_atlas_map_stale_row",
+];
+
 impl AppState {
     /// Create new application state with the given configuration (no database)
     #[cfg(not(feature = "db"))]
@@ -1954,6 +1984,8 @@ impl AppState {
     ///   * [`TENANCY_TRIGGERS_173`] is required only once either of
     ///     [`MIGRATION_173_MARKERS`] — 173's own functions — is present, on the
     ///     same reasoning.
+    ///   * [`TENANCY_TRIGGERS_210`] is required only once any of
+    ///     [`MIGRATION_210_MARKERS`] — 210's staleness functions — is present.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -1972,7 +2004,8 @@ impl AppState {
                 AND (t.tgname LIKE '%\\_require\\_tenancy' \
                      OR t.tgname LIKE '%\\_inherit\\_tenancy' \
                      OR t.tgname IN ('edges_tenancy','claims_propagate_tenancy', \
-                                     'claims_block_widening')) \
+                                     'claims_block_widening', 'claims_atlas_map_stale', \
+                                     'edges_atlas_map_stale', 'evidence_atlas_map_stale')) \
               ORDER BY c.relname, t.tgname",
         )
         .fetch_all(&self.db_pool)
@@ -2003,6 +2036,7 @@ impl AppState {
                 .chain(TENANCY_TRIGGERS_074.iter())
                 .chain(TENANCY_TRIGGERS_089.iter())
                 .chain(TENANCY_TRIGGERS_173.iter())
+                .chain(TENANCY_TRIGGERS_210.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -2017,7 +2051,7 @@ impl AppState {
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        // One read for every marker-gated tier (089's and 173's), so the boot
+        // One read for every marker-gated tier (089's, 173's and 210's), so the boot
         // check keeps a single catalog probe.
         let markers: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT p.proname::text FROM pg_proc p \
@@ -2027,6 +2061,7 @@ impl AppState {
         .bind(
             std::iter::once(MIGRATION_089_MARKER)
                 .chain(MIGRATION_173_MARKERS.iter().copied())
+                .chain(MIGRATION_210_MARKERS.iter().copied())
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
@@ -2036,6 +2071,9 @@ impl AppState {
         let migration_173_applied = markers
             .iter()
             .any(|m| MIGRATION_173_MARKERS.contains(&m.as_str()));
+        let migration_210_applied = markers
+            .iter()
+            .any(|m| MIGRATION_210_MARKERS.contains(&m.as_str()));
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -2051,6 +2089,9 @@ impl AppState {
         }
         if migration_173_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_173);
+        }
+        if migration_210_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_210);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -2107,6 +2148,7 @@ impl AppState {
             migration_074_applied,
             migration_089_applied,
             migration_173_applied,
+            migration_210_applied,
             "tenancy triggers armed"
         );
         Ok(())
