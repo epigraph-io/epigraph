@@ -94,19 +94,22 @@ W10 serves.
   level).
 - The array and string caps in the schema are set so that the worst document they
   allow still fits. That document has every array at `maxItems` and every string at
-  `maxLength`, filled with high-entropy text. So any document that passes the schema
-  is in budget: the budget is checked, not assumed.
+  `maxLength`, filled with random Latin, Greek, Cyrillic and CJK characters. So any
+  schema-valid document whose text compresses at least that well is in budget: the
+  budget is checked, not assumed. The proof does not cover adversarial text such as
+  random astral-plane characters. That is why `check_level_body` also measures every
+  served body.
 
 ## 4. Tests: how each "Done when" criterion is proven
 
 | Criterion | Proof |
 |---|---|
 | A versioned schema | `schema.json` with `$id` `urn:epigraph:atlas-level:v1` and `schema_version` const 1. Test: `schema_is_versioned_and_self_valid`. |
-| Fixtures for team, public and non-member | `team_theme_root`, `team_group_deep`, `team_leaf_dense`, `public_leaf`, `non_member_kernel` and `non_member_bff`, from a seeded generator (SplitMix64, synthetic words and ids, no real data). Tests: `fixtures_are_current`, `every_fixture_validates`. |
-| ≤ 150 KB compressed per level | `every_level_fixture_is_in_budget`, `worst_case_documents_the_schema_allows_are_in_budget` (kernel); `fixtures_fit_the_budget` (explorer). |
+| Fixtures for team, public and non-member | `team_theme_root`, `team_group_deep`, `team_leaf_dense`, `public_leaf`, `non_member_kernel` and `non_member_bff`, from a seeded generator (SplitMix64, synthetic words and ids, no real data). Tests: `fixtures_are_current`, `every_fixture_validates`, `fixtures_cover_the_cases` (kernel); `every_fixture_passes_the_helper`, `the_fixtures_cover_team_and_public_maps_and_every_flow_basis` (explorer). |
+| ≤ 150 KB compressed per level | `every_level_fixture_is_in_budget`, `worst_case_documents_the_schema_allows_are_in_budget`, `a_document_over_budget_is_rejected` (kernel); `the_fixtures_fit_the_budget`, `the_helper_rejects_a_body_over_budget` (explorer). |
 | A schema test W10's real responses must pass | `epigraph_atlas_contract::check::{check_level_body, check_not_found}` (kernel, `check` feature), and `tests/common/atlas_contract.rs` (explorer). W10 calls them on the route bodies. |
-| serde types ↔ schema | `schema_and_types_agree_on_every_mutation`: in each fixture, at every object, drop each key and add one unknown key; the schema's verdict must equal the strict serde and invariant verdict. Also `fixtures_round_trip_through_the_types` in both crates. |
-| Negative cases | `extra_private_field_is_rejected`, `missing_flow_basis_is_rejected`, `non_member_body_leaks_no_shape`, plus invariant tests (dangling edge endpoints, `exact` from a non-evidence node, a switch to the same hierarchy, 101 nodes). |
+| serde types ↔ schema | `schema_and_types_agree_on_every_mutation`: in small probe documents cut from the fixtures (both level kinds, both map scopes, every node kind and flow basis), at every key, drop it, add an unknown key beside it, and replace its value 7 ways; the schema's verdict must equal the strict serde and invariant verdict. Also `fixtures_round_trip_through_the_types` (kernel) and `the_mirror_round_trips_every_fixture` (explorer). |
+| Negative cases | `extra_private_field_is_rejected`, `missing_flow_basis_is_rejected`, `non_member_body_leaks_no_shape`, `invariants_catch_what_the_schema_cannot`, `invariants_enforce_the_schema_rules` (kernel); `the_helper_rejects_an_extra_private_field`, `the_helper_rejects_an_edge_without_its_exact_or_proxy_flag`, `the_helper_rejects_a_dangling_reference`, `the_not_found_answer_leaks_no_shape` (explorer). |
 
 Each new test is shown to fail on a mutated contract:
 - a schema with no `additionalProperties: false`;

@@ -23,8 +23,11 @@
 //! the schema checks, plus what a JSON Schema cannot express: references
 //! between parts of the document, and which flow basis each edge may have.
 //! The crate's tests prove that the strict types with `validate` and the
-//! schema agree, and that any document the caps allow fits
-//! [`BUDGET_GZIP_BYTES`].
+//! schema agree, and that the largest document the caps allow fits
+//! [`BUDGET_GZIP_BYTES`] when its text is no less compressible than random
+//! multi-script text. `validate` does not measure size: a producer that
+//! needs the budget enforced measures the compressed body itself (as
+//! [`check::check_level_body`] does).
 //!
 //! With the `check` feature, [`check`] validates a served body against the
 //! schema and the budget. Route tests call it on real responses.
