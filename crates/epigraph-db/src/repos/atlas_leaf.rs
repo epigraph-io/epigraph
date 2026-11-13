@@ -983,7 +983,12 @@ mod tests {
             id: Uuid::from_u64_pair(u64::MAX, n),
             source: LeafNode::evidence(ev),
             target: LeafNode::claim(claim),
-            relationship: if n % 2 == 0 { "supports" } else { "SUPPORTS" }.to_string(),
+            relationship: if n.is_multiple_of(2) {
+                "supports"
+            } else {
+                "SUPPORTS"
+            }
+            .to_string(),
         });
     }
 
