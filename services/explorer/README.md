@@ -101,16 +101,42 @@ and served from this origin like every other asset, so the CSP stays
 ### Atlas nested levels and the fixture preview
 
 Below a theme the Atlas can open onto nested group levels and leaf subgraphs (the
-`atlas_level` v1 contract in `contract/atlas_level/v1/`). The page needs two inputs
-the contract does not define:
-- `data-atlas-maps`: the maps the viewer may pick and each theme's root level per
-  hierarchy;
-- `data-level-prefix`: the URL prefix that serves one level by id.
+`atlas_level` v1 contract in `contract/atlas_level/v1/`). The page needs one input
+that contract does not define: `data-atlas-maps`, the map list (contract
+`atlas_maps` v1, `contract/atlas_maps/v1/schema.json`, Rust types in
+`src/atlas_maps.rs`). For each map the viewer may pick, first the default, it
+gives:
+- its `key`, `scope` (`team` or `public`), team `group_id` and picker `label`;
+- its own `level_url`, a same-origin prefix ending in `/`;
+- each theme it draws, with the theme's name and claim count **on that map** and
+  its root level in each hierarchy.
 
-`/atlas` does not carry them yet, since the level routes are backlog W10, so its
-themes behave as before. The drawing rules live in `static/atlas_nested.js`. They are
-pure functions, tested with `node --test js-tests/atlas_nested.test.cjs` (no
-dependencies).
+A level is fetched from `<level_url><hierarchy>/<level id>` (`hierarchy` is
+`meaning` or `links`) and answered with a v1 level document of that map and
+hierarchy, or the contract's not-found body. So every request names the map, the
+hierarchy and the level, and the server reads one row. The client knows each
+level's hierarchy: a root's from the map entry, a switch names its own, and
+children, breadcrumbs and link targets stay in the hierarchy of the level that
+lists them.
+
+What the producer and the page must keep (W10, and the nightly builder):
+- A route test checks the rendered attribute with
+  `tests/common/atlas_maps.rs::check_atlas_maps_attr`, as it checks level bodies
+  with `check_level_body`: one URL per map, at most one public map, one map per
+  team, unique keys and themes, distinct roots. Which maps a viewer sees is the
+  route test's to assert.
+- A link target or breadcrumb pointing at a level that awaits (re)naming carries a
+  null `name` (those objects have no `needs_naming` flag).
+- Search and `#c-` links into a nested theme land on the claim's leaf only once
+  that leaf has been fetched; a claim-to-leaf lookup is not in the contract yet.
+
+With a map list, the picked map sets each theme's name and count, and a theme the
+map does not draw shows "Not on this map" and opens onto nothing. Theme and region
+positions, region names and the links between themes stay on the viewer's own
+layout. `/atlas` does not carry the attribute yet (the level routes are backlog
+W10), so its regions and themes behave exactly as before. The drawing rules live in
+`static/atlas_nested.js`. They are pure functions, tested with
+`node --test js-tests/atlas_nested.test.cjs` (no dependencies).
 
 **Fixture preview.** To try the nested levels with no API and no database:
 
@@ -122,12 +148,13 @@ epigraph-explorer --atlas-fixture-preview 8097
 ```
 
 Then open `http://127.0.0.1:8097/atlas/preview`. On a remote host, forward the port
-first: `ssh -L 8097:127.0.0.1:8097 <host>`.
+first: `ssh -L 8097:127.0.0.1:8097 <host>`. Never give it a port a reverse proxy
+forwards: loopback keeps it off the network, not out of a proxy.
 
 What it serves:
 - The synthetic preview set in `contract/atlas_level/v1/preview/`: two maps, three
   theme trees per hierarchy, and one 100-node leaf.
-- The contract fixtures, by id.
+- The contract fixtures, under their own map and hierarchy.
 - All of it compiled into the binary and served byte for byte.
 
 Its guards:
@@ -135,9 +162,12 @@ Its guards:
   does.
 - **Loopback only.** It refuses any address that is not an IP-literal loopback (a bare
   port means `127.0.0.1:<port>`, and `[::1]:<port>` also works). `0.0.0.0`, LAN
-  addresses and host names are refused, with exit code 2.
-- **No real routes.** It mounts only `/atlas/preview`, `/bff/atlas/preview/level/{id}`,
-  `/health` and `/static/*`. No page or BFF route that calls the API exists in it, and
+  addresses and host names are refused, with exit code 2, and `serve` checks again
+  before it binds.
+- **No real routes.** It mounts only `/atlas/preview`,
+  `/bff/atlas/preview/maps/{map}/{hierarchy}/{id}`, `/health` and `/static/*`. A
+  level asked for under another map or hierarchy is not found, as on the real
+  route. No page or BFF route that calls the API exists in it, and
   its API URL is a dead loopback port.
 - **Clearly marked.** It logs a warning at start, the page carries a banner, and every
   response carries `x-atlas-preview: synthetic-fixtures`.

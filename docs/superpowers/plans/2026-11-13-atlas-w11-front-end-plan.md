@@ -30,18 +30,31 @@ as fetched (never trimmed or rewritten) in a bounded cache keyed by map and leve
 and derives scene nodes from it.
 
 **What the contract does not define** (W10's hand-off): how a viewer lists the maps
-they may pick, and which level is a theme's root in each hierarchy. The page takes
-both from one shell attribute, `data-atlas-maps`:
+they may pick, which level is a theme's root in each hierarchy, and where a level is
+fetched from. The page takes all three from one shell attribute, `data-atlas-maps`,
+now its own small contract, `services/explorer/contract/atlas_maps/v1/schema.json`
+(Rust types `src/atlas_maps.rs`, checker `tests/common/atlas_maps.rs`):
 
 ```json
-{"maps": [{"key": "team", "scope": "team", "group_id": "<uuid>", "label": "…",
-           "themes": [{"theme_id": "<uuid>", "label": "…", "claim_count": 120,
+{"schema_version": 1,
+ "maps": [{"key": "team", "scope": "team", "group_id": "<uuid>", "label": "…",
+           "level_url": "/bff/…/team/",
+           "themes": [{"theme_id": "<uuid>", "label": "… or null", "claim_count": 120,
                        "roots": {"meaning": "<level uuid>", "links": "<level uuid>"}}]}]}
 ```
 
-and the level URL prefix from `data-level-prefix`. The real `/atlas` page carries
-neither yet, so its regions and themes behave exactly as today. The preview page
-carries both. The client fetches nothing else: `GET <prefix><level id>` only.
+A level is `GET <level_url><hierarchy>/<level id>`: the map, the hierarchy and the
+level, because W2 stores a level per (run, hierarchy, group id) and finds the run by
+map, and a group id need not be unique across maps or hierarchies. (The first
+version had one page-wide `data-level-prefix` and fetched by id alone; review
+finding 1.) The hierarchy is also in the client's cache key and in `levelProblem`.
+The real `/atlas` page does not carry the attribute yet, so its regions and themes
+behave exactly as today. The preview page builds it at render time. The client
+fetches nothing else.
+
+With a map list the picked map sets each theme's name and count, and a theme off the
+map shows "Not on this map" and opens onto nothing, never the viewer's claim list
+(`themeOnMap`, `themeOpens`). Geometry stays the layout's (`layoutValue`).
 
 **Scene.** Nested levels live in the Atlas's one world, inside their theme's circle:
 - a group child is a circle at `parent + (x, y) · parent.r`, radius `r · parent.r`;
@@ -71,15 +84,20 @@ never from the relationship name):
 - Clicking a sibling bundle flies to that child. Clicking a stub (a group bundle to an
   outside target, or a leaf's `outgoing`) does the same chain-attach for
   `{theme_id, level_id}`, in this or another theme, and flies there.
-- The map picker resets the nested levels and checks every fetched document's
-  `map_scope` and `map_group_id` against the picked map.
+- The map picker resets the nested levels, renames and recounts the themes, and
+  checks every fetched document's `map_scope`, `map_group_id` and `hierarchy`
+  against the request.
+- A search hit or `#c-` link into a nested theme lands on its leaf when that leaf
+  has been fetched (`findClaimLeaf`), else frames the theme and says so; no
+  stand-in node. A claim-to-leaf lookup is a W10 hand-off.
 
 **Preview.**
 - Start it with `epigraph-explorer --atlas-fixture-preview <port | loopback-ip:port>`.
 - It refuses any address that is not an IP-literal loopback, it is off without the
   flag, and it logs a loud warning at start.
 - It builds its own minimal router: health, static, the `/atlas/preview` page with a
-  banner, and `/bff/atlas/preview/level/{id}`. It mounts no upstream route, and its
+  banner, and `/bff/atlas/preview/maps/{map}/{hierarchy}/{id}` (a level only under
+  its own map and hierarchy). It mounts no upstream route, and its
   API URL points at a dead port.
 - The data is embedded in the binary and served byte for byte. An unknown or
   malformed id gets the contract's BFF not-found body.
