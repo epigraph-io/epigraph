@@ -1227,7 +1227,12 @@ pub(crate) async fn create_claim_core(
     // exist without the claim (nor the claim, on this request, without it).
     if let Some(ref d) = request.derived_from {
         match epigraph_db::EvidenceRepository::record_derivation_conn(
-            &mut tx, viewer, claim_uuid, d.claim_id, &d.method,
+            &mut tx,
+            viewer,
+            state.edge_signing_key(),
+            claim_uuid,
+            d.claim_id,
+            &d.method,
         )
         .await?
         {

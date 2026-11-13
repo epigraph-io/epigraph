@@ -357,7 +357,14 @@ pub async fn create_evidence(
         ClaimId::from_uuid(request.claim_id),
     );
 
-    let created = EvidenceRepository::create(&state.db_pool, &evidence).await?;
+    // With its `evidence -> claim` edge, in the evidence's own transaction
+    // (backlog 2d60f619). The request names no direction: `supports`.
+    let created = EvidenceRepository::create(
+        &state.db_pool,
+        &evidence,
+        epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
+    )
+    .await?;
     let evidence_id: Uuid = created.id.into();
 
     // Materialize claim --DERIVED_FROM--> evidence edge

@@ -45,7 +45,6 @@
 //! | claims.rs | create_claim | claim -> evidence DERIVED_FROM | yes | holds a `Viewer`; a post-commit best-effort statement; conversion deferred (no direct test harness for the signed create path yet) |
 //! | community.rs | add_member | perspective -> community MEMBER_OF | no | structural |
 //! | conventions.rs | learn_convention | agent -> claim AUTHORED | no | structural |
-//! | conventions.rs | learn_convention | evidence -> claim SUPPORTS | yes | holds no `Viewer` (an `AuthContext` only) |
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
 //! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
@@ -134,8 +133,12 @@ const UNSTAMPED: &[(&str, usize)] = &[
     ("claims.rs", 1),
     ("community.rs", 1),
     // 6 before the W12b revise, which stamped `share_skill`'s and
-    // `forget_convention`'s in-scope edge statements.
-    ("conventions.rs", 4),
+    // `forget_convention`'s in-scope edge statements. 4 -> 3 (backlog
+    // 2d60f619): `learn_convention`'s evidence -> claim SUPPORTS edge is
+    // written by the evidence write itself
+    // (`EvidenceRepository::link_to_claims_signed_conn`), still on the raw
+    // pool, so no longer a route-layer site.
+    ("conventions.rs", 3),
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
@@ -154,7 +157,10 @@ const UNSTAMPED: &[(&str, usize)] = &[
 ///
 /// 31 -> 27: `provenance.rs::set_provenance` writes its four edges on the
 /// caller's stamped transaction and left the register.
-const HIGH_WATER: usize = 27;
+///
+/// 27 -> 26 (backlog 2d60f619): `learn_convention`'s evidence -> claim edge
+/// moved into the evidence write.
+const HIGH_WATER: usize = 26;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

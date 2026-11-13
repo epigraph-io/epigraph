@@ -103,6 +103,10 @@ const CALLS: &[&str] = &[
     // The document ingest's marked writer's primitive: one row of a fact per
     // ingest principal (`ingest_written.rs`).
     "EdgeRepository::create_if_absent_for_ingest_principal_signed_conn(",
+    // Every evidence row's `evidence -> claim` edge (backlog 2d60f619): a
+    // signed twin taking the caller's key, so each caller outside the
+    // repository is a site with its own key check.
+    "EvidenceRepository::link_to_claims_signed_conn(",
 ];
 
 /// The after-the-fact signing call: one way a [`Signed`] writer attests.
@@ -268,7 +272,9 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // (`ClaimIngestRepository::record_signed_conn`), registered PRIMITIVE like the
 // `EdgeRepository` twins: unsigned only when a caller passes no key, and both
 // of its callers pass the walk's key.
-const UNSIGNED_SITES_HIGH_WATER: usize = 49;
+// 50: the bug-report intake's evidence -> claim edge (migration 211, backlog
+// 2d60f619), a database function with no key.
+const UNSIGNED_SITES_HIGH_WATER: usize = 50;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -281,6 +287,14 @@ struct DbSite {
 
 /// The database-side inventory, measured from `migrations/*.sql`.
 const DB_REGISTER: &[DbSite] = &[
+    // A bug report's evidence -> claim `supports` edge (backlog 2d60f619): the
+    // one SQL-side evidence writer writes its evidence's edge too.
+    DbSite {
+        migration: "211_bug_report_evidence_edge.sql",
+        function: "epigraph_submit_bug_report",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
     // The legacy-author OPERATED_BY backfill (custodian role).
     DbSite {
         migration: "123_custodian_role.sql",
@@ -342,16 +356,12 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // Its evidence's `supports` edge is written by the evidence write itself
+    // (`EvidenceRepository::link_to_claims_signed_conn`, backlog 2d60f619).
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "learn_convention",
-        4,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/conventions.rs",
-        "forget_convention",
-        1,
+        3,
         Signed,
     ),
     site(
@@ -438,6 +448,9 @@ const REGISTER: &[Site] = &[
         2,
         Signed,
     ),
+    // Five: its evidence's `supports` edge goes through
+    // `EvidenceRepository::link_to_claims_signed_conn` (backlog 2d60f619) with
+    // the same key.
     site(
         "crates/epigraph-api/src/routes/submit.rs",
         "persist_packet",
@@ -610,6 +623,15 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-db/src/repos/ingest_written.rs",
         "create_ingest_written_edge_if_absent_conn",
+        1,
+        Signed,
+    ),
+    // Every evidence row's `evidence -> claim` edge (backlog 2d60f619): the
+    // one writer every evidence insert calls, forwarding the caller's key to
+    // the signed twin, as `create_ingest_written_edge_if_absent_conn` does.
+    site(
+        "crates/epigraph-db/src/repos/evidence.rs",
+        "link_to_claims_signed_conn",
         1,
         Signed,
     ),

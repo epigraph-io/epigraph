@@ -580,9 +580,13 @@ async fn batch_update_truth_values_keeps_the_first_value_of_a_repeated_id(pool: 
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_create_evidence_empty_slice_returns_empty(pool: PgPool) {
     let evidence: Vec<Evidence> = vec![];
-    let result = EvidenceRepository::batch_create(&pool, &evidence)
-        .await
-        .expect("Batch create should succeed");
+    let result = EvidenceRepository::batch_create(
+        &pool,
+        &evidence,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("Batch create should succeed");
 
     assert!(result.is_empty(), "Empty input should produce empty output");
 }
@@ -605,9 +609,13 @@ async fn test_batch_create_evidence_single(pool: PgPool) {
     let evidence = create_test_evidence_entity(agent.id, claim.id, "Single evidence content");
     let evidence_list = vec![evidence.clone()];
 
-    let result = EvidenceRepository::batch_create(&pool, &evidence_list)
-        .await
-        .expect("Batch create should succeed");
+    let result = EvidenceRepository::batch_create(
+        &pool,
+        &evidence_list,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("Batch create should succeed");
 
     assert_eq!(result.len(), 1, "Should return one evidence");
     assert_eq!(result[0].id, evidence.id, "Evidence ID should match");
@@ -635,9 +643,13 @@ async fn test_batch_create_evidence_multiple(pool: PgPool) {
         })
         .collect();
 
-    let result = EvidenceRepository::batch_create(&pool, &evidence_list)
-        .await
-        .expect("Batch create should succeed");
+    let result = EvidenceRepository::batch_create(
+        &pool,
+        &evidence_list,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("Batch create should succeed");
 
     assert_eq!(result.len(), 5, "Should return all 5 evidence items");
 
@@ -691,9 +703,13 @@ async fn test_batch_create_evidence_multiple_claims(pool: PgPool) {
         "Should have 6 evidence items (2 per claim)"
     );
 
-    let result = EvidenceRepository::batch_create(&pool, &evidence_list)
-        .await
-        .expect("Batch create should succeed");
+    let result = EvidenceRepository::batch_create(
+        &pool,
+        &evidence_list,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("Batch create should succeed");
 
     assert_eq!(result.len(), 6, "Should return all 6 evidence items");
 
@@ -730,9 +746,13 @@ async fn test_batch_create_evidence_atomicity(pool: PgPool) {
 
     // Create and insert evidence first
     let existing_evidence = create_test_evidence_entity(agent.id, claim.id, "Existing evidence");
-    EvidenceRepository::create(&pool, &existing_evidence)
-        .await
-        .expect("Create evidence should succeed");
+    EvidenceRepository::create(
+        &pool,
+        &existing_evidence,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("Create evidence should succeed");
 
     // Try to batch insert including duplicate
     let mut evidence_list: Vec<Evidence> = (0..3)
@@ -756,7 +776,12 @@ async fn test_batch_create_evidence_atomicity(pool: PgPool) {
         chrono::Utc::now(),
     ));
 
-    let result = EvidenceRepository::batch_create(&pool, &evidence_list).await;
+    let result = EvidenceRepository::batch_create(
+        &pool,
+        &evidence_list,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await;
     assert!(result.is_err(), "Batch with duplicate should fail");
 
     // Verify none of the new evidence was inserted
@@ -803,9 +828,13 @@ async fn test_batch_operations_in_transaction(pool: PgPool) {
         .map(|c| create_test_evidence_entity(agent.id, c.id, &format!("Evidence for {}", c.id)))
         .collect();
 
-    let created_evidence = EvidenceRepository::batch_create(&pool, &evidence_list)
-        .await
-        .expect("Batch create evidence should succeed");
+    let created_evidence = EvidenceRepository::batch_create(
+        &pool,
+        &evidence_list,
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("Batch create evidence should succeed");
 
     assert_eq!(created_evidence.len(), 3);
 
@@ -911,12 +940,16 @@ async fn test_evidence_writers_store_a_document_url_and_no_testimony_source(pool
         },
     );
 
-    EvidenceRepository::create(&pool, &created)
+    EvidenceRepository::create(&pool, &created, epigraph_db::EvidenceEdge::supports(None))
         .await
         .expect("create should succeed");
-    EvidenceRepository::batch_create(&pool, &[batched.clone(), testimony.clone()])
-        .await
-        .expect("batch create should succeed");
+    EvidenceRepository::batch_create(
+        &pool,
+        &[batched.clone(), testimony.clone()],
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("batch create should succeed");
 
     let column = |id: epigraph_core::EvidenceId| {
         let pool = pool.clone();

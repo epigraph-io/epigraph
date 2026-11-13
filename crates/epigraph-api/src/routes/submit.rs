@@ -1667,19 +1667,15 @@ async fn persist_packet(
             )
         })?;
 
-            // Materialize graph edges: evidence --supports--> claim (the canonical
-            // spelling, `epigraph_core::edge::relationships::canonical_relationship`)
-            epigraph_db::EdgeRepository::create_signed_conn(
+            // The evidence's `supports` edge to its claim, through the one
+            // writer every evidence insert calls (backlog 2d60f619), in this
+            // transaction. A packet's evidence carries no direction.
+            epigraph_db::EvidenceRepository::link_to_claims_signed_conn(
                 &mut tx,
                 state.edge_signing_key(),
                 evidence_uuid,
-                "evidence",
-                claim_uuid,
-                "claim",
-                "supports",
-                None,
-                None,
-                None,
+                &[claim_uuid],
+                epigraph_db::EvidenceDirection::Supports,
             )
             .await
             .map_err(|e| {
@@ -1687,7 +1683,7 @@ async fn persist_packet(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorResponse::new(
                         "DatabaseError",
-                        format!("Failed to create SUPPORTS edge: {}", e),
+                        format!("Failed to create the evidence's supports edge: {}", e),
                     ),
                 )
             })?;
