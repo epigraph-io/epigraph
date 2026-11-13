@@ -153,6 +153,13 @@ async fn submit_claim_and_batch_submit_store_a_supports_edge(pool: PgPool) {
         .expect("submit_claim");
     let claim = claim_by_content(&pool, &content).await;
     assert_every_evidence_edge(&pool, "submit_claim", &[claim], "supports", 1).await;
+    // Control for the memorize test: caller-supplied evidence text grounds.
+    assert!(
+        epigraph_db::ClaimRepository::has_grounded_evidence(&pool, &viewer, claim)
+            .await
+            .expect("has_grounded_evidence"),
+        "submit_claim's caller-supplied evidence grounds its claim"
+    );
 
     let a = format!("2d60f619 batch a {}", Uuid::new_v4());
     let b = format!("2d60f619 batch b {}", Uuid::new_v4());
@@ -197,6 +204,15 @@ async fn memorize_stores_a_supports_edge(pool: PgPool) {
     .expect("memorize");
     let claim = claim_by_content(&pool, &content).await;
     assert_every_evidence_edge(&pool, "memorize", &[claim], "supports", 1).await;
+    // The stamp's edge is bookkeeping, not evidence: a memorized claim is not
+    // grounded by it (`ClaimRepository::has_grounded_evidence`, the experiment
+    // loop's circularity guard), exactly as before the stamp had an edge.
+    assert!(
+        !epigraph_db::ClaimRepository::has_grounded_evidence(&pool, &viewer, claim)
+            .await
+            .expect("has_grounded_evidence"),
+        "a memorize stamp must not ground its claim"
+    );
 }
 
 fn uwe(claim: &str, supports: bool) -> UpdateWithEvidenceParams {
