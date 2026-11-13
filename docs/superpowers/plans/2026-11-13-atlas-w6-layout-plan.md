@@ -111,20 +111,29 @@ run on a remote lane on ids and edges only.
 
 | Criterion | Test |
 |-----------|------|
-| Every leaf in a synthetic hierarchy has stored positions | `atlas_w6_layout_store::every_level_of_a_synthetic_hierarchy_is_stored_with_valid_positions`: documents built with placeholder (0, 0) positions are filled, written with `write_run`/`put_level`/`finish_run`, read back with `level_for_viewer`, parsed with `parse_and_validate`, and checked for the minimum distance and the disc bound. Leaving one leaf unfilled fails it. |
-| A rerun over unchanged leaves gives identical positions and skips them through the content hash | `fill::tests::an_unchanged_level_reuses_the_previous_positions_and_is_not_laid_out` (sentinel positions under the right hash come back unchanged, `computed == 0`), `fill::tests::one_changed_leaf_is_the_only_one_laid_out_again` (`computed == 1`), and the DB test's second run over the stored record. Breaking the hash comparison fails each. |
-| The per-leaf time bound holds, so the nightly fits its window | `force::tests::a_full_leaf_lays_out_within_the_time_bound`: 100 nodes, dense edges, best of several runs under 50 ms on one core in the test (debug) build. The measured time times the leaf count per night (a prod measurement) gives the nightly's share. |
+| Every leaf in a synthetic hierarchy has stored positions | `atlas_w6_layout_store::every_level_of_a_synthetic_hierarchy_is_stored_with_valid_positions`: per hierarchy a theme root, two groups and six leaves (one at the 100-node cap), built with placeholder (0, 0) positions, filled, written with `write_run`/`put_level`/`finish_run`, read back with `level_for_viewer`, parsed with `parse_and_validate`, and checked for the minimum distance, the disc bound and non-overlap; the layout record reads back from `params`. A leaf left unfilled turns it red. |
+| A rerun over unchanged leaves gives identical positions and skips them through the content hash | `atlas_w6_layout_store::a_rerun_lays_out_only_the_changed_leaf_and_keeps_every_other_stored_position` (through W2's storage: `computed == 1`, `reused == 17`, every other level's positions equal), `fill::tests::an_unchanged_level_reuses_the_previous_positions_and_is_not_laid_out` (sentinel positions under the right hash come back, copied by id, `computed == 0`), `fill::tests::one_changed_leaf_is_the_only_one_laid_out_again` (`computed == 1`). Disabling the hash comparison, or reuse, turns them red. |
+| The per-leaf time bound holds, so the nightly fits its window | `force::tests::a_full_leaf_lays_out_within_the_time_bound`: 100 nodes, 400 edges, best of 5 runs under 50 ms on one core in the test (debug) build; measured about 26 ms. Ten times the iterations turns it red. The nightly's share is that time times the changed leaves per night (a prod measurement). |
 
-Quality bounds (all on the rounded output):
-- `leaf_nodes_keep_the_minimum_distance` and `leaf_positions_stay_inside_the_disc` (also over a sweep of random graphs);
-- `connected_nodes_sit_closer_than_unconnected_ones`;
-- `group_radii_are_monotone_in_size`, `group_circles_do_not_overlap_and_stay_inside_the_unit_disc`, `linked_children_sit_closer_than_unlinked_ones`;
-- determinism: `the_same_input_gives_byte_identical_positions`, `input_order_does_not_change_the_output`, `a_new_node_does_not_change_the_others_starting_points`, `the_hash_ignores_labels_and_edge_direction`, `the_hash_changes_with_any_layout_input`;
-- contract: every filled document passes `validate` and `to_stored_json`.
+Quality bounds (all on the rounded output), in `force::tests`:
+- `leaf_nodes_keep_the_minimum_distance_and_stay_inside_the_disc` (40 random graphs up to the cap, plus a 99-spoke star; the farthest node is also at least 0.9 of the disc radius, so the layout uses its disc);
+- `connected_nodes_sit_closer_than_unconnected_ones` (the linked mean is under two thirds of the unlinked mean);
+- `group_circles_do_not_overlap_and_stay_inside_the_unit_disc`, `group_radii_are_monotone_in_size`, `linked_children_sit_closer_than_unlinked_ones`, `one_child_fills_the_fit_disc`;
+- determinism: `the_same_input_gives_byte_identical_positions_whatever_the_input_order`, `group_layout_is_deterministic_and_order_free_and_hashed`, `the_leaf_hash_changes_with_every_layout_input_and_nothing_else`;
+- `small_leaves_are_placed`, `malformed_inputs_are_refused`.
 
-Each test is shown to fail on broken code: the mutation probes (no collision
-sweep, no gravity, no scale-to-fit, r from size inverted, hash comparison
-disabled, a leaf left unfilled) are run, seen red, and reverted.
+In `fill::tests`: `filled_fixture_levels_validate_and_keep_the_layout_bounds`
+(the W10a fixture levels pass `to_stored_json` after the fill),
+`a_record_of_another_algorithm_or_a_missing_document_is_not_reused`,
+`a_previous_document_that_does_not_place_every_id_is_not_copied`,
+`the_hash_ignores_text_flow_and_direction_but_not_structure`,
+`the_record_round_trips_through_run_params_beside_other_keys`,
+`a_level_given_twice_is_refused_and_nothing_is_filled`, and (with `db`)
+`a_w3_node_set_and_its_leaf_document_hash_and_lay_out_alike`.
+
+Each test is shown to fail on broken code: 36 mutation probes (18 on the
+layout, 14 on the fill, 4 on the stored run), each run, seen red, and
+reverted.
 
 ## Build gate (tier 1)
 
