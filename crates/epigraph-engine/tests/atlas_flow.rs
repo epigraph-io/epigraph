@@ -693,6 +693,95 @@ async fn a_mass_row_the_audience_cannot_read_does_not_contribute(pool: PgPool) {
     );
 }
 
+/// The frame and the hypothesis index an exact mass is read through are held
+/// to the map's audience too. On a public claim with public evidence: a
+/// public BBA on a public frame (0.7 on hypothesis 0, 0.2 on 1), team U's
+/// index row saying the claim is hypothesis 1 of that frame, and a second
+/// public BBA (0.95 on hypothesis 0) on a frame team U owns. The public map
+/// and T's map read neither of U's rows: index 0, U's frame ignored, 0.7
+/// (reading U's index would give 0.2, reading U's frame 0.95). U's map reads
+/// both, and the larger is 0.95.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_frame_or_hypothesis_index_the_audience_cannot_read_is_not_used(pool: PgPool) {
+    let t = team(&pool, "flow-t").await;
+    let u = team(&pool, "flow-u").await;
+    let world = fixture::world_group(&pool).await;
+    let f = agent(&pool).await;
+    let x = agent(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let binary = frame(&pool, 2).await;
+    let of_u = frame(&pool, 2).await;
+    let n =
+        sqlx::query("UPDATE frames SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+            .bind(of_u)
+            .bind(u)
+            .execute(&pool)
+            .await
+            .expect("force frame owner")
+            .rows_affected();
+    assert_eq!(n, 1);
+
+    let p = claim(&pool, f, "public", world).await;
+    let ev = evidence_row(&pool, p).await;
+    force_evidence_public(&pool, ev, world).await;
+    evidence_edge(&pool, ev, p, "supports").await;
+    claim_frame(&pool, p, binary, 1).await;
+    let n = sqlx::query(
+        "UPDATE claim_frames SET visibility = 'group', owner_group_id = $3 \
+         WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(p)
+    .bind(binary)
+    .bind(u)
+    .execute(&pool)
+    .await
+    .expect("force claim_frames owner")
+    .rows_affected();
+    assert_eq!(n, 1);
+    bba(
+        &pool,
+        p,
+        binary,
+        x,
+        None,
+        Some(ev),
+        json!({"0": 0.7, "1": 0.2, "0,1": 0.1}),
+    )
+    .await;
+    bba(
+        &pool,
+        p,
+        of_u,
+        x,
+        None,
+        Some(ev),
+        json!({"0": 0.95, "0,1": 0.05}),
+    )
+    .await;
+    let stamps: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id FROM mass_functions WHERE claim_id = $1",
+    )
+    .bind(p)
+    .fetch_all(&pool)
+    .await
+    .expect("read bba stamps");
+    assert!(stamps.iter().all(|(v, _)| v == "public"), "{stamps:?}");
+
+    for map in [AtlasMap::Public, AtlasMap::Team(t)] {
+        let (_, edges) = build(&pool, &system, map, &[p]).await;
+        assert_eq!(
+            swb(find(&edges, ev, p, "supports")),
+            (1, 0.7, FlowBasis::Exact),
+            "{map:?}"
+        );
+    }
+    let (_, on_u) = build(&pool, &system, AtlasMap::Team(u), &[p]).await;
+    assert_eq!(
+        swb(find(&on_u, ev, p, "supports")),
+        (1, 0.95, FlowBasis::Exact)
+    );
+}
+
 // ===========================================================================
 // Signs, cites, spellings
 // ===========================================================================
