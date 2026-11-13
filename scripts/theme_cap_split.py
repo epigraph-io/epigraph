@@ -40,8 +40,12 @@ What apply writes, per theme:
     which samples member text, does not rename it.
   * Refused, with nothing written, when the result no longer matches the live
     membership (claims assigned or moved since the plan), or when a part would
-    end over the cap once members without an embedding (which stay with the
-    kept part) are counted.
+    end over the cap once current members without an embedding (which stay
+    with the kept part) are counted.
+
+The cap counts CURRENT members (`COALESCE(is_current, true)`), what the Atlas
+draws. Retired members (superseded or duplicate-marked) keep their theme_id and
+have no embedding; they stay with the kept part and do not count.
 
 Member text: nothing here reads, prints or stores claim content, so the
 bug-report intake rule (`theme_lib.not_intake_owned`, which keeps intake text
@@ -178,18 +182,30 @@ def connect(database_url=None):
 
 # ── reads ───────────────────────────────────────────────────────────────────
 
+# The cap counts CURRENT members: what the Atlas draws (design 2026-11-12 §7)
+# and what ClaimThemeRepository::list_summaries counts
+# (COALESCE(c.is_current, true)). A superseded or duplicate-marked claim keeps
+# its theme_id (the retirement paths do not clear it) but has no embedding
+# (chk_deprecated_no_embedding), so it cannot be clustered and is not drawn; it
+# stays with the kept part and does not count against the cap.
+CURRENT = "COALESCE(is_current, true)"
+
+
 def over_cap_themes(conn, cap, theme_ids=None):
-    """[(theme_id, members, embedded)] for every theme with more than `cap`
-    members, counted live (not from the stored claim_count)."""
-    sql = ("SELECT theme_id::text, count(*), count(*) FILTER (WHERE embedding IS NOT NULL) "
+    """[(theme_id, current, embedded, retired)] for every theme with more than
+    `cap` CURRENT members, counted live (not from the stored claim_count)."""
+    sql = (f"SELECT theme_id::text, count(*) FILTER (WHERE {CURRENT}), "
+           "count(*) FILTER (WHERE embedding IS NOT NULL), "
+           f"count(*) FILTER (WHERE NOT {CURRENT}) "
            "FROM claims WHERE theme_id IS NOT NULL {} "
-           "GROUP BY theme_id HAVING count(*) > %s ORDER BY theme_id")
+           f"GROUP BY theme_id HAVING count(*) FILTER (WHERE {CURRENT}) > %s "
+           "ORDER BY theme_id")
     with conn.cursor() as cur:
         if theme_ids:
             cur.execute(sql.format("AND theme_id = ANY(%s::uuid[])"), (list(theme_ids), cap))
         else:
             cur.execute(sql.format(""), (cap,))
-        return [(t, int(n), int(e)) for t, n, e in cur.fetchall()]
+        return [(t, int(n), int(e), int(r)) for t, n, e, r in cur.fetchall()]
 
 
 def load_members(conn, theme_id):
@@ -219,15 +235,16 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
     report row per theme with its proposed part sizes."""
     result = {"format": core.RESULT_FORMAT, "cap": cap, "seed": seed, "themes": []}
     report = []
-    for theme_id, members, embedded in over_cap_themes(conn, cap, theme_ids):
+    for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
         ids, x = load_members(conn, theme_id)
         parts = core.split_to_cap(ids, x, cap=cap, seed=seed)
         conn.rollback()  # end the read transaction between themes
         result["themes"].append({"theme_id": theme_id, "parts": parts})
         unembedded = members - embedded
         report.append({
-            "theme_id": theme_id, "members": members, "embedded": embedded,
-            "unembedded": unembedded, "part_sizes": [len(p) for p in parts],
+            "theme_id": theme_id, "current": members, "embedded": embedded,
+            "unembedded": unembedded, "retired": retired,
+            "part_sizes": [len(p) for p in parts],
             "kept_part_with_unembedded": (len(parts[0]) if parts else 0) + unembedded,
             "reaches_cap": bool(parts) and len(parts[0]) + unembedded <= cap,
         })
@@ -239,11 +256,12 @@ def export(conn, out_dir, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_id
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     index = {"format": core.EXPORT_FORMAT, "cap": cap, "seed": seed, "themes": []}
-    for theme_id, members, embedded in over_cap_themes(conn, cap, theme_ids):
+    for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
         ids, x = load_members(conn, theme_id)
         conn.rollback()
         core.write_theme_npz(out_dir / f"{theme_id}.npz", ids, x)
-        index["themes"].append({"theme_id": theme_id, "members": members, "embedded": embedded})
+        index["themes"].append({"theme_id": theme_id, "current": members,
+                                "embedded": embedded, "retired": retired})
     (out_dir / "export.json").write_text(json.dumps(index, indent=1))
     return index
 
@@ -370,14 +388,14 @@ def apply_result(conn, result, manifest_path):
             for theme_id, with_3072 in touched:
                 _recompute(cur, theme_id, with_3072)
             if touched:
-                cur.execute("SELECT theme_id::text, count(*) FROM claims "
-                            "WHERE theme_id = ANY(%s::uuid[]) GROUP BY theme_id "
-                            "HAVING count(*) > %s ORDER BY 1",
+                cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
+                            f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
+                            "GROUP BY theme_id HAVING count(*) > %s ORDER BY 1",
                             ([t for t, _ in touched], cap))
                 over = cur.fetchall()
                 if over:
-                    raise ValueError(f"parts would end over the cap of {cap} (members without "
-                                     f"an embedding stay with the kept part): {over}")
+                    raise ValueError(f"parts would end over the cap of {cap} (current members "
+                                     f"without an embedding stay with the kept part): {over}")
         if not manifest["themes"]:
             conn.rollback()
             return manifest
@@ -533,7 +551,7 @@ def main(argv=None):
             labels = theme_labels(conn, [r["theme_id"] for r in report])
             for r in report:
                 flag = "" if r["reaches_cap"] else "  NOT UNDER CAP (unembedded members)"
-                print(f"  {r['theme_id']}  {r['members']:>6} -> {r['part_sizes']}"
+                print(f"  {r['theme_id']}  {r['current']:>6} -> {r['part_sizes']}"
                       f"  ({labels.get(r['theme_id'], '?')}){flag}", file=sys.stderr)
             print(json.dumps({"status": "dry-run", "cap": args.cap, "result_file": out,
                               "themes": report}))

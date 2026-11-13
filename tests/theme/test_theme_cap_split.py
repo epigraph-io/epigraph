@@ -34,14 +34,15 @@ PARENT_LABEL = "Parent Theme Name"
 TEXT_MARK = "capsplit-member-text-"
 
 
-def _claim(cur, agent_id, theme_id, seed, embedded=True, owner=None):
+def _claim(cur, agent_id, theme_id, seed, embedded=True, owner=None, current=True):
     content = f"{TEXT_MARK}{uuid.uuid4()}"
-    emb = make_embedding(seed) if embedded else None
+    emb = make_embedding(seed) if embedded and current else None
     if owner is None:
         cur.execute(
-            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, theme_id) "
-            "VALUES (%s, sha256(%s::bytea), 0.5, %s, %s::vector, %s) RETURNING id::text",
-            (content, content, agent_id, emb, theme_id),
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, theme_id, "
+            "                    is_current) "
+            "VALUES (%s, sha256(%s::bytea), 0.5, %s, %s::vector, %s, %s) RETURNING id::text",
+            (content, content, agent_id, emb, theme_id, current),
         )
     else:
         cur.execute(
@@ -55,9 +56,11 @@ def _claim(cur, agent_id, theme_id, seed, embedded=True, owner=None):
 
 
 def _theme(db, agent_id, sizes, label=PARENT_LABEL, props=None, unembedded=0, seed0=1,
-           with_3072=True):
-    """A theme whose members form len(sizes) separated groups (+ unembedded
-    members). Returns (theme_id, [ids of group 0, ...], [unembedded ids])."""
+           with_3072=True, retired=0):
+    """A theme whose members form len(sizes) separated groups, plus `unembedded`
+    current members with no embedding and `retired` non-current members (which
+    carry none, as chk_deprecated_no_embedding requires).
+    Returns (theme_id, [ids of group 0, ...], [unembedded and retired ids])."""
     props = props if props is not None else {"source": "cluster_run",
                                              "cluster_run_id": RUN_ID, "cluster_id": 7}
     with db.cursor() as cur:
@@ -74,6 +77,7 @@ def _theme(db, agent_id, sizes, label=PARENT_LABEL, props=None, unembedded=0, se
                   for g, n in enumerate(sizes)]
         loose = [_claim(cur, agent_id, theme_id, seed0, embedded=False)
                  for _ in range(unembedded)]
+        loose += [_claim(cur, agent_id, theme_id, seed0, current=False) for _ in range(retired)]
     db.commit()
     return theme_id, groups, loose
 
@@ -277,6 +281,29 @@ def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, seed_
 
     assert _snapshot(db) == before
     assert not (tmp_path / "m.json").exists()
+
+
+def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):
+    """Superseded and duplicate-marked members keep their theme_id but are not
+    drawn and cannot be clustered: they neither trigger a split nor overflow the
+    kept part. (Current members without an embedding do; see the test above.)"""
+    under, _, _ = _theme(db, seed_agent, (35,), label="Mostly Retired", seed0=30, retired=20)
+    over, groups, retired = _theme(db, seed_agent, (30, 25, 20), retired=15)
+
+    result, report = S.plan(db, cap=CAP)
+    assert [r["theme_id"] for r in report] == [over], "a theme of 35 current members is not over"
+    assert report[0]["retired"] == 15 and report[0]["reaches_cap"]
+    S.apply_result(db, result, tmp_path / "m.json")
+
+    assert _theme_of(db, retired) == [over], "retired members stay with the kept part"
+    assert _theme_of(db, groups[0]) == [over]
+    with db.cursor() as cur:
+        cur.execute("SELECT theme_id::text, count(*) FROM claims WHERE theme_id IS NOT NULL "
+                    "AND is_current GROUP BY theme_id")
+        current = dict(cur.fetchall())
+    db.rollback()
+    assert max(current.values()) <= CAP
+    assert current[over] == 30 and current[under] == 35
 
 
 def test_reverse_refuses_drift_unless_allowed(db, seed_agent, tmp_path):

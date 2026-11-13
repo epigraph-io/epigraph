@@ -107,5 +107,9 @@ The usage text names `MAINTENANCE_DATABASE_URL`.
   the byte-identity covers the `(id, theme_id)` membership, not whole `claims` rows.
 - **Atlas layouts.** `atlas_layout_themes` and `graph_neighborhoods` rows of a split theme are
   stale until rebuilt (W2/W9). Reverse cascades over rows that reference the deleted parts.
-- **Unembedded members.** These stay in the kept part. If they push it over the cap, the apply
-  refuses.
+- **Current members only.** The cap counts `COALESCE(is_current, true)` members, which is what the
+  Atlas draws and what `list_summaries` counts. Superseded and duplicate-marked members keep their
+  `theme_id` but have no embedding. They stay in the kept part and do not count
+  (`test_the_cap_counts_current_members_only`).
+- **Unembedded current members.** These stay in the kept part. If they push it over the cap, the
+  apply refuses.
