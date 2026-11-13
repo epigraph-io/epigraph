@@ -217,6 +217,32 @@ fn the_helper_rejects_an_edge_without_its_exact_or_proxy_flag() {
     assert!(errs.iter().any(|e| e.starts_with("mirror")), "{errs:#?}");
 }
 
+/// A proxy weight is link strength × |sign|, so a `cites` link (sign 0)
+/// weighs 0. One carrying a weight (its source's belief, say) fails the
+/// helper through the schema; a signed proxy link keeps any weight.
+#[test]
+fn the_helper_rejects_a_weighted_cites_link() {
+    let leaf = fixture_value("team_leaf_dense");
+    let edges = leaf["edges"].as_array().unwrap();
+    let cites = (0..edges.len())
+        .find(|&i| edges[i]["flow_basis"] == json!("proxy") && edges[i]["sign"] == json!(0))
+        .unwrap();
+    let signed = (0..edges.len())
+        .find(|&i| edges[i]["flow_basis"] == json!("proxy") && edges[i]["sign"] != json!(0))
+        .unwrap();
+    let body = mutated("team_leaf_dense", |v| {
+        v["edges"][cites]["flow_weight"] = json!(0.5);
+    });
+    let errs = check_as("team_leaf_dense", &body).expect_err("a weighted cites link fails");
+    assert!(errs.iter().any(|e| e.starts_with("schema")), "{errs:#?}");
+    let body = mutated("team_leaf_dense", |v| {
+        v["edges"][signed]["flow_weight"] = json!(0.0001);
+    });
+    if let Err(e) = check_as("team_leaf_dense", &body) {
+        panic!("a signed proxy link may weigh 0.0001: {e:#?}");
+    }
+}
+
 #[test]
 fn the_helper_rejects_a_dangling_reference() {
     // Schema-valid, so only the reference check can catch it.
