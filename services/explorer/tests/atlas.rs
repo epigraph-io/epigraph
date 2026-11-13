@@ -2488,7 +2488,10 @@ fn atlas_nested_js_is_pure_and_safe() {
         "pignistic",
         "betp",
     ] {
-        assert!(!js.contains(banned), "atlas_nested.js must not use {banned}");
+        assert!(
+            !js.contains(banned),
+            "atlas_nested.js must not use {banned}"
+        );
     }
     assert!(js.contains("'use strict'"));
     assert!(epigraph_explorer::assets::find("atlas_nested.js").is_some());

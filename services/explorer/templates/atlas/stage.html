@@ -1,0 +1,25 @@
+{#- The canvas, the side panel and the legends, shared by the Atlas and its
+    fixture preview. -#}
+<div class="atlas__body">
+  <div class="atlas__stage" data-role="stage">
+    <canvas class="atlas__canvas" data-role="canvas" role="img" aria-label="Map of themes and claims. Use the panel or search to move around."></canvas>
+    <p class="atlas__notice notice small" data-role="notice" role="status" hidden></p>
+    <p class="atlas__caption small muted" data-role="caption" hidden></p>
+  </div>
+  <aside class="atlas__panel" aria-live="polite" aria-labelledby="atlas-panel-title">
+    <h2 class="atlas__panel-title" id="atlas-panel-title" data-role="panel-title">The Atlas</h2>
+    <p class="atlas__panel-status small muted" data-role="panel-status">Loading the map…</p>
+    <div class="atlas__panel-body" data-role="panel-body"></div>
+  </aside>
+</div>
+<div class="atlas__legend small muted" aria-hidden="true">
+  <span class="atlas__key"><span class="atlas__ramp"></span>fill: authored truth value, low to high; grey = none</span>
+  <span class="atlas__key"><span class="atlas__swatch atlas__swatch--critical"></span>dashed: contradicts or refutes</span>
+</div>
+<div class="atlas__legend atlas__legend--leaf small muted" data-role="leaf-legend" hidden>
+  <span class="atlas__key"><span class="atlas__line atlas__line--exact"></span>solid: evidence, its stored mass</span>
+  <span class="atlas__key"><span class="atlas__line atlas__line--proxy"></span>dashed: estimate (link strength × sign, no belief)</span>
+  <span class="atlas__key"><span class="atlas__line atlas__line--oppose"></span>red: contradicts or refutes</span>
+  <span class="atlas__key">thicker = more weight; dots run the way belief moves, back out of a claim a link opposes</span>
+  <span class="atlas__key"><span class="atlas__glyph atlas__glyph--agent"></span>agent <span class="atlas__glyph atlas__glyph--evidence"></span>evidence</span>
+</div>

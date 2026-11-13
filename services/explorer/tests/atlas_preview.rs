@@ -1,0 +1,407 @@
+//! The Atlas fixture preview (`--atlas-fixture-preview`, backlog W11): off by
+//! default, loopback only, serving the committed synthetic levels byte for
+//! byte, and mounting nothing that reaches the API.
+
+mod common;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use axum::Router;
+use common::atlas_contract::{check_level_body, check_not_found, fixture_value, Expected, Side};
+use epigraph_explorer::atlas_preview::{
+    self, parse_bind, preview_bind, PreviewError, PreviewStore, FLAG, LEVEL_PREFIX, PAGE_PATH,
+    PREVIEW_HEADER, PREVIEW_HEADER_VALUE,
+};
+use epigraph_explorer::AppState;
+use serde_json::Value;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+const PREVIEW_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/contract/atlas_level/v1/preview"
+);
+
+fn preview_router() -> Router {
+    let addr: SocketAddr = "127.0.0.1:8097".parse().unwrap();
+    let config = atlas_preview::config(addr).expect("the preview config is valid");
+    let state = AppState::new(config).expect("state builds");
+    atlas_preview::router(state, Arc::new(PreviewStore::embedded()))
+}
+
+struct Res {
+    status: StatusCode,
+    headers: axum::http::HeaderMap,
+    body: Vec<u8>,
+}
+
+impl Res {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+}
+
+async fn get(router: &Router, path: &str) -> Res {
+    let resp = router
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = to_bytes(resp.into_body(), 16 << 20).await.unwrap().to_vec();
+    Res {
+        status,
+        headers,
+        body,
+    }
+}
+
+/// The committed preview lines, by level id, as bytes.
+fn committed_lines() -> BTreeMap<Uuid, String> {
+    let raw = std::fs::read_to_string(format!("{PREVIEW_DIR}/levels.jsonl")).unwrap();
+    raw.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            (
+                Uuid::parse_str(v["level_id"].as_str().unwrap()).unwrap(),
+                l.to_string(),
+            )
+        })
+        .collect()
+}
+
+fn manifest() -> Value {
+    serde_json::from_str(&std::fs::read_to_string(format!("{PREVIEW_DIR}/manifest.json")).unwrap())
+        .unwrap()
+}
+
+fn args(a: &[&str]) -> Vec<String> {
+    a.iter().map(|s| s.to_string()).collect()
+}
+
+// ---- off by default --------------------------------------------------------------
+
+#[tokio::test]
+async fn the_preview_is_off_by_default() {
+    // No flag, or other arguments only: the normal Explorer.
+    assert_eq!(preview_bind(&args(&[])), Ok(None));
+    assert_eq!(preview_bind(&args(&["--port", "8097"])), Ok(None));
+    assert_eq!(
+        preview_bind(&args(&["--atlas-fixture-previewx", "8097"])),
+        Ok(None)
+    );
+
+    // The normal app never serves a preview route, even for an id the preview
+    // itself serves.
+    let preview = preview_router();
+    let (id, _) = committed_lines().into_iter().next().unwrap();
+    let level = format!("{LEVEL_PREFIX}{id}");
+    assert_eq!(get(&preview, &level).await.status, StatusCode::OK);
+    assert_eq!(get(&preview, PAGE_PATH).await.status, StatusCode::OK);
+
+    let app = common::spawn().await;
+    let sid = app.sign_in("tok");
+    for path in [
+        level.clone(),
+        format!("/explorer{level}"),
+        PAGE_PATH.to_string(),
+        format!("/explorer{PAGE_PATH}"),
+    ] {
+        for res in [app.get(&path).await, app.get_as(&path, &sid).await] {
+            assert_eq!(res.status, StatusCode::NOT_FOUND, "{path}: {}", res.body);
+            assert!(res.header(PREVIEW_HEADER).is_none(), "{path}");
+            assert!(!res.body.contains("\"schema_version\""), "{path}");
+        }
+    }
+    // And the real Atlas page carries no preview data.
+    let page = app.get_as("/explorer/atlas", &sid).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.body.contains("data-atlas-maps"));
+    assert!(!page.body.contains("data-level-prefix"));
+    assert!(!page.body.contains("atlas-preview-banner"));
+}
+
+// ---- loopback only ---------------------------------------------------------------
+
+#[test]
+fn the_preview_refuses_a_non_loopback_bind() {
+    for bad in [
+        "0.0.0.0:8097",
+        "[::]:8097",
+        "192.168.1.20:8097",
+        "10.0.0.1:8097",
+        "172.17.0.1:8097",
+        "100.64.0.1:8097",
+        "[fe80::1]:8097",
+        "[::ffff:10.0.0.1]:8097",
+    ] {
+        assert!(
+            matches!(parse_bind(bad), Err(PreviewError::NotLoopback(_))),
+            "{bad} must be refused: {:?}",
+            parse_bind(bad)
+        );
+    }
+    for bad in [
+        "localhost:8097",
+        "example.com:80",
+        "0.0.0.0",
+        "8097x",
+        "70000",
+        "127.0.0.1",
+    ] {
+        assert!(
+            matches!(parse_bind(bad), Err(PreviewError::BadAddress(_))),
+            "{bad}: {:?}",
+            parse_bind(bad)
+        );
+    }
+    assert!(matches!(parse_bind("0"), Err(PreviewError::PortZero(_))));
+    assert!(matches!(
+        parse_bind("127.0.0.1:0"),
+        Err(PreviewError::PortZero(_))
+    ));
+    assert_eq!(parse_bind(""), Err(PreviewError::MissingAddress));
+
+    let ok = |s: &str| parse_bind(s).unwrap();
+    assert_eq!(ok("8097"), "127.0.0.1:8097".parse().unwrap());
+    assert_eq!(ok("127.0.0.1:8097"), "127.0.0.1:8097".parse().unwrap());
+    assert_eq!(ok("127.0.0.2:9000"), "127.0.0.2:9000".parse().unwrap());
+    assert_eq!(ok("[::1]:8097"), "[::1]:8097".parse().unwrap());
+
+    // Through the command line, both spellings, and a missing value.
+    assert_eq!(
+        preview_bind(&args(&[FLAG, "8097"])),
+        Ok(Some("127.0.0.1:8097".parse().unwrap()))
+    );
+    assert_eq!(
+        preview_bind(&args(&[&format!("{FLAG}=[::1]:8097")])),
+        Ok(Some("[::1]:8097".parse().unwrap()))
+    );
+    assert!(matches!(
+        preview_bind(&args(&[FLAG, "0.0.0.0:8097"])),
+        Err(PreviewError::NotLoopback(_))
+    ));
+    assert!(matches!(
+        preview_bind(&args(&[&format!("{FLAG}=0.0.0.0:8097")])),
+        Err(PreviewError::NotLoopback(_))
+    ));
+    assert_eq!(
+        preview_bind(&args(&[FLAG])),
+        Err(PreviewError::MissingAddress)
+    );
+    assert_eq!(
+        preview_bind(&args(&[FLAG, "--other"])),
+        Err(PreviewError::MissingAddress)
+    );
+
+    // The configuration it runs with points at no API and is plain-http
+    // loopback; nothing comes from the environment.
+    let c = atlas_preview::config("127.0.0.1:8097".parse().unwrap()).unwrap();
+    assert_eq!(c.public_base_url.as_str(), "http://127.0.0.1:8097/");
+    assert_eq!(c.api_url.host_str(), Some("127.0.0.1"));
+    assert_eq!(c.api_url.port(), Some(9));
+    assert!(c.dev_bearer.is_none() && c.client_id.is_none());
+}
+
+// ---- serving ---------------------------------------------------------------------
+
+/// Walk the preview from the manifest's theme roots through every child,
+/// switch, bundle target and outgoing target, fetching each level from the
+/// preview route: every level is reachable, served byte for byte as
+/// committed, and passes the contract for its map.
+#[tokio::test]
+async fn the_preview_serves_every_reachable_level_byte_for_byte_and_valid() {
+    let router = preview_router();
+    let lines = committed_lines();
+    let m = manifest();
+    let mut queue: VecDeque<(Uuid, Expected)> = VecDeque::new();
+    for map in m["maps"].as_array().unwrap() {
+        let group = map["group_id"]
+            .as_str()
+            .map(|g| Uuid::parse_str(g).unwrap());
+        for t in map["themes"].as_array().unwrap() {
+            for h in ["meaning", "links"] {
+                let id = Uuid::parse_str(t["roots"][h].as_str().unwrap()).unwrap();
+                let want = match group {
+                    Some(g) => Expected::team(g, id),
+                    None => Expected::public(id),
+                };
+                queue.push_back((id, want));
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    while let Some((id, want)) = queue.pop_front() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let res = get(&router, &format!("{LEVEL_PREFIX}{id}")).await;
+        assert_eq!(res.status, StatusCode::OK, "{id}");
+        assert_eq!(res.header("content-type"), Some("application/json"));
+        assert_eq!(res.header(PREVIEW_HEADER), Some(PREVIEW_HEADER_VALUE));
+        assert_eq!(
+            res.text(),
+            lines[&id],
+            "{id} is served exactly as committed"
+        );
+        if let Err(e) = check_level_body(&res.body, &want) {
+            panic!("{id}: {e:#?}");
+        }
+        let v: Value = serde_json::from_slice(&res.body).unwrap();
+        let next = |s: &str| Expected {
+            level_id: Uuid::parse_str(s).unwrap(),
+            ..want
+        };
+        queue.push_back((
+            next(v["switch"]["level_id"].as_str().unwrap()).level_id,
+            next(v["switch"]["level_id"].as_str().unwrap()),
+        ));
+        let mut ids: Vec<&str> = Vec::new();
+        for c in v["children"].as_array().into_iter().flatten() {
+            ids.push(c["id"].as_str().unwrap());
+        }
+        for t in v["targets"].as_array().into_iter().flatten() {
+            ids.push(t["level_id"].as_str().unwrap());
+        }
+        for o in v["outgoing"].as_array().into_iter().flatten() {
+            ids.push(o["target"]["level_id"].as_str().unwrap());
+        }
+        for s in ids {
+            let e = next(s);
+            queue.push_back((e.level_id, e));
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        lines.len(),
+        "every preview level is reachable from a theme root"
+    );
+}
+
+#[tokio::test]
+async fn the_preview_serves_the_contract_fixtures_by_id() {
+    let router = preview_router();
+    for stem in [
+        "team_theme_root",
+        "team_group_deep",
+        "team_leaf_dense",
+        "public_leaf",
+    ] {
+        let v = fixture_value(stem);
+        let id = v["level_id"].as_str().unwrap();
+        let res = get(&router, &format!("{LEVEL_PREFIX}{id}")).await;
+        assert_eq!(res.status, StatusCode::OK, "{stem}");
+        let committed = std::fs::read_to_string(format!(
+            "{}/contract/atlas_level/v1/fixtures/{stem}.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        assert_eq!(res.text(), committed, "{stem} is served as committed");
+    }
+}
+
+#[tokio::test]
+async fn the_preview_404s_an_unknown_id_with_the_contract_body() {
+    let router = preview_router();
+    let want = fixture_value("non_member_bff");
+    let mut bodies = Vec::new();
+    for id in [
+        Uuid::new_v4().to_string(),
+        "not-a-uuid".to_string(),
+        "..%2F..%2Fetc".to_string(),
+    ] {
+        let res = get(&router, &format!("{LEVEL_PREFIX}{id}")).await;
+        if let Err(e) = check_not_found(Side::Bff, res.status.as_u16(), &res.body, &id) {
+            panic!("{id}: {e:#?}");
+        }
+        let body: Value = serde_json::from_slice(&res.body).unwrap();
+        assert_eq!(body, want["body"], "{id}");
+        assert_eq!(res.header(PREVIEW_HEADER), Some(PREVIEW_HEADER_VALUE));
+        bodies.push(res.body);
+    }
+    assert!(
+        bodies.windows(2).all(|w| w[0] == w[1]),
+        "one body for every miss"
+    );
+}
+
+#[tokio::test]
+async fn the_preview_page_carries_the_banner_and_no_inline_script() {
+    let router = preview_router();
+    let res = get(&router, PAGE_PATH).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.header(PREVIEW_HEADER), Some(PREVIEW_HEADER_VALUE));
+    let body = res.text();
+    assert!(body.contains("class=\"atlas-preview-banner\""), "{body}");
+    assert!(body.contains("Preview: synthetic fixture data."));
+    assert!(body.contains("data-atlas-mode=\"preview\""));
+    assert!(body.contains(&format!("data-level-prefix=\"{LEVEL_PREFIX}\"")));
+    // The manifest rides in an attribute (escaped), not in a script.
+    let root = manifest()["maps"][0]["themes"][0]["roots"]["meaning"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(body.contains("data-atlas-maps=\""));
+    assert!(body.contains(&root));
+    for (i, _) in body.match_indices("<script") {
+        let tag = &body[i..i + body[i..].find('>').unwrap()];
+        assert!(tag.contains(" src=\"") && tag.contains(" defer"), "{tag}");
+    }
+    assert!(!body.contains("style="));
+    let nested = body.find("static/atlas_nested.js").unwrap();
+    let main = body.find("static/atlas.js").unwrap();
+    assert!(nested < main, "the rules load before the canvas");
+    // No sign-in, search or other Explorer link: none of them is served here.
+    assert!(!body.contains("/auth/login"));
+    assert!(!body.contains("/search"));
+
+    // `/` leads to the page; health and static assets answer with the mark.
+    let home = get(&router, "/").await;
+    assert!(home.status.is_redirection());
+    assert_eq!(home.header("location"), Some(PAGE_PATH));
+    for path in ["/health", "/static/atlas.js", "/static/atlas_nested.js"] {
+        let r = get(&router, path).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        assert_eq!(
+            r.header(PREVIEW_HEADER),
+            Some(PREVIEW_HEADER_VALUE),
+            "{path}"
+        );
+    }
+}
+
+/// The preview mounts no route that reaches the API: every Explorer page and
+/// BFF route is absent, so a preview on a host with a live API cannot read it.
+#[tokio::test]
+async fn the_preview_mounts_no_upstream_route() {
+    let router = preview_router();
+    let id = Uuid::new_v4();
+    for path in [
+        "/atlas".to_string(),
+        "/bff/atlas/layout".to_string(),
+        format!("/bff/atlas/claim/{id}"),
+        "/bff/atlas/search?q=x".to_string(),
+        "/bff/themes".to_string(),
+        format!("/claim/{id}"),
+        "/search?q=x".to_string(),
+        "/auth/login".to_string(),
+        "/auth/callback?code=x&state=y".to_string(),
+    ] {
+        let r = get(&router, &path).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            r.header(PREVIEW_HEADER),
+            Some(PREVIEW_HEADER_VALUE),
+            "{path}"
+        );
+    }
+}

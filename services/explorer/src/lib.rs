@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod assets;
+pub mod atlas_preview;
 pub mod auth;
 pub mod bff;
 pub mod config;

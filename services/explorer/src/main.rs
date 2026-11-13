@@ -1,9 +1,13 @@
 //! `epigraph-explorer`: config → state → router → serve on 127.0.0.1.
+//!
+//! With `--atlas-fixture-preview <port | loopback-ip:port>` it serves the
+//! Atlas fixture preview instead (`atlas_preview`): synthetic levels, no API,
+//! loopback only. Without the flag nothing about it is mounted.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
 
-use epigraph_explorer::{app, AppState, Config};
+use epigraph_explorer::{app, atlas_preview, AppState, Config};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -13,6 +17,24 @@ async fn main() -> ExitCode {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match atlas_preview::preview_bind(&args) {
+        Ok(None) => {}
+        Ok(Some(addr)) => {
+            return match atlas_preview::serve(addr, shutdown_signal()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    tracing::error!(error = %e, "atlas fixture preview failed");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Err(e) => {
+            eprintln!("epigraph-explorer: {e}");
+            return ExitCode::from(2);
+        }
+    }
 
     let config = match Config::from_env() {
         Ok(c) => c,
