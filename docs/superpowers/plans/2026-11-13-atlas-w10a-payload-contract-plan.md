@@ -97,14 +97,24 @@ positions and weights.
   - `exact`: every evidence-to-claim edge, from the stored mass;
   - `proxy`: every claim-to-claim edge, strength × the source claim's belief, which the
     view labels an estimate (a `cites` edge too, with sign 0). W7 computes it at build
-    time from a role-aware belief read of the source claim, not from a served field;
+    time, not from a served field, from a belief read of the source claim that is
+    role-aware and scoped to the map's audience (see "No belief value" below);
   - `none`: every other pair, such as an agent's authorship, so weight 0 and sign 0.
 - `relationship` is the stored name, unnormalised: `^[A-Za-z][A-Za-z0-9_]*$`, at most
   32 characters. The `edges` table uses both casings (`AUTHORED` and `authored`,
   `SUPPORTS` and `supports`), so the view compares names case-insensitively.
+- The builder draws only edge rows the map's audience can read. An edge row has its
+  own visibility and owner and co-owner groups, apart from its endpoints. The public
+  map draws public rows only; a team map draws public rows and the rows that team owns
+  or co-owns, so a row co-owned by two teams is drawn on both teams' maps. Two readable
+  endpoints do not make a row readable, and a served edge carries no row id or
+  visibility, so `for_viewer` cannot check this: it is a builder (W8) invariant, and
+  no test in this crate can prove it.
 - The `edges` table keeps one row per submission (migration 018), so a stored
-  (source, target, relationship) can repeat. The builder collapses such rows into one
-  edge with the largest `flow_weight`: a resubmission is not more support.
+  (source, target, relationship) can repeat. After the audience filter, the builder
+  collapses such rows into one edge with the largest `flow_weight`: a resubmission is
+  not more support. Filtering first matters, or an unreadable row's larger weight
+  would win the collapse.
 - `outgoing[]`: links leaving the leaf, aggregated by target group. Each has the
   target, `count`, `net_sign`, and the leaf nodes they leave from.
 
@@ -118,11 +128,19 @@ positions and weights.
   `truth_value`. The nested levels follow the same rule: a leaf claim node carries
   `truth_value` and no `betp`. Every object is closed, so a leaf carrying `betp`
   (a number or null) fails validation as an unknown key, on the schema and on the
-  types. The Explorer's banned-key list (`BELIEF_KEYS`, shared by
+  kernel types. (The Explorer mirror ignores unknown keys by its own rule, so on the
+  BFF side the schema check in `check_level_body` is what rejects it.) The Explorer's banned-key list (`BELIEF_KEYS`, shared by
   `assert_no_belief_keys` on the existing routes and the contract tests) covers both.
-- Proxy flow weights still need the source claim's belief, so W7 reads it role-aware
-  (the `no_role_blind_belief_reads` ratchet) at build time and stores only the
-  resulting `flow_weight`.
+- Proxy flow weights still need the source claim's belief. W7 reads it at build time
+  and stores only the resulting `flow_weight`. That read must be:
+  - role-aware (the `no_role_blind_belief_reads` ratchet, which is about compound vs
+    atom role), and
+  - scoped to the map's audience: folded only from the BBAs that audience can read
+    (public BBAs for the public map; public and the team's own for a team map). The
+    cached claim BetP folds every non-retracted BBA whatever group owns it, so it
+    must not be used. A weight can reveal the belief it was built from, so a public
+    claim with team-private evidence would otherwise put that private mass on the
+    public map.
 - `truth_value` stays, as the colour value only, so colour means the same at every
   level. It is not purely authored: writers that fold evidence also persist
   `truth_value = clamped(pignistic_prob)` as a mirror of the cache at write time
@@ -176,7 +194,18 @@ Each new test is shown to fail on a mutated contract:
   schema version, after the evidence-edge backfill lands. `schema_version` stays 1:
   this PR is unmerged, so v1 was never published.
 - **Proxy flow weights are computed at build time.** W7 reads the source claim's
-  belief role-aware while building the leaf and stores only `flow_weight`.
+  belief while building the leaf, role-aware and scoped to the map's audience (§2),
+  and stores only `flow_weight`.
+- **Open for the operator: a proxy weight can carry the BetP this ruling removes.**
+  `flow_weight = strength × BetP(source)`. If W7 makes strength a per-relationship
+  constant, then BetP(source) = `flow_weight / strength(relationship)` to four
+  decimal places, and every served edge names its relationship. The audience scoping
+  above keeps this from being a tenancy leak: the public map could only reveal belief
+  folded from public BBAs, a team map only belief its members can read. What is left
+  is whether serving that belief before its evidence is shown is within the ruling.
+  The options are to accept it, to make proxy weights `strength` alone (sign carried
+  by `sign`), or to quantise them. Nothing computes real proxy weights before W7, so
+  the contract is unchanged until this is decided.
 - **Evidence draws only stored edges** (a ruling on the storage items, recorded here
   because the `exact` basis rests on it). There is no derived `evidence_for` edge: a
   leaf's evidence nodes and `exact` edges come from stored evidence→claim edges. Making
