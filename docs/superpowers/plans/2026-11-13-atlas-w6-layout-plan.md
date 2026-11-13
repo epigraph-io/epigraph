@@ -104,7 +104,7 @@ run on a remote lane on ids and edges only.
 | `crates/epigraph-cli/src/atlas_layout/force.rs` | pure: input normalisation, `layout_leaf`, `layout_group`, the two input hashes, unit tests of quality, determinism and timing |
 | `crates/epigraph-cli/src/atlas_layout/fill.rs` | pure over W10a types: inputs from documents, `LayoutRecord` (to / from `params`), `fill_positions` with skip-by-hash, `FillReport`; the `LeafNodeSet` adapter behind the `db` feature |
 | `crates/epigraph-cli/src/atlas_layout/mod.rs` | module registration |
-| `crates/epigraph-cli/Cargo.toml`, `Cargo.lock` | depend on `epigraph-atlas-contract` (no features) |
+| `crates/epigraph-cli/Cargo.toml`, `Cargo.lock` | depend on `epigraph-atlas-contract` (no features); dev-depend on it with `check`, for its fixture levels; register the DB test (`required-features = ["db"]`) |
 | `crates/epigraph-cli/tests/atlas_w6_layout_store.rs` | DB test (`remote-cargo --db`): a synthetic hierarchy filled, stored through W2, read back, validated; a rerun skips through the stored hash |
 
 ## Tests and how each "Done when" is proven
@@ -131,9 +131,18 @@ In `fill::tests`: `filled_fixture_levels_validate_and_keep_the_layout_bounds`
 `a_level_given_twice_is_refused_and_nothing_is_filled`, and (with `db`)
 `a_w3_node_set_and_its_leaf_document_hash_and_lay_out_alike`.
 
-Each test is shown to fail on broken code: 36 mutation probes (18 on the
-layout, 14 on the fill, 4 on the stored run), each run, seen red, and
-reverted.
+Each test is shown to fail on broken code: 39 mutation probes went red and
+were reverted (22 on the layout, 13 on the fill, 4 on the stored run). One
+more fill probe survived and is equivalent: it lets a previous document of
+the other kind (a group where a leaf was) be reused, but a leaf and a group
+never share an input hash (their hash headers differ), so that branch cannot
+be reached through a matching hash. (The fill commit's message counts it
+among 14 red probes; that count is wrong by this one.)
+
+Group levels are not time-bounded by a test: a 128-child group (the
+contract's cap) takes about 115 ms in the debug test build, printed by
+`group_circles_do_not_overlap_and_stay_inside_the_unit_disc`. There are far
+fewer group levels than leaves.
 
 ## Build gate (tier 1)
 
