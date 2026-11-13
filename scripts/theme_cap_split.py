@@ -41,9 +41,11 @@ What apply writes, per theme:
     off label_themes_llm's placeholder patterns, so that script's default run,
     which samples member text, does not rename it.
   * Refused, with nothing written, when the result no longer matches the live
-    membership (claims assigned or moved since the plan), or when a part would
-    end over the cap once current members without an embedding (which stay
-    with the kept part) are counted.
+    membership (claims assigned or moved since the plan), when any theme the
+    result names would end over the cap once current members without an
+    embedding (which stay with the kept part) are counted, including a theme
+    whose embedded members fit in one part or that has none, or when the
+    result's cap is over apply's `--cap` (default 2000).
 
 The cap counts CURRENT members (`COALESCE(is_current, true)`), what the Atlas
 draws. Retired members (superseded or duplicate-marked) keep their theme_id and
@@ -332,8 +334,12 @@ def _recompute(cur, theme_id, with_3072):
         )
 
 
-def apply_result(conn, result, manifest_path):
+def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP):
     """Write a result document in one transaction; returns the manifest.
+
+    The result's own cap is enforced, and a result whose cap exceeds `max_cap`
+    (apply's `--cap`) is refused: the file may come back from off the box,
+    and its cap must not be what decides how large a part may be.
 
     The manifest is written and fsynced BEFORE the commit, so a committed
     apply always has one. A manifest whose apply did not commit reverses as a
@@ -341,6 +347,9 @@ def apply_result(conn, result, manifest_path):
     if result.get("format") != core.RESULT_FORMAT:
         raise ValueError(f"not a {core.RESULT_FORMAT} result: {result.get('format')!r}")
     cap = int(result["cap"])
+    if cap > int(max_cap):
+        raise ValueError(f"the result's cap of {cap} is over apply's cap of {max_cap}; refusing "
+                         "(pass --cap to apply to raise it deliberately)")
     run = str(uuid.uuid4())
     manifest = {"format": MANIFEST_FORMAT, "split_run": run, "cap": cap,
                 "seed": result.get("seed"),
@@ -542,6 +551,8 @@ def main(argv=None):
     sp = sub.add_parser("apply", help="write a result file; writes a manifest")
     db_args(sp)
     sp.add_argument("--from", dest="src", required=True, help="result file from plan or compute")
+    sp.add_argument("--cap", type=int, default=core.DEFAULT_CAP,
+                    help="refuse a result whose cap is larger (default %(default)s)")
     sp.add_argument("--manifest", default=None,
                     help="manifest to create (default theme-cap-manifest-<UTC>.json)")
 
@@ -585,7 +596,7 @@ def main(argv=None):
         elif args.command == "apply":
             result = json.loads(pathlib.Path(args.src).read_text())
             mpath = args.manifest or f"theme-cap-manifest-{_stamp()}.json"
-            manifest = apply_result(conn, result, mpath)
+            manifest = apply_result(conn, result, mpath, max_cap=args.cap)
             print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
                               "manifest": mpath if manifest["themes"] else None,
                               "split_run": manifest["split_run"],

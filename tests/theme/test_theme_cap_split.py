@@ -328,6 +328,20 @@ def test_plan_and_parts_record_an_id_order_cut(db, seed_agent, tmp_path):
     assert all(p["split_id_chunk_cuts"] == report[0]["id_chunk_cuts"] for p in props)
 
 
+class _NoDB:
+    def __getattr__(self, name):
+        raise AssertionError(f"apply touched the database ({name}) before checking the cap")
+
+
+def test_apply_refuses_a_result_whose_cap_is_over_its_own():
+    """The result file may come back from off the box; its cap must not be what
+    decides how large a part may be."""
+    result = {"format": core.RESULT_FORMAT, "cap": 8000, "seed": 42, "themes": []}
+
+    with pytest.raises(ValueError, match="over apply's cap of 2000"):
+        S.apply_result(_NoDB(), result, "unused.json")
+
+
 def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):
     """Superseded and duplicate-marked members keep their theme_id but are not
     drawn and cannot be clustered: they neither trigger a split nor overflow the
