@@ -97,7 +97,8 @@ positions and weights.
   - `exact`: every evidence-to-claim edge, from the stored mass;
   - `proxy`: every claim-to-claim edge, the link's strength × its sign and nothing
     else, which the view labels an estimate. `flow_weight` is strength × |sign| and
-    `sign` the direction, so a `cites` edge (sign 0) weighs 0. No belief factor of any
+    `sign` the direction, so a `cites` edge (sign 0) weighs 0, and both the schema and
+    `validate` reject a sign-0 proxy edge with any other weight. No belief factor of any
     kind enters it (see "No belief value" below);
   - `none`: every other pair, such as an agent's authorship, so weight 0 and sign 0.
 - `relationship` is the stored name, unnormalised: `^[A-Za-z][A-Za-z0-9_]*$`, at most
@@ -173,7 +174,7 @@ positions and weights.
 | Served filtered for the viewer | `every_leaf_filtered_for_a_viewer_is_valid` (96 seeded readable subsets of the two leaves), `for_viewer_drops_what_would_show_a_hidden_claim` (kernel). |
 | serde types ↔ schema | `schema_and_types_agree_on_every_mutation`: in small probe documents cut from the fixtures (both level kinds, both map scopes, every node kind and flow basis), at every key, drop it, add an unknown key beside it, and replace its value 7 ways; the schema's verdict must equal the strict serde and invariant verdict. Also `fixtures_round_trip_through_the_types` (kernel) and `the_mirror_round_trips_every_fixture` (explorer). |
 | No belief value | `the_contract_carries_no_belief_value`, `a_leaf_claim_node_carrying_betp_is_rejected` (kernel); `no_schema_or_fixture_key_carries_belief`, `the_helper_rejects_betp_on_a_leaf_claim` (explorer). |
-| No belief factor in proxy weights | `proxy_weights_are_link_strength_times_sign_only`, `proxy_weights_ignore_every_claim_value` (kernel, on the generator; §5). |
+| No belief factor in proxy weights | `invariants_enforce_the_schema_rules` (a sign-0 proxy edge weighs 0, kernel and schema); `proxy_weights_are_link_strength_times_sign_only`, `proxy_weights_ignore_every_claim_value` (kernel, on the generator; §5). The builder-side invariance test belongs to W7. |
 | Negative cases | `extra_private_field_is_rejected`, `missing_flow_basis_is_rejected`, `non_member_body_leaks_no_shape`, `the_kernel_not_found_message_names_the_requested_id`, `invariants_catch_what_the_schema_cannot`, `invariants_enforce_the_schema_rules`, `flow_basis_is_fixed_by_the_endpoint_kinds`, `an_agent_or_evidence_node_with_no_claim_edge_is_rejected`, `relationship_names_in_both_casings_are_accepted` (kernel); `the_helper_rejects_an_extra_private_field`, `the_helper_rejects_an_edge_without_its_exact_or_proxy_flag`, `the_helper_rejects_a_dangling_reference`, `the_not_found_answer_leaks_no_shape` (explorer). |
 
 Each new test is shown to fail on a mutated contract:
@@ -199,17 +200,27 @@ Each new test is shown to fail on a mutated contract:
   replaces design §2's "link strength × the source claim's BetP" and the same words in
   W7's backlog text. It also settles the question an earlier revision left open (a
   weight built as strength × BetP could be divided back into the BetP): there is no
-  BetP in the weight to recover. The fixture generator follows the rule, and two
-  contract tests pin it:
+  BetP in the weight to recover. The fixture generator follows the rule, and these
+  contract checks pin it:
+  - `validate` and the schema reject a proxy edge with sign 0 and a non-zero weight,
+    so no document can serve a `cites` link carrying a value such as its source's
+    belief (`invariants_enforce_the_schema_rules`).
   - `proxy_weights_are_link_strength_times_sign_only`: over the committed leaves and
     32 seeded ones, every proxy edge's sign matches its relationship, a `cites` link
-    weighs exactly 0, and every other one a strength in (0, 1]. A belief factor
-    breaks it both ways: a claim with no belief zeroes a signed link, and a `cites`
-    link picks up its source's belief.
-  - `proxy_weights_ignore_every_claim_value`: two seeded leaves identical except for
-    every claim's `truth_value` have identical edges. The contract has no other
-    belief input to vary, so W7 must carry the real invariance test: changing a
-    source claim's BBAs leaves its proxy weights unchanged.
+    weighs exactly 0, and every other one a strength in (0, 1]. This pins the shape of
+    the rule only: a belief factor that never reaches 0 (a missing belief defaulted to
+    0.5, say) passes it.
+  - `proxy_weights_ignore_every_claim_value`: the generator keeps a belief per claim
+    that the leaf never serves (the value a builder could fold from the claim's BBAs).
+    Two seeded leaves identical except for every claim's belief, or except for every
+    claim's `truth_value`, have identical edges. Each value is set to 1 for every
+    claim and to none for every claim, which moves both a factor such as
+    `0.5 + 0.5 × belief` and one that defaults a missing belief.
+  These see only what the generator holds per claim: a factor drawn from anywhere
+  else passes them, and none of them can see a builder's source. No contract test
+  can prove a real builder reads no belief, so W7 must carry the real invariance
+  test: changing a source claim's BBAs, or its cached BetP, leaves its proxy weights
+  unchanged.
 - **Evidence draws only stored edges** (a ruling on the storage items, recorded here
   because the `exact` basis rests on it). There is no derived `evidence_for` edge: a
   leaf's evidence nodes and `exact` edges come from stored evidence→claim edges. Making
@@ -234,6 +245,15 @@ How the proxy-weight rule is proven (each probe restored afterwards):
   no belief). Strength alone, sign ignored, fails it on a `cites` link.
 - The weight multiplied by the source claim's `truth_value`:
   `proxy_weights_ignore_every_claim_value` fails (`/edges/70`).
+- The weight multiplied by the source claim's belief with a non-zero default
+  (`belief.unwrap_or(0.5)`), or by `0.5 + 0.5 × belief`: the rule test passes, and
+  `proxy_weights_ignore_every_claim_value` fails on the belief variants. The old
+  formula (`belief.unwrap_or(0.0)`) fails both. A factor drawn from outside the claim
+  (a fresh random draw per link) passes both, as stated above.
+- The `validate` rule for sign-0 proxy edges switched off, and separately the
+  schema's matching clause: `invariants_enforce_the_schema_rules` fails each time.
+- Keeping the per-claim belief draws where they were leaves every fixture
+  byte-identical (`fixtures_are_current`).
 - The regenerated fixtures equal the old ones, compared as parsed JSON, except for
   the `flow_weight` of proxy edges (421 in `team_leaf_dense`, 127 in `public_leaf`);
   the group and not-found fixtures are byte-identical.
