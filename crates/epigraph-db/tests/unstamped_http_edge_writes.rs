@@ -95,6 +95,25 @@
 //! raw-pool handler that reaches it is in `no_unscoped_pool.rs`'s per-file
 //! register, which is where its stamping is tracked.
 //!
+//! The same holds for the stored `evidence -> claim` edge every evidence write
+//! makes since backlog 2d60f619, inside `EvidenceRepository`'s inserts
+//! (`EvidenceRepository::link_to_claims_signed_conn`). Two HTTP handlers reach
+//! it on the UNSTAMPED raw pool, both in D8 scope (evidence -> claim), so on a
+//! public claim the edge is `('public', world)` from birth, like any site in
+//! the register:
+//!
+//! * `conventions.rs::learn_convention`: its evidence -> claim edge was a
+//!   route-layer `EdgeRepository::create` counted here (`conventions.rs` 4 ->
+//!   3, `HIGH_WATER` 27 -> 26). It left the count by moving INTO the evidence
+//!   write, NOT by being stamped; the handler still holds no `Viewer`.
+//! * `crud.rs::create_evidence` (`POST /evidence`): a NEW unstamped in-scope
+//!   edge (it had none before 2d60f619), written by `EvidenceRepository::create`
+//!   on `state.db_pool`; the handler holds no `Viewer`.
+//!
+//! Stamping either handler moves its evidence row AND the edge onto the
+//! caller's group; until then both are tracked here and in
+//! `no_unscoped_pool.rs`, not in [`UNSTAMPED`].
+//!
 //! # How a site is counted
 //!
 //! [`UNSTAMPED`]: a code line (not a whole-line comment) of a non-test region
@@ -136,8 +155,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `forget_convention`'s in-scope edge statements. 4 -> 3 (backlog
     // 2d60f619): `learn_convention`'s evidence -> claim SUPPORTS edge is
     // written by the evidence write itself
-    // (`EvidenceRepository::link_to_claims_signed_conn`), still on the raw
-    // pool, so no longer a route-layer site.
+    // (`EvidenceRepository::link_to_claims_signed_conn`), STILL on the raw
+    // pool and NOT stamped, so no longer a route-layer site this lint can
+    // count (module doc, "What this file does NOT see").
     ("conventions.rs", 3),
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
