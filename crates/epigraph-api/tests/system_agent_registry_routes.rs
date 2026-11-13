@@ -184,10 +184,11 @@ fn challenge_content(host: &str) -> String {
     format!("Network access challenge: {host}:443 (https)")
 }
 
-/// `POST /api/v1/workflows` after a rotation: the step claim is S's and no
-/// agent holds the public-constant key.
+/// `POST /api/v1/workflows` after a rotation: the step claim is the CALLER's
+/// (workflow writes are made as the caller; it used to be S's) and no agent
+/// holds the public-constant key, so the route minted nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn rest_workflow_ingest_after_rotation_authors_as_the_registered_agent(pool: PgPool) {
+async fn rest_workflow_ingest_after_rotation_authors_as_the_caller(pool: PgPool) {
     let s = legacy_system_agent_registered(&pool).await;
     rotate(&pool, s).await;
     let (caller, _) = seed_agent_with_group(&pool, "caller").await;
@@ -210,7 +211,8 @@ async fn rest_workflow_ingest_after_rotation_authors_as_the_registered_agent(poo
     r.expect("store_workflow after the rotation");
     let authors = authors_of(&pool, &step).await;
     assert_eq!(authors.len(), 1);
-    assert_eq!(authors[0].0, s, "the step claim is the registered agent's");
+    assert_eq!(authors[0].0, caller, "the step claim is the caller's");
+    assert_ne!(authors[0].0, s, "not the registered system agent's");
     assert_eq!(k_holders(&pool).await, 0);
 }
 
@@ -258,10 +260,12 @@ async fn policy_challenge_on_an_armed_unregistered_database_refuses_without_writ
     assert_eq!(count(&pool, "agents").await, agents);
 }
 
-/// Armed, nothing registered: `POST /api/v1/workflows/steps` refuses (500
-/// naming the registry) before writing anything.
+/// Armed, nothing registered: `POST /api/v1/workflows/steps` no longer needs
+/// the system agent (workflow writes are made as the caller), so an unknown
+/// workflow is the caller's 404, not the registry's 500, and nothing is
+/// written or minted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing(pool: PgPool) {
+async fn rest_add_step_on_an_armed_unregistered_database_needs_no_system_agent(pool: PgPool) {
     let (a, _) = seed_human_operator(&pool, "human-a").await;
     arm(&pool).await;
     let state = app_role_state(&pool).await;
@@ -280,8 +284,11 @@ async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing
     )
     .await;
     let (status, body) = body_text(r.into_response()).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains("system_agents"), "names the registry: {body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        !body.contains("system_agents"),
+        "no registry refusal: {body}"
+    );
     assert_eq!(count(&pool, "claims").await, claims);
     assert_eq!(count(&pool, "agents").await, agents);
 }
@@ -290,21 +297,29 @@ async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing
 
 const RESERVED_AUTHOR: &str = "Workflow-Ingest-System.";
 
-/// A superuser `AppState`: `set_provenance` and `create_agent` run on the raw
-/// pool, and no tenancy question is asked here.
+/// A superuser `AppState`: `create_agent` runs on the raw pool, and no
+/// tenancy question is asked here.
 fn superuser_state(pool: &PgPool) -> AppState {
     AppState::with_db(pool.clone(), ApiConfig::default())
 }
 
+/// `set_provenance` as the claim's filer `owner`, on the application role
+/// (it writes on the caller's stamped transaction).
 async fn provenance(
-    state: &AppState,
+    pool: &PgPool,
+    owner: Uuid,
     claim: Uuid,
     authors: serde_json::Value,
 ) -> (StatusCode, String) {
+    let state = app_role_state(pool).await;
     let req: epigraph_api::routes::provenance::ProvenanceRequest =
         serde_json::from_value(serde_json::json!({ "authors": authors })).expect("request");
+    let mut auth = token(owner, ClientType::Service);
+    auth.scopes = vec!["claims:write".to_string(), "edges:write".to_string()];
     let r = epigraph_api::routes::provenance::set_provenance(
-        State(state.clone()),
+        ViewerExtractor(Viewer::resolve(pool, owner).await.expect("viewer")),
+        State(state),
+        Some(Extension(auth)),
         axum::extract::Path(claim),
         Json(req),
     )
@@ -354,7 +369,6 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
             .expect("the unarmed fallback creates S")
     };
     let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
-    let state = superuser_state(&pool);
     let ada = serde_json::json!({ "name": "Ada Lovelace", "position": 0 });
 
     for phase in ["(0) unregistered", "(a) registered", "(b) rotated"] {
@@ -379,7 +393,8 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
         .await;
 
         let (status, body) = provenance(
-            &state,
+            &pool,
+            owner,
             claim,
             serde_json::json!([ada, { "name": RESERVED_AUTHOR, "position": 1 }]),
         )
@@ -398,7 +413,8 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
         );
 
         let (status, body) = provenance(
-            &state,
+            &pool,
+            owner,
             claim,
             serde_json::json!([{ "name": RESERVED_AUTHOR, "orcid": "" }]),
         )
@@ -409,17 +425,26 @@ async fn provenance_refuses_an_author_naming_the_system_identity(pool: PgPool) {
             "{phase} (ii) empty ORCID: {body}"
         );
 
+        // CONTROL: a real ORCID derives from the ORCID, so the system-identity
+        // guard passes; the author is then a third party the filer does not
+        // speak for, which the authorship check refuses (403, not this 400).
         let (status, body) = provenance(
-            &state,
+            &pool,
+            owner,
             claim,
             serde_json::json!([{ "name": RESERVED_AUTHOR, "orcid": "0000-0002-1825-0097" }]),
         )
         .await;
         assert_eq!(
             status,
-            StatusCode::OK,
-            "{phase} (iii) control: a real ORCID derives from the ORCID: {body}"
+            StatusCode::FORBIDDEN,
+            "{phase} (iii) control: a real ORCID passes the system-identity guard: {body}"
         );
+        assert!(
+            body.contains("only itself or an agent it operates"),
+            "{phase} (iii): refused as a third party, not as a system identity: {body}"
+        );
+        assert_eq!(provenance_edges(&pool, claim).await, 0, "{phase} (iii)");
         if rotated {
             assert_eq!(k_holders(&pool).await, 0, "no K holder minted");
         }
@@ -442,7 +467,8 @@ async fn provenance_refuses_an_author_resolving_to_the_registered_agent(pool: Pg
     let (owner, _) = seed_agent_with_group(&pool, "claim-owner").await;
     let claim = viewer_fixture::seed_public_claim(&pool, owner, "provenance target N").await;
     let (status, body) = provenance(
-        &superuser_state(&pool),
+        &pool,
+        owner,
         claim,
         serde_json::json!([{ "name": "Ada Lovelace" }, { "name": "Some Name" }]),
     )

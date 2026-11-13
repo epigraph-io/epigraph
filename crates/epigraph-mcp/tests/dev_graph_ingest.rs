@@ -73,9 +73,15 @@ async fn ingest_extraction_into_target_db() {
         serde_json::from_str(&raw).expect("parse DocumentExtraction");
 
     let server = make_server(pool.clone()).await;
-    let result = do_ingest_document(&server, &viewer, &extraction, None)
-        .await
-        .expect("do_ingest_document succeeds");
+    let result = do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("do_ingest_document succeeds");
 
     let content = result.content.first().expect("at least one content block");
     let text = content.as_text().expect("text content").text.clone();

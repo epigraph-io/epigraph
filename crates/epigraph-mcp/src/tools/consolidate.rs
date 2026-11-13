@@ -7,7 +7,7 @@
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 
-use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
+use crate::errors::{internal_error, internal_error_logged, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::ConsolidateClaimsParams;
 
@@ -55,21 +55,49 @@ pub async fn consolidate_claims(
 
     // Default confidence: the strongest source discounted slightly, so a merge
     // never claims more certainty than its best input.
+    //
+    // The sources are read on the CALLER's stamped read, not the plain pool. On
+    // the application role an unstamped connection admits public rows only, so
+    // a member's own group-private sources read as missing, `best` stayed 0 and
+    // the merged claim was written with truth_value 0, with no error. The read
+    // is released before the write transaction below is taken, so the tool
+    // never holds two pooled connections.
+    //
+    // A failed read REFUSES the merge rather than skipping the source. Under
+    // `EPIGRAPH_SESSION_GUC_MODE=transaction` the stamped read is one
+    // transaction, so one SQL error aborts it and every later source read in
+    // this loop fails too; skipping them wrote the merged claim at a default
+    // drawn from whatever was read before the error (0 when the first source
+    // failed), with no warning. A source the caller cannot see (`Ok(None)`)
+    // is still skipped here: the write transaction's `FOR UPDATE` lock below
+    // refuses it.
     let merged_truth = match params.confidence {
         Some(c) => c.clamp(0.0, 1.0),
         None => {
+            let mut read = server.read_as(viewer, "consolidate_claims").await?;
             let mut best: f64 = 0.0;
             for id in &source_ids {
-                if let Ok(Some(c)) = ClaimRepository::get_by_id(
-                    &server.pool,
+                let source = ClaimRepository::get_by_id(
+                    &mut *read,
                     viewer,
                     epigraph_core::ClaimId::from_uuid(*id),
                 )
                 .await
-                {
+                .map_err(|e| {
+                    internal_error_logged(
+                        format!(
+                            "consolidate_claims: could not read source claim {id} to derive the \
+                             default confidence; nothing was written. Retry, or pass \
+                             `confidence` explicitly."
+                        ),
+                        e,
+                    )
+                })?;
+                if let Some(c) = source {
                     best = best.max(c.truth_value.value());
                 }
             }
+            drop(read);
             (best * 0.95).clamp(0.0, 1.0)
         }
     };

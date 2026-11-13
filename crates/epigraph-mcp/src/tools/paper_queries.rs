@@ -28,18 +28,21 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// and deliberately not `is_current`-filtered; an id it does not return gets `[]`.
 ///
 /// NOT ONE SNAPSHOT. The caller's row read and this label read are two
-/// statements on `server.pool`, so a concurrent `update_labels` between them can
+/// statements on the caller's stamped read (`conn`, from
+/// `EpiGraphMcpFull::read_as`). That is a bare connection in `Session` mode and a
+/// READ COMMITTED transaction otherwise, so each statement takes its own
+/// snapshot either way, and a concurrent `update_labels` between them can
 /// pair a row with its newer labels. That is the same accepted shape as
 /// `query_claims` (backlog `babd5904`); both errors propagate, so nothing is
 /// silently defaulted. `query_paper` and `query_undecomposed_claims` read the
 /// same way. Only REST `get_claim` reads row and labels in one statement.
 async fn claim_responses(
-    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claims: Vec<epigraph_core::Claim>,
 ) -> Result<Vec<ClaimResponse>, McpError> {
     let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(conn, viewer, &ids)
         .await
         .map_err(internal_error)?;
     Ok(claims
@@ -76,8 +79,15 @@ const DEFAULT_PAPER_CLAIM_LIMIT: i64 = 25;
 /// Hard ceiling on `limit`, so a caller cannot re-create the unbounded case.
 const MAX_PAPER_CLAIM_LIMIT: i64 = 200;
 
-/// Look up a paper by DOI and return its title, authors, claim count, and one
-/// page of asserted-claim summaries (`limit`/`offset`, default
+/// Most ingests of one paper `query_paper` names in `ingests`.
+const MAX_PAPER_INGESTS: i64 = 10;
+
+/// Most authors listed for the listed ingest.
+const MAX_INGEST_AUTHORS: i64 = 200;
+
+/// Look up a paper by DOI and return its title, its claim count, the ingests
+/// of it, and ONE ingest's own listing: that ingest's authors and one page of
+/// its asserted claims (`limit`/`offset`, default
 /// [`DEFAULT_PAPER_CLAIM_LIMIT`]).
 ///
 /// The earlier implementation searched claim *content* for the DOI substring
@@ -88,19 +98,33 @@ const MAX_PAPER_CLAIM_LIMIT: i64 = 200;
 ///
 /// The real shape: papers are first-class nodes joined to claims by
 /// `paper -asserts-> claim` edges and to authors by
-/// `agent -authored-> paper` edges.
+/// `agent -authored-> paper` edges. Both are read only as the document ingest
+/// wrote them (ingest-written, `epigraph_db::ingest_written_edge_sql`): an
+/// edge of either shape written any other way is not this paper's
+/// provenance, so it is neither listed nor counted.
+///
+/// ONE INGEST PER LISTING. A paper is shared by its document key across
+/// every ingester, and each ingest principal writes its own marked edges
+/// (`epigraph_db::ingest_written`). One ingest's authors next to another
+/// ingest's claims would credit the first ingest's authors with whatever the
+/// second ingest stated under the same key. So `authors` and `claims` are
+/// always one principal's (the edges' marker `by`): the `ingested_by` the
+/// caller names, else the paper's first ingest. Every ingest is named in
+/// `ingests`, with its own count, to be listed by passing its id. Each listed
+/// claim says whether THIS ingest created it (`created_claim`).
 ///
 /// Returns a zero-shaped response (claim_count=0, empty title/authors) when
 /// the DOI isn't in the graph. Callers (the monitor) use this as a dedup
 /// probe and expect a structured response, not a 404.
 ///
-/// `claim_count` is `max(asserted_count, labeled_count)`: the `asserts`-edge
-/// count alone under-reports a partially-ingested paper, because ingestion
-/// labels a claim `doi:<doi>` before it links the `asserts` edge (see
-/// `PaperRepository::count_claims_by_doi_label`). Without the label-based
-/// floor, a crash between those two writes leaves a claim in the graph that
-/// this probe would report as `claim_count=0`, letting the nightly monitor
-/// re-extract an already (partially) ingested paper.
+/// `claim_count` is `max(asserted_count, labeled_count)`, where
+/// `asserted_count` counts the claims ANY ingest of the paper asserts (each
+/// once): the `asserts`-edge count alone under-reports a partially-ingested
+/// paper, because ingestion labels a claim `doi:<doi>` before it links the
+/// `asserts` edge (see `PaperRepository::count_claims_by_doi_label`). Without
+/// the label-based floor, a crash between those two writes leaves a claim in
+/// the graph that this probe would report as `claim_count=0`, letting the
+/// nightly monitor re-extract an already (partially) ingested paper.
 ///
 /// This closes the write-order race going forward; it does not retroactively
 /// recover claims ingested before the `doi:<doi>` label existed (they carry
@@ -120,9 +144,23 @@ pub async fn query_paper(
         .unwrap_or(DEFAULT_PAPER_CLAIM_LIMIT)
         .clamp(1, MAX_PAPER_CLAIM_LIMIT);
     let offset = params.offset.unwrap_or(0).max(0);
+    let asked: Option<uuid::Uuid> = match params.ingested_by.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(s) => Some(s.parse().map_err(|_| McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Owned(format!(
+                "ingested_by {s:?} is not an agent id; pass one of a previous response's \
+                 ingests[].ingested_by"
+            )),
+            data: None,
+        })?),
+    };
 
     // Canonical key first (a `https://doi.org/` spelling finds the bare-DOI
     // row), then the key as given; see `find_paper_by_document_key`.
+    // `papers` carries no row security (it is a registry keyed on the
+    // document), so the lookup takes no stamp; every claim-derived read below
+    // runs on the caller's stamped read.
     let paper =
         crate::tools::ingestion::find_paper_by_document_key(&server.pool, &params.doi).await?;
 
@@ -130,98 +168,153 @@ pub async fn query_paper(
         return success_json(&PaperResponse {
             doi: params.doi,
             title: String::new(),
+            ingested_by: None,
             authors: vec![],
+            authors_truncated: false,
             claim_count: 0,
+            asserted_claim_count: 0,
             returned: 0,
             offset,
             limit,
             has_more: false,
             claims: vec![],
+            ingests: vec![],
+            ingests_truncated: false,
         });
     };
 
-    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, viewer, paper.id)
+    let mut read = server.read_as(viewer, "query_paper").await?;
+    let asserted_count = PaperRepository::count_asserted_claims(&mut *read, viewer, paper.id)
         .await
         .map_err(internal_error)?;
     // Node-existence probe, independent of the `asserts` edge: catches claims
     // a partial/crashed ingestion already labelled `doi:<doi>` but never got
     // to link, which `asserted_count` alone would silently report as zero.
-    let labeled_count =
-        PaperRepository::count_claims_by_doi_label(&server.pool, viewer, &paper.doi)
-            .await
-            .map_err(internal_error)?;
+    let labeled_count = PaperRepository::count_claims_by_doi_label(&mut *read, viewer, &paper.doi)
+        .await
+        .map_err(internal_error)?;
     let claim_count = asserted_count.max(labeled_count);
 
-    let authors = PaperRepository::list_authors(&server.pool, viewer, paper.id)
-        .await
-        .map_err(internal_error)?
+    let mut principals =
+        PaperRepository::ingest_principals(&mut *read, viewer, paper.id, MAX_PAPER_INGESTS + 1)
+            .await
+            .map_err(internal_error)?;
+    let ingests_truncated = principals.len() > usize::try_from(MAX_PAPER_INGESTS).unwrap_or(10);
+    principals.truncate(usize::try_from(MAX_PAPER_INGESTS).unwrap_or(10));
+    let mut ingests = Vec::with_capacity(principals.len());
+    for p in &principals {
+        ingests.push(PaperIngestSummary {
+            ingested_by: p.ingested_by.to_string(),
+            asserted_claim_count: PaperRepository::count_asserted_claims_by(
+                &mut *read,
+                viewer,
+                paper.id,
+                p.ingested_by,
+            )
+            .await
+            .map_err(internal_error)?,
+            first_written_at: p.first_written_at.to_rfc3339(),
+        });
+    }
+    // The listed ingest: the one asked for (even when it is past the
+    // `ingests` cap), else the paper's first.
+    let listed = asked.or_else(|| principals.first().map(|p| p.ingested_by));
+
+    let (authors, authors_truncated, asserted_claim_count, claim_rows) = match listed {
+        None => (Vec::new(), false, 0, Vec::new()),
+        Some(by) => {
+            let mut authors = PaperRepository::list_authors_by(
+                &mut *read,
+                viewer,
+                paper.id,
+                by,
+                MAX_INGEST_AUTHORS + 1,
+            )
+            .await
+            .map_err(internal_error)?;
+            let truncated = authors.len() > usize::try_from(MAX_INGEST_AUTHORS).unwrap_or(200);
+            authors.truncate(usize::try_from(MAX_INGEST_AUTHORS).unwrap_or(200));
+            let count = PaperRepository::count_asserted_claims_by(&mut *read, viewer, paper.id, by)
+                .await
+                .map_err(internal_error)?;
+            let rows = PaperRepository::list_asserted_claims_by(
+                &mut *read, viewer, paper.id, by, limit, offset,
+            )
+            .await
+            .map_err(internal_error)?;
+            (authors, truncated, count, rows)
+        }
+    };
+    let authors = authors
         .into_iter()
-        .map(|(agent_id, display_name)| AuthorResponse {
-            agent_id: agent_id.to_string(),
-            name: display_name.unwrap_or_default(),
+        .map(|a| AuthorResponse {
+            agent_id: a.agent_id.to_string(),
+            name: a.display_name.unwrap_or_default(),
+            position: a.position,
+            pending_countersign: a.pending_countersign,
+            ingested_by: a.ingested_by.map(|u| u.to_string()),
         })
         .collect();
 
-    let claim_rows =
-        PaperRepository::list_asserted_claims(&server.pool, viewer, paper.id, limit, offset)
-            .await
-            .map_err(internal_error)?;
-
     // Labels in one batched, viewer-spliced read over the page, and the row's
     // real retirement state — not `labels: []` / `is_current: true` /
-    // `supersedes: None`. `list_asserted_claims` does not filter on
-    // `is_current` (the paging below depends on that row set), so a superseded
-    // asserted claim is on the page and must say so (drain unit U008, backlog
-    // `1e6efd2d` residual).
-    let ids: Vec<uuid::Uuid> = claim_rows.iter().map(|c| c.id).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
+    // `supersedes: None`. The page does not filter on `is_current` (the
+    // paging below depends on that row set), so a superseded asserted claim
+    // is on the page and must say so (drain unit U008, backlog `1e6efd2d`
+    // residual). The replacement cascades leave an ingest's assertion on the
+    // row it created or found, so a superseded or duplicate claim the
+    // ingest asserted stays listed here, retired.
+    let ids: Vec<uuid::Uuid> = claim_rows.iter().map(|c| c.claim.id).collect();
+    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
         .await
         .map_err(internal_error)?;
 
     let mut claims = Vec::with_capacity(claim_rows.len());
-    for c in claim_rows {
-        claims.push(ClaimResponse {
-            id: c.id.to_string(),
-            content: c.content.clone(),
-            truth_value: c.truth_value,
-            agent_id: c.agent_id.to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
-            created_at: c.created_at.to_rfc3339(),
-            labels: labels_map.get(&c.id).cloned().unwrap_or_default(),
-            is_current: c.is_current,
-            supersedes: c.supersedes.map(|s| s.to_string()),
-            belief_score: None,
+    for row in claim_rows {
+        let c = row.claim;
+        claims.push(PaperClaimResponse {
+            claim: ClaimResponse {
+                id: c.id.to_string(),
+                content: c.content.clone(),
+                truth_value: c.truth_value,
+                agent_id: c.agent_id.to_string(),
+                content_hash: ContentHasher::to_hex(&c.content_hash),
+                created_at: c.created_at.to_rfc3339(),
+                labels: labels_map.get(&c.id).cloned().unwrap_or_default(),
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.to_string()),
+                belief_score: None,
+            },
+            created_claim: row.created_claim,
         });
     }
 
-    // `has_more` must TERMINATE, which rules out comparing against
-    // `claim_count` alone.
-    //
-    // `claim_count` is `max(asserted_count, labeled_count)`, but this page can
-    // only ever contain `asserts`-edge rows. A partially-ingested paper — 60
-    // claims labelled `doi:<doi>`, zero edges linked yet, the exact state
-    // `query_paper_duplicate_gate.rs` fixtures — would give `returned = 0`
-    // against `claim_count = 60` and advertise another page forever, sending
-    // any pager into an infinite loop over empty results.
-    //
-    // A SHORT PAGE IS THE END OF THE SET: the repo query asked for `limit` rows
-    // and PostgreSQL returned fewer, so there are none left. The `claim_count`
-    // comparison is kept as a second conjunct only so a page that lands exactly
-    // on the boundary (`offset + returned == claim_count`) stops immediately
-    // instead of costing one extra empty round-trip.
+    // `has_more` must TERMINATE. A SHORT PAGE IS THE END OF THE SET: the repo
+    // query asked for `limit` rows and PostgreSQL returned fewer, so there
+    // are none left. The count comparison (the listed ingest's own count,
+    // one predicate with the page) only stops a page that lands exactly on
+    // the boundary without one extra empty round-trip. A paper with labelled
+    // claims and no linked assertion (a partial ingest) lists no ingest, so
+    // nothing pages.
     let returned = claims.len();
-    let has_more = returned as i64 == limit && offset.saturating_add(returned as i64) < claim_count;
+    let has_more =
+        returned as i64 == limit && offset.saturating_add(returned as i64) < asserted_claim_count;
 
     success_json(&PaperResponse {
         doi: paper.doi,
         title: paper.title.unwrap_or_default(),
+        ingested_by: listed.map(|u| u.to_string()),
         authors,
+        authors_truncated,
         claim_count,
+        asserted_claim_count,
         returned,
         offset,
         limit,
         has_more,
         claims,
+        ingests,
+        ingests_truncated,
     })
 }
 
@@ -234,7 +327,8 @@ pub async fn query_claims_by_evidence(
     let min_truth = params.min_truth.unwrap_or(0.0);
 
     // Search claims and filter by evidence type
-    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
+    let mut read = server.read_as(viewer, "query_claims_by_evidence").await?;
+    let claims = ClaimRepository::list(&mut *read, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -246,7 +340,7 @@ pub async fn query_claims_by_evidence(
             continue;
         }
 
-        let evidence_list = EvidenceRepository::get_by_claim(&server.pool, viewer, claim.id)
+        let evidence_list = EvidenceRepository::get_by_claim(&mut *read, viewer, claim.id)
             .await
             .unwrap_or_default();
 
@@ -272,7 +366,7 @@ pub async fn query_claims_by_evidence(
         }
     }
 
-    success_json(&claim_responses(server, viewer, matched).await?)
+    success_json(&claim_responses(&mut read, viewer, matched).await?)
 }
 
 pub async fn query_claims_by_methodology(
@@ -283,7 +377,10 @@ pub async fn query_claims_by_methodology(
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
-    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
+    let mut read = server
+        .read_as(viewer, "query_claims_by_methodology")
+        .await?;
+    let claims = ClaimRepository::list(&mut *read, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -298,7 +395,7 @@ pub async fn query_claims_by_methodology(
         // Check reasoning traces for methodology
         if let Some(trace_id) = claim.trace_id {
             if let Ok(Some(trace)) =
-                ReasoningTraceRepository::get_by_id(&server.pool, viewer, trace_id).await
+                ReasoningTraceRepository::get_by_id(&mut *read, viewer, trace_id).await
             {
                 let method_name = trace.methodology.description().to_lowercase();
                 if method_name.contains(&methodology_lower) {
@@ -312,7 +409,7 @@ pub async fn query_claims_by_methodology(
         }
     }
 
-    success_json(&claim_responses(server, viewer, matched).await?)
+    success_json(&claim_responses(&mut read, viewer, matched).await?)
 }
 
 pub async fn query_claims_by_label(
@@ -354,8 +451,9 @@ pub async fn query_claims_by_label(
         });
     }
 
+    let mut read = server.read_as(viewer, "query_claims_by_label").await?;
     let rows = ClaimRepository::list_by_labels(
-        &server.pool,
+        &mut *read,
         viewer,
         epigraph_db::LabelQuery {
             labels: &params.labels,
@@ -376,7 +474,7 @@ pub async fn query_claims_by_label(
     let mut source_urls = if params.include_source_urls {
         let ids: Vec<uuid::Uuid> = rows.iter().map(|(c, _)| c.id.as_uuid()).collect();
         Some(
-            EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &ids)
+            EvidenceRepository::source_urls_by_claim_ids(&mut *read, viewer, &ids)
                 .await
                 .map_err(internal_error)?,
         )

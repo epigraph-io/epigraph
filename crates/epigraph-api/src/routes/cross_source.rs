@@ -128,7 +128,14 @@ pub async fn get_cross_source_matches(
     if let Some(g) = viewer.group_bind() {
         exists_q = exists_q.bind(g);
     }
-    let exists: (i64,) = map_sqlx(exists_q.fetch_one(&state.db_pool).await)?;
+    // The probe and both reads share ONE viewer-stamped connection. They ran
+    // on `state.db_pool` (and a `MatchCandidateRepo` built over it), an
+    // unstamped `epigraph_app` session in production, where the FORCEd
+    // `claims` policy admitted public claims only: a member asking about its
+    // own group-private claim got a 404 here.
+    let mut read =
+        crate::routes::open_scoped_read(&state, &viewer, "get_cross_source_matches").await?;
+    let exists: (i64,) = map_sqlx(exists_q.fetch_one(&mut *read).await)?;
     if exists.0 == 0 {
         return Err(ApiError::NotFound {
             entity: "claim".to_string(),
@@ -136,8 +143,12 @@ pub async fn get_cross_source_matches(
         });
     }
 
-    let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
-    let edge_rows = map_sqlx(repo.corroborates_edges_for_claim(&viewer, claim_id).await)?;
+    let edge_rows = map_sqlx(
+        epigraph_db::MatchCandidateRepo::corroborates_edges_for_claim_conn(
+            &mut read, &viewer, claim_id,
+        )
+        .await,
+    )?;
     let corroborates: Vec<CorroboratesEdge> = edge_rows
         .into_iter()
         .map(|(id, src, tgt, properties)| CorroboratesEdge {
@@ -148,7 +159,10 @@ pub async fn get_cross_source_matches(
         })
         .collect();
 
-    let candidate_rows = map_sqlx(repo.list_for_claim(&viewer, claim_id).await)?;
+    let candidate_rows = map_sqlx(
+        epigraph_db::MatchCandidateRepo::list_for_claim_conn(&mut read, &viewer, claim_id).await,
+    )?;
+    crate::routes::finish_scoped_read(read, "get_cross_source_matches").await?;
     let pending: Vec<PendingCandidate> = candidate_rows
         .into_iter()
         .filter(|r| r.status == "pending")
@@ -253,8 +267,14 @@ pub async fn list_candidates(
         None => None,
     };
 
-    let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
-    let rows = map_sqlx(repo.list(&viewer, status_ref, q.limit).await)?;
+    // Both reads share ONE viewer-stamped connection, for the reason given in
+    // `get_cross_source_matches`: on the unstamped `state.db_pool` every
+    // candidate naming the caller's own group-private claim was dropped by the
+    // `claims` join, and its excerpt by the content read.
+    let mut read = crate::routes::open_scoped_read(&state, &viewer, "list_candidates").await?;
+    let rows = map_sqlx(
+        epigraph_db::MatchCandidateRepo::list_conn(&mut read, &viewer, status_ref, q.limit).await,
+    )?;
 
     let mut claim_ids: Vec<Uuid> = Vec::with_capacity(rows.len() * 2);
     for r in &rows {
@@ -281,12 +301,9 @@ pub async fn list_candidates(
     // exists. The visibility predicate is identical between the two, so this is
     // a version-scope choice, not a read-authority one.
     let content_by_id: HashMap<Uuid, String> =
-        epigraph_db::ClaimRepository::contents_by_ids_any_version(
-            &state.db_pool,
-            &viewer,
-            &claim_ids,
-        )
-        .await?;
+        epigraph_db::ClaimRepository::contents_by_ids_any_version(&mut *read, &viewer, &claim_ids)
+            .await?;
+    crate::routes::finish_scoped_read(read, "list_candidates").await?;
 
     let out = rows
         .into_iter()

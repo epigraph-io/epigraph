@@ -78,13 +78,18 @@ use std::path::{Path, PathBuf};
 ///   one database read is an authority fact about the caller (does it hold
 ///   an elevating role), never a corpus row. A viewer here would be a
 ///   parameter with nothing to filter.
-/// * **Reads PR-09 did not convert (2), each with a named owner.** This was 3
-///   until PR-14 deleted `get_ownership`.
-///   - `get_workflow_executions` — `behavioral_executions` and `workflows` are
-///     both outside migration 062's `tier_a` array, so there is no
-///     `owner_group_id` anywhere on the path and no claim to derive one from.
-///     A real fix needs a tenancy column, i.e. a migration, and PR-09 is
-///     code-only. Backlog.
+/// * **Reads PR-09 did not convert (now none that read content).** This was 3
+///   until PR-14 deleted `get_ownership`; `theme_cluster` below is a refusal.
+///   - `get_workflow_executions` — **CONVERTED, entry removed.** It was carried
+///     here because `behavioral_executions` and `workflows` were both outside
+///     migration 062's `tier_a` array. That stopped being true at migration
+///     183 (ruling R-74), which gave `workflows` tenancy under FORCEd row
+///     security, while the exemption stayed: the tool kept reading the
+///     tenancy-less `behavioral_executions` table on the raw pool, so any
+///     caller got any workflow's `goal_text` and `step_beliefs`. It now
+///     acquires a viewer and reads, on the caller's stamped connection, only
+///     runs whose workflow (a `workflows` row or a flat workflow claim) the
+///     caller reads. Pinned by `workflow_executions_tenancy_app_role.rs`.
 ///   - `get_ownership` — **RESOLVED BY DELETION IN PR-14, entry removed.** It
 ///     was carried here as an explicitly "accepted residual": it read the
 ///     legacy `ownership` table with no `Viewer`, and PR-09/PR-11 declined to
@@ -125,8 +130,8 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "list_mcp_tools",
     "stage_claims",
     // reads not converted by PR-09 — see the module doc for the owner of each.
-    // `get_ownership` was here until PR-14 deleted the tool.
-    "get_workflow_executions",
+    // `get_ownership` was here until PR-14 deleted the tool, and
+    // `get_workflow_executions` until it acquired a viewer.
     // RETIRED (backlog a0ed0180): a refusal that reads and writes nothing.
     "theme_cluster",
 ];

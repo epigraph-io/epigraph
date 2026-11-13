@@ -33,6 +33,31 @@ ignore = [
                          #   cloudflare_access.rs), and epigraph's own tokens
                          #   are signed HS256 (epigraph-auth JwtConfig). An RSA
                          #   private key outside tests re-opens this entry.
+    "RUSTSEC-2026-0459", # libsqlite3-sys <0.39: its bundled SQLite (before
+                         #   3.54.0) can return uninitialized page-cache memory
+                         #   when a process opens a database together with a
+                         #   crafted `-wal` file. Accepted with a ratchet
+                         #   (operator ruling, 2026-11-10). No release in
+                         #   reach: the fix is libsqlite3-sys 0.39, and no sqlx
+                         #   release allows it (sqlx 0.8.6's sqlx-sqlite needs
+                         #   ^0.30.1; 0.9.0 is capped below 0.38). Accepted
+                         #   because it is NEVER COMPILED: libsqlite3-sys
+                         #   0.30.1 is in Cargo.lock only as an optional
+                         #   dependency of sqlx-sqlite, which no crate enables
+                         #   (the workspace sqlx features are postgres-only).
+                         #   Measured with
+                         #   `cargo tree -i libsqlite3-sys -e normal
+                         #   --all-features --target all` over --workspace and
+                         #   over each package with a binary (epigraph-api,
+                         #   epigraph-cli, epigraph-mcp): nothing to print, and
+                         #   the same for sqlx-sqlite. Re-opens if any crate
+                         #   enables sqlx's `sqlite` feature or adds
+                         #   rusqlite; revisit when a sqlx release allows
+                         #   libsqlite3-sys >=0.39. `cargo audit` cannot see
+                         #   that condition break once this ID is ignored, so
+                         #   the blocking ratchet is
+                         #   crates/epigraph-auth/tests/sqlite_never_compiled.rs
+                         #   (workspace manifests + Cargo.lock dependants).
     "RUSTSEC-2024-0384", # instant: unmaintained. Transitive via `ascent`
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
@@ -94,10 +119,19 @@ ignore = [
     #
     # RUSTSEC-2026-0189 (rmcp streamable-HTTP server DNS rebinding, fixed in
     # rmcp >=1.4.0) was suppressed here pending the rmcp 0.x -> 1.x migration.
-    # That migration has landed: the workspace requires rmcp 2.2 and Cargo.lock
-    # resolves rmcp 2.2.0, so the entry matched nothing and is deleted. The
-    # MCP HTTP endpoint still relies on bearer-token checks at the proxy; that
-    # control does not depend on this entry.
+    # That migration has landed (the workspace now requires rmcp 3.9, below),
+    # so the entry matched nothing and is deleted. The MCP HTTP endpoint still
+    # relies on bearer-token checks at the proxy; that control does not depend
+    # on this entry.
+    #
+    # rmcp 2.2.0 (RUSTSEC-2026-0457, OAuth-client SSRF filter checked host
+    # strings rather than resolved addresses, fixed in >=3.7.0; and
+    # RUSTSEC-2026-0462, unbounded response-body buffering in the Streamable
+    # HTTP client, fixed in >=3.9.0) was cleared by moving the workspace rmcp
+    # requirement to 3.9, which resolves rmcp 3.9.0. No 2.x backport exists.
+    # The floor is a blocking ratchet in
+    # crates/epigraph-auth/tests/dependency_security_floor.rs. They were never
+    # suppressed; do not add them.
     #
     # zstd 0.13.3 (RUSTSEC-2026-0391) and zstd-safe 7.3.0 (RUSTSEC-2026-0398 /
     # -0403) were cleared by moving the workspace zstd requirement to 0.14.3,

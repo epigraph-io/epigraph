@@ -95,13 +95,18 @@ async fn bind_and_arm(pool: &PgPool, caller: Uuid) -> Uuid {
     group
 }
 
-async fn seed_workflow(pool: &PgPool) -> Uuid {
+/// A public workflow with no recorded submitter, owned by `group` (the
+/// operator's group, which the stdio caller writes): on stdio such a row
+/// admits only a live writer of its owner group, as over HTTP.
+async fn seed_workflow(pool: &PgPool, group: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO workflows (id, canonical_name, goal) VALUES ($1, $2, 'evolve cascade test')",
+        "INSERT INTO workflows (id, canonical_name, goal, visibility, owner_group_id) \
+         VALUES ($1, $2, 'evolve cascade test', 'public', $3)",
     )
     .bind(id)
     .bind(format!("evolve-cascade-{id}"))
+    .bind(group)
     .execute(pool)
     .await
     .expect("seed workflow");
@@ -224,7 +229,7 @@ async fn evolve_step_supersedes_cascade_carries_structure_to_the_live_head_over_
     let parent = fixture::seed_group_claim(&pool, caller, group, "the D-arm").await;
     let child = fixture::seed_group_claim(&pool, caller, group, "D3.1 prepare").await;
     let prior = fixture::seed_group_claim(&pool, caller, group, "the prior paragraph").await;
-    let workflow = seed_workflow(&pool).await;
+    let workflow = seed_workflow(&pool, group).await;
 
     let decomposed_from = seed_edge(&pool, parent, "claim", step, "decomposes_to").await;
     let to_child = seed_edge(&pool, step, "claim", child, "decomposes_to").await;
@@ -316,7 +321,7 @@ async fn evolve_step_supersedes_applies_the_cascade_in_request_with_a_maintenanc
     let step = fixture::seed_group_claim(&pool, caller, group, "E2: weigh the sample").await;
     let parent = fixture::seed_group_claim(&pool, caller, group, "the E-arm").await;
     let child = fixture::seed_group_claim(&pool, caller, group, "E2.1 tare").await;
-    let workflow = seed_workflow(&pool).await;
+    let workflow = seed_workflow(&pool, group).await;
 
     let decomposed_from = seed_edge(&pool, parent, "claim", step, "decomposes_to").await;
     let to_child = seed_edge(&pool, step, "claim", child, "decomposes_to").await;
@@ -368,7 +373,7 @@ async fn evolve_step_supersedes_applies_the_cascade_in_request_with_a_maintenanc
 async fn evolve_step_supersedes_keeps_the_workflow_step_chain_on_the_frozen_steps(pool: PgPool) {
     let (server, caller) = app_role_server_with_maintenance(&pool, 0xC7).await;
     let group = bind_and_arm(&pool, caller).await;
-    let workflow = seed_workflow(&pool).await;
+    let workflow = seed_workflow(&pool, group).await;
 
     let s1 = fixture::seed_group_claim(&pool, caller, group, "S1: planned first").await;
     let s2 = fixture::seed_group_claim(&pool, caller, group, "S2: planned second").await;

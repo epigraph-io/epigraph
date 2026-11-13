@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use futures::future::try_join_all;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -157,6 +156,13 @@ impl WorkflowRepository {
     /// Idempotent on `(canonical_name, generation)` UNIQUE — repeated inserts
     /// of the same identity are silently ignored.
     ///
+    /// Returns whether THIS statement inserted the row (`RETURNING id`):
+    /// `false` when a row with the same `(canonical_name, generation)` already
+    /// existed, including one another transaction committed while this insert
+    /// waited on the unique index. That answer, not a read made before the
+    /// insert, is what tells a caller whether it created the row: a read made
+    /// earlier cannot see a concurrent creation that was still uncommitted.
+    ///
     /// Since migration 183 a row carries its plan's tenancy
     /// (`owner_group_id`, `visibility`), declared here and never defaulted
     /// (`workflows_require_tenancy`): a declared ingest passes
@@ -181,13 +187,14 @@ impl WorkflowRepository {
         parent_id: Option<Uuid>,
         metadata: serde_json::Value,
         decl: epigraph_core::TenancyDecl,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let inserted: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO workflows \
                     (id, canonical_name, generation, goal, parent_id, metadata, \
                      visibility, owner_group_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (canonical_name, generation) DO NOTHING",
+             ON CONFLICT (canonical_name, generation) DO NOTHING \
+             RETURNING id",
         )
         .bind(id)
         .bind(canonical_name)
@@ -197,9 +204,9 @@ impl WorkflowRepository {
         .bind(metadata)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
-        .execute(executor)
+        .fetch_optional(executor)
         .await?;
-        Ok(())
+        Ok(inserted.is_some())
     }
 
     /// The `metadata` key a `workflows` row records its SUBMITTER under (batch
@@ -290,9 +297,9 @@ impl WorkflowRepository {
     ///
     /// `add_step` takes it before it reads the plan it is about to extend, so
     /// two concurrent `add_step`s on one workflow cannot both compute the same
-    /// next `plan_index`. It runs on `add_step`'s system-agent-stamped
-    /// transaction, which `workflows`' row security (migration 183) bounds to
-    /// the rows that stamp reads.
+    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction,
+    /// which `workflows`' row security (migration 183) bounds to the rows that
+    /// stamp reads.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -401,7 +408,7 @@ impl WorkflowRepository {
     ///    `workflow_ingest::a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2`.
     ///
     /// Since migration 183 `workflows` has row security keyed on the plan's
-    /// tenancy; both callers run this on the plan walk's system-agent-stamped
+    /// tenancy; both callers run this on the plan walk's caller-stamped
     /// transaction, so it reads what that stamp reads.
     ///
     /// # Errors
@@ -894,6 +901,30 @@ impl WorkflowRepository {
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
+        // `ConnectionFailed`, as `LineageRepository::get_lineage` maps its
+        // acquire: pool exhaustion is not a failing query.
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::resolve_steps_to_heads_conn(&mut conn, viewer, workflow_id).await
+    }
+
+    /// [`Self::resolve_steps_to_heads`] on a caller-supplied connection: the
+    /// shape a request reaches through `ScopedPool::read_as`, so every read
+    /// runs under the viewer's own session GUCs and row security agrees with
+    /// the in-query predicates. The pool form delegates here, so the
+    /// statements exist once. One connection serves one statement at a time,
+    /// so the per-step head lookups run in sequence (the pool form used to
+    /// run them concurrently on separate checkouts).
+    ///
+    /// # Errors
+    /// As [`Self::resolve_steps_to_heads`].
+    pub async fn resolve_steps_to_heads_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
         // step_lineage_id, in PLAN ORDER: the `plan_index` order below, then
         // reordered by the `step_follows` chain (`in_chain_order`, ruling R-38).
@@ -923,21 +954,22 @@ impl WorkflowRepository {
             sq = sq.bind(g);
         }
         let step_rows: Vec<(Uuid, Option<Uuid>)> =
-            sq.fetch_all(pool).await.map_err(DbError::from)?;
+            sq.fetch_all(&mut *conn).await.map_err(DbError::from)?;
         // Plan order is the `step_follows` chain (ruling R-38): `add_step`
         // leaves a middle insert unindexed, so `plan_index` alone lists it last.
-        let step_rows = in_chain_order(pool, viewer, step_rows, |r| r.0)
+        let step_rows = in_chain_order(&mut *conn, viewer, step_rows, |r| r.0)
             .await
             .map_err(DbError::from)?;
 
-        let head_futures = step_rows.iter().map(|(_, step_lineage_id)| async move {
-            if let Some(lineage_id) = *step_lineage_id {
-                ClaimRepository::latest_in_lineage(pool, viewer, lineage_id).await
-            } else {
-                Ok(Vec::new())
-            }
-        });
-        let heads_per_step: Vec<Vec<LineageHead>> = try_join_all(head_futures).await?;
+        let mut heads_per_step: Vec<Vec<LineageHead>> = Vec::with_capacity(step_rows.len());
+        for (_, step_lineage_id) in &step_rows {
+            heads_per_step.push(match *step_lineage_id {
+                Some(lineage_id) => {
+                    ClaimRepository::latest_in_lineage(&mut *conn, viewer, lineage_id).await?
+                }
+                None => Vec::new(),
+            });
+        }
 
         let resolved = step_rows
             .into_iter()
@@ -1160,6 +1192,18 @@ impl WorkflowRepository {
     /// [`DbError::InvalidData`] naming the retired head, rather than handing
     /// back a claim the caller cannot evolve or should not attach evidence to.
     ///
+    /// # The connection decides what this can see
+    ///
+    /// The step walk filters by `viewer` in the query, but on the application
+    /// role row security ALSO filters by whatever tenancy context the
+    /// connection carries. A raw pool connection carries none, so a
+    /// group-private workflow's steps and `executes` edges are dropped by the
+    /// session policy and this answers `Ok(None)` to the group's own members.
+    /// A request path therefore calls [`Self::resolve_step_claim_conn`] on a
+    /// connection stamped with the same viewer; this pool form only acquires
+    /// and delegates, for callers that run on a role row security does not
+    /// filter (tests, maintenance).
+    ///
     /// # Errors
     /// Returns `DbError` if a database query fails, and
     /// `DbError::InvalidData` when every head of the step's lineage is retired.
@@ -1170,19 +1214,41 @@ impl WorkflowRepository {
         step_index: usize,
         prefer_head: bool,
     ) -> Result<Option<Uuid>, DbError> {
-        let Some(max_gen) = Self::max_generation_by_canonical(pool, canonical_name)
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::resolve_step_claim_conn(&mut conn, viewer, canonical_name, step_index, prefer_head)
+            .await
+    }
+
+    /// [`Self::resolve_step_claim`] on a caller-supplied connection: the
+    /// primitive. All three statements (the latest generation, the root at
+    /// that generation and the step walk) run on `conn`, so on a connection
+    /// stamped with `viewer` they see exactly the rows that viewer may read.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_step_claim`].
+    pub async fn resolve_step_claim_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        canonical_name: &str,
+        step_index: usize,
+        prefer_head: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        let Some(max_gen) = Self::max_generation_by_canonical(&mut *conn, canonical_name)
             .await
             .map_err(DbError::from)?
         else {
             return Ok(None);
         };
-        let Some(workflow_id) = Self::find_root_by_canonical(pool, canonical_name, max_gen)
+        let Some(workflow_id) = Self::find_root_by_canonical(&mut *conn, canonical_name, max_gen)
             .await
             .map_err(DbError::from)?
         else {
             return Ok(None);
         };
-        let steps = Self::resolve_steps_to_heads(pool, viewer, workflow_id).await?;
+        let steps = Self::resolve_steps_to_heads_conn(conn, viewer, workflow_id).await?;
         let Some(step) = steps.into_iter().nth(step_index) else {
             return Ok(None);
         };
@@ -2054,12 +2120,38 @@ impl WorkflowRepository {
         Ok(q.fetch_one(&mut *conn).await?)
     }
 
+    /// Whether some `workflows` row named `canonical_name` is one `conn`'s
+    /// session cannot read (migration 202's
+    /// `epigraph_workflow_name_has_hidden_rows`, a maintenance-owned definer:
+    /// the session's own view cannot answer this, because row security hides
+    /// exactly the rows asked about). One boolean, no row.
+    ///
+    /// Workflow writes run on the CALLER's stamp, so a lineage whose head is
+    /// private to a group the caller is not in looks absent to it; without this
+    /// check a non-member could mint the next generation of that lineage (a
+    /// public row every member would then resolve as the head). Callers refuse
+    /// a write to a name with hidden rows before anything is written.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails (`42883` before migration 202).
+    pub async fn name_has_hidden_rows_conn(
+        conn: &mut sqlx::PgConnection,
+        canonical_name: &str,
+    ) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_workflow_name_has_hidden_rows($1)")
+                .bind(canonical_name)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
     /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`,
     /// or `None` when the connection's stamp does not read it. The write paths
-    /// that EXTEND a plan run it on the system-agent-stamped transaction that
-    /// writes the extension, so the extension takes the row's tenancy (ruling
-    /// R-98: a step added to a group plan, a new generation of a group
-    /// lineage); a reader's view goes through [`Self::tenancy_as_viewer`].
+    /// that EXTEND a plan run it on the caller-stamped transaction that writes
+    /// the extension, so the extension takes the row's tenancy (ruling R-98: a
+    /// step added to a group plan, a new generation of a group lineage); a
+    /// reader's view goes through [`Self::tenancy_as_viewer`].
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -2137,6 +2229,27 @@ impl WorkflowRepository {
         .await
     }
 
+    /// The distinct `canonical_name`s of the `workflows` rows `ids` that the
+    /// connection's stamp reads, sorted. A cascade deprecation asks
+    /// [`Self::name_has_hidden_rows_conn`] of each, so a generation of the
+    /// lineage the caller cannot read refuses the cascade instead of being
+    /// skipped by [`Self::lineage_descendants`].
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn canonical_names_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT canonical_name FROM workflows WHERE id = ANY($1) \
+              ORDER BY canonical_name",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await
+    }
+
     /// Lock, `FOR UPDATE` and in id order, every `workflows` row that shares a
     /// `canonical_name` with any of `ids` (U017; backlog fe874d2a).
     ///
@@ -2196,10 +2309,10 @@ impl WorkflowRepository {
     /// Level-3 operation atoms are excluded outright: their ids are content-only
     /// and global, so a document may share one.
     ///
-    /// The read rides the deprecation's own system-stamped transaction and is
-    /// not filtered by a caller viewer on purpose: workflow claims belong to
-    /// the ingest system agent, and the authority decision is the workflow
-    /// authority rule over the `workflows` row, not read visibility.
+    /// The read rides the deprecation's own caller-stamped transaction and is
+    /// not filtered by a viewer on purpose: that stamp's row security already
+    /// bounds it, and the authority decision is the workflow authority rule
+    /// over the `workflows` row, not read visibility.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -2209,7 +2322,7 @@ impl WorkflowRepository {
         deprecating: &[Uuid],
     ) -> Result<Vec<ExecutedClaim>, sqlx::Error> {
         let rows: Vec<(Uuid, bool)> = sqlx::query_as(
-            "-- VISIBILITY-EXEMPT: WRITE path. The deprecation this read plans is gated by the workflow authority rule over the workflows row; the claims are the ingest system agent's and the read rides that agent's stamped transaction.
+            "-- VISIBILITY-EXEMPT: WRITE path. The deprecation this read plans is gated by the workflow authority rule over the workflows row; the read rides the deprecation's caller-stamped transaction, which row security bounds.
              SELECT DISTINCT c.id, \
                     EXISTS (SELECT 1 FROM edges e2 JOIN workflows w2 ON w2.id = e2.source_id \
                              WHERE e2.target_id = c.id AND e2.relationship = 'executes' \
@@ -2761,7 +2874,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn insert_root_creates_workflows_row(pool: sqlx::PgPool) {
         let id = uuid::Uuid::new_v4();
-        WorkflowRepository::insert_root(
+        let created = WorkflowRepository::insert_root(
             &pool,
             id,
             "deploy-canary",
@@ -2773,6 +2886,26 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(created, "the first insert creates the row");
+        // The same (canonical_name, generation) again, under another id: the
+        // insert does nothing and SAYS so, which is how a caller knows it
+        // did not create the row.
+        let again = WorkflowRepository::insert_root(
+            &pool,
+            uuid::Uuid::new_v4(),
+            "deploy-canary",
+            0,
+            "Another goal.",
+            None,
+            serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !again,
+            "a conflicting insert reports that it created nothing"
+        );
 
         let row: (String, i32, String, serde_json::Value) = sqlx::query_as(
             "SELECT canonical_name, generation, goal, metadata FROM workflows WHERE id = $1",

@@ -228,6 +228,8 @@ async fn inline(server: &EpiGraphMcpFull, doi: &str) -> Result<serde_json::Value
         IngestDocumentInlineParams {
             wait: None,
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -304,6 +306,8 @@ async fn inline_wait_ingest_by_a_linked_agent_lands_in_its_operators_group(pool:
         IngestDocumentInlineParams {
             wait: Some(true),
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -331,10 +335,16 @@ async fn walk_by_a_linked_agent_lands_in_its_operators_group(pool: PgPool) {
         .expect("stdio viewer");
 
     let doi = "10.9999/operator-owner-walk";
-    do_ingest_document(&server, &viewer, &doc(doi), None)
-        .await
-        .map_err(|e| e.message.to_string())
-        .expect("a linked, acting agent's walk must commit");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &doc(doi),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .map_err(|e| e.message.to_string())
+    .expect("a linked, acting agent's walk must commit");
     assert_landed_in(&pool, doi, agent, human_group, "walk").await;
 }
 
@@ -374,10 +384,16 @@ async fn a_linked_agent_with_no_personal_group_ingests_into_its_operators_group(
         .await
         .expect("stdio viewer");
     let doi = "10.9999/operator-owner-no-own-group";
-    do_ingest_document(&server, &viewer, &doc(doi), None)
-        .await
-        .map_err(|e| e.message.to_string())
-        .expect("a linked agent with no personal group of its own must ingest");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &doc(doi),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .map_err(|e| e.message.to_string())
+    .expect("a linked agent with no personal group of its own must ingest");
     assert_landed_in(&pool, doi, agent, human_group, "no own group").await;
 }
 
@@ -397,6 +413,8 @@ async fn spine_by_a_linked_agent_lands_in_its_operators_group(pool: PgPool) {
         &viewer,
         IngestDocumentSpineParams {
             extraction: spine_doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -643,6 +661,8 @@ async fn an_allowlist_only_author_is_refused_opl02_synchronously(pool: PgPool) {
         IngestDocumentInlineParams {
             wait: None,
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         Some(&auth),
     )
@@ -675,6 +695,8 @@ async fn an_allowlist_only_author_is_refused_opl02_in_wait_mode(pool: PgPool) {
         IngestDocumentInlineParams {
             wait: Some(true),
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         Some(&auth),
     )

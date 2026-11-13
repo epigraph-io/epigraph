@@ -1913,6 +1913,8 @@ async fn shared_copy_events(pool: &PgPool, agent: Uuid) -> Vec<(String, String, 
 /// * A shared direct successor, and a shared GRANDCHILD under an unshared
 ///   successor, are attached, each flagged once; the shared one is refused
 ///   ROL01 in the gap and writes once its human holds the role.
+/// * The grandchild's copy names its parent's copy, not the attached row
+///   (195: the follow chains its copies); its flag still names the attach.
 /// * CONTROL: the unshared successor is attached and carries no flag.
 #[sqlx::test(migrations = "../../migrations")]
 async fn attaching_an_identity_attaches_a_shared_successor_and_flags_it_once(pool: PgPool) {
@@ -1938,7 +1940,6 @@ async fn attaching_an_identity_attaches_a_shared_successor_and_flags_it_once(poo
     for (who, what) in [
         (shared, "the shared successor"),
         (own, "the unshared successor"),
-        (grand, "the shared grandchild"),
     ] {
         assert_eq!(
             live_attachments(&pool, who).await,
@@ -1946,6 +1947,21 @@ async fn attaching_an_identity_attaches_a_shared_successor_and_flags_it_once(poo
             "{what} is attached with its ancestor"
         );
     }
+    // 195: the follow CHAINS its copies, so the grandchild's copy names the
+    // copy of the identity it succeeded, not the ancestor's row past it.
+    let own_copy: Uuid = sqlx::query_scalar(
+        "SELECT id FROM role_agents WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL",
+    )
+    .bind(own)
+    .bind(ROLE)
+    .fetch_one(&pool)
+    .await
+    .expect("own's copy");
+    assert_eq!(
+        live_attachments(&pool, grand).await,
+        vec![(ROLE.to_string(), Some(own_copy))],
+        "the shared grandchild is attached through its parent's copy"
+    );
     let flagged = vec![(ROLE.to_string(), "shared_identity".to_string(), row)];
     assert_eq!(
         shared_copy_events(&pool, shared).await,

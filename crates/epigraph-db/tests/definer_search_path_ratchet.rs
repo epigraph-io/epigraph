@@ -31,6 +31,12 @@
 //!   path is only `pg_catalog, pg_temp` names every `public` relation, type and
 //!   function it uses schema-qualified, because on that path an unqualified
 //!   relation or type name is not looked up in `public`.
+//! * [`no_function_keeps_state_in_a_session_temporary_relation`]: no function
+//!   body a definer can run (the definers themselves, and the INVOKER helpers
+//!   and triggers they run as their owner) creates a temporary relation or
+//!   names a `pg_temp`-qualified one. A temporary relation is the calling
+//!   SESSION's, so the caller can create a same-named one first and the body
+//!   would use it with the owner's rights. No allowlist.
 //! * [`the_refresh_and_revocation_family_resolves_in_pg_catalog_only`][]: the
 //!   OAuth refresh-token and access-token revocation definers (the family the
 //!   backlog item names first) are on 172's form, keep their owner and grants.
@@ -112,6 +118,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
     "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
     "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+    "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
     "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
     "public.epigraph_create_passkey_enrollment(uuid, text, text)",
     "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
@@ -279,7 +286,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 /// [`PUBLIC_PATH_REGISTER`]'s length, which must equal it. Raising it is a
 /// visible decision to add a definer that resolves through `public`; it falls
 /// by one each time a registered definer moves to 172's form.
-const HIGH_WATER: usize = 197;
+const HIGH_WATER: usize = 198;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.
@@ -1113,5 +1120,197 @@ async fn a_path_without_pg_temp_searches_the_temporary_schema_first(pool: PgPool
         schema_order(&mut tx, "public, pg_temp").await,
         ["pg_catalog", "public", "pg_temp"],
         "pg_catalog unlisted: searched first; pg_temp listed last: searched last"
+    );
+}
+
+/// What a definer body does with the session's temporary schema, by form:
+/// creating a temporary relation, or naming a `pg_temp`-qualified one. Read on
+/// the RAW body, lowercased with whitespace collapsed, so a dynamic-SQL string
+/// (`EXECUTE 'CREATE TEMP TABLE ..'`) is seen too. A `search_path` value such
+/// as `'public, pg_temp'` names no relation (no dot) and is not reported.
+fn session_temp_uses(src: &str) -> BTreeSet<&'static str> {
+    let flat = src
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" .", ".")
+        .replace(". ", ".");
+    const FORMS: &[(&str, &str)] = &[
+        ("create temp ", "CREATE TEMP"),
+        ("create temporary ", "CREATE TEMP"),
+        ("create global temp", "CREATE TEMP"),
+        ("create local temp", "CREATE TEMP"),
+        ("create unlogged temp", "CREATE TEMP"),
+        ("into temp ", "SELECT INTO TEMP"),
+        ("into temporary ", "SELECT INTO TEMP"),
+        ("pg_temp.", "pg_temp-qualified relation"),
+        ("\"pg_temp\".", "pg_temp-qualified relation"),
+    ];
+    FORMS
+        .iter()
+        .filter(|(needle, _)| flat.contains(needle))
+        .map(|(_, form)| *form)
+        .collect()
+}
+
+/// Every function body a definer can run, by `schema.name(argument types)`:
+/// every function and procedure outside the system schemas and outside any
+/// extension, SECURITY DEFINER or not, except those whose body is a C symbol
+/// (`c`, `internal`), with `prosecdef`.
+///
+/// Not only the definers: an INVOKER function a definer calls, and an INVOKER
+/// trigger a definer's statement fires, run with `current_user` = the
+/// definer's owner, so a temporary relation one of them creates or names is
+/// the caller's to plant exactly as if the definer named it. 206's write
+/// window fires 001's invoker `trigger_validate_edge_refs` ->
+/// `validate_edge_reference`, for one. The set is wider than what a definer
+/// can reach (an invoker function the caller runs directly gains nothing), and
+/// deliberately so: walking calls, dynamic SQL and the triggers each statement
+/// fires is a fragile analysis, and the superset costs nothing at head.
+async fn function_bodies(pool: &PgPool) -> BTreeMap<String, (bool, String)> {
+    let rows: Vec<(String, bool, String)> = sqlx::query_as(
+        "SELECT format('%s.%s(%s)', n.nspname, p.proname, \
+                           pg_catalog.oidvectortypes(p.proargtypes)), \
+                    p.prosecdef, p.prosrc \
+               FROM pg_catalog.pg_proc p \
+               JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+               JOIN pg_catalog.pg_language l ON l.oid = p.prolang \
+              WHERE l.lanname NOT IN ('c', 'internal') \
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                AND n.nspname !~ '^pg_(toast|temp)' \
+                AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d \
+                                 WHERE d.classid = 'pg_catalog.pg_proc'::regclass \
+                                   AND d.objid = p.oid AND d.deptype = 'e')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the function bodies");
+    rows.into_iter()
+        .map(|(sig, secdef, src)| (sig, (secdef, src)))
+        .collect()
+}
+
+/// Probe functions for [`no_function_keeps_state_in_a_session_temporary_relation`]:
+/// each form it must report, and one it must not.
+const TEMP_PROBES: &str = r#"
+CREATE FUNCTION public.tmp_probe_static() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    CREATE TEMP TABLE IF NOT EXISTS pg_temp.tmp_probe (x integer) ON COMMIT DROP;
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_dynamic() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    EXECUTE 'CREATE   TEMPORARY TABLE tmp_probe (x integer)';
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_reads() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    PERFORM 1 FROM pg_temp . tmp_probe;
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_path_only() RETURNS integer
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);
+    RETURN 1;
+END $$;
+CREATE FUNCTION public.tmp_probe_invoker_trigger() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    CREATE TEMP TABLE IF NOT EXISTS tmp_probe_seen (x integer);
+    RETURN NEW;
+END $$;
+"#;
+
+/// No function a SECURITY DEFINER body can run keeps state in a
+/// session-temporary relation: not the definers, and not the INVOKER helpers
+/// and triggers they run as their owner ([`function_bodies`]).
+///
+/// A temporary relation belongs to the SESSION, not to the definer's owner, so
+/// the caller can create one of the same name before the call (with its own
+/// triggers and rows), and `CREATE TEMP TABLE IF NOT EXISTS` then adopts it.
+/// The body would read and write the caller's relation with the owner's
+/// privileges. Classify into local variables, arrays or a CTE instead. 115's
+/// `epigraph_delete_mass_functions_scoped` and 206's visibility acts do. The
+/// behavioural pin for 206 is the app-role test
+/// `a_temp_table_planted_by_the_caller_cannot_steer_publicize_or_share`
+/// (epigraph-mcp). No allowlist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_function_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
+    let scan =
+        |fns: &BTreeMap<String, (bool, String)>| -> BTreeMap<String, BTreeSet<&'static str>> {
+            fns.iter()
+                .map(|(sig, (_, src))| (sig.clone(), session_temp_uses(src)))
+                .filter(|(_, forms)| !forms.is_empty())
+                .collect()
+        };
+    let at_head_fns = function_bodies(&pool).await;
+    let definer_count = at_head_fns.values().filter(|(secdef, _)| *secdef).count();
+    assert!(
+        definer_count > 100 && at_head_fns.len() > definer_count,
+        "CALIBRATION: the scan sees the schema's definers ({definer_count}) and more \
+         ({} functions)",
+        at_head_fns.len()
+    );
+    for invoker in [
+        "public.trigger_validate_edge_refs()",
+        "public.validate_edge_reference(uuid, character varying)",
+    ] {
+        assert!(
+            at_head_fns.get(invoker).is_some_and(|(secdef, _)| !secdef),
+            "CALIBRATION: the scan sees {invoker}, an INVOKER function 206's write window runs"
+        );
+    }
+    let at_head = scan(&at_head_fns);
+
+    sqlx::raw_sql(TEMP_PROBES)
+        .execute(&pool)
+        .await
+        .expect("probes");
+    let with_probes = scan(&function_bodies(&pool).await);
+    let probed: BTreeMap<&str, &BTreeSet<&str>> = with_probes
+        .iter()
+        .filter(|(k, _)| !at_head.contains_key(*k))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    assert_eq!(
+        probed,
+        BTreeMap::from([
+            (
+                "public.tmp_probe_dynamic()",
+                &BTreeSet::from(["CREATE TEMP"])
+            ),
+            (
+                "public.tmp_probe_invoker_trigger()",
+                &BTreeSet::from(["CREATE TEMP"])
+            ),
+            (
+                "public.tmp_probe_reads()",
+                &BTreeSet::from(["pg_temp-qualified relation"])
+            ),
+            (
+                "public.tmp_probe_static()",
+                &BTreeSet::from(["CREATE TEMP", "pg_temp-qualified relation"])
+            ),
+        ]),
+        "CALIBRATION: the static, dynamic-SQL, qualified-read and INVOKER-trigger probes are \
+         reported, and a body that only sets a search_path naming pg_temp is not"
+    );
+
+    assert!(
+        at_head.is_empty(),
+        "{} function(s) a SECURITY DEFINER body can run create or name a session-temporary \
+         relation, which the caller's session can create first. Keep the state in local \
+         variables, arrays or a CTE:\n{}",
+        at_head.len(),
+        at_head
+            .iter()
+            .map(|(s, f)| format!("  {s}: {f:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

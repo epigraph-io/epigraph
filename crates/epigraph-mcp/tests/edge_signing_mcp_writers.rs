@@ -113,6 +113,8 @@ async fn submit(server: &EpiGraphMcpFull, pool: &PgPool, content: &str) -> Uuid 
             reasoning: Some("because".into()),
             labels: vec![],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -142,6 +144,8 @@ async fn submit_claim_and_memorize_attest_their_verb_edges(pool: PgPool) {
             confidence: None,
             tags: None,
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -367,6 +371,7 @@ async fn ingest_document_attests_every_edge_it_writes(pool: PgPool) {
         &viewer,
         &extraction("document"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("document ingests");
@@ -393,6 +398,7 @@ async fn ingest_document_spine_attests_every_edge_it_writes(pool: PgPool) {
         &viewer,
         &extraction("spine"),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("spine ingests");
@@ -541,6 +547,8 @@ async fn a_callers_edges_are_signed_by_the_server_not_the_caller(pool: PgPool) {
                 reasoning: Some("because".into()),
                 labels: vec![],
                 novelty_threshold: Some(0.0),
+                visibility: Some("public".to_string()),
+                group_id: None,
             },
             Some(&token),
         )
@@ -601,6 +609,7 @@ async fn a_callers_ingest_is_signed_by_the_server_not_the_caller(pool: PgPool) {
         &viewer,
         &extraction("caller"),
         Some(&token),
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .expect("document ingests as the caller");

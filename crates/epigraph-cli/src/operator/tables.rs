@@ -795,6 +795,28 @@ pub async fn xact_counters(
         .collect())
 }
 
+/// Whether narrowing a public claim or edge in this transaction would bump
+/// `atlas_layout_epoch`: migration 197's trigger bumps it once per
+/// transaction, on the first public-to-non-public narrowing, guarded by the
+/// transaction-local `epigraph.atlas_layout_bumped_xact`. False on a database
+/// without the table (before migration 197), where nothing is bumped.
+///
+/// A census that must account for every row its transaction changed reads
+/// this before its first narrowing write and, when it is true, expects that
+/// one update on `atlas_layout_epoch`.
+///
+/// # Errors
+/// The query fails.
+pub async fn layout_epoch_bump_due(conn: &mut PgConnection) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT to_regclass('public.atlas_layout_epoch') IS NOT NULL \
+            AND current_setting('epigraph.atlas_layout_bumped_xact', true) \
+                IS DISTINCT FROM txid_current()::text",
+    )
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// Refuse up front, before any manifest or write, when this connection cannot
 /// switch `session_user` to `epigraph_app` — the readability check inside
 /// every batch depends on it, and a run that could only discover that in its
@@ -833,6 +855,23 @@ pub async fn app_readable(
     claims: &[Uuid],
     attached: &BTreeSet<RowKey>,
 ) -> anyhow::Result<BTreeSet<RowKey>> {
+    app_readable_as(conn, specs, claims, attached, &[]).await
+}
+
+/// [`app_readable`] for an `epigraph_app` session whose read set
+/// (`epigraph.group_ids`, which the tenancy policies read) is exactly
+/// `groups`: what a member of those groups, and of no other, can read. Empty
+/// `groups` is the unstamped session.
+///
+/// # Errors
+/// The session switch is refused, or a read fails.
+pub async fn app_readable_as(
+    conn: &mut PgConnection,
+    specs: &[TableSpec],
+    claims: &[Uuid],
+    attached: &BTreeSet<RowKey>,
+    groups: &[Uuid],
+) -> anyhow::Result<BTreeSet<RowKey>> {
     sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
         .execute(&mut *conn)
         .await
@@ -841,7 +880,7 @@ pub async fn app_readable(
              that no row became less readable needs a connection that may switch session_user \
              (a superuser login); refusing to write without it",
         )?;
-    let result = app_readable_inner(conn, specs, claims, attached).await;
+    let result = app_readable_inner(conn, specs, claims, attached, groups).await;
     let reset = sqlx::query("SET LOCAL SESSION AUTHORIZATION DEFAULT")
         .execute(&mut *conn)
         .await;
@@ -857,14 +896,21 @@ async fn app_readable_inner(
     specs: &[TableSpec],
     claims: &[Uuid],
     attached: &BTreeSet<RowKey>,
+    groups: &[Uuid],
 ) -> anyhow::Result<BTreeSet<RowKey>> {
+    let read_set = groups
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     sqlx::query(
-        "SELECT set_config('epigraph.group_ids', '', true), \
+        "SELECT set_config('epigraph.group_ids', $1, true), \
                 set_config('epigraph.writable_group_ids', '', true), \
                 set_config('epigraph.principal_id', '', true), \
                 set_config('epigraph.elevation_id', '', true), \
                 set_config('epigraph.family_id', '', true)",
     )
+    .bind(read_set)
     .execute(&mut *conn)
     .await?;
     let bypass: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")

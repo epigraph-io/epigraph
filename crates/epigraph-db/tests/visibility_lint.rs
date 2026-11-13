@@ -782,6 +782,33 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          maintenance role (ADS02) and the table's own trigger audits the change.",
     ),
     (
+        "bug_report.rs",
+        "list_mine_conn",
+        "READ through migration 207's principal-bound app-callable definer \
+         `epigraph_my_bug_reports` on the requester's STAMPED connection: only the stamped \
+         principal's own intake reports (no caller-supplied id or group), filtered in the \
+         definer by the unforgeable `bug_report.submitted` marker, the claim's author and the \
+         configured intake group; the viewer is spent on the stamp.",
+    ),
+    (
+        "bug_report.rs",
+        "preflight_conn",
+        "READ through migration 207's principal-bound app-callable definer \
+         `epigraph_bug_report_preflight` on the reporter's STAMPED connection: it takes no \
+         argument, reads the principal from the stamped session, writes nothing and answers \
+         nothing but the write's own refusal (or a pass) for that principal; the viewer is \
+         spent on the stamp.",
+    ),
+    (
+        "bug_report.rs",
+        "submit_conn",
+        "WRITE through migration 207's principal-bound app-callable definer \
+         `epigraph_submit_bug_report` on the reporter's STAMPED connection: the definer takes the \
+         author from the stamped session and the owner group from the instance's settings row, \
+         never from an argument, and answers only the new row's id and timestamp. Nothing is \
+         read back to the caller; the viewer is spent on the stamp.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \
@@ -812,6 +839,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "passkey.rs",
+        "revoke_compromised",
+        "WRITE through migration 200's maintenance-only `epigraph_revoke_passkey_compromised`: \
+         the revoke stamp on one person's passkey and every passkey enrolled through it, \
+         authentication records with no tenancy columns.",
+    ),
+    (
+        "passkey.rs",
         "get",
         "READ of one `person_authenticators` row by id for the maintenance CLI. No tenancy \
          columns; 124's FORCEd policy shows an application connection no row at all.",
@@ -835,6 +869,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "passkey_ceremony.rs",
+        "anchor",
+        "READ of ONE enrollment's anchor by id through migration 200's app-callable SECURITY \
+         DEFINER `epigraph_enrollment_anchor`, for the anonymous enrollment page's anchored \
+         path: the act a live enrollment was opened on and the passkey that confirmed it, and \
+         only while the enrollment is live; it enumerates nothing. Authentication records \
+         about one principal, not corpus rows, and the page has no principal a Viewer could \
+         carry.",
+    ),
+    (
+        "passkey_ceremony.rs",
         "store_challenge",
         "WRITE through 124's app-callable definer `epigraph_set_passkey_enrollment_challenge` \
          (the ceremony state of one live enrollment, by id). The table's guard refuses a \
@@ -847,6 +891,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          passkey a verified ceremony registered, consuming its enrollment. Every rule is the \
          tables' (ELV01/ELV03/ELV04, user verification a CHECK) and the audit row their \
          trigger's; nothing for a viewer to filter.",
+    ),
+    (
+        "ego.rs",
+        "untenanted_entity_types",
+        "Reads `entity_types` -- the schema REGISTRY (type_name, schema_name, table_name, \
+         id_column, tenancy_tier, ...), not a tenant table. Measured at migration head: it \
+         carries neither `visibility` nor `owner_group_id`, `relrowsecurity` and \
+         `relforcerowsecurity` are both false, and it is absent from migration 062's `tier_a` \
+         array, so there is no column to attach a predicate to and no policy for a session GUC \
+         to select. Same relation and same posture as `entity_type.rs::get_by_name_conn` / \
+         `resolve_row` above. WHAT IT IS FOR: `/claims/:id/ego` may emit a bare typed node only \
+         for a neighbour type that has no tenancy of its own, and this fn reads that set from \
+         the registry rather than hard-coding it -- so a type registered after the route was \
+         written is WITHHELD rather than published. Giving it a Viewer would filter the \
+         registry, which is exactly backwards: the set of untenanted types is not viewer-\
+         dependent, and narrowing it per viewer would publish MORE types to a member, not fewer.",
     ),
     (
         "elevated_access.rs",
@@ -1777,7 +1837,94 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          asking about the claims it reused before it writes an edge to any of them; an id \
          missing from the answer exists but is invisible to the stamp and refuses the ingest. \
          The answer is never returned to a caller (the caller-filtered read is \
-         `tenancy_of_conn`, which takes a viewer).",
+         `tenancy_of_conn`, which takes a viewer). The claim visibility controls add two \
+         callers of the same shape, each on its caller-STAMPED transaction and each about ids \
+         it already holds: `ClaimRepository::write_tenancy_report` (below) and MCP \
+         `resolve_backlog_item`'s read of the original it resolves.",
+    ),
+    (
+        "claim_visibility.rs",
+        "writable_teams",
+        "READ through migration 206's app-callable definer `epigraph_writable_teams(agent)`: \
+         the TEAM groups one agent may write into (own writer/admin membership or its live \
+         human's, D-V3). Group ids about the agent, no corpus row and no `visibility` column; \
+         the definer answers the same on any connection, so there is nothing for a viewer to \
+         narrow.",
+    ),
+    (
+        "claim_visibility.rs",
+        "default_group_of",
+        "READ through 206's definer `epigraph_default_group(agent)`: one group id \
+         (`agents.default_group_id`, else the live human's). A preference about the agent, not \
+         a corpus row; validated by the caller against `writable_teams`.",
+    ),
+    (
+        "claim_visibility.rs",
+        "human_default_group_of",
+        "READ through 206's definer `epigraph_default_group` applied to 149's app-callable \
+         definer `epigraph_human_of(agent, true)`: one group id, the live human's \
+         `agents.default_group_id`. A preference about the agent's human, not a corpus row; \
+         validated by the caller against `writable_teams` (D-V1's second link).",
+    ),
+    (
+        "claim_visibility.rs",
+        "default_private_of",
+        "READ through 209's definer `epigraph_default_private(agent)`: one boolean, the agent's \
+         own private default. A preference about the agent, not a corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
+        "human_default_private_of",
+        "READ through 209's definer `epigraph_default_private` applied to 149's app-callable \
+         definer `epigraph_human_of(agent, true)`: one boolean, the live human's private default. \
+         A preference about the agent's human, not a corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
+        "resolve_visibility_choice",
+        "Composes `writable_teams`, `default_group_of`, `human_default_group_of`, \
+         `default_private_of` and `human_default_private_of` (all definers) into the write-time \
+         visibility decision for one author. Reads no corpus row; the decision is enforced by \
+         the claims trigger and policies on the WRITE's stamped transaction.",
+    ),
+    (
+        "claim_visibility.rs",
+        "resolve_write_decl",
+        "`default_decl_for_author` (the home group, definer answer) plus \
+         `resolve_visibility_choice`. Declares a write's tenancy; reads no corpus row.",
+    ),
+    (
+        "claim_visibility.rs",
+        "write_tenancy_report",
+        "READ of ONE claim's `visibility, owner_group_id` through `tenancy_on_session_conn`, for \
+         the id the same request just wrote or matched, on that write's caller-STAMPED \
+         transaction (API create_claim_core and submit_packet, MCP claim_tenancy_report): \
+         row security on the stamped connection is the filter, and only the caller's own \
+         claim's tenancy is reported back to it.",
+    ),
+    (
+        "claim_visibility.rs",
+        "set_agent_default_conn",
+        "WRITE through 209's definer `epigraph_set_agent_default_group` on a STAMPED \
+         transaction: one agent's `default_group_id` / `default_private`, authority decided in the \
+         body from the stamped principal (the agent itself, or its registered live human operator \
+         through a live, non-retired operator link; VIS01 / VIS02 / VIS05), audited. The viewer \
+         is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "publicize_conn",
+        "WRITE through 206's definer `epigraph_publicize_claims` on a STAMPED transaction: the \
+         definer classifies every id against the session's own readable groups (an unreadable \
+         id is `not_found`) and the principal's live admin memberships, all or nothing, and \
+         audits. The viewer is spent on the stamp.",
+    ),
+    (
+        "claim_visibility.rs",
+        "share_with_team_conn",
+        "WRITE through 206's definer `epigraph_share_claims_with_team` on a STAMPED \
+         transaction: as `publicize_conn`, classified against the session's readable groups, \
+         the principal's home group and its writable teams, all or nothing, audited.",
     ),
     (
         "security_event.rs",
@@ -1812,9 +1959,20 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          lineage-takeover fix), to decide which existing rows need the caller's authority. \
          Since migration 183 (ruling R-74) `workflows` carries its plan's tenancy and row \
          security, so the stamp of the connection it runs on bounds what it sees: the ingest \
-         entry points call it on the plan walk's own transaction, stamped from the ingest \
-         system agent, which reads every group it ingests into; a caller viewer predicate could \
-         only hide an anchor and so skip an authority check.",
+         entry points call it on the plan walk's own transaction, stamped from the CALLER \
+         (workflow writes are made as the caller), after migration 202's \
+         `name_has_hidden_rows_conn` refused a name with rows that stamp cannot read; a caller \
+         viewer predicate could only hide an anchor and so skip an authority check.",
+    ),
+    (
+        "workflow.rs",
+        "name_has_hidden_rows_conn",
+        "READ of NO table directly: one boolean from migration 202's maintenance-owned \
+         definer, whether some `workflows` row of a name fails 183's read policy for the \
+         SESSION (its stamp's groups). The question is exactly what the caller's own view \
+         cannot answer (row security hides the rows asked about), so a viewer predicate is \
+         meaningless here; no row, id or count reaches a caller, and a true answer refuses \
+         the write.",
     ),
     (
         "workflow.rs",
@@ -1823,8 +1981,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          parent at `generation - 1` or the lineage's predecessor. Since migration 183 (ruling \
          R-74) `workflows` carries its plan's tenancy and row security, so the stamp of the \
          connection it runs on bounds what it sees: the executor and `ingest_anchors` both call \
-         it on the plan walk's system-agent-stamped transaction, so the row authority-checked \
-         is the row linked.",
+         it on the plan walk's caller-stamped transaction, so the row authority-checked is the \
+         row linked.",
     ),
     (
         "workflow.rs",
@@ -1839,6 +1997,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          it gates, so row security on that connection still applies; the residual it leaves \
          (lineage members split across tenancies out of band) is stated on the function. \
          Returns workflow ids only, never content.",
+    ),
+    (
+        "agent_lookup.rs",
+        "author_nodes",
+        "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \
+         the document ingest's explicit-author check, plus migration 148's `system_agents` \
+         registry (no row security, app-readable). `agents_identity` is USING (true) and \
+         GET /api/v1/agents/:id answers for any id: no tenancy columns, nothing to filter.",
+    ),
+    (
+        "agent_lookup.rs",
+        "disclosed_roles",
+        "READ through migration 198's `epigraph_disclosed_role_assignments` SECURITY DEFINER \
+         function, the agent-lookup card's only reader of `role_assignments` (FORCE RLS, holder \
+         only). The function decides in its body, on the SESSION: non-elevating roles for any \
+         agent (a subset of 123's public projection), any role of the session principal itself, \
+         everything on a privileged session. No tenancy columns; nothing for a Viewer to add.",
+    ),
+    (
+        "agent_lookup.rs",
+        "exact_name_candidates",
+        "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
+         equality, excluding migration 148's `system_agents` rows (no row security): the \
+         document ingest's same-name author candidates. `agents_identity` is USING (true), only \
+         the public identity columns are returned and no ORCID / ROR tier is used, so no fact \
+         depends on the caller and there is nothing for a Viewer to add.",
     ),
     (
         "system_agent.rs",
@@ -2254,6 +2438,25 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorised by edges_tenancy's WITH CHECK.",
     ),
     (
+        "countersign.rs",
+        "countersign_conn",
+        "WRITE. Calls migration 208's epigraph_countersign_authorship definer on the CALLER's \
+         stamped transaction; the definer reads the caller from the session principal and acts \
+         only on authorship rows naming the caller (or an agent it is the live operator of), \
+         returning only those rows' ids. It reads nothing for display.",
+    ),
+    (
+        "claim_ingest.rs",
+        "record_signed_conn",
+        "WRITE. The document walk's paper -ingested_claim-> claim record (which ingest created \
+         the claim, and every later one), on the ingest's own transaction, deduplicated on \
+         (paper, claim, properties->>'ingested_by'). Its dedup probe on edges is the same \
+         VISIBILITY-EXEMPT write-path read as create_processed_by_stamp_if_absent_conn (it \
+         must see an existing record whoever asks, or a re-run writes a duplicate); the INSERT \
+         goes through EdgeRepository::create_signed_conn and is authorised by edges_tenancy's \
+         WITH CHECK.",
+    ),
+    (
         "edge.rs",
         "create_processed_by_stamp_if_absent_conn",
         "WRITE. The paper -processed_by-> agent pipeline stamp on the ingest's own transaction, \
@@ -2325,6 +2528,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          write made on another principal's stamp (`add_step` into a group plan, on the \
          workflow-ingest system agent's stamp, ruling R-98), so a viewer predicate would ask \
          about the wrong principal; it returns one boolean and no row reaches a caller.",
+    ),
+    (
+        "group_membership.rs",
+        "live_team_writer_groups_conn",
+        "READ of the CALLER's own live writer/admin memberships (migration 077's \
+         `epigraph_live_memberships` definer, the read `Viewer::resolve` is built from) joined \
+         to `groups` on the caller's OWN stamp (groups_tenancy filters it to the stamp's \
+         groups). It answers which team group a caller-authored workflow write lands in \
+         (`epigraph_ingest_executor::owner`), a question about the writing principal itself on \
+         a transaction stamped from it; a spliced viewer would be the same set the stamp was \
+         computed from, and the live definer is what catches a membership revoked since. \
+         Returns group ids the caller writes, no row of anyone else.",
     ),
     (
         "group_membership.rs",
@@ -2434,6 +2649,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_signed_reporting_conn",
+        "WRITE. create_signed_conn's body, also returning whether THIS call inserted the row (the document walk decides whether it created an atom from that, never from the row): the same dedup probes and INSERT; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
+    ),
+    (
+        "claim.rs",
         "create_with_id_if_absent_signed_conn",
         "WRITE. The signed twin of the unsigned form above it (backlog 4ff87716): the same INSERT plus the claim's v1 signature and signer_id, gated by v1_claim_signature_to_store; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
     ),
@@ -2441,6 +2661,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "edge.rs",
         "create_if_absent_including_retracted_signed_conn",
         "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_absent_for_ingest_principal_signed_conn",
+        "WRITE. The document ingest's per-principal dedup and signed INSERT (one row of a fact per \
+         ingest principal): the shared create-if-absent primitive with a VISIBILITY-EXEMPT \
+         write-path probe that also reads the marker's principal, plus the attestation columns; \
+         the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "ingest_written.rs",
+        "create_ingest_written_edge_if_absent_conn",
+        "WRITE. The document ingest's marked writer: \
+         create_if_absent_for_ingest_principal_signed_conn (a VISIBILITY-EXEMPT dedup probe and \
+         INSERT, one row of a fact per ingest principal, authorised by edges_tenancy's WITH \
+         CHECK on the walk's stamped transaction) with the ingest-written marker added and \
+         migration 198's transaction-local declaration set around that INSERT only. Reads \
+         nothing a viewer could filter; the walk spends its viewer on the stamp.",
+    ),
+    (
+        "ingest_written.rs",
+        "declare_ingest_written",
+        "SESSION SETTING. Sets or clears migration 198's transaction-local declaration \
+         (set_config(..., true)) on the caller's connection; touches no table, so there is \
+         nothing a viewer could filter. Called only around the document ingest record's own \
+         INSERT.",
     ),
     (
         "edge.rs",
@@ -2491,6 +2737,25 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "edge_signature.rs",
         "insert_attested_conn",
         "WRITE. The attested edge INSERT (ruling R-50) every signed edge twin runs: one INSERT carrying content_hash, the v1 edge signature and signer_id, re-made once over the stored row if the database rewrote a column; nothing to filter, and the INSERT is authorised by edges_tenancy's WITH CHECK.",
+    ),
+    // Atlas P3a (migration 197): the operator layout build's writes.
+    (
+        "atlas_layout.rs",
+        "write_run",
+        "WRITE. One Atlas layout run into the four untenanted derived tables `atlas_layout_runs`, \
+         `_regions`, `_themes` and `_theme_links` (migration 197): no claim_id column, no FK to \
+         claims, no visibility or owner_group_id. Every row is an aggregate of PUBLIC rows the \
+         same transaction read through `read_public_inputs`, which spends its viewer and names \
+         `visibility = 'public'`; the operator CLI `atlas_layout` calls it on the maintenance \
+         connection, and the application role holds SELECT only on these tables.",
+    ),
+    (
+        "atlas_layout.rs",
+        "prune_runs",
+        "WRITE. Deletes all but the newest N rows of the untenanted `atlas_layout_runs` \
+         (migration 197), its child rows going by the FK cascade; a corpus-wide maintenance \
+         statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
+         column to name (the shape of claim_theme.rs `delete_all_conn`).",
     ),
 ];
 
@@ -2645,6 +2910,64 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // Atlas P3a (migration 197): untenanted layout reads. Each is ONE statement
+    // over `atlas_layout_*` (no claim_id, no FK to claims, no visibility or
+    // owner_group_id) and `claim_themes` (a corpus-wide row, as
+    // `ClaimThemeRepository::list_summaries` treats it). The per-viewer decision
+    // is made before each is called, by `visible_themes` /
+    // `any_visible_member`, which splice the viewer onto `claims`.
+    (
+        "atlas_layout.rs",
+        "run",
+        "Reads one `atlas_layout_runs` row (the named run or the latest) joined to the one-row \
+         `atlas_layout_epoch`, with a staleness probe over `claim_themes.created_at` and the \
+         run's own `atlas_layout_themes` count. None of these tables has a visibility or \
+         owner_group_id column, the row carries no claim content or claim id, and the epoch \
+         number itself is not returned (only whether it still equals the run's). Same reason \
+         class as cluster_run.rs `latest`; the layout routes then read the run's contents \
+         through the caller's viewer.",
+    ),
+    (
+        "atlas_layout.rs",
+        "resolve_sides",
+        "Resolves the two ids of a `/graph/links` request in one statement: a region id of the \
+         run to its shared themes (`atlas_layout_themes`), else a `claim_themes` id to itself. \
+         Neither table carries tenancy columns, and the answer is theme ids only. The route \
+         refuses either side unless `any_visible_member` (spliced onto `claims`) finds a current \
+         member the caller can read, with the same 404 as an id that names nothing.",
+    ),
+    (
+        "atlas_layout.rs",
+        "region_rows",
+        "Reads the `atlas_layout_regions` rows of one run (ordinal, label, x, y, r): shared \
+         positions computed from public rows only, with no visibility or owner_group_id column. \
+         The caller (`overview`, `region_detail`) keeps only regions holding a theme the viewer \
+         can read, as decided by the spliced `visible_themes`.",
+    ),
+    (
+        "atlas_layout.rs",
+        "theme_rows",
+        "Reads `claim_themes` labels (a corpus-wide row, as `list_summaries` treats it) and the \
+         shared `atlas_layout_themes` position for theme ids the caller already established the \
+         viewer can see through the spliced `visible_themes`; neither table has a visibility or \
+         owner_group_id column, and no claim row is read.",
+    ),
+    (
+        "atlas_layout.rs",
+        "region_bundle_rows",
+        "Sums `atlas_layout_theme_links` (public link counts the build stored) into region-pair \
+         bundles over a theme set BOUND by the caller: the viewer's visible shared themes from \
+         the spliced `visible_themes`, both themes of every pair required in it. The layout \
+         tables have no visibility or owner_group_id column; no claim or edge row is read.",
+    ),
+    (
+        "atlas_layout.rs",
+        "region_link_rows",
+        "Sums `atlas_layout_theme_links` into a region's theme pairs and theme-to-region stubs \
+         over a theme set BOUND by the caller: the viewer's visible shared themes from the \
+         spliced `visible_themes`, both themes of every pair required in it. The layout tables \
+         have no visibility or owner_group_id column; no claim or edge row is read.",
+    ),
     // ── Batch B1 (rulings R-22, R-36): derivation scope and same-human owners.
     (
         "agent.rs",
@@ -2653,6 +2976,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
          itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
          `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "agent.rs",
+        "speaks_for",
+        "READ, no SQL of its own: `humans_of(agents, live)` (above) plus an id comparison, \
+         answering whether a writer IS an agent or operates it through a live binding (the \
+         authority rule for an agent-sourced asserts/authored edge). Identity data, not \
+         tenant content.",
     ),
     (
         "derivation_scope.rs",
@@ -2863,6 +3194,23 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          epigraph_principal_id()`, so on the unstamped pool every audit row was refused. The \
          engine's agent-less library path still passes its pool. Pinned by \
          `epigraph-mcp/tests/recall_audit_wiring.rs::the_audit_row_is_not_written_on_the_unstamped_pool`.",
+    ),
+    (
+        "cluster_run.rs",
+        "latest",
+        "Reads `graph_cluster_runs` for the newest completed run; the statement's FROM is that \
+         table alone and it joins nothing. The row is `(run_id, completed_at, degraded)` -- an \
+         operational record of when the clusterer last finished, with no claim content and no \
+         claim id. `graph_cluster_runs` is NOT in migration 062's tier_a array, so it has neither \
+         a `visibility` nor an `owner_group_id` column for a predicate to name, and \
+         `routes/graph_neighborhood.rs::expand` records that measured at migration head 92 it \
+         carries no row-level security either. The tenancy decision belongs to the membership \
+         tables this run id is then used against -- `claim_cluster_membership` and \
+         `claim_neighborhood_membership`, both of which ARE in tier_a -- and \
+         `ClusterRunRepository::claim_placement`, the caller that matters, takes a `&Viewer` and \
+         splices it onto both of them plus the `claims` existence probe. SCOPE: the Explorer \
+         branch widened the executor from `&PgPool` so the three `expand` handlers can pass their \
+         viewer-stamped connection and keep one connection per request. The SQL is unchanged.",
     ),
     (
         "method.rs",
@@ -3439,9 +3787,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
          set of `deprecate_workflow`). Since migration 183 (ruling R-74) `workflows` carries \
          its plan's tenancy and row security, so the stamp of the connection it runs on bounds \
-         what it sees: on the system-agent stamp (MCP) every group it ingests into, on the \
-         caller's stamp (REST) the rows the caller reads; a descendant outside that set is not \
-         deprecated by this call.",
+         what it sees: on the caller's stamp the rows the caller reads. A cascade whose \
+         lineage has a row outside that set is refused (`canonical_names_of` + migration 202's \
+         hidden-rows check), never deprecated in part.",
+    ),
+    (
+        "workflow.rs",
+        "canonical_names_of",
+        "READ of `workflows` only: the distinct `canonical_name`s of a cascade's target rows, \
+         which `deprecate_workflow` hands to migration 202's hidden-rows check. Since migration \
+         183 (ruling R-74) `workflows` carries its plan's tenancy and row security, so the \
+         stamp of the connection it runs on (the caller's) bounds what it sees; the targets \
+         were themselves read on that stamp, and there is no read for a viewer to filter.",
     ),
     (
         "workflow.rs",

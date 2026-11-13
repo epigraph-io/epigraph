@@ -148,18 +148,27 @@ pub async fn hypothesize(
                 message: format!("Failed to embed hypothesis: {e}"),
             })?;
 
+    // Both reads below share ONE viewer-stamped connection, acquired after the
+    // embedder call so no pooled connection waits on the provider. They ran on
+    // `state.db_pool`, an unstamped `epigraph_app` session in production, where
+    // the FORCEd `claims` policy hid the caller's own group-private claims:
+    // the prior and the clusters were computed over public claims only.
+    let mut read = crate::routes::open_scoped_read(&state, &viewer, "hypothesize").await?;
+
     // Find similar VISIBLE claims. Same predicate, ordering and limit as the
     // inline statement this replaces.
     let similar = epigraph_db::ClaimRepository::semantic_search_flat(
-        &state.db_pool,
+        &mut *read,
         &viewer,
-        &format_embedding(&embedding),
+        epigraph_db::FlatRanking::Query(&format_embedding(&embedding)),
         search_radius,
         None,
         None,
         None,
         None,
         50,
+        None,
+        0,
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -218,7 +227,7 @@ pub async fn hypothesize(
             // the 200 nearest claims; the pgvector cast rationale now lives with
             // the statement in `ClaimRepository::neighborhood_embeddings`.
             let neighborhood = epigraph_db::ClaimRepository::neighborhood_embeddings(
-                &state.db_pool,
+                &mut *read,
                 &viewer,
                 &format_embedding(&embedding),
                 search_radius,
@@ -291,6 +300,7 @@ pub async fn hypothesize(
     } else {
         serde_json::Value::Null
     };
+    crate::routes::finish_scoped_read(read, "hypothesize").await?;
 
     let mut response = serde_json::json!({
         "prior_belief": prior_belief,
@@ -662,8 +672,16 @@ pub async fn design_experiment(
     let mut _all_equipment: Vec<String> = Vec::new();
     let mut critical_gaps = Vec::new();
 
+    // ONE viewer-stamped connection for the loop. `methods` carries no row
+    // security, so the method read narrows nothing and only shares the
+    // connection; `get_evidence_strength` reads `claims` and `edges`, and on
+    // the unstamped `state.db_pool` (an `epigraph_app` session in production)
+    // their FORCEd policies hid the caller's own group-private evidence, so a
+    // method backed only by it was flagged "no published evidence".
+    let mut read = crate::routes::open_scoped_read(&state, &viewer, "design_experiment").await?;
+
     for (i, method_id) in request.method_ids.iter().enumerate() {
-        let method = epigraph_db::MethodRepository::get(&state.db_pool, *method_id)
+        let method = epigraph_db::MethodRepository::get(&mut *read, *method_id)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to load method {method_id}: {e}"),
@@ -673,16 +691,22 @@ pub async fn design_experiment(
                 id: method_id.to_string(),
             })?;
 
-        let evidence = epigraph_db::MethodRepository::get_evidence_strength(
-            &state.db_pool,
-            &viewer,
-            *method_id,
-        )
-        .await
-        .ok();
+        // PROPAGATED, where it used to be `.ok()`. The loop's statements now
+        // share one connection, and under `SessionGucMode::Transaction` a
+        // failed statement aborts it, so a swallowed error here would turn
+        // every later method into a spurious "no published evidence" gap (the
+        // rule in `routes/mod.rs::finish_scoped_read`'s doc).
+        // `get_evidence_strength` maps "no evidence" to `Ok` itself, so only a
+        // real database error reaches the `?`.
+        let evidence =
+            epigraph_db::MethodRepository::get_evidence_strength(&mut *read, &viewer, *method_id)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Failed to load evidence for method {method_id}: {e}"),
+                })?;
 
         // Flag methods with no published evidence
-        if evidence.as_ref().is_none_or(|e| e.source_count == 0) {
+        if evidence.source_count == 0 {
             critical_gaps.push(format!("{}: no published evidence", method.name));
         }
 
@@ -707,6 +731,7 @@ pub async fn design_experiment(
         // Note: required_equipment is on MethodRecord, not MethodSearchResult
         // We'd need to query it separately or add to the get() return type.
     }
+    crate::routes::finish_scoped_read(read, "design_experiment").await?;
 
     Ok(Json(serde_json::json!({
         "hypothesis_id": request.hypothesis_id,

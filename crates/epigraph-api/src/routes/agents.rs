@@ -406,6 +406,82 @@ pub async fn list_agents(
     }))
 }
 
+/// Query parameters of `GET /api/v1/agents/search`.
+#[derive(Deserialize, Debug)]
+pub struct AgentSearchParams {
+    /// The name (or an ORCID / ROR id) to look up. Required.
+    pub name: String,
+    /// Keep only agents of this kind: `human`, `llm_agent`, `system`, `role`,
+    /// `ingest_author` or `unknown`.
+    pub kind: Option<String>,
+    /// Keep only agents holding this role (`role:<key>` or `<key>`).
+    pub role: Option<String>,
+    /// At most this many results (default 10, at most 25).
+    pub limit: Option<i64>,
+}
+
+/// The scope `GET /api/v1/agents/search` requires: the card counts claims
+/// and names agents, both claim-reading facts (the MCP `find_agent` /
+/// `get_agent` tools are mapped to the same scope).
+#[cfg(feature = "db")]
+pub const AGENT_SEARCH_SCOPE: &str = "claims:read";
+
+/// Find agents by name
+///
+/// GET /api/v1/agents/search?name=&kind=&role=&limit=
+///
+/// Case-insensitive, accent-folded name match (plus exact ORCID / ROR id
+/// where the caller may see it), ranked exact > prefix > similar, each result
+/// carrying the card that tells near-duplicates apart: kind (derived from
+/// evidence the caller may see), the roles it may see, the human the agent
+/// is currently bound to (shown to every reader; none once its link is
+/// retired), created_at, and counts of authored papers (not awaiting
+/// countersignature, and pending apart) and asserted claims computed under
+/// the caller's viewer.
+/// The same code and viewer rules serve MCP `find_agent`
+/// (`epigraph_db::AgentLookupRepository::find`). Requires authentication.
+#[cfg(feature = "db")]
+pub async fn search_agents(
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
+    Query(params): Query<AgentSearchParams>,
+) -> Result<Json<epigraph_db::FindAgentResult>, ApiError> {
+    // Fail closed: no AuthContext is a 401, never a skipped scope check.
+    let Some(axum::Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "agent search requires authentication".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &[AGENT_SEARCH_SCOPE])?;
+    let query = epigraph_db::FindAgentQuery::new(
+        &params.name,
+        params.kind.as_deref(),
+        params.role.as_deref(),
+        params.limit,
+    )
+    .map_err(|e| match e {
+        epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+            field: "name/kind/role".to_string(),
+            reason,
+        },
+        other => other.into(),
+    })?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "search_agents",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let result = epigraph_db::AgentLookupRepository::find(&mut read, &viewer, &query).await?;
+    Ok(Json(result))
+}
+
 /// Get an agent's reputation score
 ///
 /// GET /agents/:id/reputation
@@ -633,6 +709,10 @@ pub async fn agent_claims(
                 group_id: None,
                 labels: Vec::new(),
                 was_created: false,
+                authored_by: None,
+                visibility: None,
+                owner_group_id: None,
+                visibility_note: None,
             };
             AttributedClaimResponse {
                 claim,
@@ -913,6 +993,10 @@ mod tests {
                 group_id: None,
                 labels: Vec::new(),
                 was_created: false,
+                authored_by: None,
+                visibility: None,
+                owner_group_id: None,
+                visibility_note: None,
             },
             attribution: serde_json::json!({
                 "prov": "wasAttributedTo",

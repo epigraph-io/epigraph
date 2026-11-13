@@ -88,39 +88,60 @@ pub struct Step {
     pub evidence_type: Option<String>,
 }
 
-/// The tenancy an ingest DECLARES for the claims it creates, beside the
-/// extraction (`ingest_workflow`'s `tenancy` parameter, and the same key in
-/// `POST /api/v1/workflows/ingest`'s body).
+/// The tenancy a workflow write DECLARES for the rows it creates, beside the
+/// extraction (`ingest_workflow`'s and `store_workflow`'s `tenancy` parameter,
+/// and the same key in the bodies of `POST /api/v1/workflows/ingest` and
+/// `POST /api/v1/workflows`).
 ///
-/// Only `visibility: "group"` is a declaration: absent, an ingest keeps its
-/// default (public, owned by the ingest system agent's default group), so
-/// there is nothing to declare for "public". Any other value is refused at
-/// deserialization. `deny_unknown_fields`, so a misspelt key INSIDE the
-/// declaration is refused. A misspelt or unsupported `tenancy` key itself is
-/// not: the request bodies ignore unknown keys, so it parses as an absent
-/// declaration and the plan is published public. A caller must therefore treat
-/// a response without `reused_items` (present exactly when a declaration was
-/// honoured) as "not declared" and fail closed.
+/// Two forms, both naming the owner group, which the calling agent itself must
+/// write (a live writer or admin membership; its operator's does not count):
+///
+/// * `{"visibility": "group", "owner_group_id": G}`: readable only by live
+///   members of G.
+/// * `{"visibility": "public", "owner_group_id": G}`: readable by every
+///   principal, owned by G. The ONLY way to publish a new workflow: an
+///   undeclared write is private to its owner group (the caller's one team
+///   group, else its own default group), and a new generation keeps its
+///   lineage's visibility. Declaring public on a new generation of a
+///   group-private lineage is refused (it would publish the lineage).
+///
+/// Any other visibility is refused at deserialization. `deny_unknown_fields`,
+/// so a misspelt key INSIDE the declaration is refused. A misspelt `tenancy`
+/// key itself is not (the request bodies ignore unknown keys): it parses as an
+/// absent declaration, whose default is the private one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowTenancy {
-    /// Always `"group"`: readable only by live members of `owner_group_id`.
+    /// `"group"` (readable only by live members of `owner_group_id`) or
+    /// `"public"` (readable by every principal, owned by `owner_group_id`).
     pub visibility: DeclaredVisibility,
-    /// The group that owns every claim the ingest creates. The calling agent
-    /// itself, and the ingest system agent, must each hold a live writer or
-    /// admin membership of it.
+    /// The group that owns every row the write creates. The calling agent
+    /// itself must hold a live writer or admin membership of it.
     #[schemars(with = "String")]
     pub owner_group_id: uuid::Uuid,
 }
 
-/// The one visibility a [`WorkflowTenancy`] may declare.
+impl WorkflowTenancy {
+    /// The declaration as the row tenancy it binds.
+    #[must_use]
+    pub const fn decl(&self) -> epigraph_core::TenancyDecl {
+        match self.visibility {
+            DeclaredVisibility::Group => epigraph_core::TenancyDecl::group(self.owner_group_id),
+            DeclaredVisibility::Public => epigraph_core::TenancyDecl::public(self.owner_group_id),
+        }
+    }
+}
+
+/// The visibilities a [`WorkflowTenancy`] may declare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum DeclaredVisibility {
     /// `visibility = 'group'`.
     Group,
+    /// `visibility = 'public'`: the explicit request to publish.
+    Public,
 }
 
 #[cfg(test)]
@@ -128,18 +149,27 @@ mod tenancy_tests {
     use super::{DeclaredVisibility, WorkflowTenancy};
 
     #[test]
-    fn only_a_group_declaration_parses() {
+    fn a_group_or_an_explicit_public_declaration_parses_and_nothing_else() {
         let g = uuid::Uuid::from_u128(7);
         let ok: WorkflowTenancy =
             serde_json::from_value(serde_json::json!({"visibility": "group", "owner_group_id": g}))
                 .expect("a group declaration");
         assert_eq!(ok.visibility, DeclaredVisibility::Group);
         assert_eq!(ok.owner_group_id, g);
-        for refused in [
+        assert_eq!(ok.decl(), epigraph_core::TenancyDecl::group(g));
+        let public: WorkflowTenancy = serde_json::from_value(
             serde_json::json!({"visibility": "public", "owner_group_id": g}),
+        )
+        .expect("an explicit public declaration");
+        assert_eq!(public.visibility, DeclaredVisibility::Public);
+        assert_eq!(public.decl(), epigraph_core::TenancyDecl::public(g));
+        for refused in [
             serde_json::json!({"visibility": "Group", "owner_group_id": g}),
+            serde_json::json!({"visibility": "Public", "owner_group_id": g}),
+            serde_json::json!({"visibility": "world", "owner_group_id": g}),
             serde_json::json!({"owner_group_id": g}),
             serde_json::json!({"visibility": "group"}),
+            serde_json::json!({"visibility": "public"}),
             serde_json::json!({"visibility": "group", "owner_group_id": g, "group": g}),
         ] {
             assert!(

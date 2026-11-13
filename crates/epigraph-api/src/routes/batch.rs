@@ -1114,7 +1114,8 @@ mod item_decoding_tests {
                 "encrypted_content": "ciphertext-base64",
                 "encryption_epoch": 2,
                 "labels": ["a", "b"], "if_not_exists": true,
-                "derived_from": {"claim_id": parent, "method": "decompose_claims"}
+                "derived_from": {"claim_id": parent, "method": "decompose_claims"},
+                "visibility": "public"
             }),
             caller,
         )
@@ -1138,7 +1139,11 @@ mod item_decoding_tests {
             labels,
             if_not_exists,
             derived_from,
+            visibility,
         } = req;
+        // docs/tenancy/claim-visibility-controls.md: a batch item carries its
+        // visibility to `create_claim_core` too.
+        assert_eq!(visibility.as_deref(), Some("public"));
         assert_eq!(content, "c");
         assert_eq!(agent_id, named, "an item that names an author keeps it");
         assert_eq!(initial_truth, Some(0.7));

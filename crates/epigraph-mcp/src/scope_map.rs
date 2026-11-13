@@ -36,10 +36,12 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("embedding_neighborhood_density", "claims:read"),
     ("entity_neighborhood", "claims:read"),
     ("evaluate_workflow_promotion", "claims:read"),
+    ("find_agent", "claims:read"),
     ("find_cross_source_matches", "claims:read"),
     ("find_workflow", "claims:read"),
     ("find_workflow_hierarchical", "claims:read"),
     ("get_belief", "claims:read"),
+    ("get_agent", "claims:read"),
     ("get_claim", "claims:read"),
     ("get_divergence", "claims:read"),
     ("get_neighborhood", "claims:read"),
@@ -59,12 +61,15 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // caller (a stale scheduled prompt included) see WHY, rather than a 403.
     ("theme_cluster", "claims:read"),
     ("consolidate_claims", "claims:write"),
+    ("countersign_authorship", "claims:write"),
     ("get_workflow_executions", "claims:read"),
     ("get_workflow_plan", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
     ("list_frames", "claims:read"),
     ("list_match_candidates", "claims:read"),
+    // The caller's own intake reports (migration 207).
+    ("list_my_bug_reports", "claims:read"),
     ("list_mcp_tools", "claims:read"),
     ("list_perspectives", "claims:read"),
     ("query_claims", "claims:read"),
@@ -139,6 +144,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("stage_claims", "claims:write"),
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
+    // Migration 207's write-only intake: the caller files into a group it
+    // need not belong to, through the definer, and reads nothing back.
+    ("submit_bug_report", "claims:write"),
     // The two claim-retiring ACTS (batch OA1, operator decision D1). The act
     // is the caller's own write to a claim it may write; the per-claim rule
     // (admin/writer membership in the owning group, for a dedup of both the
@@ -161,6 +169,14 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // per-row rule as retract_bba (migration 184's un-retract definer).
     ("unretract_bba", "claims:write"),
     ("update_labels", "claims:write"),
+    // The visibility controls (migration 206, docs/tenancy/claim-visibility-
+    // controls.md). The per-claim rule is the definer's own: a live ADMIN of
+    // the owning group to publish (owner decision D-V2); the author, or an admin
+    // of the home group, to share a private claim with a team the caller
+    // writes. Every act is audited in its own transaction.
+    ("publicize_claims", "claims:write"),
+    ("share_claims_with_team", "claims:write"),
+    ("set_default_group", "claims:write"),
     // Marks through mark_duplicate's act and writes labels through the
     // `update_labels` path, each claim under its own per-claim rule.
     ("apply_label_dedup", "claims:write"),

@@ -8,6 +8,7 @@
 
 pub mod authorship;
 pub mod error;
+pub mod owner;
 pub mod system_agent;
 pub mod workflow;
 pub mod workflow_plan;
@@ -15,6 +16,7 @@ pub mod workflow_steps;
 
 pub use authorship::record_caller_authorship;
 pub use error::IngestExecutorError;
+pub use owner::{caller_writes_group_now, resolve_caller_owner, CallerOwner, OwnerSource};
 pub use system_agent::{
     get_or_create_system_agent, require_caller_write_authority, system_agent_write_authority,
     SystemAgentAuthority,

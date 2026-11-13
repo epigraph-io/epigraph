@@ -69,6 +69,14 @@ fn hnsw_ef_search_for_pool(candidate_pool: i64) -> i64 {
     candidate_pool.clamp(40, 1000)
 }
 
+/// `hnsw.ef_search` for an unpinned [`ClaimRepository::semantic_search_flat`]
+/// page of `limit` rows. It takes no offset ON PURPOSE: every page of a cursor
+/// walk must run the same approximate scan, or `OFFSET` over a different scan
+/// can skip or repeat a row (see that fn's "Paging" section).
+fn flat_ef_search(limit: i64) -> i64 {
+    limit.clamp(40, 1000)
+}
+
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
@@ -377,7 +385,22 @@ pub struct ClaimVersionHit {
     pub superseded_by: Option<Uuid>,
 }
 
+/// What [`ClaimRepository::semantic_search_flat`] ranks by.
+#[derive(Debug, Clone, Copy)]
+pub enum FlatRanking<'q> {
+    /// Cosine distance to this pgvector text literal (the query embedding).
+    Query(&'q str),
+    /// Cosine distance to the pinned theme's core: the mean of its PUBLIC
+    /// embedded members, else the mean of the members this viewer can read.
+    /// Never `claim_themes.centroid`. Valid only with `theme_id = Some(_)`.
+    ThemeCore,
+}
+
 /// Result row for [`ClaimRepository::semantic_search_flat`].
+///
+/// `similarity` is `1 - cosine distance` to whatever the call ranked by: the
+/// query vector under [`FlatRanking::Query`], the theme core under
+/// [`FlatRanking::ThemeCore`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SemanticFlatHit {
     pub claim_id: Uuid,
@@ -1066,10 +1089,24 @@ pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
     "properties.supersede_act is reserved for the AUTHORED edge a supersession \
      writes (supersede_claim, custodial-supersede); nothing was written";
 
-/// The edge `properties` keys only an act writes:
-/// [`DUPLICATE_IDENTITY_PROPERTY`] and [`SUPERSEDE_ACT_PROPERTY`].
-pub const RESERVED_EDGE_PROPERTIES: &[&str] =
-    &[DUPLICATE_IDENTITY_PROPERTY, SUPERSEDE_ACT_PROPERTY];
+/// The edge `properties` keys only an act or the document ingest writes:
+/// [`DUPLICATE_IDENTITY_PROPERTY`], [`SUPERSEDE_ACT_PROPERTY`],
+/// [`crate::INGEST_WRITTEN_PROPERTY`] (which migration 198's guard also
+/// refuses in the database, for every writer), and the document ingest
+/// record's [`crate::INGESTED_BY_PROPERTY`], [`crate::CREATED_CLAIM_PROPERTY`]
+/// and [`crate::INGEST_AUTHORS_PROPERTY`] (an ingest record on a
+/// group-private claim is owned by that group, whose writers could otherwise
+/// patch a convergence into a creation, rewrite who ingested it, or rewrite
+/// the primary authors the creating ingest recorded).
+pub const RESERVED_EDGE_PROPERTIES: &[&str] = &[
+    DUPLICATE_IDENTITY_PROPERTY,
+    SUPERSEDE_ACT_PROPERTY,
+    crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY,
+    crate::repos::claim_ingest::INGESTED_BY_PROPERTY,
+    crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY,
+    crate::repos::claim_ingest::INGEST_AUTHORS_PROPERTY,
+    crate::repos::paper::AUTHORED_REPLACES_KEY,
+];
 
 /// The refusal for an application edge write whose `properties` carry a key
 /// of [`RESERVED_EDGE_PROPERTIES`], or `None` when it carries none.
@@ -1079,6 +1116,27 @@ pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<
         Some(DEDUP_IDENTITY_KEY_RESERVED)
     } else if properties.get(SUPERSEDE_ACT_PROPERTY).is_some() {
         Some(SUPERSEDE_ACT_KEY_RESERVED)
+    } else if properties
+        .get(crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY)
+        .is_some()
+    {
+        Some(crate::repos::ingest_written::INGEST_WRITTEN_KEY_RESERVED)
+    } else if properties
+        .get(crate::repos::claim_ingest::INGESTED_BY_PROPERTY)
+        .is_some()
+        || properties
+            .get(crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY)
+            .is_some()
+        || properties
+            .get(crate::repos::claim_ingest::INGEST_AUTHORS_PROPERTY)
+            .is_some()
+    {
+        Some(crate::repos::claim_ingest::INGEST_RECORD_KEYS_RESERVED)
+    } else if properties
+        .get(crate::repos::paper::AUTHORED_REPLACES_KEY)
+        .is_some()
+    {
+        Some(crate::repos::paper::AUTHORED_REPLACES_KEY_RESERVED)
     } else {
         None
     }
@@ -1180,6 +1238,35 @@ async fn non_public_frozen_relationships(
 /// keep the relationship's ordinary rule.
 pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
 
+/// Every replacement ([`migrate_superseded_edges`],
+/// [`repair_marked_duplicate`], [`migrate_consolidated_edges`]) leaves an
+/// edge carrying the document ingest's marker
+/// ([`crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY`]) on the claim it
+/// points at, whatever its source: a paper's `asserts`, its `ingested_claim`
+/// record, an author's `asserts`. Each records what ONE ingest stated about,
+/// or did to, THAT row (that its document asserts the claim, that it created
+/// or found the claim), and the readers trust it only as written. Moved,
+/// migration 198's guard would strip the marker and every reader would drop
+/// the claim from the paper (its count, its claims page, the author's card,
+/// the claim's ingest record), on both claims. Left in place, the paper keeps
+/// asserting the row its ingest created or found, which stays readable
+/// retired (`is_current = false`, `supersedes` naming the successor), and the
+/// claim the cascade points at reads no ingest of the paper. Agents'
+/// authorship already stays (R-133); this covers the paper-sourced edges with
+/// the same reasoning. The marker is the test, not the relationship: an
+/// unmarked (legacy) paper edge keeps the ordinary rule.
+///
+/// The key the cascades bind and test with `properties ? $n`.
+pub(crate) const INGEST_WRITTEN_FROZEN: &str =
+    crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY;
+
+/// The label form of [`INGEST_WRITTEN_FROZEN`]: a legacy ingest edge the
+/// backfill marked carries [`crate::repos::ingest_written::INGEST_WRITTEN_LABEL`]
+/// instead of the property (migration 208), and stays on its row the same way.
+/// The cascades bind it and test `labels @> ARRAY[$n]`.
+pub(crate) const INGEST_WRITTEN_FROZEN_LABEL: &str =
+    crate::repos::ingest_written::INGEST_WRITTEN_LABEL;
+
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
 /// "Privileged" is migration 114's `epigraph_session_is_privileged_writer()`: a
@@ -1235,6 +1322,9 @@ async fn require_privileged_session(
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// EVERY supersession leaves the document ingest's own edges on the retired
+/// claim ([`INGEST_WRITTEN_FROZEN`]).
 ///
 /// Neither direction moves a RETRACTED edge (`valid_to` set): it is history
 /// about the retired claim, as the dedup and merge cascades already treat
@@ -1326,6 +1416,7 @@ async fn migrate_superseded_edges(
            AND NOT COALESCE(properties->>$7 = ANY($6), false) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
+           AND NOT (properties ? $8 OR labels @> ARRAY[$9]::text[]) \
          RETURNING id",
     )
     .bind(new_uuid)
@@ -1335,6 +1426,8 @@ async fn migrate_superseded_edges(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -2137,6 +2230,28 @@ impl ClaimRepository {
         decl: TenancyDecl,
         signer_id: Option<Uuid>,
     ) -> Result<Claim, DbError> {
+        Ok(
+            Self::create_signed_reporting_conn(conn, claim, decl, signer_id)
+                .await?
+                .0,
+        )
+    }
+
+    /// [`Self::create_signed_conn`], also saying whether THIS call inserted
+    /// the row (`true`) or returned an existing one (`false`: a dedup hit,
+    /// unlocked or under the dedup lock). A caller that must not rewrite or
+    /// take credit for a row it did not write (the document walk's
+    /// `persist_planned_claim`) decides from this, never from the row's
+    /// author or trace.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signed_reporting_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
         // A dedup HIT on an already-committed row is answered here, unlocked
@@ -2150,7 +2265,7 @@ impl ClaimRepository {
         if let Some(existing) =
             Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         // The serialization scope, exactly as in `create_or_get_signed`: a real
@@ -2222,7 +2337,7 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
         signer_id: Option<Uuid>,
-    ) -> Result<Claim, DbError> {
+    ) -> Result<(Claim, bool), DbError> {
         use sqlx::Row;
 
         let id: Uuid = claim.id.into();
@@ -2251,7 +2366,7 @@ impl ClaimRepository {
         if let Some(existing) =
             Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
         {
-            return Ok(existing);
+            return Ok((existing, false));
         }
 
         let (signature, signer_id) = v1_claim_signature_to_store(
@@ -2313,14 +2428,17 @@ impl ClaimRepository {
 
         let truth_value = TruthValue::new(row.truth_value)?;
 
-        Ok(claim_from_row(
-            row.id,
-            row.content,
-            row.agent_id,
-            row.trace_id,
-            truth_value,
-            row.created_at,
-            row.updated_at,
+        Ok((
+            claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            ),
+            true,
         ))
     }
 
@@ -2389,11 +2507,14 @@ impl ClaimRepository {
     /// re-derived rather than left undecided: the seed is recovered through
     /// `WorkflowRepository::executing_canonical_names`.)
     ///
+    /// Generic over the executor (one statement), so a request passes the
+    /// connection `ScopedPool::read_as` stamped for its viewer.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_properties(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_properties<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Option<serde_json::Value>, DbError> {
@@ -2420,7 +2541,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let props: Option<serde_json::Value> = q.fetch_optional(pool).await?;
+        let props: Option<serde_json::Value> = q.fetch_optional(executor).await?;
         Ok(props)
     }
 
@@ -2764,12 +2885,15 @@ impl ClaimRepository {
     /// An HNSW index scan yields at most `hnsw.ef_search` rows (pgvector
     /// default 40), and the scope predicates (`claim_type`, the dates,
     /// `agent_id`, the visibility splice, `min_similarity`) are applied AFTER
-    /// it. So the query runs in a short transaction that first sets, `is_local`:
+    /// it. So the unpinned query runs in a short transaction that first sets,
+    /// `is_local`:
     ///
     ///  - `hnsw.iterative_scan = strict_order`: keep scanning past `ef_search`
-    ///    until `LIMIT $7` matching rows are found, in exact distance order.
+    ///    until `LIMIT $7 + $9` matching rows are found, in exact distance
+    ///    order.
     ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`: the first batch already
-    ///    covers an unscoped `limit`.
+    ///    covers an unscoped first page. It deliberately does NOT depend on
+    ///    `offset` (see "Paging" below).
     ///
     /// The transaction is ROLLED BACK, not committed: on a caller's own
     /// transaction `begin()` opens a savepoint, and releasing it would carry the
@@ -2780,74 +2904,233 @@ impl ClaimRepository {
     ///
     /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`); prod runs 0.8.2.
     ///
+    /// # Theme pin
+    ///
+    /// `theme_id = Some(t)` confines every hit to `claims.theme_id = t`. The
+    /// predicate sits inside the member set, above every cut (`min_similarity`,
+    /// `LIMIT`, `OFFSET`), the placement the recall theme pin uses, so a theme
+    /// whose members are all far from the query still fills its page.
+    /// Embedded implies current (`chk_deprecated_no_embedding`, migrations 052
+    /// and 144), so `embedding IS NOT NULL` already excludes retired members
+    /// and no `is_current` term is needed.
+    ///
+    /// # Theme core
+    ///
+    /// [`FlatRanking::ThemeCore`] ranks a pinned theme's members by cosine
+    /// distance to its core, computed here in SQL on every call:
+    ///
+    /// ```text
+    /// core = COALESCE(mean embedding of the theme's PUBLIC members,
+    ///                 mean embedding of the members this viewer can read)
+    /// ```
+    ///
+    /// The public mean comes first, so every viewer of a theme with a public
+    /// member ranks against the same reference point, derived from public
+    /// claims only. Its subquery is deliberately public-only and NOT
+    /// viewer-scoped: its predicate is strictly narrower than any viewer's, and
+    /// under migration 077's policies public rows are readable by every role.
+    /// The fallback averages only rows the viewer can read, so it carries
+    /// nothing the viewer cannot see (the reasoning on
+    /// `ClaimThemeRepository::set_centroid_from_claims`). The stored
+    /// `claim_themes.centroid` is never read: it averages every member under
+    /// the `ThemeClustering` bypass, so ranking by it would send a signal
+    /// derived from private embeddings to every viewer. When neither mean
+    /// exists the core is NULL and the call returns no rows. `ThemeCore`
+    /// without a theme is refused with `DbError::InvalidData` before any SQL
+    /// runs.
+    ///
+    /// # Paging
+    ///
+    /// `offset` skips that many rows of the ranking (0 is the first page). The
+    /// order is total, `(distance, id)`, on both statement shapes. Unpinned, a
+    /// tie group that straddles the inner `LIMIT $7 + $9` cut stays arbitrary,
+    /// the same residual the hybrid recall leg records.
+    ///
+    /// Unpinned pages are prefixes of ONE approximate scan only while
+    /// `hnsw.ef_search` stays the same from page to page: an index access
+    /// method never sees the `LIMIT`, so with a fixed `ef_search` the
+    /// iterative scan emits the same stream and a deeper page just reads
+    /// further along it. A different `ef_search` is a different stream, and
+    /// `OFFSET` over a different stream can skip a row or repeat one. So
+    /// `ef_search` is derived from `limit` alone, never from `offset`, and a
+    /// walk with a constant `limit` reads one stream. Residuals: a caller that
+    /// changes `limit` mid-walk, index writes between pages, a planner that
+    /// switches away from the index at a deeper `LIMIT`, and a query
+    /// re-embedded differently on a later page can each still move a row
+    /// across a page boundary.
+    ///
+    /// # Exactness of the pinned path
+    ///
+    /// The pinned statement materializes the theme's visible, embedded members
+    /// with their distances in a `MATERIALIZED` CTE that has no `ORDER BY`, so
+    /// no ordering-operator index path applies inside it (pgvector's HNSW
+    /// access method serves only ordered scans), and the ordering happens over
+    /// that CTE's `(uuid, float8)` rows. The read is exact whatever the planner
+    /// does, needs no `hnsw.*` settings, and does not depend on
+    /// `hnsw.max_scan_tuples`. Its cost is one distance per visible member.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns `DbError::QueryFailed` if the database query fails, and
+    /// `DbError::InvalidData` for `ThemeCore` without a `theme_id`.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(executor, viewer, embedding))]
+    #[instrument(skip(executor, viewer, ranking))]
     pub async fn semantic_search_flat<'a, A>(
         executor: A,
         viewer: &crate::visibility::Viewer,
-        embedding: &str,
+        ranking: FlatRanking<'_>,
         min_similarity: f64,
         claim_type: Option<&str>,
         created_after: Option<chrono::DateTime<chrono::Utc>>,
         created_before: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<Uuid>,
         limit: i64,
+        theme_id: Option<Uuid>,
+        offset: i64,
     ) -> Result<Vec<SemanticFlatHit>, DbError>
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
-        let sql = viewer.splice(
-            r#"
-            WITH query_vec AS (
-                SELECT $1::vector AS vec
-            )
-            SELECT
-                c.id as claim_id,
-                c.content as statement,
-                1 - (c.embedding <=> q.vec) as similarity,
-                c.truth_value,
-                c.belief,
-                c.plausibility,
-                c.agent_id,
-                c.trace_id,
-                c.labels[1] as claim_type,
-                c.created_at
-            FROM claims c, query_vec q
-            WHERE c.embedding IS NOT NULL
-              AND 1 - (c.embedding <=> q.vec) >= $2
-              AND ($3::text IS NULL OR $3 = ANY(c.labels))
-              AND ($4::timestamptz IS NULL OR c.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR c.created_at <= $5)
-              AND ($6::uuid IS NULL OR c.agent_id = $6)
-              /* {VISIBILITY:c} */
-            ORDER BY c.embedding <=> q.vec
-            LIMIT $7
-            "#,
-            8,
-        );
+        let query_literal: Option<&str> = match (ranking, theme_id) {
+            (FlatRanking::Query(v), _) => Some(v),
+            (FlatRanking::ThemeCore, Some(_)) => None,
+            (FlatRanking::ThemeCore, None) => {
+                return Err(DbError::InvalidData {
+                    reason: "ThemeCore needs a theme_id".to_string(),
+                })
+            }
+        };
+
+        // Two statement templates, chosen here. Neither carries caller text:
+        // every value is a bind, and the only interpolated fragment is one of
+        // two literals below. The pinned one is a `format!` template, so its
+        // own markers are written with doubled braces.
+        let sql = match theme_id {
+            // (U) Unpinned: the HNSW form. The inner ORDER BY / LIMIT is the
+            // shape the index serves; the outer sort only orders that prefix
+            // totally and pages it.
+            None => r#"
+                WITH query_vec AS (SELECT $1::vector AS vec),
+                nearest AS (
+                    SELECT k.id, (k.embedding <=> q.vec) AS dist
+                    FROM claims k, query_vec q
+                    WHERE k.embedding IS NOT NULL
+                      AND 1 - (k.embedding <=> q.vec) >= $2
+                      AND ($3::text IS NULL OR $3 = ANY(k.labels))
+                      AND ($4::timestamptz IS NULL OR k.created_at >= $4)
+                      AND ($5::timestamptz IS NULL OR k.created_at <= $5)
+                      AND ($6::uuid IS NULL OR k.agent_id = $6)
+                      AND $8::uuid IS NULL
+                      /* {VISIBILITY:k} */
+                    ORDER BY k.embedding <=> q.vec
+                    LIMIT $7 + $9
+                )
+                SELECT
+                    c.id AS claim_id,
+                    c.content AS statement,
+                    (1 - n.dist)::float8 AS similarity,
+                    c.truth_value,
+                    c.belief,
+                    c.plausibility,
+                    c.agent_id,
+                    c.trace_id,
+                    c.labels[1] AS claim_type,
+                    c.created_at
+                FROM nearest n JOIN claims c ON c.id = n.id
+                WHERE c.embedding IS NOT NULL /* {VISIBILITY:c} */
+                ORDER BY n.dist, n.id
+                LIMIT $7 OFFSET $9
+                "#
+            .to_string(),
+            // (P) Pinned: exact, and independent of the planner. See
+            // "Exactness of the pinned path" above.
+            Some(_) => {
+                let query_vec = match ranking {
+                    FlatRanking::Query(_) => "SELECT $1::vector AS vec",
+                    // `$1` is always NULL in this mode; it is referenced so the
+                    // bind arity is the same for every shape. The `p` subquery
+                    // is PUBLIC-ONLY by design (see "Theme core" above): it is
+                    // the shared reference, not a viewer read.
+                    FlatRanking::ThemeCore => {
+                        "SELECT COALESCE( \
+                             $1::vector, \
+                             (SELECT AVG(p.embedding) FROM claims p \
+                               WHERE p.theme_id = $8::uuid AND p.embedding IS NOT NULL \
+                                 AND p.visibility = 'public'), \
+                             (SELECT AVG(v.embedding) FROM claims v \
+                               WHERE v.theme_id = $8::uuid AND v.embedding IS NOT NULL \
+                                 /* {VISIBILITY:v} */) \
+                         )::vector AS vec"
+                    }
+                };
+                format!(
+                    r#"
+                    WITH query_vec AS MATERIALIZED ({query_vec}),
+                    members AS MATERIALIZED (
+                        SELECT k.id, (k.embedding <=> q.vec) AS dist
+                        FROM claims k, query_vec q
+                        WHERE k.theme_id = $8::uuid
+                          AND k.embedding IS NOT NULL
+                          AND ($3::text IS NULL OR $3 = ANY(k.labels))
+                          AND ($4::timestamptz IS NULL OR k.created_at >= $4)
+                          AND ($5::timestamptz IS NULL OR k.created_at <= $5)
+                          AND ($6::uuid IS NULL OR k.agent_id = $6)
+                          /* {{VISIBILITY:k}} */
+                    ),
+                    page AS (
+                        SELECT id, dist FROM members
+                        WHERE 1 - dist >= $2
+                        ORDER BY dist, id
+                        LIMIT $7 OFFSET $9
+                    )
+                    SELECT
+                        c.id AS claim_id,
+                        c.content AS statement,
+                        (1 - n.dist)::float8 AS similarity,
+                        c.truth_value,
+                        c.belief,
+                        c.plausibility,
+                        c.agent_id,
+                        c.trace_id,
+                        c.labels[1] AS claim_type,
+                        c.created_at
+                    FROM page n JOIN claims c ON c.id = n.id
+                    WHERE c.embedding IS NOT NULL /* {{VISIBILITY:c}} */
+                    ORDER BY n.dist, n.id
+                    "#
+                )
+            }
+        };
+        // `{{` in the pinned template emits the single brace `splice` looks
+        // for (the interpolated theme-core fragment is not a template and
+        // carries a single brace already). Every marker resolves to `$10`.
+        let sql = viewer.splice(&sql, 10);
         let mut q = sqlx::query_as::<_, SemanticFlatHit>(&sql)
-            .bind(embedding)
-            .bind(min_similarity)
-            .bind(claim_type)
-            .bind(created_after)
-            .bind(created_before)
-            .bind(agent_id)
-            .bind(limit);
+            .bind(query_literal) // $1
+            .bind(min_similarity) // $2
+            .bind(claim_type) // $3
+            .bind(created_after) // $4
+            .bind(created_before) // $5
+            .bind(agent_id) // $6
+            .bind(limit) // $7
+            .bind(theme_id) // $8
+            .bind(offset); // $9
         if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+            q = q.bind(g); // $10
         }
 
-        // See "The scan is served by the HNSW index" above.
+        // One code path for both shapes. The pinned read needs no HNSW
+        // settings; running it in the same rolled-back transaction is harmless.
         let mut tx = executor.begin().await?;
-        sqlx::query(
-            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                    set_config('hnsw.ef_search', $1, true)",
-        )
-        .bind(limit.clamp(40, 1000).to_string())
-        .execute(&mut *tx)
-        .await?;
+        if theme_id.is_none() {
+            // See "The scan is served by the HNSW index" above.
+            sqlx::query(
+                "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                        set_config('hnsw.ef_search', $1, true)",
+            )
+            .bind(flat_ef_search(limit).to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
         let rows = q.fetch_all(&mut *tx).await?;
         tx.rollback().await?;
 
@@ -3605,6 +3888,60 @@ impl ClaimRepository {
         row.map(|r| Ok((r.row.into_claim()?, r.labels))).transpose()
     }
 
+    /// Set-based twin of [`Self::get_by_id_with_labels`]: the same projection,
+    /// row type and post-fixes, for many ids in one statement. Rows the viewer
+    /// may not read and ids that match nothing are both simply absent. No
+    /// ORDER BY: the caller orders by its own request. The caller bounds `ids`
+    /// (`POST /api/v1/claims/batch-get` caps it at 100).
+    ///
+    /// The row's raw `trace_id` is returned as stored. Whether the viewer may
+    /// read that trace is a separate question
+    /// ([`crate::ReasoningTraceRepository::readable_ids`]) that the caller
+    /// answers, so this read stays field-for-field equal to the single read.
+    ///
+    /// One marker, on `c`: `agents` carries no `owner_group_id`, the same
+    /// reason as [`Self::get_by_id_with_labels`].
+    ///
+    /// # Errors
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
+    /// * [`DbError::InvalidData`] if a stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if a stored `truth_value` is outside `[0, 1]`.
+    #[instrument(skip(executor, viewer, ids), fields(n = ids.len()))]
+    pub async fn get_by_ids_with_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes,
+                   c.labels, c.content_hash, c.signature,
+                   s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = ANY($1)
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, SingleClaimRowWithLabels>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+
+        rows.into_iter()
+            .map(|r| Ok((r.row.into_claim()?, r.labels)))
+            .collect()
+    }
+
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
     /// restricted to paragraph-level (level=2) claims, optionally filtered by
     /// the paper that asserts the claim. Results are ordered by cosine
@@ -3691,7 +4028,6 @@ impl ClaimRepository {
     ///
     /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`).
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
     pub async fn search_by_embedding_since<'a, A>(
         executor: A,
         viewer: &crate::visibility::Viewer,
@@ -3705,6 +4041,40 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        let mut conn = executor.acquire().await?;
+        Self::search_by_embedding_since_conn(
+            &mut conn,
+            viewer,
+            query_embedding_pgvector,
+            dim,
+            limit,
+            paper_doi_filter,
+            since,
+            scope,
+        )
+        .await
+    }
+
+    /// [`Self::search_by_embedding_since`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so every statement runs under
+    /// the viewer's own session GUCs and row security agrees with the
+    /// in-query predicate. The other form acquires and delegates here, so the
+    /// statements exist once.
+    ///
+    /// # Errors
+    /// As [`Self::search_by_embedding_since`].
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_since_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        dim: u32,
+        limit: i64,
+        paper_doi_filter: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        scope: EmbeddingSeedScope,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
         let column = match dim {
             1536 => "embedding",
             3072 => "embedding_3072",
@@ -3792,7 +4162,7 @@ impl ClaimRepository {
         }
 
         // See "Iterative HNSW scan" above.
-        let mut tx = executor.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         sqlx::query(
             "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
                     set_config('hnsw.ef_search', $1, true)",
@@ -4130,6 +4500,47 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        let mut conn = executor.acquire().await?;
+        Self::search_hybrid_scoped_since_in_theme_conn(
+            &mut conn,
+            viewer,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            offset,
+            tags,
+            agent_id,
+            since,
+            theme_id,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped_since_in_theme`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so every statement runs under
+    /// the viewer's own session GUCs and row security agrees with the
+    /// in-query predicate. The other form acquires and delegates here, so the
+    /// statements exist once.
+    ///
+    /// # Errors
+    /// As [`Self::search_hybrid_scoped_since_in_theme`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since_in_theme_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -4196,7 +4607,7 @@ impl ClaimRepository {
         }
 
         // See "The dense leg runs with pgvector's iterative HNSW scan" above.
-        let mut tx = executor.begin().await?;
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         sqlx::query(
             "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
                     set_config('hnsw.ef_search', $1, true)",
@@ -9471,9 +9882,31 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any underlying edge query fails.
-    #[instrument(skip(pool, viewer, seed_ids))]
     pub async fn graph_expand_seeds_since(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        seed_ids: &[Uuid],
+        max_depth: u32,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<Vec<GraphExpansionHit>, DbError> {
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::graph_expand_seeds_since_conn(&mut conn, viewer, seed_ids, max_depth, since).await
+    }
+
+    /// [`Self::graph_expand_seeds_since`] on a caller-supplied connection: the form a request
+    /// reaches through `ScopedPool::read_as`, so every statement runs under
+    /// the viewer's own session GUCs and row security agrees with the
+    /// in-query predicate. The other form acquires and delegates here, so the
+    /// statements exist once.
+    ///
+    /// # Errors
+    /// As [`Self::graph_expand_seeds_since`].
+    #[instrument(skip(conn, viewer, seed_ids))]
+    pub async fn graph_expand_seeds_since_conn(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         seed_ids: &[Uuid],
         max_depth: u32,
@@ -9504,9 +9937,10 @@ impl ClaimRepository {
             let mut next_frontier = Vec::new();
             let mut level_new: Vec<Uuid> = Vec::new();
             'level: for &node in &frontier {
-                let outgoing =
-                    crate::repos::edge::EdgeRepository::get_by_source(pool, viewer, node, "claim")
-                        .await?;
+                let outgoing = crate::repos::edge::EdgeRepository::get_by_source(
+                    &mut *conn, viewer, node, "claim",
+                )
+                .await?;
                 for e in outgoing {
                     if !EXPANSION_RELATIONSHIPS.contains(&e.relationship.as_str()) {
                         continue;
@@ -9542,7 +9976,7 @@ impl ClaimRepository {
                         wq = wq.bind(g);
                     }
                     let in_window: std::collections::HashSet<Uuid> =
-                        wq.fetch_all(pool).await?.into_iter().collect();
+                        wq.fetch_all(&mut *conn).await?.into_iter().collect();
                     level_new
                         .into_iter()
                         .filter(|id| in_window.contains(id))
@@ -11671,6 +12105,10 @@ async fn migrate_consolidated_edges(
     // candidates either: they record who stated or wrote THAT source, and the
     // merged claim is content they never saw (ruling R-133, as in
     // `migrate_superseded_edges`). They stay on the retired source.
+    //
+    // Nor is an edge carrying the document ingest's marker
+    // (`INGEST_WRITTEN_FROZEN`): neither moved nor retracted as a redundant
+    // copy, it stays on the source its ingest created or found.
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -11694,6 +12132,7 @@ async fn migrate_consolidated_edges(
           AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
           AND NOT (e.source_type = 'agent' AND e.relationship = ANY($3))
           AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
+          AND NOT (e.properties ? $6 OR e.labels @> ARRAY[$7]::text[])
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -11708,6 +12147,8 @@ async fn migrate_consolidated_edges(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -12391,7 +12832,8 @@ async fn repair_marked_duplicate(
     // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
     // Agents' authorship of the duplicate and act-marked edges stay on it
-    // (ruling R-133, as in `migrate_superseded_edges`). Both point AT the
+    // (ruling R-133, as in `migrate_superseded_edges`), and so do the
+    // document ingest's own edges (`INGEST_WRITTEN_FROZEN`). Both point AT the
     // claim they record, so the incoming re-point tests them; the collision
     // guards never meet an agent-sourced edge (they act on claim-sourced ones).
     let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
@@ -12601,6 +13043,9 @@ async fn repair_marked_duplicate(
            -- canonical is content they never saw (ruling R-133).
            AND NOT (source_type = 'agent' AND relationship = ANY($4)) \
            AND NOT COALESCE(properties->>$6 = ANY($5), false) \
+           -- The document ingest's own edges stay on the row its ingest
+           -- created or found (`INGEST_WRITTEN_FROZEN`).
+           AND NOT (properties ? $7 OR labels @> ARRAY[$8]::text[]) \
          RETURNING id",
     )
     .bind(canon_uuid)
@@ -12609,6 +13054,8 @@ async fn repair_marked_duplicate(
     .bind(&agent_authorship)
     .bind(&act_tools)
     .bind(SUPERSEDE_ACT_PROPERTY)
+    .bind(INGEST_WRITTEN_FROZEN)
+    .bind(INGEST_WRITTEN_FROZEN_LABEL)
     .fetch_all(&mut *conn)
     .await?;
 

@@ -64,7 +64,10 @@ semantics, so `update_labels`, `patch_claim` and `update_with_evidence`'s
 transport (the stdio half closed in batch H-b). Ownership is the claim's
 author, or an agent linked to the same operator as the author (stdio;
 migration 107's operator arms, which is what makes a model-bumped fleet agent
-able to retire its predecessor's items), or the author's operator (HTTP).
+able to retire its predecessor's items), an agent live-linked to the author
+itself (its delegate, operator ruling R-183: one hop, a retired link grants
+nothing; stdio, or over HTTP a live delegated run token), or the author's
+operator (HTTP).
 Over HTTP a `claims:admin` token also passes; its write into a group the admin
 cannot write goes through the audited admin path (batch H-b, D2) on
 `update_labels` / `patch_claim`; `update_with_evidence` has no admin path and
@@ -72,7 +75,7 @@ refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's
-author is now refused, including through `release/epiclaw/CLAUDE.md`'s
+author, and is not its delegate, is now refused, including through `release/epiclaw/CLAUDE.md`'s
 `update_labels(original_id, add=["resolved"])` procedure, and so is a stdio
 server with no declared signer (`--agent-key` / `--agent-model`) on any claim it
 did not author. The deploy preconditions this sets for the fleet are in
@@ -205,6 +208,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs:217`
 - **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs:103`
 - **MCP `batch_submit_claims`** — delegates to `submit_claim`
+- **MCP `submit_bug_report`** — `crates/epigraph-mcp/src/tools/bug_report.rs::submit_bug_report`. The one exception to post-commit: the vector is computed best-effort BEFORE the transaction and stored by migration 207's definer in the same statement sequence as the row, because the reporter cannot update an intake-owned claim after commit (row security hides it from them). The embed runs only after `epigraph_bug_report_preflight` passes, so a caller the write would refuse for who it is or its limit (not configured, system agent, unbound, a role's agent whose role its own human does not hold, over its limit) costs no provider call. The theme scripts never turn an intake-owned claim's text into a label (`scripts/theme_lib.py::not_intake_owned`)
 - **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs:321`
 - **MCP `ingest_document_spine`** — `do_ingest_document_spine` in the same file; phase-1 of the two-phase flow, embeds spine claims (thesis + sections + paragraphs) post-write
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`

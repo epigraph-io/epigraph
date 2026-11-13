@@ -43,6 +43,7 @@ async fn store(
         server,
         viewer,
         StoreWorkflowParams {
+            tenancy: Some(common::stdio_public_tenancy(server).await),
             goal: goal.to_string(),
             steps: steps.iter().map(|s| (*s).to_string()).collect(),
             prerequisites: None,

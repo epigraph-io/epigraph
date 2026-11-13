@@ -151,6 +151,31 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          `promote_if_pending_conn` on the author-stamped transaction.",
     ),
     (
+        "claim_helper.rs",
+        "server.pool.acquire",
+        1,
+        "`resolve_claim_visibility` (docs/tenancy/claim-visibility-controls.md), the write-time \
+         visibility resolution of `submit_claim` / `memorize` / `batch_submit_claims` / \
+         `resolve_backlog_item`. It must run BEFORE the author-stamped transaction, because a \
+         team the author writes only through its live human (D-V3) has to be stamped INTO that \
+         transaction (`begin_author_stamped_tx_for`'s grant). Every statement it runs is a \
+         SECURITY DEFINER: `default_decl_for_author`'s 107 lookup and personal-group mint, and \
+         migration 206's `epigraph_writable_teams` / `epigraph_default_group` reads (the latter \
+         also over 149's `epigraph_human_of`, for D-V1's human default). The only \
+         row it can write is the author's own personal group, minted by the definer under its \
+         own identity exactly as the stamped path mints it, so a viewer stamp on the calling \
+         connection would change nothing the definers check.",
+    ),
+    (
+        "tools/ingestion.rs",
+        "server.pool.acquire",
+        1,
+        "`resolve_ingest_visibility`, the ingest tools' twin of `claim_helper.rs`'s \
+         `resolve_claim_visibility` (same reason, same definers): an `ingest_document*` call's \
+         visibility is resolved before `begin_ingest_tx`, so a D-V3 team grant can be stamped \
+         into the ingest transaction.",
+    ),
+    (
         "operator.rs",
         "server.pool.acquire",
         1,
@@ -276,8 +301,13 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`refresh_workflow_promotion`'s `properties.promotion` overwrite. Surfaced when `merge` \
          joined WRITE_TOKENS (batch H-a review). An `UPDATE claims`, so a clean migrate refuses \
-         it unstamped; its config-A behaviour is INFERRED, not measured (the probe's variant \
-         reached the lineage-root early return). Same population and the same H3 question as \
+         it unstamped. MEASURED on the application role over a clean migrate, both session \
+         modes: a member's own group-private variant now gets past the variant-parent read \
+         (which runs as the caller) and the tool fails at this write with the opaque -32603, \
+         writing nothing. Pinned by write_tool_source_reads_app_role.rs::\
+         refresh_promotion_on_a_members_private_variant_fails_at_the_unstamped_write. The cause \
+         the code implies: the unstamped UPDATE matches 0 rows under row security and \
+         `merge_properties` returns NotFound. Same population and the same H3 question as \
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),
@@ -299,15 +329,6 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
     // `tests/dedup_probes_app_role.rs` pins it on `epigraph_app`. A READ is
     // never "harmless" on the raw pool merely because it writes nothing;
     // `raw_pool_register.rs` registers reads by their tenancy instead.
-    (
-        "tools/workflows.rs",
-        "server.pool.acquire",
-        "`CallerRead::open`'s fallback for a server with no tenancy-aware pool (a development \
-         superuser): the connection carries the READS of `workflows` rows that find_workflow, \
-         recall's include_workflows leg and verify_claim's digest seed make as the caller \
-         (migration 183). With a `ScopedPool` the same reads run on `read_as(viewer)`; nothing \
-         is written on either connection.",
-    ),
     (
     "claim_helper.rs",
     "store_embedding_author_stamped",
@@ -967,10 +988,11 @@ fn the_production_embedder_scan_sees_the_two_known_sites() {
 // this" and "you have to work at it".
 //
 // WHAT IT STILL DOES NOT PIN, stated so the next reader does not over-trust it:
-// that the `tx` came from the SYSTEM agent's viewer rather than some other one.
-// A stamped-from-the-wrong-author transaction is spelled `&mut tx` too. That
-// axis remains `scripts/e2e/probe-workflow.sh`'s, exactly as the header above
-// says for the first ratchet.
+// that the `tx` came from the CALLER's viewer (workflow writes are made as the
+// caller) rather than some other one. A stamped-from-the-wrong-author
+// transaction is spelled `&mut tx` too. That axis is pinned behaviourally by
+// `epigraph-api/tests/workflow_writes_as_caller.rs` (every created row's
+// `agent_id` is the caller's) and `scripts/e2e/probe-workflow.sh`.
 // ===========================================================================
 
 /// The executor entry points whose first argument decides whether the ingest is
@@ -998,12 +1020,13 @@ const EXECUTOR_ENTRY_POINTS: &[&str] = &[
 const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
     (
         "epigraph-api/src/routes/workflows.rs",
-        4,
-        4,
-        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` (one \
-         `execute_workflow_ingest_plan` / `execute_workflow_ingest_plan_in_group` each) plus `POST /workflows/steps` and \
-         `/workflows/steps/delete`. All four stamp through this module's own \
-         `begin_system_ingest_stamped_tx`; none is exempt.",
+        3,
+        3,
+        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` share ONE \
+         `execute_workflow_ingest_plan_in_group` call (`execute_admitted_ingest`, which also \
+         checks the lineage gate over a row the walk did not create), plus `POST \
+         /workflows/steps` and `/workflows/steps/delete`. All three stamp through this \
+         module's own `begin_caller_workflow_tx`; none is exempt.",
     ),
     (
         "epigraph-mcp/src/tools/step_ops.rs",
@@ -1029,13 +1052,15 @@ const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
 
 /// The helper each production caller must use to obtain its `tx`. One NAME, two
 /// definitions: `epigraph-mcp`'s lives in `claim_helper.rs` and `epigraph-api`'s
-/// in `routes/workflows.rs`, with the same semantics and the same stamp.
-const STAMP_HELPER_NAME: &str = "begin_system_ingest_stamped_tx";
+/// in `routes/workflows.rs`, with the same semantics and the same stamp: the
+/// CALLER's own viewer (workflow writes are made as the caller; this was
+/// `begin_system_ingest_stamped_tx`, the shared system agent's stamp).
+const STAMP_HELPER_NAME: &str = "begin_caller_workflow_tx";
 
 /// Spellings that count as "this file names the stamp helper at all".
 const STAMP_HELPERS: &[&str] = &[
-    "claim_helper::begin_system_ingest_stamped_tx",
-    "begin_system_ingest_stamped_tx",
+    "claim_helper::begin_caller_workflow_tx",
+    "begin_caller_workflow_tx",
 ];
 
 /// `(relative file, total executor calls, calls passing `&mut tx`)`.

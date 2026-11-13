@@ -67,6 +67,8 @@ fn submit(content: &str) -> SubmitClaimParams {
         reasoning: None,
         labels: vec![],
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -173,6 +175,8 @@ async fn an_authenticated_memorize_is_authored_by_the_caller(pool: PgPool) {
             confidence: None,
             tags: None,
             novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         Some(&token),
     )

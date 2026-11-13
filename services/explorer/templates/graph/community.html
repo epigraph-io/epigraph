@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}Community · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("graph.css") }}">
+<script src="{{ ctx.static_url("graph.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<h1 class="graph-title">Community</h1>
+<p class="small muted mono">{{ cluster_id }}</p>
+{%- if expired %}
+{% include "graph/_expired.html" %}
+{%- else %}
+{% include "graph/_not_permalink.html" %}
+
+<section class="section" aria-labelledby="claims-title">
+  <h2 id="claims-title" class="section__title">Claims <span class="small muted">{{ claims.len() }}</span></h2>
+  {%- if truncated %}
+  <p class="small muted">Showing the {{ claims.len() }} best-connected claims of this community.</p>
+  {%- endif %}
+  {%- if claims.is_empty() %}
+  <p class="muted">This community has no claims to show.</p>
+  {%- else %}
+  <ol class="link-list graph-list">
+    {%- for c in claims %}
+    <li class="graph-row">
+      <a href="{{ c.href }}">{{ c.label }}</a>
+      <span class="small muted num">belief {{ c.betp }}</span>
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+</section>
+
+<section class="section" aria-labelledby="edges-title">
+  <h2 id="edges-title" class="section__title">Connections <span class="small muted">{{ edges.len() }}</span></h2>
+  {%- if edges.is_empty() %}
+  <p class="muted">No connections among these claims.</p>
+  {%- else %}
+  {% include "graph/_edge_table.html" %}
+  {%- if more_edges > 0 %}
+  <p class="small muted">{{ more_edges }} more connections are not listed.</p>
+  {%- endif %}
+  {%- endif %}
+  {%- if filtered_edge_count > 0 %}
+  <p class="small muted">{{ filtered_edge_count }} connections of other kinds are left out.</p>
+  {%- endif %}
+</section>
+{%- endif %}
+{% endblock %}

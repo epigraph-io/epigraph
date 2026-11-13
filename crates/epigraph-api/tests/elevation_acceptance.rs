@@ -20,13 +20,12 @@
 //! between two of B's claims); one public claim is the calibration that the
 //! read paths serve at all.
 //!
-//! ONE STATED GAP, PINNED HERE: the MCP read tools read on the server's
-//! UNSTAMPED pool, so an elevated MCP request is NOT widened by the elevated
-//! read arms (it is recorded, attributed to B when the answer names B's
-//! row). "P after sudo reads B's canaries through MCP" therefore does not
-//! hold yet; `p_after_sudo_reads_bs_canaries_and_b_reads_every_access`
-//! asserts what does (REST widened, MCP recorded and not widened) so the day
-//! the MCP reads are stamped this test is the one to flip.
+//! THE FORMERLY STATED GAP, NOW FLIPPED: the MCP read tools used to read on
+//! the server's UNSTAMPED pool, so an elevated MCP request was not widened by
+//! the elevated read arms. They now read on a connection stamped from the
+//! request's viewer (`EpiGraphMcpFull::read_as`), so "P after sudo reads B's
+//! canaries through MCP" holds: `p_after_sudo_reads_bs_canaries_and_b_reads_every_access`
+//! asserts REST and MCP widened, and both recorded against B's group.
 //!
 //! Each test names the planted regression or mutation it was run against.
 
@@ -857,11 +856,10 @@ async fn a_ceremony_for_bs_family_completed_by_p_is_refused(pool: PgPool) {
 /// every such row through the log's row policy as `epigraph_app`, while C
 /// reads none.
 ///
-/// MCP (THE STATED GAP): the same token's `get_claim` of B's canary is NOT
-/// widened (the MCP read tools read unstamped), and the call is still
-/// recorded, attributed to B's group because the answer names B's row, so the
-/// attempt is B's to see. Flip the `mcp get_claim` expectation when the MCP
-/// reads are stamped.
+/// MCP (formerly the stated gap, now flipped): the same token's `get_claim`
+/// of B's canary IS widened, since the MCP read tools read on a connection
+/// stamped from the elevated viewer, and the call is recorded, attributed to
+/// B's group because the answer names B's row, so the access is B's to see.
 ///
 /// Planted regressions (§10.5): the API recorder layer's record call removed
 /// ("a missing elevated_access row") -> the REST reads are served with no row
@@ -886,14 +884,12 @@ async fn p_after_sudo_reads_bs_canaries_and_b_reads_every_access(pool: PgPool) {
 
     let seen = view(&s, &w, &elevated).await;
     let mut want = baseline();
-    for (read, v) in want.iter_mut() {
-        if read.starts_with("rest") {
-            *v = true;
-        }
+    for (_, v) in want.iter_mut() {
+        *v = true;
     }
     assert_eq!(
         seen, want,
-        "elevated: every REST read sees B's canary; MCP get_claim is NOT widened (stated gap)"
+        "elevated: every REST read and the stamped MCP get_claim see B's canary"
     );
 
     let log = accesses(&pool, session).await;
@@ -912,7 +908,7 @@ async fn p_after_sudo_reads_bs_canaries_and_b_reads_every_access(pool: PgPool) {
     assert!(
         log.iter()
             .any(|(s, groups)| s == "mcp:get_claim" && groups.contains(&w.b.group)),
-        "the MCP attempt on B's canary is recorded against B's group: {log:?}"
+        "the MCP read of B's canary is recorded against B's group: {log:?}"
     );
     let for_b = log
         .iter()

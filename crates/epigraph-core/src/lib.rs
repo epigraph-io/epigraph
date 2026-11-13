@@ -38,6 +38,7 @@ pub mod graph;
 pub mod ids;
 pub mod labels;
 pub mod node;
+pub mod projection;
 pub mod properties;
 pub mod prov;
 pub mod tenancy;
@@ -54,7 +55,7 @@ pub use properties::{PropertyMap, PropertyValue};
 pub use prov::ProvAgentType;
 pub use tenancy::{
     consolidate_owner, consolidate_tenancy, ConsolidateTenancyError, SourceTenancy, TenancyDecl,
-    Visibility, WORLD_GROUP,
+    Visibility, VisibilityChoice, WORLD_GROUP,
 };
 pub use traits::{ContentAddressable, Signable, Verifiable};
 pub use truth::TruthValue;

@@ -14,7 +14,9 @@
 //! A caller keeps the connection it locked on for the whole run.
 //!
 //! The keys live here, in one place, so they cannot collide by accident;
-//! `tests::the_three_keys_are_distinct` pins that.
+//! `tests::the_four_keys_are_distinct` pins that. The fourth is the operator
+//! CLI `atlas_layout`, which rebuilds the shared Atlas layout in one
+//! transaction; two concurrent builds would each write a run.
 
 use sqlx::PgConnection;
 
@@ -26,6 +28,8 @@ pub const REPLAY_LOCK_KEY: i64 = 0x4550_4752_0119_0001;
 pub const DRAIN_LOCK_KEY: i64 = 0x4550_4752_0119_0002;
 /// `sweep_semantic_duplicates` (the operator's dedup sweep CLI).
 pub const SWEEP_LOCK_KEY: i64 = 0x4550_4752_0119_0003;
+/// `atlas_layout` (the operator's Atlas theme-layout build, migration 197).
+pub const ATLAS_LAYOUT_LOCK_KEY: i64 = 0x4550_4752_0119_0004;
 
 /// Try to take the session advisory lock `key` on `conn` without waiting.
 ///
@@ -61,8 +65,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_three_keys_are_distinct() {
-        let keys = [REPLAY_LOCK_KEY, DRAIN_LOCK_KEY, SWEEP_LOCK_KEY];
+    fn the_four_keys_are_distinct() {
+        let keys = [
+            REPLAY_LOCK_KEY,
+            DRAIN_LOCK_KEY,
+            SWEEP_LOCK_KEY,
+            ATLAS_LAYOUT_LOCK_KEY,
+        ];
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
                 assert_ne!(a, b, "two maintenance binaries share an advisory lock key");

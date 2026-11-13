@@ -208,7 +208,12 @@ impl PaperRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
-    /// Count the claims this paper asserts (`paper -asserts-> claim` edges).
+    /// Count the claims this paper asserts: its ingest-written
+    /// (`crate::ingest_written_edge_sql`) `paper -asserts-> claim` edges,
+    /// each claim once (every principal whose ingest of the paper asserts a
+    /// claim keeps an edge of its own, `crate::ingest_written`, so one claim
+    /// can carry several). An assertion written any other way (by hand,
+    /// before the marker existed) is not the ingest's and is not counted.
     ///
     /// This alone under-counts a partially-ingested paper: `do_ingest_document`
     /// / `do_ingest_document_spine` label every claim `doi:<doi>` *before*
@@ -231,27 +236,30 @@ impl PaperRepository {
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
     ) -> Result<i64, DbError> {
-        // MACRO SITE — static three-bind spelling.
-        let row = sqlx::query!(
-            r#"
-            SELECT COUNT(*) AS "count!"
-            FROM edges
-            WHERE source_id = $1
-              AND source_type = 'paper'
-              AND target_type = 'claim'
-              AND relationship = 'asserts'
-              AND ($2::bool OR visibility = 'public'
-                   OR (owner_group_id = ANY($3::uuid[])
-                       AND (co_owner_group_id IS NULL
-                            OR co_owner_group_id = ANY($3::uuid[]))))
-            "#,
-            paper_id,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_one(executor)
-        .await?;
-        Ok(row.count)
+        // Static three-bind spelling (runtime form: the ingest-written
+        // predicate is spliced from `ingest_written`, the one place it is
+        // defined).
+        let sql = format!(
+            "SELECT COUNT(DISTINCT e.target_id) \
+               FROM edges e \
+              WHERE e.source_id = $1 \
+                AND e.source_type = 'paper' \
+                AND e.target_type = 'claim' \
+                AND e.relationship = 'asserts' \
+                AND {marked} \
+                AND ($2::bool OR e.visibility = 'public' \
+                     OR (e.owner_group_id = ANY($3::uuid[]) \
+                         AND (e.co_owner_group_id IS NULL \
+                              OR e.co_owner_group_id = ANY($3::uuid[]))))",
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        );
+        let count: i64 = sqlx::query_scalar(&sql)
+            .bind(paper_id)
+            .bind(viewer.bypass_bind())
+            .bind(viewer.group_bind().unwrap_or(&[]))
+            .fetch_one(executor)
+            .await?;
+        Ok(count)
     }
 
     /// Count current claims labelled `doi:<doi>`, independent of whether a
@@ -294,8 +302,22 @@ impl PaperRepository {
         Ok(row.count)
     }
 
-    /// List the authors of a paper as `(agent_id, display_name)` pairs,
-    /// resolved via `agent -authored-> paper` edges.
+    /// The paper's authors as a reader sees them: every in-force,
+    /// ingest-written (`crate::ingest_written_edge_sql`) `agent -authored->
+    /// paper` edge `viewer` may read, in the extraction's
+    /// order (`properties.position`, then age), each with what the edge
+    /// records. A RETRACTED authorship (an author the operator CLI replaced)
+    /// is not listed. An authorship an ingester asserted for someone it
+    /// neither is nor operates is listed with `pending_countersign: true` and
+    /// the ingester ([`AUTHORED_PENDING_KEY`], [`AUTHORED_INGESTED_BY_KEY`]),
+    /// never as a plain author: the same predicate the agent card counts by
+    /// ([`crate::agent_lookup::authorship_pending_sql`]).
+    ///
+    /// One row per authorship EDGE: every principal whose ingest names an
+    /// author keeps an edge of its own (`crate::ingest_written`), so an author
+    /// two principals' ingests named is listed once per principal, each row
+    /// with its own `written_by`. A reader groups by `written_by`; it never
+    /// shows one principal's rows beside another's claims.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -304,34 +326,199 @@ impl PaperRepository {
         executor: E,
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
-    ) -> Result<Vec<(Uuid, Option<String>)>, DbError> {
-        // MACRO SITE — static three-bind spelling.
-        let rows = sqlx::query!(
-            r#"
-            SELECT a.id AS "id!", a.display_name
-            FROM edges e
-            JOIN agents a ON a.id = e.source_id
-            WHERE e.target_id = $1
-              AND e.target_type = 'paper'
-              AND e.source_type = 'agent'
-              AND e.relationship = 'authored'
-              AND ($2::bool OR e.visibility = 'public'
-                   OR (e.owner_group_id = ANY($3::uuid[])
-                       AND (e.co_owner_group_id IS NULL
-                            OR e.co_owner_group_id = ANY($3::uuid[]))))
-            ORDER BY a.display_name NULLS LAST, a.id
-            "#,
-            paper_id,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_all(executor)
-        .await?;
-        Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
+    ) -> Result<Vec<PaperAuthorListing>, DbError> {
+        Self::author_listing(executor, viewer, paper_id, None, None).await
+    }
+
+    /// The authorships ONE ingest principal's document ingest wrote for the
+    /// paper (their ingest-written marker names `ingested_by`), as
+    /// [`Self::list_authors`] lists them, at most `limit` rows: that
+    /// principal's author list, which goes with that principal's claims
+    /// ([`Self::list_asserted_claims_by`]) and never with another's.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_authors_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        ingested_by: Uuid,
+        limit: i64,
+    ) -> Result<Vec<PaperAuthorListing>, DbError> {
+        Self::author_listing(executor, viewer, paper_id, Some(ingested_by), Some(limit)).await
+    }
+
+    /// [`Self::list_authors`] / [`Self::list_authors_by`]: `ingested_by`
+    /// `None` lists every principal's rows, `limit` `None` no cap (`LIMIT
+    /// NULL`).
+    async fn author_listing<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        ingested_by: Option<Uuid>,
+        limit: Option<i64>,
+    ) -> Result<Vec<PaperAuthorListing>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT {columns} \
+                   FROM edges e \
+                   JOIN agents a ON a.id = e.source_id \
+                  WHERE e.target_id = $1 AND {authored} \
+                    AND ($2::text IS NULL OR {written_by} = $2::text) \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                  ORDER BY {order} \
+                  LIMIT $3",
+                columns = author_listing_columns(),
+                authored = authored_in_force_readable(),
+                order = AUTHOR_LISTING_ORDER,
+                written_by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+            ),
+            4,
+        );
+        let mut q = sqlx::query_as::<_, AuthorListingRow>(&sql)
+            .bind(paper_id)
+            .bind(ingested_by.map(|u| u.to_string()))
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(author_listing)
+            .collect())
+    }
+
+    /// The authors of several papers in ONE read, bounded in SQL, as the
+    /// INGESTS named in `writers` wrote them: at most `per_paper` authors of
+    /// each paper (under [`Self::list_authors`]'s predicate), plus whether
+    /// more exist. Papers with no listed author are absent from the map. For
+    /// a reader that lists several documents' authors at once (a claim's
+    /// provenance block), so neither the number of papers nor the length of
+    /// an author list turns one read into an unbounded one.
+    ///
+    /// Each principal's ingest keeps its own authorship rows
+    /// (`crate::ingest_written`), so a paper's authors are a set of words,
+    /// one per ingest principal. `writers` names, per paper, the principals
+    /// whose rows this read takes, as `(paper, principal, rank)`: only a row
+    /// whose ingest-written marker's `by` is one of the paper's writers is
+    /// listed (compared as text, so a malformed marker matches nothing). An
+    /// author is listed ONCE: from its recorded row if it has one (below),
+    /// else from the lowest-ranked writer's row, a row not awaiting
+    /// countersignature before one that is, then the oldest.
+    ///
+    /// `recorded` names the authorships a reader takes from a record rather
+    /// than from the edges alone, as `(paper, author, principal)`: a claim's
+    /// creating ingest records its document's authors
+    /// (`crate::ClaimIngestRecord::authors`), and the row that backs a
+    /// recorded author is that SAME principal's own row, never another
+    /// ingest's row of the same author. Each listed author carries whether it
+    /// was listed from a recorded row; those are listed FIRST (then position
+    /// order), so authorships other ingests wrote, however many and wherever
+    /// they sort, can never push a recorded author out of the `per_paper`
+    /// window.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, writers, recorded))]
+    pub async fn list_authors_bounded<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_ids: &[Uuid],
+        per_paper: i64,
+        writers: &[(Uuid, Uuid, i32)],
+        recorded: &[(Uuid, Uuid, Uuid)],
+    ) -> Result<BoundedAuthorListings, DbError> {
+        let mut out = BoundedAuthorListings::new();
+        if paper_ids.is_empty() || per_paper <= 0 || writers.is_empty() {
+            return Ok(out);
+        }
+        let written_by = crate::repos::ingest_written::ingest_written_by_sql("e");
+        let in_record = format!(
+            "EXISTS (SELECT 1 FROM unnest($3::uuid[], $4::uuid[], $5::uuid[]) AS r(p, a, w) \
+              WHERE r.p = p.id AND r.a = e.source_id AND r.w::text = {written_by})"
+        );
+        let sql = viewer.splice(
+            &format!(
+                "SELECT p.id, x.* \
+                   FROM unnest($1::uuid[]) AS p(id) \
+                  CROSS JOIN LATERAL ( \
+                        SELECT d.*, \
+                               row_number() OVER (ORDER BY d.in_record DESC, \
+                                                  d.pos NULLS LAST, d.at, d.eid) \
+                                   AS listing_rank \
+                          FROM ( \
+                                SELECT DISTINCT ON (e.source_id) \
+                                       {columns}, {in_record} AS in_record, \
+                                       {pos} AS pos, e.created_at AS at, e.id AS eid \
+                                  FROM edges e \
+                                  JOIN agents a ON a.id = e.source_id \
+                                  JOIN unnest($6::uuid[], $7::uuid[], $8::int[]) \
+                                       AS w(p, by, rank) \
+                                    ON w.p = p.id AND w.by::text = {written_by} \
+                                 WHERE e.target_id = p.id AND {authored} \
+                                   /* {{EDGE_VISIBILITY:e}} */ \
+                                 ORDER BY e.source_id, {in_record} DESC, w.rank, \
+                                          {pending}, e.created_at, e.id) d \
+                         ORDER BY d.in_record DESC, d.pos NULLS LAST, d.at, d.eid \
+                         LIMIT $2) x \
+                  ORDER BY p.id, x.listing_rank",
+                columns = author_listing_columns(),
+                authored = authored_in_force_readable(),
+                pos = AUTHOR_LISTING_POSITION,
+                pending = crate::agent_lookup::authorship_pending_sql("e"),
+            ),
+            9,
+        );
+        type Row = (
+            Uuid,
+            Uuid,
+            Option<String>,
+            Option<i64>,
+            String,
+            serde_json::Value,
+            bool,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<i64>,
+            chrono::DateTime<chrono::Utc>,
+            Uuid,
+            i64,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(paper_ids)
+            .bind(per_paper.saturating_add(1))
+            .bind(recorded.iter().map(|(p, _, _)| *p).collect::<Vec<Uuid>>())
+            .bind(recorded.iter().map(|(_, a, _)| *a).collect::<Vec<Uuid>>())
+            .bind(recorded.iter().map(|(_, _, w)| *w).collect::<Vec<Uuid>>())
+            .bind(writers.iter().map(|(p, _, _)| *p).collect::<Vec<Uuid>>())
+            .bind(writers.iter().map(|(_, w, _)| *w).collect::<Vec<Uuid>>())
+            .bind(writers.iter().map(|(_, _, r)| *r).collect::<Vec<i32>>());
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let limit = usize::try_from(per_paper).unwrap_or(usize::MAX);
+        for (paper, a, name, pos, role, aff, pending, by, written, in_record, ..) in
+            q.fetch_all(executor).await?
+        {
+            let entry = out.entry(paper).or_default();
+            if entry.0.len() < limit {
+                entry.0.push((
+                    author_listing((a, name, pos, role, aff, pending, by, written)),
+                    in_record,
+                ));
+            } else {
+                entry.1 = true;
+            }
+        }
+        Ok(out)
     }
 
     /// List claim summaries asserted by this paper — one page of `limit` rows
-    /// starting at `offset` — reached via `paper -asserts-> claim` edges.
+    /// starting at `offset` — reached via its ingest-written
+    /// `paper -asserts-> claim` edges (as [`Self::count_asserted_claims`]).
     /// Ordered by claim `created_at` ascending (ingest order), with an `id`
     /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across the many claims
     /// a single ingestion writes with an identical timestamp.
@@ -354,8 +541,12 @@ impl PaperRepository {
     /// [`Self::count_asserted_claims`] so a caller can tell a full page from
     /// the end of the set.
     ///
+    /// Each claim once (`SELECT DISTINCT`): every principal whose ingest of
+    /// the paper asserts a claim keeps an edge of its own.
+    ///
     /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry),
-    /// so adding `OFFSET` needs no `cargo sqlx prepare`.
+    /// so adding `OFFSET` (or the ingest-written predicate) needs no
+    /// `cargo sqlx prepare`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -380,8 +571,8 @@ impl PaperRepository {
         }
 
         let rows: Vec<Row> = sqlx::query_as(
-            r#"
-            SELECT
+            &r#"
+            SELECT DISTINCT
                 c.id,
                 c.content,
                 c.truth_value,
@@ -396,6 +587,7 @@ impl PaperRepository {
               AND e.source_type = 'paper'
               AND e.target_type = 'claim'
               AND e.relationship = 'asserts'
+              AND __INGEST_WRITTEN__
               AND ($4::bool OR e.visibility = 'public'
                    OR (e.owner_group_id = ANY($5::uuid[])
                        AND (e.co_owner_group_id IS NULL
@@ -403,7 +595,11 @@ impl PaperRepository {
               AND ($4::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($5::uuid[]))
             ORDER BY c.created_at ASC, c.id
             LIMIT $2 OFFSET $3
-            "#,
+            "#
+            .replace(
+                "__INGEST_WRITTEN__",
+                &crate::repos::ingest_written::ingest_written_edge_sql("e"),
+            ),
         )
         .bind(paper_id) // $1
         .bind(limit) // $2
@@ -444,6 +640,615 @@ impl PaperRepository {
             })
             .collect()
     }
+
+    /// The ingest principals whose document ingest of the paper wrote an
+    /// in-force, ingest-written edge `viewer` may read (a `paper -asserts->
+    /// claim` or an `agent -authored-> paper`, each marked with the
+    /// principal's `by`), oldest first, at most `limit`. Each principal is one
+    /// ingest of the paper as its readers see it: its authors
+    /// ([`Self::list_authors_by`]) go with its claims
+    /// ([`Self::list_asserted_claims_by`]), never with another principal's.
+    /// One principal's several ingests of the same document are one
+    /// principal (the writer keeps one row of a fact per principal).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn ingest_principals<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<PaperIngestPrincipal>, DbError> {
+        // Static three-bind spelling: every bind is unconditional.
+        let sql = format!(
+            "SELECT k.by::uuid, k.first_at \
+               FROM (SELECT {by} AS by, min(e.created_at) AS first_at \
+                       FROM edges e \
+                      WHERE ((e.source_id = $1 AND e.source_type = 'paper' \
+                              AND e.target_type = 'claim' AND e.relationship = 'asserts') \
+                          OR (e.target_id = $1 AND e.target_type = 'paper' \
+                              AND e.source_type = 'agent' AND e.relationship = 'authored')) \
+                        AND {in_force} \
+                        AND {marked} \
+                        AND {by} ~ '^[0-9a-fA-F]{{8}}-([0-9a-fA-F]{{4}}-){{3}}[0-9a-fA-F]{{12}}$' \
+                        AND ($2::bool OR e.visibility = 'public' \
+                             OR (e.owner_group_id = ANY($3::uuid[]) \
+                                 AND (e.co_owner_group_id IS NULL \
+                                      OR e.co_owner_group_id = ANY($3::uuid[])))) \
+                      GROUP BY 1) k \
+              ORDER BY k.first_at, k.by \
+              LIMIT $4",
+            by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        );
+        let rows: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(&sql)
+            .bind(paper_id)
+            .bind(viewer.bypass_bind())
+            .bind(viewer.group_bind().unwrap_or(&[]))
+            .bind(limit)
+            .fetch_all(executor)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ingested_by, first_written_at)| PaperIngestPrincipal {
+                ingested_by,
+                first_written_at,
+            })
+            .collect())
+    }
+
+    /// The provenance half of the predicate [`Self::count_asserted_claims_by`]
+    /// and [`Self::list_asserted_claims_by`] share, over `e` (the assertion):
+    /// the in-force, ingest-written `paper -asserts-> claim` edge whose marker
+    /// names `$2` (the principal, text), from paper `$1`. Each caller spells
+    /// the same static visibility predicate (`$3` bypass, `$4` groups) over
+    /// `e` and `c` inline in its own SQL, so count and page stay one set.
+    fn asserted_by_predicate() -> String {
+        format!(
+            "e.source_id = $1 AND e.source_type = 'paper' \
+             AND e.target_type = 'claim' AND e.relationship = 'asserts' \
+             AND {in_force} AND {marked} AND {by} = $2::text",
+            in_force = crate::repos::edge::EDGE_IN_FORCE,
+            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+            by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+        )
+    }
+
+    /// Count the claims ONE ingest principal's document ingest of the paper
+    /// asserts (its own in-force, ingest-written `paper -asserts-> claim`
+    /// edges), each once. In step with [`Self::list_asserted_claims_by`]
+    /// (one predicate), so a pager can tell a full page from the end.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_asserted_claims_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        ingested_by: Uuid,
+    ) -> Result<i64, DbError> {
+        // Static four-bind spelling over the assertion and the claim; the
+        // same predicate as `list_asserted_claims_by`.
+        let sql = format!(
+            "SELECT COUNT(DISTINCT c.id) FROM edges e JOIN claims c ON c.id = e.target_id \
+              WHERE {pred} \
+                AND ($3::bool OR e.visibility = 'public' \
+                     OR (e.owner_group_id = ANY($4::uuid[]) \
+                         AND (e.co_owner_group_id IS NULL \
+                              OR e.co_owner_group_id = ANY($4::uuid[])))) \
+                AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))",
+            pred = Self::asserted_by_predicate(),
+        );
+        let count: i64 = sqlx::query_scalar(&sql)
+            .bind(paper_id)
+            .bind(ingested_by.to_string())
+            .bind(viewer.bypass_bind())
+            .bind(viewer.group_bind().unwrap_or(&[]))
+            .fetch_one(executor)
+            .await?;
+        Ok(count)
+    }
+
+    /// One page of the claims ONE ingest principal's document ingest of the
+    /// paper asserts ([`Self::count_asserted_claims_by`]'s set, oldest
+    /// first), each with whether THAT ingest created it: its own
+    /// ingest-written, in-force `ingested_claim` record says so and names the
+    /// claim's filer (the rule `crate::ClaimIngestRepository::for_claims`
+    /// reads the creator by). Another principal's ingest of the same document
+    /// is never on this page.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails, and
+    /// `DbError::InvalidData` for a stored hash that is not 32 bytes.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_asserted_claims_by<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        ingested_by: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<IngestAssertedClaimRow>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            content_hash: Vec<u8>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+            created_claim: bool,
+        }
+        let sql = format!(
+            "SELECT DISTINCT c.id, c.content, c.truth_value, c.agent_id, c.content_hash, \
+                    c.created_at, COALESCE(c.is_current, true) AS is_current, c.supersedes, \
+                    EXISTS (SELECT 1 FROM edges r \
+                             WHERE r.source_id = $1 AND r.source_type = 'paper' \
+                               AND r.target_id = c.id AND r.target_type = 'claim' \
+                               AND r.relationship = '{rel}' \
+                               AND {in_force_r} AND {marked_r} AND {by_r} = $2::text \
+                               AND r.properties ->> '{rec_by}' = $2::text \
+                               AND COALESCE(r.properties ->> '{created}' = 'true', false) \
+                               AND c.agent_id::text = $2::text \
+                               AND ($3::bool OR r.visibility = 'public' \
+                                    OR (r.owner_group_id = ANY($4::uuid[]) \
+                                        AND (r.co_owner_group_id IS NULL \
+                                             OR r.co_owner_group_id = ANY($4::uuid[]))))) \
+                        AS created_claim \
+               FROM edges e JOIN claims c ON c.id = e.target_id \
+              WHERE {pred} \
+                AND ($3::bool OR e.visibility = 'public' \
+                     OR (e.owner_group_id = ANY($4::uuid[]) \
+                         AND (e.co_owner_group_id IS NULL \
+                              OR e.co_owner_group_id = ANY($4::uuid[])))) \
+                AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[])) \
+              ORDER BY c.created_at ASC, c.id \
+              LIMIT $5 OFFSET $6",
+            rel = crate::INGEST_RECORD_RELATIONSHIP,
+            rec_by = crate::INGESTED_BY_PROPERTY,
+            created = crate::CREATED_CLAIM_PROPERTY,
+            in_force_r = crate::repos::edge::EDGE_IN_FORCE.replace("e.", "r."),
+            marked_r = crate::repos::ingest_written::ingest_written_edge_sql("r"),
+            by_r = crate::repos::ingest_written::ingest_written_by_sql("r"),
+            pred = Self::asserted_by_predicate(),
+        );
+        let rows: Vec<Row> = sqlx::query_as(&sql)
+            .bind(paper_id) // $1
+            .bind(ingested_by.to_string()) // $2
+            .bind(viewer.bypass_bind()) // $3
+            .bind(viewer.group_bind().unwrap_or(&[])) // $4
+            .bind(limit) // $5
+            .bind(offset) // $6
+            .fetch_all(executor)
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                let content_hash: [u8; 32] =
+                    r.content_hash
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| DbError::InvalidData {
+                            reason: format!(
+                                "claim {} has content_hash of length {} (expected 32)",
+                                r.id,
+                                r.content_hash.len()
+                            ),
+                        })?;
+                Ok(IngestAssertedClaimRow {
+                    claim: AssertedClaimRow {
+                        id: r.id,
+                        content: r.content,
+                        truth_value: r.truth_value,
+                        agent_id: r.agent_id,
+                        content_hash,
+                        created_at: r.created_at,
+                        is_current: r.is_current,
+                        supersedes: r.supersedes,
+                    },
+                    created_claim: r.created_claim,
+                })
+            })
+            .collect()
+    }
+
+    /// The in-force `authored` edges into `paper_id` that `viewer` may read,
+    /// one per (agent, edge), by `position` then age: who a document ingest
+    /// finds already attached when it attaches its own authors (backlog
+    /// 94cc12db). Runs on the ingest's own author-stamped connection, so row
+    /// security answers as well as the spliced predicate.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn author_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+    ) -> Result<Vec<PaperAuthorEdge>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT e.id, e.source_id, \
+                        CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
+                             THEN (e.properties ->> 'position')::bigint END, \
+                        COALESCE(e.properties ->> '{explicit}' = 'true', false), \
+                        e.properties ->> '{name}', \
+                        {pending}, \
+                        CASE WHEN {pending} THEN e.properties ->> '{ingested_by}' END, \
+                        {written_by} \
+                   FROM edges e \
+                  WHERE e.target_id = $1 AND e.target_type = 'paper' \
+                    AND e.source_type = 'agent' AND e.relationship = 'authored' \
+                    AND {in_force} \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                  ORDER BY 3 NULLS LAST, e.created_at, e.id",
+                explicit = AUTHORED_EXPLICIT_KEY,
+                name = AUTHORED_NAME_KEY,
+                pending = crate::agent_lookup::authorship_pending_sql("e"),
+                ingested_by = AUTHORED_INGESTED_BY_KEY,
+                written_by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+                in_force = crate::repos::edge::EDGE_IN_FORCE,
+            ),
+            2,
+        );
+        type Row = (
+            Uuid,
+            Uuid,
+            Option<i64>,
+            bool,
+            Option<String>,
+            bool,
+            Option<String>,
+            Option<String>,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql).bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(
+                |(edge_id, agent_id, position, explicit, author_name, pending, by, written)| {
+                    PaperAuthorEdge {
+                        edge_id,
+                        agent_id,
+                        position,
+                        explicit,
+                        author_name,
+                        pending,
+                        ingested_by: by.and_then(|s| s.parse().ok()),
+                        written_by: written.and_then(|s| s.parse().ok()),
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// The authors an OPERATOR REPLACEMENT removed from `paper_id`: agents
+    /// with a retracted `authored` edge into the paper (retracted after it
+    /// was written, never born retracted) whose removal the replacement
+    /// itself recorded. The replacing author's own in-force, ingest-written
+    /// `authored` edge into the paper names the removed agent
+    /// ([`AUTHORED_REPLACES_KEY`]), which only the maintenance replacement
+    /// writes. A retraction nothing recorded, or one matched only by position
+    /// or spelling, is no replacement and is not listed. The document walk's
+    /// name path never credits a listed agent again.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn retracted_author_ids_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT DISTINCT e.source_id \
+                   FROM edges e \
+                  WHERE e.target_id = $1 AND e.target_type = 'paper' \
+                    AND e.source_type = 'agent' AND e.relationship = 'authored' \
+                    AND NOT {in_force} AND e.valid_to > e.created_at \
+                    AND EXISTS (SELECT 1 FROM edges rp \
+                                 WHERE rp.target_id = $1 AND rp.target_type = 'paper' \
+                                   AND rp.source_type = 'agent' \
+                                   AND rp.relationship = 'authored' \
+                                   AND {in_force_rp} AND {marked_rp} \
+                                   AND rp.properties ->> '{replaces}' = e.source_id::text \
+                                   /* {{EDGE_VISIBILITY:rp}} */) \
+                    /* {{EDGE_VISIBILITY:e}} */",
+                in_force = crate::repos::edge::EDGE_IN_FORCE,
+                in_force_rp = crate::repos::edge::EDGE_IN_FORCE.replace("e.", "rp."),
+                marked_rp = crate::repos::ingest_written::ingest_written_edge_sql("rp"),
+                replaces = AUTHORED_REPLACES_KEY,
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
+    /// Take `agent_id` off `paper_id` as an author: retract its in-force
+    /// `authored` edge into the paper and its in-force `asserts` edges onto
+    /// the claims THIS paper asserts, except a claim that another paper the
+    /// agent still authors also asserts (that attribution is not this
+    /// paper's to remove). Retraction, not deletion: the rows survive with
+    /// `valid_to` closed, and the document walk's
+    /// `create_if_absent_including_retracted` writes never revive them.
+    ///
+    /// What a document ingest does when an explicit `agent_id` replaces the
+    /// name-derived node an earlier ingest of the same document attached
+    /// (backlog 94cc12db). Agent-to-claim and agent-to-paper edges carry no
+    /// factor and no BBA (`edges_auto_factor` and the DS auto-wire both
+    /// require claim endpoints), so nothing derived is left behind.
+    ///
+    /// Returns `(authored, asserts)` retracted.
+    ///
+    /// # Errors
+    /// `DbError::WriteRefused` (run it in a transaction and roll back: some
+    /// edges may have closed) when an edge this session can read was not
+    /// closed: the spliced writable predicate, and 117's owner-scoped UPDATE
+    /// under it, skip a row the session may not write without an error, so
+    /// the count tells. An agent's edges are `('public', world)` (migration
+    /// 120), so on an application session that is the answer; a privileged
+    /// (bypass) session retracts them.
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn retract_author_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<(u64, u64), DbError> {
+        let in_force =
+            |alias: &str| crate::repos::edge::EDGE_IN_FORCE.replace("e.", &format!("{alias}."));
+        // 1. What the session can SEE of this author on this paper (read
+        //    predicate). The write below is gated separately: one statement
+        //    cannot carry both marker spellings.
+        let read = viewer.splice(
+            &format!(
+                "SELECT e.id FROM edges e \
+                  WHERE e.source_id = $1 AND e.source_type = 'agent' \
+                    AND e.target_id = $2 AND e.target_type = 'paper' \
+                    AND e.relationship = 'authored' AND {e} \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                 UNION ALL \
+                 SELECT a.id FROM edges a \
+                  WHERE a.source_id = $1 AND a.source_type = 'agent' \
+                    AND a.target_type = 'claim' AND a.relationship = 'asserts' AND {a} \
+                    /* {{EDGE_VISIBILITY:a}} */ \
+                    AND EXISTS (SELECT 1 FROM edges pc \
+                                 WHERE pc.source_id = $2 AND pc.source_type = 'paper' \
+                                   AND pc.relationship = 'asserts' \
+                                   AND pc.target_id = a.target_id \
+                                   AND pc.target_type = 'claim' AND {pc}) \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM edges oa \
+                          JOIN edges oc ON oc.source_id = oa.target_id \
+                                       AND oc.source_type = 'paper' \
+                                       AND oc.relationship = 'asserts' \
+                                       AND oc.target_id = a.target_id \
+                                       AND oc.target_type = 'claim' AND {oc} \
+                         WHERE oa.source_id = $1 AND oa.source_type = 'agent' \
+                           AND oa.relationship = 'authored' AND oa.target_type = 'paper' \
+                           AND oa.target_id <> $2 AND {oa})",
+                e = in_force("e"),
+                a = in_force("a"),
+                pc = in_force("pc"),
+                oc = in_force("oc"),
+                oa = in_force("oa"),
+            ),
+            3,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&read)
+            .bind(agent_id)
+            .bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let seen: Vec<Uuid> = q.fetch_all(&mut *conn).await?;
+        if seen.is_empty() {
+            return Ok((0, 0));
+        }
+        // 2. Retract them, gated by the session's WRITABLE set (and row
+        //    security under it).
+        let write = viewer.splice_write(
+            "UPDATE edges AS e SET valid_to = now() \
+              WHERE e.id = ANY($1::uuid[]) /* {WRITABLE:e} */ \
+             RETURNING e.relationship",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&write).bind(&seen);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let done: Vec<String> = q.fetch_all(&mut *conn).await?;
+        if done.len() < seen.len() {
+            return Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id: agent_id,
+                action: "retract this author's edges on the paper".to_string(),
+            });
+        }
+        let authored = done.iter().filter(|r| r.as_str() == "authored").count();
+        Ok((
+            u64::try_from(authored).unwrap_or(0),
+            u64::try_from(done.len() - authored).unwrap_or(0),
+        ))
+    }
+}
+
+/// Property on an `authored` edge a document ingest wrote for an explicit
+/// `source.authors[].agent_id` (backlog 94cc12db): `true`. Name-derived
+/// author edges never carry it.
+pub const AUTHORED_EXPLICIT_KEY: &str = "explicit_agent_id";
+/// Property on an explicit `authored` edge: the author's name as the
+/// extraction spelled it, so a later name-only ingest of the same document
+/// finds the explicit author instead of attaching the name-derived node too.
+pub const AUTHORED_NAME_KEY: &str = "author_name";
+/// Property on an explicit `authored` edge naming an agent the ingester
+/// neither is nor operates: `true` while the attribution is the ingester's
+/// word alone, until the named person countersigns. Such an author gets no
+/// `asserts` edge, and the agent card's `authored_papers` does not count it.
+/// The same key the card reads
+/// ([`crate::agent_lookup::AUTHORSHIP_PENDING_PROPERTY`]): one spelling.
+pub const AUTHORED_PENDING_KEY: &str = crate::agent_lookup::AUTHORSHIP_PENDING_PROPERTY;
+/// Property on a pending explicit `authored` edge: the agent that ingested
+/// the document, which is the one asserting the authorship
+/// ([`crate::agent_lookup::AUTHORSHIP_INGESTED_BY_PROPERTY`]).
+pub const AUTHORED_INGESTED_BY_KEY: &str = crate::agent_lookup::AUTHORSHIP_INGESTED_BY_PROPERTY;
+/// Property on the REPLACING author's `authored` edge, written by the operator
+/// replacement only: the name-derived agent whose authorship of the paper
+/// that ingest retracted and this author replaces, as a UUID string. The
+/// walk writes it only when its retraction actually retracted an `authored`
+/// edge, which only a maintenance connection can do (an application session
+/// is refused before anything is written), and it is a reserved edge key
+/// ([`crate::RESERVED_EDGE_PROPERTIES`]), so no generic writer sets it. It is
+/// the one signal [`PaperRepository::retracted_author_ids_conn`] reads.
+pub const AUTHORED_REPLACES_KEY: &str = "replaces_author";
+
+/// The refusal for an application edge write whose `properties` carry
+/// [`AUTHORED_REPLACES_KEY`].
+pub const AUTHORED_REPLACES_KEY_RESERVED: &str =
+    "properties.replaces_author is reserved for the operator's author replacement \
+     (the document ingest on the maintenance connection); nothing was written";
+
+/// One in-force `authored` edge into a paper
+/// ([`PaperRepository::author_edges_conn`]).
+#[derive(Debug, Clone)]
+pub struct PaperAuthorEdge {
+    pub edge_id: Uuid,
+    pub agent_id: Uuid,
+    /// `properties.position`, when it is a non-negative integer.
+    pub position: Option<i64>,
+    /// Written for an explicit `agent_id` ([`AUTHORED_EXPLICIT_KEY`]).
+    pub explicit: bool,
+    /// The extraction's spelling, on an explicit edge ([`AUTHORED_NAME_KEY`]).
+    pub author_name: Option<String>,
+    /// The authorship awaits the person's countersignature
+    /// ([`AUTHORED_PENDING_KEY`]).
+    pub pending: bool,
+    /// On a pending edge, the ingester that asserted the authorship
+    /// ([`AUTHORED_INGESTED_BY_KEY`]).
+    pub ingested_by: Option<Uuid>,
+    /// The principal whose document ingest wrote the edge, from its
+    /// ingest-written marker (`crate::ingest_written_by_sql`); `None` for an
+    /// edge the walk did not mark (written before the marker existed).
+    pub written_by: Option<Uuid>,
+}
+
+/// What [`PaperRepository::list_authors_bounded`] returns: per paper, its
+/// listed authors (each with whether it was listed from a recorded row) and
+/// whether more exist.
+pub type BoundedAuthorListings =
+    std::collections::HashMap<Uuid, (Vec<(PaperAuthorListing, bool)>, bool)>;
+
+/// The columns [`PaperRepository::list_authors`] and
+/// [`PaperRepository::list_authors_bounded`] read for one `authored` edge
+/// `e` from agent `a`, in [`AuthorListingRow`] order.
+fn author_listing_columns() -> String {
+    format!(
+        "a.id, a.display_name, \
+         CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
+              THEN (e.properties ->> 'position')::bigint END, \
+         COALESCE(e.properties ->> 'role', 'author'), \
+         CASE WHEN jsonb_typeof(e.properties -> 'affiliations') = 'array' \
+              THEN e.properties -> 'affiliations' ELSE '[]'::jsonb END, \
+         {pending}, \
+         CASE WHEN {pending} THEN e.properties ->> '{ingested_by}' END, \
+         {written_by}",
+        pending = crate::agent_lookup::authorship_pending_sql("e"),
+        ingested_by = AUTHORED_INGESTED_BY_KEY,
+        written_by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+    )
+}
+
+/// The predicate both author listings read edge `e` under: an in-force,
+/// ingest-written (`crate::ingest_written_edge_sql`) `agent -authored->
+/// paper` edge (each listing adds the viewer's edge visibility marker in its
+/// own statement).
+fn authored_in_force_readable() -> String {
+    format!(
+        "e.target_type = 'paper' AND e.source_type = 'agent' AND e.relationship = 'authored' \
+         AND {in_force} AND {marked}",
+        in_force = crate::repos::edge::EDGE_IN_FORCE,
+        marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+    )
+}
+
+/// An authorship edge `e`'s extraction position, when it is a non-negative
+/// integer.
+const AUTHOR_LISTING_POSITION: &str = "CASE WHEN e.properties ->> 'position' ~ '^[0-9]{1,9}$' \
+     THEN (e.properties ->> 'position')::bigint END";
+
+/// The listing order: the extraction's position (missing last), then age.
+const AUTHOR_LISTING_ORDER: &str = "CASE WHEN e.properties ->> 'position' ~ '^[0-9]{1,9}$' \
+     THEN (e.properties ->> 'position')::bigint END NULLS LAST, e.created_at, e.id";
+
+type AuthorListingRow = (
+    Uuid,
+    Option<String>,
+    Option<i64>,
+    String,
+    serde_json::Value,
+    bool,
+    Option<String>,
+    Option<String>,
+);
+
+fn author_listing(
+    (agent_id, display_name, position, role, affiliations, pending, by, written): AuthorListingRow,
+) -> PaperAuthorListing {
+    PaperAuthorListing {
+        agent_id,
+        display_name,
+        position,
+        role,
+        affiliations: affiliations
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        pending_countersign: pending,
+        ingested_by: by.and_then(|s| s.parse().ok()),
+        written_by: written.and_then(|s| s.parse().ok()),
+    }
+}
+
+/// One author of a paper as [`PaperRepository::list_authors`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperAuthorListing {
+    pub agent_id: Uuid,
+    pub display_name: Option<String>,
+    /// `properties.position` (the extraction's index), when it is a
+    /// non-negative integer.
+    pub position: Option<i64>,
+    /// `properties.role`, `"author"` when absent.
+    pub role: String,
+    /// `properties.affiliations` (strings only).
+    pub affiliations: Vec<String>,
+    /// The authorship is an ingester's word, awaiting the person's
+    /// countersignature ([`AUTHORED_PENDING_KEY`]): show it as pending,
+    /// never as a plain author.
+    pub pending_countersign: bool,
+    /// On a pending authorship, the ingester that asserted it
+    /// ([`AUTHORED_INGESTED_BY_KEY`]); `None` otherwise.
+    pub ingested_by: Option<Uuid>,
+    /// The principal whose document ingest wrote this authorship (its
+    /// ingest-written marker, `crate::ingest_written_by_sql`). Every listed
+    /// author has one: only ingest-written authorships are listed. A reader
+    /// that combines a paper's authors with one ingest's record of a claim
+    /// (`crate::ClaimIngestRepository`) keeps the authors whose `written_by`
+    /// is that record's ingester.
+    pub written_by: Option<Uuid>,
 }
 
 /// Minimal claim shape returned by [`PaperRepository::list_asserted_claims`].
@@ -460,6 +1265,26 @@ pub struct AssertedClaimRow {
     pub is_current: bool,
     /// The claim this one superseded, if any.
     pub supersedes: Option<Uuid>,
+}
+
+/// One ingest principal of a paper ([`PaperRepository::ingest_principals`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperIngestPrincipal {
+    /// The principal whose document ingest wrote the edges (the
+    /// ingest-written marker's `by`).
+    pub ingested_by: Uuid,
+    /// Its oldest readable in-force ingest-written edge on the paper.
+    pub first_written_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One claim of one ingest principal's listing of a paper
+/// ([`PaperRepository::list_asserted_claims_by`]).
+#[derive(Debug, Clone)]
+pub struct IngestAssertedClaimRow {
+    pub claim: AssertedClaimRow,
+    /// THAT ingest created the claim (its own creation record, naming the
+    /// claim's filer); `false`: it found the claim already there.
+    pub created_claim: bool,
 }
 
 // =============================================================================

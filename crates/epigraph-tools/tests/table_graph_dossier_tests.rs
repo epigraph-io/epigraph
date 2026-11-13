@@ -44,8 +44,32 @@ fn ddl_for_claims_includes_create_table() {
     assert!(ddl.contains("claims"), "DDL should mention 'claims'");
 }
 
+/// Needs the repository's history: it runs `git log` under [`REPO_ROOT`].
+///
+/// A build host that receives the tree without `.git` (an rsync of the
+/// working tree, a source tarball) has no history to read, so there the test
+/// SKIPS with a message rather than failing on something it cannot check. In
+/// CI (`CI` set, as GitHub Actions sets it) the checkout always has `.git`, so
+/// a missing one there is a broken checkout and the test FAILS instead of
+/// skipping, which keeps the skip from hiding the test where it matters.
 #[test]
 fn git_context_for_claims_returns_some_commits() {
+    let git = std::path::Path::new(REPO_ROOT).join(".git");
+    if !git.exists() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but {} does not exist: the checkout has no git history, \
+             so git_context_for_claims_returns_some_commits cannot run",
+            git.display()
+        );
+        eprintln!(
+            "SKIPPED git_context_for_claims_returns_some_commits: {} does not exist \
+             (this tree was copied without its git history), so there is no `git log` \
+             to read. It runs wherever the checkout has .git, including CI.",
+            git.display()
+        );
+        return;
+    }
     let commits = collect_git_context(REPO_ROOT, "001_initial_schema.sql", "claims").unwrap();
     assert!(
         !commits.is_empty(),

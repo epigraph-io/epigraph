@@ -68,10 +68,10 @@ The four logins:
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
 hatch of migration 074. Nothing connects as it in production.
 
-Five `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
+Six `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
 switches the session to the application role: `reown-claims`,
-`reown-linked`, `reown-reverse`, `restrict-claims` and `hide-evidence` (its
-`--apply`). For those runs only, point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at
+`reown-linked`, `reown-reverse`, `restrict-claims`, `regroup-claims` and
+`hide-evidence` (its `--apply`). For those runs only, point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at
 a superuser login (the migration login, if it is one). The standing maintenance login, the one in
 `MAINTENANCE_DATABASE_URL` and in every other operator run, stays a
 non-superuser.
@@ -367,7 +367,8 @@ switches do not share one parser:
   ignored.
 - `EPIGRAPH_MCP_LOG_PAYLOADS`: `1` or `true` (case-insensitive), whitespace
   ignored.
-- `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION`: `1`/`true`/`yes` or
+- `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` and
+  `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`: `1`/`true`/`yes` or
   `0`/`false`/`no`, case-insensitive, whitespace ignored. When passkeys are
   configured, any other value stops the server at boot.
 
@@ -396,8 +397,11 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUIRE_SIGNATURES` | off | Enforces Ed25519 payload signatures on `POST /api/v1/submit/packet` only (section 7). |
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | unset | The passkey relying party. Both unset → passkeys off, and the ceremonies answer 503. A partial or malformed configuration → exit 1. The RP id is effectively permanent: a passkey registered under one never asserts under another. |
-| `EPIGRAPH_WEBAUTHN_AAGUIDS`, `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` | — | The attestation allowlist (authenticator model UUIDs) and the PEM file of the roots they chain to. |
-| `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` | off | Tests and development only. Accepts `none` and self attestation. Refused at boot on a database armed for operator binding. |
+| `EPIGRAPH_WEBAUTHN_AAGUIDS`, `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` | — | The attestation allowlist (authenticator model UUIDs) and the PEM file of the roots they chain to: `packed` and `tpm` attestation by a listed model. Both or neither; required unless `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` is set. |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` | unset | A local copy of Google's attestation status list (the JSON at `https://android.googleapis.com/attestation/status`), refreshed by an operator job; the API never fetches it. REQUIRED with `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (either without the other → exit 1, as is a file that is unreadable or not a status list). Re-read at every Android enrollment and anchor use; a listed certificate anywhere in the chain refuses, and a file older than 48 hours (by modification time) refuses every Android enrollment and anchor. Section 10, as above. |
+| `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` | off | On: a person's LATER passkey, enrolled on a confirmed `passkey.register` act, may carry no attestation (a synced passkey, e.g. a password manager's), when the act was confirmed by one of that person's live passkeys that is hardware-attested under the CURRENT configuration, as is every passkey that authorized it. A first passkey is always attested. Served on an armed database. Needs migration 200. Section 10, as above. |
+| `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` | off | Tests and development only. Accepts `none` and self attestation. Refused at boot on a database armed for operator binding, and with either setting above (exit 1). |
 | `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT` | on | `off` is the emergency valve for operator binding: it relieves `OPL01` only (section 9). |
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
@@ -463,7 +467,7 @@ not to the API.
 
 | Variable | Meaning |
 |---|---|
-| `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` | The only DSN it reads. A login outside `epigraph_maintenance` is refused. Five verbs need a superuser DSN instead and say so (`reown-claims`, `reown-linked`, `reown-reverse`, `restrict-claims`, and `hide-evidence` for its `--apply`). |
+| `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` | The only DSN it reads. A login outside `epigraph_maintenance` is refused. Six verbs need a superuser DSN instead and say so (`reown-claims`, `reown-linked`, `reown-reverse`, `restrict-claims`, `regroup-claims`, and `hide-evidence` for its `--apply`). |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | Required by `verify-confirmations`: the values the API's ceremonies ran under. |
 
 ### Other CLIs and scripts
@@ -2404,6 +2408,260 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 - **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
   on reverse.
 
+### `epigraph-operator regroup-claims` — move group-private claims between groups (no migration)
+
+This verb moves listed claims that are `('group', <source>)` to
+`('group', <target>)`, together with every row that follows only them, keeping
+`group` visibility. It is for claims an earlier act put in the wrong group:
+`restrict-claims` moves only public claims, and reversing the earlier act
+first would make the claims public for a while and, on a linked graph, can
+leave a shared edge public while its other end stays private. Nothing this
+verb does makes a row public. `reown-reverse` reverses it exactly. It needs a
+SUPERUSER DSN, like `restrict-claims`. Module doc:
+`crates/epigraph-cli/src/operator/regroup.rs`.
+
+```bash
+# dry run: plan, every held claim with its reason code, every co-owned edge and
+# source-node edge, a sample
+epigraph-operator regroup-claims --claims-file ids.txt --source-group <group> \
+    --target-group <group> --operator <person> --manifest-out regroup-1.jsonl
+# apply: repeat the dry run's eligible count back
+epigraph-operator regroup-claims ... --manifest-out regroup-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>"
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
+```
+
+- **Who**: `--operator` must be a registered human operator and a live admin
+  of both groups. The target must be an active `team` or `community` group,
+  or the operator's OWN personal group (the group carrying
+  `did:epigraph:personal:<operator>`, created by the operator). Another
+  person's personal group is refused, and so is the personal group of an
+  agent the operator operates, even when the operator administers it: that
+  group is the agent's, and the ownership model moves an operated agent's
+  claims out of it (`reown-linked`), never into it. The source is held to
+  the same rule: an active `team` or `community` group, or the operator's own
+  personal group. Another person's personal group and an operated agent's
+  are refused as `--source-group` even when the operator administers them,
+  so their claims never leave them through this verb, into the operator's own
+  group or into a team (`reown-workflows`' private move applies the same
+  rule). Neither group may be the world or seed group, and they must differ.
+- **Eligible**: a claim that is `('group', <source>)` and not sealed. A claim
+  already `('group', <target>)` counts as done, so a re-run resumes. A public
+  claim (`public-claim`) and another group's claim (`not-in-source`) are held,
+  and so is a sealed claim (`sealed`): one with a `claim_encryption` row, or
+  with a `claim_version_encryption` row on one of its versions (the version
+  row would follow the claim away from the group that keys it). The `HELD`
+  line names the table.
+- **Held whole, never partly moved**: a claim carrying a public row
+  (`public-row`), a row owned by a third group (`third-group`), sealed
+  evidence (`sealed-evidence`: an `evidence_encryption` row, whose ciphertext
+  is keyed to the group that sealed it), a sealed edge the move would
+  re-tuple (`sealed-edge`: an `edge_encryption` row; the line names the edge
+  and its key group), pinned evidence (`pinned`), or an edge whose new meet
+  would drop a group its current tuple requires (`edge-would-widen`). The
+  plan applies these checks too, so its eligible count is the number
+  `--confirm-count` repeats. Ciphertext is never re-keyed by a move, and it
+  never leaves the group it is keyed to, whether the target is a team or the
+  operator's personal group. Each batch repeats the checks under its locks,
+  with its claims, their evidence and their edges taken `FOR UPDATE` before
+  it reads the seal tables, so a seal that lands after the dry run holds too.
+- **Edges** take the EXACT meet of their endpoints: the INSERT rule applied
+  to what each endpoint is.
+  - An edge whose other end is a claim or evidence that stays in the source
+    becomes co-owned by both groups, so only a member of both reads it. Every
+    such edge is printed (`CO-OWNED-EDGE`) and counted. Edges with an evidence
+    endpoint get the same meet, which the tool writes itself because the
+    trigger does not re-meet them.
+  - An edge whose other end is a NODE with its own tenancy (the `NODE-TYPES`
+    line lists them; at head a workflow, frame, context, perspective,
+    community or reasoning trace) is met with the node's own tuple. The
+    trigger and `epigraph_node_tenancy` count such a node as public, so left
+    alone an `executes` edge from a source-private workflow would go to the
+    target alone: source-only members would lose it, and target-only members
+    would gain an edge naming a workflow they cannot read. The tool writes the
+    exact meet instead (co-owned by the node's group and the target) and
+    prints every edge to a group-private node that is not the target's
+    (`SOURCE-NODE-EDGE`, with the node, and a `source-node edges` count). An
+    edge to a public node, or to one in the target, goes to the target alone.
+    An edge to a moving claim's reasoning trace is also read through the
+    trace, so the batch that moves the trace re-meets it whichever batch
+    moves its other end, and an edge from a claim outside the run to a moving
+    trace takes the exact meet as well (co-owned, `CO-OWNED-EDGE`; a public
+    one holds the claim, `public-row`).
+    A later act that re-tenants the claim again (another regroup, a
+    restriction, the privatization pipeline's re-meet) puts such an edge back
+    on the trigger's meet.
+- **Locks**: each batch, dry runs included, holds `SHARE ROW EXCLUSIVE` on
+  `edges`, `harvester_fragments` and the derived tables with no key to claims
+  (`LOCKED-PER-BATCH`), so an edge or fragment inserted on a moving claim
+  while the batch runs either lands before the batch reads its rows or is
+  stamped after the move. Every write to those tables on the instance waits
+  for the batch; keep `--batch-size` small on a busy instance.
+- **Left as they are**: an outsider's challenge (it is the challenger's; it
+  is readable with its claim) and a fragment shared with a claim that stays.
+- **Invariants per batch**: the row census, every row's end state, and
+  readability measured as an unstamped session (unchanged) and as a session
+  reading only the source and only the target (each must match the tenancy
+  model before and after). A table without enforced row security is refused.
+- **Audit**: one `security_events` row per applied run
+  (`privatization.cli_regroup`) and per reversed manifest
+  (`privatization.cli_regroup_reverse`).
+- **Exit**: `--apply` exits 3 when any listed claim was held or the moved
+  count differs from `--confirm-count`.
+- **Reverse** is a compare-and-swap per claim. A claim something moved since,
+  a row written after the act, a neighbour that moved since, a claim, claim
+  version or evidence row sealed since, a sealed edge the reversal would
+  change (the run held every sealed edge it would have re-tupled, so such an
+  edge was sealed after it), or an edge whose recorded tuple would be wider
+  than the exact meet of its endpoints after the restore (an endpoint the
+  neighbour watch does not cover moved: another claim's evidence, a node)
+  holds the claim (exit 3). An
+  edge stays on the meet of its current endpoints until every endpoint the
+  manifest moved is back, then takes its recorded tuple. An edge to a
+  group-private node that is not in the source (one in the target or one of
+  a third group) was already wider than that node before the act, so its
+  reversal holds the claim rather than write the wider tuple back: such a
+  claim cannot be reversed by this tool. The dry run and the apply predict
+  this for every edge and print each one (`IRREVERSIBLE-EDGE`, naming the
+  claim, and an `irreversible edges` count with the number of claims).
+- **Authority for its first use** (the 17 legacy workflow claims an earlier
+  restriction put in the wrong team group): two operator rulings, both of
+  2026-11-11. "Do both along with the 25 mixed lineage move" decides the
+  move; "Build a regroup-claims verb" authorizes this tool to carry it out.
+  The apply's `--ruling` text cites both. Before applying, read the dry run's
+  `SOURCE-NODE-EDGE` lines: each is an edge from a group-private workflow (or
+  other node) to one of the claims, and it stays co-owned with that node's
+  group. Compare the count with the `executes` edges measured on production
+  from source-group workflow rows to the listed claims; any other line is a
+  reason to stop. Then read the `irreversible edges` count: every
+  `IRREVERSIBLE-EDGE` line names a claim the act could not undo (an edge from
+  a target-group or third-group workflow, or another node, to it). A count
+  above zero is a reason to stop unless the decision accepts those claims as
+  not reversible.
+
+### `epigraph-operator reown-workflows --from-visibility group` — move group-private lineages to another group (no migration)
+
+`reown-workflows` moves public lineages (`('public', <source>)`) into a team,
+or narrows them in place. With `--from-visibility group` it instead moves
+lineages that are ALREADY group-private, `('group', <source>)`, whole to
+`('group', <target>)`: every generation, the plan claims they execute (and
+their step lineages), every row those carry, and the plan edges. Nothing
+becomes public. It needs a SUPERUSER DSN, like `regroup-claims`. Module doc:
+`crates/epigraph-cli/src/operator/reown_workflows.rs` ("A private move").
+
+```bash
+# dry run: plan, held lineages, LEFT-CLAIM / SHARED-SPLIT / CO-OWNED-EDGE lines,
+# ELIGIBLE-WORKFLOW-ROWS
+epigraph-operator reown-workflows --canonical-names-file lineages.txt \
+    --from-group <source group> --target-group <target group> --operator <person> \
+    --from-visibility group --visibility group --manifest-out private-move-1.jsonl
+# apply: repeat ELIGIBLE-WORKFLOW-ROWS back
+epigraph-operator reown-workflows ... --manifest-out private-move-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>"
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
+```
+
+- **Who**: the source is `--from-group` or, without it, the operator's
+  personal group. The rows are private, so the source is held to the same
+  rule as the target: an active `team` or `community` group the operator is a
+  live admin of, or the OWN personal group of an operator who is a registered
+  human operator. Another person's personal group and an operated agent's are
+  refused as `--from-group` even when the operator administers them, and an
+  operated agent passed as `--operator` cannot move its own group's rows. The target must be another group that
+  passes the same rule (the one `regroup-claims` applies). `--visibility
+  group` is required and `--catch-up` is refused.
+- **Public input is refused**: a public generation holds its lineage
+  (`PublicInput`). An unshared public plan claim, or a public row a moving
+  claim carries, holds its lineage as a hand-off, and an `--apply` then exits
+  3: moving the rest would split the plan. Narrow such a plan in place first
+  (the public act, `--visibility group` with the target equal to the source).
+- **Left where it is, reported**: a plan claim shared with a lineage the list
+  omits (`LEFT-CLAIM ... SHARED`, and `SHARED-SPLIT` when that lineage is the
+  source's private one: list both in one run), or owned by another group.
+  An edge from a moved row to one that stays in its group becomes co-owned by
+  both groups, readable only by a member of both (`CO-OWNED-EDGE`).
+- **Held whole**: a private row a third group owns, an edge whose new tuple
+  would drop a group its current one requires, an edge to a group-private
+  frame, context, perspective, community or reasoning trace that does not move
+  (the edges trigger counts such a node as public, so the edge would go to the
+  target naming a node the target cannot read), and a SEALED row: a plan claim
+  with a `claim_encryption` row or a sealed version
+  (`claim_version_encryption`), evidence of one with an `evidence_encryption`
+  row, or a moving edge with an `edge_encryption` row. A move does not re-key
+  ciphertext, and ciphertext never leaves the group it is keyed to, so the
+  `HELD-LINEAGE` line reads `<claim|evidence|edge> <id> is sealed (<table>,
+  keyed to group <group>)` and an `--apply` exits 3. Each batch re-plans under
+  its locks, so a seal that lands after the dry run holds too.
+- **Invariants per batch**: the public act's (every row's end state, the row
+  census, the unstamped view, the atlas epoch), plus what a session reading
+  ONLY the source and one reading ONLY the target read among the batch's rows,
+  before and after, each against the tenancy model.
+- **Reverse**: as for the public act (all of a manifest or nothing; refused
+  when the plan changed or grew since, or when a moved claim, claim version,
+  evidence row or edge was sealed since: ciphertext keyed to the target never
+  goes back to the source).
+
+#### Moving a pinned (scheduled) pipeline
+
+A client that runs pinned workflows reads each generation's plan through
+`GET /api/v1/workflows/:id/plan` with its OWN reader principal's token. The
+read is viewer-scoped: it answers 404 when that principal can see none of the
+generation's `executes` edges, and `hidden_count` counts every plan claim it
+cannot read. After the move every row of the plan is owned by the target
+group, so that reader principal needs a live membership of the TARGET group;
+its membership of the source no longer reads anything of the plan. A client
+that also checks each plan item's owner group against the group its pin
+records refuses the plan from the moment the move commits until its pins
+record the target. A non-member principal the client uses to prove that
+outsiders see nothing must NOT be a member of the target.
+
+Operator ruling, 2026-11-12: the pinned procurement pipeline moves, private,
+from the team group that runs it to the consultancy team group. In the steps
+below `<source>` is the team group that holds the pipeline now and `<target>`
+is the consultancy team group. The operator must be a live admin of both, and
+both must be active `team` or `community` groups (see **Who** above).
+
+0. Build the lineage list from what the client has pinned, not from memory:
+   every pinned root and every child generation a root names. A root that
+   names its children only in its own content (no `executes` or `variant_of`
+   edge between them) does not join them in the plan, so a child missing
+   from the list stays in the source and the root's check refuses it at the
+   next fire. If the client binds ONE owner group per schedule owner, every
+   pinned lineage of that owner must be in this one act: re-pointing the
+   owner's group breaks any of its pins left behind. `--confirm-count` is
+   the dry run's `ELIGIBLE-WORKFLOW-ROWS` (generations, not lineages).
+1. Before the move, add the reader principal's agent to the target group
+   (`epigraph-operator group-member add --group <target> --agent <reader agent>
+   --role <role per operator ruling> --reason "<why>" --apply`). The role is
+   the operator's ruling, not this runbook's: the target group's membership
+   policy may admit new members as writers only, and an operated agent is a
+   member only where its operator writes. Check the non-member principal is not in the
+   target (`epigraph-operator group-roster --group <target>`). If the client
+   publishes new generations, its publishing agent needs a writer membership
+   of the target too.
+2. Dry run the move (`--from-group <source> --target-group <target>
+   --from-visibility group --visibility group`). Stop on any `HELD-LINEAGE`,
+   `LEFT-CLAIM` or `SHARED-SPLIT` line for the pipeline's lineages, and on a
+   sealed hold in particular (a `HELD-LINEAGE` line reading `... is sealed
+   (claim_encryption | claim_version_encryption | evidence_encryption |
+   edge_encryption, keyed to group <source>)`): a claim left in the source
+   keeps the source as its owner, so an owner-group check refuses the plan,
+   and the reader would still need the source; a sealed row's lineage cannot
+   move with this tool (it does not re-key ciphertext) and needs its own
+   ruling.
+3. Pause the client's pinned schedules for these lineages (or pick a window
+   with no fire), then apply with the dry run's count.
+4. Verify a plan fetch AS the reader principal for each pinned generation:
+   200, `hidden_count` 0, every item's `owner_group_id` the target and
+   `visibility` `group`. The same fetch as the non-member principal: 404.
+5. Change the pins' recorded owner group to the target in the client's
+   configuration, have the client verify the pins live, install them, and
+   resume the schedules.
+6. Undo: `reown-reverse` the manifest, then restore the pins' previous owner
+   group.
+
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's
 personal group. `hide-evidence` hides and pins selected evidence on the
@@ -2515,6 +2773,8 @@ that runs the WebAuthn ceremony is deployed with a relying party configured
    human opens it under the public base URL, on the device that holds the
    authenticator. `list-passkeys` shows the result. For a lost device:
    `revoke-passkey --id <passkey> --reason <text> --apply` (audited; final).
+   For a stolen or otherwise suspect device, add `--compromised` (migration
+   200; "Two revoke modes" in that section).
 
 The default attestation policy requires a verified attestation that chains
 to a CA in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE`, from an authenticator
@@ -2522,6 +2782,9 @@ model on the `EPIGRAPH_WEBAUTHN_AAGUIDS` allowlist.
 `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` accepts software
 authenticators. It is for tests and development only, and a request binary
 refuses to start with it on a database armed for operator binding.
+
+Two settings widen that policy; see "Android hardware keys and a synced
+second passkey (migration 200)" below.
 
 **Rollback.** First roll back every binary that calls a 124 function
 (`epigraph-operator`, any `epigraph-api` that serves the enrollment ceremony,
@@ -2531,6 +2794,518 @@ it drops, then drops both tables and every 124 function. The
 `platform.passkey_*` audit rows stay (history), and so does 124's
 `_sqlx_migrations` row. Re-introducing passkeys is a new migration, and every
 human then enrolls again.
+
+### Android hardware keys and a synced second passkey (migration 200) — settings, cost, operator steps, rollback
+
+**The rule, on an armed database.**
+- A person's first passkey is always hardware-attested.
+- A passkey anchors a later unattested passkey only if it is hardware-attested
+  AND still trusted under the configuration the API runs at that moment.
+- A synced passkey never anchors, directly or through any chain of acts.
+
+**Why.** `webauthn-rs` checks an authenticator model (AAGUID) only for
+`packed` and `tpm` attestation. An Android phone's hardware-backed key
+attests in the `android-key` format, which names no model, so it verifies
+only under a root trusted for every key it attests. The allowlist's roots
+admit only their listed models, so an Android key chaining to a configured
+Google root is refused there with "The attestation CA that was trusted
+limits the aaguids allowed, but this device does not have an aaguid".
+
+**`EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE`** holds those roots, kept apart
+from the allowlist. A registration is checked against the allowlist first,
+unchanged. Only when the allowlist refuses it is it checked against the
+Android roots alone. A registration that verifies that way is accepted only
+when all of these hold:
+- the format is `android-key`;
+- the credential is device-bound and the user is verified;
+- the attestation itself puts the key in hardware. The leaf certificate's
+  KeyDescription must give both `attestationSecurityLevel` and
+  `keyMintSecurityLevel` as TrustedEnvironment (1) or StrongBox (2). The
+  key's `purpose` (SIGN) and `origin` (GENERATED) must be in the
+  hardware-enforced list.
+  - The library accepts security level 0 (Software), so this check is the
+    API's.
+  - Google also publishes a software attestation root. Its statements say
+    Software, and they are refused.
+  - The pinned library refuses StrongBox (level 2) outright, so a
+    StrongBox-only key cannot register until the library parses it.
+- only the leaf carries a KeyDescription. A chain with a second one, which
+  would be an attacker's certificate extending a genuine chain, is refused;
+- no certificate of the chain, the root included, is on the attestation
+  status list (next item).
+
+The passkey is recorded with format `android-key` and the nil AAGUID. A
+`packed` certificate chaining to a Google root is refused.
+
+**`EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`** is REQUIRED with the Android
+roots. It is a local copy of Google's attestation status list:
+- the URL is <https://android.googleapis.com/attestation/status>;
+- the format is `{"entries": {"<serial>": {"status":
+  "REVOKED"|"SUSPENDED", ...}}}`. Google's schema says the key is the serial
+  in lowercase hex, but the published list keys its 64-bit serials in
+  DECIMAL and its 128-bit ones in hex (measured 2026-11-06: 981 of 1,771
+  keys were 17-20 decimal digits). The API therefore looks each certificate
+  up in both forms.
+
+Google lists the serial numbers of attestation certificates it has revoked or
+suspended, for example leaked device keys. The library loads no CRL and no
+status list, so the API reads this file itself. It never fetches it, and no
+request reaches the network.
+
+The policy:
+- **At boot.** The roots without the file, or a file that is unreadable or
+  is not a status list, are a boot error (exit 1). The file alone, without
+  the roots, is also a boot error. A file that is valid but stale never
+  blocks boot; it refuses Android enrollments and anchors only.
+- **At every use.** The file is re-read at every Android enrollment and at
+  every use of an Android passkey as an anchor. A refreshed file takes
+  effect without a restart.
+- **Any listed serial refuses.** A certificate of the chain listed with any
+  status (`REVOKED` or `SUSPENDED`) refuses the enrollment or the anchor.
+- **Older than 48 hours refuses (fail closed).** The age is the file's
+  modification time. A file older than that refuses, until it is refreshed:
+  - every Android enrollment, on BOTH ceremonies. The anchored ceremony
+    refuses an Android key whose chain, hardware rules and device binding
+    pass but whose standing cannot be checked; it does NOT record it `none`.
+    The refusal names the list and says to refresh it, and the API logs it
+    at WARN (`passkey.anchor`, "its attestation status list cannot be
+    checked");
+  - every Android anchor;
+  - every OTHER anchor whose lineage holds an Android passkey, a security key
+    included, even when that Android passkey is revoked (a person whose first
+    passkey was a phone, for example). The API logs those as
+    `refusal=lineage_not_attested`, and their enrollments fall back to the
+    attested ceremony, which refuses a synced passkey at the finish.
+
+  A missing or unreadable file, and one dated more than 5 minutes in the
+  future, are refused the same way. Android passkeys still ASSERT (elevate)
+  while the file is stale.
+
+Fetching and refreshing the file is an operator job outside the API. A job
+that fails leaves the old file in place, and nothing in the API refuses until
+the file is 48 hours old. Without an alert, the first sign would be a refused
+enrollment. Install BOTH of the following, because each catches what the other
+cannot: a failing run alerts at once, and a job that stopped running (a
+disabled timer never fails) is caught by its age.
+
+**1. The refresh job.** It exits non-zero and prints one line on any failure:
+a failed fetch, a download that fails the API's parse rule (for example one
+non-hex key upstream), or a failed replace. Paths are placeholders:
+
+```bash
+#!/usr/bin/env bash
+# refresh-android-attestation-status: replace the API's copy of Google's
+# attestation status list. Exit 0 only when the file was replaced.
+set -euo pipefail
+STATUS=/path/readable/by/the/api/android-attestation-status.json
+URL=https://android.googleapis.com/attestation/status
+TMP="$STATUS.tmp"
+fail() { echo "ANDROID-STATUS REFRESH FAILED: $*" >&2; rm -f "$TMP"; exit 1; }
+curl -fsS --max-time 30 -o "$TMP" "$URL" \
+  || fail "the fetch of $URL failed (curl exit $?); the old file is kept"
+jq -e '(.entries | type == "object")
+       and (.entries | to_entries
+            | all((.key | test("^[0-9a-fA-F]+$")) and (.value.status | type == "string")))' \
+   "$TMP" >/dev/null \
+  || fail "the download does not pass the API's parse rule; the old file is kept"
+mv -f "$TMP" "$STATUS" || fail "could not replace $STATUS"
+echo "android attestation status list refreshed: $(jq '.entries | length' "$STATUS") entries"
+```
+
+Run it from a systemd timer at least daily (every 6 hours leaves room for a
+failed run before the 24-hour warning), as a user that can write the file's
+directory, with an alert on failure:
+
+```ini
+# android-status-refresh.service
+[Unit]
+Description=Refresh the Android attestation status list
+OnFailure=android-status-alert@%n.service
+
+[Service]
+Type=oneshot
+User=<a user that can write the file's directory>
+ExecStart=/usr/local/bin/refresh-android-attestation-status
+
+# android-status-refresh.timer
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`android-status-alert@.service` is your alert: a oneshot whose `ExecStart`
+sends the failing unit's name (`%i`) and its last journal lines through a mail
+or chat path whose delivery you have verified end to end. An alert nobody
+receives is no alert.
+
+**2. The age check.** It exits 1 and prints one line unless the file exists,
+is readable, is at most 24 hours old, is not dated in the future, and passes
+the API's parse rule:
+
+```bash
+#!/usr/bin/env bash
+# check-android-attestation-status: exit 1 with one line unless the API's copy
+# of the attestation status list is present, fresh (<= 24h) and well-formed.
+set -uo pipefail
+STATUS=/path/readable/by/the/api/android-attestation-status.json
+MAX_AGE_H=24
+bad() { echo "ANDROID-STATUS CHECK FAILED: $*"; exit 1; }
+[ -r "$STATUS" ] || bad "$STATUS is missing or unreadable; every Android enrollment and anchor is refused"
+age_s=$(( $(date +%s) - $(stat -c %Y "$STATUS") ))
+[ "$age_s" -ge -300 ] || bad "$STATUS is dated in the future; the API refuses it"
+[ "$age_s" -le $(( MAX_AGE_H * 3600 )) ] \
+  || bad "$STATUS is $(( age_s / 3600 ))h old (over ${MAX_AGE_H}h; refused at 48h): the refresh job has stopped or is failing"
+jq -e '(.entries | type == "object")
+       and (.entries | to_entries
+            | all((.key | test("^[0-9a-fA-F]+$")) and (.value.status | type == "string")))' \
+   "$STATUS" >/dev/null 2>&1 \
+  || bad "$STATUS does not pass the API's parse rule; the API exits 1 at its next restart"
+echo "android attestation status list OK: $(( age_s / 3600 ))h old, $(jq '.entries | length' "$STATUS") entries"
+```
+
+Run it hourly from your monitoring (or from its own timer with the same
+`OnFailure=` alert), and alert on a non-zero exit.
+
+**What the API logs.** These thresholds are constants, not settings.
+- **At boot**, after `passkey relying party configured`: the line `Android
+  attestation status list` with `path=`, `age_hours=` and `entries=` (INFO).
+  Past 24 hours the same facts are a WARN ("older than 24h: its refresh job
+  has missed a run"). A file that cannot be read is a WARN too. None of these
+  blocks boot.
+- **At every use** (an Android enrollment, an Android anchor, an Android
+  passkey on a lineage) past 24 hours: a WARN (target
+  `passkey.android_status`, `age_hours=`). The file is still used.
+- **Past 48 hours:** refused, as above.
+
+The `jq` check in both scripts is the API's own parse rule (an `entries`
+object, every key hex digits, every entry a string `status`). A download that
+fails it never replaces the good file. The API exits 1 at boot on a file that
+does not parse, so a bad file left in place would take the whole API down at
+the next restart. The `mv` replaces the file atomically, so a partial download
+is never read.
+Never use `curl -R`, `cp -a` or `rsync -t` for this step. Each keeps an older
+modification time, and a file that looks stale refuses every Android anchor
+even though its content is new.
+
+**`EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`** (default off) lets a
+person add a passkey that carries no attestation, such as a password
+manager's synced passkey. It is anchored by a passkey they already hold:
+- **The first passkey is always attested.** A person's first passkey comes
+  from a maintenance enrollment, which has no act, so it always runs the
+  attested ceremony. The setting therefore never lets a maintenance-DSN
+  holder plant a first key, and it is served on an armed database. The
+  software flag stays refused there.
+- **A later passkey may be unattested.** It comes from a confirmed
+  `passkey.register` act. Its enrollment takes the anchored path when the
+  passkey that confirmed the act (the anchor) passes all of these checks:
+  - it is the same person's;
+  - it is live;
+  - it is HARDWARE-ATTESTED UNDER THE CONFIGURATION THE API RUNS NOW. The
+    API re-verifies the certificate chain stored with the anchor's
+    credential against today's roots, never the columns its registration
+    wrote:
+    - `packed`/`tpm`: an allowlist root that still admits its model;
+    - `android-key`: an Android root, plus the TEE/StrongBox rule and the
+      status list above.
+
+    The row's recorded format, AAGUID and backup-eligible flag must also
+    agree with that credential. The anchor's certificate validity periods are
+    checked NOW, as at registration, so an anchor whose chain has expired
+    anchors nothing.
+  - every passkey on its LINEAGE passes the same check, with one
+    difference: its certificates' VALIDITY PERIODS are checked at the moment
+    it confirmed the act its successor was enrolled on, not now. The lineage
+    is the passkey that confirmed the act the anchor was itself enrolled on,
+    then that passkey's own confirmer, and so on, back to the person's first,
+    maintenance-enrolled passkey. A lineage that does not reach the first
+    passkey within 32 steps anchors nothing.
+    - **As of now** for every ancestor: the roots and the allowlist
+      configured today, the Android hardware rules, and today's status list
+      (which must be fresh). A certificate revoked on the status list breaks
+      the lineage, whenever it was listed.
+    - **As of its confirmation** for every ancestor: each certificate of its
+      stored chain, and the root, must have been valid then. The time is the
+      act's `asserted_at`, which the database sets at the assertion. An
+      ancestor whose chain expired AFTER it confirmed still counts, so a
+      first passkey's expiry does not stop the person's later hardware keys
+      anchoring.
+    - **A revoked passkey** on the lineage is still checked, and being
+      revoked (`revoke-passkey`) does not disqualify it: it authorized its
+      successor while it was live. So a backup key enrolled on an act a lost
+      phone confirmed still anchors after the phone is revoked.
+    - **The consequence of expiry.** A passkey whose chain has expired can
+      still elevate and confirm acts. It no longer anchors. A passkey
+      enrolled on an act it confirmed after the expiry never anchors either:
+      its lineage holds a chain that was not valid at that confirmation. To
+      recover, confirm the next `passkey.register` act with a passkey whose
+      chain is still valid. If none is left, revoke every passkey of the
+      person and enroll a first passkey again (`passkey-enroll` without
+      `--act`, which 130 allows only once the person has no live passkey).
+      How long real Android chains stay valid was not measured. Remotely
+      provisioned intermediates may be short-lived; the API log names the
+      certificate and its window (`reason=... was not valid at ...`).
+- **The confirmation is re-verified.** The API re-verifies the act's
+  recorded confirmation before taking the anchored path: the act's own
+  challenge, the anchor's stored public key and the credential. The
+  database cannot verify a signature, so a confirmation written with
+  fabricated evidence anchors nothing.
+- **Which path a ceremony takes.** The decision is made from the database
+  rows at both the challenge and the finish, never from the stored ceremony
+  state. Otherwise the act's enrollment is attested, exactly as with the
+  setting off. The API log says why an anchor was refused (`refusal=` and
+  `reason=`).
+- **What the anchored ceremony records.** It ASKS for attestation
+  (`direct`; a browser would otherwise strip a hardware key's statement) but
+  needs none, and records the passkey one of two ways, or refuses it:
+  - **`none`** for a synced passkey, or for any key whose attestation is not
+    trusted under the configuration the API runs now: self attestation, a
+    model not on the allowlist, a root that is not configured, or an Android
+    key that fails the Android rules (a software-level key, `purpose` or
+    `origin` only software-enforced, a KeyDescription outside the leaf, a
+    backup-eligible credential) or has a certificate on a CURRENT status
+    list. Such an attestation is dropped, as a browser drops it when asked
+    for none, and logged at INFO. The passkey holds only through its anchor:
+    it never anchors a further one, and it is revoked with its anchor.
+  - **Attested** for a hardware key whose attestation IS trusted now (an
+    allowlisted model, or an Android key under the Android roots, rules and
+    status list). It is recorded exactly as the attested ceremony would
+    record it (its format and model), stands on its own, may anchor in turn,
+    and is NOT revoked with its anchor.
+  - **Refused** for an Android key whose chain is trusted but whose standing
+    cannot be checked, because the status list is older than 48 hours,
+    missing, unreadable or malformed. It is not recorded `none` (that would
+    hide the outage and give a backup that dies with its anchor). Refresh the
+    list, then retry the enrollment link within its 15 minutes; after that,
+    propose and confirm a new `passkey.register` act.
+
+  So a backup hardware key for a lost phone can be enrolled with the setting
+  on. Check `list-passkeys` afterwards: it must show the backup's format
+  (`packed`, `tpm` or `android-key`), not `none`. A backup recorded `none`
+  (its user declined the browser's prompt to share the key's make and model,
+  or its model is not allowlisted) is revoked with the phone; enroll it again
+  and allow the prompt, or enroll it with the setting off, which refuses an
+  untrusted key outright.
+  - A statement the WebAuthn library cannot verify at all is refused before
+    this choice is made, as on the attested path: a StrongBox-level Android
+    key, an unsupported format, and the one-in-64 Android key with a leading
+    zero byte in a coordinate (retry). Before this change the browser
+    stripped those to `none`.
+  - The anchored ceremony does not ask the authenticator to enforce the
+    credential protection policy as the attested one does. User verification
+    is still required at registration and at every assertion.
+- **The response says which act anchored it.** The enrollment finish
+  answers `anchored_by` with that act's id for a passkey recorded `none` on
+  the anchored path. It is `null` on the attested path and for a passkey the
+  anchored path recorded attested.
+- **No completion on a revoked anchor.** Migration 200's insert guard records
+  a passkey enrolled on an act only while the passkey that confirmed the act
+  is live. It reads that passkey under a share lock, so a revoke and a
+  completion that race are serialised. This applies to every act enrollment,
+  attested ones included.
+- **Revoking an anchor revokes what it anchored.** `revoke-passkey` on a
+  passkey also revokes, in the same transaction, every live `none` passkey
+  enrolled on an act it confirmed. On an armed database those are exactly
+  the passkeys it anchored. They are stamped with the same login and the
+  reason `anchor <id> revoked: <reason>`. An attested passkey enrolled on
+  such an act stays live: it stands on its own attestation. That includes a
+  backup hardware key the anchored ceremony recorded attested, and excludes
+  one it recorded `none` (see above). This is the default, LOST-device mode.
+- **Two revoke modes: lost or compromised.** Every `platform.passkey_revoked`
+  audit row records which one revoked it, as `mode` (`lost` or
+  `compromised`).
+  - **Lost** (the default: `revoke-passkey --id <passkey> --reason <text>
+    --apply`). Use it when the device is gone but nobody else can use it: it
+    was lost, broken, or wiped. It revokes the passkey and the `none`
+    passkeys it anchored, as above. Attested keys enrolled on acts it
+    confirmed stay live, so the person keeps working with them.
+    *Example:* a phone falls into a lake. Revoke it as lost. The person's
+    backup security key, enrolled on an act the phone confirmed, keeps
+    elevating, and confirms the `passkey.register` act for the next phone.
+  - **Compromised** (`revoke-passkey --id <passkey> --reason <text>
+    --compromised --apply`). Use it when someone else may have used the
+    device or its passkey: stolen, unlocked out of the person's sight, or
+    otherwise suspect. Whoever held it could have confirmed the
+    `passkey.register` acts that enrolled further keys. It revokes the
+    passkey and every passkey whose anchor lineage passes through it: each
+    passkey enrolled on an act it confirmed, each enrolled on an act one of
+    those confirmed, and so on, attested ones included. It never touches
+    another person's passkeys. Every elevation any of them confirmed ends
+    (`passkey_revoked`), and every unexecuted act they confirmed is voided,
+    as for any revoke. It first locks the person's passkeys, so an
+    enrollment completing at that moment on one of their acts is waited
+    for and then revoked with the rest, and one that starts later is
+    refused. It prints one line per passkey reached (`depth=` 0 for the
+    passkey named) and, without `--apply`, rolls everything back.
+    It also works on a passkey already revoked: revoked passkeys are walked
+    through, not revoked again, and anything still live below them is
+    revoked. Afterwards the person enrolls a replacement on a
+    `passkey.register` act confirmed with a passkey still live (one not
+    enrolled through the compromised one), or, if none is left, through
+    `passkey-enroll` without `--act` (the bootstrap).
+    *Example:* a phone is stolen while unlocked. Revoke it as compromised.
+    The backup security key enrolled on the phone's act is revoked too,
+    because the thief could have enrolled it, and so is any key enrolled
+    through that one. If the phone was first revoked as lost and only
+    later found to be stolen, run the compromised revoke on it then: it
+    sweeps what the lost revoke left.
+
+**What remains, exactly.**
+- **The anchor confirms an act, not a credential.** The anchor's
+  confirmation commits to "register a passkey for this person, with this
+  label and reason". It does not commit to WHICH credential. Whoever first
+  opens the 15-minute `/elevate/enroll/<id>` link registers their own key.
+  That can be the maintenance-DSN holder who opened the enrollment, or anyone
+  the link reaches. On the attested path they would need an allowlisted or
+  Android hardware key. On the anchored path they need no hardware at all.
+  The remaining guarantee:
+  - an anchored passkey is registered only for the act's person;
+  - only on an act that person confirmed with a live hardware-attested
+    passkey;
+  - only within 15 minutes of the enrollment's opening;
+  - only once per act.
+
+  Hand the link only to the person, on the device that will hold the
+  passkey. Check `list-passkeys` after each anchored enrollment.
+- **Chains of acts.** A synced passkey can still confirm a `passkey.register`
+  act. That act's enrollment runs the ATTESTED ceremony, so only a genuine
+  hardware key registers on it. That hardware key never anchors, because
+  its lineage holds the synced passkey. So the password-manager account
+  cannot mint an anchor, through any number of acts.
+- **Not re-checked at use, for `packed`/`tpm`:** that the anchor's stored
+  certificate chain was the one that attested its stored key. That
+  certificate is the authenticator model's, and the attestation signature
+  that bound it to the key is not stored. The API's ceremony verified it when
+  it wrote the row, but the row has other writers:
+  - the maintenance DSN;
+  - a holder of the REQUEST DSN with a live enrollment id. They can call
+    124's `epigraph_complete_passkey_enrollment` directly, with a key, a
+    stored credential and the format, AAGUID and backup-eligible columns of
+    their choosing.
+
+  Such a holder can already plant any key on that enrollment, and it elevates
+  as the person (the enrollment-link threat above). What a planted `packed`
+  or `tpm` row adds, when it pairs a genuine, public model certificate chain
+  with the planter's own key:
+  - it passes the anchor check, so it anchors later passkeys (on acts it
+    confirms, each opened by the operator's `passkey-enroll --act`);
+  - it counts as hardware on a lineage (its genuine chain also passes the
+    validity window);
+  - recorded as non-`none`, it is NOT revoked with its anchor. The cascade
+    deliberately spares attested rows, including a backup hardware key.
+
+  An `android-key` row cannot be planted this way: its leaf certificate must
+  certify the credential's key, which must then assert, and the API checks
+  both at every use. Re-deriving the columns in the database would not close
+  it, because the stored credential is as freely chosen as the columns, and
+  the API already demands that they agree. Storing the attestation statement
+  and re-verifying its signature at use would close it; that is not done.
+  Hand enrollment links only to their person, and check `list-passkeys`.
+
+**The accepted cost.** Once a synced passkey is registered, an elevation (and
+every admin-act confirmation) is only as strong as the password-manager
+account that holds it: whoever controls that account can elevate as the
+person. Revoking the synced passkey (`epigraph-operator revoke-passkey`)
+ends that, and ends any elevation it confirmed. So does revoking its anchor,
+which revokes it.
+
+**Operator steps.**
+
+1. **Migrate 200** (`epigraph-migrate`, migration DSN). It adds the
+   enrollment page's reader of an act enrollment's anchor and its lineage,
+   the act-confirmer insert guard, the anchored-revoke cascade and the
+   compromised revoke. It re-states ONE earlier body: 124's passkey audit
+   trigger function, whose revoke rows gain `mode`. Then deploy
+   `epigraph-tenancy-backfill` and `epigraph-operator` from the same commit;
+   `verify` checks the four functions' owner, the reader's grant to
+   `epigraph_app` and that `epigraph_app` cannot call the compromised
+   revoke. The guard and the cascade apply whatever the settings say.
+2. **The status list.** Install the refresh job and its timer with the
+   `OnFailure=` alert, and the age check under your monitoring (both above).
+   Run the job once, then run the age check: it must print `android
+   attestation status list OK`. Trigger the alert once (for example, run the
+   alert unit by hand) and confirm it arrives. Set
+   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` to the file.
+3. **The Android roots.** Write Google's hardware attestation root
+   certificates to a PEM file the API unit can read (one or more
+   `-----BEGIN CERTIFICATE-----` blocks). Google publishes them in the
+   Android key attestation documentation, and as a JSON array at
+   <https://android.googleapis.com/attestation/root>. Do NOT include Google's
+   software attestation root. Set `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` to
+   that file.
+   **The CA-file overlap hazard.** An earlier configuration may have
+   allowlisted Android: a Google root in
+   `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` with an Android AAGUID in
+   `EPIGRAPH_WEBAUTHN_AAGUIDS`. Remove that root and that AAGUID IN THE SAME
+   CHANGE: a root in both files stops the server at boot (exit 1). Keep the
+   allowlist for security keys, or unset BOTH of its variables when no
+   security-key model remains, to accept Android keys only.
+4. **The anchored setting** (only if a synced second passkey is wanted): set
+   `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY=1`.
+5. **Restart the API.** The boot line `passkey relying party configured`
+   shows `software_attestation=false` and `synced_anchored=true|false`, and
+   the next line, `Android attestation status list`, shows the file's
+   `age_hours=` and `entries=` (a WARN past 24 hours). A configuration error
+   exits 1 with the variable named.
+6. **First passkey**, on the phone: `epigraph-operator passkey-enroll
+   --person <agent> --reason <text> [--label <device>] --apply`, then open
+   the printed `/elevate/enroll/<id>` path on the phone. `list-passkeys`
+   shows it as `android-key`.
+   - A first passkey must be device-bound. A synced passkey offered by the
+     phone (its password manager's) is refused with "not truly bound to
+     hardware" or "this one is backup-eligible", whatever either setting
+     says. Choose the device's own key.
+   - A phone whose attestation is software-level is refused with "not
+     attested as hardware-backed". So is one with a certificate on the
+     status list ("is REVOKED" / "is SUSPENDED"). A stale status file
+     refuses with "older than the 48h maximum", a missing one with "cannot
+     be read"; both add "refused until the operator refreshes it". The same
+     holds for an Android backup on the anchored ceremony.
+   - About one Android key in 64 is refused by the WebAuthn library with
+     "The COSEKey contains invalid ECDSA X/Y coordinate data" (a coordinate
+     with a leading zero byte). A retry creates a new key and passes.
+7. **Second (synced) passkey.**
+   1. Elevate with the phone.
+   2. Propose `passkey.register` with
+      `{"person": <agent>, "label": <name>, "reason": <text>}`
+      (`POST /api/v1/admin/acts`).
+   3. Confirm it at `/elevate/act/<id>` WITH THE PHONE (a confirmation by a
+      synced passkey anchors nothing).
+   4. Run `epigraph-operator passkey-enroll --person <agent> --reason
+      <same text> --label <same name> --act <id> --apply`.
+   5. Open the printed path, yourself, in the browser where the password
+      manager runs.
+   The finish answers `anchored_by`. If the enrollment ran the attested
+   ceremony instead, the API log says why (`refusal=`, `reason=`).
+
+**Rollback.**
+- **The anchored setting.** Unset `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`
+  and restart; later passkeys are attested again. A synced passkey registered
+  meanwhile stays live until `revoke-passkey` on it or on its anchor.
+- **The Android roots.** Unsetting `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE`
+  (and with it `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`) stops new Android
+  enrollments. It also stops, at once, because anchors and their lineages are
+  re-verified against the current roots:
+  - every Android passkey ANCHORING;
+  - every other anchor whose LINEAGE holds an Android passkey, revoked or
+    not: for example a security key enrolled on an act a phone confirmed, or
+    any later key of a person whose first passkey was a phone. The API logs
+    them as `refusal=lineage_not_attested`, and their enrollments run the
+    attested ceremony instead.
+
+  Registered Android passkeys keep asserting. The same holds for an AAGUID
+  removed from the allowlist or a root replaced: every anchor whose own chain
+  or lineage depends on it stops anchoring. Synced passkeys already anchored
+  stay live; revoke them, or their anchors, to remove them.
+- **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
+  only after no unit runs with the anchored setting on and `epigraph-operator`
+  is rolled back to a build without `--compromised`. It drops the reader, the
+  insert guard, the cascade and the compromised revoke, and restores 124's
+  audit body (later revoke rows carry no `mode`). After the undo, revoking
+  an anchor no longer revokes what it anchored.
 
 ### Elevation tickets and sessions (migration 125) — deploy order and rollback
 
@@ -3074,7 +3849,8 @@ minutes), other arguments, or another actor. A dry run spends nothing.
 
 **The break-glass.** `epigraph-operator revoke-passkey` (audited) of a lost
 or suspect passkey lifts the requirement for its holder, and voids every
-unexecuted act it confirmed. Proposing an act needs a LIVE elevation, and no
+unexecuted act it confirmed. For a suspect passkey use `--compromised`
+(migration 200), which also revokes every passkey enrolled through it. Proposing an act needs a LIVE elevation, and no
 elevation is live until migration 132 opens the recorder gate. The act API
 that proposes and confirms is migration 131. Until both are deployed, a
 custodian who holds a passkey makes these writes only after revoking it.
@@ -3301,7 +4077,8 @@ maintenance-CLI acts. The rollback is `disarm-admin-scopes --reason TEXT
 --apply`, with no DDL.
 
 **Undo order.** Disarm first (if armed). Roll back the binaries, newest
-first. Then run the undo scripts in reverse: `132-undo.sql`, `131-undo.sql`,
+first. Then run the undo scripts in reverse: `200-undo.sql` (if 200 is
+applied; its reader and triggers read 124's and 130's tables), `132-undo.sql`, `131-undo.sql`,
 `130-undo.sql`, `129-undo.sql` (after `169-undo.sql`, if 169 is applied),
 `128-undo.sql`, `127-undo.sql` (which archives the log into
 `security_events` first), `126-undo.sql`, `125-undo.sql`, `124-undo.sql`.

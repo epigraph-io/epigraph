@@ -97,6 +97,12 @@ const CALLS: &[&str] = &[
     "EdgeRepository::create_if_not_exists_signed_conn(",
     "EdgeRepository::create_if_absent_including_retracted_signed_conn(",
     "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(",
+    // The document ingest's `paper -ingested_claim-> claim` record: a signed
+    // twin taking the walk's key, so each walk's call is checked per site.
+    "ClaimIngestRepository::record_signed_conn(",
+    // The document ingest's marked writer's primitive: one row of a fact per
+    // ingest principal (`ingest_written.rs`).
+    "EdgeRepository::create_if_absent_for_ingest_principal_signed_conn(",
 ];
 
 /// The after-the-fact signing call: one way a [`Signed`] writer attests.
@@ -258,7 +264,11 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // 47: this branch's 46 plus main's supersede-act AUTHORED edge (R-23), one
 // more unsigned REPO_INTERNAL site (#704's merge of main raised its own
 // count 103 -> 104 for the same site).
-const UNSIGNED_SITES_HIGH_WATER: usize = 47;
+// 48: the document ingest record's insert primitive
+// (`ClaimIngestRepository::record_signed_conn`), registered PRIMITIVE like the
+// `EdgeRepository` twins: unsigned only when a caller passes no key, and both
+// of its callers pass the walk's key.
+const UNSIGNED_SITES_HIGH_WATER: usize = 49;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -323,7 +333,7 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-api/src/routes/claims.rs",
         "create_claim_core",
-        3,
+        2,
         Signed,
     ),
     site(
@@ -434,6 +444,16 @@ const REGISTER: &[Site] = &[
         5,
         Signed,
     ),
+    // The legacy ingest-marker backfill's creation records: written on the
+    // maintenance DSN on behalf of a past ingest whose key this operator
+    // does not hold, so unsigned (the reader trusts the guarded marker, not
+    // a signature).
+    site(
+        "crates/epigraph-cli/src/operator/backfill_markers.rs",
+        "batch_records",
+        1,
+        Unsigned(NO_KEY_CLI),
+    ),
     site(
         "crates/epigraph-cli/src/decompose.rs",
         "persist_decomposition",
@@ -475,6 +495,14 @@ const REGISTER: &[Site] = &[
         "create_edge",
         1,
         Unsigned(NO_KEY_CLI),
+    ),
+    // The ingest record's insert primitive: the key is the caller's (both
+    // document walks pass theirs, checked per site above).
+    site(
+        "crates/epigraph-db/src/repos/claim_ingest.rs",
+        "record_signed_conn",
+        1,
+        Unsigned(PRIMITIVE),
     ),
     site(
         "crates/epigraph-db/src/repos/analysis.rs",
@@ -575,6 +603,16 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // The document ingest's writer of the edges a provenance read trusts
+    // (`authored`, paper and agent `asserts`): the walks call it with their
+    // `edge_signing_key()`, so their counts above are the edges they write
+    // directly.
+    site(
+        "crates/epigraph-db/src/repos/ingest_written.rs",
+        "create_ingest_written_edge_if_absent_conn",
+        1,
+        Signed,
+    ),
     // Was `promote_if_pending`; the body moved into its connection form in the
     // raw-pool residual review (the pool form now acquires and delegates), so
     // the MCP promote can write the matcher edge on its author-stamped
@@ -633,16 +671,20 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // 4 each: the walk's two unmarked edge writes (an unmapped plan edge and
+    // the processed_by stamp), plus the ingest record after the paper's
+    // asserts edge on the created and on the converged branch. The marked
+    // edges go through `create_ingest_written_edge_if_absent_conn`.
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document",
-        5,
+        "do_ingest_document_reporting",
+        4,
         Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document_spine",
-        5,
+        4,
         Signed,
     ),
     site(

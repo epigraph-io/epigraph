@@ -1629,6 +1629,17 @@ async fn the_trigger_and_the_reown_carry_the_writer_rule_and_the_one_scope(pool:
             "the legacy re-own lost `{needle}`:\n{reown}"
         );
     }
+    // Migration 206's publicize re-meets the edges incident to the claims it
+    // publishes with the same rule as the revert below (both-public edges go to
+    // the recorded writer's group), so it reads the one scope too.
+    let publicize = prosrc(&pool, "epigraph_publicize_claims").await;
+    assert_eq!(
+        publicize
+            .matches("public.epigraph_edge_writer_scope(e.source_type, e.target_type)")
+            .count(),
+        2,
+        "publicize must read the scope in both its before-meet and its recompute:\n{publicize}"
+    );
     // Exactly these catalog bodies reference the scope (the revert is Rust).
     let referencing: Vec<String> = sqlx::query_scalar(
         "SELECT proname::text FROM pg_proc \
@@ -1642,6 +1653,7 @@ async fn the_trigger_and_the_reown_carry_the_writer_rule_and_the_one_scope(pool:
         referencing,
         vec![
             "epigraph_edges_tenancy".to_string(),
+            "epigraph_publicize_claims".to_string(),
             "epigraph_reown_legacy_edges_to_signer".to_string()
         ]
     );

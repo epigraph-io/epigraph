@@ -384,10 +384,41 @@ impl McpEmbedder {
         self.search_scoped(viewer, query, limit, None, None).await
     }
 
+    /// The connection a search runs on, taken AFTER the embedding round trip:
+    /// a read stamped with `viewer` on the declared [`StorePath::AuthorStamped`]
+    /// pool (the server's own `ScopedPool`), so row security agrees with the
+    /// search's in-query predicate and a member finds its own group-private
+    /// claims. On an unstamped application session that policy admits public
+    /// rows only. A [`StorePath::PrivilegedPool`] embedder reads its own pool,
+    /// which bypasses row security by declaration. An undeclared embedder
+    /// REFUSES, as its stores do, rather than reading unstamped.
+    async fn search_conn(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<SearchConn<'_>, String> {
+        match &self.store_path {
+            StorePath::AuthorStamped(scoped) => scoped
+                .read_as(viewer)
+                .await
+                .map(SearchConn::Stamped)
+                .map_err(|e| format!("search: could not acquire a viewer-stamped connection: {e}")),
+            StorePath::PrivilegedPool(_) => self
+                .pool
+                .acquire()
+                .await
+                .map(SearchConn::Privileged)
+                .map_err(|e| format!("search: could not acquire a connection: {e}")),
+            StorePath::Undeclared => Err("search refused: this embedder was built without a \
+                 ScopedPool (McpEmbedder::with_scoped_pool), so the search cannot be stamped \
+                 with the caller's tenancy context and would see public rows only"
+                .to_string()),
+        }
+    }
+
     /// Embedding search over current claims with optional scope pushed into
     /// the query (see `ClaimRepository::search_by_embedding_scoped`): `tags`
     /// requires label containment, `agent_id` requires authorship, `None` does
-    /// not restrict.
+    /// not restrict. Reads as `viewer` (see `search_conn`).
     pub async fn search_scoped(
         &self,
         viewer: &epigraph_db::visibility::Viewer,
@@ -399,8 +430,9 @@ impl McpEmbedder {
         let embedding = self.generate(query).await?;
 
         let pgvec = format_pgvector(&embedding);
+        let mut conn = self.search_conn(viewer).await?;
         let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
-            &self.pool, viewer, &pgvec, limit, tags, agent_id,
+            &mut *conn, viewer, &pgvec, limit, tags, agent_id,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -414,6 +446,7 @@ impl McpEmbedder {
     /// Hybrid retrieval: embed the query (1536d), then RRF-fuse the dense and
     /// lexical legs via [`ClaimRepository::search_hybrid_scoped`]. Returns the
     /// fused hits; the caller (`recall`) degrades to lexical-only on `Err`.
+    /// Reads as `viewer` (see `search_conn`).
     pub async fn search_hybrid_scoped(
         &self,
         viewer: &epigraph_db::visibility::Viewer,
@@ -424,19 +457,48 @@ impl McpEmbedder {
     ) -> Result<Vec<epigraph_db::HybridHit>, String> {
         let embedding = self.generate(query).await?;
         let pgvec = format_pgvector(&embedding);
-        epigraph_db::ClaimRepository::search_hybrid_scoped(
-            &self.pool,
+        let mut conn = self.search_conn(viewer).await?;
+        epigraph_db::ClaimRepository::search_hybrid_scoped_since_in_theme_conn(
+            &mut conn,
             viewer,
             &pgvec,
             query,
             HYBRID_CANDIDATE_POOL,
             HYBRID_RRF_K,
             limit,
+            0,
             tags,
             agent_id,
+            None,
+            None,
         )
         .await
         .map_err(|e| e.to_string())
+    }
+}
+
+/// The connection [`McpEmbedder::search_conn`] hands a search.
+enum SearchConn<'a> {
+    Stamped(epigraph_db::ScopedRead<'a>),
+    Privileged(sqlx::pool::PoolConnection<sqlx::Postgres>),
+}
+
+impl std::ops::Deref for SearchConn<'_> {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Stamped(r) => r,
+            Self::Privileged(c) => c,
+        }
+    }
+}
+
+impl std::ops::DerefMut for SearchConn<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Stamped(r) => r,
+            Self::Privileged(c) => c,
+        }
     }
 }
 

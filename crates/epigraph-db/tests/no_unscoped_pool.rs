@@ -194,7 +194,10 @@
 //!   `claims_in_themes_at_dim` is itself an unconverted wrapper over the
 //!   converted `claims_in_themes_at_dim_since` — so they are convertible
 //!   whenever a shard wants them and are deferred only to keep this pass to one
-//!   rule.
+//!   rule. (Those are PR-27's counts. Since then `workflow.rs::resolve_step_claim`
+//!   has moved class: it is now a `Pool::acquire` wrapper over the
+//!   connection-taking primitive `resolve_step_claim_conn`, which MCP's
+//!   `update_with_evidence` and `evolve_step` call on the caller's stamped read.)
 //!
 //!   Do not read the count of unconverted functions as a count of blockers: the
 //!   paragraph this replaced did exactly that. Calling
@@ -340,7 +343,6 @@
 //!   recompute_claim_belief}`, `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
-//!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
 //!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
 //!   agent_is_not_operated, agent_may_receive, deliver_event}`,
 //!   `routes/workflows.rs::{get_or_create_system_agent,
@@ -578,7 +580,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "routes/elevate.rs",
-        4,
+        5,
         "Pre-authentication, BY DESIGN rather than by sequence. The passkey enrollment ceremony \
          (elevation plan EL-3, migration 124) is a page the operator opens on the device that \
          holds the authenticator, with no bearer token to present: the enrollment id (random, \
@@ -587,8 +589,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          ceremony (EL-5, migration 125) is the same: the ticket id (live for at most 5 minutes, \
          asserted once) and the passkey are its credentials. Three sites are one connection each \
          for the enrollment reader, challenge store and completion; the fourth is the one \
-         `ceremony_conn` acquire every ticket handler shares. Each calls one of 124's or 125's \
-         ceremony definers, keyed by that id, which need no stamp: their \
+         `ceremony_conn` acquire every ticket handler shares. The fifth is the enrollment \
+         anchor reader (migration 200, the anchored passkey path), one connection on the same \
+         unauthenticated enrollment page, keyed by the same enrollment id. Each calls one of \
+         124's, 125's or 200's ceremony definers, keyed by that id, which need no stamp: their \
          SECURITY DEFINER frame is what the tables' policies admit, and the application role \
          holds no DML on either table. Unlike the OAuth entries this is not 'before a principal \
          is minted': no principal is ever minted here, which is why a later shard must not read \
@@ -737,7 +741,34 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 223 -> 222 (staging integration of both entries above): the two moves touch
 /// disjoint files (`routes/submit.rs` + `routes/claims.rs` vs `routes/workflows.rs`),
 /// so the merged count is 226 - 3 - 1.
-const HIGH_WATER: usize = 222;
+///
+/// 222 -> 221 (backlog 57917c13, 2026-11-04): `themes_overview` holds a
+/// `Viewer` and runs its one read, `ClaimThemeRepository::overview_page`, on
+/// the caller's stamped read (`routes/graph.rs` 3 -> 2), confirmed by
+/// `the_scanner_is_not_vacuous` passing on the converted tree. No file reached
+/// zero.
+///
+/// 221 -> 211 (HTTP public-only reads, 2026-11-05). Production builds
+/// `AppState.db_pool` as `scoped.inner()` on the `epigraph_app` login, and an
+/// unstamped `epigraph_app` session there sees 49,407 of 498,171 claims, the
+/// public ones: the MCP defect of the same day, on the REST surface. The
+/// read-only, viewer-holding handlers moved onto `AppState::read_as`:
+/// `routes/graph_query.rs` 1 -> 0 (key deleted), `routes/computation.rs`
+/// 6 -> 5, `routes/experiments.rs` 8 -> 4 and `routes/cross_source.rs` 6 -> 2.
+/// Pinned on the production pool shape by
+/// `epigraph-api/tests/http_public_only_reads.rs`. The files are disjoint from
+/// the entry above, so the merged count is 221 - 10, confirmed by this test on
+/// the merged tree.
+/// 221 -> 220 on its own branch: `set_provenance` holds a `Viewer` and runs every read and
+/// write on the caller's stamped transaction, its organization helper on that
+/// connection; `routes/provenance.rs` reached zero and its key was DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+///
+/// Staging merge (integration/20261109) of both entries above: they are
+/// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
+/// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
+/// equal to the `UNCONVERTED` table this test sums.
+const HIGH_WATER: usize = 210;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -802,7 +833,10 @@ const HIGH_WATER: usize = 222;
 /// 43 -> 42 when `routes/entities.rs` reached zero (backlog 850dcc61).
 /// 42 -> 41 when `routes/challenge.rs` reached zero (backlog 2f2eeaea).
 /// 41 -> 40 when `routes/groups.rs` reached zero (backlog 323773fe).
-const HIGH_WATER_FILES: usize = 40;
+/// 40 -> 39 when `routes/graph_query.rs` reached zero (HTTP public-only reads).
+/// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
+/// caller's stamped transaction; merged with the line above on staging).
+const HIGH_WATER_FILES: usize = 38;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -875,7 +909,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `AppState::read_as`, because the `decomposes_to` exclusion's legacy arm
     // reads `edges` and must see the caller's own private edges.
     // 7 -> 6 (R-22 / R-36): the CDST seed rows are loaded once (`bp_seed_rows`).
-    ("routes/computation.rs", 6),
+    // 6 -> 5 (HTTP public-only reads, 2026-11-05): `bp_seed_rows`' BBA load
+    // moved onto the stamped read its source reads already used. On the
+    // production pool (`scoped.inner()`, `epigraph_app`) the unstamped load saw
+    // public `mass_functions` rows only. What remains: `propagate_beliefs` (2,
+    // it writes) and `compose_subgraphs` (3, no `Viewer`).
+    ("routes/computation.rs", 5),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),
@@ -908,7 +947,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `ScopedRead<'_>` that cannot be cloned into one, and giving that repo a
     // connection-taking form is a cross-crate signature change reaching
     // `epigraph-mcp`, `epigraph-engine`'s matching pipeline and an
-    // `epigraph-cli` binary -- not an executor swap. One of those three is also
+    // `epigraph-cli` binary -- not an executor swap. [6 -> 2, 2026-11-05: that
+    // premise no longer holds for the reads. `MatchCandidateRepo` gained
+    // executor-taking `list_conn`, `list_for_claim_conn` and
+    // `corroborates_edges_for_claim_conn` (the `&self` forms delegate, so the
+    // MCP and engine callers are untouched), and the two read-only handlers
+    // `get_cross_source_matches` and `list_candidates` moved onto ONE
+    // `AppState::read_as` each. The 2 that remain are `decide_candidate`,
+    // which writes. The rest of this note is the earlier measurement.] One of those three is also
     // WRITE-BEARING (`set_status`, and a `retire` that opens its own
     // transaction). The remaining four sites are individually swappable, but
     // each shares a handler with one that is not, so converting them would
@@ -916,7 +962,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `read_as` doc's own stated hazard, and the disposition shard 4 already
     // took when `routes/computation.rs` offered the same choice. Whole handlers
     // or nothing.
-    ("routes/cross_source.rs", 6),
+    ("routes/cross_source.rs", 2),
     // 40 before conversion shard 7, which moved the four read-only
     // `ClaimThemeRepository` handlers (`get_boundary_claims`,
     // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto
@@ -947,7 +993,18 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // caller's viewer before their first insert.
     ("routes/events.rs", 6),
     ("routes/experiment_loop.rs", 20),
-    ("routes/experiments.rs", 8),
+    // 8 -> 4 (HTTP public-only reads, 2026-11-05): `hypothesize` (2) and
+    // `design_experiment` (2) moved onto `AppState::read_as`. The 4 that remain
+    // hold no `Viewer`: `add_method` (writes) and `find_methods` (reads
+    // `methods` / `method_capabilities`, which carry no row security).
+    ("routes/experiments.rs", 4),
+    // UNCHANGED at 5, deliberately (HTTP public-only reads, 2026-11-05).
+    // `gap_analysis` holds a `Viewer` and its claim search is a read, but the
+    // result feeds `GapRepository::store_gap_analysis`, which persists claim
+    // text into `gap_analyses` -- a table with no tenancy that the viewer-less
+    // `surface_gaps` serves back to any caller. Stamping the read would start
+    // copying group-private content there. Its owner is a tenancy decision
+    // for `gap_analyses`, not an executor swap.
     ("routes/gaps.rs", 5),
     // 4 before conversion shard 7, which moved `expand` onto
     // `AppState::read_as`. ONE register site spending its alias on FOUR
@@ -956,10 +1013,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `fetch_subgraph_edges`, whose signature changed to `&mut PgConnection` in
     // place — it has exactly one caller workspace-wide, so no pool-shaped
     // wrapper was created and this file leaves the `&PgPool`-PARAMETER blind
-    // spot enumerated in the Known limits above. The three that remain
-    // (`overview`, `themes_overview`, `themes_expand`) are routed GETs that hold
-    // NO `Viewer`; their owner is `D-PR16-theme-cluster-viewer-scope`.
-    ("routes/graph.rs", 3),
+    // spot enumerated in the Known limits above. 3 -> 2 (backlog 57917c13):
+    // `themes_overview` now holds a `Viewer` and reads through
+    // `AppState::read_as` and the viewer-spliced
+    // `ClaimThemeRepository::overview_page`. The two that remain (`overview`,
+    // `themes_expand`) are routed GETs that hold NO `Viewer`; their owner is
+    // `D-PR16-theme-cluster-viewer-scope`.
+    ("routes/graph.rs", 2),
     // `routes/graph_neighborhood.rs` was 2 and is GONE, not zeroed: conversion
     // shard 5 moved `expand` and `claim_compound_neighborhood` onto
     // `AppState::read_as`. It is one of TWO rows that shard deleted; see
@@ -977,7 +1037,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `compound_response` and `atomic_response` moved from `pool: &PgPool` to
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.
-    ("routes/graph_query.rs", 1),
+    //
+    // `routes/graph_query.rs` was 1 and is GONE, not zeroed (HTTP public-only
+    // reads, 2026-11-05): `execute_graph_query`'s `let pool = &state.db_pool;`
+    // alias, spent on the node selection and the subgraph load, became ONE
+    // `AppState::read_as`, and the load moved to `load_subgraph_conn`.
     // 11 before the operator-binding delta review, which moved
     // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
     // 6 since its VOI cache moved onto that same stamped transaction (round 4
@@ -1024,7 +1088,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
     ("routes/political.rs", 5),
-    ("routes/provenance.rs", 1),
     ("routes/rag.rs", 2),
     // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
     // loader moved onto `AppState::read_as` and

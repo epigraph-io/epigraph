@@ -1,6 +1,6 @@
 //! Session keep-alive on the MCP streamable-HTTP listener.
 //!
-//! rmcp 2.x ends a session when its worker sees no session event for
+//! rmcp (2.x and 3.x) ends a session when its worker sees no session event for
 //! `SessionConfig::keep_alive` (default 5 minutes; rmcp 0.15 had no such
 //! timer). The timer is re-armed only by an inbound HTTP event or by a message
 //! from the handler, and an in-flight tool call produces neither until it
@@ -23,7 +23,8 @@ use axum::body::Body;
 use axum::http::Request;
 use epigraph_mcp::http_listener::{mcp_http_listener, SESSION_KEEP_ALIVE};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ServerCapabilities, ServerInfo,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ServerCapabilities,
+    ServerConfig,
 };
 use rmcp::transport::streamable_http_server::SessionManager;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt as _};
@@ -46,20 +47,21 @@ const RESPONSE_DEADLINE: Duration = Duration::from_secs(6 * 60 * 60);
 struct SlowServer;
 
 impl ServerHandler for SlowServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         tokio::time::sleep(LONG_CALL).await;
         Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{} finished",
             request.name
-        ))]))
+        ))])
+        .into())
     }
 }
 

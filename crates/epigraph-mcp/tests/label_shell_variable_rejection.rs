@@ -57,6 +57,8 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
             reasoning: None,
             labels: vec!["fine-label".into(), BAD_LABEL.into()],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -110,6 +112,8 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
                 "group:0f4d3c1e-2b8a-4c6d-9e31-7a5b2c8d4f60".into(),
             ],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -145,6 +149,8 @@ async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
             confidence: Some(0.7),
             tags: Some(vec!["claude-memory".into(), BAD_LABEL.into()]),
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -194,6 +200,8 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     evidence_type: "logical".into(),
                     confidence: Some(0.6),
                     labels: vec!["backlog".into()],
+                    visibility: Some("public".to_string()),
+                    group_id: None,
                 },
                 epigraph_mcp::types::BatchClaimEntry {
                     content: bad.into(),
@@ -205,6 +213,8 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     evidence_type: "logical".into(),
                     confidence: Some(0.6),
                     labels: vec![BAD_LABEL.into()],
+                    visibility: Some("public".to_string()),
+                    group_id: None,
                 },
             ],
         },
@@ -345,7 +355,17 @@ async fn update_with_evidence_rejects_unexpanded_label_before_writing_evidence(p
 async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool: PgPool) {
     let signer = epigraph_crypto::AgentSigner::generate();
     let embedder = epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None);
-    let server = epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    let server = {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false)
+            .with_scoped_pool(scoped)
+    };
     let viewer = fixture::public_viewer(&pool).await;
 
     // Same shape as ingest_document_smoke.rs's fixture, with the DOI carrying an
@@ -373,10 +393,15 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
     let extraction: epigraph_ingest::schema::DocumentExtraction =
         serde_json::from_str(fixture).expect("fixture parses");
 
-    let err =
-        epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
-            .await
-            .expect_err("an unexpandable DOI must be refused");
+    let err = epigraph_mcp::tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect_err("an unexpandable DOI must be refused");
 
     // Nothing may have landed: no paper row, no claims.
     let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers")

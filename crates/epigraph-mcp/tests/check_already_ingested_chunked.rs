@@ -82,9 +82,15 @@ async fn the_default_sees_a_chunked_ingest(pool: PgPool) {
     let server = make_server(pool.clone()).await;
     let doi = "10.1234/g8-chunked";
 
-    do_ingest_document(&server, &viewer, &document(doi, Some(3)), None)
-        .await
-        .expect("chapter 3 ingest");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &document(doi, Some(3)),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("chapter 3 ingest");
 
     let default = check(&server, &viewer, doi, None).await;
     assert_eq!(
@@ -134,9 +140,15 @@ async fn the_default_still_sees_a_whole_document_ingest_and_not_a_missing_one(po
     assert_eq!(missing["already_ingested"], false, "{missing}");
     assert_eq!(missing["matched_pipeline_versions"], serde_json::json!([]));
 
-    do_ingest_document(&server, &viewer, &document(doi, None), None)
-        .await
-        .expect("whole ingest");
+    do_ingest_document(
+        &server,
+        &viewer,
+        &document(doi, None),
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("whole ingest");
     let whole = check(&server, &viewer, doi, None).await;
     assert_eq!(whole["already_ingested"], true, "{whole}");
     assert_eq!(
@@ -163,9 +175,15 @@ async fn every_chunk_of_a_chunked_ingest_records_its_own_stamp(pool: PgPool) {
     let doi = "10.1234/g8-two-chapters";
 
     for chapter in [1, 3, 3] {
-        do_ingest_document(&server, &viewer, &document(doi, Some(chapter)), None)
-            .await
-            .unwrap_or_else(|e| panic!("chapter {chapter} ingest: {e:?}"));
+        do_ingest_document(
+            &server,
+            &viewer,
+            &document(doi, Some(chapter)),
+            None,
+            epigraph_core::VisibilityChoice::Public,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("chapter {chapter} ingest: {e:?}"));
     }
 
     let default = check(&server, &viewer, doi, None).await;

@@ -204,32 +204,53 @@ impl BehavioralExecutionRepository {
     /// proposing a variant. The aggregate methods (`rolling_success_rate`,
     /// `behavioral_affinity`) summarise; this returns the rows themselves.
     ///
+    /// # Tenancy
+    ///
+    /// `behavioral_executions` carries no visibility columns and no row
+    /// security, and `epigraph_app` keeps `SELECT` on it (migration 118), so
+    /// the table alone discloses every workflow's runs (`goal_text`,
+    /// `step_beliefs`) to every caller. A row is returned only when its
+    /// workflow is one `viewer` reads: the polymorphic `workflow_id`
+    /// (migration 022) names either a `workflows` row (hierarchical; tenancy
+    /// since migration 183) or a flat workflow claim, and the parent filter
+    /// admits the row when EITHER parent is visible (both markers resolve to
+    /// the same `$V` bind). A hidden workflow therefore answers exactly like
+    /// an unknown id: no rows. Run it on `viewer`'s STAMPED connection, so the
+    /// in-query predicate and the parents' row security agree.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn recent_executions(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn recent_executions<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
         limit: i64,
     ) -> Result<Vec<BehavioralExecutionRow>, DbError> {
-        let rows = sqlx::query_as::<_, BehavioralExecutionRow>(
+        let sql = viewer.splice(
             r#"
-            SELECT id, workflow_id, goal_text,
-                   success, step_beliefs, tool_pattern,
-                   quality, deviation_count, total_steps, created_at,
-                   step_claim_id, run_label
-            FROM behavioral_executions
-            WHERE workflow_id = $1
-            ORDER BY created_at DESC
+            SELECT be.id, be.workflow_id, be.goal_text,
+                   be.success, be.step_beliefs, be.tool_pattern,
+                   be.quality, be.deviation_count, be.total_steps, be.created_at,
+                   be.step_claim_id, be.run_label
+            FROM behavioral_executions be
+            WHERE be.workflow_id = $1
+              AND (EXISTS (SELECT 1 FROM workflows w
+                            WHERE w.id = $1 /* {VISIBILITY:w} */)
+                   OR EXISTS (SELECT 1 FROM claims c
+                               WHERE c.id = $1 /* {VISIBILITY:c} */))
+            ORDER BY be.created_at DESC
             LIMIT $2
             "#,
-        )
-        .bind(workflow_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
-
-        Ok(rows)
+            3,
+        );
+        let mut q = sqlx::query_as::<_, BehavioralExecutionRow>(&sql)
+            .bind(workflow_id)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Count `(successes, total)` over a workflow's last `window` executions.
@@ -238,34 +259,46 @@ impl BehavioralExecutionRepository {
     /// the denominator — the Wilson promotion gate needs both the success count
     /// and the sample size to compute a lower bound.
     ///
+    /// Counts only the runs of a workflow `viewer` reads, by the same parent
+    /// filter as [`Self::recent_executions`]: a hidden
+    /// workflow counts `(0, 0)`, exactly like an unknown id. Run it on
+    /// `viewer`'s STAMPED connection.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn success_stats(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn success_stats<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
         window: i64,
     ) -> Result<(i64, i64), DbError> {
-        let row: (i64, i64) = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT
                 COUNT(*) FILTER (WHERE success)::bigint AS successes,
                 COUNT(*)::bigint AS total
             FROM (
-                SELECT success
-                FROM behavioral_executions
-                WHERE workflow_id = $1
-                ORDER BY created_at DESC
+                SELECT be.success
+                FROM behavioral_executions be
+                WHERE be.workflow_id = $1
+                  AND (EXISTS (SELECT 1 FROM workflows w
+                                WHERE w.id = $1 /* {VISIBILITY:w} */)
+                       OR EXISTS (SELECT 1 FROM claims c
+                                   WHERE c.id = $1 /* {VISIBILITY:c} */))
+                ORDER BY be.created_at DESC
                 LIMIT $2
             ) AS recent
             "#,
-        )
-        .bind(workflow_id)
-        .bind(window)
-        .fetch_one(pool)
-        .await?;
-
-        Ok(row)
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64)>(&sql)
+            .bind(workflow_id)
+            .bind(window);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Find workflows with high behavioral success for goals similar to the
@@ -662,8 +695,11 @@ mod tests {
                 .unwrap();
         }
 
+        // Public-only reader: the fixture workflows are public claims.
+        let viewer = crate::visibility::Viewer::test_scoped(agent_id, vec![]);
+
         // Limit < count: newest two of the target workflow, DESC by created_at.
-        let recent = BehavioralExecutionRepository::recent_executions(&pool, wf, 2)
+        let recent = BehavioralExecutionRepository::recent_executions(&pool, &viewer, wf, 2)
             .await
             .unwrap();
         assert_eq!(recent.len(), 2, "limit honoured");
@@ -675,7 +711,7 @@ mod tests {
         );
 
         // Limit > count: all three target rows, never the other workflow's row.
-        let all = BehavioralExecutionRepository::recent_executions(&pool, wf, 100)
+        let all = BehavioralExecutionRepository::recent_executions(&pool, &viewer, wf, 100)
             .await
             .unwrap();
         assert_eq!(all.len(), 3);
@@ -729,21 +765,24 @@ mod tests {
             .unwrap();
         }
 
+        // Public-only reader: the fixture workflow is a public claim.
+        let viewer = crate::visibility::Viewer::test_scoped(agent_id, vec![]);
+
         // Whole history: 3 successes of 5.
-        let (succ, total) = BehavioralExecutionRepository::success_stats(&pool, wf, 100)
+        let (succ, total) = BehavioralExecutionRepository::success_stats(&pool, &viewer, wf, 100)
             .await
             .unwrap();
         assert_eq!((succ, total), (3, 5));
 
         // Window of the newest 3 (all successes): 3 of 3.
-        let (succ3, total3) = BehavioralExecutionRepository::success_stats(&pool, wf, 3)
+        let (succ3, total3) = BehavioralExecutionRepository::success_stats(&pool, &viewer, wf, 3)
             .await
             .unwrap();
         assert_eq!((succ3, total3), (3, 3), "window restricts to newest N");
 
         // Unknown workflow: empty.
         let (z_s, z_t) =
-            BehavioralExecutionRepository::success_stats(&pool, uuid::Uuid::new_v4(), 100)
+            BehavioralExecutionRepository::success_stats(&pool, &viewer, uuid::Uuid::new_v4(), 100)
                 .await
                 .unwrap();
         assert_eq!((z_s, z_t), (0, 0));

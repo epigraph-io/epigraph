@@ -142,6 +142,7 @@ async fn store(server: &EpiGraphMcpFull, step: &str) -> Result<String, String> {
         server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: None,
             goal: goal.clone(),
             steps: vec![step.to_string()],
             prerequisites: None,
@@ -499,8 +500,10 @@ async fn the_rotation_order_keeps_one_system_identity(pool: PgPool) {
     let step = format!("rotation order step {}", Uuid::new_v4());
     store(&bound, &step)
         .await
-        .expect("a bound caller stores through the registered system agent");
-    assert_eq!(author_of(&pool, &step).await, (s, a_group));
+        .expect("a bound caller stores, as itself, with the system agent rotated");
+    // Workflow writes are made as the caller: the bound caller authors the
+    // step, in its operator's group; the rotated system agent is not touched.
+    assert_eq!(author_of(&pool, &step).await, (bound_caller, a_group));
     assert_eq!(count(&pool, "agents").await, agents, "no agent minted");
     assert_eq!(k_holders(&pool).await, 0);
 
@@ -521,32 +524,31 @@ async fn the_rotation_order_keeps_one_system_identity(pool: PgPool) {
 
 // ── 4.3: the MCP entry points ───────────────────────────────────────────────
 
-/// `store_workflow` after a rotation authors as S and mints nothing. Kills: a
-/// caller path that still does its own key lookup (after the rotation it would
-/// try to re-create K, which the `agents` guard refuses, so the store fails).
+/// `store_workflow` after a rotation authors as its CALLER (workflow writes
+/// are made as the caller) and mints nothing. Kills: a caller path that still
+/// does its own system-agent key lookup (after the rotation it would try to
+/// re-create K, which the `agents` guard refuses, so the store fails).
 #[sqlx::test(migrations = "../../migrations")]
-async fn store_workflow_after_rotation_authors_as_the_registered_agent(pool: PgPool) {
+async fn store_workflow_after_rotation_authors_as_the_caller_and_mints_nothing(pool: PgPool) {
     let s = legacy_system_agent_registered(&pool).await;
     rotate(&pool, s).await;
-    let (server, _) = app_role_server(&pool, 0xD1).await;
+    let (server, caller) = app_role_server(&pool, 0xD1).await;
     let step = format!("post-rotation step {}", Uuid::new_v4());
     store(&server, &step)
         .await
         .expect("store_workflow after the rotation");
-    assert_eq!(author_of(&pool, &step).await.0, s);
+    assert_eq!(author_of(&pool, &step).await.0, caller);
     assert_eq!(k_holders(&pool).await, 0);
 }
 
-/// `add_step` after a rotation authors as S and mints nothing. The workflow is
-/// stored BEFORE the rotation, so every post-rotation resolution belongs to the
-/// `add_step` call: MCP `add_step` resolves on its autocommit `boot` connection
-/// (`system_agent_write_authority`) and the executor resolves again inside the
-/// stamped transaction. Both go to the same function, so this guards the entry
-/// point; it cannot isolate the in-transaction call.
+/// `add_step` after a rotation authors as its CALLER and mints nothing. The
+/// workflow is stored BEFORE the rotation, so every post-rotation resolution
+/// belongs to the `add_step` call, which no longer resolves the system agent
+/// at all (workflow writes are made as the caller).
 #[sqlx::test(migrations = "../../migrations")]
 async fn mcp_add_step_after_rotation_mints_nothing(pool: PgPool) {
     let s = legacy_system_agent_registered(&pool).await;
-    let (server, _) = app_role_server(&pool, 0xD2).await;
+    let (server, caller) = app_role_server(&pool, 0xD2).await;
     store(&server, &format!("first step {}", Uuid::new_v4()))
         .await
         .expect("store before the rotation");
@@ -574,7 +576,7 @@ async fn mcp_add_step_after_rotation_mints_nothing(pool: PgPool) {
     .await
     .map_err(|e| e.message.to_string())
     .expect("add_step after the rotation");
-    assert_eq!(author_of(&pool, &added).await.0, s);
+    assert_eq!(author_of(&pool, &added).await.0, caller);
     assert_eq!(k_holders(&pool).await, 0);
 }
 
@@ -652,6 +654,7 @@ fn workflow_extraction(
                     name: (*n).to_string(),
                     affiliations: vec![],
                     roles: vec![],
+                    agent_id: None,
                 })
                 .collect(),
             expected_outcome: None,
@@ -744,8 +747,14 @@ async fn ingest_document_authors(
     let extraction = document(authors, text);
     let r = match path {
         DocPath::Full => {
-            epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction, None)
-                .await
+            epigraph_mcp::tools::ingestion::do_ingest_document(
+                &server,
+                &viewer,
+                &extraction,
+                None,
+                epigraph_core::VisibilityChoice::Public,
+            )
+            .await
         }
         DocPath::Spine => {
             epigraph_mcp::tools::ingestion::do_ingest_document_spine(
@@ -753,6 +762,7 @@ async fn ingest_document_authors(
                 &viewer,
                 &extraction,
                 None,
+                epigraph_core::VisibilityChoice::Public,
             )
             .await
         }
@@ -919,6 +929,7 @@ async fn an_author_resolving_to_a_registered_agent_is_never_adopted(pool: PgPool
         &viewer,
         &document(&["Ada Lovelace", "Some Name"], None),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .map_err(|e| e.message.to_string())
@@ -1032,6 +1043,7 @@ async fn registry_absent_fails_closed(pool: PgPool, armed: bool) {
         &viewer,
         &document(&["Ada Lovelace"], None),
         None,
+        epigraph_core::VisibilityChoice::Public,
     )
     .await
     .map_err(|e| e.message.to_string());

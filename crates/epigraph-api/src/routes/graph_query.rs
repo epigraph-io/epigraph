@@ -120,8 +120,6 @@ pub async fn execute_graph_query(
 
     // The anchor rows are taken newest first, `id` as the tie-breaker, so the
     // LIMIT window is a total order (backlog 2aacb390).
-    let pool = &state.db_pool;
-
     let walk = match &ast.match_clause.edge {
         Some(edge) => {
             // Validate relationship type against allowlist
@@ -166,8 +164,16 @@ pub async fn execute_graph_query(
     // 4815dcf7): the anchor table and every `edges` hop carry the predicate,
     // so neither a property predicate nor a traversal reaches past what the
     // caller can read, and the LIMIT window counts only readable rows.
+    //
+    // Both statements run on ONE viewer-stamped connection. They used to run
+    // on `state.db_pool`, which in production is `scoped.inner()` connected as
+    // `epigraph_app`: an unstamped session there carries no
+    // `epigraph.group_ids`, so the FORCEd `claims` / `edges` policies admitted
+    // public rows only, and a member's own group-private claims were missing
+    // from every query result even though `$V` named their group.
+    let mut read = super::open_scoped_read(&state, &viewer, "execute_graph_query").await?;
     let node_ids = GraphViewRepository::graph_query_node_ids(
-        pool,
+        &mut *read,
         &viewer,
         node_table,
         &conditions,
@@ -184,6 +190,7 @@ pub async fn execute_graph_query(
     })?;
 
     if node_ids.is_empty() {
+        super::finish_scoped_read(read, "execute_graph_query").await?;
         return Ok(Json(FullGraphResponse {
             nodes: vec![],
             edges: vec![],
@@ -192,9 +199,10 @@ pub async fn execute_graph_query(
         }));
     }
 
-    // No `apply_partition_filter`: `load_subgraph` is spliced with
+    // No `apply_partition_filter`: `load_subgraph_conn` is spliced with
     // `&viewer`, so a claim node the caller may not read is not in `resp`.
-    let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
+    let resp = super::graph_query_utils::load_subgraph_conn(&mut read, &viewer, node_ids).await?;
+    super::finish_scoped_read(read, "execute_graph_query").await?;
     Ok(resp)
 }
 

@@ -175,6 +175,16 @@ pub struct CreateClaimRequest {
     /// refused with 400 and nothing is written. Public tier only.
     #[serde(default)]
     pub derived_from: Option<DerivedFrom>,
+    /// Who may read the claim, on the plain (`privacy_tier = "public"`) tier:
+    /// `"team"` (the default), `"private"` or `"public"`
+    /// (docs/tenancy/claim-visibility-controls.md). On the plain tier
+    /// `group_id` names the team, and naming one implies `"team"`. Omitted: the
+    /// caller's default team, else its only team, else private, never public.
+    /// One exception: a `derived_from` claim with no visibility named is public,
+    /// as its parent must be. Refused on the `fully_private` tier, whose
+    /// `group_id` is the sealing group.
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 /// The parent a claim was derived from, for [`CreateClaimRequest::derived_from`].
@@ -228,6 +238,281 @@ pub struct ClaimResponse {
     /// the create handler; omitted from non-create responses (GET/PATCH/list).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub was_created: bool,
+    /// Who wrote the claim, as the caller may see it. Present on
+    /// `GET /api/v1/claims/:id` only; omitted from every other claim response,
+    /// `POST /api/v1/claims/batch-get` items included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_by: Option<AuthoredByView>,
+    /// On a create: where the claim landed, `team`, `private` or `public`
+    /// (docs/tenancy/claim-visibility-controls.md). Omitted elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// On a create: the claim's owner group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<Uuid>,
+    /// On a create: how a default visibility was resolved (D-V1), or that an
+    /// existing claim of another visibility was returned unchanged (D-V4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility_note: Option<String>,
+}
+
+/// A claim's `authored_by` block (`epigraph_db::authored_by`), tagged by
+/// `source`. `agent`: no readable creation record names a document, so the
+/// filer is the author (a claim stated directly, or one a document later
+/// repeated). `literature`: the document ingest recorded, when the claim was
+/// created, that a document's ingest created it; that document's authors are
+/// the claim's primary authors and the filer (the creating ingest's agent)
+/// is shown apart as `ingested_by`. Never decided from a bare `asserts` edge
+/// or from content. Both carry `corroborated_by` (every other readable
+/// document whose ingest recorded the claim) and `ingesters` (every readable
+/// ingest, the creating one included). A part the caller may not see is
+/// `null`, exactly as a part that does not exist (no snapshot recorded).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum AuthoredByView {
+    /// The filer stated the claim.
+    Agent {
+        /// The agent that filed the claim (`agent_id`), for every reader.
+        agent: AuthorRefView,
+        /// The human the agent was bound to when it filed the claim, for
+        /// every reader: its operator link from creation until retirement,
+        /// else the client allowance in force then. Read from that binding
+        /// record only: never from an `OPERATED_BY` edge, and never from
+        /// client or registration status. `null` when the agent was bound to
+        /// no human then (a claim filed after its link was retired), and on a
+        /// registered human's own claim.
+        human: Option<AuthorRefView>,
+        /// The prompt snapshot the agent was running at the claim's
+        /// `created_at`, shown only to the agent's linked human and to admins
+        /// (the prompt-history gate); otherwise `null`.
+        prompt_snapshot: Option<PromptSnapshotView>,
+        /// Every readable document whose ingest recorded the claim (at most
+        /// 10, in record order); none is an author.
+        corroborated_by: Vec<PaperAuthorshipView>,
+        /// More than 10 such documents are readable.
+        corroborated_by_truncated: bool,
+        /// Every readable ingest of the claim, oldest first.
+        ingesters: Vec<IngesterView>,
+        /// More ingest records exist than are listed.
+        ingesters_truncated: bool,
+    },
+    /// A document's ingest created the claim.
+    Literature {
+        /// The creating document with its authors: the claim's primary
+        /// authors (pending authors are listed apart, never primary).
+        paper: PaperAuthorshipView,
+        /// The agent that ran the creating ingest (the claim's filer), with
+        /// its human and prompt snapshot under the same rules as the `agent`
+        /// block. Never an author.
+        ingested_by: FilerView,
+        /// Every other readable document whose ingest recorded the claim (at
+        /// most 10, in record order).
+        corroborated_by: Vec<PaperAuthorshipView>,
+        /// More than 10 such documents are readable.
+        corroborated_by_truncated: bool,
+        /// Every readable ingest of the claim, the creating one included,
+        /// oldest first.
+        ingesters: Vec<IngesterView>,
+        /// More ingest records exist than are listed.
+        ingesters_truncated: bool,
+    },
+}
+
+/// The agent that filed a claim row, with its human and prompt snapshot.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct FilerView {
+    pub agent: AuthorRefView,
+    pub human: Option<AuthorRefView>,
+    pub prompt_snapshot: Option<PromptSnapshotView>,
+}
+
+/// One ingest of the claim.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct IngesterView {
+    /// The ingesting agent.
+    pub agent: AuthorRefView,
+    /// The human that agent was bound to when it ingested, for every reader.
+    pub human: Option<AuthorRefView>,
+    /// The document it ingested.
+    pub paper_id: Uuid,
+    /// This ingest created the claim.
+    pub created_claim: bool,
+    /// When the ingest recorded the claim.
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A document and its authors.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperAuthorshipView {
+    pub paper: PaperRefView,
+    /// On the creating document, the claim's primary authors: those its
+    /// creating ingest recorded when it created the claim, whose readable,
+    /// in-force `authored` edge WRITTEN BY THAT SAME INGEST is not awaiting
+    /// countersignature, in position order. On a corroborating document, the
+    /// authors the ingests that recorded the claim through it named, not
+    /// awaiting countersignature. Only the ingests that recorded the claim
+    /// contribute authors, each author once.
+    pub authors: Vec<PaperAuthorView>,
+    /// Authors an ingester named without speaking for them, not yet
+    /// countersigned (`pending_countersign: true`, `named_by`). Never
+    /// primary.
+    pub pending_authors: Vec<PaperAuthorView>,
+    /// On the creating document only: authors its creating ingest did not
+    /// record (a later ingest of the same document key that also recorded
+    /// the claim added them), each with `added_by`. Never primary; empty on
+    /// a corroborating document.
+    pub added_authors: Vec<PaperAuthorView>,
+    /// More than 50 readable authors exist (the three lists together).
+    pub authors_truncated: bool,
+}
+
+/// A document node.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperRefView {
+    pub id: Uuid,
+    /// The document key (a DOI, or another document key).
+    pub doi: String,
+    pub title: Option<String>,
+}
+
+/// One author of a document, from its `authored` edge.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperAuthorView {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    /// The extraction's author index; positions are not unique.
+    pub position: Option<i64>,
+    /// The edge's `role` (`author` when absent).
+    pub role: String,
+    pub affiliations: Vec<String>,
+    /// The authorship awaits the person's countersignature.
+    pub pending_countersign: bool,
+    /// On a pending authorship, the ingester whose word it is.
+    pub named_by: Option<AuthorRefView>,
+    /// On an added author, the ingester whose ingest added the authorship.
+    pub added_by: Option<AuthorRefView>,
+}
+
+/// One agent: the two fields `GET /api/v1/agents/:id` names.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct AuthorRefView {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+}
+
+/// The prompt snapshot (design D4) an agent was running at an instant. No
+/// prompt text: that stays behind `GET /api/v1/agents/:id/prompt-history`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PromptSnapshotView {
+    /// The snapshot, as `GET /api/v1/agents/:id/prompt-history` lists it.
+    pub snapshot_id: Uuid,
+    pub model: String,
+    /// The identity prompt hash (64 hex digits); the same for every snapshot
+    /// of one agent.
+    pub prompt_hash: String,
+    /// The snapshot's latest recorded start at or before the claim's
+    /// `created_at`.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::AuthorRef> for AuthorRefView {
+    fn from(a: epigraph_db::AuthorRef) -> Self {
+        Self {
+            id: a.id,
+            display_name: a.display_name,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::Filer> for FilerView {
+    fn from(f: epigraph_db::Filer) -> Self {
+        Self {
+            agent: f.agent.into(),
+            human: f.human.map(Into::into),
+            prompt_snapshot: f.prompt_snapshot.map(|p| PromptSnapshotView {
+                snapshot_id: p.snapshot_id,
+                model: p.model,
+                prompt_hash: p.prompt_hash,
+                started_at: p.started_at,
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::PaperAuthorship> for PaperAuthorshipView {
+    fn from(p: epigraph_db::PaperAuthorship) -> Self {
+        let author = |a: epigraph_db::PaperAuthor| PaperAuthorView {
+            id: a.id,
+            display_name: a.display_name,
+            position: a.position,
+            role: a.role,
+            affiliations: a.affiliations,
+            pending_countersign: a.pending_countersign,
+            named_by: a.named_by.map(Into::into),
+            added_by: a.added_by.map(Into::into),
+        };
+        Self {
+            paper: PaperRefView {
+                id: p.paper.id,
+                doi: p.paper.doi,
+                title: p.paper.title,
+            },
+            authors: p.authors.into_iter().map(author).collect(),
+            pending_authors: p.pending_authors.into_iter().map(author).collect(),
+            added_authors: p.added_authors.into_iter().map(author).collect(),
+            authors_truncated: p.authors_truncated,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::Ingester> for IngesterView {
+    fn from(i: epigraph_db::Ingester) -> Self {
+        Self {
+            agent: i.agent.into(),
+            human: i.human.map(Into::into),
+            paper_id: i.paper_id,
+            created_claim: i.created_claim,
+            recorded_at: i.recorded_at,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::AuthoredBy> for AuthoredByView {
+    fn from(b: epigraph_db::AuthoredBy) -> Self {
+        let papers = |v: Vec<epigraph_db::PaperAuthorship>| v.into_iter().map(Into::into).collect();
+        let ingesters = |v: Vec<epigraph_db::Ingester>| v.into_iter().map(Into::into).collect();
+        match b {
+            epigraph_db::AuthoredBy::Agent(a) => {
+                let f = FilerView::from(a.filer);
+                let c = a.corroboration;
+                Self::Agent {
+                    agent: f.agent,
+                    human: f.human,
+                    prompt_snapshot: f.prompt_snapshot,
+                    corroborated_by: papers(c.corroborated_by),
+                    corroborated_by_truncated: c.corroborated_by_truncated,
+                    ingesters: ingesters(c.ingesters),
+                    ingesters_truncated: c.ingesters_truncated,
+                }
+            }
+            epigraph_db::AuthoredBy::Literature(l) => {
+                let c = l.corroboration;
+                Self::Literature {
+                    paper: l.paper.into(),
+                    ingested_by: l.ingested_by.into(),
+                    corroborated_by: papers(c.corroborated_by),
+                    corroborated_by_truncated: c.corroborated_by_truncated,
+                    ingesters: ingesters(c.ingesters),
+                    ingesters_truncated: c.ingesters_truncated,
+                }
+            }
+        }
+    }
 }
 
 impl From<Claim> for ClaimResponse {
@@ -246,6 +531,10 @@ impl From<Claim> for ClaimResponse {
             group_id: None,
             labels: Vec::new(),
             was_created: false,
+            authored_by: None,
+            visibility: None,
+            owner_group_id: None,
+            visibility_note: None,
         }
     }
 }
@@ -685,6 +974,76 @@ pub(crate) async fn create_claim_core(
     // caller must be bound and may name only an author of its own human. On
     // the raw pool the trigger saw no principal at all (and, once armed, now
     // refuses the write outright rather than checking the body's author).
+    // ── Visibility (docs/tenancy/claim-visibility-controls.md) ──
+    //
+    // Plain tier only. Resolved for the AUTHENTICATED principal
+    // (`author_agent_id`, never the body's `agent_id`, for the reason the
+    // PR-16 block below gives), BEFORE the transaction: a team the caller writes
+    // only through its human (D-V3) must be stamped into it.
+    let resolved = if privacy_tier == "public" {
+        let choice =
+            match (request.visibility.as_deref(), &request.derived_from) {
+                // A derivation of a PUBLIC parent stays public unless the caller
+                // says otherwise (`decompose_claims` posts atoms this way).
+                (None, Some(_)) => epigraph_core::VisibilityChoice::Public,
+                (v, _) => epigraph_core::VisibilityChoice::parse(v, request.group_id).map_err(
+                    |reason| ApiError::ValidationError {
+                        field: "visibility".to_string(),
+                        reason,
+                    },
+                )?,
+            };
+        if request.derived_from.is_some() && choice != epigraph_core::VisibilityChoice::Public {
+            return Err(ApiError::ValidationError {
+                field: "visibility".to_string(),
+                reason: "derived_from is only supported for a public claim".to_string(),
+            });
+        }
+        let mut conn = state
+            .db_pool
+            .acquire()
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to acquire a connection: {e}"),
+            })?;
+        Some(ClaimRepository::resolve_write_decl(&mut conn, author_agent_id, choice).await?)
+    } else {
+        if request.visibility.is_some() {
+            return Err(ApiError::ValidationError {
+                field: "visibility".to_string(),
+                reason: "visibility applies to the plain tier; a fully_private claim is sealed \
+                         into its group_id"
+                    .to_string(),
+            });
+        }
+        None
+    };
+    // A home group the resolution just PROVISIONED (`default_decl_for_author`
+    // mints a personal group on a miss) is not in the viewer resolved at the
+    // start of the request. A private claim written there would then be
+    // invisible to this request's own dedup find, so a second identical item in
+    // the same batch would land as a second row. Re-resolve the caller once in
+    // that case. Production tokens are provisioned at mint (PR-02), so this is
+    // the rare first-write path.
+    let refreshed = match &resolved {
+        Some(r)
+            if r.decl.visibility_bind() == Some("group")
+                && r.operator_grant.is_none()
+                && viewer.principal() == Some(author_agent_id)
+                && viewer.group_bind().is_some_and(|g| {
+                    r.decl.owner_group_bind().is_some_and(|o| !g.contains(&o))
+                }) =>
+        {
+            Some(epigraph_db::visibility::Viewer::resolve(&state.db_pool, author_agent_id).await?)
+        }
+        _ => None,
+    };
+    let viewer = refreshed.as_ref().unwrap_or(viewer);
+    let granted = resolved
+        .as_ref()
+        .and_then(|r| r.operator_grant.as_ref())
+        .and_then(|g| viewer.with_team_write_grant(g));
+    let viewer = granted.as_ref().unwrap_or(viewer);
     let mut tx = state.begin_claim_write(viewer, "create_claim").await?;
 
     // ── Tenancy declaration (PR-16) ──
@@ -739,8 +1098,10 @@ pub(crate) async fn create_claim_core(
     //
     // Resolved inside the same transaction as the insert, so a rollback takes
     // any minted personal group with it.
-    let decl = if privacy_tier == "public" {
-        ClaimRepository::default_decl_for_author(&mut tx, author_agent_id).await?
+    let decl = if let Some(r) = &resolved {
+        // The plain tier: the caller's visibility, resolved above through
+        // `resolve_write_decl` (which runs `default_decl_for_author` first).
+        r.decl
     } else {
         // `validate_privacy_fields` above rejects a non-public tier with no
         // `group_id`, and the membership check has already run against it.
@@ -1015,50 +1376,70 @@ pub(crate) async fn create_claim_core(
     // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
     // and for the same reason, as the labels and properties writes above.
     if was_created {
-        let _ = epigraph_db::EdgeRepository::create_signed(
-            &state.db_pool,
-            state.edge_signing_key(),
-            request.agent_id,
-            "agent",
-            claim_uuid,
-            "claim",
-            "AUTHORED",
-            None,
-            None,
-            None,
-        )
-        .await;
-
+        let mut structural: Vec<(Uuid, &str, Uuid, &str, &str)> =
+            vec![(request.agent_id, "agent", claim_uuid, "claim", "AUTHORED")];
         if let Some(trace_uuid) = request.trace_id {
-            let _ = epigraph_db::EdgeRepository::create_signed(
-                &state.db_pool,
-                state.edge_signing_key(),
-                claim_uuid,
-                "claim",
-                trace_uuid,
-                "trace",
-                "HAS_TRACE",
-                None,
-                None,
-                None,
-            )
-            .await;
+            structural.push((claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"));
         }
-
         if let Some(evidence_id) = request.evidence_id {
-            let _ = epigraph_db::EdgeRepository::create_signed(
-                &state.db_pool,
-                state.edge_signing_key(),
-                claim_uuid,
-                "claim",
-                evidence_id,
-                "evidence",
-                "DERIVED_FROM",
-                None,
-                None,
-                None,
-            )
-            .await;
+            structural.push((claim_uuid, "claim", evidence_id, "evidence", "DERIVED_FROM"));
+        }
+        // A group-visible claim (the team / private default,
+        // docs/tenancy/claim-visibility-controls.md) is invisible to the
+        // unstamped pool, so the edge trigger's reference check refuses these
+        // inserts there and the `let _` below would drop them silently. Write
+        // them as the caller that just wrote the claim, one transaction per
+        // edge so one bad reference does not take the others with it (the
+        // same best-effort contract as the public path).
+        let group_visible = resolved
+            .as_ref()
+            .is_some_and(|r| r.decl.visibility_bind() == Some("group"));
+        for (source, source_type, target, target_type, relationship) in structural {
+            if group_visible {
+                let written = async {
+                    let mut etx = state
+                        .begin_claim_write(viewer, "create_claim_edges")
+                        .await?;
+                    epigraph_db::EdgeRepository::create_signed_conn(
+                        &mut etx,
+                        state.edge_signing_key(),
+                        source,
+                        source_type,
+                        target,
+                        target_type,
+                        relationship,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    etx.commit().await?;
+                    Ok::<(), ApiError>(())
+                }
+                .await;
+                if let Err(e) = written {
+                    tracing::warn!(
+                        claim_id = %claim_uuid,
+                        relationship,
+                        error = ?e,
+                        "could not write a group-visible claim's structural edge"
+                    );
+                }
+            } else {
+                let _ = epigraph_db::EdgeRepository::create_signed(
+                    &state.db_pool,
+                    state.edge_signing_key(),
+                    source,
+                    source_type,
+                    target,
+                    target_type,
+                    relationship,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
         }
     }
 
@@ -1069,6 +1450,38 @@ pub(crate) async fn create_claim_core(
     response.group_id = encryption_response.3;
     response.labels = request.labels;
     response.was_created = was_created;
+    if let Some(r) = &resolved {
+        // Read the stored tenancy back AS THE CALLER, on a transaction stamped
+        // like the write's (`begin_claim_write`). On the raw application pool
+        // a group-visible row is invisible, so the report would echo what was
+        // asked and drop D-V4's note for a resubmit that matched the caller's
+        // existing private or team claim. Nothing is written; the transaction
+        // rolls back on drop.
+        let report = async {
+            let mut rtx = state
+                .begin_claim_write(viewer, "create_claim_tenancy_report")
+                .await?;
+            Ok::<_, ApiError>(
+                ClaimRepository::write_tenancy_report(&mut rtx, response.id, r, was_created)
+                    .await?,
+            )
+        }
+        .await;
+        match report {
+            Ok(rep) => {
+                response.visibility = Some(rep.visibility.to_string());
+                response.owner_group_id = Some(rep.owner_group_id);
+                response.visibility_note = rep.note;
+            }
+            // The stamped read failed (begin, stamp or query): report what
+            // was declared rather than fail a claim that is already written.
+            Err(_) => {
+                response.visibility = Some(r.resolved.to_string());
+                response.owner_group_id = r.decl.owner_group_bind();
+                response.visibility_note = r.note.clone();
+            }
+        }
+    }
 
     // Record provenance chain of custody. Unconditional on the caller (`ctx`
     // is bound by the guard at the top of this function), but only for a row
@@ -1147,6 +1560,10 @@ pub async fn create_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        authored_by: None,
+        visibility: None,
+        owner_group_id: None,
+        visibility_note: None,
     };
 
     Ok(Json(response))
@@ -1300,8 +1717,56 @@ pub async fn get_claim(
             message: format!("Failed to query claim encryption: {e}"),
         })?;
 
+    // Who wrote it, on the same stamped connection: the asserting documents'
+    // authors under this caller's edge visibility, the filer's human from its
+    // binding, the prompt snapshot through the audience
+    // `PROMPT_SNAPSHOT_AUDIENCE` names (ruled: the prompt-history gate).
+    // Only reached for a claim the caller has just read.
+    let authored_by = epigraph_db::AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim.id.as_uuid(),
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
+    )
+    .await?;
+
     drop(read);
 
+    // `trace_readable = true` keeps GET's wire unchanged: it still names the
+    // row's `trace_id` whatever that trace's own tenancy. `POST
+    // /api/v1/claims/batch-get` checks the trace against the viewer
+    // (`ReasoningTraceRepository::readable_ids`) and passes the answer here;
+    // doing the same on GET is a separate, wire-changing follow-up.
+    let mut response = claim_response_for_read(claim, labels, encryption, true);
+    // GET only: `POST /api/v1/claims/batch-get` shares the body above and
+    // carries no `authored_by` (the field is omitted there).
+    response.authored_by = Some(authored_by.into());
+
+    // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
+    // so reaching this line means the claim is readable; the post-pass that
+    // used to overwrite `response.content` here could only ever downgrade a row
+    // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking
+    // disagreement with the `ok_or_else` 404 above is exactly the
+    // confirmation oracle PR-14 removes.
+    Ok(Json(response))
+}
+
+/// The `GET /api/v1/claims/:id` body for a claim the caller has already been
+/// allowed to read. Shared with `POST /api/v1/claims/batch-get` so the two
+/// cannot drift.
+///
+/// `trace_readable` is whether the caller may read the trace `claim.trace_id`
+/// names; when false the body's `trace_id` is null, the same answer as no
+/// trace.
+#[cfg(feature = "db")]
+pub(crate) fn claim_response_for_read(
+    claim: Claim,
+    labels: Vec<String>,
+    encryption: Option<epigraph_db::ClaimEncryptionRow>,
+    trace_readable: bool,
+) -> ClaimResponse {
     let mut response: ClaimResponse = claim.into();
     response.labels = labels;
 
@@ -1313,13 +1778,10 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
-    // so reaching this line means the claim is readable; the post-pass that
-    // used to overwrite `response.content` here could only ever downgrade a row
-    // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking
-    // disagreement with the `ok_or_else` 404 four lines up is exactly the
-    // confirmation oracle PR-14 removes.
-    Ok(Json(response))
+    if !trace_readable {
+        response.trace_id = None;
+    }
+    response
 }
 
 /// Get a claim by ID (placeholder - no database)
@@ -1349,6 +1811,10 @@ pub async fn get_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        authored_by: None,
+        visibility: None,
+        owner_group_id: None,
+        visibility_note: None,
     };
 
     Ok(Json(response))
@@ -3651,6 +4117,7 @@ mod db_tests {
             labels: vec![],
             if_not_exists: false,
             derived_from: None,
+            visibility: None,
         };
 
         let result = create_claim_core(&state, &viewer, Some(&auth), request).await;
@@ -3738,6 +4205,7 @@ mod db_tests {
                 labels: vec![],
                 if_not_exists: false,
                 derived_from: None,
+                visibility: None,
             };
             let result = create_claim_core(&state, &viewer, None, request).await;
             assert!(

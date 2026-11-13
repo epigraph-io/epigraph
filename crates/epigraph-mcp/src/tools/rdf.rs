@@ -45,7 +45,8 @@ pub async fn query_triples(
         ));
     }
 
-    let index_populated = TripleRepository::index_populated(&server.pool, viewer)
+    let mut read = server.read_as(viewer, "query_triples").await?;
+    let index_populated = TripleRepository::index_populated(&mut *read, viewer)
         .await
         .map_err(internal_error)?;
 
@@ -55,7 +56,7 @@ pub async fn query_triples(
 
     let subject_id = match (params.subject.as_deref(), params.subject_type.as_deref()) {
         (Some(name), Some(type_top)) => {
-            let id = EntityRepository::find_by_name_and_type(&server.pool, name, type_top)
+            let id = EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
                 .await
                 .map_err(internal_error)?
                 .map(|e| e.id);
@@ -69,7 +70,7 @@ pub async fn query_triples(
 
     let object_id = match (params.object.as_deref(), params.object_type.as_deref()) {
         (Some(name), Some(type_top)) => {
-            let id = EntityRepository::find_by_name_and_type(&server.pool, name, type_top)
+            let id = EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
                 .await
                 .map_err(internal_error)?
                 .map(|e| e.id);
@@ -92,7 +93,7 @@ pub async fn query_triples(
 
     let min_confidence = params.min_confidence.unwrap_or(0.0);
     let triples = TripleRepository::query(
-        &server.pool,
+        &mut *read,
         viewer,
         subject_id,
         params.predicate.as_deref(),
@@ -116,18 +117,19 @@ pub async fn entity_neighborhood(
     viewer: &epigraph_db::visibility::Viewer,
     params: EntityNeighborhoodParams,
 ) -> Result<CallToolResult, McpError> {
-    let index_populated = TripleRepository::index_populated(&server.pool, viewer)
+    let mut read = server.read_as(viewer, "entity_neighborhood").await?;
+    let index_populated = TripleRepository::index_populated(&mut *read, viewer)
         .await
         .map_err(internal_error)?;
 
     // Try UUID first, then name lookup
     let entity = if let Ok(uuid) = params.entity.parse::<Uuid>() {
-        EntityRepository::get(&server.pool, uuid)
+        EntityRepository::get(&mut *read, uuid)
             .await
             .map_err(internal_error)?
     } else {
         let type_top = params.entity_type.as_deref().unwrap_or("Material");
-        EntityRepository::find_by_name_and_type(&server.pool, &params.entity, type_top)
+        EntityRepository::find_by_name_and_type(&mut *read, &params.entity, type_top)
             .await
             .map_err(internal_error)?
     };
@@ -153,7 +155,7 @@ pub async fn entity_neighborhood(
         entity.merged_into.unwrap_or(entity.id)
     };
 
-    let triples = TripleRepository::entity_neighborhood(&server.pool, viewer, canonical_id, 100)
+    let triples = TripleRepository::entity_neighborhood(&mut *read, viewer, canonical_id, 100)
         .await
         .map_err(internal_error)?;
 
@@ -175,9 +177,12 @@ pub async fn search_triples(
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     // On an empty index the answer is known without embedding the query.
-    let index_populated = TripleRepository::index_populated(&server.pool, viewer)
+    let mut read = server.read_as(viewer, "search_triples").await?;
+    let index_populated = TripleRepository::index_populated(&mut *read, viewer)
         .await
         .map_err(internal_error)?;
+    // Released before the embedding round trip; taken again after it.
+    read.commit().await.map_err(internal_error)?;
     if !index_populated {
         return success_json(&serde_json::json!({
             "count": 0,
@@ -187,16 +192,18 @@ pub async fn search_triples(
         }));
     }
 
-    // Path B: Embedding fallback — find claims, then look up their triples
+    // Path B: Embedding fallback — find claims, then look up their triples.
+    // The embedder's search reads as `viewer` on its own stamped connection.
     let claim_results = server
         .embedder
         .search(viewer, &params.query, limit)
         .await
         .map_err(internal_error)?;
 
+    let mut read = server.read_as(viewer, "search_triples").await?;
     let mut triples = Vec::new();
     for (claim_id, _similarity) in &claim_results {
-        let claim_triples = TripleRepository::get_by_claim(&server.pool, viewer, *claim_id)
+        let claim_triples = TripleRepository::get_by_claim(&mut *read, viewer, *claim_id)
             .await
             .map_err(internal_error)?;
         triples.extend(claim_triples);

@@ -17,7 +17,9 @@ use crate::routes::admin::{
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
 use crate::routes::claims::{
-    ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse,
+    AuthorRefView, AuthoredByView, ClaimResponse, FilerView, IngesterView, PaperAuthorView,
+    PaperAuthorshipView, PaperRefView, PatchClaimRequest, PromptSnapshotView, UpdateLabelsRequest,
+    UpdateLabelsResponse,
 };
 use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
@@ -92,6 +94,7 @@ use workflow_schema_stubs::{
         supersede_claim_doc,
         mark_duplicate_doc,
         unmark_duplicate_doc,
+        get_claim_doc,
         patch_claim_doc,
         update_labels_doc,
         evolve_step_doc,
@@ -100,6 +103,7 @@ use workflow_schema_stubs::{
         deprecate_workflow_doc,
         ingest_workflow_doc,
         create_hierarchical_edge_doc,
+        search_agents_doc,
     ),
     components(
         schemas(
@@ -133,6 +137,14 @@ use workflow_schema_stubs::{
             UndedupResponse,
             PatchClaimRequest,
             ClaimResponse,
+            AuthoredByView,
+            AuthorRefView,
+            PromptSnapshotView,
+            FilerView,
+            IngesterView,
+            PaperAuthorshipView,
+            PaperRefView,
+            PaperAuthorView,
             UpdateLabelsRequest,
             UpdateLabelsResponse,
             EvolveStepRequest,
@@ -393,6 +405,85 @@ async fn mark_duplicate_doc() {}
     security(("ed25519_signature" = []))
 )]
 async fn unmark_duplicate_doc() {}
+
+/// Read one claim (doc stub)
+///
+/// A claim the caller may not read is 404, exactly as an id with no claim.
+/// The response carries `authored_by`, tagged by `source`. `agent` (no
+/// readable creation record names a document): `agent` (the filer, the
+/// author), `human` (the human the agent was bound to when it filed the
+/// claim, read from the binding record, never from an `OPERATED_BY` edge)
+/// for every reader, and `prompt_snapshot` only for the agent's linked human
+/// and admins (the prompt-history gate). `literature` (the document ingest
+/// recorded at creation that a document's ingest created the claim):
+/// `paper` (that document and its authors: the claim's primary authors are
+/// the ones its creating ingest recorded at creation, each on that ingest's
+/// own authorship of the document; authors an ingester named without their
+/// countersignature are listed apart under `pending_authors`, and authors a
+/// later ingest of the same document that also recorded the claim added
+/// under `added_authors` with `added_by`, neither ever primary; only the
+/// ingests that recorded the claim contribute authors) and `ingested_by` (the
+/// filer, with the same three parts). Both carry `corroborated_by` (every
+/// other readable document whose ingest recorded the claim) and `ingesters`
+/// (every readable ingest, each with the human its agent was bound to then).
+/// A bare `asserts` edge no ingest recorded is not read. A part the caller
+/// may not see is `null`, exactly as a part that does not exist.
+#[utoipa::path(
+    get,
+    path = "/api/v1/claims/{id}",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim")),
+    responses(
+        (status = 200, body = ClaimResponse),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+    )
+)]
+async fn get_claim_doc() {}
+
+/// Find agents by name (doc stub)
+///
+/// Case-insensitive, accent-folded name match (plus exact ORCID / ROR id where
+/// the caller may see the profile), ranked `orcid`/`ror` > `exact` > `prefix` >
+/// `trigram`. The body is `{results: [...], candidates_truncated}`; each result
+/// is an agent card (`id`, `display_name`, `kind`, `kind_evidence`, `roles`,
+/// `orcid`, `ror_id`, `operator_human`, `created_at`, `counts`) plus `tier`
+/// and `score`. `operator_human` (the human the agent is currently bound
+/// to: its live operator link, else its unrevoked client allowance; null
+/// once the link is retired) is shown to every reader; every other field is
+/// computed under the caller's viewer. `counts` holds `authored_papers`
+/// (papers it has an authorship of that is not awaiting its countersignature;
+/// a name-derived author is never countersigned and never pending),
+/// `pending_authored_papers` (papers an ingester named it on, awaiting its
+/// countersignature, where it has no other authorship) and `asserted_claims`,
+/// each paper and claim once. They count only in-force edges that carry the
+/// document ingest's ingest-written marker, which no other writer can set (an
+/// edge written over `POST /api/v1/edges` never counts, whatever its shape),
+/// and an attribution only when the same principal's ingest wrote the
+/// agent's counted authorship of a paper and that paper's assertion of the
+/// claim: each ingest that names the agent credits it with that ingest's
+/// claims, and no other ingest does.
+/// Same code as MCP `find_agent`. Scope `claims:read`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/agents/search",
+    tag = "agents",
+    params(
+        ("name" = String, Query, description = "Name, ORCID or ROR id (2-200 characters)"),
+        ("kind" = Option<String>, Query, description = "human | llm_agent | system | role | ingest_author | unknown"),
+        ("role" = Option<String>, Query, description = "Keep agents holding this role (role:<key> or <key>)"),
+        ("limit" = Option<i64>, Query, description = "1-25, default 10"),
+    ),
+    responses(
+        (status = 200, description = "Ranked agent cards"),
+        (status = 400),
+        (status = 401),
+        (status = 403),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn search_agents_doc() {}
 
 /// Partial update of a claim (doc stub)
 #[utoipa::path(

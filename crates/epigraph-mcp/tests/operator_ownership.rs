@@ -337,28 +337,31 @@ async fn an_operator_on_stdio_may_retire_its_agents_claims(pool: PgPool) {
     assert!(!is_current(&pool, c).await);
 }
 
-/// The ownership rule is exactly two arms (stage-2 brief A1): the operator
-/// over its linked agents' claims, and an acting agent over its operator's
-/// OTHER linked agents' claims. An operated agent does NOT own a claim its
-/// operator authored directly: the operator itself has no link record, so
-/// `author_op(operator)` is `None`. (An earlier revision had a third arm,
-/// `op(caller) == target`; it was removed to keep the rule to the brief's two.
-/// A human's other claims, of course, stay refused too.)
+/// Operator ruling R-183 ("agents acting for me should inherit my
+/// authority"): an operated agent with a LIVE link DOES own a claim its
+/// operator authored directly (the delegate arm, `op(caller) == target`,
+/// which stage-2 brief A1 had left out). Another human's claims stay refused:
+/// the arm follows the caller's own link, one hop
+/// (`delegate_claim_ownership.rs` pins the guards).
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_operated_agent_does_not_own_its_operators_directly_authored_claims(pool: PgPool) {
+async fn an_operated_agent_owns_its_operators_directly_authored_claims_only(pool: PgPool) {
     let operator = operator_agent(&pool, "operator").await;
     let other_human = agent(&pool, "other-human").await;
     let (server, me) = server_with_seed(&pool, 0x54).await;
     link(&pool, me, operator).await;
 
-    for author in [operator, other_human] {
-        let c = own_claim(&pool, author).await;
-        let err = supersede(&server, &pool, c, None)
-            .await
-            .expect_err("an operated agent must not own a claim authored by a human directly");
-        assert!(err.contains("declared signer identity"), "{err}");
-        assert!(is_current(&pool, c).await);
-    }
+    let mine = own_claim(&pool, operator).await;
+    supersede(&server, &pool, mine, None)
+        .await
+        .expect("a live delegate owns its operator's directly authored claim (R-183)");
+    assert!(!is_current(&pool, mine).await);
+
+    let c = own_claim(&pool, other_human).await;
+    let err = supersede(&server, &pool, c, None)
+        .await
+        .expect_err("an operated agent must not own another human's claim");
+    assert!(err.contains("declared signer identity"), "{err}");
+    assert!(is_current(&pool, c).await);
 }
 
 /// A2 + A1: a RETIRED agent's claims — world-owned legacy ones and ones owned
@@ -434,6 +437,8 @@ async fn submit_claim_from_an_operated_agent_is_owned_by_the_operator(pool: PgPo
             reasoning: Some("operator ownership".to_string()),
             labels: Vec::new(),
             novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

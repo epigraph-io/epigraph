@@ -130,8 +130,9 @@ pub async fn get_provenance(
     let claim_id = parse_uuid(&params.claim_id)?;
     let limits = Limits::from_params(&params);
 
-    let lineage = LineageRepository::get_lineage(
-        &server.pool,
+    let mut read = server.read_as(viewer, "get_provenance").await?;
+    let lineage = LineageRepository::get_lineage_conn(
+        &mut read,
         viewer,
         claim_id,
         Some(limits.max_depth),

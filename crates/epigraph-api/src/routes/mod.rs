@@ -44,7 +44,13 @@ pub mod batch;
 pub mod bba_retract;
 pub mod belief;
 pub mod challenge;
+#[cfg(feature = "db")]
+pub mod claim_context;
+#[cfg(feature = "db")]
+pub mod claim_visibility;
 pub mod claims;
+#[cfg(feature = "db")]
+pub mod claims_batch_get;
 pub mod claims_query;
 pub mod clusters;
 pub mod community;
@@ -58,6 +64,8 @@ pub mod conventions;
 pub mod cross_source;
 pub mod crud;
 pub mod edges;
+#[cfg(feature = "db")]
+pub mod ego;
 #[cfg(feature = "db")]
 pub mod elevate;
 #[cfg(feature = "db")]
@@ -75,6 +83,9 @@ pub mod extensions;
 pub mod gaps;
 #[cfg(feature = "db")]
 pub mod graph;
+/// The Atlas layout and its bundle drill-down (migration 197).
+#[cfg(feature = "db")]
+pub mod graph_layout;
 #[cfg(feature = "db")]
 pub mod graph_neighborhood;
 #[cfg(feature = "db")]
@@ -102,6 +113,8 @@ mod negative_tests;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
+pub mod placement;
+#[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
 pub mod privatization;
@@ -110,6 +123,8 @@ pub mod privatization;
 pub mod projection;
 #[cfg(feature = "db")]
 pub mod provenance;
+#[cfg(feature = "db")]
+pub mod provenance_chain;
 pub mod rag;
 pub mod reasoning;
 pub mod revoke_signature;
@@ -117,6 +132,8 @@ pub mod revoke_signature;
 pub mod search;
 pub mod spans;
 pub mod staging;
+#[cfg(feature = "db")]
+pub mod stats;
 pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
@@ -224,6 +241,32 @@ pub(crate) async fn finish_scoped_read(
     })
 }
 
+/// Open a viewer-stamped read for `handler`: the acquire half of
+/// [`finish_scoped_read`], with the same error shape.
+///
+/// `AppState::read_as`'s refusal reason is internal design prose aimed at
+/// whoever built the `AppState`, so it goes to the operator's log and the
+/// client gets an opaque 500. Converted handlers before this one spelled the
+/// mapping out inline; it is the same twelve lines in each.
+#[cfg(feature = "db")]
+pub(crate) async fn open_scoped_read<'a>(
+    state: &'a AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedRead<'a>, crate::errors::ApiError> {
+    state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = handler,
+            "could not acquire a viewer-stamped connection"
+        );
+        crate::errors::ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })
+}
+
 // `crate::metrics` is deliberately NOT imported here. `/metrics` was removed
 // from both router variants in PR-03 and is served only by the internal
 // listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).
@@ -266,6 +309,31 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    res
+}
+
+/// Response headers for a route whose every response is viewer-scoped
+/// (`POST /api/v1/search/semantic`): its body depends on who asks, so no
+/// shared cache may store it, and a private cache must key on the credential.
+///
+/// * `Cache-Control: private, no-store`.
+/// * `Vary: Authorization`.
+///
+/// Inserted, not appended, so a handler cannot weaken them. Applied with
+/// `middleware::map_response` on the method router, inside the protected
+/// chain, so bearer auth still wraps it; the handler's own return type is
+/// unchanged.
+#[cfg(feature = "db")]
+async fn viewer_scoped_cache_headers(
+    mut res: axum::response::Response,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let h = res.headers_mut();
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    h.insert(header::VARY, HeaderValue::from_static("Authorization"));
     res
 }
 
@@ -471,6 +539,25 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/mass-functions/:id/unretract",
             post(bba_retract::unretract_bba),
+        )
+        // Claim visibility controls (migration 206,
+        // docs/tenancy/claim-visibility-controls.md).
+        .route(
+            "/api/v1/claims/publicize",
+            post(claim_visibility::publicize_claims),
+        )
+        .route(
+            "/api/v1/claims/share-with-team",
+            post(claim_visibility::share_claims_with_team),
+        )
+        .route(
+            "/api/v1/agents/me/default-group",
+            put(claim_visibility::set_default_group),
+        )
+        // Migration 209: an operator sets the default of an agent it operates.
+        .route(
+            "/api/v1/agents/:id/default-group",
+            put(claim_visibility::set_agent_default_group),
         )
         .route(
             "/api/v1/frames/:id/conflict-batch",
@@ -713,6 +800,11 @@ pub fn create_router_with_extensions(
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
         .route("/api/v1/graph/themes/overview", get(graph::themes_overview))
         .route(
+            "/api/v1/graph/themes/layout",
+            get(graph_layout::themes_layout),
+        )
+        .route("/api/v1/graph/links", get(graph_layout::graph_links))
+        .route(
             "/api/v1/graph/themes/:theme_id/expand",
             get(graph::themes_expand),
         )
@@ -772,6 +864,9 @@ pub fn create_router_with_extensions(
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
         .route("/api/v1/agents", get(agents::list_agents))
+        // Name search (find_agent): registered before `/api/v1/agents/:id`
+        // for readability; axum's router prefers the static segment anyway.
+        .route("/api/v1/agents/search", get(agents::search_agents))
         .route("/agents/:id", get(agents::get_agent))
         .route("/api/v1/agents/:id", get(agents::get_agent))
         .route("/agents/:id/reputation", get(agents::get_agent_reputation))
@@ -800,13 +895,21 @@ pub fn create_router_with_extensions(
             get(timeline::get_agent_timeline),
         )
         .route("/lineage/:claim_id", get(lineage::get_lineage))
-        .route("/api/v1/search/semantic", post(search::semantic_search))
+        .route(
+            "/api/v1/search/semantic",
+            post(search::semantic_search)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
         .route("/api/v1/claims", get(claims_query::list_claims_query_route))
         .route(
             "/api/v1/claims/needing-embeddings",
             get(claims::find_claims_needing_embeddings),
         )
         .route("/api/v1/claims/:id", get(claims::get_claim))
+        .route(
+            "/api/v1/claims/batch-get",
+            post(claims_batch_get::batch_get_claims),
+        )
         .route("/api/v1/query/rag", get(rag::rag_context))
         .route("/api/v1/search/evidence", get(rag::search_evidence))
         .route(
@@ -833,6 +936,7 @@ pub fn create_router_with_extensions(
             get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
+        .route("/api/v1/stats", get(stats::corpus_stats))
         // Elevation (plan EL-5, rulings D2/D5): a human asks for a grant-mode
         // ticket for ITSELF (the definer is principal-bound and refuses anyone
         // without a live elevating-role assignment and a live passkey), and
@@ -886,6 +990,19 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/claims/:id/provenance",
             get(edges::claim_provenance),
+        )
+        .route(
+            "/api/v1/claims/:id/provenance-chain",
+            get(provenance_chain::claim_provenance_chain),
+        )
+        .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
+        .route(
+            "/api/v1/claims/:id/context",
+            get(claim_context::claim_context),
+        )
+        .route(
+            "/api/v1/claims/:id/placement",
+            get(placement::claim_placement),
         )
         .route(
             "/api/v1/claims/:id/supporting-evidence",

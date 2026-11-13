@@ -3,6 +3,9 @@
 //! evolution (GEPA) proposer consumes. Mirrors the server-construction harness
 //! in `recompute_beliefs_test.rs`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::{BehavioralExecutionRepository, BehavioralExecutionRow};
 use epigraph_mcp::types::GetWorkflowExecutionsParams;
@@ -14,7 +17,16 @@ use uuid::Uuid;
 fn make_server(pool: PgPool) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0x2bu8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
+    }
 }
 
 fn result_json(out: rmcp::model::CallToolResult) -> serde_json::Value {
@@ -51,6 +63,7 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "gwe-agent").await;
     let wf = insert_claim(&pool, agent, "gwe-workflow-root").await;
@@ -78,6 +91,7 @@ async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
 
     let out = tools::workflows::get_workflow_executions(
         &server,
+        &viewer,
         GetWorkflowExecutionsParams {
             workflow_id: wf.to_string(),
             limit: Some(10),
@@ -102,6 +116,7 @@ async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
     // (that would be a confusing false negative for the proposer).
     let bad = tools::workflows::get_workflow_executions(
         &server,
+        &viewer,
         GetWorkflowExecutionsParams {
             workflow_id: "not-a-uuid".into(),
             limit: None,
