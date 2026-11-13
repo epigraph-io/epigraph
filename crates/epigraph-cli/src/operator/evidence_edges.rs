@@ -227,6 +227,9 @@ struct Missing {
     /// `"<visibility>/<owner group kind>"` of the evidence row and of its claim.
     evidence_tenancy: String,
     claim_tenancy: String,
+    /// A derivation row or a memorize stamp: its edge does not ground the
+    /// claim (`ClaimRepository::has_grounded_evidence`).
+    provenance_only: bool,
 }
 
 const MISSING_PREDICATE: &str = "\
@@ -247,7 +250,9 @@ async fn missing_page(
     let sql = format!(
         "SELECT ev.id, ev.claim_id, \
                 ev.visibility::text || '/' || COALESCE(ge.kind::text, 'none'), \
-                c.visibility::text || '/' || COALESCE(gc.kind::text, 'none') \
+                c.visibility::text || '/' || COALESCE(gc.kind::text, 'none'), \
+                COALESCE(ev.properties ? 'derived_from_claim' \
+                         OR ev.properties->>'source' = 'mcp-memorize', false) \
            FROM public.evidence ev \
            JOIN public.claims c ON c.id = ev.claim_id \
            LEFT JOIN public.groups ge ON ge.id = ev.owner_group_id \
@@ -268,6 +273,7 @@ async fn missing_page(
             claim: r.get(1),
             evidence_tenancy: r.get(2),
             claim_tenancy: r.get(3),
+            provenance_only: r.get(4),
         })
         .collect())
 }
@@ -330,12 +336,19 @@ pub struct Census {
     pub present_by_relationship: BTreeMap<String, i64>,
     /// Rows whose only edges to their claim are retracted (never re-written).
     pub retracted_only: i64,
-    /// Missing rows skipped because their claim is sealed.
+    /// Missing rows skipped because they are sealed either way: each row
+    /// once, whatever [`Self::sealed_claim`] and [`Self::sealed_evidence`]
+    /// say (a row sealed both ways is in both of those).
+    pub sealed_total: i64,
+    /// Missing rows whose claim is sealed.
     pub sealed_claim: i64,
-    /// Missing rows skipped because the evidence row itself is sealed.
+    /// Missing rows that are themselves sealed.
     pub sealed_evidence: i64,
     /// Missing, unsealed rows: what `--apply` writes.
     pub to_write: u64,
+    /// Of [`Self::to_write`], derivation rows and memorize stamps: their
+    /// edges are written but do not ground the claim.
+    pub provenance_only: u64,
     pub by_relationship: BTreeMap<&'static str, u64>,
     pub by_rule: BTreeMap<&'static str, u64>,
     /// `(evidence tenancy, claim tenancy)` -> rows.
@@ -387,13 +400,15 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
     .fetch_one(&mut *tx)
     .await?;
     let sealed_sql = format!(
-        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM public.claim_encryption ce \
+        "SELECT count(*) FILTER (WHERE NOT ({UNSEALED_PREDICATE})), \
+                count(*) FILTER (WHERE EXISTS (SELECT 1 FROM public.claim_encryption ce \
                                                 WHERE ce.claim_id = ev.claim_id)), \
                 count(*) FILTER (WHERE EXISTS (SELECT 1 FROM public.evidence_encryption ee \
                                                 WHERE ee.evidence_id = ev.id)) \
            FROM public.evidence ev WHERE {MISSING_PREDICATE}"
     );
-    let (sc, se): (i64, i64) = sqlx::query_as(&sealed_sql).fetch_one(&mut *tx).await?;
+    let (st, sc, se): (i64, i64, i64) = sqlx::query_as(&sealed_sql).fetch_one(&mut *tx).await?;
+    c.sealed_total = st;
     c.sealed_claim = sc;
     c.sealed_evidence = se;
 
@@ -407,6 +422,7 @@ pub async fn census(conn: &mut PgConnection, o: &Options) -> anyhow::Result<Cens
         for m in &page {
             let rule = rules.get(&m.evidence).copied().unwrap_or(Rule::NoBba);
             c.to_write += 1;
+            c.provenance_only += u64::from(m.provenance_only);
             *c.by_relationship
                 .entry(rule.direction().relationship())
                 .or_default() += 1;
@@ -438,10 +454,16 @@ pub fn describe(c: &Census) -> Vec<String> {
         c.retracted_only
     ));
     out.push(format!(
-        "SKIPPED, sealed: {} missing row(s) on a sealed claim, {} sealed evidence row(s)",
-        c.sealed_claim, c.sealed_evidence
+        "SKIPPED, sealed: {} missing row(s) ({} on a sealed claim, {} sealed evidence; a row \
+         sealed both ways is in each)",
+        c.sealed_total, c.sealed_claim, c.sealed_evidence
     ));
     out.push(format!("to_write: {}", c.to_write));
+    out.push(format!(
+        "  of which provenance only (derivation rows, memorize stamps; the edge does not \
+         ground the claim): {}",
+        c.provenance_only
+    ));
     out.push("  by relationship:".to_string());
     for (rel, n) in &c.by_relationship {
         out.push(format!("    {rel}: {n}"));

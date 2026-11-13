@@ -231,8 +231,9 @@ async fn the_dry_run_counts_exactly_the_missing_edges_and_writes_nothing(pool: P
         "evidence rows: 6",
         "  SUPPORTS: 1",
         "rows whose only edges to their claim are retracted (left alone): 1",
-        "SKIPPED, sealed: 1 missing row(s) on a sealed claim, 1 sealed evidence row(s)",
+        "SKIPPED, sealed: 2 missing row(s) (1 on a sealed claim, 1 sealed evidence;",
         "to_write: 2",
+        "ground the claim): 0",
         "    supports: 2",
         "    no_bba_default_supports: 2",
         "    group/personal -> group/personal: 1",
@@ -520,3 +521,62 @@ async fn evidence_filed_against_its_claim_is_backfilled_refutes(pool: PgPool) {
     assert_eq!(edges.len(), 1, "{edges:?}");
     assert_eq!(edges[0].0, "refutes", "{}", run.show());
 }
+
+/// The census counts a row sealed BOTH ways (its claim and itself) once in
+/// its skipped total, and names the rows whose edge will not ground their
+/// claim (a derivation row here).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_census_counts_a_doubly_sealed_row_once_and_names_provenance_rows(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "ev-edge-census").await;
+    let sealed_claim = fixture::seed_group_claim(&pool, agent, group, "sealed twice").await;
+    let both = fixture::seed_evidence(&pool, sealed_claim, "document").await;
+    let seal = seal_group(&pool, agent).await;
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                       encrypted_content) \
+         VALUES ($1, $2, $3, 'fully_private', ''::bytea)",
+    )
+    .bind(sealed_claim)
+    .bind(seal)
+    .bind(EPOCH)
+    .execute(&pool)
+    .await
+    .expect("seal the claim");
+    sqlx::query(
+        "INSERT INTO evidence_encryption (evidence_id, group_id, epoch, privacy_tier, \
+                                          encrypted_content) \
+         VALUES ($1, $2, $3, 'fully_private', ''::bytea)",
+    )
+    .bind(both)
+    .bind(seal)
+    .bind(EPOCH)
+    .execute(&pool)
+    .await
+    .expect("seal the evidence");
+    let derived_claim = fixture::seed_public_claim(&pool, agent, "an atom").await;
+    sqlx::query(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content, properties) \
+         VALUES ($1, 'document', $2, 'the parent text', $3)",
+    )
+    .bind(derived_claim)
+    .bind(vec![9u8; 32])
+    .bind(serde_json::json!({
+        "type": "document", "mime_type": "text/plain", "source_url": null, "checksum": null,
+        "derived_from_claim": Uuid::new_v4().to_string(), "method": "decomposition"
+    }))
+    .execute(&pool)
+    .await
+    .expect("derivation row");
+    assert_eq!(missing(&pool).await.len(), 2, "control: both rows lack an edge");
+
+    let run = run_op(&pool, &["backfill-evidence-edges"]).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    for line in [
+        "SKIPPED, sealed: 1 missing row(s) (1 on a sealed claim, 1 sealed evidence;",
+        "to_write: 1",
+        "ground the claim): 1",
+    ] {
+        assert!(run.stdout.contains(line), "missing {line:?}:\n{}", run.show());
+    }
+}
+
