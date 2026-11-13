@@ -265,6 +265,13 @@ name = "embed_backfill_workflows"
 path = "tests/embed_backfill_workflows.rs"
 required-features = ["db"]
 
+# Atlas W6: positions filled into a synthetic map and stored through W2's
+# `AtlasMapRepository` (a fresh database per test).
+[[test]]
+name = "atlas_w6_layout_store"
+path = "tests/atlas_w6_layout_store.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "bootstrap_clients"
 path = "src/bin/bootstrap_clients.rs"
