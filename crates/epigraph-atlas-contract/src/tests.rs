@@ -599,6 +599,114 @@ fn extra_private_field_is_rejected() {
     }
 }
 
+/// Keys that carry a belief value. No Atlas body carries one: not the
+/// region and theme routes (the Explorer's `assert_no_belief_keys` bans the
+/// same list), and not a v1 level, whose claim nodes carry no BetP until
+/// the evidence behind them is filed as stored edges.
+const BELIEF_KEYS: &[&str] = &[
+    "belief",
+    "plausibility",
+    "pignistic_prob",
+    "epistemic",
+    "mean_betp",
+    "betp",
+];
+
+/// Every object key in `v`, and every string listed under a `required`.
+fn keys_in(v: &Value, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                out.insert(k.clone());
+                if k == "required" {
+                    for r in x.as_array().into_iter().flatten() {
+                        out.insert(r.as_str().unwrap_or_default().to_string());
+                    }
+                }
+                keys_in(x, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| keys_in(x, out)),
+        _ => {}
+    }
+}
+
+/// Neither the schema nor any document the generator writes names a belief
+/// key, and a claim node is exactly its id, label, position and colour.
+#[test]
+fn the_contract_carries_no_belief_value() {
+    let mut docs: Vec<(String, Value)> = vec![("schema.json".into(), schema().clone())];
+    for (name, body) in fixtures::files() {
+        docs.push((
+            name,
+            serde_json::from_str(&body).expect("a fixture is JSON"),
+        ));
+    }
+    for (what, doc) in [
+        ("worst-case leaf", fixtures::worst_case_leaf()),
+        ("worst-case group", fixtures::worst_case_group()),
+    ] {
+        docs.push((what.into(), serde_json::to_value(&doc).unwrap()));
+    }
+    for (what, doc) in &docs {
+        let mut keys = BTreeSet::new();
+        keys_in(doc, &mut keys);
+        for k in BELIEF_KEYS {
+            assert!(!keys.contains(*k), "{what} names `{k}`");
+        }
+    }
+    let claim = &schema()["$defs"]["claim_node"];
+    assert_eq!(
+        claim["required"],
+        json!(["kind", "id", "label", "x", "y", "truth_value"])
+    );
+    let props: BTreeSet<&str> = claim["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        props,
+        BTreeSet::from(["kind", "id", "label", "x", "y", "truth_value"])
+    );
+}
+
+/// A leaf claim node carrying `betp` fails as an unknown key of a closed
+/// object, on both sides and whatever its value, null included.
+#[test]
+fn a_leaf_claim_node_carrying_betp_is_rejected() {
+    for stem in ["team_leaf_dense", "public_leaf"] {
+        for value in [json!(0.7), Value::Null] {
+            let mut v = read_value(stem);
+            let i = v["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|n| n["kind"] == json!("claim"))
+                .expect("a leaf has a claim");
+            v["nodes"][i]["betp"] = value.clone();
+            let errs = check_as(stem, &serde_json::to_vec(&v).unwrap())
+                .expect_err("a claim node carrying betp must fail the contract");
+            assert!(
+                errs.iter()
+                    .any(|e| e.starts_with(&format!("schema /nodes/{i}:"))),
+                "{stem} betp={value}: the schema rejects the node: {errs:#?}"
+            );
+            assert!(
+                errs.iter()
+                    .any(|e| e.starts_with("types") && e.contains("unknown field `betp`")),
+                "{stem} betp={value}: the types reject an unknown field: {errs:#?}"
+            );
+            let def = crate::check::def_errors("claim_node", &v["nodes"][i]);
+            assert!(
+                def.iter().any(|e| e.contains("betp")),
+                "{stem} betp={value}: claim_node names the extra key: {def:#?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn missing_flow_basis_is_rejected() {
     let mut v = read_value("team_leaf_dense");

@@ -327,11 +327,13 @@ fn leaf_level(
     n_outgoing: usize,
 ) -> LeafLevel {
     let pos = |rng: &mut Rng| (r4(rng.unit() * 1.9 - 0.95), r4(rng.unit() * 1.9 - 0.95));
-    let claims: Vec<ClaimNode> = (0..n_claims)
+    // Each claim's belief, as the builder reads it role-aware at build time.
+    // It only feeds the proxy flow weights below: no node carries it.
+    let (claims, belief): (Vec<ClaimNode>, Vec<Option<f64>>) = (0..n_claims)
         .map(|_| {
             let (x, y) = pos(rng);
-            let betp = r4(rng.unit());
-            ClaimNode {
+            let b = r4(rng.unit());
+            let node = ClaimNode {
                 id: rng.uuid(),
                 label: claim_label(rng),
                 x,
@@ -341,10 +343,10 @@ fn leaf_level(
                 } else {
                     Some(r4(rng.unit()))
                 },
-                betp: if rng.chance(0.05) { None } else { Some(betp) },
-            }
+            };
+            (node, if rng.chance(0.05) { None } else { Some(b) })
         })
-        .collect();
+        .unzip();
     let agents: Vec<PlainNode> = (0..n_agents)
         .map(|i| {
             let (x, y) = pos(rng);
@@ -421,8 +423,8 @@ fn leaf_level(
             );
         }
     }
-    // Claims to claims: link strength times the source's BetP.
-    for c in &claims {
+    // Claims to claims: link strength times the source's belief.
+    for (c, b) in claims.iter().zip(&belief) {
         for _ in 0..per_claim {
             let t = &claims[rng.below(claims.len())];
             let (rel, sign) = CLAIM_RELATIONSHIPS[rng.below(CLAIM_RELATIONSHIPS.len())];
@@ -434,7 +436,7 @@ fn leaf_level(
                     target: t.id,
                     relationship: rel.into(),
                     sign,
-                    flow_weight: r4(strength * c.betp.unwrap_or(0.0)),
+                    flow_weight: r4(strength * b.unwrap_or(0.0)),
                     flow_basis: FlowBasis::Proxy,
                 },
             );
@@ -647,7 +649,6 @@ pub fn worst_case_leaf() -> LevelDocument {
             x: rng.unit() * 2.0 - 1.0,
             y: rng.unit() * 2.0 - 1.0,
             truth_value: Some(rng.unit()),
-            betp: Some(rng.unit()),
         })
         .collect();
     let ids: Vec<Uuid> = claims.iter().map(|c| c.id).collect();

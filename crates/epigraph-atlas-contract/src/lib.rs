@@ -138,9 +138,12 @@ pub enum ChildKind {
 pub enum FlowBasis {
     /// Evidence to claim, always: the stored mass.
     Exact,
-    /// Claim to claim, always: link strength times the source claim's BetP.
-    /// The view labels it an estimate. A link with no belief direction
-    /// (`cites`) is still `proxy`, with sign 0.
+    /// Claim to claim, always: link strength times the source claim's
+    /// belief, which the view labels an estimate. The builder (backlog W7)
+    /// computes it at build time from a role-aware belief read of the source
+    /// claim (the `no_role_blind_belief_reads` ratchet), never from a served
+    /// field: no leaf node carries a belief value. A link with no belief
+    /// direction (`cites`) is still `proxy`, with sign 0.
     Proxy,
     /// Every other pair of kinds (an agent's authorship, for example): no
     /// belief flow, so weight 0 and sign 0.
@@ -227,6 +230,12 @@ pub struct Bundle {
 }
 
 /// A claim node of a leaf.
+///
+/// It carries no belief value: no BetP, as on the region and theme routes.
+/// A v1 leaf is drawn before the evidence behind each claim is filed as
+/// stored evidence-to-claim edges, so a served BetP would rest on evidence
+/// the leaf cannot show. Adding one is a later schema version. A document
+/// carrying `betp` fails as an unknown key.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimNode {
@@ -234,16 +243,11 @@ pub struct ClaimNode {
     pub label: String,
     pub x: f64,
     pub y: f64,
-    /// The colour value, as at the region and theme levels.
+    /// The colour value, as at the region and theme levels, and nothing
+    /// more: the view never sorts, compares or folds it, and no flow weight
+    /// is computed from it.
     #[serde(deserialize_with = "Option::deserialize")]
     pub truth_value: Option<f64>,
-    /// The claim's BetP, which proxy flows are computed from. It comes from
-    /// a role-aware belief read (the `no_role_blind_belief_reads` ratchet),
-    /// never from a compound's folded cache, and is `None` where that read
-    /// gives no value. Whether the leaf carries it at all is open for an
-    /// operator ruling: the existing Atlas routes serve no belief value.
-    #[serde(deserialize_with = "Option::deserialize")]
-    pub betp: Option<f64>,
 }
 
 /// An agent or evidence node of a leaf.
@@ -760,9 +764,6 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
         if let Node::Claim(c) = n {
             if let Some(t) = c.truth_value {
                 check_unit(&format!("{p}/truth_value"), t, v);
-            }
-            if let Some(b) = c.betp {
-                check_unit(&format!("{p}/betp"), b, v);
             }
         }
     }

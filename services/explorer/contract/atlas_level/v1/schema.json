@@ -150,7 +150,8 @@
     "claim_node": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "id", "label", "x", "y", "truth_value", "betp"],
+      "description": "A claim of the leaf. It carries no belief value (no BetP): v1 leaves are drawn before the evidence behind each claim is filed as stored edges, so a served BetP would rest on evidence the leaf cannot show. A later schema version may add one.",
+      "required": ["kind", "id", "label", "x", "y", "truth_value"],
       "properties": {
         "kind": { "const": "claim" },
         "id": { "$ref": "#/$defs/uuid" },
@@ -158,11 +159,7 @@
         "x": { "$ref": "#/$defs/coord" },
         "y": { "$ref": "#/$defs/coord" },
         "truth_value": {
-          "description": "The colour value, as at the region and theme levels.",
-          "$ref": "#/$defs/nullable_unit_interval"
-        },
-        "betp": {
-          "description": "The claim's BetP, from a role-aware belief read (never a compound's folded cache); null where that read gives none. The proxy flow of its outgoing claim edges is computed from it.",
+          "description": "The colour value, as at the region and theme levels. Colour only: never an input to a flow weight.",
           "$ref": "#/$defs/nullable_unit_interval"
         }
       }
@@ -180,7 +177,7 @@
       }
     },
     "edge": {
-      "description": "A link between two nodes of the leaf, pointing the way belief flows. The endpoint kinds fix flow_basis. exact: every evidence-to-claim edge, the stored mass. proxy: every claim-to-claim edge, link strength times the source claim's BetP, which the view labels an estimate. none: every other pair (an agent's authorship, for example), so weight 0 and sign 0. Stored edges repeating one (source, target, relationship) collapse into one edge with the largest flow_weight among them.",
+      "description": "A link between two nodes of the leaf, pointing the way belief flows. The endpoint kinds fix flow_basis. exact: every evidence-to-claim edge, the stored mass. proxy: every claim-to-claim edge, link strength times the source claim's belief, which the view labels an estimate; the layout builder computes it at build time from a role-aware belief read of the source claim, not from any field of this document. none: every other pair (an agent's authorship, for example), so weight 0 and sign 0. Stored edges repeating one (source, target, relationship) collapse into one edge with the largest flow_weight among them.",
       "type": "object",
       "additionalProperties": false,
       "required": ["source", "target", "relationship", "sign", "flow_weight", "flow_basis"],

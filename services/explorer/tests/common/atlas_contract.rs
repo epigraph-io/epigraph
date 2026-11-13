@@ -96,6 +96,29 @@ fn validator(def: Option<&str>) -> jsonschema::Validator {
     jsonschema::validator_for(&doc).expect("schema.json compiles")
 }
 
+/// Schema errors against one of the schema's `$defs`, such as
+/// `claim_node`: the root's `oneOf` reports a bad node only as "no branch
+/// matched", while its own def names the key that is wrong.
+pub fn def_errors(def: &str, doc: &Value) -> Vec<String> {
+    validator(Some(def))
+        .iter_errors(doc)
+        .map(|e| format!("schema #/$defs/{def}{}: {e}", e.instance_path()))
+        .collect()
+}
+
+/// Keys that carry a belief value. No Atlas body carries one: the region
+/// and theme routes (colour comes from `truth_value` alone) and the nested
+/// levels alike, whose claim nodes carry no BetP until the evidence behind
+/// them is filed as stored edges.
+pub const BELIEF_KEYS: &[&str] = &[
+    "belief",
+    "plausibility",
+    "pignistic_prob",
+    "epistemic",
+    "mean_betp",
+    "betp",
+];
+
 /// Schema errors for a level document; empty when it validates.
 pub fn schema_errors(doc: &Value) -> Vec<String> {
     static ROOT: OnceLock<jsonschema::Validator> = OnceLock::new();

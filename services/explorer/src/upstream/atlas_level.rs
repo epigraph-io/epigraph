@@ -59,8 +59,9 @@ pub enum ChildKind {
 }
 
 /// `exact` (evidence to claim, the stored mass), `proxy` (claim to claim,
-/// strength times the source's BetP: shown as an estimate) or `none` (no
-/// belief flow).
+/// strength times the source's belief, computed by the kernel's layout
+/// builder at build time from a role-aware read, never from a served field:
+/// shown as an estimate) or `none` (no belief flow).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
@@ -114,17 +115,17 @@ pub struct Bundle {
     pub net_sign: i8,
 }
 
+/// A claim of a leaf. Like the region and theme routes, it carries no
+/// belief value: no BetP until the evidence behind each claim is filed as
+/// stored edges (a later schema version).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ClaimNode {
     pub id: Uuid,
     pub label: String,
     pub x: f64,
     pub y: f64,
+    /// The colour value, as at the region and theme levels.
     pub truth_value: Option<f64>,
-    /// From a role-aware belief read, never a compound's folded cache. This
-    /// is the one Atlas body that carries a belief value (the region and
-    /// theme routes carry none); whether it stays is open for a ruling.
-    pub betp: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

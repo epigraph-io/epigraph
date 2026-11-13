@@ -48,8 +48,7 @@
       "label": "Roisdun kane mimi selbel onvor torthi imve.",
       "x": -0.9051,
       "y": -0.4309,
-      "truth_value": 0.4705,
-      "betp": 0.3885
+      "truth_value": 0.4705
     },
     {
       "kind": "claim",
@@ -57,8 +56,7 @@
       "label": "Saqua linprami veul vorfobel roqua praop cordun kasane delpra foisdel onsel vorbel imqua isthimi imta opopve ondel thitaex saonsa mibel tais vorrovor thivorbel ",
       "x": 0.4085,
       "y": -0.1743,
-      "truth_value": 0.312,
-      "betp": 0.1319
+      "truth_value": 0.312
     },
     {
       "kind": "claim",
@@ -66,8 +64,7 @@
       "label": "Taop dunfo selzen delselve arcor pracordun ulvorsel vorvordel.",
       "x": 0.0587,
       "y": 0.378,
-      "truth_value": 0.9915,
-      "betp": 0.728
+      "truth_value": 0.9915
     },
     {
       "kind": "claim",
@@ -75,8 +72,7 @@
       "label": "Lindunlin exdunta belrita delfolin deltorsel delthimi quaarar onimtor prathizen torvor dunmi focorsa onlinis dunis quaquaim imthi pravethi linar pracoron saex a",
       "x": 0.3785,
       "y": 0.6124,
-      "truth_value": 0.2824,
-      "betp": 0.4329
+      "truth_value": 0.2824
     },
     {
       "kind": "claim",
@@ -84,8 +80,7 @@
       "label": "Linim neta roisis toropcor mive arulsa taul artator sanedun kadel ondel expra corzen roar arve velinve arvor dunro onex torisro exzenka torarro tormi.",
       "x": -0.5993,
       "y": 0.4346,
-      "truth_value": 0.0845,
-      "betp": 0.6005
+      "truth_value": 0.0845
     },
     {
       "kind": "claim",
@@ -93,8 +88,7 @@
       "label": "Linul fopraka artorthi quazenop dundel ulim torex ulthiex taimon.",
       "x": -0.1282,
       "y": 0.8434,
-      "truth_value": 0.6593,
-      "betp": 0.8627
+      "truth_value": 0.6593
     },
     {
       "kind": "claim",
@@ -102,8 +96,7 @@
       "label": "Taka zensa exri quaistor seltor rithidel venecor imriqua.",
       "x": -0.3412,
       "y": -0.7707,
-      "truth_value": 0.0223,
-      "betp": 0.7606
+      "truth_value": 0.0223
     },
     {
       "kind": "claim",
@@ -111,8 +104,7 @@
       "label": "Nevorpra selseldun taqua selqua torpra opdel isbellin mionri torquadel foul ritortor.",
       "x": 0.0469,
       "y": 0.7212,
-      "truth_value": 0.1607,
-      "betp": 0.8015
+      "truth_value": 0.1607
     },
     {
       "kind": "claim",
@@ -120,8 +112,7 @@
       "label": "Sabellin opul selop cortortor quabel coron delista belcor kaar onquaar roexop kathidun veta rimitor kaarsa saquadel nezen dunex quaex isim imfopra zenta beltave",
       "x": -0.5687,
       "y": -0.5652,
-      "truth_value": 0.5656,
-      "betp": 0.0594
+      "truth_value": 0.5656
     },
     {
       "kind": "claim",
@@ -129,8 +120,7 @@
       "label": "Verithi belta riis kavor veonbel belexex neim torsel roim praveul seldel isqua quafovor veveri prarone kais isri safo.",
       "x": 0.6175,
       "y": 0.0776,
-      "truth_value": null,
-      "betp": 0.8794
+      "truth_value": null
     },
     {
       "kind": "claim",
@@ -138,8 +128,7 @@
       "label": "Velinop zenardun selsa fothi selve selimop belvor rozen prari quacoron takasa praonne selcor belmidun thikaon zenquasel dunis taqua kalinar kacor vorfoar fove.",
       "x": -0.8706,
       "y": -0.3665,
-      "truth_value": 0.4736,
-      "betp": 0.383
+      "truth_value": 0.4736
     },
     {
       "kind": "claim",
@@ -147,8 +136,7 @@
       "label": "Linri ulmi zenfo belar ardel isar imtorro nenear quaopne selnemi deltor rosa mimine rithiim rone sathi.",
       "x": 0.8345,
       "y": -0.5319,
-      "truth_value": 0.7426,
-      "betp": 0.6409
+      "truth_value": 0.7426
     },
     {
       "kind": "claim",
@@ -156,8 +144,7 @@
       "label": "Thitortor imrothi selsalin miimtor ulardun prasa foex thita isim ridunro quavor opiska bellindel netor ulri corcor imdunfo mivor tormilin belsel selim opispra m",
       "x": 0.3987,
       "y": 0.7085,
-      "truth_value": 0.9253,
-      "betp": 0.3721
+      "truth_value": 0.9253
     },
     {
       "kind": "claim",
@@ -165,8 +152,7 @@
       "label": "Quacor tordun quator belthibel sasa miopul exardel sabel foul belne dunpra delbelsa roprafo kaarqua deldunthi.",
       "x": -0.8608,
       "y": 0.6556,
-      "truth_value": 0.6644,
-      "betp": 0.1389
+      "truth_value": 0.6644
     },
     {
       "kind": "claim",
@@ -174,8 +160,7 @@
       "label": "Corex foqua linsa linvecor linka imne torve neop zenim voron extoron linromi linthiis imonri neneve ontalin ribelmi ulselmi selnemi pradel.",
       "x": -0.0691,
       "y": 0.6824,
-      "truth_value": 0.6209,
-      "betp": 0.7185
+      "truth_value": 0.6209
     },
     {
       "kind": "claim",
@@ -183,8 +168,7 @@
       "label": "Necor rilinka quacorim imroka onri zenvorul coris fotor rone torbel rion cordel prasel voron prami nethi ardun thifomi rirodel.",
       "x": 0.3178,
       "y": 0.5712,
-      "truth_value": 0.8868,
-      "betp": 0.9753
+      "truth_value": 0.8868
     },
     {
       "kind": "claim",
@@ -192,8 +176,7 @@
       "label": "Quapra sari foim rilinar thidunis mika onop delqua imsabel kadun immi exop opne ulthilin thidel ropra dunri praprathi onbel selve exsa fomizen quathi.",
       "x": 0.3541,
       "y": -0.4319,
-      "truth_value": 0.6694,
-      "betp": 0.0441
+      "truth_value": 0.6694
     },
     {
       "kind": "claim",
@@ -201,8 +184,7 @@
       "label": "Nefo arfo neexdun taexdel corpra sami ulfoon taul selexon velin vorsel kadun isnedel torka.",
       "x": -0.8186,
       "y": -0.3998,
-      "truth_value": 0.9223,
-      "betp": 0.4583
+      "truth_value": 0.9223
     },
     {
       "kind": "claim",
@@ -210,8 +192,7 @@
       "label": "Kavoris taimpra tadelne misaul prasel delvear riimthi.",
       "x": -0.5255,
       "y": -0.7123,
-      "truth_value": 0.5093,
-      "betp": 0.3279
+      "truth_value": 0.5093
     },
     {
       "kind": "claim",
@@ -219,8 +200,7 @@
       "label": "Prane opex vesel imprane ulvordun quaon ridel delmiis thive linrisa folinsel torlindun mion belthiar corpra rika thisa.",
       "x": 0.4796,
       "y": -0.2809,
-      "truth_value": 0.3495,
-      "betp": 0.021
+      "truth_value": 0.3495
     },
     {
       "kind": "claim",
@@ -228,8 +208,7 @@
       "label": "Opthita ulquazen saimpra taexis exthi nesel kaka thidun nezenvor zendel arriqua sadundel ondelzen tacorar savordun belsel vevorve.",
       "x": 0.3155,
       "y": -0.912,
-      "truth_value": 0.7014,
-      "betp": 0.5112
+      "truth_value": 0.7014
     },
     {
       "kind": "claim",
@@ -237,8 +216,7 @@
       "label": "Kanesel quathiop savorta ribelul neisim quaaris praroim onbelzen selis misa thine saarro prave torsa riselbel corvorsel optazen tazen linarex tavorsa linka tors",
       "x": -0.3765,
       "y": -0.6906,
-      "truth_value": 0.0969,
-      "betp": 0.2168
+      "truth_value": 0.0969
     },
     {
       "kind": "claim",
@@ -246,8 +224,7 @@
       "label": "Exonne torul toron exnequa arrovor deltavor kaselka riro kaimvor saar ulardel arkazen tapra sadel linvor roar corzenis prabellin arim.",
       "x": -0.1081,
       "y": 0.3697,
-      "truth_value": 0.726,
-      "betp": 0.3156
+      "truth_value": 0.726
     },
     {
       "kind": "claim",
@@ -255,8 +232,7 @@
       "label": "Quasaro quami sabelsel tais arthi ullin extabel selcor corne exexqua tadunis zenta prari.",
       "x": 0.6496,
       "y": 0.826,
-      "truth_value": 0.6938,
-      "betp": 0.0913
+      "truth_value": 0.6938
     },
     {
       "kind": "claim",
@@ -264,8 +240,7 @@
       "label": "Tornene selfoar quafo romiop tortor miex selvorcor mirine thiimmi sathi miquaim lincor zenlinis rolin kakaop midunka ridun torka vesa arim delro opopfo taoncor ",
       "x": -0.6063,
       "y": 0.4933,
-      "truth_value": 0.4199,
-      "betp": 0.5768
+      "truth_value": 0.4199
     },
     {
       "kind": "claim",
@@ -273,8 +248,7 @@
       "label": "Satorta opcor vearzen exar thifocor belon opduncor vequadel thikaar thikane zenthi exul islin karoim linlindun corri sari vetor torbelar miromi pradunar seltor ",
       "x": -0.4249,
       "y": 0.2987,
-      "truth_value": 0.4842,
-      "betp": 0.8815
+      "truth_value": 0.4842
     },
     {
       "kind": "claim",
@@ -282,8 +256,7 @@
       "label": "Onthi vorbel linta saul isthi veve fovorfo zenroka corarpra rota onta opdunvor dunrifo thisel foprave isselve.",
       "x": 0.7274,
       "y": 0.3249,
-      "truth_value": 0.7606,
-      "betp": 0.4357
+      "truth_value": 0.7606
     },
     {
       "kind": "claim",
@@ -291,8 +264,7 @@
       "label": "Dunri belsa fotor torsel armi vorisis exmita beldel thilin belpracor imbelsel.",
       "x": -0.7076,
       "y": 0.3691,
-      "truth_value": 0.1498,
-      "betp": 0.9516
+      "truth_value": 0.1498
     },
     {
       "kind": "claim",
@@ -300,8 +272,7 @@
       "label": "Exul quavor pratabel linul selmiex belzenne belulri torular saar dunthiex rovorve ronear ulka taissa belfo thiarsel isdelpra sapra belbel dunve foonon iszen vec",
       "x": 0.5171,
       "y": -0.4066,
-      "truth_value": 0.3267,
-      "betp": 0.5495
+      "truth_value": 0.3267
     },
     {
       "kind": "claim",
@@ -309,8 +280,7 @@
       "label": "Kacor belmi torseldel corkave thiul vorrothi mika delul ulimsel.",
       "x": 0.6028,
       "y": -0.4108,
-      "truth_value": 0.3517,
-      "betp": 0.7205
+      "truth_value": 0.3517
     },
     {
       "kind": "claim",
@@ -318,8 +288,7 @@
       "label": "Zenzen zenexul corro saar onexqua quaprabel rotor arselim onqua imriis sellin delar tasais neve neop aronsa belvorve thikaul onthiop torpraex tavor nequadun roi",
       "x": -0.0216,
       "y": -0.3531,
-      "truth_value": 0.2825,
-      "betp": 0.3925
+      "truth_value": 0.2825
     },
     {
       "kind": "claim",
@@ -327,8 +296,7 @@
       "label": "Vordun praopqua netaqua foroim sadun delisvor.",
       "x": 0.2548,
       "y": -0.2305,
-      "truth_value": 0.1493,
-      "betp": 0.8127
+      "truth_value": 0.1493
     },
     {
       "kind": "claim",
@@ -336,8 +304,7 @@
       "label": "Taulon isdelro linfovor tordunthi belro linopve imdel quaroar riarcor linlin quaisvor.",
       "x": 0.3025,
       "y": -0.6987,
-      "truth_value": 0.863,
-      "betp": 0.1368
+      "truth_value": 0.863
     },
     {
       "kind": "claim",
@@ -345,8 +312,7 @@
       "label": "Arex opdel beldelve torcormi opne folinar katathi quaon onvorbel exro kasaar quaka torveve quabelve sacor dunon belonlin dundel kabeltor onsa linmiim miex ulop ",
       "x": 0.6108,
       "y": -0.9302,
-      "truth_value": 0.0198,
-      "betp": 0.6071
+      "truth_value": 0.0198
     },
     {
       "kind": "claim",
@@ -354,8 +320,7 @@
       "label": "Neve oncordel imul exka corqua praulbel ripraex arsa thiimim zenta nelin exdel fodelthi delri linmi corseldel corvorop arropra focordel selro tavor kasel torro.",
       "x": 0.2667,
       "y": -0.2281,
-      "truth_value": 0.685,
-      "betp": 0.5269
+      "truth_value": 0.685
     },
     {
       "kind": "claim",
@@ -363,8 +328,7 @@
       "label": "Tarive onvorul exdunthi kanelin corkaop vecor zenis beldel belvesel belmine verosa torlinul delthiex veulis rozensa selon.",
       "x": 0.8966,
       "y": 0.0057,
-      "truth_value": 0.4313,
-      "betp": 0.9389
+      "truth_value": 0.4313
     },
     {
       "kind": "claim",
@@ -372,8 +336,7 @@
       "label": "Quari torro isexex prami exka cortane quazen selopqua tane quavethi miul ulimdun linimzen karo vorim riexqua.",
       "x": 0.2969,
       "y": 0.0426,
-      "truth_value": 0.1199,
-      "betp": 0.0235
+      "truth_value": 0.1199
     },
     {
       "kind": "claim",
@@ -381,8 +344,7 @@
       "label": "Thipradun belon impraex mivor nelin opmiqua dunlin thiisdel ispra vorim foro selulsa ulfo prazen saulim belthibel delar.",
       "x": -0.4823,
       "y": 0.2113,
-      "truth_value": 0.5099,
-      "betp": 0.9019
+      "truth_value": 0.5099
     },
     {
       "kind": "claim",
@@ -390,8 +352,7 @@
       "label": "Delvor delta rinepra quasel praar duntorta vethidun vorzen nevorcor taex tordelzen talin thifofo torve linnethi oplin thivor thiimvor thitavor mithisa aropzen s",
       "x": -0.2868,
       "y": -0.5432,
-      "truth_value": 0.2014,
-      "betp": 0.2966
+      "truth_value": 0.2014
     },
     {
       "kind": "claim",
@@ -399,8 +360,7 @@
       "label": "Imnelin vethibel cortorta rikadel corveri ismi dunop miqualin foneim fovor praquathi quaselvor rofo.",
       "x": 0.6823,
       "y": -0.4841,
-      "truth_value": null,
-      "betp": null
+      "truth_value": null
     },
     {
       "kind": "claim",
@@ -408,8 +368,7 @@
       "label": "Quaka isartor exim delvorlin opqua dunimex kaopdun imulzen sakaon vorvor belzenzen saimtor delta ultor thizenzen thimifo robel tortator selfo rofopra thiex nebe",
       "x": 0.1943,
       "y": -0.1536,
-      "truth_value": 0.4569,
-      "betp": 0.6177
+      "truth_value": 0.4569
     },
     {
       "kind": "claim",
@@ -417,8 +376,7 @@
       "label": "Belul kave sathisa fothi delthita imar excor nelin neexthi linlin lintor forolin delkane mithion selarim opri.",
       "x": 0.8174,
       "y": 0.6053,
-      "truth_value": 0.823,
-      "betp": 0.5142
+      "truth_value": 0.823
     },
     {
       "kind": "claim",
@@ -426,8 +384,7 @@
       "label": "Dellinri belis lintorne nefo thibelop vorzen opbeldun exop taulbel selthi belartor belro linri taexne fone rosa foka midunri vorsel zenrodun.",
       "x": -0.5075,
       "y": -0.4156,
-      "truth_value": 0.8838,
-      "betp": 0.6335
+      "truth_value": 0.8838
     },
     {
       "kind": "claim",
@@ -435,8 +392,7 @@
       "label": "Imdel neimne torveta rideltor torka kaim onkari saex ulmi delfozen quaveop corselve arka exbel praon corridel imlin fois.",
       "x": -0.0166,
       "y": 0.3645,
-      "truth_value": 0.629,
-      "betp": 0.6871
+      "truth_value": 0.629
     },
     {
       "kind": "claim",
@@ -444,8 +400,7 @@
       "label": "Pratorqua opvorqua thifori delne rivor torvene saselve.",
       "x": -0.0967,
       "y": 0.3448,
-      "truth_value": 0.5492,
-      "betp": 0.4966
+      "truth_value": 0.5492
     },
     {
       "kind": "claim",
@@ -453,8 +408,7 @@
       "label": "Ulthidel selprafo nezenne prabelthi vortave belmi corthi tadel ridel corexul rithi vethimi thitor imondel belrotor tortor linvor opzenka thiprata fove rizenzen ",
       "x": 0.6338,
       "y": 0.2296,
-      "truth_value": 0.233,
-      "betp": 0.3686
+      "truth_value": 0.233
     },
     {
       "kind": "claim",
@@ -462,8 +416,7 @@
       "label": "Exexex ondelta imvor zenfoar seldelul imbelqua milinne thivorthi mipra foon exka corzenqua zenmi selveon dunbel oponri onvorcor vorselri mifo ropra sellin fobel",
       "x": 0.9048,
       "y": -0.6145,
-      "truth_value": 0.793,
-      "betp": null
+      "truth_value": 0.793
     },
     {
       "kind": "claim",
@@ -471,8 +424,7 @@
       "label": "Rithiis veka arimmi corul roop opcor linim ista saon vorne rilinne imonta saimka.",
       "x": 0.6237,
       "y": -0.0315,
-      "truth_value": 0.2407,
-      "betp": 0.222
+      "truth_value": 0.2407
     },
     {
       "kind": "claim",
@@ -480,8 +432,7 @@
       "label": "Expra selvoron ulta voron iscor tator exfovor exdel dunzen arta mithika corzen corop pranequa ultoron sanemi vorvor fotorfo corimpra dunvor pracor imdunro nekar",
       "x": -0.2539,
       "y": -0.5111,
-      "truth_value": 0.0255,
-      "betp": 0.8801
+      "truth_value": 0.0255
     },
     {
       "kind": "claim",
@@ -489,8 +440,7 @@
       "label": "Dundunmi iszenop salinul miul linfoka selka saop torbel onmithi selka neexne.",
       "x": -0.7286,
       "y": 0.1033,
-      "truth_value": 0.3205,
-      "betp": 0.1495
+      "truth_value": 0.3205
     },
     {
       "kind": "claim",
@@ -498,8 +448,7 @@
       "label": "Zendun tazendel vorvorthi belroim prasaqua corarne mizenpra.",
       "x": 0.1753,
       "y": -0.2523,
-      "truth_value": 0.1063,
-      "betp": 0.5002
+      "truth_value": 0.1063
     },
     {
       "kind": "claim",
@@ -507,8 +456,7 @@
       "label": "Praka sasel fomi thicorim selqua torisar.",
       "x": 0.5643,
       "y": -0.3187,
-      "truth_value": 0.514,
-      "betp": 0.2033
+      "truth_value": 0.514
     },
     {
       "kind": "claim",
@@ -516,8 +464,7 @@
       "label": "Veex sator opve onne isrois vorsel thizen lindel ulvepra thine nevorqua fopra riquasel extorlin veul.",
       "x": 0.1067,
       "y": -0.1406,
-      "truth_value": 0.1305,
-      "betp": 0.1782
+      "truth_value": 0.1305
     },
     {
       "kind": "claim",
@@ -525,8 +472,7 @@
       "label": "Thimita rodel opon isvesel exkata vorrilin saselon kaisri zenpra selpralin prafo micorsa linselul torthion rovelin onvorka miulmi ultor dunlin optor midel quaul",
       "x": 0.9047,
       "y": 0.5956,
-      "truth_value": 0.965,
-      "betp": 0.4513
+      "truth_value": 0.965
     },
     {
       "kind": "claim",
@@ -534,8 +480,7 @@
       "label": "Rifo taon pratata zenselis onlin pralin uldunvor miarqua imsasel onopop armi iszenta oplin taquafo neop selve exthi corvorta corro foopne exdelcor dunpra.",
       "x": 0.8181,
       "y": 0.2183,
-      "truth_value": 0.8555,
-      "betp": 0.3659
+      "truth_value": 0.8555
     },
     {
       "kind": "claim",
@@ -543,8 +488,7 @@
       "label": "Linex seltordun quauldel isex selopfo prarota onka miexri exrove zendelthi qualin imka ardeltor quave immisa sata fosata kator neimex lintorne isex safo taselri",
       "x": 0.894,
       "y": -0.2086,
-      "truth_value": 0.3085,
-      "betp": 0.4092
+      "truth_value": 0.3085
     },
     {
       "kind": "claim",
@@ -552,8 +496,7 @@
       "label": "Fotaop taopmi belop selneex belar voron torexlin miissa vorcorve imopul cortor riar zendunlin tasel oprotor thiro rofosel onoplin selim deltorka tadel corne qua",
       "x": 0.7467,
       "y": -0.241,
-      "truth_value": 0.8688,
-      "betp": 0.2956
+      "truth_value": 0.8688
     },
     {
       "kind": "claim",
@@ -561,8 +504,7 @@
       "label": "Riop vornedel arcorzen belzen iscortor sadunar torrilin cortorpra vorar neta sathiro dunri exuldel arcorsa.",
       "x": -0.6222,
       "y": -0.0795,
-      "truth_value": 0.9902,
-      "betp": 0.4709
+      "truth_value": 0.9902
     },
     {
       "kind": "claim",
@@ -570,8 +512,7 @@
       "label": "Belmi belquadun roim lintaka kabelve vorka deldunon fodunthi netorve opselar isvorzen imbelthi vorkaka vorkator ulta zenthimi quanequa prais thirone onka vordel",
       "x": 0.0592,
       "y": 0.4137,
-      "truth_value": 0.8896,
-      "betp": 0.9794
+      "truth_value": 0.8896
     },
     {
       "kind": "claim",
@@ -579,8 +520,7 @@
       "label": "Isbelne ontorar riop arpra ridun kaar issel saop misa onvor.",
       "x": 0.0698,
       "y": -0.0448,
-      "truth_value": 0.6689,
-      "betp": 0.2836
+      "truth_value": 0.6689
     },
     {
       "kind": "claim",
@@ -588,8 +528,7 @@
       "label": "Neimex opzen dunquami saro thivorne vorim neneop nebel saselon vordun corvor isopzen voron onbel kaar vorfo toropne vekane opcor vorbelqua corbel.",
       "x": 0.8756,
       "y": 0.3227,
-      "truth_value": 0.8811,
-      "betp": null
+      "truth_value": 0.8811
     },
     {
       "kind": "claim",
@@ -597,8 +536,7 @@
       "label": "Thicor zenex delthine belfo taop lindun veisri exseldun nemita isbelri zenneop pravor excor deltorne praonsa imlinmi.",
       "x": -0.8752,
       "y": -0.7088,
-      "truth_value": 0.287,
-      "betp": 0.8774
+      "truth_value": 0.287
     },
     {
       "kind": "claim",
@@ -606,8 +544,7 @@
       "label": "Nebelsa linbelon delimmi kasave dunta praex delcor taex dunve nedun onim foqua duntorri.",
       "x": -0.8561,
       "y": 0.8996,
-      "truth_value": 0.0978,
-      "betp": 0.9206
+      "truth_value": 0.0978
     },
     {
       "kind": "claim",
@@ -615,8 +552,7 @@
       "label": "Linka artor exka midel ispra delmithi linrove.",
       "x": 0.5118,
       "y": -0.9126,
-      "truth_value": 0.2036,
-      "betp": 0.0123
+      "truth_value": 0.2036
     },
     {
       "kind": "claim",
@@ -624,8 +560,7 @@
       "label": "Thizen prais midel vorulul zenmi coron mimiri.",
       "x": 0.0692,
       "y": 0.3124,
-      "truth_value": 0.2008,
-      "betp": null
+      "truth_value": 0.2008
     },
     {
       "kind": "claim",
@@ -633,8 +568,7 @@
       "label": "Exzen folinis neimqua kadelar foonis kaop mimi tordel praonne seltor exthi selon.",
       "x": 0.2473,
       "y": 0.6051,
-      "truth_value": 0.9927,
-      "betp": 0.5819
+      "truth_value": 0.9927
     },
     {
       "kind": "claim",
@@ -642,8 +576,7 @@
       "label": "Onmiim ulzenlin kasel linimne kasel exthion oncor onrosa nesel delvor foqua linimsel rifo.",
       "x": 0.2132,
       "y": -0.0367,
-      "truth_value": 0.1838,
-      "betp": 0.8245
+      "truth_value": 0.1838
     },
     {
       "kind": "claim",
@@ -651,8 +584,7 @@
       "label": "Kaon torar focoron selpra thita dunthi neim prapra praop opri delsa prazen isar rothi thiquami sais rodun thidelul mion tormi imimka delimro vorar dundunqua vea",
       "x": 0.4052,
       "y": -0.4935,
-      "truth_value": 0.352,
-      "betp": 0.9102
+      "truth_value": 0.352
     },
     {
       "kind": "claim",
@@ -660,8 +592,7 @@
       "label": "Imtor ulthi sari ririar neimim belduntor ismi onsel veon onqua foexvor torthi prakaar miri quasa vorlin saar thifoex vevor torrine arex safo.",
       "x": 0.0151,
       "y": -0.5826,
-      "truth_value": 0.9761,
-      "betp": 0.7122
+      "truth_value": 0.9761
     },
     {
       "kind": "claim",
@@ -669,8 +600,7 @@
       "label": "Thidelar savorthi selsa dunvor selfoop dunexsa lindelpra opop quaop.",
       "x": 0.5979,
       "y": -0.5325,
-      "truth_value": 0.3314,
-      "betp": 0.1214
+      "truth_value": 0.3314
     },
     {
       "kind": "claim",
@@ -678,8 +608,7 @@
       "label": "Kane fotor iskavor selonve delim ondel isqua linprata delopro.",
       "x": -0.304,
       "y": 0.0069,
-      "truth_value": 0.8903,
-      "betp": 0.1888
+      "truth_value": 0.8903
     },
     {
       "kind": "claim",
@@ -687,8 +616,7 @@
       "label": "Praul prarothi opimmi prarone exvorne vorim duncor fothi torquaon netorsa quaon selzenis tavepra dunvear sathion eximvor corlin corselqua imlinon nequa forodel.",
       "x": -0.8803,
       "y": -0.3704,
-      "truth_value": 0.3414,
-      "betp": 0.7297
+      "truth_value": 0.3414
     },
     {
       "kind": "agent",

@@ -5,9 +5,9 @@
 mod common;
 
 use common::atlas_contract::{
-    assert_indistinguishable, check_level_body, check_not_found, fixture, fixture_value, gzip_len,
-    invariant_errors, same_json, schema, schema_errors, Expected, Side, FIXTURE_TEAM_GROUP_ID,
-    LEVEL_FIXTURES,
+    assert_indistinguishable, check_level_body, check_not_found, def_errors, fixture,
+    fixture_value, gzip_len, invariant_errors, same_json, schema, schema_errors, Expected, Side,
+    BELIEF_KEYS, FIXTURE_TEAM_GROUP_ID, LEVEL_FIXTURES,
 };
 use epigraph_explorer::upstream::atlas_level::{
     AtlasLevel, FlowBasis, MapScope, ATLAS_LEAF_MAX_NODES, ATLAS_LEVEL_BUDGET_GZIP_BYTES,
@@ -135,6 +135,76 @@ fn the_helper_rejects_an_extra_private_field() {
         v["children"][0]["private_claim_count"] = json!(3);
     });
     assert!(check_as("team_theme_root", &body).is_err());
+}
+
+/// Every object key in `v`, and every string listed under a `required`.
+fn keys_in(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                out.insert(k.clone());
+                if k == "required" {
+                    for r in x.as_array().into_iter().flatten() {
+                        out.insert(r.as_str().unwrap_or_default().to_string());
+                    }
+                }
+                keys_in(x, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| keys_in(x, out)),
+        _ => {}
+    }
+}
+
+/// The region and theme routes' belief-key ban holds for the nested levels
+/// too: neither the schema nor any fixture names a belief key.
+#[test]
+fn no_schema_or_fixture_key_carries_belief() {
+    let mut docs = vec![("schema.json", schema().clone())];
+    for stem in LEVEL_FIXTURES
+        .iter()
+        .chain(&["non_member_kernel", "non_member_bff"])
+    {
+        docs.push((stem, fixture_value(stem)));
+    }
+    for (what, doc) in &docs {
+        let mut keys = std::collections::BTreeSet::new();
+        keys_in(doc, &mut keys);
+        for k in BELIEF_KEYS {
+            assert!(!keys.contains(*k), "{what} names `{k}`");
+        }
+    }
+}
+
+/// A leaf claim node carrying `betp` fails as an unknown key of the closed
+/// `claim_node`, whatever its value, null included.
+#[test]
+fn the_helper_rejects_betp_on_a_leaf_claim() {
+    for stem in ["team_leaf_dense", "public_leaf"] {
+        for value in [json!(0.7), Value::Null] {
+            let mut i = 0;
+            let body = mutated(stem, |v| {
+                i = v["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|n| n["kind"] == json!("claim"))
+                    .expect("a leaf has a claim");
+                v["nodes"][i]["betp"] = value.clone();
+            });
+            let errs = check_as(stem, &body).expect_err("a claim node carrying betp fails");
+            assert!(
+                errs.iter().any(|e| e.starts_with("schema")),
+                "{stem} betp={value}: {errs:#?}"
+            );
+            let node = &serde_json::from_slice::<Value>(&body).unwrap()["nodes"][i];
+            let def = def_errors("claim_node", node);
+            assert!(
+                def.iter().any(|e| e.contains("betp")),
+                "{stem} betp={value}: claim_node names the extra key: {def:#?}"
+            );
+        }
+    }
 }
 
 #[test]
