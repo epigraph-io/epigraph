@@ -45,12 +45,16 @@
 //! `let alias = &server.pool;` binding within the function that makes it (see
 //! `alias_regions`). Before that it could not see a write reached through a
 //! binding — `tools/ingestion.rs`'s whole document walk was that shape — and the
-//! broadening surfaced nine more alias-bound sites, now registered below. It
-//! still cannot see a pool passed through a FUNCTION PARAMETER or a struct
-//! field other than `server.pool`, and it only counts callees whose name
-//! carries a WRITE_TOKEN. It is also purely syntactic: it says which call sites
-//! take the unstamped pool, never whether the statement they run would be
-//! refused.
+//! broadening surfaced nine more alias-bound sites, now registered below.
+//! Since the raw-pool residual review it also matches `self.pool`
+//! (`EpiGraphMcpFull`'s own methods, `McpEmbedder`) and counts a pool CAPTURED
+//! by a constructor (`Repo::new(server.pool.clone())`) at the capture, whatever
+//! the struct later runs on it; that is how `MatchCandidateRepo`'s matcher edge
+//! write had stayed invisible. It still cannot see a pool passed through a
+//! FUNCTION PARAMETER (`raw_pool_register.rs` counts those beside a `Viewer`),
+//! and it only counts callees whose name carries a WRITE_TOKEN. It is also
+//! purely syntactic: it says which call sites take the unstamped pool, never
+//! whether the statement they run would be refused.
 //!
 //! # The axis it pins, and the axis it does not
 //!
@@ -87,6 +91,65 @@ use std::path::{Path, PathBuf};
 // list when the site is converted; an entry that ARRIVES is a regression.
 // ===========================================================================
 const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
+    // The next seven entries ARRIVED in the raw-pool residual review, when the
+    // scan learned `self.pool` and `Repo::new(server.pool.clone())`
+    // (`POOL_NEEDLES`, the capture arm in `scan`). Each site predates that
+    // review; none is a new write.
+    (
+        "embed.rs",
+        "ClaimRepository::store_embedding",
+        1,
+        "`McpEmbedder::store_vector`'s `StorePath::PrivilegedPool` arm: the store runs directly \
+         on a pool its constructor DECLARED privileged (`on_a_privileged_pool`, a BYPASSRLS \
+         MaintenancePool: the operator `ingest-document` CLI). A scoped embedder never reaches \
+         it, and one with no declaration refuses (`every_production_embedder_declares_a_store_path`).",
+    ),
+    (
+        "server.rs",
+        "AgentRepository::create",
+        1,
+        "`agent_id`'s first-boot creation of the server's OWN `agents` row. `agents` carries no \
+         owner group (universally readable, migration 077), so the INSERT is admitted unstamped, \
+         and no caller exists to stamp from: this resolves the identity requests are attributed to.",
+    ),
+    (
+        "server.rs",
+        "AgentRepository::set_llm_properties",
+        1,
+        "`agent_id`'s CREATE branch: annotate the freshly created server agent row with its \
+         derived LLM identity. Same row and same reason as `AgentRepository::create` above.",
+    ),
+    (
+        "server.rs",
+        "EventRepository::publish_or_log",
+        1,
+        "`emit_tool_invoked`'s `tool.invoked` event, best-effort. `events` takes no \
+         `owner_group_id`, so there is no WITH CHECK for a stamp to satisfy (the same reason as \
+         `tools/events.rs` `EventRepository::insert`).",
+    ),
+    (
+        "server.rs",
+        "self.pool.acquire",
+        2,
+        "Two connections, neither a tenancy row written as a caller. (a) `agent_id`'s \
+         `ensure_personal_group`: migration 105's SECURITY DEFINER provisioning, once per process, \
+         of the very group the server agent's viewer is resolved from (stamping first would be \
+         circular). (b) `record_auth_lineage`'s OPERATED_BY edge: agent to agent is a structural \
+         edge migration 120 makes ('public', world) whoever writes it, so it is admitted \
+         unstamped; `dedup_probes_app_role.rs` pins that it lands on `epigraph_app`.",
+    ),
+    (
+        "tools/matching.rs",
+        "MatchCandidateRepo::new(pool.clone())",
+        2,
+        "A repo built on the plain pool in two tools (`find_cross_source_matches` and \
+         `list_match_candidates` no longer build one: they read on the caller's stamped read). \
+         `retire_match_candidate` reads one row by id. `decide_match_candidate` reads by id \
+         and writes `reject_if_pending`, a status flip on `match_candidates`, which has no \
+         tenancy columns. Its PROMOTE no longer runs on the \
+         captured pool: the matcher edge is a tenancy row, so it runs \
+         `promote_if_pending_conn` on the author-stamped transaction.",
+    ),
     (
         "claim_helper.rs",
         "server.pool.acquire",
@@ -190,15 +253,14 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          with neither never reaches it — it gets `begin_author_stamped_tx`'s refusal.",
     ),
     // `tools/matching.rs` / `EdgeRepository::create_symmetric_if_absent` (1)
-    // left in U012 WITHOUT being stamped. `decide_match_candidate`'s matcher
-    // edge is now written inside `MatchCandidateRepo::promote_if_pending`, on
-    // the same transaction as the candidate's status flip, on the pool the repo
-    // was built from (`MatchCandidateRepo::new(server.pool.clone())`): a pool
-    // held in a struct field, which this scan does not follow (module doc).
-    // The batch H-a measurement still describes it: between PUBLIC claims,
-    // migration 070's BEFORE trigger makes the edge world-owned and
-    // `edges_tenancy`'s static world arm admits it unstamped; an edge touching
-    // a group-private claim is NOT covered by that measurement.
+    // left in U012 WITHOUT being stamped: the matcher edge moved inside
+    // `MatchCandidateRepo::promote_if_pending`, on the pool the repo captured
+    // (`MatchCandidateRepo::new(server.pool.clone())`), which this scan did not
+    // follow. An edge touching a group-private claim was refused there. Since
+    // the raw-pool residual review `decide_match_candidate` promotes through
+    // `promote_if_pending_conn` on its author-stamped transaction, and the
+    // capture itself is now counted (`MatchCandidateRepo::new(pool.clone())`
+    // below).
     (
         "tools/perspectives.rs",
         "EdgeRepository::create_signed",
@@ -258,22 +320,15 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
 /// heuristic that excluded it by shape would also start excluding real writes,
 /// and this lint's value is that its false-positive set is written down.
 const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
-    (
-        "tools/claims.rs",
-        "server.pool.acquire",
-        "`submit_claim`'s novelty-gate preamble: a READ-ONLY content-hash existence probe \
-         (`ClaimRepository::find_by_content_hash_and_agent`) that runs before any write, so that \
-         an exact resubmit takes the unchanged dedup path. Matched only because `acquire` had to \
-         join WRITE_TOKENS to keep the three cascade sites visible; nothing is written on this \
-         connection.",
-    ),
-    (
-        "tools/memory.rs",
-        "server.pool.acquire",
-        "`memorize`'s novelty-gate preamble. The same read-only content-hash probe as \
-         `tools/claims.rs` above, matched for the same WRITE_TOKENS reason. The write half of \
-         `memorize` runs on `begin_author_stamped_tx`.",
-    ),
+    // `tools/claims.rs` and `tools/memory.rs` `server.pool.acquire` (the
+    // exact-resubmit probe of `submit_claim` / `memorize`) LEFT in the raw-pool
+    // residual review. They were registered here as "read-only, harmless", and
+    // that was the defect: the probe is viewer-filtered, so on the unstamped
+    // pool a resubmit of the caller's own group-private claim missed it. Both
+    // now read as the caller (`novelty_gate::exact_resubmit_probe`), and
+    // `tests/dedup_probes_app_role.rs` pins it on `epigraph_app`. A READ is
+    // never "harmless" on the raw pool merely because it writes nothing;
+    // `raw_pool_register.rs` registers reads by their tenancy instead.
     (
     "claim_helper.rs",
     "store_embedding_author_stamped",
@@ -281,6 +336,14 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
      `epigraph_live_memberships` (SECURITY DEFINER) before the stamp exists. The WRITE inside that \
      helper runs on `ScopedPool::begin_as`, which is the whole point of it.",
 ),
+    (
+        "embed.rs",
+        "claim_helper::store_embedding_author_stamped",
+        "`McpEmbedder::store_vector`'s `StorePath::AuthorStamped` arm, the same helper as the \
+         `claim_helper.rs` entry above: `&self.pool` is its READ pool for resolving the author's \
+         viewer, and the UPDATE runs on `ScopedPool::begin_as` from that author. Surfaced when \
+         `self.pool` joined POOL_NEEDLES.",
+    ),
     (
         "tools/workflow_ingest.rs",
         "claim_helper::store_embedding_author_stamped",
@@ -351,6 +414,18 @@ const WRITE_TOKENS: &[&str] = &[
     "merge",
     "run_theme",
 ];
+
+/// The field accesses that name a raw pool. `server.pool` is a tool's handle on
+/// `EpiGraphMcpFull::pool`; `self.pool` is the same field inside
+/// `EpiGraphMcpFull`'s own methods (`server.rs`), and `McpEmbedder`'s pool in
+/// `embed.rs`.
+///
+/// `self.pool` joined in the raw-pool residual review: `record_auth_lineage`'s
+/// `OPERATED_BY` edge and `agent_id`'s provisioning writes ran on it and no entry
+/// here named them, because the scan matched the literal `server.pool` only.
+/// The broadening ADDED register entries for sites that already existed; it
+/// did not add writes.
+const POOL_NEEDLES: &[&str] = &["server.pool", "self.pool"];
 
 /// Remove `//` line comments and (nestable) `/* */` block comments.
 ///
@@ -488,7 +563,9 @@ fn alias_regions(stripped: &str) -> Vec<(String, usize, usize)> {
             .strip_prefix('=')
             .map(str::trim_start)
             .is_some_and(|rhs| {
-                rhs.starts_with("&server.pool;") || rhs.starts_with("server.pool.clone();")
+                POOL_NEEDLES.iter().any(|n| {
+                    rhs.starts_with(&format!("&{n};")) || rhs.starts_with(&format!("{n}.clone();"))
+                })
             });
         if !bound {
             continue;
@@ -528,14 +605,41 @@ fn scan() -> BTreeMap<(String, String), usize> {
             .replace('\\', "/");
         let stripped = strip_comments(&std::fs::read_to_string(&path).expect("read source"));
         let chars: Vec<char> = stripped.chars().collect();
-        let needle: Vec<char> = "server.pool".chars().collect();
-        let mut i = 0;
-        while i + needle.len() <= chars.len() {
-            if chars[i..i + needle.len()] == needle[..] {
+        for needle_text in POOL_NEEDLES {
+            let needle: Vec<char> = needle_text.chars().collect();
+            let mut i = 0;
+            while i + needle.len() <= chars.len() {
+                if chars[i..i + needle.len()] != needle[..]
+                    || chars
+                        .get(i + needle.len())
+                        .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+                    || (i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
+                {
+                    i += 1;
+                    continue;
+                }
                 let after: String = chars[i + needle.len()..]
                     .iter()
                     .take(48)
                     .collect::<String>();
+                // `Repo::new(server.pool.clone())`: the pool is CAPTURED by a
+                // struct whose methods then run on it (`MatchCandidateRepo`'s
+                // `promote_if_pending` wrote its matcher edge that way, and this
+                // scan could not see it). Counted whatever the struct's name, so
+                // every write behind such a capture is registered at the
+                // capture site.
+                let captured = after
+                    .starts_with(".clone()")
+                    .then(|| callee_before(&chars, i))
+                    .flatten()
+                    .filter(|callee| callee.ends_with("::new"));
+                if let Some(callee) = captured {
+                    *found
+                        .entry((rel.clone(), format!("{}(pool.clone())", normalize(&callee))))
+                        .or_insert(0) += 1;
+                    i += needle.len();
+                    continue;
+                }
                 let name = if after.starts_with('.') {
                     // `server.pool.begin()` — a method ON the pool.
                     after
@@ -543,7 +647,7 @@ fn scan() -> BTreeMap<(String, String), usize> {
                         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                         .next()
                         .filter(|s| !s.is_empty())
-                        .map(|m| format!("server.pool.{m}"))
+                        .map(|m| format!("{needle_text}.{m}"))
                 } else {
                     callee_before(&chars, i)
                 };
@@ -555,8 +659,6 @@ fn scan() -> BTreeMap<(String, String), usize> {
                     }
                 }
                 i += needle.len();
-            } else {
-                i += 1;
             }
         }
 

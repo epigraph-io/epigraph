@@ -507,26 +507,32 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
     })
 }
 
-/// Pool-only gate check: returns `Some(paper_id)` iff a paper with `doi`
-/// exists AND has a `processed_by` edge whose `properties.pipeline` equals
+/// Gate check: returns `Some(paper_id)` iff a paper with `doi` exists AND has
+/// a `processed_by` edge `viewer` can read whose `properties.pipeline` equals
 /// `pipeline_version`. Mirrors the inline gate used by `do_ingest_document`.
+///
+/// The `papers` lookup runs on the plain pool (`papers` has no row security);
+/// the EDGE read runs on a read stamped from `viewer`
+/// (`EpiGraphMcpFull::read_as`). It used to run on the plain pool too, where
+/// FORCEd row security admits public rows only, so a group-private ingest's
+/// `processed_by` stamp was invisible to the group's own members and the gate
+/// reported "not ingested".
 pub async fn paper_already_ingested(
-    pool: &sqlx::PgPool,
+    server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
-    let Some(prior) = find_paper_by_document_key(pool, doi).await? else {
+    let Some(prior) = find_paper_by_document_key(&server.pool, doi).await? else {
         return Ok(None);
     };
-    if PaperRepository::has_processed_by_edge(pool, viewer, prior.id, pipeline_version)
-        .await
-        .map_err(internal_error)?
-    {
-        Ok(Some(prior.id))
-    } else {
-        Ok(None)
-    }
+    let mut read = server.read_as(viewer, "check_already_ingested").await?;
+    let stamped =
+        PaperRepository::has_processed_by_edge(&mut *read, viewer, prior.id, pipeline_version)
+            .await
+            .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
+    Ok(stamped.then_some(prior.id))
 }
 
 /// Pre-flight idempotency check exposing the same `(doi, pipeline)` gate that
@@ -571,24 +577,32 @@ pub async fn check_already_ingested(
     // and every `base:ch{n}`. The explicit arm stays exact, and it is reliable
     // for every chunk only because each chunk now writes its own stamp (G8
     // review: the triple-keyed writer kept only the first chunk's).
+    //
+    // The `processed_by` stamps are read as the CALLER (see
+    // `paper_already_ingested`): on the plain pool a group-private ingest read
+    // as "not ingested" to the group that ran it.
     let (pipeline, paper_id, matched) = match params.pipeline_version {
         Some(exact) => {
-            let paper_id =
-                paper_already_ingested(&server.pool, viewer, &params.doi, &exact).await?;
+            let paper_id = paper_already_ingested(server, viewer, &params.doi, &exact).await?;
             let matched = paper_id.map(|_| vec![exact.clone()]).unwrap_or_default();
             (exact, paper_id, matched)
         }
         None => {
             let paper = find_paper_by_document_key(&server.pool, &params.doi).await?;
             let matched = match &paper {
-                Some(p) => PaperRepository::processed_by_pipelines_in_family(
-                    &server.pool,
-                    viewer,
-                    p.id,
-                    PIPELINE_VERSION_BASE,
-                )
-                .await
-                .map_err(internal_error)?,
+                Some(p) => {
+                    let mut read = server.read_as(viewer, "check_already_ingested").await?;
+                    let matched = PaperRepository::processed_by_pipelines_in_family(
+                        &mut *read,
+                        viewer,
+                        p.id,
+                        PIPELINE_VERSION_BASE,
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    read.commit().await.map_err(internal_error)?;
+                    matched
+                }
                 None => Vec::new(),
             };
             let paper_id = paper.filter(|_| !matched.is_empty()).map(|p| p.id);
@@ -2720,6 +2734,21 @@ pub async fn do_ingest_document_spine(
 mod tests {
     use super::*;
 
+    /// A server over the test pool with a lazily connected `ScopedPool` on the
+    /// pool's own options (a superuser, so row security filters nothing): the
+    /// gate's caller read is `read_as`, which refuses on a server with no
+    /// `ScopedPool`. The application-role behaviour is
+    /// `tests/dedup_probes_app_role.rs`'s.
+    fn server_over(pool: &sqlx::PgPool) -> EpiGraphMcpFull {
+        let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x51u8; 32]).expect("signer");
+        let embedder = crate::embed::McpEmbedder::new(pool.clone(), None);
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
+    }
+
     /// Gate returns false when the DOI is unknown, false when the paper exists
     /// but has no `processed_by` edge at this pipeline version, and true once
     /// the edge is present.
@@ -2729,7 +2758,7 @@ mod tests {
 
         // Unknown DOI → not ingested.
         assert!(paper_already_ingested(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),
@@ -2745,7 +2774,7 @@ mod tests {
             .await
             .expect("create paper");
         assert!(paper_already_ingested(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),
@@ -2779,7 +2808,7 @@ mod tests {
         .await
         .expect("create edge with other pipeline");
         assert!(paper_already_ingested(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),
@@ -2812,7 +2841,7 @@ mod tests {
         .await
         .expect("create edge with matching pipeline");
         let hit = paper_already_ingested(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),

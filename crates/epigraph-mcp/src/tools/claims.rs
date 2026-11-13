@@ -451,21 +451,19 @@ async fn prepare_submission(
     // check happens FIRST so an exact-content resubmit takes the existing
     // create_claim_idempotent dedup path unchanged (no embedding call, no
     // gate, byte-identical to pre-gate behavior — the gate augments that
-    // path, it does not replace it). See crate::tools::novelty_gate.
-    let is_exact_resubmit = {
-        let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, viewer, &content_hash, agent_id)
-            .await
-            .map_err(internal_error)?
-            .is_some()
-    };
+    // path, it does not replace it). See crate::tools::novelty_gate. Both the
+    // probe and the gate read as the CALLER, so a resubmit or near-duplicate of
+    // the caller's own group-private claim is found.
+    let is_exact_resubmit =
+        crate::tools::novelty_gate::exact_resubmit_probe(server, viewer, &content_hash, agent_id)
+            .await?;
     let mut pending_embedding: Option<String> = None;
     if !is_exact_resubmit {
         let novelty_threshold = params
             .novelty_threshold
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
         if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
-            &server.pool,
+            server,
             viewer,
             server.embedder.as_ref(),
             &params.content,
@@ -505,18 +503,9 @@ async fn prepare_submission(
                 //      nothing is inserted. `resolve_backlog_item` is
                 //      unaffected (it hardcodes novelty_threshold=0.0 so
                 //      this branch never fires for it).
-                let existing = ClaimRepository::get_by_id(
-                    &server.pool,
-                    viewer,
-                    ClaimId::from_uuid(existing_id),
-                )
-                .await
-                .map_err(internal_error)?
-                .ok_or_else(|| {
-                    crate::errors::internal_error_text(format!(
-                        "novelty gate: nearest claim {existing_id} vanished before read-back"
-                    ))
-                })?;
+                let existing =
+                    crate::tools::novelty_gate::read_back_existing(server, viewer, existing_id)
+                        .await?;
                 return Ok(PreparedSubmission::Existing(Box::new(
                     SubmitClaimResponse {
                         claim_id: existing_id.to_string(),
@@ -892,8 +881,12 @@ async fn finish_submission(
     let embed_text: Option<String> = if was_created {
         Some(params.content.clone())
     } else {
-        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
-            .await
+        // As the caller: a dedup hit on its own group-private claim must see
+        // that the vector is missing (the plain pool could not see the row).
+        match crate::claim_helper::claim_text_if_embedding_missing_as_caller(
+            server, viewer, claim_uuid,
+        )
+        .await
         {
             Ok(text) => text,
             Err(e) => {
