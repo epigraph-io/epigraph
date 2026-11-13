@@ -950,7 +950,7 @@ impl AtlasLeafRepository {
 
 /// The team a map's predicate binds: `None` for the public map, so only
 /// public rows pass.
-const fn map_team(map: AtlasMap) -> Option<Uuid> {
+pub(crate) const fn map_team(map: AtlasMap) -> Option<Uuid> {
     match map {
         AtlasMap::Public => None,
         AtlasMap::Team(t) => Some(t),
