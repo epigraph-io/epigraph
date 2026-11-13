@@ -141,12 +141,12 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "tools/matching.rs",
         "MatchCandidateRepo::new(pool.clone())",
-        4,
-        "A repo built on the plain pool in four tools. `find_cross_source_matches` and \
-         `list_match_candidates` only READ through it (viewer-filtered; `raw_pool_register.rs` \
-         carries them as READ_PENDING). `retire_match_candidate` reads one row by id. \
-         `decide_match_candidate` reads by id and writes `reject_if_pending`, a status flip on \
-         `match_candidates`, which has no tenancy columns. Its PROMOTE no longer runs on the \
+        2,
+        "A repo built on the plain pool in two tools (`find_cross_source_matches` and \
+         `list_match_candidates` no longer build one: they read on the caller's stamped read). \
+         `retire_match_candidate` reads one row by id. `decide_match_candidate` reads by id \
+         and writes `reject_if_pending`, a status flip on `match_candidates`, which has no \
+         tenancy columns. Its PROMOTE no longer runs on the \
          captured pool: the matcher edge is a tenancy row, so it runs \
          `promote_if_pending_conn` on the author-stamped transaction.",
     ),

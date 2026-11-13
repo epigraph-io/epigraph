@@ -51,21 +51,25 @@
 //! * [`HIGH_WATER`] is the never-raised ceiling on the total, so growth fails
 //!   structurally and not only by a reviewer noticing an edited literal.
 //! * The register was SEEDED against `origin/main` 7520793d plus the raw-pool
-//!   residual fixes. The read-conversion branch
-//!   (`feat/agent-inherits-human-memberships`) converts many of the rows marked
-//!   [`READ_PENDING`]; it lowers or deletes them on rebase, reading the new
-//!   counts off this test's own failure output, never by subtraction.
+//!   residual fixes: 215 sites in 126 rows, 130 of the sites viewer-filtered
+//!   reads still on the raw pool (a `READ_PENDING` class). It was re-measured
+//!   after merging the read-conversion change that runs every content-read
+//!   tool on `EpiGraphMcpFull::read_as`, reading the new counts off this
+//!   test's own failure output, never by subtraction: no row of that class
+//!   remained, so the class was removed. A new viewer-filtered read on a raw
+//!   pool is converted onto the caller's stamped read, not registered.
 //!
 //! # What a green run does NOT mean
 //!
 //! It means no UNREGISTERED raw-pool site exists in these two crates. It does
-//! not mean the registered ones are safe: [`READ_PENDING`] rows are live
-//! defects on the application role, listed so they cannot grow. Nor does it
-//! see a pool reached by any other name (a `PgPool` returned from a function,
-//! `ScopedPool::inner()`), and it cannot tell a stamped connection stamped from
-//! the WRONG viewer from a right one; the app-role tests
-//! (`dedup_probes_app_role.rs` and the `*_app_role.rs` family) are the
-//! instrument for that.
+//! not mean the registered ones are safe: [`ENGINE_POOL_PARAM`] rows are
+//! signatures that hand a caller-filtered read a raw pool whenever a caller
+//! passes one, and [`REGISTERED_WRITE`] rows are unstamped writes, both listed
+//! so they cannot grow. Nor does it see a pool reached by any other name (a
+//! `PgPool` returned from a function, `ScopedPool::inner()`), and it cannot
+//! tell a connection stamped from the WRONG viewer from a right one; the
+//! app-role tests (`dedup_probes_app_role.rs` and the `*_app_role.rs` family)
+//! are the instrument for that.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -75,21 +79,19 @@ use std::path::{Path, PathBuf};
 // can check, not prose that drifts per row.
 // ===========================================================================
 
-/// A viewer-filtered READ on the raw pool. LIVE DEFECT on the application
-/// role: row security admits public rows only, so the caller's own
-/// group-private rows are silently missing. Conversion target: the caller's
-/// stamped read (`ScopedPool::read_as`, or `CallerRead` in a tool). Most of
-/// these are in the read-conversion branch.
-const READ_PENDING: &str = "READ_PENDING: a viewer-filtered read on the raw pool. On \
-     epigraph_app FORCEd row security admits public rows only, so the caller's own \
-     group-private rows are silently missing. Convert onto the caller's stamped read.";
-
 /// The table read or written carries no row security, so the stamp changes
 /// nothing about which rows are admitted.
 const NO_ROW_SECURITY: &str = "NO_ROW_SECURITY: every statement here reads or writes \
      tables without tenancy row security (papers, match_candidates, events, \
      behavioral_executions, agents and the like), so an unstamped session is admitted \
      exactly as a stamped one would be.";
+
+/// A write's visibility resolution, run before the stamped transaction it
+/// parameterises, through definer functions.
+const DEFINER_RESOLUTION: &str = "DEFINER_RESOLUTION: resolves a write's visibility choice for \
+     its author (ClaimRepository::resolve_write_decl / resolve_visibility_choice) BEFORE the \
+     author-stamped transaction it parameterises; every read in it is a migration 206 or 107 \
+     SECURITY DEFINER function, so the unstamped pool answers as a stamped one would.";
 
 /// Membership or identity resolution that must run before any viewer exists,
 /// through SECURITY DEFINER functions that answer without a stamp.
@@ -147,11 +149,6 @@ const AUTH_LINEAGE_EDGE: &str = "AUTH_LINEAGE_EDGE: the OPERATED_BY edge joins t
      the_auth_lineage_edge_lands_on_the_application_role pins it on epigraph_app, so the \
      warn-only failure branch is not hiding a refusal.";
 
-/// `events` suppression runs in SECURITY DEFINER frames.
-const EVENT_LIST_DEFINER: &str = "EVENT_LIST_DEFINER: EventRepository::list's suppression arms \
-     run inside migration 086's SECURITY DEFINER frame (PR-25), so the answer does not depend \
-     on the session's stamp, and `events` itself carries no tenancy columns.";
-
 /// Frames are an instance-wide registry.
 const INSTANCE_REGISTRY_READ: &str = "INSTANCE_REGISTRY_READ: reads a frame's per-frame \
      evidence-type weights; `frames` is one of migration 077's instance-wide registries, \
@@ -168,12 +165,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-engine/src/belief_query.rs",
         "for_perspective",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/belief_query.rs",
-        "framed_belief",
         1,
         ENGINE_POOL_PARAM,
     ),
@@ -215,30 +206,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-engine/src/belief_query.rs",
-        "perspective_belief_for_claim",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/belief_query.rs",
-        "perspective_tier_inputs",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/belief_query.rs",
-        "recompute_framed_belief",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/belief_query.rs",
-        "resolve",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/belief_query.rs",
         "scope_conn",
         1,
         ENGINE_POOL_PARAM,
@@ -246,12 +213,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-engine/src/belief_query.rs",
         "shadow_belief",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/belief_query.rs",
-        "shadow_view",
         1,
         ENGINE_POOL_PARAM,
     ),
@@ -325,7 +286,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("epigraph-mcp/src/auth.rs", "is_revoked", 1, PRE_VIEWER),
     (
         "epigraph-mcp/src/claim_helper.rs",
-        "begin_author_stamped_tx",
+        "begin_author_stamped_tx_for",
         1,
         DELEGATES_THE_STAMP,
     ),
@@ -336,16 +297,16 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         DELEGATES_THE_STAMP,
     ),
     (
-        "epigraph-mcp/src/embed.rs",
-        "search_hybrid_scoped",
+        "epigraph-mcp/src/claim_helper.rs",
+        "resolve_claim_visibility",
         1,
-        READ_PENDING,
+        DEFINER_RESOLUTION,
     ),
     (
-        "epigraph-mcp/src/embed.rs",
-        "search_scoped",
+        "epigraph-mcp/src/claim_helper.rs",
+        "write_viewer",
         1,
-        READ_PENDING,
+        PRE_VIEWER,
     ),
     (
         "epigraph-mcp/src/embed.rs",
@@ -438,358 +399,22 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         PRE_VIEWER,
     ),
     (
+        "epigraph-mcp/src/tools/workflow_ingest.rs",
+        "execute_workflow_ingest_with_inserted",
+        1,
+        PRE_VIEWER,
+    ),
+    (
         "epigraph-mcp/src/tools/claims.rs",
         "operator_arm_allows",
         2,
         PRE_VIEWER,
     ),
     (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "open",
-        1,
-        NO_SCOPED_POOL_FALLBACK,
-    ),
-    // ── epigraph-mcp: tool reads still on the raw pool ───────────────────
-    (
-        "epigraph-mcp/src/tools/alternative_sets.rs",
-        "suggest_alternative_sets",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/batch.rs",
-        "system_stats",
-        4,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/challenges.rs",
-        "list_challenges",
-        1,
-        READ_PENDING,
-    ),
-    (
         "epigraph-mcp/src/tools/claims.rs",
-        "get_claim",
-        5,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "query_claims",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "query_undecomposed_claims",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "update_with_evidence",
+        "delegate_arm_allows",
         1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "verify_claim",
-        3,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/consolidate.rs",
-        "consolidate_claims",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/ds.rs",
-        "compare_methods",
-        4,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/ds.rs",
-        "get_belief_in_mode",
-        4,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/ds.rs",
-        "get_divergence",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/ds.rs",
-        "list_frames",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/ds.rs",
-        "scoped_belief",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/ds.rs",
-        "submit_ds_evidence",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/embeddings.rs",
-        "embedding_neighborhood_density",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/graph.rs",
-        "get_neighborhood",
-        3,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/graph.rs",
-        "traverse",
-        4,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/lens.rs",
-        "validate_lens_exists",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/matching.rs",
-        "find_cross_source_matches",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/matching.rs",
-        "list_match_candidates",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/memory.rs",
-        "recall_post_embed",
-        9,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "claim_responses",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_claims_by_evidence",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_claims_by_label",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_claims_by_methodology",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_paper",
-        6,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/perspectives.rs",
-        "get_perspective",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/perspectives.rs",
-        "list_perspectives",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/provenance.rs",
-        "get_provenance",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/provenance_chain.rs",
-        "get_provenance_chain",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/rdf.rs",
-        "entity_neighborhood",
-        4,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/rdf.rs",
-        "query_triples",
-        4,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/rdf.rs",
-        "search_triples",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "apply_graph_expansion",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "compute_corpus_scope",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "detect_centroid_dim",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "embedded_3072_population",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "fetch_batched_context",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "fraction",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "recall_with_context",
-        3,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "recall_with_context_post_embed",
-        12,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "recall_with_context_with_pgvec",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall.rs",
-        "refresh",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/recall_events.rs",
-        "get_recall_events",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/sheaf.rs",
-        "check_sheaf_consistency",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/sheaf.rs",
-        "reconcile_sheaf",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/sheaf.rs",
-        "sheaf_cohomology",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "get_theme",
-        3,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "list_themes",
-        2,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "resolve_theme_selector",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "enrich_workflow_result",
-        1,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "find_workflow_post_embed",
-        6,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "hierarchical_workflow_result",
-        3,
-        READ_PENDING,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "assess_workflow_promotion",
-        3,
-        "READ_PENDING for the variant-parent lookup \
-         (WorkflowRepository::immediate_variant_parent, viewer-filtered over claims and edges); \
-         the two success_stats reads are NO_ROW_SECURITY (behavioral_executions carries no \
-         tenancy). Convert the first onto the caller's read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/workflow_hierarchical.rs",
-        "find_workflow_hierarchical",
-        3,
-        "Two NO_SCOPED_POOL_FALLBACK arms (the hierarchical search without a ScopedPool; with \
-         one it runs on read_as) and one READ_PENDING: resolve_steps_to_heads(&server.pool, \
-         viewer, ..) for resolve_to_latest, which should move onto the same stamped read.",
+        PRE_VIEWER,
     ),
     // ── epigraph-mcp: tables without row security ────────────────────────
     (
@@ -805,6 +430,55 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         NO_ROW_SECURITY,
     ),
     (
+        "epigraph-mcp/src/tools/ingestion.rs",
+        "preflight_write_authority",
+        1,
+        NO_ROW_SECURITY,
+    ),
+    (
+        "epigraph-mcp/src/tools/ingestion.rs",
+        "resolve_ingest_visibility",
+        1,
+        DEFINER_RESOLUTION,
+    ),
+    (
+        "epigraph-mcp/src/tools/memory.rs",
+        "recall_post_embed",
+        1,
+        "NO_ROW_SECURITY: the `&server.pool` argument to themes::resolve_theme_selector, for its \
+         claim_themes label lookup (a registry with no tenancy); every claim-derived read of \
+         the page runs on the caller's stamped read.",
+    ),
+    (
+        "epigraph-mcp/src/tools/paper_queries.rs",
+        "query_paper",
+        1,
+        "NO_ROW_SECURITY: the `papers` lookup (find_paper_by_document_key); every claim-derived \
+         read below it runs on the caller's stamped read.",
+    ),
+    (
+        "epigraph-mcp/src/tools/themes.rs",
+        "get_theme",
+        1,
+        "NO_ROW_SECURITY: the `&server.pool` argument to resolve_theme_selector, for its \
+         claim_themes label lookup; the summary and member reads run on the caller's stamped \
+         read.",
+    ),
+    (
+        "epigraph-mcp/src/tools/themes.rs",
+        "list_themes",
+        1,
+        "NO_ROW_SECURITY: ClaimThemeRepository::count_summaries over claim_themes, corpus-wide by \
+         design; the page itself runs on the caller's stamped read.",
+    ),
+    (
+        "epigraph-mcp/src/tools/themes.rs",
+        "resolve_theme_selector",
+        1,
+        "NO_ROW_SECURITY: its `pool` parameter serves only ClaimThemeRepository::find_by_label \
+         over claim_themes; the viewer-filtered summary read takes the caller's stamped `conn`.",
+    ),
+    (
         "epigraph-mcp/src/tools/matching.rs",
         "decide_match_candidate",
         1,
@@ -815,18 +489,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "retire_match_candidate",
         1,
         NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "get_workflow_executions",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/events.rs",
-        "list_events",
-        1,
-        EVENT_LIST_DEFINER,
     ),
     (
         "epigraph-mcp/src/tools/ds.rs",
@@ -855,7 +517,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document",
+        "do_ingest_document_reporting",
         2,
         REGISTERED_WRITE,
     ),
@@ -914,12 +576,21 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         NO_SCOPED_POOL_FALLBACK,
     ),
     (
+        "epigraph-mcp/src/tools/recall.rs",
+        "detect_centroid_dim",
+        1,
+        "TEST_ONLY_WRAPPER: `recall::__test_only::detect_centroid_dim`, a #[doc(hidden)] \
+         wrapper taking `&PgPool` so a #[sqlx::test] can pin the centroid-dimension decision; \
+         no tool routes through it (the tool's own detect_centroid_dim takes the stamped \
+         read).",
+    ),
+    (
         "epigraph-mcp/src/tools/evolve_step.rs",
         "evolve_step",
-        2,
-        "One READ_PENDING (resolve_step_claim(&server.pool, viewer, ..), the step-name \
-         resolution, which misses a group-private workflow's step on the plain pool) and one \
-         REGISTERED_WRITE (the server.pool.begin() fallback for a server with no ScopedPool).",
+        1,
+        "REGISTERED_WRITE: the server.pool.begin() fallback for a server with no ScopedPool (a \
+         fixture; every deployed server is built with_scoped_pool). The step-name resolution \
+         that was the second site now runs on the caller's stamped read.",
     ),
     (
         "epigraph-mcp/src/tools/workflows.rs",
@@ -932,7 +603,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 215;
+const HIGH_WATER: usize = 84;
 
 // ===========================================================================
 // The scanner.
