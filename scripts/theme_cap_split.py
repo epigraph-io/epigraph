@@ -463,22 +463,30 @@ def reverse_manifest(conn, manifest, allow_drift=False):
     status = []
     try:
         with conn.cursor() as cur:
-            cols = _restorable_columns(cur)
-            restore = sql.SQL(
-                "UPDATE claim_themes t SET ({cols}) = (SELECT {rcols} FROM "
-                "jsonb_populate_record(NULL::claim_themes, %s::jsonb) r) WHERE t.id = %s"
-            ).format(cols=sql.SQL(", ").join(map(sql.Identifier, cols)),
-                     rcols=sql.SQL(", ").join(sql.SQL("r.") + sql.Identifier(c) for c in cols))
+            live_cols = _restorable_columns(cur)
             for t in reversed(manifest["themes"]):
                 parent = t["parent_id"]
                 snapshot = json.dumps(t["parent_row"])
+                # Only the columns the snapshot holds: one added to claim_themes
+                # after the apply keeps its current value (not NULL), and one
+                # dropped since is skipped.
+                cols = [c for c in live_cols if c in t["parent_row"]]
+                restore = sql.SQL(
+                    "UPDATE claim_themes t SET ({cols}) = (SELECT {rcols} FROM "
+                    "jsonb_populate_record(NULL::claim_themes, %s::jsonb) r) WHERE t.id = %s"
+                ).format(cols=sql.SQL(", ").join(map(sql.Identifier, cols)),
+                         rcols=sql.SQL(", ").join(sql.SQL("r.") + sql.Identifier(c)
+                                                  for c in cols))
                 new_ids = [p["theme_id"] for p in t["new_parts"]]
                 cur.execute("SELECT id::text FROM claim_themes WHERE id = ANY(%s::uuid[])",
                             (new_ids,))
                 present = {r[0] for r in cur.fetchall()}
                 if not present:
-                    cur.execute("SELECT to_jsonb(ct) = %s::jsonb FROM claim_themes ct "
-                                "WHERE id = %s", (snapshot, parent))
+                    cur.execute("SELECT (SELECT jsonb_object_agg(e.key, e.value) "
+                                "        FROM jsonb_each(to_jsonb(ct)) e "
+                                "        WHERE %s::jsonb ? e.key) = %s::jsonb "
+                                "FROM claim_themes ct WHERE id = %s",
+                                (snapshot, snapshot, parent))
                     same = cur.fetchone()
                     if same and same[0]:
                         status.append({"parent_id": parent, "status": "nothing to reverse"})

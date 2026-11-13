@@ -342,6 +342,35 @@ def test_apply_refuses_a_result_whose_cap_is_over_its_own():
         S.apply_result(_NoDB(), result, "unused.json")
 
 
+def test_reverse_keeps_a_column_added_after_the_apply(db, seed_agent, tmp_path):
+    """A claim_themes column added between apply and reverse (a later Atlas item
+    may add one) is not in the snapshot. Reverse leaves it as it is, rather
+    than writing NULL into it or failing on its NOT NULL."""
+    theme, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    before = _snapshot(db)
+    result, _ = S.plan(db, cap=CAP)
+    manifest = S.apply_result(db, result, tmp_path / "m.json")
+    try:
+        with db.cursor() as cur:
+            cur.execute("ALTER TABLE claim_themes ADD COLUMN w1_added text NOT NULL "
+                        "DEFAULT 'kept'")
+            cur.execute("UPDATE claim_themes SET w1_added = 'changed' WHERE id = %s", (theme,))
+        db.commit()
+
+        S.reverse_manifest(db, manifest)
+
+        with db.cursor() as cur:
+            cur.execute("SELECT w1_added FROM claim_themes")
+            assert [r[0] for r in cur.fetchall()] == ["changed"]
+        db.rollback()
+    finally:
+        db.rollback()
+        with db.cursor() as cur:
+            cur.execute("ALTER TABLE claim_themes DROP COLUMN IF EXISTS w1_added")
+        db.commit()
+    assert _snapshot(db) == before
+
+
 def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):
     """Superseded and duplicate-marked members keep their theme_id but are not
     drawn and cannot be clustered: they neither trigger a split nor overflow the
