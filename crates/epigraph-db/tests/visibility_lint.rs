@@ -2747,6 +2747,30 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
          column to name (the shape of claim_theme.rs `delete_all_conn`).",
     ),
+    // Atlas W2 (migration 210): the nightly's writes of a team or public map.
+    (
+        "atlas_map.rs",
+        "write_run",
+        "WRITE. Opens one unfinished `atlas_map_runs` row of one map, declared ('group', T) for a \
+         team map or ('public', world) for the public map; the nightly calls it on the \
+         maintenance connection, the application role holds SELECT only on the table, and its \
+         `atlas_map_runs_tenancy` WITH CHECK would hold any other writer to its writable groups. \
+         The one read is the `groups` kind check of the declared owner.",
+    ),
+    (
+        "atlas_map.rs",
+        "put_level",
+        "WRITE. Upserts one `atlas_map_levels` document into an unfinished run, copying the \
+         run's own tenancy columns (pinned by the composite FK); the nightly calls it on the \
+         maintenance connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "finish_run",
+        "WRITE. Stamps one unfinished `atlas_map_runs` row finished with its level count, \
+         counted over the run's own documents; the nightly calls it on the maintenance \
+         connection and the application role holds SELECT only on the table.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
