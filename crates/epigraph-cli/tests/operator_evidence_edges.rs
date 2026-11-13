@@ -580,3 +580,65 @@ async fn the_census_counts_a_doubly_sealed_row_once_and_names_provenance_rows(po
     }
 }
 
+/// The advisory lock name the operator verbs hold (the CLI's `LOCK_NAME`).
+const LOCK_NAME: &str = "epigraph-operator:backfill-evidence-edges";
+
+/// An applied run, and an applied reversal, refuse to start while another
+/// holds the lock, and write nothing (no edge, no manifest).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_applied_run_or_reversal_refuses_while_another_holds_the_lock(pool: PgPool) {
+    seed(&pool).await;
+    let before = edges_snapshot(&pool).await;
+    let mut holder = pool.acquire().await.expect("holder connection");
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(LOCK_NAME)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the lock");
+
+    let m = scratch("locked.jsonl");
+    let apply = [
+        "backfill-evidence-edges",
+        "--apply",
+        "--confirm-count",
+        "2",
+        "--manifest-out",
+        p(&m),
+        "--reason",
+        "while locked",
+    ];
+    let run = run_op(&pool, &apply).await;
+    assert_ne!(run.code, 0, "{}", run.show());
+    assert!(run.stderr.contains("advisory lock"), "{}", run.show());
+    assert_eq!(edges_snapshot(&pool).await, before, "nothing written");
+    assert!(!m.exists(), "no manifest for a refused run");
+
+    // A dry run is read-only and takes no lock.
+    let dry = run_op(&pool, &["backfill-evidence-edges"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+
+    // Released, the same apply runs; re-held, its reversal refuses.
+    sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        .bind(LOCK_NAME)
+        .execute(&mut *holder)
+        .await
+        .expect("release");
+    let run = run_op(&pool, &apply).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let applied = edges_snapshot(&pool).await;
+    assert_ne!(applied, before, "control: the unlocked apply wrote");
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(LOCK_NAME)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the lock again");
+    let r = run_op(
+        &pool,
+        &["reverse-evidence-edges", "--manifest", p(&m), "--apply"],
+    )
+    .await;
+    assert_ne!(r.code, 0, "{}", r.show());
+    assert!(r.stderr.contains("advisory lock"), "{}", r.show());
+    assert_eq!(edges_snapshot(&pool).await, applied, "nothing deleted");
+}
+

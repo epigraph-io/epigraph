@@ -50,7 +50,11 @@
 //! to the manifest and `fsync`ed BEFORE its COMMIT, and a `committed_batch`
 //! line follows AFTER it. One `security_events` row per applied run, in its
 //! first batch. `--max-batches` stops early; a re-run (a new manifest) picks
-//! up the rest, since the selection is "missing".
+//! up the rest, since the selection is "missing". An applied run (and an
+//! applied reversal) holds the session advisory lock [`LOCK_NAME`] from
+//! before its census to its end, and refuses to start while another holds
+//! it: `edges` has no unique key on its triple, so two interleaved applies
+//! could otherwise both write one row's edge.
 //!
 //! # Reversal
 //!
@@ -82,6 +86,36 @@ pub const EVENT_APPLY: &str = "evidence_claim_edge.backfill";
 pub const EVENT_REVERSE: &str = "evidence_claim_edge.backfill_reverse";
 /// The largest batch a run takes.
 pub const MAX_BATCH: usize = 10_000;
+/// The session advisory lock (`pg_try_advisory_lock(hashtextextended(name, 0))`)
+/// an applied backfill or reversal holds for its whole run, so two never
+/// interleave: the "is it missing?" check before each edge INSERT takes no
+/// row lock and `edges` has no unique key on its triple, so two concurrent
+/// applies could each write an edge for the same row.
+pub const LOCK_NAME: &str = "epigraph-operator:backfill-evidence-edges";
+
+/// Take [`LOCK_NAME`] on `conn`, or refuse.
+async fn try_lock(conn: &mut PgConnection) -> anyhow::Result<()> {
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
+        .bind(LOCK_NAME)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !locked {
+        bail!(
+            "refusing: another applied backfill-evidence-edges or reverse-evidence-edges holds \
+             the advisory lock `{LOCK_NAME}`; nothing was written"
+        );
+    }
+    Ok(())
+}
+
+/// Release [`LOCK_NAME`] (best effort: the session's end releases it too).
+async fn unlock(conn: &mut PgConnection) {
+    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        .bind(LOCK_NAME)
+        .execute(&mut *conn)
+        .await;
+}
+
 
 /// The run's options.
 #[derive(Debug, Clone)]
@@ -545,11 +579,30 @@ impl ManifestWriter {
 
 /// The census, then (under `--apply`) the batches.
 ///
+/// Under `--apply` the whole run, census included, holds [`LOCK_NAME`], so
+/// the confirmed count and the writes see no concurrent applied run.
+///
 /// # Errors
-/// The census fails; under `--apply`, `--confirm-count` differs from the
-/// census, or the manifest cannot be written. A failed BATCH is not an error:
-/// it is reported in [`Report::batch_failure`] and stops the run.
+/// The census fails; under `--apply`, the lock is held by another run,
+/// `--confirm-count` differs from the census, or the manifest cannot be
+/// written. A failed BATCH is not an error: it is reported in
+/// [`Report::batch_failure`] and stops the run.
 pub async fn run(
+    conn: &mut PgConnection,
+    o: &Options,
+    session_user: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<Report> {
+    if !o.apply {
+        return run_locked(conn, o, session_user, out).await;
+    }
+    try_lock(conn).await?;
+    let result = run_locked(conn, o, session_user, out).await;
+    unlock(conn).await;
+    result
+}
+
+async fn run_locked(
     conn: &mut PgConnection,
     o: &Options,
     session_user: &str,
@@ -811,9 +864,29 @@ pub struct ReverseReport {
 
 /// Delete exactly the edges a run's manifest names (see the module doc).
 ///
+/// An applied reversal holds [`LOCK_NAME`] for its whole run.
+///
 /// # Errors
-/// The manifest cannot be read or is not this operation's; a statement fails.
+/// The manifest cannot be read or is not this operation's; the lock is held
+/// by another run; a statement fails.
 pub async fn reverse(
+    conn: &mut PgConnection,
+    manifest: &Path,
+    apply: bool,
+    lock_timeout: &str,
+    session_user: &str,
+    out: &mut impl Write,
+) -> anyhow::Result<ReverseReport> {
+    if !apply {
+        return reverse_locked(conn, manifest, apply, lock_timeout, session_user, out).await;
+    }
+    try_lock(conn).await?;
+    let result = reverse_locked(conn, manifest, apply, lock_timeout, session_user, out).await;
+    unlock(conn).await;
+    result
+}
+
+async fn reverse_locked(
     conn: &mut PgConnection,
     manifest: &Path,
     apply: bool,
