@@ -265,17 +265,22 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
 def export(conn, out_dir, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
     """Write each over-cap theme's ids and embeddings to `out_dir`."""
     out_dir = pathlib.Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     index = {"format": core.EXPORT_FORMAT, "cap": cap, "seed": seed, "themes": []}
-    for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
-        ids, x = load_members(conn, theme_id)
-        conn.rollback()
-        core.write_theme_npz(out_dir / f"{theme_id}.npz", ids, x)
-        # Embeddings are approximately invertible to claim content: owner-only.
-        os.chmod(out_dir / f"{theme_id}.npz", 0o600)
-        index["themes"].append({"theme_id": theme_id, "current": members,
-                                "embedded": embedded, "retired": retired})
-    (out_dir / "export.json").write_text(json.dumps(index, indent=1))
+    # Embeddings are approximately invertible to claim content: everything the
+    # export creates (the directory when it is new, each .npz, export.json) is
+    # owner-only from the moment it exists, not chmod-ed after.
+    old_umask = os.umask(0o077)
+    try:
+        out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
+            ids, x = load_members(conn, theme_id)
+            conn.rollback()
+            core.write_theme_npz(out_dir / f"{theme_id}.npz", ids, x)
+            index["themes"].append({"theme_id": theme_id, "current": members,
+                                    "embedded": embedded, "retired": retired})
+        (out_dir / "export.json").write_text(json.dumps(index, indent=1))
+    finally:
+        os.umask(old_umask)
     return index
 
 
