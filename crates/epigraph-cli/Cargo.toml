@@ -343,7 +343,14 @@ name = "atlas_layout_bin"
 path = "tests/atlas_layout_bin.rs"
 required-features = ["db"]
 
-# Atlas W4: the "by meaning" hierarchy's export and apply, in process.
+# Atlas W4: the "by meaning" hierarchy's export and apply (maintenance DSN).
+[[bin]]
+name = "atlas_meaning"
+path = "src/bin/atlas_meaning.rs"
+required-features = ["db"]
+
+# Atlas W4: the "by meaning" hierarchy's export and apply, in process, and
+# the binary's argument refusals.
 [[test]]
 name = "atlas_meaning"
 path = "tests/atlas_meaning.rs"

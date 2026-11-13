@@ -752,3 +752,44 @@ async fn retired_and_unembedded_claims_are_not_members(pool: PgPool) {
         .iter()
         .all(|(_, e)| e.starts_with('[') && e.matches(',').count() == DIM - 1));
 }
+
+/// The binary refuses a malformed map or an out-of-range cap before it
+/// connects anywhere (the database URL names nothing that answers).
+#[test]
+fn the_binary_refuses_a_bad_map_or_cap_before_connecting() {
+    let bin = env!("CARGO_BIN_EXE_atlas_meaning");
+    let dir = tmpdir();
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["export", "--map", "team:not-a-uuid", "--out"],
+            "is not a uuid",
+        ),
+        (
+            &["export", "--map", "group:x", "--out"],
+            "a map is `public`",
+        ),
+        (
+            &["export", "--map", "public", "--cap", "101", "--out"],
+            "--cap must be 1 to 100",
+        ),
+        (
+            &["apply", "--map", "public", "--cap", "0", "--from"],
+            "--cap must be 1 to 100",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = std::process::Command::new(bin)
+            .env_clear()
+            .current_dir(&dir)
+            .arg("--database-url")
+            .arg("postgres://nobody@127.0.0.1:1/none")
+            .args(args)
+            .arg(&dir)
+            .output()
+            .expect("run atlas_meaning");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} succeeded");
+        assert!(stderr.contains(want), "{args:?}: {stderr}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
