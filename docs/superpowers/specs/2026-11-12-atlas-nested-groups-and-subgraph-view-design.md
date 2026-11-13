@@ -74,8 +74,12 @@ and that graph, each small enough to read, each with a name.
   edges table; the view never synthesises one. Every evidence write path must name at
   least one claim and write that edge, and existing evidence gets an operator-run backfill
   (most evidence rows had no such edge).
-- **Co-owned edges.** An edge co-owned by two teams is drawn on both teams' maps (never on
-  the public map unless the edge itself is public).
+- **Co-owned edges.** The database's rule stands: an edge co-owned by two teams is readable
+  only by people in both. A map draws an edge only when both endpoints are drawable on it
+  and the map's whole audience may read the edge, so a co-owned edge is never baked into a
+  single-team map, and the public map draws public edges only. A joint per-viewer view for
+  people in both teams is future work. (This replaces an earlier ruling that drew it on both
+  teams' maps.)
 - **Proxy weights.** Claim-to-claim flow weight is link strength × sign only (§2).
 
 ## 3. Goals
