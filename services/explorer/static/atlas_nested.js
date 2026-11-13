@@ -85,7 +85,8 @@
   /**
    * How a leaf edge is drawn. `basis` is exact | proxy | none; anything else
    * counts as none. Returns {width, dash, estimate, tone, direction,
-   * particles, flows}.
+   * particles, flows}. `tone` follows the sign whatever the weight; width,
+   * direction and particles need a weight above 0 and a non-zero sign.
    */
   function edgeStyle(edge) {
     const e = edge || {};
@@ -98,7 +99,9 @@
       width: flows ? flowWidth(weight) : HAIRLINE,
       dash: basis === 'proxy' ? PROXY_DASH.slice() : [],
       estimate: basis === 'proxy',
-      tone: !flows ? 'neutral' : direction > 0 ? 'support' : 'oppose',
+      // The tone comes from the sign alone: a contradicting link stored with
+      // strength 0 still reads as opposing, though it carries no flow.
+      tone: direction > 0 ? 'support' : direction < 0 ? 'oppose' : 'neutral',
       direction: flows ? direction : 0,
       particles: flows ? particleCount(weight) : 0,
       flows,

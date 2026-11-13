@@ -107,6 +107,30 @@ test('a cites link, with weight 0, draws no flow', () => {
   }
 });
 
+test('a signed link with weight 0 keeps its tone but carries no flow', () => {
+  // A contradicts or refutes link stored with strength 0: still the opposing
+  // style, as a hairline with no particles.
+  for (const basis of ['proxy', 'exact']) {
+    const opp = N.edgeStyle(edge({ flow_basis: basis, sign: -1, flow_weight: 0, relationship: 'contradicts' }));
+    assert.equal(opp.tone, 'oppose', basis);
+    assert.equal(opp.flows, false, basis);
+    assert.equal(opp.particles, 0, basis);
+    assert.equal(opp.direction, 0, basis);
+    assert.equal(opp.width, N.HAIRLINE, basis);
+    assert.deepEqual(N.particleFractions(2.5, opp, 0.3), [], basis);
+    // A supporting link with weight 0 likewise draws no flow.
+    const sup = N.edgeStyle(edge({ flow_basis: basis, sign: 1, flow_weight: 0 }));
+    assert.equal(sup.tone, 'support', basis);
+    assert.equal(sup.flows, false, basis);
+    assert.equal(sup.particles, 0, basis);
+    assert.equal(sup.width, N.HAIRLINE, basis);
+  }
+  // The proxy dash still marks the zero-weight estimate.
+  assert.ok(N.edgeStyle(edge({ flow_basis: 'proxy', sign: -1, flow_weight: 0 })).estimate);
+  // Sign 0 (cites) stays neutral at any weight the contract allows.
+  assert.equal(N.edgeStyle(edge({ sign: 0, flow_weight: 0 })).tone, 'neutral');
+});
+
 test('the switch leads to the other hierarchy, and nothing else', () => {
   for (const stem of ['team_theme_root', 'team_group_deep', 'team_leaf_dense', 'public_leaf']) {
     const doc = fixture(stem);
