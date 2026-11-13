@@ -410,6 +410,8 @@ epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-mcp = { workspace = true }
 epigraph-ingest = { workspace = true }
+# Atlas W6: the level documents `atlas_layout::fill` puts positions into.
+epigraph-atlas-contract = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 epigraph-db = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
@@ -446,6 +448,8 @@ ndarray = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# Atlas W6: the contract's fixture levels, for `atlas_layout::fill`'s tests.
+epigraph-atlas-contract = { workspace = true, features = ["check"] }
 sqlx = { workspace = true }
 # PR-hierarchical ingest integration test (tests/pr_hierarchical_ingest_test.rs):
 # oneshot the real epigraph-api handlers the CLI hits against epigraph_db_repo_test.

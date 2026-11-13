@@ -8,8 +8,10 @@
 //!
 //! Below a theme (Atlas W6): [`force`] is the pure force-directed layout of a
 //! leaf and the circle placement of a group level's children, on ids and
-//! edges only.
+//! edges only; [`fill`] puts those positions into a run's W10a level
+//! documents and skips every level whose layout input is unchanged.
 
+pub mod fill;
 pub mod force;
 pub mod math;
 
