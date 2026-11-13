@@ -62,6 +62,12 @@ application role, and refuses a session that row-level security on `claims`
 applies to (not a superuser or BYPASSRLS role, and the database's own
 `epigraph_bypass()` is false).
 
+Run plan and apply in small `--theme-id` batches on a large corpus. Each
+apply is one transaction holding row locks on every claim it moves, and any
+theme whose membership changed since its plan (a supersede, a dedup, a new
+assignment) refuses the whole apply, as does any theme the result names that
+would stay over the cap.
+
 After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
 of a split theme are stale until rebuilt. `reverse` deletes the new parts'
 rows, and rows that reference them cascade.
@@ -395,15 +401,20 @@ def apply_result(conn, result, manifest_path):
                                            "kept_claim_ids": kept, "new_parts": new_parts})
             for theme_id, with_3072 in touched:
                 _recompute(cur, theme_id, with_3072)
-            if touched:
-                cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
-                            f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
-                            "GROUP BY theme_id HAVING count(*) > %s ORDER BY 1",
-                            ([t for t, _ in touched], cap))
-                over = cur.fetchall()
-                if over:
-                    raise ValueError(f"parts would end over the cap of {cap} (current members "
-                                     f"without an embedding stay with the kept part): {over}")
+            # EVERY theme the result names, not only the ones written: a theme
+            # whose embedded members fit in one part (or that has none) is not
+            # split above, and would otherwise stay over the cap behind a
+            # successful apply.
+            checked = sorted({t for t, _ in touched} | {str(e["theme_id"]) for e in result["themes"]})
+            cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
+                        f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
+                        "GROUP BY theme_id HAVING count(*) > %s ORDER BY 1",
+                        (checked, cap))
+            over = cur.fetchall()
+            if over:
+                raise ValueError(f"themes would end over the cap of {cap} (current members "
+                                 "without an embedding stay with the kept part, and cannot be "
+                                 f"split); drop them with --theme-id and re-plan: {over}")
         if not manifest["themes"]:
             conn.rollback()
             return manifest

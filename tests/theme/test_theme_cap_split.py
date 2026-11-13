@@ -288,6 +288,29 @@ def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, seed_
     assert not (tmp_path / "m.json").exists()
 
 
+@pytest.mark.parametrize("embedded, unembedded", [
+    ((35,), 10),  # embedded members fit in ONE part; the theme is still over the cap
+    ((), 45),     # no embedded member at all: the result has no parts for it
+], ids=["one-part", "no-embeddings"])
+def test_apply_refuses_an_over_cap_theme_it_cannot_split(db, seed_agent, tmp_path,
+                                                         embedded, unembedded):
+    """A theme the split leaves whole must not pass as applied: the apply would
+    report success and the theme would stay over the cap."""
+    stuck, _, _ = _theme(db, seed_agent, embedded, label="Unembedded Theme", seed0=40,
+                         unembedded=unembedded)
+    _theme(db, seed_agent, (30, 25, 20))  # a splittable theme in the same result
+    result, report = S.plan(db, cap=CAP)
+    by_id = {r["theme_id"]: r for r in report}
+    assert by_id[stuck]["current"] == 45 and by_id[stuck]["reaches_cap"] is False
+    before = _snapshot(db)
+
+    with pytest.raises(ValueError, match=f"over the cap.*{stuck}"):
+        S.apply_result(db, result, tmp_path / "m.json")
+
+    assert _snapshot(db) == before, "the whole apply is refused, the splittable theme too"
+    assert not (tmp_path / "m.json").exists()
+
+
 def test_plan_and_parts_record_an_id_order_cut(db, seed_agent, tmp_path):
     """Members with identical vectors can only be cut by claim id. The dry run
     and the written parts both say so, so it is countable on a real corpus."""
