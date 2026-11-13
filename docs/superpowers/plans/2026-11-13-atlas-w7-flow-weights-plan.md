@@ -33,7 +33,7 @@ edge list (`epigraph_atlas_contract::Edge`), each edge with `sign`,
 |------|------|
 | `crates/epigraph-db/src/repos/atlas_flow.rs` | the DB read, `AtlasFlowRepository::read_flow_inputs`: stored link strengths of the leaf's claim-to-claim edge rows, and the evidence-keyed mass rows behind its evidence-to-claim edges, both under the map's audience; the plain input type `FlowInputs` |
 | `crates/epigraph-engine/src/atlas_flow.rs` | the pure weighting, `weigh_leaf_edges(&LeafNodeSet, &FlowInputs) -> Vec<Edge>`, the sign table, the strength fallback, the mass reading, and `build_leaf_flow_edges` (read then weigh); unit tests of the pure half |
-| `crates/epigraph-engine/Cargo.toml` | depends on `epigraph-atlas-contract` (types and `validate`); the contract's `check` feature in dev-dependencies for the fixture envelope |
+| `crates/epigraph-engine/Cargo.toml` | depends on `epigraph-atlas-contract` (types and `validate`); the tests build the level envelope by hand, so no `check` feature is needed |
 | `crates/epigraph-engine/tests/atlas_flow.rs` | DB tests, a fresh database per test (`#[sqlx::test]`, `remote-cargo --db`) |
 
 The pure half lives in `epigraph-engine` because the strength fallback is the
