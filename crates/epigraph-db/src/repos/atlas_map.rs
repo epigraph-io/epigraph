@@ -16,16 +16,27 @@
 //! **The build** runs on the maintenance connection: [`AtlasMapRepository::write_run`]
 //! opens an unfinished run, [`AtlasMapRepository::put_level`] writes its level
 //! documents and [`AtlasMapRepository::finish_run`] publishes it. The
-//! application role holds SELECT only on these tables. The builder reads
-//! [`AtlasMapRepository::map_epochs`] first in its REPEATABLE READ snapshot and
-//! records both numbers on the run.
+//! application role holds SELECT only on these tables. The builder opens its
+//! transaction with [`AtlasMapRepository::begin_build_snapshot`], which fixes a
+//! REPEATABLE READ snapshot and reads the epochs in it, and records them on the
+//! run.
 //!
 //! **The serve** runs on the caller's viewer-stamped connection:
 //! [`AtlasMapRepository::level_for_viewer`] reads one level of the latest
 //! FINISHED run of one map in one statement, spliced on both tables it reads,
-//! with row security beneath. It reports whether the run is still
-//! [`MapLevel::current`]; what a route does with a stale run is the route's
-//! decision (Atlas W10).
+//! with row security beneath. It reports two things about the run:
+//! [`MapLevel::current`] (nothing entered or left the map's readable set, and
+//! no level of the run was deleted) and [`MapLevel::nothing_left`] (no row left
+//! it for somewhere its viewers cannot read). What a route does with either is
+//! the route's decision (Atlas W10): an arrival leaves a map incomplete, a
+//! departure may leave it holding a row its viewers may no longer read.
+//!
+//! # The epochs are not for the browser
+//!
+//! The world row of `atlas_map_epochs` is readable by every session, so its
+//! counters say how often public rows moved. Migration 197 never hands its
+//! epoch out; a route built on this module should return the two flags, not
+//! the numbers.
 //!
 //! # The payload
 //!
@@ -84,13 +95,19 @@ impl AtlasHierarchy {
     }
 }
 
-/// A map's epoch and the public map's, as one build snapshot reads them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A map's epoch counters and the public map's, as one build snapshot reads
+/// them (migration 210, section 1). Every counter is 0 before its first bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MapEpochs {
-    /// `atlas_map_epochs.n` of the map (0 before its first bump).
+    /// `atlas_map_epochs.n` of the map: rows that entered or left its half.
     pub map: i64,
-    /// `atlas_map_epochs.n` of the public map (0 before its first bump).
+    /// `atlas_map_epochs.n` of the public map.
     pub public: i64,
+    /// `atlas_map_epochs.left_n` of the map: rows that left its half for
+    /// somewhere not public.
+    pub map_left: i64,
+    /// `atlas_map_epochs.left_n` of the public map.
+    pub public_left: i64,
 }
 
 /// A run to open, from [`AtlasMapRepository::write_run`].
@@ -100,7 +117,7 @@ pub struct NewMapRun {
     /// The builder's algorithm name, 1 to 64 characters.
     pub algo: String,
     pub params: serde_json::Value,
-    /// What [`AtlasMapRepository::map_epochs`] returned in the build snapshot.
+    /// What [`AtlasMapRepository::begin_build_snapshot`] returned.
     pub epochs: MapEpochs,
 }
 
@@ -131,9 +148,16 @@ pub struct MapLevel {
     pub level: i32,
     pub schema_version: i32,
     pub payload: serde_json::Value,
-    /// Both epochs the run recorded still equal the live ones: no claim has
-    /// entered or left the map's readable set since the build's snapshot.
+    /// Nothing changed since the build's snapshot: both `n` counters the run
+    /// recorded still equal the live ones (no claim, edge or evidence row
+    /// entered or left the map's readable set) and every level the run was
+    /// finished with is still stored (a theme delete cascades its levels away).
     pub current: bool,
+    /// No row LEFT the map's readable set for somewhere not public since the
+    /// build's snapshot: both `left_n` counters still match. When false the
+    /// stored map may hold a row its viewers can no longer read. Tenancy
+    /// departures only: a deleted row bumps nothing.
+    pub nothing_left: bool,
 }
 
 /// Per-team Atlas map storage. See the module documentation.
@@ -142,15 +166,56 @@ pub struct AtlasMapRepository;
 impl AtlasMapRepository {
     // ── build side ───────────────────────────────────────────────────────────
 
-    /// The map's epoch and the public map's, in one statement.
+    /// Open a build: fix a REPEATABLE READ snapshot on a fresh transaction and
+    /// read `map`'s epochs in it, so the rows the build reads afterwards and the
+    /// epochs it records on the run come from the same snapshot. A move still
+    /// uncommitted when the snapshot is taken bumps an epoch past the recorded
+    /// one when it commits, and the run is stale on arrival rather than
+    /// silently missing the move.
     ///
-    /// The builder makes this the first read of its REPEATABLE READ
-    /// transaction, so the snapshot it builds from and the epochs it records
-    /// are the same: a move still uncommitted when the snapshot is taken bumps
-    /// an epoch past the recorded one when it commits, and the run is stale on
-    /// arrival rather than silently missing the move. On the maintenance
-    /// connection the viewer is a system viewer and the splice is empty; on a
-    /// stamped connection a non-member reads 0 for a team map.
+    /// MUST be the first call on its transaction: its first statement is
+    /// `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`, which PostgreSQL
+    /// refuses once the transaction has run a query. Outside a transaction
+    /// block that statement only warns, so the isolation level is then read
+    /// back and anything weaker than REPEATABLE READ is refused.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` when the isolation level cannot be set (the
+    /// transaction already ran a query); `DbError::InvalidData` when the
+    /// connection is not in a REPEATABLE READ or SERIALIZABLE transaction.
+    pub async fn begin_build_snapshot(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+    ) -> Result<MapEpochs, DbError> {
+        Self::fix_repeatable_read(conn).await?;
+        Self::map_epochs(conn, viewer, map).await
+    }
+
+    /// [`Self::begin_build_snapshot`]'s first half: set REPEATABLE READ on the
+    /// connection's fresh transaction and refuse anything weaker.
+    async fn fix_repeatable_read(conn: &mut PgConnection) -> Result<(), DbError> {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *conn)
+            .await?;
+        let level: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+            .fetch_one(&mut *conn)
+            .await?;
+        if level != "repeatable read" && level != "serializable" {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "an Atlas map build needs a REPEATABLE READ transaction, not {level:?} \
+                     (begin a transaction first)"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The map's epoch counters and the public map's, in one statement, as
+    /// `viewer` may read them: on a stamped connection a non-member reads 0
+    /// for a team map. For a build use [`Self::begin_build_snapshot`], which
+    /// also fixes the snapshot.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the statement fails.
@@ -161,23 +226,27 @@ impl AtlasMapRepository {
     ) -> Result<MapEpochs, DbError> {
         let (owner, _) = map.tenancy();
         let sql = viewer.splice(
-            "SELECT COALESCE((SELECT e.n FROM atlas_map_epochs e \
-                               WHERE e.owner_group_id = $1 /* {VISIBILITY:e} */), 0)::int8, \
-                    COALESCE((SELECT p.n FROM atlas_map_epochs p \
-                               WHERE p.owner_group_id = $2 AND p.visibility = 'public' \
-                                 /* {VISIBILITY:p} */), 0)::int8",
+            "SELECT COALESCE(e.n, 0)::int8, COALESCE(p.n, 0)::int8, \
+                    COALESCE(e.left_n, 0)::int8, COALESCE(p.left_n, 0)::int8 \
+               FROM (SELECT 1) one \
+               LEFT JOIN atlas_map_epochs e \
+                 ON e.owner_group_id = $1 /* {VISIBILITY:e} */ \
+               LEFT JOIN atlas_map_epochs p \
+                 ON p.owner_group_id = $2 AND p.visibility = 'public' /* {VISIBILITY:p} */",
             3,
         );
-        let mut q = sqlx::query_as::<_, (i64, i64)>(&sql)
+        let mut q = sqlx::query_as::<_, (i64, i64, i64, i64)>(&sql)
             .bind(owner)
             .bind(WORLD_GROUP);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let (map_n, public_n) = q.fetch_one(&mut *conn).await?;
+        let (map, public, map_left, public_left) = q.fetch_one(&mut *conn).await?;
         Ok(MapEpochs {
-            map: map_n,
-            public: public_n,
+            map,
+            public,
+            map_left,
+            public_left,
         })
     }
 
@@ -196,8 +265,9 @@ impl AtlasMapRepository {
         let (owner, visibility) = run.map.tenancy();
         let id: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO atlas_map_runs \
-                 (owner_group_id, visibility, algo, params, map_epoch, public_epoch) \
-             SELECT $1, $2, $3, $4, $5, $6 \
+                 (owner_group_id, visibility, algo, params, map_epoch, public_epoch, \
+                  map_left_epoch, public_left_epoch) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8 \
              WHERE $2 = 'public' \
                 OR EXISTS (SELECT 1 FROM groups g WHERE g.id = $1 \
                               AND g.kind IN ('team', 'community')) \
@@ -209,6 +279,8 @@ impl AtlasMapRepository {
         .bind(&run.params)
         .bind(run.epochs.map)
         .bind(run.epochs.public)
+        .bind(run.epochs.map_left)
+        .bind(run.epochs.public_left)
         .fetch_optional(&mut *conn)
         .await?;
         id.ok_or_else(|| DbError::InvalidData {
@@ -297,7 +369,9 @@ impl AtlasMapRepository {
     /// the level are each spliced on the viewer, and row security filters both
     /// beneath the splice, so a non-member of a team gets `None` for any of its
     /// groups, exactly as for a group id that names nothing. The run lookup is
-    /// `atlas_map_runs_latest_idx` and the level lookup the primary key.
+    /// `atlas_map_runs_latest_idx` and the level lookup the primary key;
+    /// [`MapLevel::current`] also counts the run's stored levels (a primary-key
+    /// prefix scan) against the count it was finished with.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the statement fails.
@@ -311,7 +385,8 @@ impl AtlasMapRepository {
         let (owner, visibility) = map.tenancy();
         let sql = viewer.splice(
             "WITH run AS ( \
-                 SELECT r.id, r.finished_at, r.map_epoch, r.public_epoch \
+                 SELECT r.id, r.finished_at, r.map_epoch, r.public_epoch, \
+                        r.map_left_epoch, r.public_left_epoch, r.level_count \
                    FROM atlas_map_runs r \
                   WHERE r.owner_group_id = $1 AND r.visibility = $2 \
                     AND r.finished_at IS NOT NULL \
@@ -321,15 +396,19 @@ impl AtlasMapRepository {
              ) \
              SELECT run.id AS run_id, run.finished_at, l.group_id, l.parent_group_id, \
                     l.theme_id, l.level, l.schema_version, l.payload, \
-                    ( run.map_epoch = COALESCE((SELECT e.n FROM atlas_map_epochs e \
-                                                 WHERE e.owner_group_id = $1 \
-                                                   /* {VISIBILITY:e} */), 0) \
-                      AND run.public_epoch = COALESCE((SELECT p.n FROM atlas_map_epochs p \
-                                                        WHERE p.owner_group_id = $5 \
-                                                          AND p.visibility = 'public' \
-                                                          /* {VISIBILITY:p} */), 0) \
-                    ) AS current \
+                    ( run.map_epoch = COALESCE(e.n, 0) \
+                      AND run.public_epoch = COALESCE(p.n, 0) \
+                      AND run.level_count = (SELECT COUNT(*)::int4 FROM atlas_map_levels lc \
+                                              WHERE lc.run_id = run.id /* {VISIBILITY:lc} */) \
+                    ) AS current, \
+                    ( run.map_left_epoch = COALESCE(e.left_n, 0) \
+                      AND run.public_left_epoch = COALESCE(p.left_n, 0) \
+                    ) AS nothing_left \
                FROM run \
+               LEFT JOIN atlas_map_epochs e \
+                 ON e.owner_group_id = $1 /* {VISIBILITY:e} */ \
+               LEFT JOIN atlas_map_epochs p \
+                 ON p.owner_group_id = $5 AND p.visibility = 'public' /* {VISIBILITY:p} */ \
                JOIN atlas_map_levels l \
                  ON l.run_id = run.id AND l.hierarchy = $3 AND l.group_id = $4 \
               WHERE TRUE /* {VISIBILITY:l} */",

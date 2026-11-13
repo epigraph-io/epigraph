@@ -2771,6 +2771,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          counted over the run's own documents; the nightly calls it on the maintenance \
          connection and the application role holds SELECT only on the table.",
     ),
+    (
+        "atlas_map.rs",
+        "fix_repeatable_read",
+        "NO ROW READ. Private first half of `begin_build_snapshot`: runs `SET TRANSACTION \
+         ISOLATION LEVEL REPEATABLE READ` and reads back `current_setting('transaction_isolation')`; \
+         it touches no table. `begin_build_snapshot` then reads the epochs through `map_epochs`, \
+         which splices the viewer.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
