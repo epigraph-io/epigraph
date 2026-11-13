@@ -1059,6 +1059,12 @@ mod tests {
             let input = random_group(s, m, m * 2);
             assert_packed(&input, &layout_group(seed(), &input));
         }
+        // The contract's cap on children, for the build report (not a bound).
+        let full = random_group(77, 128, 256);
+        let t = Instant::now();
+        let placed = layout_group(seed(), &full);
+        eprintln!("atlas W6: a 128-child group took {:?}", t.elapsed());
+        assert_packed(&full, &placed);
     }
 
     #[test]
