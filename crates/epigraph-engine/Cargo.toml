@@ -11,6 +11,8 @@ anyhow = { workspace = true }
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-db = { workspace = true }
+# The Atlas level contract: `atlas_flow` returns its `Edge` list (Atlas W7).
+epigraph-atlas-contract = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-embeddings = { workspace = true }
 ascent = { workspace = true }
