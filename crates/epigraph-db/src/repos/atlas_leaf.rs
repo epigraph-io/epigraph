@@ -27,9 +27,17 @@
 //!
 //! * claims and evidence: `visibility = 'public' OR (visibility = 'group' AND
 //!   owner_group_id = T)`;
-//! * edges: the same, and never a co-owned edge (migration 072): an edge
-//!   co-owned by T and another group is readable only by members of both, so a
-//!   member of T who is not in the other group cannot read it;
+//! * edges: `visibility = 'public' OR (visibility = 'group' AND
+//!   (owner_group_id = T OR co_owner_group_id = T))`. An edge co-owned by two
+//!   teams (migration 072) is drawn on the map of each, when both its
+//!   endpoints are drawable there, and never on the public map unless it is
+//!   public. This is wider than row security, on purpose: 077's
+//!   `edges_tenancy` lets only a session in BOTH groups read a co-owned edge,
+//!   so a stamped session of one team alone cannot read it. The nightly reads
+//!   on the maintenance connection, where `epigraph_bypass()` holds and row
+//!   security admits the row for either team's map; a map is never built on a
+//!   single team's session. Migration 210 keys a co-owned edge's epochs on
+//!   both teams already, so either map goes stale when it moves;
 //! * the public map binds T as NULL, so only public rows pass.
 //!
 //! Every statement is ALSO spliced on the viewer, so a scoped caller is
@@ -39,8 +47,8 @@
 //!
 //! A node reached only through a row the map cannot read never appears: an
 //! agent whose only authorship edge is another team's, an evidence row of
-//! another team, an edge owned or co-owned by another team, a claim of another
-//! team named in the input (counted in [`LeafCounts::unreadable_claims`]).
+//! another team, an edge neither owned nor co-owned by the map's team, a claim
+//! of another team named in the input (counted in [`LeafCounts::unreadable_claims`]).
 //! `agents` has no tenancy (077's `agents_identity` is `USING (true)`); the
 //! read only drops agent ids that name no agent row, since `edges` has no
 //! foreign key.
@@ -765,8 +773,8 @@ impl AtlasLeafRepository {
             });
         }
 
-        // 2. Edges touching the claims. A co-owned edge is never drawn
-        //    (module documentation).
+        // 2. Edges touching the claims. A co-owned edge is drawn on its
+        //    owner's map and on its co-owner's (module documentation).
         let sql = viewer.splice(
             "SELECT e.id, e.source_type::text, e.source_id, e.target_type::text, e.target_id, \
                     e.relationship::text \
@@ -778,7 +786,7 @@ impl AtlasLeafRepository {
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
                 AND (e.visibility = 'public' \
                      OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
-                         AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
+                         AND (e.owner_group_id = $2 OR e.co_owner_group_id = $2))) \
                 /* {EDGE_VISIBILITY:e} */",
             3,
         );
@@ -864,7 +872,7 @@ impl AtlasLeafRepository {
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
                 AND (e.visibility = 'public' \
                      OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
-                         AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
+                         AND (e.owner_group_id = $2 OR e.co_owner_group_id = $2))) \
                 /* {EDGE_VISIBILITY:e} */",
             3,
         );

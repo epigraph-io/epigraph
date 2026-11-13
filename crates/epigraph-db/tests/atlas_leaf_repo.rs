@@ -244,6 +244,22 @@ async fn build(pool: &PgPool, viewer: &Viewer, map: AtlasMap, ids: &[Uuid]) -> L
     out
 }
 
+/// [`build`] on a stamped `epigraph_app` transaction, where row security
+/// applies beneath the viewer's splice.
+async fn build_stamped(
+    app: &ScopedPool,
+    viewer: &Viewer,
+    map: AtlasMap,
+    ids: &[Uuid],
+) -> LeafNodeSet {
+    let mut tx = app.begin_as(viewer).await.expect("stamped tx");
+    let out = AtlasLeafRepository::build_leaf(&mut tx, viewer, map, ids, CAP)
+        .await
+        .expect("build_leaf as epigraph_app");
+    tx.commit().await.expect("commit");
+    fits(out)
+}
+
 fn fits(outcome: LeafOutcome) -> LeafNodeSet {
     match outcome {
         LeafOutcome::Fits(set) => set,
@@ -456,12 +472,15 @@ async fn a_high_degree_agent_appears_once(pool: PgPool) {
 /// Team T's map and the public map, built from the same candidate leaf that
 /// names a claim of team U. Never drawn: U's claim, its evidence and filer, an
 /// evidence row of U on T's claim (reached by `claim_id` and by an edge), a
-/// claim-to-claim edge owned by U, an edge co-owned by T and U, and an
-/// authorship edge owned by U that is the only path to its agent, and an
-/// evidence-to-agent edge owned by U and an evidence-to-evidence edge co-owned
-/// by T and U between nodes the map does draw. T's own and public rows are
-/// drawn, an evidence-to-evidence edge of T's among them (the calibration that
-/// the map is not just empty).
+/// claim-to-claim edge owned by U, an authorship edge owned by U that is the
+/// only path to its agent, and an evidence-to-agent edge owned by U between
+/// nodes the map does draw. T's own and public rows are drawn, an
+/// evidence-to-evidence edge of T's among them (the calibration that the map is
+/// not just empty), and so are a claim-to-claim edge and an
+/// evidence-to-evidence edge co-owned by T and U between nodes T's map draws:
+/// a co-owned edge is on each co-owner's map
+/// ([`a_co_owned_edge_is_drawn_on_both_co_owner_maps`] has the co-owner's side,
+/// a third team and the public map).
 ///
 /// Evidence is a node only through a stored edge to a claim of the leaf: an
 /// evidence row attached by `claim_id` alone, one of T's and one public, is no
@@ -538,8 +557,8 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     let e_ay = edge(&pool, LeafNode::agent(a_y), LeafNode::claim(t1), "AUTHORED").await;
     let e_up = edge(&pool, LeafNode::claim(u1), LeafNode::claim(p1), "supports").await;
     // Edges among agent and evidence nodes the team map draws (the read's
-    // fifth statement): one of T's is drawn, one owned by U and one co-owned
-    // by T and U are not.
+    // fifth statement): one of T's and one co-owned by T and U are drawn, one
+    // owned by U is not.
     let e_ee_t = edge(
         &pool,
         LeafNode::evidence(ev_p),
@@ -595,6 +614,14 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
             "edge {id}"
         );
     }
+    let co_stamps: Vec<(String, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = ANY($1)",
+    )
+    .bind(vec![e_co, e_ee_co])
+    .fetch_all(&pool)
+    .await
+    .expect("stamps of the co-owned edges");
+    assert_eq!(co_stamps, vec![("group".to_string(), t, Some(u)); 2]);
     let public_edges: Vec<(String, Option<Uuid>)> =
         sqlx::query_as("SELECT visibility::text, co_owner_group_id FROM edges WHERE id = ANY($1)")
             .bind(vec![e_xp, ed_p, ed_tp])
@@ -650,7 +677,7 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         LeafNode::evidence(ev_p),
         LeafNode::evidence(ev_x),
     ]);
-    let never_edges = BTreeSet::from([e_tp_u, e_co, e_ax, e_evu, e_up, e_ea_u, e_ee_co, ed_u1]);
+    let never_edges = BTreeSet::from([e_tp_u, e_ax, e_evu, e_up, e_ea_u, ed_u1]);
     let never_ids = [u1, ev_u, ev_u1, f_u, a_x, ev_bare_t, ev_bare_p];
 
     let check_team = |set: &LeafNodeSet, who: &str| {
@@ -664,7 +691,9 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
         let stored = stored_ids(set);
         assert_eq!(
             stored,
-            BTreeSet::from([e_tt, e_ay, e_ee_t, e_pp_t, e_pa_t, e_xp, ed_t1, ed_p, ed_tp]),
+            BTreeSet::from([
+                e_tt, e_co, e_ay, e_ee_t, e_ee_co, e_pp_t, e_pa_t, e_xp, ed_t1, ed_p, ed_tp
+            ]),
             "{who}: team map stored edges"
         );
         assert!(stored.is_disjoint(&never_edges), "{who}");
@@ -763,6 +792,134 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     check_team(&set, "scoped, epigraph_app");
     assert_eq!(set, team_set);
     drop(scoped);
+}
+
+/// An edge co-owned by teams A and B is drawn on A's map and on B's map, and on
+/// neither a third team C's map nor the public map.
+///
+/// The co-owned edges hang on public nodes, so every map draws both endpoints
+/// and only the edge's own tenancy decides: a claim-to-claim edge (the read's
+/// second statement) and an evidence-to-agent edge (its fifth), each owned by A
+/// and co-owned by B, so A's map tests the owner arm and B's map the co-owner
+/// arm. A's own edge between the same claims (no co-owner) is the calibration:
+/// on A's map only. A co-owned edge as the tenancy trigger stamps it, between
+/// a claim of A and a claim of B, is on no map: each map lacks one endpoint.
+///
+/// Built the way the nightly builds (bypass viewer), and on a stamped
+/// `epigraph_app` connection for a member of both teams, which row security
+/// lets read a co-owned edge (migration 077's `edges_tenancy`: a session in
+/// both groups). A stamped member of A alone cannot read it, so the map is
+/// built on the bypass snapshot, never on a single team's session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_co_owned_edge_is_drawn_on_both_co_owner_maps(pool: PgPool) {
+    let a = team(&pool, "team-a").await;
+    let b = team(&pool, "team-b").await;
+    let c = team(&pool, "team-c").await;
+    let world = fixture::world_group(&pool).await;
+    let f = agent(&pool).await;
+    let pc = claims(&pool, f, "public", world, 2).await;
+    let (p1, p2) = (pc[0], pc[1]);
+    let a1 = claims(&pool, f, "group", a, 1).await[0];
+    let b1 = claims(&pool, f, "group", b, 1).await[0];
+    let (ev, ed) = linked_evidence(&pool, p1, 1).await[0];
+
+    let co_cc = edge(&pool, LeafNode::claim(p1), LeafNode::claim(p2), "supports").await;
+    force_edge(&pool, co_cc, a, Some(b)).await;
+    let co_ea = edge(&pool, LeafNode::evidence(ev), LeafNode::agent(f), "cites").await;
+    force_edge(&pool, co_ea, a, Some(b)).await;
+    let a_cc = edge(&pool, LeafNode::claim(p2), LeafNode::claim(p1), "refutes").await;
+    force_edge(&pool, a_cc, a, None).await;
+    let co_ab = edge(&pool, LeafNode::claim(a1), LeafNode::claim(b1), "supports").await;
+
+    // Calibration: the stamps the test rests on.
+    let stamps: Vec<(Uuid, String, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, visibility::text, owner_group_id, co_owner_group_id FROM edges \
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![co_cc, co_ea, a_cc, co_ab, ed])
+    .fetch_all(&pool)
+    .await
+    .expect("stamps");
+    assert_eq!(stamps.len(), 5);
+    for (id, vis, owner, co) in &stamps {
+        let want = if *id == a_cc {
+            ("group", a, None)
+        } else if *id == ed {
+            ("public", world, None)
+        } else {
+            ("group", a, Some(b))
+        };
+        assert_eq!((vis.as_str(), *owner, *co), want, "edge {id}");
+    }
+
+    let input = [b1, p2, a1, p1];
+    let public_nodes = [
+        LeafNode::claim(p1),
+        LeafNode::claim(p2),
+        LeafNode::agent(f),
+        LeafNode::evidence(ev),
+    ];
+    let with = |extra: Option<LeafNode>| -> BTreeSet<LeafNode> {
+        public_nodes.iter().copied().chain(extra).collect()
+    };
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let maps = [
+        (
+            AtlasMap::Team(a),
+            "A",
+            with(Some(LeafNode::claim(a1))),
+            BTreeSet::from([ed, co_cc, co_ea, a_cc]),
+        ),
+        (
+            AtlasMap::Team(b),
+            "B",
+            with(Some(LeafNode::claim(b1))),
+            BTreeSet::from([ed, co_cc, co_ea]),
+        ),
+        (AtlasMap::Team(c), "C", with(None), BTreeSet::from([ed])),
+        (AtlasMap::Public, "public", with(None), BTreeSet::from([ed])),
+    ];
+    let mut built = Vec::new();
+    for (map, who, nodes, edges) in &maps {
+        let set = fits(build(&pool, &system, *map, &input).await);
+        let got: BTreeSet<LeafNode> = set.nodes.iter().copied().collect();
+        assert_eq!(&got, nodes, "{who}: nodes");
+        let stored = stored_ids(&set);
+        assert!(
+            !stored.contains(&co_ab),
+            "{who}: an endpoint is not drawable"
+        );
+        assert_eq!(&stored, edges, "{who}: stored edges");
+        built.push(set);
+    }
+    assert!(stored_ids(&built[0]).contains(&co_cc), "the owner's map");
+    assert!(stored_ids(&built[1]).contains(&co_cc), "the co-owner's map");
+    assert!(stored_ids(&built[1]).contains(&co_ea), "the co-owner's map");
+
+    // A stamped epigraph_app connection, where row security applies.
+    let url = fixture::database_url_for(&pool).await;
+    let app =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let (m, _) = fixture::seed_agent_with_group(&pool, "leaf-ab").await;
+    add_member(&pool, a, m, "reader").await;
+    add_member(&pool, b, m, "reader").await;
+    let both = Viewer::resolve(&pool, m).await.expect("viewer");
+    let set = build_stamped(&app, &both, AtlasMap::Team(a), &input).await;
+    assert_eq!(set, built[0], "A, member of both");
+    let set = build_stamped(&app, &both, AtlasMap::Team(b), &input).await;
+    assert_eq!(set, built[1], "B, member of both");
+
+    let (only_a, _) = fixture::seed_agent_with_group(&pool, "leaf-a").await;
+    add_member(&pool, a, only_a, "reader").await;
+    let only_a = Viewer::resolve(&pool, only_a).await.expect("viewer");
+    let stored = stored_ids(&build_stamped(&app, &only_a, AtlasMap::Team(a), &input).await);
+    assert_eq!(
+        stored,
+        BTreeSet::from([ed, a_cc]),
+        "row security hides a co-owned edge from a member of A alone"
+    );
 }
 
 /// A retracted edge (its `valid_to` past) is never drawn, and neither is the
