@@ -1,0 +1,537 @@
+{
+  "kind": "group",
+  "schema_version": 1,
+  "map_scope": "team",
+  "map_group_id": "e06878a5-030a-4e96-bdb9-4af1e6adbe2b",
+  "hierarchy": "links",
+  "theme_id": "612b1c38-5799-4fce-b58a-ed4316ede18c",
+  "run_id": "df22b0a9-6b75-485b-936f-2d55d71f0c87",
+  "level_id": "8c771f50-7f40-4f70-8ada-504ed8efd3c9",
+  "depth": 4,
+  "name": null,
+  "needs_naming": true,
+  "breadcrumbs": [
+    {
+      "level_id": "8c80eff4-87f2-4e8d-972d-2d3d01f6ae15",
+      "name": "Savorka oncorfo",
+      "depth": 0
+    },
+    {
+      "level_id": "21728db5-4115-470e-bcfc-d5e44d9d9828",
+      "name": "Lindun mizenro onthi rois",
+      "depth": 1
+    },
+    {
+      "level_id": "4ed49eb7-745b-4a48-8a58-ab4da7eb1fdd",
+      "name": "Zensa prathi onsa",
+      "depth": 2
+    },
+    {
+      "level_id": "cca02c4d-6829-4472-9d3c-1ca42d3149fd",
+      "name": "Kapra imprafo ulex",
+      "depth": 3
+    }
+  ],
+  "switch": {
+    "hierarchy": "meaning",
+    "level_id": "68d5f046-5143-40e4-9fb2-7bed90e4000a"
+  },
+  "children": [
+    {
+      "id": "76b371ff-0c9d-4726-8cda-957dd51174e0",
+      "kind": "group",
+      "name": "Kasa seltaar torbel",
+      "needs_naming": false,
+      "claim_count": 64,
+      "x": 0.1735,
+      "y": 0.0,
+      "r": 0.0906
+    },
+    {
+      "id": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "kind": "group",
+      "name": "Arriar vorka isqua",
+      "needs_naming": false,
+      "claim_count": 70,
+      "x": -0.2216,
+      "y": 0.203,
+      "r": 0.0929
+    },
+    {
+      "id": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "kind": "group",
+      "name": "Corro vedun",
+      "needs_naming": false,
+      "claim_count": 46,
+      "x": 0.0339,
+      "y": -0.3865,
+      "r": 0.0829
+    },
+    {
+      "id": "71bb6cdc-b836-4190-a67e-346eac767606",
+      "kind": "group",
+      "name": "Ulfocor thivor roex zenvebel robel",
+      "needs_naming": false,
+      "claim_count": 78,
+      "x": 0.2793,
+      "y": 0.3643,
+      "r": 0.0959
+    },
+    {
+      "id": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "kind": "leaf",
+      "name": "Zenexim corveka",
+      "needs_naming": false,
+      "claim_count": 37,
+      "x": -0.5126,
+      "y": -0.0907,
+      "r": 0.0785
+    },
+    {
+      "id": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "kind": "leaf",
+      "name": "Onlin nequami",
+      "needs_naming": false,
+      "claim_count": 30,
+      "x": 0.4855,
+      "y": -0.3089,
+      "r": 0.0746
+    },
+    {
+      "id": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "kind": "leaf",
+      "name": "Onve neis",
+      "needs_naming": false,
+      "claim_count": 20,
+      "x": -0.1624,
+      "y": 0.6041,
+      "r": 0.0683
+    },
+    {
+      "id": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "kind": "leaf",
+      "name": "Torsa qualinis saop fotazen miriop",
+      "needs_naming": false,
+      "claim_count": 41,
+      "x": -0.3097,
+      "y": -0.5964,
+      "r": 0.0805
+    },
+    {
+      "id": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "kind": "leaf",
+      "name": "Ritorta onka foexcor rotor duntorbel",
+      "needs_naming": false,
+      "claim_count": 56,
+      "x": 0.672,
+      "y": 0.2454,
+      "r": 0.0873
+    },
+    {
+      "id": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "kind": "leaf",
+      "name": "Opve vorar kaqua exsel foexul",
+      "needs_naming": false,
+      "claim_count": 19,
+      "x": -0.6991,
+      "y": 0.2886,
+      "r": 0.0676
+    },
+    {
+      "id": "fb7aa2b3-ad01-4fc4-ac56-64512ceb1a01",
+      "kind": "leaf",
+      "name": "Isridel vorkaka",
+      "needs_naming": false,
+      "claim_count": 37,
+      "x": 0.337,
+      "y": -0.7202,
+      "r": 0.0785
+    },
+    {
+      "id": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "kind": "leaf",
+      "name": "Selselve saisvor quazen torimdun",
+      "needs_naming": false,
+      "claim_count": 39,
+      "x": 0.249,
+      "y": 0.794,
+      "r": 0.0795
+    }
+  ],
+  "bundles": [
+    {
+      "source": "76b371ff-0c9d-4726-8cda-957dd51174e0",
+      "target": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "count": 34,
+      "net_sign": 1
+    },
+    {
+      "source": "76b371ff-0c9d-4726-8cda-957dd51174e0",
+      "target": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "count": 6,
+      "net_sign": -1
+    },
+    {
+      "source": "76b371ff-0c9d-4726-8cda-957dd51174e0",
+      "target": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "count": 14,
+      "net_sign": 1
+    },
+    {
+      "source": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "target": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "count": 20,
+      "net_sign": -1
+    },
+    {
+      "source": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "target": "71bb6cdc-b836-4190-a67e-346eac767606",
+      "count": 39,
+      "net_sign": 0
+    },
+    {
+      "source": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "target": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "count": 2,
+      "net_sign": 1
+    },
+    {
+      "source": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "target": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "count": 37,
+      "net_sign": 1
+    },
+    {
+      "source": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "target": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "count": 14,
+      "net_sign": 1
+    },
+    {
+      "source": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "target": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "count": 10,
+      "net_sign": 1
+    },
+    {
+      "source": "71bb6cdc-b836-4190-a67e-346eac767606",
+      "target": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "count": 8,
+      "net_sign": 1
+    },
+    {
+      "source": "71bb6cdc-b836-4190-a67e-346eac767606",
+      "target": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "count": 30,
+      "net_sign": -1
+    },
+    {
+      "source": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "target": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "count": 32,
+      "net_sign": 0
+    },
+    {
+      "source": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "target": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "count": 24,
+      "net_sign": 1
+    },
+    {
+      "source": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "target": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "count": 9,
+      "net_sign": 1
+    },
+    {
+      "source": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "target": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "count": 25,
+      "net_sign": 1
+    },
+    {
+      "source": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "target": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "count": 27,
+      "net_sign": 0
+    },
+    {
+      "source": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "target": "71bb6cdc-b836-4190-a67e-346eac767606",
+      "count": 3,
+      "net_sign": 1
+    },
+    {
+      "source": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "target": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "count": 21,
+      "net_sign": 0
+    },
+    {
+      "source": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "target": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "count": 34,
+      "net_sign": 1
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "count": 10,
+      "net_sign": 1
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "71bb6cdc-b836-4190-a67e-346eac767606",
+      "count": 19,
+      "net_sign": 1
+    },
+    {
+      "source": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "target": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "count": 38,
+      "net_sign": 0
+    },
+    {
+      "source": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "target": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "count": 29,
+      "net_sign": 1
+    },
+    {
+      "source": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "target": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "count": 11,
+      "net_sign": -1
+    },
+    {
+      "source": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "target": "76b371ff-0c9d-4726-8cda-957dd51174e0",
+      "count": 15,
+      "net_sign": 0
+    },
+    {
+      "source": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "target": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "count": 29,
+      "net_sign": 1
+    },
+    {
+      "source": "fb7aa2b3-ad01-4fc4-ac56-64512ceb1a01",
+      "target": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "count": 9,
+      "net_sign": -1
+    },
+    {
+      "source": "fb7aa2b3-ad01-4fc4-ac56-64512ceb1a01",
+      "target": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "count": 1,
+      "net_sign": 1
+    },
+    {
+      "source": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "target": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "count": 29,
+      "net_sign": 1
+    },
+    {
+      "source": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "target": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "count": 8,
+      "net_sign": 0
+    },
+    {
+      "source": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "target": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "count": 23,
+      "net_sign": 0
+    },
+    {
+      "source": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "target": "75a9f1f6-e0d7-4a1e-b2fb-011a6fbfce5c",
+      "count": 21,
+      "net_sign": 1
+    },
+    {
+      "source": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "target": "fb0d1a6f-7715-4c7b-b68e-8499ab2bafa2",
+      "count": 11,
+      "net_sign": 1
+    },
+    {
+      "source": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "target": "fb0d1a6f-7715-4c7b-b68e-8499ab2bafa2",
+      "count": 22,
+      "net_sign": 1
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "5f7d955e-241e-4ef1-b3bb-81db67299c3b",
+      "count": 6,
+      "net_sign": 1
+    },
+    {
+      "source": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "target": "5f7d955e-241e-4ef1-b3bb-81db67299c3b",
+      "count": 11,
+      "net_sign": 0
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "06ab30b8-ba0d-4146-962e-e028d5765b62",
+      "count": 36,
+      "net_sign": 1
+    },
+    {
+      "source": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "target": "06ab30b8-ba0d-4146-962e-e028d5765b62",
+      "count": 25,
+      "net_sign": 1
+    },
+    {
+      "source": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "target": "d077cf9e-79f3-4c0c-82de-d952a1da274a",
+      "count": 18,
+      "net_sign": 0
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "f607e375-d516-4f08-b595-6caf4eb51dbd",
+      "count": 11,
+      "net_sign": 0
+    },
+    {
+      "source": "882fc431-53e3-4cab-95bd-7f3b5d5e3718",
+      "target": "8543604c-f13f-4429-9f39-17a29c9127e7",
+      "count": 25,
+      "net_sign": 1
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "8543604c-f13f-4429-9f39-17a29c9127e7",
+      "count": 39,
+      "net_sign": -1
+    },
+    {
+      "source": "b9734704-4c08-48f9-b927-c299f952e98b",
+      "target": "8543604c-f13f-4429-9f39-17a29c9127e7",
+      "count": 31,
+      "net_sign": 1
+    },
+    {
+      "source": "fb7aa2b3-ad01-4fc4-ac56-64512ceb1a01",
+      "target": "8543604c-f13f-4429-9f39-17a29c9127e7",
+      "count": 21,
+      "net_sign": 1
+    },
+    {
+      "source": "a5983289-48a5-4090-bb97-64b693a9ccbc",
+      "target": "c666eb73-11e5-4f81-8e8c-2e6bbb3d90be",
+      "count": 32,
+      "net_sign": 1
+    },
+    {
+      "source": "e6c42a00-3694-4731-ab9d-ad5156869ffc",
+      "target": "c666eb73-11e5-4f81-8e8c-2e6bbb3d90be",
+      "count": 26,
+      "net_sign": 0
+    },
+    {
+      "source": "d47c08ff-4bbf-4dc7-ba7a-1511d8bb2aec",
+      "target": "b1acffd7-6f6d-4bdd-bf1f-10eae0252ae9",
+      "count": 32,
+      "net_sign": 0
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "b1acffd7-6f6d-4bdd-bf1f-10eae0252ae9",
+      "count": 3,
+      "net_sign": 1
+    },
+    {
+      "source": "76561cd2-3350-4e22-9657-6b85559e2ddf",
+      "target": "271f4b2d-10c4-48bc-ac7d-2471f1942fd1",
+      "count": 32,
+      "net_sign": 1
+    },
+    {
+      "source": "55a8cffe-7bbc-4d11-90c6-2310bcace4de",
+      "target": "271f4b2d-10c4-48bc-ac7d-2471f1942fd1",
+      "count": 36,
+      "net_sign": 1
+    },
+    {
+      "source": "30b8a694-19dc-4fc3-92fb-24feae43a70c",
+      "target": "271f4b2d-10c4-48bc-ac7d-2471f1942fd1",
+      "count": 31,
+      "net_sign": 1
+    },
+    {
+      "source": "e55c87fe-ddb4-4893-8ce8-3523e5605e5e",
+      "target": "271f4b2d-10c4-48bc-ac7d-2471f1942fd1",
+      "count": 11,
+      "net_sign": 1
+    }
+  ],
+  "targets": [
+    {
+      "level_id": "75a9f1f6-e0d7-4a1e-b2fb-011a6fbfce5c",
+      "theme_id": "093fa6e4-3950-4a47-838b-05e9915d0bc5",
+      "name": "Zensane oncor necor kafo",
+      "depth": 4
+    },
+    {
+      "level_id": "fb0d1a6f-7715-4c7b-b68e-8499ab2bafa2",
+      "theme_id": "b9b6c77a-a1c3-44af-a215-b03d04303ee1",
+      "name": "Pradundun ripra ararpra sasafo dunarqua",
+      "depth": 2
+    },
+    {
+      "level_id": "5f7d955e-241e-4ef1-b3bb-81db67299c3b",
+      "theme_id": "093fa6e4-3950-4a47-838b-05e9915d0bc5",
+      "name": "Saop istorul",
+      "depth": 0
+    },
+    {
+      "level_id": "06ab30b8-ba0d-4146-962e-e028d5765b62",
+      "theme_id": "b9b6c77a-a1c3-44af-a215-b03d04303ee1",
+      "name": "Cordun selis mitor seltortor",
+      "depth": 2
+    },
+    {
+      "level_id": "d077cf9e-79f3-4c0c-82de-d952a1da274a",
+      "theme_id": "b9b6c77a-a1c3-44af-a215-b03d04303ee1",
+      "name": "Artave nenefo selexthi",
+      "depth": 3
+    },
+    {
+      "level_id": "f607e375-d516-4f08-b595-6caf4eb51dbd",
+      "theme_id": "b9b6c77a-a1c3-44af-a215-b03d04303ee1",
+      "name": "Kaop imzenex belon",
+      "depth": 0
+    },
+    {
+      "level_id": "8543604c-f13f-4429-9f39-17a29c9127e7",
+      "theme_id": "24b31f38-3dda-4af0-815f-5ee2c69df366",
+      "name": "Vorzen taul zenzen thimi dunbel",
+      "depth": 2
+    },
+    {
+      "level_id": "c666eb73-11e5-4f81-8e8c-2e6bbb3d90be",
+      "theme_id": "24b31f38-3dda-4af0-815f-5ee2c69df366",
+      "name": "Thipra sellinka",
+      "depth": 2
+    },
+    {
+      "level_id": "b1acffd7-6f6d-4bdd-bf1f-10eae0252ae9",
+      "theme_id": "093fa6e4-3950-4a47-838b-05e9915d0bc5",
+      "name": "Arro tathi zenta ridun nefo",
+      "depth": 4
+    },
+    {
+      "level_id": "271f4b2d-10c4-48bc-ac7d-2471f1942fd1",
+      "theme_id": "093fa6e4-3950-4a47-838b-05e9915d0bc5",
+      "name": null,
+      "depth": 1
+    }
+  ]
+}

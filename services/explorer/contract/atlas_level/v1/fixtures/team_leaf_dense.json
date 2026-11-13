@@ -1,0 +1,5928 @@
+{
+  "kind": "leaf",
+  "schema_version": 1,
+  "map_scope": "team",
+  "map_group_id": "b839c900-e7a7-4538-ac40-135311c10f45",
+  "hierarchy": "meaning",
+  "theme_id": "3f89e5a1-b20e-4ec8-808a-ac25ab82d672",
+  "run_id": "284889dd-f26d-4914-96e2-7ac48ba8444b",
+  "level_id": "f670620c-2a46-4d19-b82c-f7691d85f22c",
+  "depth": 5,
+  "name": "Thiop vorul ulpra",
+  "needs_naming": false,
+  "breadcrumbs": [
+    {
+      "level_id": "d43f8f1c-1063-47e8-9ea8-e7c720cad347",
+      "name": "Pradel exopri thiri pravor",
+      "depth": 0
+    },
+    {
+      "level_id": "c305ffcb-9787-4db9-8cc6-d5e8e2b6c972",
+      "name": "Oplinri selmi ondeltor",
+      "depth": 1
+    },
+    {
+      "level_id": "2b61e769-b607-4fc4-8fc0-eb2f09186fe6",
+      "name": "Artaqua corar",
+      "depth": 2
+    },
+    {
+      "level_id": "9d2b508e-2452-44b1-a2a8-4c5e092aaa33",
+      "name": "Quathi exbeldun exquasel quaopka",
+      "depth": 3
+    },
+    {
+      "level_id": "f8b82626-1b77-43d5-9ce7-d59e4c58fb37",
+      "name": "Dunquaex corne",
+      "depth": 4
+    }
+  ],
+  "switch": {
+    "hierarchy": "links",
+    "level_id": "fdb24bc9-1c09-4fed-b998-c334f68fa5c8"
+  },
+  "nodes": [
+    {
+      "kind": "claim",
+      "id": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "label": "Selzenro dunveka opmimi selbel onvor torthi imve.",
+      "x": -0.1265,
+      "y": -0.0629,
+      "truth_value": 0.4705,
+      "betp": 0.0236
+    },
+    {
+      "kind": "claim",
+      "id": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "label": "Saqua linprami veul vorfobel roqua praop cordun kasane delpra foisdel onsel vorbel imqua isthimi imta opopve ondel thitaex saonsa mibel tais vorrovor thivorbel ",
+      "x": 0.4085,
+      "y": -0.1743,
+      "truth_value": 0.312,
+      "betp": 0.1319
+    },
+    {
+      "kind": "claim",
+      "id": "65722717-54d8-48bb-917e-d1f87054f291",
+      "label": "Taop dunfo selzen delselve arcor pracordun ulvorsel vorvordel.",
+      "x": 0.0587,
+      "y": 0.378,
+      "truth_value": 0.9915,
+      "betp": 0.728
+    },
+    {
+      "kind": "claim",
+      "id": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "label": "Lindunlin exdunta belrita delfolin deltorsel delthimi quaarar onimtor prathizen torvor dunmi focorsa onlinis dunis quaquaim imthi pravethi linar pracoron saex a",
+      "x": 0.3785,
+      "y": 0.6124,
+      "truth_value": 0.2824,
+      "betp": 0.4329
+    },
+    {
+      "kind": "claim",
+      "id": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "label": "Linim neta roisis toropcor mive arulsa taul artator sanedun kadel ondel expra corzen roar arve velinve arvor dunro onex torisro exzenka torarro tormi.",
+      "x": -0.5993,
+      "y": 0.4346,
+      "truth_value": 0.0845,
+      "betp": 0.6005
+    },
+    {
+      "kind": "claim",
+      "id": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "label": "Linul fopraka artorthi quazenop dundel ulim torex ulthiex taimon.",
+      "x": -0.1282,
+      "y": 0.8434,
+      "truth_value": 0.6593,
+      "betp": 0.8627
+    },
+    {
+      "kind": "claim",
+      "id": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "label": "Taka zensa exri quaistor seltor rithidel venecor imriqua.",
+      "x": -0.3412,
+      "y": -0.7707,
+      "truth_value": 0.0223,
+      "betp": 0.7606
+    },
+    {
+      "kind": "claim",
+      "id": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "label": "Nevorpra selseldun taqua selqua torpra opdel isbellin mionri torquadel foul ritortor.",
+      "x": 0.0469,
+      "y": 0.7212,
+      "truth_value": 0.1607,
+      "betp": 0.8015
+    },
+    {
+      "kind": "claim",
+      "id": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "label": "Sabellin opul selop cortortor quabel coron delista belcor kaar onquaar roexop kathidun veta rimitor kaarsa saquadel nezen dunex quaex isim imfopra zenta beltave",
+      "x": -0.5687,
+      "y": -0.5652,
+      "truth_value": 0.5656,
+      "betp": 0.0594
+    },
+    {
+      "kind": "claim",
+      "id": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "label": "Verithi belta riis kavor veonbel belexex neim torsel roim praveul seldel isqua quafovor veveri prarone kais isri safo.",
+      "x": 0.6175,
+      "y": 0.0776,
+      "truth_value": null,
+      "betp": 0.8794
+    },
+    {
+      "kind": "claim",
+      "id": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "label": "Velinop zenardun selsa fothi selve selimop belvor rozen prari quacoron takasa praonne selcor belmidun thikaon zenquasel dunis taqua kalinar kacor vorfoar fove.",
+      "x": -0.8706,
+      "y": -0.3665,
+      "truth_value": 0.4736,
+      "betp": 0.383
+    },
+    {
+      "kind": "claim",
+      "id": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "label": "Linri ulmi zenfo belar ardel isar imtorro nenear quaopne selnemi deltor rosa mimine rithiim rone sathi.",
+      "x": 0.8345,
+      "y": -0.5319,
+      "truth_value": 0.7426,
+      "betp": 0.6409
+    },
+    {
+      "kind": "claim",
+      "id": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "label": "Thitortor imrothi selsalin miimtor ulardun prasa foex thita isim ridunro quavor opiska bellindel netor ulri corcor imdunfo mivor tormilin belsel selim opispra m",
+      "x": 0.3987,
+      "y": 0.7085,
+      "truth_value": 0.9253,
+      "betp": 0.3721
+    },
+    {
+      "kind": "claim",
+      "id": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "label": "Quacor tordun quator belthibel sasa miopul exardel sabel foul belne dunpra delbelsa roprafo kaarqua deldunthi.",
+      "x": -0.8608,
+      "y": 0.6556,
+      "truth_value": 0.6644,
+      "betp": 0.1389
+    },
+    {
+      "kind": "claim",
+      "id": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "label": "Corex foqua linsa linvecor linka imne torve neop zenim voron extoron linromi linthiis imonri neneve ontalin ribelmi ulselmi selnemi pradel.",
+      "x": -0.0691,
+      "y": 0.6824,
+      "truth_value": 0.6209,
+      "betp": 0.7185
+    },
+    {
+      "kind": "claim",
+      "id": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "label": "Necor rilinka quacorim imroka onri zenvorul coris fotor rone torbel rion cordel prasel voron prami nethi ardun thifomi rirodel.",
+      "x": 0.3178,
+      "y": 0.5712,
+      "truth_value": 0.8868,
+      "betp": 0.9753
+    },
+    {
+      "kind": "claim",
+      "id": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "label": "Quapra sari foim rilinar thidunis mika onop delqua imsabel kadun immi exop opne ulthilin thidel ropra dunri praprathi onbel selve exsa fomizen quathi.",
+      "x": 0.3541,
+      "y": -0.4319,
+      "truth_value": 0.6694,
+      "betp": 0.0441
+    },
+    {
+      "kind": "claim",
+      "id": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "label": "Nefo arfo neexdun taexdel corpra sami ulfoon taul selexon velin vorsel kadun isnedel torka.",
+      "x": -0.8186,
+      "y": -0.3998,
+      "truth_value": 0.9223,
+      "betp": 0.4583
+    },
+    {
+      "kind": "claim",
+      "id": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "label": "Kavoris taimpra tadelne misaul prasel delvear riimthi.",
+      "x": -0.5255,
+      "y": -0.7123,
+      "truth_value": 0.5093,
+      "betp": 0.3279
+    },
+    {
+      "kind": "claim",
+      "id": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "label": "Prane opex vesel imprane ulvordun quaon ridel delmiis thive linrisa folinsel torlindun mion belthiar corpra rika thisa.",
+      "x": 0.4796,
+      "y": -0.2809,
+      "truth_value": 0.3495,
+      "betp": 0.021
+    },
+    {
+      "kind": "claim",
+      "id": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "label": "Opthita ulquazen saimpra taexis exthi nesel kaka thidun nezenvor zendel arriqua sadundel ondelzen tacorar savordun belsel vevorve.",
+      "x": 0.3155,
+      "y": -0.912,
+      "truth_value": 0.7014,
+      "betp": 0.5112
+    },
+    {
+      "kind": "claim",
+      "id": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "label": "Kanesel quathiop savorta ribelul neisim quaaris praroim onbelzen selis misa thine saarro prave torsa riselbel corvorsel optazen tazen linarex tavorsa linka tors",
+      "x": -0.3765,
+      "y": -0.6906,
+      "truth_value": 0.0969,
+      "betp": 0.2168
+    },
+    {
+      "kind": "claim",
+      "id": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "label": "Exonne torul toron exnequa arrovor deltavor kaselka riro kaimvor saar ulardel arkazen tapra sadel linvor roar corzenis prabellin arim.",
+      "x": -0.1081,
+      "y": 0.3697,
+      "truth_value": 0.726,
+      "betp": 0.3156
+    },
+    {
+      "kind": "claim",
+      "id": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "label": "Quasaro quami sabelsel tais arthi ullin extabel selcor corne exexqua tadunis zenta prari.",
+      "x": 0.6496,
+      "y": 0.826,
+      "truth_value": 0.6938,
+      "betp": 0.0913
+    },
+    {
+      "kind": "claim",
+      "id": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "label": "Tornene selfoar quafo romiop tortor miex selvorcor mirine thiimmi sathi miquaim lincor zenlinis rolin kakaop midunka ridun torka vesa arim delro opopfo taoncor ",
+      "x": -0.6063,
+      "y": 0.4933,
+      "truth_value": 0.4199,
+      "betp": 0.5768
+    },
+    {
+      "kind": "claim",
+      "id": "f27838c0-c344-4232-b544-472b4303099d",
+      "label": "Satorta opcor vearzen exar thifocor belon opduncor vequadel thikaar thikane zenthi exul islin karoim linlindun corri sari vetor torbelar miromi pradunar seltor ",
+      "x": -0.4249,
+      "y": 0.2987,
+      "truth_value": 0.4842,
+      "betp": 0.8815
+    },
+    {
+      "kind": "claim",
+      "id": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "label": "Onthi vorbel linta saul isthi veve fovorfo zenroka corarpra rota onta opdunvor dunrifo thisel foprave isselve.",
+      "x": 0.7274,
+      "y": 0.3249,
+      "truth_value": 0.7606,
+      "betp": 0.4357
+    },
+    {
+      "kind": "claim",
+      "id": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "label": "Dunri belsa fotor torsel armi vorisis exmita beldel thilin belpracor imbelsel.",
+      "x": -0.7076,
+      "y": 0.3691,
+      "truth_value": 0.1498,
+      "betp": 0.9516
+    },
+    {
+      "kind": "claim",
+      "id": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "label": "Exul quavor pratabel linul selmiex belzenne belulri torular saar dunthiex rovorve ronear ulka taissa belfo thiarsel isdelpra sapra belbel dunve foonon iszen vec",
+      "x": 0.5171,
+      "y": -0.4066,
+      "truth_value": 0.3267,
+      "betp": 0.5495
+    },
+    {
+      "kind": "claim",
+      "id": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "label": "Kacor belmi torseldel corkave thiul vorrothi mika delul ulimsel.",
+      "x": 0.6028,
+      "y": -0.4108,
+      "truth_value": 0.3517,
+      "betp": 0.7205
+    },
+    {
+      "kind": "claim",
+      "id": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "label": "Zenzen zenexul corro saar onexqua quaprabel rotor arselim onqua imriis sellin delar tasais neve neop aronsa belvorve thikaul onthiop torpraex tavor nequadun roi",
+      "x": -0.0216,
+      "y": -0.3531,
+      "truth_value": 0.2825,
+      "betp": 0.3925
+    },
+    {
+      "kind": "claim",
+      "id": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "label": "Vordun praopqua netaqua foroim sadun delisvor.",
+      "x": 0.2548,
+      "y": -0.2305,
+      "truth_value": 0.1493,
+      "betp": 0.8127
+    },
+    {
+      "kind": "claim",
+      "id": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "label": "Taulon isdelro linfovor tordunthi belro linopve imdel quaroar riarcor linlin quaisvor.",
+      "x": 0.3025,
+      "y": -0.6987,
+      "truth_value": 0.863,
+      "betp": 0.1368
+    },
+    {
+      "kind": "claim",
+      "id": "22af1509-24a2-46d1-810d-a16853a20927",
+      "label": "Arex opdel beldelve torcormi opne folinar katathi quaon onvorbel exro kasaar quaka torveve quabelve sacor dunon belonlin dundel kabeltor onsa linmiim miex ulop ",
+      "x": 0.6108,
+      "y": -0.9302,
+      "truth_value": 0.0198,
+      "betp": 0.6071
+    },
+    {
+      "kind": "claim",
+      "id": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "label": "Neve oncordel imul exka corqua praulbel ripraex arsa thiimim zenta nelin exdel fodelthi delri linmi corseldel corvorop arropra focordel selro tavor kasel torro.",
+      "x": 0.2667,
+      "y": -0.2281,
+      "truth_value": 0.685,
+      "betp": 0.5269
+    },
+    {
+      "kind": "claim",
+      "id": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "label": "Tarive onvorul exdunthi kanelin corkaop vecor zenis beldel belvesel belmine verosa torlinul delthiex veulis rozensa selon.",
+      "x": 0.8966,
+      "y": 0.0057,
+      "truth_value": 0.4313,
+      "betp": 0.9389
+    },
+    {
+      "kind": "claim",
+      "id": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "label": "Quari torro isexex prami exka cortane quazen selopqua tane quavethi miul ulimdun linimzen karo vorim riexqua.",
+      "x": 0.2969,
+      "y": 0.0426,
+      "truth_value": 0.1199,
+      "betp": 0.0235
+    },
+    {
+      "kind": "claim",
+      "id": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "label": "Thipradun belon impraex mivor nelin opmiqua dunlin thiisdel ispra vorim foro selulsa ulfo prazen saulim belthibel delar.",
+      "x": -0.4823,
+      "y": 0.2113,
+      "truth_value": 0.5099,
+      "betp": 0.9019
+    },
+    {
+      "kind": "claim",
+      "id": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "label": "Delvor delta rinepra quasel praar duntorta vethidun vorzen nevorcor taex tordelzen talin thifofo torve linnethi oplin thivor thiimvor thitavor mithisa aropzen s",
+      "x": -0.2868,
+      "y": -0.5432,
+      "truth_value": 0.2014,
+      "betp": 0.2966
+    },
+    {
+      "kind": "claim",
+      "id": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "label": "Imnelin vethibel cortorta rikadel corveri ismi dunop miqualin foneim fovor praquathi quaselvor rofo.",
+      "x": 0.6823,
+      "y": -0.4841,
+      "truth_value": null,
+      "betp": null
+    },
+    {
+      "kind": "claim",
+      "id": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "label": "Quaka isartor exim delvorlin opqua dunimex kaopdun imulzen sakaon vorvor belzenzen saimtor delta ultor thizenzen thimifo robel tortator selfo rofopra thiex nebe",
+      "x": 0.1943,
+      "y": -0.1536,
+      "truth_value": 0.4569,
+      "betp": 0.6177
+    },
+    {
+      "kind": "claim",
+      "id": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "label": "Belul kave sathisa fothi delthita imar excor nelin neexthi linlin lintor forolin delkane mithion selarim opri.",
+      "x": 0.8174,
+      "y": 0.6053,
+      "truth_value": 0.823,
+      "betp": 0.5142
+    },
+    {
+      "kind": "claim",
+      "id": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "label": "Dellinri belis lintorne nefo thibelop vorzen opbeldun exop taulbel selthi belartor belro linri taexne fone rosa foka midunri vorsel zenrodun.",
+      "x": -0.5075,
+      "y": -0.4156,
+      "truth_value": 0.8838,
+      "betp": 0.6335
+    },
+    {
+      "kind": "claim",
+      "id": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "label": "Imdel neimne torveta rideltor torka kaim onkari saex ulmi delfozen quaveop corselve arka exbel praon corridel imlin fois.",
+      "x": -0.0166,
+      "y": 0.3645,
+      "truth_value": 0.629,
+      "betp": 0.6871
+    },
+    {
+      "kind": "claim",
+      "id": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "label": "Pratorqua opvorqua thifori delne rivor torvene saselve.",
+      "x": -0.0967,
+      "y": 0.3448,
+      "truth_value": 0.5492,
+      "betp": 0.4966
+    },
+    {
+      "kind": "claim",
+      "id": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "label": "Ulthidel selprafo nezenne prabelthi vortave belmi corthi tadel ridel corexul rithi vethimi thitor imondel belrotor tortor linvor opzenka thiprata fove rizenzen ",
+      "x": 0.6338,
+      "y": 0.2296,
+      "truth_value": 0.233,
+      "betp": 0.3686
+    },
+    {
+      "kind": "claim",
+      "id": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "label": "Exexex ondelta imvor zenfoar seldelul imbelqua milinne thivorthi mipra foon exka corzenqua zenmi selveon dunbel oponri onvorcor vorselri mifo ropra sellin fobel",
+      "x": 0.9048,
+      "y": -0.6145,
+      "truth_value": 0.793,
+      "betp": null
+    },
+    {
+      "kind": "claim",
+      "id": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "label": "Rithiis veka arimmi corul roop opcor linim ista saon vorne rilinne imonta saimka.",
+      "x": 0.6237,
+      "y": -0.0315,
+      "truth_value": 0.2407,
+      "betp": 0.222
+    },
+    {
+      "kind": "claim",
+      "id": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "label": "Expra selvoron ulta voron iscor tator exfovor exdel dunzen arta mithika corzen corop pranequa ultoron sanemi vorvor fotorfo corimpra dunvor pracor imdunro nekar",
+      "x": -0.2539,
+      "y": -0.5111,
+      "truth_value": 0.0255,
+      "betp": 0.8801
+    },
+    {
+      "kind": "claim",
+      "id": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "label": "Dundunmi iszenop salinul miul linfoka selka saop torbel onmithi selka neexne.",
+      "x": -0.7286,
+      "y": 0.1033,
+      "truth_value": 0.3205,
+      "betp": 0.1495
+    },
+    {
+      "kind": "claim",
+      "id": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "label": "Zendun tazendel vorvorthi belroim prasaqua corarne mizenpra.",
+      "x": 0.1753,
+      "y": -0.2523,
+      "truth_value": 0.1063,
+      "betp": 0.5002
+    },
+    {
+      "kind": "claim",
+      "id": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "label": "Praka sasel fomi thicorim selqua torisar.",
+      "x": 0.5643,
+      "y": -0.3187,
+      "truth_value": 0.514,
+      "betp": 0.2033
+    },
+    {
+      "kind": "claim",
+      "id": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "label": "Veex sator opve onne isrois vorsel thizen lindel ulvepra thine nevorqua fopra riquasel extorlin veul.",
+      "x": 0.1067,
+      "y": -0.1406,
+      "truth_value": 0.1305,
+      "betp": 0.1782
+    },
+    {
+      "kind": "claim",
+      "id": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "label": "Thimita rodel opon isvesel exkata vorrilin saselon kaisri zenpra selpralin prafo micorsa linselul torthion rovelin onvorka miulmi ultor dunlin optor midel quaul",
+      "x": 0.9047,
+      "y": 0.5956,
+      "truth_value": 0.965,
+      "betp": 0.4513
+    },
+    {
+      "kind": "claim",
+      "id": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "label": "Rifo taon pratata zenselis onlin pralin uldunvor miarqua imsasel onopop armi iszenta oplin taquafo neop selve exthi corvorta corro foopne exdelcor dunpra.",
+      "x": 0.8181,
+      "y": 0.2183,
+      "truth_value": 0.8555,
+      "betp": 0.3659
+    },
+    {
+      "kind": "claim",
+      "id": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "label": "Linex seltordun quauldel isex selopfo prarota onka miexri exrove zendelthi qualin imka ardeltor quave immisa sata fosata kator neimex lintorne isex safo taselri",
+      "x": 0.894,
+      "y": -0.2086,
+      "truth_value": 0.3085,
+      "betp": 0.4092
+    },
+    {
+      "kind": "claim",
+      "id": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "label": "Fotaop taopmi belop selneex belar voron torexlin miissa vorcorve imopul cortor riar zendunlin tasel oprotor thiro rofosel onoplin selim deltorka tadel corne qua",
+      "x": 0.7467,
+      "y": -0.241,
+      "truth_value": 0.8688,
+      "betp": 0.2956
+    },
+    {
+      "kind": "claim",
+      "id": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "label": "Riop vornedel arcorzen belzen iscortor sadunar torrilin cortorpra vorar neta sathiro dunri exuldel arcorsa.",
+      "x": -0.6222,
+      "y": -0.0795,
+      "truth_value": 0.9902,
+      "betp": 0.4709
+    },
+    {
+      "kind": "claim",
+      "id": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "label": "Belmi belquadun roim lintaka kabelve vorka deldunon fodunthi netorve opselar isvorzen imbelthi vorkaka vorkator ulta zenthimi quanequa prais thirone onka vordel",
+      "x": 0.0592,
+      "y": 0.4137,
+      "truth_value": 0.8896,
+      "betp": 0.9794
+    },
+    {
+      "kind": "claim",
+      "id": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "label": "Isbelne ontorar riop arpra ridun kaar issel saop misa onvor.",
+      "x": 0.0698,
+      "y": -0.0448,
+      "truth_value": 0.6689,
+      "betp": 0.2836
+    },
+    {
+      "kind": "claim",
+      "id": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "label": "Neimex opzen dunquami saro thivorne vorim neneop nebel saselon vordun corvor isopzen voron onbel kaar vorfo toropne vekane opcor vorbelqua corbel.",
+      "x": 0.8756,
+      "y": 0.3227,
+      "truth_value": 0.8811,
+      "betp": null
+    },
+    {
+      "kind": "claim",
+      "id": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "label": "Thicor zenex delthine belfo taop lindun veisri exseldun nemita isbelri zenneop pravor excor deltorne praonsa imlinmi.",
+      "x": -0.8752,
+      "y": -0.7088,
+      "truth_value": 0.287,
+      "betp": 0.8774
+    },
+    {
+      "kind": "claim",
+      "id": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "label": "Nebelsa linbelon delimmi kasave dunta praex delcor taex dunve nedun onim foqua duntorri.",
+      "x": -0.8561,
+      "y": 0.8996,
+      "truth_value": 0.0978,
+      "betp": 0.9206
+    },
+    {
+      "kind": "claim",
+      "id": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "label": "Linka artor exka midel ispra delmithi linrove.",
+      "x": 0.5118,
+      "y": -0.9126,
+      "truth_value": 0.2036,
+      "betp": 0.0123
+    },
+    {
+      "kind": "claim",
+      "id": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "label": "Thizen prais midel vorulul zenmi coron mimiri.",
+      "x": 0.0692,
+      "y": 0.3124,
+      "truth_value": 0.2008,
+      "betp": null
+    },
+    {
+      "kind": "claim",
+      "id": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "label": "Exzen folinis neimqua kadelar foonis kaop mimi tordel praonne seltor exthi selon.",
+      "x": 0.2473,
+      "y": 0.6051,
+      "truth_value": 0.9927,
+      "betp": 0.5819
+    },
+    {
+      "kind": "claim",
+      "id": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "label": "Onmiim ulzenlin kasel linimne kasel exthion oncor onrosa nesel delvor foqua linimsel rifo.",
+      "x": 0.2132,
+      "y": -0.0367,
+      "truth_value": 0.1838,
+      "betp": 0.8245
+    },
+    {
+      "kind": "claim",
+      "id": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "label": "Kaon torar focoron selpra thita dunthi neim prapra praop opri delsa prazen isar rothi thiquami sais rodun thidelul mion tormi imimka delimro vorar dundunqua vea",
+      "x": 0.4052,
+      "y": -0.4935,
+      "truth_value": 0.352,
+      "betp": 0.9102
+    },
+    {
+      "kind": "claim",
+      "id": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "label": "Imtor ulthi sari ririar neimim belduntor ismi onsel veon onqua foexvor torthi prakaar miri quasa vorlin saar thifoex vevor torrine arex safo.",
+      "x": 0.0151,
+      "y": -0.5826,
+      "truth_value": 0.9761,
+      "betp": 0.7122
+    },
+    {
+      "kind": "claim",
+      "id": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "label": "Thidelar savorthi selsa dunvor selfoop dunexsa lindelpra opop quaop.",
+      "x": 0.5979,
+      "y": -0.5325,
+      "truth_value": 0.3314,
+      "betp": 0.1214
+    },
+    {
+      "kind": "claim",
+      "id": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "label": "Kane fotor iskavor selonve delim ondel isqua linprata delopro.",
+      "x": -0.304,
+      "y": 0.0069,
+      "truth_value": 0.8903,
+      "betp": 0.1888
+    },
+    {
+      "kind": "claim",
+      "id": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "label": "Praul prarothi opimmi prarone exvorne vorim duncor fothi torquaon netorsa quaon selzenis tavepra dunvear sathion eximvor corlin corselqua imlinon nequa forodel.",
+      "x": -0.8803,
+      "y": -0.3704,
+      "truth_value": 0.3414,
+      "betp": 0.7297
+    },
+    {
+      "kind": "agent",
+      "id": "ea38ea5d-1fcd-4d3c-82a1-746419144858",
+      "label": "Synthetic agent 01",
+      "x": -0.039,
+      "y": -0.1959
+    },
+    {
+      "kind": "agent",
+      "id": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "label": "Synthetic agent 02",
+      "x": 0.1692,
+      "y": 0.1778
+    },
+    {
+      "kind": "agent",
+      "id": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "label": "Synthetic agent 03",
+      "x": 0.7764,
+      "y": 0.6298
+    },
+    {
+      "kind": "agent",
+      "id": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "label": "Synthetic agent 04",
+      "x": -0.7487,
+      "y": -0.1282
+    },
+    {
+      "kind": "agent",
+      "id": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "label": "Synthetic agent 05",
+      "x": -0.6466,
+      "y": 0.669
+    },
+    {
+      "kind": "agent",
+      "id": "a65aca5c-673e-4817-b35f-24cc8a5390ae",
+      "label": "Synthetic agent 06",
+      "x": -0.3841,
+      "y": 0.124
+    },
+    {
+      "kind": "agent",
+      "id": "3a8eeac6-c5a5-43ce-a713-dfbebf4ccc80",
+      "label": "Synthetic agent 07",
+      "x": 0.4933,
+      "y": -0.894
+    },
+    {
+      "kind": "agent",
+      "id": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "label": "Synthetic agent 08",
+      "x": -0.4849,
+      "y": 0.1627
+    },
+    {
+      "kind": "agent",
+      "id": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "label": "Synthetic agent 09",
+      "x": 0.8531,
+      "y": -0.1254
+    },
+    {
+      "kind": "agent",
+      "id": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "label": "Synthetic agent 10",
+      "x": 0.043,
+      "y": -0.1338
+    },
+    {
+      "kind": "evidence",
+      "id": "2da80b16-83cd-4eef-99da-246f18b49c0d",
+      "label": "Evidence: Nedel mimiri vorsel imrivor fove",
+      "x": -0.7861,
+      "y": 0.5541
+    },
+    {
+      "kind": "evidence",
+      "id": "22934a4b-fd0e-458f-8bd0-e859465177bb",
+      "label": "Evidence: Vorne saropra zenprais",
+      "x": -0.2032,
+      "y": -0.7179
+    },
+    {
+      "kind": "evidence",
+      "id": "ad36af20-0f52-480f-b054-c0899ea9341e",
+      "label": "Evidence: Torar ulzen",
+      "x": -0.5499,
+      "y": 0.6009
+    },
+    {
+      "kind": "evidence",
+      "id": "1e7a5b42-609e-4bc2-876c-291b42b55878",
+      "label": "Evidence: Thiulon torvor corrotor quaneex",
+      "x": 0.3819,
+      "y": -0.8014
+    },
+    {
+      "kind": "evidence",
+      "id": "32e6613e-5ffa-4799-8b5f-045fb1c74437",
+      "label": "Evidence: Prasa quaexqua zenoncor",
+      "x": -0.2151,
+      "y": 0.363
+    },
+    {
+      "kind": "evidence",
+      "id": "08153e39-bead-484f-a09c-adbbc42beeb8",
+      "label": "Evidence: Isvorri prabelar opselve opcor",
+      "x": -0.7218,
+      "y": 0.0131
+    },
+    {
+      "kind": "evidence",
+      "id": "d5e0d2a3-ca25-419d-bb3c-f80981b087d1",
+      "label": "Evidence: Veis vorispra thiaris veon lindel",
+      "x": 0.3643,
+      "y": -0.9444
+    },
+    {
+      "kind": "evidence",
+      "id": "38daf9e5-2f85-4451-b333-c30fcf7d77dc",
+      "label": "Evidence: Nefoop imro torzen vorpra prabelcor",
+      "x": -0.4308,
+      "y": -0.0779
+    },
+    {
+      "kind": "evidence",
+      "id": "c9470ca1-2571-44a2-a627-07a167060ad7",
+      "label": "Evidence: Vorsel zenulvor",
+      "x": 0.1275,
+      "y": 0.938
+    },
+    {
+      "kind": "evidence",
+      "id": "cfe5a5ae-d124-4661-9474-3e13c6dfd45a",
+      "label": "Evidence: Zensel imqua vear onulzen",
+      "x": 0.5985,
+      "y": 0.5963
+    },
+    {
+      "kind": "evidence",
+      "id": "7b6cece7-7516-4b93-a1bf-41019928e67b",
+      "label": "Evidence: Kata quavorcor belul",
+      "x": 0.5324,
+      "y": -0.4067
+    },
+    {
+      "kind": "evidence",
+      "id": "980b799c-91af-4e9e-b354-01ebd4a9b279",
+      "label": "Evidence: Dundunis immi thitor imimtor",
+      "x": -0.0675,
+      "y": 0.4931
+    },
+    {
+      "kind": "evidence",
+      "id": "8d1bb655-f3d2-4932-9ef8-e5443aa932bc",
+      "label": "Evidence: Oprodel istorta taimfo neta",
+      "x": 0.5473,
+      "y": 0.2983
+    },
+    {
+      "kind": "evidence",
+      "id": "7cc6279e-ae63-404f-8484-6a2f92a0301b",
+      "label": "Evidence: Dellin mizenmi vorexta exmi",
+      "x": 0.8347,
+      "y": 0.0116
+    },
+    {
+      "kind": "evidence",
+      "id": "d522281e-14f6-4046-8a6f-89bbac513cae",
+      "label": "Evidence: Arlinbel thiimbel rothibel delopon cordun",
+      "x": 0.3075,
+      "y": 0.2097
+    },
+    {
+      "kind": "evidence",
+      "id": "5534dd1b-124a-4026-bbec-35bef5850a7b",
+      "label": "Evidence: Rotor exrizen safothi imtorar selfo",
+      "x": 0.1475,
+      "y": -0.922
+    },
+    {
+      "kind": "evidence",
+      "id": "6aa7767c-62e1-4105-89cb-d0d61eba3098",
+      "label": "Evidence: Nefo vorve thitor",
+      "x": 0.5774,
+      "y": -0.4836
+    },
+    {
+      "kind": "evidence",
+      "id": "dc53bfbf-9a85-4ba4-b643-7c107e2e3b1c",
+      "label": "Evidence: Tacor opcor sarois",
+      "x": 0.7071,
+      "y": 0.171
+    }
+  ],
+  "edges": [
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a65aca5c-673e-4817-b35f-24cc8a5390ae",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a8eeac6-c5a5-43ce-a713-dfbebf4ccc80",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ea38ea5d-1fcd-4d3c-82a1-746419144858",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a65aca5c-673e-4817-b35f-24cc8a5390ae",
+      "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a8eeac6-c5a5-43ce-a713-dfbebf4ccc80",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a65aca5c-673e-4817-b35f-24cc8a5390ae",
+      "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "f27838c0-c344-4232-b544-472b4303099d",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a65aca5c-673e-4817-b35f-24cc8a5390ae",
+      "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a8eeac6-c5a5-43ce-a713-dfbebf4ccc80",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a8eeac6-c5a5-43ce-a713-dfbebf4ccc80",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "22af1509-24a2-46d1-810d-a16853a20927",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ea38ea5d-1fcd-4d3c-82a1-746419144858",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a2585050-69de-4f2a-ac90-618d1b950041",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "3a8eeac6-c5a5-43ce-a713-dfbebf4ccc80",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "a65aca5c-673e-4817-b35f-24cc8a5390ae",
+      "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ea38ea5d-1fcd-4d3c-82a1-746419144858",
+      "target": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ea38ea5d-1fcd-4d3c-82a1-746419144858",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "5e683cea-2903-4c5b-8832-74078d24929d",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ea38ea5d-1fcd-4d3c-82a1-746419144858",
+      "target": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "ec32656d-74a5-442d-8e93-73aa4074c60f",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "e077e81b-9c49-4965-aac4-337de4a7f6ea",
+      "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71ac8595-b6ed-44cc-9ada-723d1f2a3867",
+      "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "78e7a625-2f21-4638-b34a-56ecf2cc0a0e",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "71f7060d-177d-4e6b-81ea-f8ef2c562a4e",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "asserted",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "none"
+    },
+    {
+      "source": "2da80b16-83cd-4eef-99da-246f18b49c0d",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6996,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "2da80b16-83cd-4eef-99da-246f18b49c0d",
+      "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.9034,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "2da80b16-83cd-4eef-99da-246f18b49c0d",
+      "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.7255,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "22934a4b-fd0e-458f-8bd0-e859465177bb",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1923,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "22934a4b-fd0e-458f-8bd0-e859465177bb",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7333,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "ad36af20-0f52-480f-b054-c0899ea9341e",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6057,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "ad36af20-0f52-480f-b054-c0899ea9341e",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1921,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "ad36af20-0f52-480f-b054-c0899ea9341e",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1078,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "1e7a5b42-609e-4bc2-876c-291b42b55878",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.9258,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "1e7a5b42-609e-4bc2-876c-291b42b55878",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6329,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "1e7a5b42-609e-4bc2-876c-291b42b55878",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4378,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "1e7a5b42-609e-4bc2-876c-291b42b55878",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0727,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "32e6613e-5ffa-4799-8b5f-045fb1c74437",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4494,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "32e6613e-5ffa-4799-8b5f-045fb1c74437",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1402,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "32e6613e-5ffa-4799-8b5f-045fb1c74437",
+      "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.282,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "08153e39-bead-484f-a09c-adbbc42beeb8",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5965,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "08153e39-bead-484f-a09c-adbbc42beeb8",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4365,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "08153e39-bead-484f-a09c-adbbc42beeb8",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.749,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d5e0d2a3-ca25-419d-bb3c-f80981b087d1",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2233,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d5e0d2a3-ca25-419d-bb3c-f80981b087d1",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1936,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d5e0d2a3-ca25-419d-bb3c-f80981b087d1",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6404,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d5e0d2a3-ca25-419d-bb3c-f80981b087d1",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5832,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "38daf9e5-2f85-4451-b333-c30fcf7d77dc",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5117,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "38daf9e5-2f85-4451-b333-c30fcf7d77dc",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6115,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "38daf9e5-2f85-4451-b333-c30fcf7d77dc",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5086,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "38daf9e5-2f85-4451-b333-c30fcf7d77dc",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3425,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9470ca1-2571-44a2-a627-07a167060ad7",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2817,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9470ca1-2571-44a2-a627-07a167060ad7",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5887,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "c9470ca1-2571-44a2-a627-07a167060ad7",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.7318,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "cfe5a5ae-d124-4661-9474-3e13c6dfd45a",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.55,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "cfe5a5ae-d124-4661-9474-3e13c6dfd45a",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.9427,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "cfe5a5ae-d124-4661-9474-3e13c6dfd45a",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8101,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7b6cece7-7516-4b93-a1bf-41019928e67b",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4819,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7b6cece7-7516-4b93-a1bf-41019928e67b",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4162,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7b6cece7-7516-4b93-a1bf-41019928e67b",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8822,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7b6cece7-7516-4b93-a1bf-41019928e67b",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2017,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "980b799c-91af-4e9e-b354-01ebd4a9b279",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.44,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "980b799c-91af-4e9e-b354-01ebd4a9b279",
+      "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3865,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "8d1bb655-f3d2-4932-9ef8-e5443aa932bc",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1741,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "8d1bb655-f3d2-4932-9ef8-e5443aa932bc",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5353,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "8d1bb655-f3d2-4932-9ef8-e5443aa932bc",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.359,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7cc6279e-ae63-404f-8484-6a2f92a0301b",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6649,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7cc6279e-ae63-404f-8484-6a2f92a0301b",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7663,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "7cc6279e-ae63-404f-8484-6a2f92a0301b",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5075,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d522281e-14f6-4046-8a6f-89bbac513cae",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5394,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d522281e-14f6-4046-8a6f-89bbac513cae",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6024,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d522281e-14f6-4046-8a6f-89bbac513cae",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6185,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "d522281e-14f6-4046-8a6f-89bbac513cae",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5771,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "5534dd1b-124a-4026-bbec-35bef5850a7b",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.8079,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "5534dd1b-124a-4026-bbec-35bef5850a7b",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8385,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "5534dd1b-124a-4026-bbec-35bef5850a7b",
+      "target": "22af1509-24a2-46d1-810d-a16853a20927",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.9001,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "5534dd1b-124a-4026-bbec-35bef5850a7b",
+      "target": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3471,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "6aa7767c-62e1-4105-89cb-d0d61eba3098",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4256,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "6aa7767c-62e1-4105-89cb-d0d61eba3098",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4954,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "6aa7767c-62e1-4105-89cb-d0d61eba3098",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5235,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "dc53bfbf-9a85-4ba4-b643-7c107e2e3b1c",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1563,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "dc53bfbf-9a85-4ba4-b643-7c107e2e3b1c",
+      "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.9376,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "dc53bfbf-9a85-4ba4-b643-7c107e2e3b1c",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5225,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "dc53bfbf-9a85-4ba4-b643-7c107e2e3b1c",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4674,
+      "flow_basis": "exact"
+    },
+    {
+      "source": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.022,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0211,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0216,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0167,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.011,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1036,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1194,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0981,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1114,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0773,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1171,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65722717-54d8-48bb-917e-d1f87054f291",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.3134,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65722717-54d8-48bb-917e-d1f87054f291",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5392,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65722717-54d8-48bb-917e-d1f87054f291",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4425,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65722717-54d8-48bb-917e-d1f87054f291",
+      "target": "22af1509-24a2-46d1-810d-a16853a20927",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2314,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65722717-54d8-48bb-917e-d1f87054f291",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4604,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2323,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1861,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.2515,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1896,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3659,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3366,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2155,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.5602,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3501,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3221,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3178,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5252,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3732,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3558,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.8095,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7606,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.8359,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.4645,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3651,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.282,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.5593,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4079,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.3836,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3558,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3675,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2581,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5693,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6158,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.2582,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0295,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0415,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0449,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0465,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0252,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0309,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.7653,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6012,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2935,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3783,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.3932,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.4398,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1241,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1728,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "target": "f27838c0-c344-4232-b544-472b4303099d",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3049,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.3505,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1511,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2347,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3901,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4894,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5508,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "target": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5762,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6286,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5201,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.2186,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3669,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.289,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3675,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1303,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.3449,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0771,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0969,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0497,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1228,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0935,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1252,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3599,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.272,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5844,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.362,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.6675,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5838,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5813,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.541,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.6239,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.6306,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.7392,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.5175,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0171,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0389,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0206,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0185,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.033,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0181,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1926,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1562,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2044,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.254,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4314,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4547,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1131,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1261,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "target": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1392,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3014,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2403,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2925,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0178,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0181,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0129,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0192,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0131,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0161,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2113,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3449,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2642,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.3533,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.248,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2739,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0812,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1428,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.2083,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0884,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1091,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2072,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.3025,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.233,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2527,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2893,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2233,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3148,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0528,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0395,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0281,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0511,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0664,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0857,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4974,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.4931,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3636,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2663,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "target": "22af1509-24a2-46d1-810d-a16853a20927",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.5101,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.4475,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f27838c0-c344-4232-b544-472b4303099d",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.559,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f27838c0-c344-4232-b544-472b4303099d",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4434,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f27838c0-c344-4232-b544-472b4303099d",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.5742,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f27838c0-c344-4232-b544-472b4303099d",
+      "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8582,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f27838c0-c344-4232-b544-472b4303099d",
+      "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.6266,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f27838c0-c344-4232-b544-472b4303099d",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4142,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.316,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4081,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1463,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2217,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.1357,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.2178,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.4635,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.6015,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.922,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7254,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4719,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "target": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7175,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1853,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2691,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.5427,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.5485,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "target": "a44901e1-b5e6-40df-afc1-6473db233f9a",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2626,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.2802,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.337,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5024,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2687,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5555,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3755,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3499,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3309,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3412,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3019,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1436,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.3425,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "target": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2968,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5389,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4499,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4005,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.6944,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4975,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.3342,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.048,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "target": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0968,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0417,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0607,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1027,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0808,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "22af1509-24a2-46d1-810d-a16853a20927",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4432,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "22af1509-24a2-46d1-810d-a16853a20927",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4983,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "22af1509-24a2-46d1-810d-a16853a20927",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.5826,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "22af1509-24a2-46d1-810d-a16853a20927",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.318,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "22af1509-24a2-46d1-810d-a16853a20927",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4279,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "22af1509-24a2-46d1-810d-a16853a20927",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.5908,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4212,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3432,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4477,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4341,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3031,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.469,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4899,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5063,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8803,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7114,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.7741,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.7974,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.02,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0133,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0189,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0171,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0118,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0096,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "target": "e71a446e-dc62-4215-8468-c9fd2688f79c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.8813,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6382,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.5371,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.777,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4645,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.583,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2366,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1771,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1958,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1658,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.2415,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1253,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4778,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5197,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.425,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2954,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3221,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.6151,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3782,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2686,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1951,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.3313,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.233,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "target": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3098,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3377,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.2243,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "target": "f27838c0-c344-4232-b544-472b4303099d",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.4459,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.2421,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "target": "bb67a745-92e9-4590-bb2d-d779f31143df",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.3888,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2492,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5377,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5207,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6075,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.6431,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4249,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.4829,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2183,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3952,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "target": "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1781,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2233,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.4862,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3718,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3337,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.3098,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2219,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.2014,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "target": "22af1509-24a2-46d1-810d-a16853a20927",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.1616,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "33ce9b8d-ad49-4bca-8beb-e30a9dad1e50",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1404,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "target": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+      "target": "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.067,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1728,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "target": "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1562,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.1748,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1742,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0947,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "target": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.7516,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.5092,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5648,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.5291,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.5623,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5962,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1295,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1435,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0825,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "target": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1103,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "target": "f27838c0-c344-4232-b544-472b4303099d",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0585,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.075,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1866,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4036,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "target": "b4216b8b-87ef-401c-ae73-b76d8a89367c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1959,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.2861,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3447,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2301,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.173,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "target": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0822,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1344,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1923,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.173,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.1307,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.1148,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1428,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "target": "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1646,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "target": "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.066,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0795,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1109,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2249,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2205,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4127,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2434,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "target": "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.245,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "target": "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2112,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1646,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2518,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.299,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3625,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1556,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.308,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2509,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3715,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2388,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2074,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1242,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "target": "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.344,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.1355,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2234,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2375,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.2494,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "target": "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.2783,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1174,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.185,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4416,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.235,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "target": "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3396,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "target": "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.4171,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+      "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1566,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.9595,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.413,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "target": "150d8121-05e3-4a36-963b-8d6e974fad00",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4462,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "target": "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5841,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "target": "a83e0326-4310-4364-aef7-e47105769ecc",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3233,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.4837,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2371,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0965,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.226,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1256,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "target": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.1892,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.1939,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "target": "0c4d7daf-42c0-4352-b17e-2929308b822b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "target": "d4849252-33fd-4ec4-ac53-acb6b25be407",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "target": "1c47cda3-6a64-4046-a309-f6558d826ef3",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3691,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "target": "89e49406-90ed-4be6-ba54-d2ca07e048df",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4057,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "target": "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4686,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.6647,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3692,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "target": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.8514,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "target": "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3389,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.678,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "target": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6673,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.3901,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "target": "f27838c0-c344-4232-b544-472b4303099d",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5743,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "45630100-bb52-468c-9cdf-1fbebedec0b2",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.78,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0049,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0113,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "target": "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.006,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.0056,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "target": "0082126e-a59e-4d1f-8585-f6fa1204132b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.01,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0045,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "target": "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "target": "260aa5ef-347e-434d-ac96-77e045e874be",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "target": "22af1509-24a2-46d1-810d-a16853a20927",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.313,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.3586,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.2368,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2196,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "target": "99d625db-7a83-40bb-80cc-fe4967da1818",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4666,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+      "target": "3288bbfb-58f6-4f38-9db4-20bd903b78dd",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.3223,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.5075,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "target": "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.2795,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.7662,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.3158,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "target": "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.275,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.7457,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.648,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "target": "d5de061d-6181-4f90-86ed-39e65c3abc17",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.3017,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "target": "65722717-54d8-48bb-917e-d1f87054f291",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.4673,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "target": "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.6305,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "target": "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.6782,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "target": "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.4195,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "target": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.2999,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "target": "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.5076,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "target": "1a60b5f1-e492-4103-8da5-5433188199ce",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.4568,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "target": "97598049-f99f-47c6-83f2-28e57b7642cc",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.3801,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.275,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c562c128-690b-435d-ab0a-a25ecfda30aa",
+      "target": "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.2948,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "target": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1089,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "target": "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+      "relationship": "elaborates",
+      "sign": 1,
+      "flow_weight": 0.0615,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "target": "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.1151,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "refutes",
+      "sign": -1,
+      "flow_weight": 0.0707,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "target": "9387150e-b15a-4a5b-94a2-5188711210c7",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1173,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+      "target": "8df9ff68-7100-4216-ba86-3e168a252511",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0667,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "target": "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1242,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "target": "34381974-a8bc-4292-bc2c-42d80c189e16",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.1388,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "target": "548eb762-8e47-468b-8ee7-ab1112059548",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.1731,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "target": "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+      "relationship": "corroborates",
+      "sign": 1,
+      "flow_weight": 0.0602,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "target": "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.0632,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "c75f5037-81cb-4f2b-867b-ca77d7018935",
+      "target": "f27838c0-c344-4232-b544-472b4303099d",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.0718,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "target": "7eb81577-b26b-4f31-8392-fbdd10441a78",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5905,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "target": "fe026d53-f71e-422e-9665-1cf233156c1b",
+      "relationship": "decomposes_to",
+      "sign": 1,
+      "flow_weight": 0.6154,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "target": "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.5209,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "target": "489685e7-9c3e-4d87-a0da-735b300fc74e",
+      "relationship": "supports",
+      "sign": 1,
+      "flow_weight": 0.6708,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "target": "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+      "relationship": "cites",
+      "sign": 0,
+      "flow_weight": 0.2351,
+      "flow_basis": "proxy"
+    },
+    {
+      "source": "d75b2bb6-d1f2-4e46-a7ec-1bfdc2f9f616",
+      "target": "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+      "relationship": "contradicts",
+      "sign": -1,
+      "flow_weight": 0.5915,
+      "flow_basis": "proxy"
+    }
+  ],
+  "outgoing": [
+    {
+      "target": {
+        "level_id": "1eaf48bd-68a1-42af-a82d-037dffcb5cf4",
+        "theme_id": "e51bca01-d883-4dda-a0f7-4efbc7b59509",
+        "name": "Vorbel vornesel misa",
+        "depth": 0
+      },
+      "count": 14,
+      "net_sign": -1,
+      "sources": [
+        "260aa5ef-347e-434d-ac96-77e045e874be",
+        "1c47cda3-6a64-4046-a309-f6558d826ef3",
+        "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+        "45630100-bb52-468c-9cdf-1fbebedec0b2",
+        "8df9ff68-7100-4216-ba86-3e168a252511",
+        "89e49406-90ed-4be6-ba54-d2ca07e048df",
+        "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "e80c6f8c-5eab-4a56-a39c-077b35591c50"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "fe92415a-75d9-4de6-b293-3cafab44239a",
+        "theme_id": "1c1a3abb-918c-4e07-a223-2188e0ed9bb3",
+        "name": "Belroex delul delim",
+        "depth": 3
+      },
+      "count": 13,
+      "net_sign": -1,
+      "sources": [
+        "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+        "34381974-a8bc-4292-bc2c-42d80c189e16",
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "4e2d1f70-3bf0-4361-b715-9dd9a99d4825",
+        "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+        "a07786ac-7002-4f4c-ac89-0937b1a8106d"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "8fd0cf38-dfb3-45a9-81bc-b6b8db87ee57",
+        "theme_id": "6e25c779-6cdf-4b0e-9d02-8064aa1944bb",
+        "name": "Delzensel cordun belribel arcor isim",
+        "depth": 4
+      },
+      "count": 12,
+      "net_sign": 0,
+      "sources": [
+        "22af1509-24a2-46d1-810d-a16853a20927",
+        "548eb762-8e47-468b-8ee7-ab1112059548",
+        "150d8121-05e3-4a36-963b-8d6e974fad00",
+        "1a60b5f1-e492-4103-8da5-5433188199ce"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "6c9fc2e0-df52-4c8f-b48f-47a91938b2a7",
+        "theme_id": "c5eb7ea2-b88b-45e0-a45c-65237e231f97",
+        "name": "Vemi prator arvorzen ultata fone",
+        "depth": 3
+      },
+      "count": 19,
+      "net_sign": 0,
+      "sources": [
+        "e71a446e-dc62-4215-8468-c9fd2688f79c",
+        "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+        "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+        "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+        "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+        "69d8f016-de08-4e3e-8f76-59c0b7bd57e4",
+        "c562c128-690b-435d-ab0a-a25ecfda30aa",
+        "d5de061d-6181-4f90-86ed-39e65c3abc17",
+        "1a60b5f1-e492-4103-8da5-5433188199ce"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "71872f29-772b-4beb-9785-9c8a8a8feadc",
+        "theme_id": "1c1a3abb-918c-4e07-a223-2188e0ed9bb3",
+        "name": "Ontorri oponve",
+        "depth": 1
+      },
+      "count": 14,
+      "net_sign": 1,
+      "sources": [
+        "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+        "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+        "1a60b5f1-e492-4103-8da5-5433188199ce",
+        "260aa5ef-347e-434d-ac96-77e045e874be",
+        "7eb81577-b26b-4f31-8392-fbdd10441a78",
+        "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+        "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+        "34381974-a8bc-4292-bc2c-42d80c189e16",
+        "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "1dfd9c2b-378e-4945-a44e-a4cd526848e1",
+        "theme_id": "5d440f79-dbac-438f-8455-28f2d13eb344",
+        "name": "Takasel rofothi exfo",
+        "depth": 1
+      },
+      "count": 20,
+      "net_sign": -1,
+      "sources": [
+        "34381974-a8bc-4292-bc2c-42d80c189e16",
+        "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+        "45630100-bb52-468c-9cdf-1fbebedec0b2",
+        "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+        "31c4e758-a32e-421b-929d-551cf2b0e2d1",
+        "a83e0326-4310-4364-aef7-e47105769ecc",
+        "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+        "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+        "c2bc7752-fbcc-422f-9fe5-d4ba548b900a",
+        "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+        "676c91b0-fb52-4c93-82a7-4b3d7024206d"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "6d0188c8-b5d4-4e1c-99bb-7f10e064b808",
+        "theme_id": "5d440f79-dbac-438f-8455-28f2d13eb344",
+        "name": "Cordunbel ulthi",
+        "depth": 3
+      },
+      "count": 9,
+      "net_sign": 1,
+      "sources": [
+        "489685e7-9c3e-4d87-a0da-735b300fc74e",
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+        "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+        "f5a71436-5e25-4e84-a6d8-bde3460ded35"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "266b5b99-3b4a-4924-b02d-cea7ef72554e",
+        "theme_id": "7d6cc081-6073-4cb6-a706-a0f3c2cecd38",
+        "name": "Arex thisel thiarka thiar prafo",
+        "depth": 4
+      },
+      "count": 16,
+      "net_sign": 1,
+      "sources": [
+        "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+        "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+        "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+        "c75f5037-81cb-4f2b-867b-ca77d7018935",
+        "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+        "89e49406-90ed-4be6-ba54-d2ca07e048df",
+        "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+        "a44901e1-b5e6-40df-afc1-6473db233f9a",
+        "34381974-a8bc-4292-bc2c-42d80c189e16"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "a2822852-259d-4279-bba7-9733a5c5428e",
+        "theme_id": "47589865-91b7-40d4-a18d-72eb35390366",
+        "name": "Mifoar sarofo belfo save dunulve",
+        "depth": 3
+      },
+      "count": 27,
+      "net_sign": 1,
+      "sources": [
+        "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+        "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+        "f27838c0-c344-4232-b544-472b4303099d",
+        "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2",
+        "f5a71436-5e25-4e84-a6d8-bde3460ded35"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "9c1109e3-c5b0-4cc5-84cb-e0e3cc2a6c35",
+        "theme_id": "7d6cc081-6073-4cb6-a706-a0f3c2cecd38",
+        "name": "Ritor rothi kalin midun corim",
+        "depth": 1
+      },
+      "count": 17,
+      "net_sign": 1,
+      "sources": [
+        "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+        "150d8121-05e3-4a36-963b-8d6e974fad00",
+        "a83e0326-4310-4364-aef7-e47105769ecc",
+        "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+        "8df9ff68-7100-4216-ba86-3e168a252511",
+        "9387150e-b15a-4a5b-94a2-5188711210c7"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "ce4ca6bd-fd6e-4e28-85d9-b8f56e38d4c2",
+        "theme_id": "6e25c779-6cdf-4b0e-9d02-8064aa1944bb",
+        "name": null,
+        "depth": 1
+      },
+      "count": 21,
+      "net_sign": 1,
+      "sources": [
+        "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+        "24721d70-2a67-4099-a8eb-9761b8a9f35e",
+        "c562c128-690b-435d-ab0a-a25ecfda30aa",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "fe026d53-f71e-422e-9665-1cf233156c1b",
+        "53ba0646-c6e5-42e7-93a5-a959c4ab5b33",
+        "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "641c851f-ed4e-4878-98ba-77bdf566b5ec",
+        "theme_id": "05f7a49c-764e-454d-af88-c2c250b22aef",
+        "name": "Quafobel sataqua",
+        "depth": 0
+      },
+      "count": 11,
+      "net_sign": 1,
+      "sources": [
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c",
+        "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+        "89e49406-90ed-4be6-ba54-d2ca07e048df",
+        "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+        "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+        "260aa5ef-347e-434d-ac96-77e045e874be",
+        "489685e7-9c3e-4d87-a0da-735b300fc74e",
+        "f5a71436-5e25-4e84-a6d8-bde3460ded35"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "d0b38628-105d-443d-9aaf-794bafaf1867",
+        "theme_id": "47589865-91b7-40d4-a18d-72eb35390366",
+        "name": "Imro belonop torpra",
+        "depth": 3
+      },
+      "count": 24,
+      "net_sign": 0,
+      "sources": [
+        "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+        "7eb81577-b26b-4f31-8392-fbdd10441a78",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "34381974-a8bc-4292-bc2c-42d80c189e16"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "38377ebc-aaf3-4580-8ce5-be32bfff785f",
+        "theme_id": "47589865-91b7-40d4-a18d-72eb35390366",
+        "name": "Delthidun zensafo exro rivebel mibelbel",
+        "depth": 0
+      },
+      "count": 10,
+      "net_sign": 0,
+      "sources": [
+        "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+        "db61bfb5-37bb-42b2-b8e2-aeeb876fe54f",
+        "62aa335f-92e5-4d9c-9f02-cc0269af05e7",
+        "489685e7-9c3e-4d87-a0da-735b300fc74e",
+        "d5de061d-6181-4f90-86ed-39e65c3abc17",
+        "7eb81577-b26b-4f31-8392-fbdd10441a78",
+        "53ba0646-c6e5-42e7-93a5-a959c4ab5b33"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "2494aee8-ff5b-4f5a-9274-459fdf4610a1",
+        "theme_id": "47589865-91b7-40d4-a18d-72eb35390366",
+        "name": "Nene vebelve corvor belka",
+        "depth": 4
+      },
+      "count": 18,
+      "net_sign": 1,
+      "sources": [
+        "1c47cda3-6a64-4046-a309-f6558d826ef3",
+        "a495b3a8-fa4e-45c5-b9ba-676e19d158a6",
+        "a44901e1-b5e6-40df-afc1-6473db233f9a",
+        "2b79a06e-04ca-4603-be77-a2d4c8fab7ba"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "b26e8bcb-84c7-4d1f-acda-a27a3c84e551",
+        "theme_id": "e51bca01-d883-4dda-a0f7-4efbc7b59509",
+        "name": "Selricor belar dunopvor opzenzen roqua",
+        "depth": 3
+      },
+      "count": 18,
+      "net_sign": 0,
+      "sources": [
+        "45630100-bb52-468c-9cdf-1fbebedec0b2",
+        "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+        "bc341efd-ce3a-490c-87ac-d459fc6631e7",
+        "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+        "34381974-a8bc-4292-bc2c-42d80c189e16",
+        "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+        "e9698a92-03e0-4149-80cf-089bfd7d04cc",
+        "50b1b2a8-2390-4b7f-b2f2-f94640d3a5d9",
+        "65722717-54d8-48bb-917e-d1f87054f291",
+        "fe026d53-f71e-422e-9665-1cf233156c1b",
+        "27d953ab-cfd6-4b81-a9c6-5ef858b133c9"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "7350298e-df31-406a-bcd0-0395309d6e66",
+        "theme_id": "c5eb7ea2-b88b-45e0-a45c-65237e231f97",
+        "name": "Onmita vero selulmi imisne",
+        "depth": 1
+      },
+      "count": 27,
+      "net_sign": 0,
+      "sources": [
+        "53acb1ee-8f30-4386-b7ed-0e90fd0901a3",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "0c4d7daf-42c0-4352-b17e-2929308b822b",
+        "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+        "0a58deda-6fa5-4e40-b834-fcd558f9b48d",
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "5145a71d-ef81-4817-bc6b-978c7b51f7b5",
+        "theme_id": "6e25c779-6cdf-4b0e-9d02-8064aa1944bb",
+        "name": "Extaop saimsel miquaon",
+        "depth": 3
+      },
+      "count": 16,
+      "net_sign": 1,
+      "sources": [
+        "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+        "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+        "45630100-bb52-468c-9cdf-1fbebedec0b2",
+        "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+        "7eb81577-b26b-4f31-8392-fbdd10441a78",
+        "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+        "f2ce0de7-27bf-4429-b394-f9b7c1a92f7c"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "b7e9bb56-46f1-4075-b60b-8ead059fd4ee",
+        "theme_id": "05f7a49c-764e-454d-af88-c2c250b22aef",
+        "name": "Oproex exbel exsel",
+        "depth": 2
+      },
+      "count": 3,
+      "net_sign": 1,
+      "sources": [
+        "0c4d7daf-42c0-4352-b17e-2929308b822b",
+        "a44901e1-b5e6-40df-afc1-6473db233f9a"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "528a49a2-8b8c-4c51-9ad8-d8900cb21758",
+        "theme_id": "47589865-91b7-40d4-a18d-72eb35390366",
+        "name": "Corvordun belar tavesa",
+        "depth": 2
+      },
+      "count": 6,
+      "net_sign": 1,
+      "sources": [
+        "ceaeddcc-b3bc-43b4-aa54-e2e0263b02d2"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "f6738196-7c44-4891-90b5-99324d22824c",
+        "theme_id": "019f6e4e-9d29-4169-807f-7894c8ed5803",
+        "name": "Dunnetor deltorop exdelsel",
+        "depth": 1
+      },
+      "count": 28,
+      "net_sign": -1,
+      "sources": [
+        "d8e3f4e9-79c1-4036-abba-cef4b996ed09",
+        "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+        "d5de061d-6181-4f90-86ed-39e65c3abc17",
+        "b4ff6a72-3b50-4b69-9910-9b4ce96c18f5",
+        "5bd314d1-7b78-458e-9b0c-b11fae0c18df",
+        "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+        "45630100-bb52-468c-9cdf-1fbebedec0b2",
+        "99d625db-7a83-40bb-80cc-fe4967da1818",
+        "4e2d1f70-3bf0-4361-b715-9dd9a99d4825"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "51b43b6e-b984-4cd2-8852-4f5daf2b64e8",
+        "theme_id": "c5eb7ea2-b88b-45e0-a45c-65237e231f97",
+        "name": "Roimul kabel",
+        "depth": 2
+      },
+      "count": 31,
+      "net_sign": -1,
+      "sources": [
+        "9387150e-b15a-4a5b-94a2-5188711210c7",
+        "7eca9677-1246-4177-8cd3-7ccc4720cfb4",
+        "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+        "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+        "a07786ac-7002-4f4c-ac89-0937b1a8106d",
+        "22af1509-24a2-46d1-810d-a16853a20927",
+        "99d625db-7a83-40bb-80cc-fe4967da1818",
+        "65dcf6a9-78dc-4ecc-903d-6b2aeec0e68b",
+        "8df9ff68-7100-4216-ba86-3e168a252511",
+        "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+        "97598049-f99f-47c6-83f2-28e57b7642cc"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "2694d62d-9768-4ebd-89f7-65b635260445",
+        "theme_id": "019f6e4e-9d29-4169-807f-7894c8ed5803",
+        "name": "Belul onquais",
+        "depth": 2
+      },
+      "count": 15,
+      "net_sign": 0,
+      "sources": [
+        "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "a44901e1-b5e6-40df-afc1-6473db233f9a"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "7e6928a5-a530-43e0-8449-ea71326d6396",
+        "theme_id": "019f6e4e-9d29-4169-807f-7894c8ed5803",
+        "name": "Riimon onulve thiular exlin foselne",
+        "depth": 4
+      },
+      "count": 2,
+      "net_sign": 0,
+      "sources": [
+        "69d8f016-de08-4e3e-8f76-59c0b7bd57e4"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "e6799673-fcfd-4e50-a1b0-073dcae5b3c7",
+        "theme_id": "1c1a3abb-918c-4e07-a223-2188e0ed9bb3",
+        "name": "Tasadel tortormi",
+        "depth": 4
+      },
+      "count": 8,
+      "net_sign": 1,
+      "sources": [
+        "f0b309e9-6329-4899-bba3-abf9a0fa6436",
+        "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+        "89e49406-90ed-4be6-ba54-d2ca07e048df",
+        "0c4d7daf-42c0-4352-b17e-2929308b822b",
+        "22af1509-24a2-46d1-810d-a16853a20927"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "6e5f12bf-b982-45f9-a55b-8c704160bf45",
+        "theme_id": "c5eb7ea2-b88b-45e0-a45c-65237e231f97",
+        "name": "Dunne sapra kaopex",
+        "depth": 1
+      },
+      "count": 23,
+      "net_sign": 0,
+      "sources": [
+        "97598049-f99f-47c6-83f2-28e57b7642cc",
+        "8bd1347e-fd9f-4dfd-8403-1725dc423399",
+        "a7c17a22-8d79-4823-beb2-7034d79a77e2",
+        "a44901e1-b5e6-40df-afc1-6473db233f9a",
+        "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+        "27d953ab-cfd6-4b81-a9c6-5ef858b133c9",
+        "34381974-a8bc-4292-bc2c-42d80c189e16",
+        "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+        "548eb762-8e47-468b-8ee7-ab1112059548",
+        "f27838c0-c344-4232-b544-472b4303099d",
+        "a83e0326-4310-4364-aef7-e47105769ecc",
+        "03c2afd1-e26e-427a-bfab-e97132d8fd50"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "123eecea-45ee-4983-b7d2-bcd2ecf21495",
+        "theme_id": "1c1a3abb-918c-4e07-a223-2188e0ed9bb3",
+        "name": "Ondel dunulqua fois",
+        "depth": 3
+      },
+      "count": 14,
+      "net_sign": -1,
+      "sources": [
+        "d3485049-48fb-4a5d-a5b5-9fc1e31577a8",
+        "260aa5ef-347e-434d-ac96-77e045e874be",
+        "bb67a745-92e9-4590-bb2d-d779f31143df",
+        "a83e0326-4310-4364-aef7-e47105769ecc",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "03c2afd1-e26e-427a-bfab-e97132d8fd50",
+        "1c47cda3-6a64-4046-a309-f6558d826ef3",
+        "45630100-bb52-468c-9cdf-1fbebedec0b2"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "2f36b63e-850b-49aa-ba89-9bead3132c5b",
+        "theme_id": "7d6cc081-6073-4cb6-a706-a0f3c2cecd38",
+        "name": "Cortaqua miroon onimro lincorop delsa",
+        "depth": 4
+      },
+      "count": 13,
+      "net_sign": -1,
+      "sources": [
+        "e19a6973-160d-4245-bb63-ddfe7f3f7563",
+        "e80c6f8c-5eab-4a56-a39c-077b35591c50",
+        "88d86a7b-56ab-44ee-ac68-19c8e663fff6",
+        "676c91b0-fb52-4c93-82a7-4b3d7024206d",
+        "c2bc7752-fbcc-422f-9fe5-d4ba548b900a"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "be87a5a1-d886-44e7-a355-416f790bafcd",
+        "theme_id": "7d6cc081-6073-4cb6-a706-a0f3c2cecd38",
+        "name": "Arprata corpraop dunim corve rotor",
+        "depth": 3
+      },
+      "count": 17,
+      "net_sign": -1,
+      "sources": [
+        "663c1f26-cb5f-4e71-ad3b-8596ef464ab6",
+        "e56c9158-cb79-4a4f-a614-c5b714b1ef84",
+        "26c11b28-4e84-4b8f-b9c1-7e2602c0059b",
+        "d4849252-33fd-4ec4-ac53-acb6b25be407",
+        "2b79a06e-04ca-4603-be77-a2d4c8fab7ba",
+        "45630100-bb52-468c-9cdf-1fbebedec0b2",
+        "f5a71436-5e25-4e84-a6d8-bde3460ded35",
+        "8df9ff68-7100-4216-ba86-3e168a252511"
+      ]
+    },
+    {
+      "target": {
+        "level_id": "e6b6cc11-e962-4e00-a816-a08a06a582a3",
+        "theme_id": "5d440f79-dbac-438f-8455-28f2d13eb344",
+        "name": null,
+        "depth": 4
+      },
+      "count": 14,
+      "net_sign": -1,
+      "sources": [
+        "2f2d2bb7-65a7-4443-bf80-74a4dc6e0c08",
+        "a21f9391-e35d-4567-8ad7-2a4d378d08ff",
+        "34a2802a-0bf1-428e-8d8e-5190a3f62cf8",
+        "1c47cda3-6a64-4046-a309-f6558d826ef3",
+        "8df9ff68-7100-4216-ba86-3e168a252511"
+      ]
+    }
+  ]
+}
