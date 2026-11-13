@@ -328,3 +328,37 @@ test('a map with no usable level URL is dropped', () => {
   // Another version is not read.
   assert.deepEqual(N.parseMaps(Object.assign(pageMaps(), { schema_version: 2 })), []);
 });
+
+test('the picked map names, counts and opens a theme; off the map it opens onto nothing', () => {
+  const A = '0f0e0d0c-0b0a-4900-8800-00000000000a';
+  const B = '0f0e0d0c-0b0a-4900-8800-00000000000b';
+  const C = '0f0e0d0c-0b0a-4900-8800-00000000000c';
+  const roots = { meaning: '0f0e0d0c-0b0a-4900-8800-000000000101', links: '0f0e0d0c-0b0a-4900-8800-000000000102' };
+  const team = { key: 'team', themes: [{ theme_id: A, label: 'Team name for A', claim_count: 120, roots }, { theme_id: B, label: null, claim_count: 7, roots }] };
+  const pub = { key: 'public', themes: [{ theme_id: A, label: 'Public name for A', claim_count: 9, roots }] };
+  // No map list: themes open onto their claim list, as before nesting.
+  assert.equal(N.themeOpens(false, null, A), 'claims');
+  assert.equal(N.themeOpens(false, team, C), 'claims');
+  // A theme on the map: the map's own name and count, opening onto its levels.
+  assert.deepEqual(N.themeOnMap(team, A), { onMap: true, label: 'Team name for A', placeholder: false, count: 120, opens: 'nested' });
+  assert.equal(N.themeOnMap(pub, A).label, 'Public name for A', 'the public map names it from public text');
+  assert.equal(N.themeOnMap(pub, A).count, 9);
+  assert.equal(N.themeOpens(true, team, A), 'nested');
+  // Unnamed on this map: the neutral placeholder, never the layout's label.
+  assert.equal(N.themeOnMap(team, B).label, N.PLACEHOLDER);
+  assert.equal(N.themeOnMap(team, B).placeholder, true);
+  // Not on the picked map: shown as such, no count, and it opens onto
+  // nothing, never the viewer's own (team-private) claims.
+  for (const [map, id] of [[pub, B], [pub, C], [team, C], [null, A]]) {
+    const t = N.themeOnMap(map, id);
+    assert.equal(t.onMap, false);
+    assert.equal(t.label, N.NOT_ON_MAP);
+    assert.equal(t.count, null);
+    assert.equal(N.themeOpens(true, map, id), 'nothing');
+  }
+  // On the preview maps: the second theme is on the team map only.
+  const maps = N.parseMaps(pageMaps());
+  const second = maps[0].themes[1].theme_id;
+  assert.equal(N.themeOpens(true, maps[0], second), 'nested');
+  assert.equal(N.themeOpens(true, maps[1], second), 'nothing');
+});

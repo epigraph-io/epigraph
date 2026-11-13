@@ -306,6 +306,14 @@
     return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
   }
 
+  /**
+   * The size a node is laid out by: the layout route's count, kept when the
+   * picked map renames or recounts a theme, so the map never moves a circle.
+   */
+  function layoutSize(d) {
+    return Math.max(1, (d.layoutValue !== undefined ? d.layoutValue : d.value) || 1);
+  }
+
   /** Circles `{r}` packed inside a circle of radius `R` round (cx, cy). */
   function packInto(items, cx, cy, R) {
     if (items.length === 0) return;
@@ -313,7 +321,7 @@
       const size = 2 * R;
       const h = d3
         .hierarchy({ children: items })
-        .sum((d) => (d.children ? 0 : Math.max(1, d.value || 1)));
+        .sum((d) => (d.children ? 0 : layoutSize(d)));
       d3.pack().size([size, size]).padding(size / 150)(h);
       for (const leaf of h.leaves()) {
         leaf.data.x = cx - R + leaf.x;
@@ -323,9 +331,9 @@
       return;
     }
     // Fallback: a sunflower spiral, area by value.
-    const total = items.reduce((s, d) => s + Math.max(1, d.value || 1), 0);
+    const total = items.reduce((s, d) => s + layoutSize(d), 0);
     items.forEach((d, i) => {
-      const share = Math.max(1, d.value || 1) / total;
+      const share = layoutSize(d) / total;
       d.r = R * Math.sqrt(share) * 0.7;
       const rho = 0.8 * R * Math.sqrt((i + 0.5) / items.length);
       d.x = cx + rho * Math.cos(i * GOLDEN);
@@ -575,6 +583,7 @@
       S.themesById.set(id, n);
     }
     packInto(root.children, 0, 0, WORLD / 2);
+    for (const t of root.children) applyMapToTheme(t);
     root.next = body.next || null;
     S.root = root;
     setNotice(body.notice || 'There is no layout run yet, so positions carry no meaning.');
@@ -646,6 +655,7 @@
       S.themesById.set(id, n);
     }
     placeThemes(node, themes);
+    for (const t of themes) applyMapToTheme(t);
     node.children = themes;
     node.links = (more ? node.links : []).concat((body.links || []).filter((l) => uuid(l.a) && uuid(l.b)));
     node.next = body.next && body.next.themes ? body.next.themes : null;
@@ -660,9 +670,9 @@
       packInto(themes, region.x, region.y, region.r * 0.95);
       return;
     }
-    const total = themes.reduce((s, t) => s + Math.max(1, t.value), 0) || 1;
+    const total = themes.reduce((s, t) => s + layoutSize(t), 0) || 1;
     for (const t of themes) {
-      t.r = region.r * Math.sqrt(Math.max(1, t.value) / total) * 0.9;
+      t.r = region.r * Math.sqrt(layoutSize(t) / total) * 0.9;
       if (t.sx !== null && t.sy !== null && t.placement === 'shared') {
         t.x = t.sx * S.scale;
         t.y = t.sy * S.scale;
@@ -677,7 +687,12 @@
 
   async function loadTheme(node, more) {
     if (node.state === 'loading') return;
-    if (!more && nestedRoot(node)) return loadNestedTheme(node);
+    // With a map list, a theme opens onto the picked map's levels or onto
+    // nothing; never onto the viewer's own claim list (themeOpens).
+    if (NESTED && NESTED.themeOpens(NS.on, NS.map, node.id) !== 'claims') {
+      if (!more) loadNestedTheme(node);
+      return;
+    }
     if (more && !node.next) return;
     node.state = 'loading';
     redraw();
@@ -972,6 +987,15 @@
 
   async function loadNestedTheme(theme) {
     const id = nestedRoot(theme);
+    if (!id) {
+      // Not on this map: nothing to open.
+      theme.children = [];
+      theme.state = 'ok';
+      theme.error = null;
+      if (S.selected === theme) showNodePanel(theme);
+      redraw();
+      return;
+    }
     theme.state = 'loading';
     redraw();
     try {
@@ -1111,12 +1135,45 @@
     }
   }
 
+  /**
+   * Show a theme as the picked map draws it: the map's name and count (or
+   * "Not on this map"). The layout route's label and count are kept, so a
+   * map switch never moves a circle and a page without a map list is as
+   * before.
+   */
+  function applyMapToTheme(t) {
+    if (!NS.on || !t || t.kind !== 'theme') return;
+    if (t.layoutValue === undefined) {
+      t.layoutLabel = t.label;
+      t.layoutValue = t.value;
+    }
+    const m = NESTED.themeOnMap(NS.map, t.id);
+    t.label = m.label;
+    t.value = m.count || 0;
+    t.placeholder = m.placeholder;
+    t.offMap = !m.onMap;
+  }
+
+  /** Forget what a theme opened onto, so the picked map's levels load. */
+  function resetTheme(t) {
+    t.doc = null;
+    t.children = null;
+    t.childById = null;
+    t.bundles = null;
+    t.next = null;
+    t.state = 'idle';
+    t.error = null;
+  }
+
   function setMap(key) {
     const next = NS.maps.find((m) => m.key === key);
     if (!next || next === NS.map) return;
     NS.map = next;
     NS.minR = Infinity;
-    for (const t of S.themesById.values()) resetNested(t);
+    for (const t of S.themesById.values()) {
+      resetTheme(t);
+      applyMapToTheme(t);
+    }
     S.selected = null;
     if (PREVIEW) loadPreviewTop();
     else fitRoot(true);
@@ -2082,6 +2139,10 @@
     const title =
       node.kind === 'root' ? (S.mode === 'packed' ? 'All themes' : 'All regions') : node.label || 'Untitled';
     clearPanel(title);
+    if (node.offMap) {
+      dom.panelBody.appendChild(el('p', 'small muted', 'This theme is not on the map you picked.'));
+      return;
+    }
     if (node.kind !== 'root' && node.kind !== 'unplaced') dom.panelBody.appendChild(el('p', 'small muted', countText(node.value)));
     if (node.state === 'error') unavailable(section(null), node.error, () => retryNode(node));
     const kids = node.children || [];
@@ -2508,6 +2569,14 @@
     const older = 'This theme link is from an older map.';
     if (!themeId) {
       setNotice(older);
+      return;
+    }
+    if (NS.on) {
+      // With a map list a theme link opens the theme on the picked map; its
+      // claim list is the viewer's own, not the map's, so it is not read.
+      const theme = await ensureTheme(themeId, null);
+      if (theme) select(theme, true);
+      else setNotice(older);
       return;
     }
     try {

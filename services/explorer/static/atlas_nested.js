@@ -31,6 +31,8 @@
   /** Leaf positions are in a unit square; 0.7 keeps its corners inside the circle. */
   const LEAF_SPREAD = 0.7;
   const PLACEHOLDER = 'Not yet named';
+  /** A theme the picked map does not draw. */
+  const NOT_ON_MAP = 'Not on this map';
   const HAIRLINE = 0.6;
   const PROXY_DASH = [6, 4];
   /** Fraction of an edge a particle travels per second. */
@@ -331,6 +333,37 @@
     return (map ? map.key : '') + '|' + hierarchy + '|' + levelId;
   }
 
+  /**
+   * What a theme shows and opens onto on the picked map, once the page has a
+   * map list. Its name and count are the map's (a team map's names come from
+   * text its members can read, the public map's from public text), never the
+   * viewer's own layout. A theme the map does not draw shows NOT_ON_MAP, no
+   * count, and opens onto nothing: never onto the viewer's own claims.
+   * Returns {onMap, label, placeholder, count, opens: 'nested' | 'nothing'}.
+   */
+  function themeOnMap(map, themeId) {
+    const t = map && Array.isArray(map.themes) ? map.themes.find((x) => x.theme_id === themeId) : null;
+    if (!t) return { onMap: false, label: NOT_ON_MAP, placeholder: true, count: null, opens: 'nothing' };
+    const named = typeof t.label === 'string' && t.label.length > 0;
+    return {
+      onMap: true,
+      label: named ? t.label : PLACEHOLDER,
+      placeholder: !named,
+      count: Math.max(0, finite(t.claim_count, 0)),
+      opens: 'nested',
+    };
+  }
+
+  /**
+   * What opening a theme loads: 'claims' (the theme's claim list, as before
+   * nesting) only when the page has no map list; with one, 'nested' or
+   * 'nothing' per themeOnMap.
+   */
+  function themeOpens(nestedOn, map, themeId) {
+    if (!nestedOn) return 'claims';
+    return themeOnMap(map, themeId).opens;
+  }
+
   /** A theme's root level on `map` in `hierarchy`, or null. */
   function rootFor(map, themeId, hierarchy) {
     if (!map) return null;
@@ -343,6 +376,7 @@
     LOAD_FRACTION,
     LEAF_SPREAD,
     PLACEHOLDER,
+    NOT_ON_MAP,
     HAIRLINE,
     displayName,
     isPlaceholder,
@@ -370,6 +404,8 @@
     parseMaps,
     levelUrl,
     levelKey,
+    themeOnMap,
+    themeOpens,
     rootFor,
   };
 });

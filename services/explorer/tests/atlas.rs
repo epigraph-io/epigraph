@@ -2530,6 +2530,27 @@ fn atlas_js_nested_levels_run_no_layout() {
     }
 }
 
+/// With a map list (`data-atlas-maps`), no theme opens onto the viewer's own
+/// claim list: every read of the theme-claims route sits in a function that
+/// first asks `themeOpens` (or `NS.on`), so the picked map, not the viewer's
+/// layout, decides what a theme shows.
+#[test]
+fn atlas_js_theme_claim_reads_are_gated_by_the_map_list() {
+    let js = include_str!("../static/atlas.js");
+    let mut reads = 0;
+    for (at, _) in js.match_indices("cfg.themeClaims +") {
+        let start = js[..at].rfind("function ").expect("inside a function");
+        let head = &js[start..at];
+        let name = &head[..head.find('(').unwrap_or(head.len())];
+        assert!(
+            head.contains("NESTED.themeOpens(") || head.contains("if (NS.on)"),
+            "{name} reads a theme's claims without asking the map list first"
+        );
+        reads += 1;
+    }
+    assert!(reads >= 2, "loadTheme and followThemeKey read theme claims");
+}
+
 /// A `--token: #rrggbb;` from a stylesheet, in the light or the dark theme.
 fn css_hex(css: &str, name: &str, dark: bool) -> [f64; 3] {
     let split = css
