@@ -53,7 +53,9 @@ and that graph, each small enough to read, each with a name.
 - **Flow meaning (operator): a labelled proxy.**
   - Evidence-to-claim edges show their exact stored mass (`mass_functions.evidence_id`).
   - Claim-to-claim edges (supports, contradicts, refutes, …) show a proxy: link strength ×
-    the source claim's BetP. The view labels it as an estimate.
+    sign only, with no belief factor, so a served weight can never be turned back into a
+    claim's belief. The view labels it as an estimate. (Operator, 2026-11-13; this replaces
+    an earlier "strength × the source claim's BetP".)
   - No leave-one-out recomputation.
 - **Private data off the host (operator): embeddings and structure only.**
   - The heavy maths (UMAP, community detection, force layout) may run on the remote build
@@ -62,6 +64,19 @@ and that graph, each small enough to read, each with a name.
   - LLM naming runs from prod through the existing Claude CLI path.
 - **Anti-goal: latency.** Zooming and switching must feel instant. A version that works
   but lags has failed.
+
+## 2a. Operator rulings during the build (2026-11-13)
+
+- **No belief values on leaf claims.** Leaf claim nodes carry no BetP. A later contract
+  version may add one after the evidence-edge backfill (below) lands; `truth_value` stays
+  as the colour value, as on the region and theme levels.
+- **Stored evidence edges only.** A leaf draws only evidence-to-claim edges stored in the
+  edges table; the view never synthesises one. Every evidence write path must name at
+  least one claim and write that edge, and existing evidence gets an operator-run backfill
+  (most evidence rows had no such edge).
+- **Co-owned edges.** An edge co-owned by two teams is drawn on both teams' maps (never on
+  the public map unless the edge itself is public).
+- **Proxy weights.** Claim-to-claim flow weight is link strength × sign only (§2).
 
 ## 3. Goals
 
@@ -81,8 +96,8 @@ and that graph, each small enough to read, each with a name.
   (in the style of Graphileon) is a future project, not this one.
 - **Changing regions or themes.** Regions, theme placement and the region/theme levels
   of the Atlas are unchanged, except that oversized themes are split.
-- **New belief maths.** Flows show belief as it currently stands (the cached DS belief
-  and BetP of each claim and edge), not a live re-propagation.
+- **New belief maths.** Flows show stored evidence mass and link strength as they stand,
+  not a live re-propagation.
 
 ## 5. Constraints
 
@@ -141,8 +156,8 @@ document's call.
    If that takes a leaf past 100, split it again.
 4. Compute the leaf force layouts. Make them deterministic: seeded, and stable across
    nights for unchanged leaves.
-5. Compute the flow weights per edge. The candidate is each edge's contribution to the
-   target claim's belief, from the stored mass functions and evidence weights.
+5. Compute the flow weights per edge: an evidence-to-claim edge's exact stored mass, and a
+   claim-to-claim edge's strength × sign (§2, §2a).
 6. Name the groups.
 7. Write one new layout run, keyed like today's `atlas_layout_runs`.
 
