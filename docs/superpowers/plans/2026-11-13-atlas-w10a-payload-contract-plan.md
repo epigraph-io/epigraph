@@ -86,7 +86,8 @@ positions and weights.
   name and depth.
 
 **Leaf level** (`kind: "leaf"`):
-- `nodes[]` (at most 100): `claim` (`truth_value`, `betp`), `agent` or `evidence`.
+- `nodes[]` (at most 100): `claim` (`truth_value`, and no belief value), `agent` or
+  `evidence`.
   Each has an id, a label (at most 160 characters) and a precomputed `x, y` in
   [-1, 1].
 - Every agent and evidence node has an edge to a claim of the leaf (design §7 step 3).
@@ -94,8 +95,9 @@ positions and weights.
   `flow_basis`. The endpoint kinds fix the basis, so a producer cannot drop a belief
   flow by marking it `none`:
   - `exact`: every evidence-to-claim edge, from the stored mass;
-  - `proxy`: every claim-to-claim edge, strength × source BetP, which the view labels
-    an estimate (a `cites` edge too, with sign 0);
+  - `proxy`: every claim-to-claim edge, strength × the source claim's belief, which the
+    view labels an estimate (a `cites` edge too, with sign 0). W7 computes it at build
+    time from a role-aware belief read of the source claim, not from a served field;
   - `none`: every other pair, such as an agent's authorship, so weight 0 and sign 0.
 - `relationship` is the stored name, unnormalised: `^[A-Za-z][A-Za-z0-9_]*$`, at most
   32 characters. The `edges` table uses both casings (`AUTHORED` and `authored`,
@@ -111,16 +113,23 @@ positions and weights.
 - kernel: `{"error":"NotFound","message":"atlas_level with ID <id> not found","details":{"entity":"atlas_level","id":"<id>"}}`
 - BFF: `{"error":"not_found","message":"We could not find that atlas level."}`
 
-**Belief in the payload (a deliberate departure, open for an operator ruling):**
-- The P3a Atlas routes carry no belief key; colour comes from `truth_value`. The
-  Explorer's `assert_no_belief_keys` now also bans `betp` on those routes.
-- Leaf claim nodes keep `truth_value`, so colour means the same thing at every
-  level. They also carry `betp`, because design §2 and §4 compute the proxy flow
-  from the source claim's BetP.
-- `betp` comes from a role-aware belief read (the `no_role_blind_belief_reads`
-  ratchet), never from a compound's folded cache, and is null where that read gives
-  none. Dropping it costs the view nothing (`flow_weight` already carries the proxy):
-  one field and a re-bless.
+**No belief value in the payload:**
+- The region and theme Atlas routes carry no belief key; colour comes from
+  `truth_value`. The nested levels follow the same rule: a leaf claim node carries
+  `truth_value` and no `betp`. Every object is closed, so a leaf carrying `betp`
+  (a number or null) fails validation as an unknown key, on the schema and on the
+  types. The Explorer's banned-key list (`BELIEF_KEYS`, shared by
+  `assert_no_belief_keys` on the existing routes and the contract tests) covers both.
+- Proxy flow weights still need the source claim's belief, so W7 reads it role-aware
+  (the `no_role_blind_belief_reads` ratchet) at build time and stores only the
+  resulting `flow_weight`.
+- `truth_value` stays, as the colour value only, so colour means the same at every
+  level. It is not purely authored: writers that fold evidence also persist
+  `truth_value = clamped(pignistic_prob)` as a mirror of the cache at write time
+  (`crates/epigraph-cli/src/truth_mirror.rs`). The region and theme routes already
+  serve it, so a leaf serving it adds no key and no value a member does not already
+  see. The view never sorts, compares or folds it, and no flow weight is computed
+  from it.
 
 ## 3. Budget
 
@@ -130,7 +139,7 @@ positions and weights.
   the budget when its text compresses at least as well as random Latin, Greek,
   Cyrillic and CJK characters. That document has every array at `maxItems` and every
   string at `maxLength` (`worst_case_multiscript_documents_are_in_budget`: leaf
-  127,520 and group 115,056 gzip bytes).
+  126,505 and group 115,056 gzip bytes, after the leaf lost `betp`).
 - The caps do not guarantee the budget. The same leaf with random astral-plane text is
   valid by schema and types and is over budget
   (`astral_text_can_exceed_the_budget_and_storage_refuses_it`). A JSON Schema
@@ -148,6 +157,7 @@ positions and weights.
 | A schema test W10's real responses must pass | `epigraph_atlas_contract::check::{check_level_body, check_not_found, assert_indistinguishable}` (kernel, `check` feature), and the same functions in `tests/common/atlas_contract.rs` (explorer). `check_level_body` takes the request's `Expected` map and level, so a body for another map or level fails (`the_body_must_be_the_map_and_level_requested`, `the_helper_ties_the_body_to_the_request`). The Explorer helper ports every kernel invariant (`the_helper_enforces_every_kernel_invariant`) and compares numbers by value (`an_integer_float_passes_the_helper`). W10 calls them on the route bodies. |
 | Served filtered for the viewer | `every_leaf_filtered_for_a_viewer_is_valid` (96 seeded readable subsets of the two leaves), `for_viewer_drops_what_would_show_a_hidden_claim` (kernel). |
 | serde types ↔ schema | `schema_and_types_agree_on_every_mutation`: in small probe documents cut from the fixtures (both level kinds, both map scopes, every node kind and flow basis), at every key, drop it, add an unknown key beside it, and replace its value 7 ways; the schema's verdict must equal the strict serde and invariant verdict. Also `fixtures_round_trip_through_the_types` (kernel) and `the_mirror_round_trips_every_fixture` (explorer). |
+| No belief value | `the_contract_carries_no_belief_value`, `a_leaf_claim_node_carrying_betp_is_rejected` (kernel); `no_schema_or_fixture_key_carries_belief`, `the_helper_rejects_betp_on_a_leaf_claim` (explorer). |
 | Negative cases | `extra_private_field_is_rejected`, `missing_flow_basis_is_rejected`, `non_member_body_leaks_no_shape`, `the_kernel_not_found_message_names_the_requested_id`, `invariants_catch_what_the_schema_cannot`, `invariants_enforce_the_schema_rules`, `flow_basis_is_fixed_by_the_endpoint_kinds`, `an_agent_or_evidence_node_with_no_claim_edge_is_rejected`, `relationship_names_in_both_casings_are_accepted` (kernel); `the_helper_rejects_an_extra_private_field`, `the_helper_rejects_an_edge_without_its_exact_or_proxy_flag`, `the_helper_rejects_a_dangling_reference`, `the_not_found_answer_leaks_no_shape` (explorer). |
 
 Each new test is shown to fail on a mutated contract:
@@ -156,3 +166,27 @@ Each new test is shown to fail on a mutated contract:
 - a kernel field added without regenerating the fixtures;
 - a field dropped from the Explorer mirror;
 - a cap raised past the budget.
+
+## 5. Operator rulings 2026-11-13
+
+- **No BetP on leaf claims until their evidence is filed.** A v1 leaf is drawn before
+  the evidence behind each claim is filed as stored evidence-to-claim edges, so a
+  served BetP would rest on evidence the leaf cannot show. Leaf claim nodes carry no
+  `betp`, and a document carrying one fails validation. Adding it back is a later
+  schema version, after the evidence-edge backfill lands. `schema_version` stays 1:
+  this PR is unmerged, so v1 was never published.
+- **Proxy flow weights are computed at build time.** W7 reads the source claim's
+  belief role-aware while building the leaf and stores only `flow_weight`.
+- **Evidence draws only stored edges** (a ruling on the storage items, recorded here
+  because the `exact` basis rests on it). There is no derived `evidence_for` edge: a
+  leaf's evidence nodes and `exact` edges come from stored evidence→claim edges. Making
+  every evidence write path name a claim and write that edge, and backfilling existing
+  evidence, is separate backlog (2d60f619). The contract needs no change for it.
+
+How the first is proven: §4, row "No belief value". All four tests failed on the
+contract before this change. Three mutation probes of the new code also go red:
+- the Explorer mirror given `betp` back: `the_mirror_round_trips_every_fixture` and
+  four other helper tests;
+- the kernel claim node opened to unknown keys: `a_leaf_claim_node_carrying_betp_is_rejected`,
+  `extra_private_field_is_rejected` and `schema_and_types_agree_on_every_mutation`;
+- the schema given an optional `betp` property: all four new tests.
