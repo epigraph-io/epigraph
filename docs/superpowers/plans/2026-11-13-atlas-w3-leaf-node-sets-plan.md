@@ -136,10 +136,13 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
 - `fallback_split_partitions_the_claims_and_every_part_fits`: seeded random
   graphs; the parts cover every readable claim exactly once, in id order, every
   part re-assembles to `Fits`, each claim's capped evidence is in its part.
-- `every_agent_and_evidence_node_has_an_edge_to_a_claim`: after capping and
-  after splitting, including derived edges.
+- every agent and evidence node has an edge to a claim, after capping and after
+  splitting, derived edges included: not a test of its own but the
+  `assert_attached` helper, which the count, cap, split and derived-edge tests
+  call on every leaf they assemble.
 - `duplicate_stored_edges_collapse_and_keep_every_id`.
-- `a_zero_cap_is_refused` and `no_readable_claim_is_empty`.
+- `derived_edges_stand_in_only_where_no_stored_edge_does`.
+- `a_zero_cap_is_refused_and_no_drawable_claim_is_empty`.
 
 **DB tests** (`crates/epigraph-db/tests/atlas_leaf_repo.rs`):
 - `every_leaf_of_a_test_hierarchy_fits_the_cap`: a team hierarchy of three
@@ -158,8 +161,20 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   the input, an evidence row re-tenanted to U on T's claim, a claim-to-claim
   edge owned by U, an authorship edge owned by U that is the only path to its
   agent, an edge co-owned by T and U, and the filer of U's claim never appear.
-  T's own rows and public rows do (calibration). Seeded by direct inserts and
-  forced tenancy updates on the superuser pool.
+  T's own rows and public rows do (calibration). The public map's own arms are
+  tested by rows of T hung on nodes the public map draws: an edge between two
+  public claims, an evidence row on a public claim (migration 110's hidden
+  evidence), an edge between a public evidence row and a public filer; all are
+  on T's map and none on the public map. A public evidence row of U's claim,
+  reached through a public edge, is drawn on both maps and the read carries no
+  claim id for it. Seeded by direct inserts and forced tenancy updates on the
+  superuser pool; every forced stamp is checked before the reads.
+- `retracted_edges_are_never_drawn`: a retracted claim-to-claim edge, a
+  retracted authorship edge (and so its author) and a retracted
+  evidence-to-agent edge are not drawn; the same leaf built while they are in
+  force draws all three (calibration). In force is the predicate of `EDGE_IN_FORCE`
+  (`repos/edge.rs`), the repo's one predicate: `valid_to` only, so a future
+  `valid_from` is not filtered, as on every other edge read.
 - `the_node_set_is_identical_across_runs`: two reads with the claim ids in
   different orders and with duplicates, over rows inserted out of id order,
   give equal results.
@@ -182,6 +197,22 @@ targets run, then restored and `touch`ed). Measured on the pushed branch:
 | fallback split walks input order | `fallback_split_...` (unit); `the_node_set_is_identical_across_runs` (DB) |
 | derived edges removed | 4 unit; `another_teams_private_rows_never_appear` |
 | public map binds the nil uuid as its team | none: an equivalent mutant (no row is owned by the nil group), recorded, not a gap |
+| public map lets team rows in, team map unchanged (claims read) | `another_teams_private_rows_never_appear` (public map nodes) |
+
+Added after review (the public map's own arms, retracted edges, hidden claim
+ids), each run alone against the DB target and restored:
+
+| Mutation | Assertion that went red in the DB tests |
+|---|---|
+| claim-edge read: public map admits any single-owner group edge | `another_teams_private_rows_never_appear`: T's edge between two public claims is on the public map |
+| agent/evidence-edge read: the same | `another_teams_private_rows_never_appear`: T's edge between a public evidence row and a public filer is on the public map |
+| evidence read: public map admits any group evidence | `another_teams_private_rows_never_appear`: T's evidence on a public claim is on the public map |
+| evidence read keeps the raw `claim_id` | `another_teams_private_rows_never_appear`: the read carries U's claim id for the public evidence row |
+| claim-edge read: in-force check removed | `retracted_edges_are_never_drawn` |
+| agent/evidence-edge read: in-force check removed | `retracted_edges_are_never_drawn` |
+
+Before the scope test seeded rows of T on public nodes, the first three
+mutations, applied together, left every test green.
 
 **Lints**: `no_unscoped_pool`, `visibility_lint` (every new function that takes
 a connection takes and splices a viewer), `pool_read_lint`, `viewer_ratchet`.
