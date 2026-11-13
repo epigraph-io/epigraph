@@ -376,9 +376,10 @@ test('a claim link finds the fetched leaf that draws the claim, or nothing', () 
   assert.equal(N.findClaimLeaf(levels, agent.id), null);
   assert.equal(N.findClaimLeaf(levels, 'c-' + claim.id), null);
   assert.equal(N.findClaimLeaf([], claim.id), null);
-  // Group levels never answer, even if a child shared the id.
-  const g = levels.find((d) => d.kind === 'group');
-  assert.equal(N.findClaimLeaf([g], g.children[0].id), null);
+  // Only a leaf answers: a document of another kind is never taken for the
+  // claim's leaf, even one that carried the claim node.
+  const notLeaf = Object.assign({}, leaf, { kind: 'group' });
+  assert.equal(N.findClaimLeaf([notLeaf], claim.id), null);
 });
 
 test('a map count is labelled as stored on the map, not as what the viewer can read', () => {
