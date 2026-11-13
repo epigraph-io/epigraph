@@ -319,8 +319,13 @@ pub struct LeafCounts {
     ///
     /// BUILDER-INTERNAL: not part of the served level document (the W10a
     /// contract has no field for it). It counts only rows this map may draw,
-    /// so a build log or run metric may carry it; it measures what the
-    /// evidence-edge backfill (backlog 2d60f619) still has to link.
+    /// so a build log or run metric may carry it.
+    ///
+    /// It is an UPPER bound on what the evidence-edge backfill (backlog
+    /// 2d60f619) still has to link, not that number: it also counts a row
+    /// whose stored edge exists but cannot be drawn on this map (the edge is
+    /// owned by another team, or co-owned), and, in a fallback part, a row
+    /// whose stored edge links it only to a claim in another part.
     pub unlinked_evidence: usize,
 }
 
