@@ -52,8 +52,9 @@ Database role: run as the MAINTENANCE role (MAINTENANCE_DATABASE_URL, a login
 in the `epigraph_maintenance` role). `claims` has forced row-level security,
 so an application-role connection sees and moves only a subset of each theme
 and would report success. This script refuses a DSN whose user is the
-application role, and refuses a session for which the database's own
-`epigraph_bypass()` is false.
+application role, and refuses a session that row-level security on `claims`
+applies to (not a superuser or BYPASSRLS role, and the database's own
+`epigraph_bypass()` is false).
 
 After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
 of a split theme are stale until rebuilt. `reverse` deletes the new parts'
@@ -141,19 +142,25 @@ def refuse_application_role(dsn):
 
 
 def require_maintenance_session(conn):
-    """Exit unless the database's own epigraph_bypass() holds for this session
-    (skipped on a schema without the maintenance role, which has no RLS)."""
+    """Exit unless this session reads `claims` whole.
+
+    It does when `claims` has no row-level security, when the session role is
+    a superuser or BYPASSRLS, or when the database's own `epigraph_bypass()`
+    (membership of `epigraph_maintenance`) holds. The rule is the database's,
+    asked of the database, rather than a Python restatement of it."""
     with conn.cursor() as cur:
-        cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance'), "
-                    "to_regprocedure('public.epigraph_bypass()') IS NOT NULL")
-        role_exists, has_fn = cur.fetchone()
-        if not (role_exists and has_fn):
-            return
-        cur.execute("SELECT public.epigraph_bypass()")
-        bypass = cur.fetchone()[0]
+        cur.execute("SELECT c.relrowsecurity, r.rolsuper OR r.rolbypassrls, "
+                    "       to_regprocedure('public.epigraph_bypass()') IS NOT NULL "
+                    "FROM pg_class c, pg_roles r "
+                    "WHERE c.oid = 'public.claims'::regclass AND r.rolname = session_user")
+        rls, privileged, has_fn = cur.fetchone()
+        bypass = False
+        if rls and not privileged and has_fn:
+            cur.execute("SELECT public.epigraph_bypass()")
+            bypass = cur.fetchone()[0]
     conn.rollback()
-    if not bypass:
-        sys.exit("refusing: this session does not bypass row-level security "
+    if rls and not privileged and not bypass:
+        sys.exit("refusing: this session does not bypass row-level security on claims "
                  "(epigraph_bypass() is false), so it would read and move only a subset. "
                  "Run as the maintenance role: set MAINTENANCE_DATABASE_URL.")
 

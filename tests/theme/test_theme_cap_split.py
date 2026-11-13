@@ -326,6 +326,23 @@ def test_manifest_of_an_uncommitted_apply_reverses_as_a_no_op(db, seed_agent, tm
     assert _snapshot(db) == before
 
 
+def test_a_session_under_row_security_is_refused(db):
+    """The application role sees a subset of claims under forced RLS; the guard
+    asks the database (epigraph_bypass) and refuses it."""
+    with db.cursor() as cur:
+        cur.execute("SET SESSION AUTHORIZATION epigraph_app")
+    db.commit()
+    try:
+        with pytest.raises(SystemExit, match="does not bypass row-level security"):
+            S.require_maintenance_session(db)
+    finally:
+        db.rollback()
+        with db.cursor() as cur:
+            cur.execute("RESET SESSION AUTHORIZATION")
+        db.commit()
+    S.require_maintenance_session(db)  # the fixture's own session passes
+
+
 # ── DB-free: the off-box compute step, names, the role guard ──
 
 
