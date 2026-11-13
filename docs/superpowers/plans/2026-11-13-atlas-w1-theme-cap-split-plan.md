@@ -16,8 +16,8 @@ cap. The largest part keeps the theme id, and the split can be reversed exactly.
 | `scripts/theme_cap_core.py` | The pure split: `split_to_cap(ids, embeddings, cap, seed) -> parts`. It also holds the export and result file formats. It imports numpy, scikit-learn and umap-learn only: no DB driver, no `theme_lib`, no text. |
 | `scripts/theme_cap_split.py` | The CLI: `plan`, `export`, `compute`, `apply`, `reverse`. The DB helpers are imported lazily, so `compute` runs on a host with no DB driver. |
 | `scripts/theme_lib.py` | Docstring only: the new script is added to `not_intake_owned`'s "checked and not routed" list. |
-| `tests/theme/test_theme_cap_core.py` | The pure core, the file formats, labels, the DSN refusal and the off-box `compute` subprocess. No DB. |
-| `tests/theme/test_theme_cap_split.py` | The DB arm, on the `tests/theme` fixture DB (a fresh database migrated to head). |
+| `tests/theme/test_theme_cap_core.py` | The pure core and the export file format. No DB. |
+| `tests/theme/test_theme_cap_split.py` | The CLI: names, the role guards, the off-box `compute` subprocess, and the DB arm on the `tests/theme` fixture DB (a fresh database migrated to head). |
 
 ## Split core
 
@@ -85,8 +85,9 @@ The off-box rule (design §2) allows ids and embeddings only.
 in two cases:
 
 - a DSN whose user is the application role;
-- a session for which the DB's own `epigraph_bypass()` is false while the `epigraph_maintenance`
-  role exists.
+- a session that row security on `claims` applies to: one whose role is not a superuser or
+  BYPASSRLS, and for which the DB's own `epigraph_bypass()` is false
+  (`test_a_session_under_row_security_is_refused`).
 
 The usage text names `MAINTENANCE_DATABASE_URL`.
 
@@ -97,7 +98,7 @@ The usage text names `MAINTENANCE_DATABASE_URL`.
 | A dry run lists every theme over the cap with its proposed parts | `test_plan_lists_every_over_cap_theme_with_part_sizes` (DB) |
 | The apply leaves no theme over ~2,000 | `test_blobs_split_under_cap_without_cutting_a_blob` and `test_degenerate_identical_embeddings_terminate_under_cap` (core); `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id` (DB); `test_apply_refuses_when_unembedded_members_push_kept_part_over_cap` (DB) |
 | Ids stay stable for kept parts | `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id`; `test_split_is_deterministic_and_input_order_free` |
-| The split is reversible | `test_apply_then_reverse_is_byte_identical` (full-row md5 of `claim_themes`, plus the `(id, theme_id)` projection of `claims`); `test_reverse_refuses_drift_unless_allowed` |
+| The split is reversible | `test_apply_then_reverse_is_byte_identical` (every `claim_themes` row in full, plus an md5 of the `(id, theme_id)` projection of `claims`); `test_reverse_refuses_drift_unless_allowed` |
 | Off-box: ids and embeddings only | `test_compute_runs_without_db_driver` (subprocess with `psycopg2` and `theme_lib` blocked); `test_no_claim_text_reaches_any_output` |
 
 ## Limits
