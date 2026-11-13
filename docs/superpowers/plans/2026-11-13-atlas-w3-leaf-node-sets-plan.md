@@ -21,14 +21,17 @@ sections that follow already reflect them.
   the leaf is its `claim_id` is not a node: the W10a contract requires every
   evidence node to have an edge to a claim, so the row is left out and counted
   in the builder-internal `LeafCounts::unlinked_evidence`.
-- **An edge co-owned by two teams is drawn on both teams' maps.** It appears
-  on the map of its owner team and on the map of its co-owner team, whenever
-  both endpoints are drawable on that map, and never on the public map unless
-  the edge itself is public. Row security is narrower: 077's `edges_tenancy`
-  lets only a session in both groups read a co-owned edge. The nightly reads
-  on the maintenance connection, where `epigraph_bypass()` holds, so the build
-  snapshot reads the row for either team; a map is never built on one team's
-  session. Migration 210 already keys a co-owned edge's epochs on both teams.
+- **A map draws an edge only when its whole audience may read the edge
+  row.** The database rule stands: row security (077's `edges_tenancy`, after
+  072) lets a session read an edge co-owned by two teams only when it is in
+  BOTH. So a team map draws a group edge only when that team owns it and it
+  has no co-owner; a co-owned edge is never baked into a single-team map,
+  neither the owner's nor the co-owner's, and the public map draws public
+  edges only. A view for a viewer in both teams is future work. (An earlier
+  revision of this PR drew a co-owned edge on both teams' maps; that was
+  withdrawn before merge.) Migration 210's "the edge gained a co-owner"
+  already means the edge leaves the owner's map; its co-owner-side epoch bump
+  only marks the co-owner's map stale when nothing on it changed.
 
 ## What this item delivers
 
@@ -134,9 +137,12 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   - claims and evidence: `visibility = 'public' OR (visibility = 'group' AND
     owner_group_id = T)`;
   - edges: `visibility = 'public' OR (visibility = 'group' AND
-    (owner_group_id = T OR co_owner_group_id = T))`, so an edge co-owned by T
-    and another team is drawn on both teams' maps (wider than 072's
-    both-groups read, on purpose; see the rulings above);
+    owner_group_id = T AND co_owner_group_id IS NULL)`, so a co-owned edge is
+    on no single-team map (see the rulings above). This is the MAP rule, not
+    `Viewer::edge_predicate_fragment`, which admits a co-owned edge for a
+    session in both teams; the later Atlas reads that draw edges on a team map
+    (W10's outgoing links, W5's "by links" hierarchy) must use the map rule
+    too, or an edge hidden from a leaf reappears between leaves;
   - the public map binds T as NULL, so only public rows pass.
 - Every statement is also spliced on the viewer (`VISIBILITY` for claims and
   evidence, `EDGE_VISIBILITY` for edges), so a scoped caller is filtered by its
@@ -145,7 +151,7 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   from A's map.
 - A node reached only through a row the map cannot read is dropped: an agent
   whose only authorship edge is another team's, evidence re-tenanted to another
-  team, an edge neither owned nor co-owned by T.
+  team, an edge owned by another team or co-owned at all.
 - No belief column is read (W7 and W10 own belief, behind the role-aware
   belief ratchet).
 - Set-based reads (`= ANY($1)`), five statements per leaf whatever its size.
@@ -190,9 +196,9 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   the public map, and once for a scoped viewer who is in T and U: U's claim in
   the input, an evidence row re-tenanted to U on T's claim, a claim-to-claim
   edge owned by U, an authorship edge owned by U that is the only path to its
-  agent, and the filer of U's claim never appear. T's own rows and public rows
-  do (calibration), and so do a claim-to-claim edge and an
-  evidence-to-evidence edge owned by T and co-owned by U. The public map's own
+  agent, a claim-to-claim edge and an evidence-to-evidence edge owned by T
+  and co-owned by U, and the filer of U's claim never appear. T's own rows and
+  public rows do (calibration). The public map's own
   arms are tested by rows of T hung on nodes the public map draws: an edge
   between two public claims, an evidence row on a public claim (migration 110's hidden
   evidence), an edge between a public evidence row and a public filer; all are
@@ -200,15 +206,16 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   reached through a public edge, is drawn on both maps and the read carries no
   claim id for it. Seeded by direct inserts and forced tenancy updates on the
   superuser pool; every forced stamp is checked before the reads.
-- `a_co_owned_edge_is_drawn_on_both_co_owner_maps`: teams A, B and C. A
+- `a_co_owned_edge_is_on_no_single_team_map`: teams A, B and C. A
   claim-to-claim edge and an evidence-to-agent edge between public nodes,
-  owned by A and co-owned by B, are drawn on A's map and on B's map, and on
-  neither C's map nor the public map. A's own edge between the same claims is
-  on A's map only (calibration), and a co-owned edge as the trigger stamps it,
-  between a claim of A and a claim of B, is on no map (each lacks one
-  endpoint). A stamped `epigraph_app` member of both teams gets the same A and
-  B maps; a stamped member of A alone does not read the co-owned edges, which
-  is why the map is built on the bypass snapshot. Every stamp is checked.
+  owned by A and co-owned by B, are on none of A's map, B's map, C's map or
+  the public map, though both endpoints are nodes of every one. A's own edge
+  between the same claims is on A's map only (calibration), and a co-owned
+  edge as the trigger stamps it, between a claim of A and a claim of B, is on
+  no map. Then the audience rule itself: on a stamped `epigraph_app`
+  connection, where row security applies, a member of A alone and a member of
+  both each build exactly the bypass A map, and a member of B alone and a
+  member of both exactly the bypass B map. Every stamp is checked.
 - `retracted_edges_are_never_drawn`: a retracted claim-to-claim edge, a
   retracted authorship edge (and so its author) and a retracted
   evidence-to-agent edge are not drawn; the same leaf built while they are in
@@ -229,9 +236,9 @@ targets run, then restored and `touch`ed). Measured on the pushed branch:
 | claims map predicate removed | `another_teams_private_rows_never_appear` |
 | evidence map predicate removed | `another_teams_private_rows_never_appear` |
 | claim-edge read: owner clause removed | `another_teams_private_rows_never_appear` |
-| claim-edge read: co-owner clause removed | `another_teams_private_rows_never_appear` (before the rulings, when a co-owned edge was never drawn) |
+| claim-edge read: co-owner clause removed | `another_teams_private_rows_never_appear` |
 | agent/evidence-edge read: owner clause removed | `another_teams_private_rows_never_appear` (it survived the scope test before that test seeded such edges) |
-| agent/evidence-edge read: co-owner clause removed | `another_teams_private_rows_never_appear` (before the rulings) |
+| agent/evidence-edge read: co-owner clause removed | `another_teams_private_rows_never_appear` |
 | per-claim cap removed | `a_claim_with_more_evidence_...`, `fallback_split_...` (unit); `every_leaf_..._fits_the_cap` (DB) |
 | collapsed edge ids left unsorted | `duplicate_stored_edges_collapse_and_keep_every_id` (unit only: the read already sorts edges by id, so the DB path cannot see it) |
 | fallback split walks input order | `fallback_split_...` (unit); `the_node_set_is_identical_across_runs` (DB) |
@@ -260,13 +267,11 @@ After the rulings, each run alone and restored:
 |---|---|
 | evidence joins by `claim_id` again (the `by_claim_id` rows also inserted as linked evidence) | `evidence_joins_only_through_a_stored_edge_...`, `unlinked_evidence_counts_...`, `fallback_split_...` (unit); `another_teams_private_rows_never_appear` ("team map nodes": the bare rows are drawn) |
 | the fifth statement reads edges among every evidence row, not only those an edge reached | none: an equivalent mutant (the assembly drops an edge whose endpoint is not a node; the filter only narrows the read), recorded, not a gap |
-| the pre-revision edge predicate (`owner = T AND co_owner IS NULL`), both reads at once, against the new tests | `a_co_owned_edge_is_drawn_on_both_co_owner_maps` ("A: stored edges"), `another_teams_private_rows_never_appear` ("team map stored edges") |
-| claim-edge read: back to `owner = T AND co_owner IS NULL` | the same two, the same assertions |
-| agent/evidence-edge read: the same | the same two, the same assertions |
-| claim-edge read: owner arm only (`owner = T`) | `a_co_owned_edge_is_drawn_on_both_co_owner_maps` ("B: stored edges") |
-| agent/evidence-edge read: the same | `a_co_owned_edge_is_drawn_on_both_co_owner_maps` ("B: stored edges") |
-| claim-edge read: `owner = T OR co_owner IS NOT NULL` (any co-owned edge) | `a_co_owned_edge_is_drawn_on_both_co_owner_maps` ("C: stored edges") |
-| agent/evidence-edge read: the same | `a_co_owned_edge_is_drawn_on_both_co_owner_maps` ("C: stored edges") |
+| both edge reads: the withdrawn "drawn on both teams' maps" predicate (`owner = T OR co_owner = T`) | `a_co_owned_edge_is_on_no_single_team_map` ("A: a co-owned edge is drawn"), `another_teams_private_rows_never_appear` ("team map stored edges") |
+| claim-edge read alone: `owner = T` (co-owner clause dropped) | the same two, the same assertions |
+| claim-edge read alone: `owner = T OR co_owner = T` | the same two, the same assertions |
+| agent/evidence-edge read alone: `owner = T` | the same two, the same assertions |
+| agent/evidence-edge read alone: `owner = T OR co_owner = T` | the same two, the same assertions |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint` (every new function that takes
 a connection takes and splices a viewer), `pool_read_lint`, `viewer_ratchet`.
@@ -281,7 +286,7 @@ W3 writes no edge, so `edge_writer_signing_ratchet` is not affected.
 | a node from outside the team's readable set never appears | `another_teams_private_rows_never_appear` (DB, team map, public map, multi-team scoped viewer) |
 | (brief) a high-degree agent appears once | `a_high_degree_agent_appears_once` (DB) |
 | (brief) identical across runs | `the_node_set_is_identical_across_runs` (DB) |
-| (ruling) a co-owned edge is on both co-owner teams' maps, on no other map | `a_co_owned_edge_is_drawn_on_both_co_owner_maps` (DB) |
+| (ruling) a co-owned edge is on no single-team map, and every member of a team builds exactly that team's map under row security | `a_co_owned_edge_is_on_no_single_team_map` (DB) |
 | (ruling) evidence is drawn only through a stored edge | `evidence_joins_only_through_a_stored_edge_and_only_the_filer_edge_is_derived`, `unlinked_evidence_counts_rows_no_stored_edge_links_to_the_leaf` (unit); `another_teams_private_rows_never_appear` (DB) |
 
 ## Needs prod measurement (the orchestrator's)

@@ -28,17 +28,22 @@
 //! * claims and evidence: `visibility = 'public' OR (visibility = 'group' AND
 //!   owner_group_id = T)`;
 //! * edges: `visibility = 'public' OR (visibility = 'group' AND
-//!   (owner_group_id = T OR co_owner_group_id = T))`. An edge co-owned by two
-//!   teams (migration 072) is drawn on the map of each, when both its
-//!   endpoints are drawable there, and never on the public map unless it is
-//!   public. This is wider than row security, on purpose: 077's
-//!   `edges_tenancy` lets only a session in BOTH groups read a co-owned edge,
-//!   so a stamped session of one team alone cannot read it. The nightly reads
-//!   on the maintenance connection, where `epigraph_bypass()` holds and row
-//!   security admits the row for either team's map; a map is never built on a
-//!   single team's session. Migration 210 keys a co-owned edge's epochs on
-//!   both teams already, so either map goes stale when it moves;
+//!   owner_group_id = T AND co_owner_group_id IS NULL)`. A map draws an edge
+//!   only when its whole audience may read the edge row. Row security (077's
+//!   `edges_tenancy`, after 072) lets a session read an edge co-owned by two
+//!   teams only when it is in BOTH, so a member of T alone cannot read it and
+//!   a co-owned edge is never baked into a single-team map, neither the
+//!   owner's nor the co-owner's. A view for a viewer in both teams is future
+//!   work. Migration 210 already treats "the edge gained a co-owner" as the
+//!   edge leaving the owner's map;
 //! * the public map binds T as NULL, so only public rows pass.
+//!
+//! The edge predicate is the MAP rule, not
+//! [`crate::visibility::Viewer::edge_predicate_fragment`]: that admits a
+//! co-owned edge for a session in both teams, the map rule never does. Every
+//! later Atlas read that draws edges on a team map (the outgoing links, the
+//! "by links" hierarchy) must use the same map rule, or an edge hidden from a
+//! leaf would reappear between leaves.
 //!
 //! Every statement is ALSO spliced on the viewer, so a scoped caller is
 //! filtered by its own session as well. The map predicate still decides then:
@@ -47,8 +52,9 @@
 //!
 //! A node reached only through a row the map cannot read never appears: an
 //! agent whose only authorship edge is another team's, an evidence row of
-//! another team, an edge neither owned nor co-owned by the map's team, a claim
-//! of another team named in the input (counted in [`LeafCounts::unreadable_claims`]).
+//! another team, an edge owned by another team or co-owned at all, a claim of
+//! another team named in the input (counted in
+//! [`LeafCounts::unreadable_claims`]).
 //! `agents` has no tenancy (077's `agents_identity` is `USING (true)`); the
 //! read only drops agent ids that name no agent row, since `edges` has no
 //! foreign key.
@@ -773,8 +779,8 @@ impl AtlasLeafRepository {
             });
         }
 
-        // 2. Edges touching the claims. A co-owned edge is drawn on its
-        //    owner's map and on its co-owner's (module documentation).
+        // 2. Edges touching the claims. A co-owned edge is never drawn on a
+        //    team map (module documentation).
         let sql = viewer.splice(
             "SELECT e.id, e.source_type::text, e.source_id, e.target_type::text, e.target_id, \
                     e.relationship::text \
@@ -786,7 +792,7 @@ impl AtlasLeafRepository {
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
                 AND (e.visibility = 'public' \
                      OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
-                         AND (e.owner_group_id = $2 OR e.co_owner_group_id = $2))) \
+                         AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
                 /* {EDGE_VISIBILITY:e} */",
             3,
         );
@@ -872,7 +878,7 @@ impl AtlasLeafRepository {
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
                 AND (e.visibility = 'public' \
                      OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
-                         AND (e.owner_group_id = $2 OR e.co_owner_group_id = $2))) \
+                         AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
                 /* {EDGE_VISIBILITY:e} */",
             3,
         );
