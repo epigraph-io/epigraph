@@ -156,6 +156,21 @@ async fn force_evidence_public(pool: &PgPool, id: Uuid, world: Uuid) {
     assert_eq!(n, 1);
 }
 
+/// Retract an edge: in force from two hours ago until one hour ago.
+async fn retract_edge(pool: &PgPool, id: Uuid) {
+    let n = sqlx::query(
+        "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                          valid_to = now() - interval '1 hour' \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("retract edge")
+    .rows_affected();
+    assert_eq!(n, 1);
+}
+
 async fn force_evidence(pool: &PgPool, id: Uuid, owner: Uuid) {
     let n =
         sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
@@ -700,6 +715,68 @@ async fn another_teams_private_rows_never_appear(pool: PgPool) {
     check_team(&set, "scoped, epigraph_app");
     assert_eq!(set, team_set);
     drop(scoped);
+}
+
+/// A retracted edge (its `valid_to` past) is never drawn, and neither is the
+/// agent it alone would bring in: a retracted authorship edge, a retracted
+/// claim-to-claim edge (the read's second statement) and a retracted
+/// evidence-to-agent edge (its fifth). Calibrated by building the same leaf
+/// while the three are still in force, where all three and the author are
+/// drawn.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retracted_edges_are_never_drawn(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let (f, a_r) = (agent(&pool).await, agent(&pool).await);
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let map = AtlasMap::Team(t);
+    let cs = claims(&pool, f, "group", t, 2).await;
+    let (c1, c2) = (cs[0], cs[1]);
+    let e1 = evidence(&pool, c1, 1).await[0];
+
+    let e_cc = edge(&pool, LeafNode::claim(c1), LeafNode::claim(c2), "supports").await;
+    let e_ef = edge(&pool, LeafNode::evidence(e1), LeafNode::agent(f), "cites").await;
+    let r_cc = edge(&pool, LeafNode::claim(c2), LeafNode::claim(c1), "refutes").await;
+    let r_ar = edge(&pool, LeafNode::agent(a_r), LeafNode::claim(c1), "AUTHORED").await;
+    let r_ef = edge(
+        &pool,
+        LeafNode::evidence(e1),
+        LeafNode::agent(f),
+        "mentions",
+    )
+    .await;
+
+    let live = fits(build(&pool, &system, map, &cs).await);
+    assert_eq!(
+        stored_ids(&live),
+        BTreeSet::from([e_cc, e_ef, r_cc, r_ar, r_ef]),
+        "calibration: in force, all five are drawn"
+    );
+    assert!(of_kind(&live, LeafNodeKind::Agent).contains(&a_r));
+
+    for id in [r_cc, r_ar, r_ef] {
+        retract_edge(&pool, id).await;
+    }
+    let set = fits(build(&pool, &system, map, &cs).await);
+    assert_within_cap(&set);
+    let stored = stored_ids(&set);
+    assert!(!stored.contains(&r_cc), "a retracted claim-to-claim edge");
+    assert!(!stored.contains(&r_ar), "a retracted authorship edge");
+    assert!(
+        !stored.contains(&r_ef),
+        "a retracted evidence-to-agent edge"
+    );
+    assert_eq!(stored, BTreeSet::from([e_cc, e_ef]));
+    let nodes: BTreeSet<LeafNode> = set.nodes.iter().copied().collect();
+    assert_eq!(
+        nodes,
+        BTreeSet::from([
+            LeafNode::claim(c1),
+            LeafNode::claim(c2),
+            LeafNode::agent(f),
+            LeafNode::evidence(e1),
+        ]),
+        "the retracted author is no node"
+    );
 }
 
 // ===========================================================================
