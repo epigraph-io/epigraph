@@ -194,13 +194,26 @@
         "flow_weight": { "$ref": "#/$defs/unit_interval" },
         "flow_basis": { "enum": ["exact", "proxy", "none"] }
       },
-      "if": {
-        "properties": { "flow_basis": { "const": "none" } },
-        "required": ["flow_basis"]
-      },
-      "then": {
-        "properties": { "flow_weight": { "const": 0 }, "sign": { "const": 0 } }
-      }
+      "allOf": [
+        {
+          "description": "An edge with no flow has weight 0 and sign 0.",
+          "if": {
+            "properties": { "flow_basis": { "const": "none" } },
+            "required": ["flow_basis"]
+          },
+          "then": {
+            "properties": { "flow_weight": { "const": 0 }, "sign": { "const": 0 } }
+          }
+        },
+        {
+          "description": "A proxy edge weighs strength times the absolute sign, so with sign 0 it weighs 0.",
+          "if": {
+            "properties": { "flow_basis": { "const": "proxy" }, "sign": { "const": 0 } },
+            "required": ["flow_basis", "sign"]
+          },
+          "then": { "properties": { "flow_weight": { "const": 0 } } }
+        }
+      ]
     },
     "outgoing": {
       "description": "All links leaving the leaf for one target group, aggregated; sources are the leaf nodes they leave from.",

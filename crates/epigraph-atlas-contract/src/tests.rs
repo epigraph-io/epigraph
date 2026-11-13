@@ -946,6 +946,38 @@ fn invariants_enforce_the_schema_rules() {
         .contains("no flow has weight 0"));
     assert!(!schema_errors(&leaf).is_empty());
 
+    // A proxy weight is strength × |sign|, so a `cites` link weighs 0: one
+    // that carried a value (its source's belief, say) fails both checks.
+    // Signed proxy links keep any weight in [0, 1].
+    let leaf = read_value("team_leaf_dense");
+    let i = (0..)
+        .find(|&i| {
+            leaf["edges"][i]["flow_basis"] == json!("proxy") && leaf["edges"][i]["sign"] == json!(0)
+        })
+        .unwrap();
+    for w in [0.5, 1.0, 0.0001] {
+        let mut m = leaf.clone();
+        m["edges"][i]["flow_weight"] = json!(w);
+        let err = types_accept(&m).expect_err("cites with a weight");
+        assert!(
+            err.contains(&format!(
+                "/edges/{i}: a proxy edge with sign 0 has weight 0"
+            )),
+            "{w}: {err}"
+        );
+        assert!(!schema_errors(&m).is_empty(), "{w}: the schema accepts it");
+    }
+    let j = (0..)
+        .find(|&j| {
+            leaf["edges"][j]["flow_basis"] == json!("proxy") && leaf["edges"][j]["sign"] != json!(0)
+        })
+        .unwrap();
+    for w in [0.0, 0.0001, 1.0] {
+        let mut m = leaf.clone();
+        m["edges"][j]["flow_weight"] = json!(w);
+        types_accept(&m).unwrap_or_else(|e| panic!("signed proxy weighing {w}: {e}"));
+        assert!(schema_errors(&m).is_empty(), "signed proxy weighing {w}");
+    }
 }
 
 // ---- relationship names, flow basis, node anchoring --------------------------------

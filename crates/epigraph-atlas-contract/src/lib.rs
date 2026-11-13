@@ -151,7 +151,8 @@ pub enum FlowBasis {
     /// drawn, before repeated rows are collapsed.
     ///
     /// A link with no belief direction (`cites`) is still `proxy`, with
-    /// sign 0 and so weight 0.
+    /// sign 0 and so weight 0; validation rejects a proxy edge with sign 0
+    /// and any other weight.
     Proxy,
     /// Every other pair of kinds (an agent's authorship, for example): no
     /// belief flow, so weight 0 and sign 0.
@@ -835,6 +836,11 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
         }
         if e.flow_basis == FlowBasis::None && (e.flow_weight != 0.0 || e.sign != 0) {
             v.push(format!("{p}: an edge with no flow has weight 0 and sign 0"));
+        }
+        // strength × |sign|: a claim-to-claim link with no direction weighs
+        // 0, so it cannot carry a value such as its source's belief.
+        if e.flow_basis == FlowBasis::Proxy && e.sign == 0 && e.flow_weight != 0.0 {
+            v.push(format!("{p}: a proxy edge with sign 0 has weight 0"));
         }
     }
     // Agents and evidence are in a leaf because they assert, author or back
