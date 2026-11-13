@@ -164,14 +164,24 @@ recorded epochs), a `Viewer` and the `AtlasMap`.
   different orders and with duplicates, over rows inserted out of id order,
   give equal results.
 
-**Fail on the old code** (each mutation applied, the test run red, then
-restored and `touch`ed):
-- count only claims → the over-cap, resplit and hierarchy tests fail;
-- per-claim agents counted without dedup → the high-degree agent test fails;
-- the map predicate removed → the scope test fails;
-- per-claim cap removed → the capped-claim and split tests fail (the split
-  would leave a part over the cap);
-- input order or row order kept instead of sorted → the determinism tests fail.
+**Fail on the old code** (each mutation applied to `atlas_leaf.rs`, both test
+targets run, then restored and `touch`ed). Measured on the pushed branch:
+
+| Mutation | Tests that went red |
+|---|---|
+| cap check on claims only | `exactly_at_the_cap_...`, `fallback_split_...` (unit); `agents_or_evidence_..._resplit`, `every_leaf_..._fits_the_cap` (DB) |
+| node count summed per claim (a shared agent counted per claim) | 2 unit; `a_high_degree_agent_appears_once`, the resplit, hierarchy and determinism DB tests |
+| claims map predicate removed | `another_teams_private_rows_never_appear` |
+| evidence map predicate removed | `another_teams_private_rows_never_appear` |
+| claim-edge read: owner clause removed | `another_teams_private_rows_never_appear` |
+| claim-edge read: co-owner clause removed | `another_teams_private_rows_never_appear` |
+| agent/evidence-edge read: owner clause removed | `another_teams_private_rows_never_appear` (it survived the scope test before that test seeded such edges) |
+| agent/evidence-edge read: co-owner clause removed | `another_teams_private_rows_never_appear` |
+| per-claim cap removed | `a_claim_with_more_evidence_...`, `fallback_split_...` (unit); `every_leaf_..._fits_the_cap` (DB) |
+| collapsed edge ids left unsorted | `duplicate_stored_edges_collapse_and_keep_every_id` (unit only: the read already sorts edges by id, so the DB path cannot see it) |
+| fallback split walks input order | `fallback_split_...` (unit); `the_node_set_is_identical_across_runs` (DB) |
+| derived edges removed | 4 unit; `another_teams_private_rows_never_appear` |
+| public map binds the nil uuid as its team | none: an equivalent mutant (no row is owned by the nil group), recorded, not a gap |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint` (every new function that takes
 a connection takes and splices a viewer), `pool_read_lint`, `viewer_ratchet`.
