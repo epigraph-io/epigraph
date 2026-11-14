@@ -1,13 +1,11 @@
-//! `POST /api/v1/voids/detect` (`routes/voids.rs::detect_voids`): its request
-//! is bounded and it holds no scoped connection while it embeds (F-PR29-A1,
-//! backlog efe82380).
+//! `POST /api/v1/voids/detect` (`routes/voids.rs::detect_voids`): F-PR29-A1
+//! (backlog efe82380).
 //!
-//! * more than `MAX_VOID_CONCEPTS` concepts is `400` before anything runs;
-//! * every embedding call happens while the scoped pool has NO connection
-//!   checked out. The probe is an embedder that wraps the shared mock and,
-//!   on each `generate`, records how many of the scoped pool's connections
-//!   are in use. The handler's result must still be served from the stamped
-//!   connection (the viewer's own group-private claim covers its concept).
+//! * an oversized request is `400` before anything runs;
+//! * the footprint probe below records the scoped pool's state at each
+//!   embedder call, and the handler's result must still be served from the
+//!   stamped connection (the viewer's own group-private claim covers its
+//!   concept).
 #![cfg(feature = "db")]
 
 mod search_fixture;
@@ -27,8 +25,7 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use viewer_fixture::{seed_agent_with_group, seed_group_claim};
 
-/// The shared mock, plus a record of the scoped pool's checked-out connection
-/// count at every `generate`.
+/// The shared mock, plus the footprint probe's record.
 struct OccupancyProbe {
     inner: Arc<MockProvider>,
     pool: PgPool,
@@ -81,7 +78,7 @@ impl EmbeddingService for OccupancyProbe {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn more_than_the_cap_is_refused_before_anything_runs(pool: PgPool) {
+async fn an_oversized_request_is_refused_before_anything_runs(pool: PgPool) {
     let (agent, _) = seed_agent_with_group(&pool, "efe8-cap").await;
     // No embedding service at all: a handler that reached it would answer 500,
     // so a 400 here proves the cap is checked first.
@@ -102,7 +99,7 @@ async fn more_than_the_cap_is_refused_before_anything_runs(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn no_scoped_connection_is_held_while_concepts_are_embedded(pool: PgPool) {
+async fn detect_voids_meets_the_f_pr29_a1_footprint(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "efe8-hold").await;
     let embedder = mock_embedder();
     let concepts = [
@@ -143,8 +140,7 @@ async fn no_scoped_connection_is_held_while_concepts_are_embedded(pool: PgPool) 
     );
     assert!(
         seen.iter().all(|n| *n == 0),
-        "no scoped connection may be checked out during an embedding call; \
-         in use at each call: {seen:?}"
+        "F-PR29-A1 footprint probe: {seen:?}"
     );
     let first_covered = out["covered_concepts"]
         .as_array()

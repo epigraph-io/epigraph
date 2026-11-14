@@ -74,16 +74,12 @@ pub const MAX_VOID_CONCEPTS: usize = 50;
 /// purpose: deref coercion does not fire against a generic `E`, so `&mut read`
 /// would infer `E = &mut ScopedRead<'_>` and fail the bound.
 ///
-/// # Footprint: embed first, then one connection for the reads (F-PR29-A1)
+/// # Footprint (F-PR29-A1)
 ///
-/// Every concept in one request is still answered from the same stamped
-/// session — a request that returned `void` for one concept and `covered` for
-/// another because the two sampled different sessions would be describing two
-/// different corpora. But the session is acquired only AFTER every concept has
-/// been embedded, so it is held for the nearest-claim reads alone and never
-/// across an outbound embedding call. `concepts` is capped at
-/// [`MAX_VOID_CONCEPTS`] per request (`400` above it), checked before anything
-/// else runs.
+/// Every concept in one request is answered from the same stamped session — a
+/// request that returned `void` for one concept and `covered` for another
+/// because the two sampled different sessions would be describing two
+/// different corpora. The request size is bounded by [`MAX_VOID_CONCEPTS`].
 #[cfg(feature = "db")]
 pub async fn detect_voids(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -108,7 +104,7 @@ pub async fn detect_voids(
     let mut sparse = Vec::new();
     let mut covered = Vec::new();
 
-    // Every outbound embedding call happens BEFORE the scoped read is acquired.
+    // F-PR29-A1.
     let mut embeddings = Vec::with_capacity(request.concepts.len());
     for concept in &request.concepts {
         let embedding = embedder
