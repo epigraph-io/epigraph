@@ -22,8 +22,10 @@
 --     a fragment of a claim whose tenancy changed takes THAT claim's tuple,
 --     whatever its other citers are. So publicizing claim A made a fragment
 --     public although group-private claim B also cites it: B's source text
---     became world-readable. And moving A to another group moved a fragment B
---     (still in the old group) cites away from B's group.
+--     became world-readable. (Moving A to another group also moves a fragment
+--     B cites with it; 218 keeps that, because the operator tools model the
+--     cascade that way and put a kept node back afterwards.) With several
+--     changed claims, the one applied was again chosen by plan order.
 --
 -- The operator decided the rule on 2026-09-22 (finding F-089-A in
 -- docs/tenancy/progress.json): MOST RESTRICTIVE WINS.
@@ -32,31 +34,35 @@
 -- 1. THE RULE, ONE ORDER IN THREE PLACES
 -- ===================================================================
 --
--- Among a fragment's citing claims, the winner is the first by:
+-- Among the CANDIDATE citing claims, the winner is the first by:
 --
 --   1. `visibility = 'group'` before `'public'` (the restrictive direction;
 --      062's CHECKs make these the only two values);
---   2. arm (d) only: a claim of THIS statement's `changed` set before one it
---      did not change. At equal visibility the act that moved the claim keeps
---      168's meaning: a share, a re-own or a regroup still carries the
---      fragment with the claim (the operator tools' `reown-claims`,
---      `regroup-claims` and `restrict-claims` model the cascade that way);
---   3. a real owner before a sentinel (world `...0000`, seed `...dead`): a
+--   2. a real owner before a sentinel (world `...0000`, seed `...dead`): a
 --      sentinel owns nothing (062's `*_group_needs_real_group`), so it never
 --      beats a real group at equal visibility;
---   4. arm (d) only: the fragment's CURRENT owner before another group (two
---      groups are incomparable, so a fragment no changed claim decides stays
---      with a citer's group it already has rather than moving on a uuid);
---   5. `owner_group_id ASC`: a deterministic tie-break, so the result does not
+--   3. `owner_group_id ASC`: a deterministic tie-break, so the result does not
 --      depend on plan or insert order.
 --
--- Keys 2 and 4 are left out of the provenance trigger and the backfill: there
--- is no `changed` set, and the target is always a sentinel, so a current-owner
--- key would decide nothing.
+-- WHO IS A CANDIDATE. Only a claim the firing act itself names, never a
+-- provenance row some earlier statement wrote:
 --
--- The rank is over EVERY citing claim in `harvester_claim_provenance`, not
--- only the rows of the statement that fired: at AFTER STATEMENT time the
--- table already holds them.
+--   * the provenance stamp ranks the citers of THIS statement's rows
+--     (`newprov`), exactly the rows 115 stamped from. Ranking every provenance
+--     row of the fragment would let a link written earlier by an application
+--     session (which 115 section 9 deliberately does not stamp from) decide the
+--     fragment as soon as any privileged link arrived;
+--   * arm (d) ranks the claims of THIS statement's `changed` set that cite the
+--     fragment, as 168 did; the fragment never moves to a claim the statement
+--     did not change. One guard is added (the most-restrictive rule's arm (d)
+--     half): when the changed claims' winner is `public`, a fragment that is
+--     `group` and still has ANOTHER group-private citer is left where it is,
+--     owner and all. Publicizing one citer therefore no longer makes the
+--     fragment public, and it does not hand the fragment to the other citer's
+--     group either (that citer's link may have been written by any session
+--     that can INSERT provenance; section 2).
+--   * the backfill ranks every non-world citer of a sentinel-owned fragment
+--     (it has no statement to scope to; it is operator-run, section 2).
 --
 -- WHERE EACH WRITER MAY MOVE A FRAGMENT IS UNCHANGED:
 --
@@ -65,10 +71,10 @@
 --     world-owned citing claim (089's source predicate), and the trigger still
 --     runs only for an `epigraph_bypass()` session (115 section 9);
 --   * arm (d) still re-stamps every fragment of a changed claim (a claim's own
---     tenancy change is authoritative), now to the winner over all its citers.
---     The result differs from 168's only where another citer is MORE
---     restrictive than the changed claim's new tuple (a publicize, or a claim
---     moved to a sentinel), or where several changed claims disagree.
+--     tenancy change is authoritative), to the winner among the changed
+--     claims. The result differs from 168's only where the guard above keeps a
+--     group fragment (every changed citer went public while another citer is
+--     group-private), or where several changed claims disagree.
 --
 -- WHAT IS NOT DONE HERE, AND WHY. A fragment ALREADY owned by a real group
 -- with `visibility = 'public'` is not narrowed when a group-private claim later
@@ -80,9 +86,8 @@
 -- would undo an audited, census-checked run. Which rule governs that shape is
 -- an operator question, recorded on F-089-A and F-089-C in
 -- docs/tenancy/progress.json. Arm (d) does not collide with the node rule:
--- when the moved claim's new tuple is `group`, key 2 below makes it win, so arm
--- (d) writes exactly the tuple 168 wrote, and the tools still put a kept node
--- back afterwards.
+-- when the moved claim's new tuple is `group`, arm (d) writes exactly the
+-- tuple 168 wrote, and the tools still put a kept node back afterwards.
 --
 -- ===================================================================
 -- 2. THE TRUST MODEL OF THE STAMP (backlog 0bf301fd, finding F-089-F)
@@ -91,14 +96,28 @@
 -- The stamp copies tenancy from a claim the WRITER of the provenance row
 -- names, and nothing constrains which claims it may name. The operator
 -- ACCEPTED that on 2026-09-22: the harvester ingest path is TRUSTED to name
--- any citing claim. Since 115 the stamp runs only for a privileged session
--- (`epigraph_bypass()`), so the writer that can name a claim to it is the
--- harvester on a maintenance or superuser DSN, nothing else. The consequence
--- is an INTEGRITY and AVAILABILITY one (a wrong citation can make a fragment
--- private to the wrong group, or hide it from a public claim's readers), not a
--- DISCLOSURE one: a sentinel-owned fragment is necessarily public (062), and
--- a stamp moves it only public->public or public->group, so it never becomes
--- MORE readable. docs/tenancy.md states the same.
+-- any citing claim. Since 115 the INSERT-time stamp runs only for a privileged
+-- session (`epigraph_bypass()`), and since this file it ranks only the rows of
+-- the statement that fired, so the writer that can name a claim to the
+-- INSERT-time stamp is a privileged one (the harvester on a maintenance or
+-- superuser DSN). The consequence is an INTEGRITY and AVAILABILITY one (a
+-- wrong citation can make a fragment private to the wrong group, or hide it
+-- from a public claim's readers), not a DISCLOSURE one: a sentinel-owned
+-- fragment is necessarily public (062), and a stamp moves it only
+-- public->public or public->group, so it never becomes MORE readable.
+--
+-- THE TRUST MODEL IS NOT YET ENFORCED ON EVERY PATH. `epigraph_app` still
+-- holds INSERT on `harvester_claim_provenance` (115 keeps the insert and only
+-- skips the stamp), and arm (d) re-stamps a fragment from whichever of its
+-- linked claims a later tenancy change names, without asking who wrote the
+-- link. So a link written on an application connection can still influence a
+-- fragment's tenancy through arm (d). That is pre-existing (168 behaves the
+-- same), not introduced here; this file only makes sure 218 does not widen it.
+-- It is recorded as an open finding at class level in
+-- docs/tenancy/progress.json (F-218-A). The candidate repair is to revoke
+-- INSERT on the table from `epigraph_app`, which needs the operator to confirm
+-- first which role the external harvester connects as.
+-- docs/tenancy.md states the same.
 --
 -- ===================================================================
 -- 3. NO UPDATE ON harvester_claim_provenance FOR epigraph_app (77fbf3f9)
@@ -112,7 +131,7 @@
 -- rows' own tenancy as a maintenance-owned definer, under
 -- `epigraph_maintenance`'s own UPDATE (070). The external harvester that
 -- writes it is outside this tree; the README's deploy note asks the operator
--- to confirm it only INSERTs on an application DSN.
+-- to confirm which role it connects as and that it never UPDATEs this table.
 -- So the application role loses UPDATE outright, which closes the path
 -- without a second trigger and moves none of the four pinned trigger counts.
 -- A table-level REVOKE also removes any column-level UPDATE grant. INSERT,
@@ -159,20 +178,20 @@ BEGIN
     END IF;
     -- 218: the MOST RESTRICTIVE citing claim wins (group before public, a
     -- real owner before the seed sentinel, then the lowest owner id), ranked
-    -- over every provenance row of the fragment, not only this statement's.
+    -- over THIS statement's rows only (`newprov`), as 115 stamped from them:
+    -- a link an earlier, unstamped session wrote never decides the fragment.
     -- The ingest path is trusted to name any citing claim (finding F-089-F,
     -- accepted): a stamp only ever moves a sentinel-owned, hence public,
     -- fragment to public or group, never to something more readable.
     UPDATE public.harvester_fragments f
        SET owner_group_id = w.owner_group_id,
            visibility     = w.visibility
-      FROM (SELECT DISTINCT ON (p.fragment_id)
-                   p.fragment_id, c.owner_group_id, c.visibility
-              FROM public.harvester_claim_provenance p
-              JOIN public.claims c ON c.id = p.claim_id
-             WHERE p.fragment_id IN (SELECT n.fragment_id FROM newprov n)
-               AND c.owner_group_id <> '00000000-0000-0000-0000-000000000000'::uuid
-             ORDER BY p.fragment_id,
+      FROM (SELECT DISTINCT ON (n.fragment_id)
+                   n.fragment_id, c.owner_group_id, c.visibility
+              FROM newprov n
+              JOIN public.claims c ON c.id = n.claim_id
+             WHERE c.owner_group_id <> '00000000-0000-0000-0000-000000000000'::uuid
+             ORDER BY n.fragment_id,
                       (c.visibility = 'group') DESC,
                       (c.owner_group_id = '00000000-0000-0000-0000-00000000dead'::uuid) ASC,
                       c.owner_group_id ASC) w
@@ -305,32 +324,33 @@ BEGIN
         END IF;
     END LOOP;
     -- Harvester fragments hang off provenance, not off claim_id.
-    -- 218: a fragment of a changed claim takes the MOST RESTRICTIVE of ALL
-    -- its citing claims as they stand after this statement: group before
-    -- public. At equal visibility the changed claim decides, as in 168 (a
-    -- share, re-own or regroup still carries the fragment with the claim);
-    -- then a real owner before a sentinel, the fragment's current owner, and
-    -- the lowest owner id. Publicizing one citer no longer makes a fragment
-    -- public while another citer is group-private.
+    -- 218: a fragment of a changed claim takes the MOST RESTRICTIVE of the
+    -- CHANGED claims that cite it (group before public, a real owner before a
+    -- sentinel, then the lowest owner id); it never moves to a claim this
+    -- statement did not change. When that winner is public, a group fragment
+    -- that another group-private claim still cites is left as it is (owner
+    -- and visibility): publicizing one citer no longer makes the fragment
+    -- public, and does not hand it to the other citer's group either.
     UPDATE public.harvester_fragments f
        SET owner_group_id = w.owner_group_id, visibility = w.visibility
       FROM (SELECT DISTINCT ON (p.fragment_id)
-                   p.fragment_id, c.owner_group_id, c.visibility
+                   p.fragment_id, ch.owner_group_id, ch.visibility
               FROM public.harvester_claim_provenance p
-              JOIN public.claims c ON c.id = p.claim_id
-              JOIN public.harvester_fragments f0 ON f0.id = p.fragment_id
-             WHERE p.fragment_id IN (SELECT p0.fragment_id
-                                       FROM public.harvester_claim_provenance p0
-                                       JOIN changed ch ON ch.id = p0.claim_id)
+              JOIN changed ch ON ch.id = p.claim_id
              ORDER BY p.fragment_id,
-                      (c.visibility = 'group') DESC,
-                      (c.id IN (SELECT ch2.id FROM changed ch2)) DESC,
-                      (c.owner_group_id IN (
+                      (ch.visibility = 'group') DESC,
+                      (ch.owner_group_id IN (
                          '00000000-0000-0000-0000-000000000000'::uuid,
                          '00000000-0000-0000-0000-00000000dead'::uuid)) ASC,
-                      (c.owner_group_id = f0.owner_group_id) DESC,
-                      c.owner_group_id ASC) w
+                      ch.owner_group_id ASC) w
      WHERE f.id = w.fragment_id
+       AND NOT (w.visibility = 'public'
+                AND f.visibility = 'group'
+                AND EXISTS (SELECT 1
+                              FROM public.harvester_claim_provenance p2
+                              JOIN public.claims c2 ON c2.id = p2.claim_id
+                             WHERE p2.fragment_id = f.id
+                               AND c2.visibility = 'group'))
        AND (f.owner_group_id, f.visibility)
            IS DISTINCT FROM (w.owner_group_id, w.visibility);
     -- Edges are the MEET of their (possibly changed) endpoints, recomputed from

@@ -23,23 +23,39 @@
 //! the same citer under any fixed scan order; the winner rule must put both on
 //! it.
 //!
+//! # Who is a candidate
+//!
+//! Only a claim the firing act names: the provenance stamp ranks the rows of
+//! the statement that fired, and arm (d) ranks the claims its statement
+//! changed. A link an application session wrote earlier (115 section 9 stamps
+//! nothing from it) never decides a fragment, and arm (d) never moves a
+//! fragment to a claim it did not change. The two `…never…` tests below pin
+//! that, from a real `epigraph_app` session.
+//!
 //! # Verified to fail
 //!
-//! * Migration 218 removed (the tree below it): every test fails, each on its
-//!   own assertion (the undo test on its calibration, since nothing changes),
-//!   except `moving_one_group_citer_to_another_group_still_carries_the_fragment`,
-//!   a pin of 168's behaviour that 218 must keep.
-//! * The seed-last key removed from the provenance stamp AND the current-owner
-//!   key removed from arm (d), in one run: exactly
-//!   `the_provenance_stamp_puts_a_real_owner_before_the_seed_sentinel` and
-//!   `a_fragment_no_changed_claim_decides_stays_with_its_current_group` fail.
-//! * The changed-claim key removed from arm (d): exactly
-//!   `moving_one_group_citer_to_another_group_still_carries_the_fragment` fails.
+//! * Migration 218 replaced by a no-op (115's and 168's bodies): every test
+//!   fails on its own assertion except
+//!   `an_earlier_unstamped_link_never_decides_a_later_stamp` (115's property,
+//!   which 218 must keep) and
+//!   `moving_one_group_citer_to_another_group_still_carries_the_fragment` (a
+//!   pin of 168's behaviour that 218 must keep).
+//! * The first draft of 218 (every provenance row ranked, arm (d) ranking
+//!   every citer of the fragment): exactly
+//!   `an_earlier_unstamped_link_never_decides_a_later_stamp` and
+//!   `publicizing_a_citer_never_hands_its_fragment_to_another_citers_group`
+//!   fail, on their tenancy assertions.
+//! * Arm (d)'s keep-a-group-fragment guard disabled: exactly
+//!   `publicizing_one_citer_leaves_a_fragment_another_citer_keeps_private`,
+//!   `a_fragment_no_changed_claim_decides_stays_with_its_current_group` and
+//!   `publicizing_a_citer_never_hands_its_fragment_to_another_citers_group`
+//!   fail.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use sqlx::PgPool;
+use epigraph_db::visibility::Viewer;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 /// Migration 074's seed group.
@@ -261,9 +277,9 @@ async fn publicizing_one_citer_leaves_a_fragment_another_citer_keeps_private(poo
     );
 }
 
-/// Arm (d): when no changed claim decides (the changed claim went public and
-/// two group-private citers of different groups remain), the fragment stays
-/// with the one of them whose group already owns it, not the lower id.
+/// Arm (d): when the changed claim goes public and two group-private citers of
+/// different groups remain, the fragment stays exactly where it is (owner and
+/// visibility): it is neither made public nor moved to the lower group id.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_fragment_no_changed_claim_decides_stays_with_its_current_group(pool: PgPool) {
     let ((agent_lo, lo), (agent_hi, hi)) = two_groups(&pool).await;
@@ -395,6 +411,204 @@ async fn the_app_role_cannot_update_provenance(pool: PgPool) {
         code.as_deref(),
         Some("42501"),
         "the app role's UPDATE of a provenance row must be refused for want of the privilege"
+    );
+}
+
+/// Stamp `conn` for `agent` exactly as `ScopedPool::begin_as` would (the
+/// same helper as `owner_scoped_delete.rs`).
+async fn stamp(conn: &mut PgConnection, pool: &PgPool, agent: Uuid) {
+    let csv = |ids: &[Uuid]| {
+        ids.iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let v = Viewer::resolve(pool, agent).await.expect("resolve viewer");
+    let groups = csv(v.group_bind().expect("scoped viewer"));
+    let writable = csv(v.writable_groups());
+    assert!(
+        !writable.is_empty(),
+        "a writer with no writable group makes the app-session arms vacuous"
+    );
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(groups)
+    .bind(writable)
+    .bind(agent.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp session gucs");
+}
+
+/// As `epigraph_app` stamped for `agent`: INSERT each `(claim, fragment)` link
+/// (when `links` is non-empty), then DELETE `deletes`. Returns
+/// `(links inserted, fragments deleted)`.
+async fn as_app_session(
+    pool: &PgPool,
+    agent: Uuid,
+    links: Vec<(Uuid, Uuid)>,
+    deletes: Vec<Uuid>,
+) -> (u64, u64) {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app's rolbypassrls");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: the test is vacuous"
+    );
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, agent).await;
+        let mut linked = 0;
+        for (claim, frag) in links {
+            linked += sqlx::query(
+                "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
+            )
+            .bind(claim)
+            .bind(frag)
+            .execute(&mut *conn)
+            .await
+            .expect("the app session links a fragment to its own claim")
+            .rows_affected();
+        }
+        let deleted = sqlx::query("DELETE FROM harvester_fragments WHERE id = ANY($1)")
+            .bind(&deletes[..])
+            .execute(&mut *conn)
+            .await
+            .expect("the app session's DELETE")
+            .rows_affected();
+        (conn, (linked, deleted))
+    })
+    .await
+}
+
+async fn provenance_rows(pool: &PgPool, claim: Uuid, fragment: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM harvester_claim_provenance WHERE claim_id = $1 AND fragment_id = $2",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .fetch_one(pool)
+    .await
+    .expect("read provenance")
+}
+
+/// Review finding 1: the provenance stamp ranks only the rows of the statement
+/// that fired. An application session T links its own group-private claim to
+/// two sentinel-owned fragments; 115 section 9 stamps nothing from that. Later
+/// the privileged harvester links one fragment to a seed-owned public claim and
+/// the other to a world-owned public claim. Neither fragment becomes T's: the
+/// first takes the seed claim's tuple (115's own result), the second stays
+/// world-owned (115 ignores a world citer), T's DELETE removes nothing, and the
+/// harvester's provenance rows survive. Ranking every provenance row of the
+/// fragment would let T's earlier link win both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_earlier_unstamped_link_never_decides_a_later_stamp(pool: PgPool) {
+    let world = fixture::world_group(&pool).await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "frag-author").await;
+    let (t, t_group) = fixture::seed_agent_with_group(&pool, "frag-t").await;
+    let t_private = claim(&pool, t, "group", t_group).await;
+    let seed_public = claim(&pool, author, "public", SEED).await;
+    let world_public = claim(&pool, author, "public", world).await;
+    let via_seed = fragment(&pool, "public", world).await;
+    let via_world = fragment(&pool, "public", world).await;
+
+    let (linked, _) = as_app_session(
+        &pool,
+        t,
+        vec![(t_private, via_seed), (t_private, via_world)],
+        vec![],
+    )
+    .await;
+    assert_eq!(linked, 2, "CALIBRATION: both app-session links landed");
+    for f in [via_seed, via_world] {
+        assert_eq!(
+            tenancy_of(&pool, f).await,
+            (world, "public".to_string()),
+            "CALIBRATION: an application session's link stamps nothing (115 section 9)"
+        );
+    }
+
+    link_in_one_statement(&pool, &[(seed_public, via_seed)]).await;
+    link_in_one_statement(&pool, &[(world_public, via_world)]).await;
+    assert_eq!(
+        tenancy_of(&pool, via_seed).await,
+        (SEED, "public".to_string()),
+        "the privileged link names the seed-owned public claim, so the fragment takes ITS \
+         tuple; the earlier unstamped link must not decide it"
+    );
+    assert_eq!(
+        tenancy_of(&pool, via_world).await,
+        (world, "public".to_string()),
+        "the privileged link names a world-owned claim, which donates nothing; the earlier \
+         unstamped link must not decide the fragment either"
+    );
+
+    let (_, deleted) = as_app_session(&pool, t, vec![], vec![via_seed, via_world]).await;
+    assert_eq!(
+        deleted, 0,
+        "T owns neither fragment, so its DELETE removes none"
+    );
+    assert_eq!(provenance_rows(&pool, seed_public, via_seed).await, 1);
+    assert_eq!(provenance_rows(&pool, world_public, via_world).await, 1);
+}
+
+/// Review finding 2: arm (d) never hands a fragment to a claim its statement
+/// did not change. Author A's group-private claim gives the fragment A's group;
+/// an application session T then links its own group-private claim to it; A's
+/// claim is publicized. The fragment stays A's and group-private (T's citer is
+/// still group-private, so it is not made public, and it does not move to T's
+/// group); T's DELETE removes nothing and A's provenance row survives.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicizing_a_citer_never_hands_its_fragment_to_another_citers_group(pool: PgPool) {
+    let world = fixture::world_group(&pool).await;
+    let (a, a_group) = fixture::seed_agent_with_group(&pool, "frag-a-owner").await;
+    let (t, t_group) = fixture::seed_agent_with_group(&pool, "frag-t-linker").await;
+    let a_claim = claim(&pool, a, "group", a_group).await;
+    let t_private = claim(&pool, t, "group", t_group).await;
+    let shared = fragment(&pool, "public", world).await;
+    link_in_one_statement(&pool, &[(a_claim, shared)]).await;
+    assert_eq!(
+        tenancy_of(&pool, shared).await,
+        (a_group, "group".to_string()),
+        "CALIBRATION: the harvester's link stamps the fragment with A's claim"
+    );
+    let (linked, _) = as_app_session(&pool, t, vec![(t_private, shared)], vec![]).await;
+    assert_eq!(linked, 1, "CALIBRATION: T's link landed");
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('epigraph.allow_declassify', 'yes', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("allow the declassification");
+    sqlx::query("UPDATE claims SET visibility = 'public' WHERE id = $1")
+        .bind(a_claim)
+        .execute(&mut *tx)
+        .await
+        .expect("publicize A's claim");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        tenancy_of(&pool, shared).await,
+        (a_group, "group".to_string()),
+        "publicizing A's claim must leave the fragment with A's group and group-private: \
+         never moved to T's group (T's claim was not changed), never made public while T's \
+         claim cites it"
+    );
+    let (_, deleted) = as_app_session(&pool, t, vec![], vec![shared]).await;
+    assert_eq!(
+        deleted, 0,
+        "T does not own the fragment, so its DELETE removes nothing"
+    );
+    assert_eq!(
+        provenance_rows(&pool, a_claim, shared).await,
+        1,
+        "A's provenance row survived"
     );
 }
 
