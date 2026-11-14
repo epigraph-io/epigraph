@@ -391,19 +391,39 @@ async fn consolidate_identity(
     }
 
     let mut marked = Vec::with_capacity(duplicates.len());
+    let mut marked_ids: Vec<String> = Vec::with_capacity(duplicates.len());
     for dup in duplicates {
-        marked.push(
-            crate::tools::supersede::mark_duplicate_pair(
-                server,
-                viewer,
-                auth,
-                dup,
-                survivor,
-                Some(params.reason.as_str()),
-                TOOL,
-            )
-            .await?,
-        );
+        let one = crate::tools::supersede::mark_duplicate_pair(
+            server,
+            viewer,
+            auth,
+            dup,
+            survivor,
+            Some(params.reason.as_str()),
+            TOOL,
+        )
+        .await;
+        match one {
+            Ok(v) => {
+                marked.push(v);
+                marked_ids.push(dup.to_string());
+            }
+            // A source changed after the checks above (a concurrent writer).
+            // The sources marked before it stay marked: say which, so the
+            // caller can un-mark them or finish the rest, rather than retry a
+            // call whose first sources now read as not current.
+            Err(mut e) if !marked_ids.is_empty() => {
+                e.message = format!(
+                    "{} (consolidate identity: these sources were already marked duplicates \
+                     of {survivor} before this one was refused, and stay marked: {})",
+                    e.message,
+                    marked_ids.join(", ")
+                )
+                .into();
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     let response = IdentityResponse {
