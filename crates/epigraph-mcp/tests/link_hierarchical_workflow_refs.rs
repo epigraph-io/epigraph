@@ -342,3 +342,173 @@ async fn a_non_submitter_cannot_write_a_workflow_sourced_reference(pool: PgPool)
     .expect("the submitter's own repair is admitted");
     assert_eq!(in_force(&pool, workflow, step, "executes").await, 1);
 }
+
+/// The stdio server's own viewer: it reads the group rows its agent writes,
+/// which `fixture::public_viewer` does not.
+async fn own_viewer(server: &epigraph_mcp::EpiGraphMcpFull) -> epigraph_db::visibility::Viewer {
+    epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .expect("stdio viewer")
+}
+
+/// `epigraph_node_tenancy` treats a workflow endpoint as public, so a
+/// `depends_on` or `invokes` touching a group-private workflow would be
+/// stored as a PUBLIC edge naming that workflow to every reader. Both are
+/// refused with nothing written, even for the workflow's own submitter, and
+/// the private workflow stays unnamed by any edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reference_to_a_group_private_workflow_is_refused(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let public = store(&server, &["call the private workflow"]).await;
+    let private = store(&server, &["private step"]).await;
+    let (_, step) = step_claim(&pool, public, "call the private workflow").await;
+    sqlx::query("UPDATE workflows SET visibility = 'group' WHERE id = $1")
+        .bind(private)
+        .execute(&pool)
+        .await
+        .expect("make the workflow group-private in its owner group");
+
+    for (s, st, t, tt, rel) in [
+        (public, "workflow", private, "workflow", "depends_on"),
+        (private, "workflow", public, "workflow", "depends_on"),
+        (public, "workflow", private, "workflow", "invokes"),
+        (step, "claim", private, "workflow", "invokes"),
+    ] {
+        let err = do_link_hierarchical(&server, &viewer, link(s, st, t, tt, rel), None)
+            .await
+            .expect_err("a reference touching a group-private workflow is refused");
+        assert!(
+            err.message.contains("is not public"),
+            "{rel} {st} -> {tt}: {}",
+            err.message
+        );
+        assert_eq!(
+            in_force(&pool, s, t, rel).await,
+            0,
+            "{rel}: nothing written"
+        );
+    }
+    let naming: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE visibility = 'public' \
+           AND relationship IN ('invokes', 'depends_on') \
+           AND (source_id = $1 OR target_id = $1)",
+    )
+    .bind(private)
+    .fetch_one(&pool)
+    .await
+    .expect("count public edges naming the private workflow");
+    assert_eq!(naming, 0);
+}
+
+/// A step claim's `invokes` is its workflow's reference, so it takes the
+/// authority gate over the workflow executing the step: an outsider cannot
+/// attach a sub-workflow to someone else's public step (nor, through the
+/// cycle guard, block the owner's own references), and a claim that no
+/// workflow executes is not a step at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_outsider_cannot_invoke_from_another_agents_step_claim(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let outsider = outsider_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let outsider_viewer = own_viewer(&outsider).await;
+    let w1 = store(&server, &["call a sub-workflow"]).await;
+    let w2 = store(&server, &["sub step"]).await;
+    let (_, s1) = step_claim(&pool, w1, "call a sub-workflow").await;
+
+    let err = do_link_hierarchical(
+        &outsider,
+        &outsider_viewer,
+        link(s1, "claim", w2, "workflow", "invokes"),
+        None,
+    )
+    .await
+    .expect_err("an outsider's invokes from another agent's step is refused");
+    assert!(err.message.contains("submitter"), "{}", err.message);
+    assert_eq!(in_force(&pool, s1, w2, "invokes").await, 0);
+
+    let loose = seed_claim(&pool, "a claim no workflow executes", 0.5).await;
+    let err = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(loose, "claim", w2, "workflow", "invokes"),
+        None,
+    )
+    .await
+    .expect_err("a claim that is not a step cannot invoke");
+    assert!(err.message.contains("not a step"), "{}", err.message);
+    assert_eq!(in_force(&pool, loose, w2, "invokes").await, 0);
+
+    // The owner's references are not blocked: both directions of what the
+    // outsider tried are still the owner's to choose.
+    do_link_hierarchical(
+        &server,
+        &viewer,
+        link(w2, "workflow", w1, "workflow", "invokes"),
+        None,
+    )
+    .await
+    .expect("the submitter's own W2 invokes W1 is admitted");
+}
+
+/// `executes` is cycle-checked too (`W -executes-> S` where `S` already
+/// invokes `W`), and is written from a lineage's head generation only, as
+/// `add_step` writes it: an older generation's plan is frozen.
+#[sqlx::test(migrations = "../../migrations")]
+async fn executes_refuses_a_closing_cycle_and_a_non_head_generation(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let w1 = store(&server, &["call w2"]).await;
+    let w2 = store(&server, &["w2 step"]).await;
+    let (_, s1) = step_claim(&pool, w1, "call w2").await;
+    do_link_hierarchical(
+        &server,
+        &viewer,
+        link(s1, "claim", w2, "workflow", "invokes"),
+        None,
+    )
+    .await
+    .expect("S1 invokes W2");
+    let err = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(w2, "workflow", s1, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect_err("W2 executes S1 closes S1 -invokes-> W2");
+    assert!(
+        err.message.contains("would close a cycle"),
+        "{}",
+        err.message
+    );
+    assert_eq!(in_force(&pool, w2, s1, "executes").await, 0);
+
+    // Make W2 the next generation of W1's lineage: W1 is then frozen.
+    sqlx::query(
+        "UPDATE workflows SET canonical_name = w1.canonical_name, generation = w1.generation + 1 \
+           FROM (SELECT canonical_name, generation FROM workflows WHERE id = $1) w1 \
+          WHERE workflows.id = $2",
+    )
+    .bind(w1)
+    .bind(w2)
+    .execute(&pool)
+    .await
+    .expect("put W2 after W1 in one lineage");
+    let (dropped, step) = step_claim(&pool, w1, "call w2").await;
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(dropped)
+        .execute(&pool)
+        .await
+        .expect("drop W1's executes edge");
+    let err = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(w1, "workflow", step, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect_err("an older generation's plan is not extended");
+    assert!(err.message.contains("head generation"), "{}", err.message);
+    assert_eq!(in_force(&pool, w1, step, "executes").await, 0);
+}

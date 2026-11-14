@@ -16,14 +16,31 @@
 //!   a pair the relationship admits ([`endpoint_types_for`]),
 //! - a workflow SOURCE requires authority over that workflow
 //!   (`require_workflow_authority`, the gate `add_step` uses), and the write
-//!   is recorded as that gate's writes are,
-//! - `invokes` and `depends_on` refuse an edge that would close a cycle,
+//!   is recorded as that gate's writes are. A step-claim source of `invokes`
+//!   requires that authority over every workflow executing the step, and a
+//!   claim no workflow executes is refused,
+//! - `executes` writes from the HEAD generation of a lineage only (as
+//!   `add_step` does), so a frozen older generation's plan is not extended,
+//! - `invokes` and `depends_on` refuse a NON-PUBLIC workflow endpoint: the
+//!   edges trigger derives an edge's tenancy from its claim endpoints only
+//!   (a workflow endpoint counts as public), so such an edge would be stored
+//!   public and name the private workflow to every reader,
+//! - `invokes`, `depends_on` and `executes` refuse an edge that would close a
+//!   cycle through `invokes` / `executes` (or `depends_on`) edges the caller
+//!   reads; the check and the insert are serialized per relationship set,
 //! - the call is idempotent on `(source, target, relationship)`.
 //!
 //! Intentionally side-effect-free vs the generic POST: no DS recomputation,
 //! no factor inserts, no `edge.added` event, no provenance. These structural
 //! edges carry no evidential semantics and the matching `ingest_document`
 //! flow treats them the same way.
+//!
+//! Residual, stated: a reference between two public workflows (or from a
+//! public step claim to one) is outside `epigraph_edge_writer_scope`, so it is
+//! world-owned like the `executes` edges `store_workflow` writes, and
+//! `owned_by_caller` is false: its writer cannot patch or retract it, which
+//! takes maintenance. Widening that scope to workflow endpoints is a
+//! migration.
 
 use rmcp::model::*;
 
@@ -70,14 +87,24 @@ pub fn endpoint_types_for(relationship: &str) -> &'static [(&'static str, &'stat
 ///
 /// `invokes` walks `executes` too: a step claim's `invokes` belongs to the
 /// workflow that executes the step, so `W1 -executes-> S1 -invokes-> W2`
-/// followed by `W2 -invokes-> W1` is a cycle.
+/// followed by `W2 -invokes-> W1` is a cycle. `executes` walks the same
+/// pair: `W -executes-> S` closes a loop when `S` already invokes back to `W`.
 #[must_use]
 pub fn cycle_walk_for(relationship: &str) -> Option<&'static [&'static str]> {
     match relationship {
-        "invokes" => Some(&["invokes", "executes"]),
+        "invokes" | "executes" => Some(&["invokes", "executes"]),
         "depends_on" => Some(&["depends_on"]),
         _ => None,
     }
+}
+
+/// Whether `relationship`'s edges must not touch a non-public workflow: the
+/// workflow-to-workflow and claim-to-workflow references, whose tenancy the
+/// edges trigger cannot derive from the workflow end (`executes` takes its
+/// step claim's tenancy, as `add_step`'s edges do).
+#[must_use]
+pub fn requires_public_workflow_endpoints(relationship: &str) -> bool {
+    matches!(relationship, "invokes" | "depends_on")
 }
 
 fn is_hierarchical_relationship(s: &str) -> bool {
@@ -230,26 +257,94 @@ pub async fn do_link_hierarchical(
         )));
     }
 
+    // A reference touching a non-public workflow would be stored public
+    // (`epigraph_node_tenancy` treats a workflow endpoint as tenancy-less), so
+    // it is refused before anything is written. Both endpoints were read
+    // through the caller's viewer above, so this names nothing it cannot read.
+    if requires_public_workflow_endpoints(&params.relationship) {
+        for (side, id, ty) in [
+            ("source", source_id, source_type),
+            ("target", target_id, target_type),
+        ] {
+            if ty != "workflow" {
+                continue;
+            }
+            let tenancy = epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut tx, viewer, id)
+                .await
+                .map_err(internal_error)?;
+            if !matches!(tenancy.as_ref().map(|(v, _)| v.as_str()), Some("public")) {
+                return Err(invalid_params(format!(
+                    "refused: the {side} workflow {id} is not public. A '{}' edge takes its \
+                     tenancy from claim endpoints only, so it would be stored public; references \
+                     to a non-public workflow are not supported yet. Nothing was written.",
+                    params.relationship
+                )));
+            }
+        }
+    }
+
     // A workflow SOURCE changes what that workflow runs or references, so it
     // takes the authority `add_step` takes over it (backlog 03d87e3a: "under
-    // the same authority checks"), decided before anything is written.
-    let grant = if source_type == "workflow" {
-        let not_found = move || invalid_params(format!("source workflow {source_id} not found"));
-        Some(
-            crate::tools::workflow_authority::require_workflow_authority(
-                server,
-                &mut tx,
-                auth,
-                actor,
-                source_id,
-                "link_hierarchical",
-                &not_found,
-            )
-            .await?,
-        )
+    // the same authority checks"), decided before anything is written. A
+    // step-claim source of `invokes` is that step's workflows' reference
+    // ([`cycle_walk_for`]), so it takes the same authority over EVERY
+    // workflow that executes the step's lineage; a claim no workflow executes
+    // is not a step and is refused.
+    let governed: Vec<uuid::Uuid> = if source_type == "workflow" {
+        vec![source_id]
+    } else if params.relationship == "invokes" {
+        let executing =
+            epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut tx, source_id)
+                .await
+                .map_err(internal_error)?;
+        if executing.is_empty() {
+            return Err(invalid_params(format!(
+                "refused: claim {source_id} is not a step of any workflow (nothing executes it). \
+                 An invokes from a claim belongs to the workflow running that step. Nothing was \
+                 written."
+            )));
+        }
+        executing
     } else {
-        None
+        Vec::new()
     };
+    let mut grants = Vec::with_capacity(governed.len());
+    for workflow_id in governed {
+        let not_found = move || invalid_params(format!("workflow {workflow_id} not found"));
+        let grant = crate::tools::workflow_authority::require_workflow_authority(
+            server,
+            &mut tx,
+            auth,
+            actor,
+            workflow_id,
+            "link_hierarchical",
+            &not_found,
+        )
+        .await?;
+        grants.push((workflow_id, grant));
+    }
+
+    // `executes` extends a plan, which `add_step` does only on the head of a
+    // lineage: an older generation is frozen (a pinned generation is verified
+    // against exactly its `executes` edges), so its plan is not repaired here.
+    if params.relationship == "executes" {
+        let names = epigraph_db::WorkflowRepository::canonical_names_of(&mut *tx, &[source_id])
+            .await
+            .map_err(internal_error)?;
+        let head = match names.first() {
+            Some(name) => epigraph_db::WorkflowRepository::head_by_canonical(&mut *tx, name)
+                .await
+                .map_err(internal_error)?,
+            None => None,
+        };
+        if head != Some(source_id) {
+            return Err(invalid_params(format!(
+                "refused: workflow {source_id} is not the head generation of its lineage; \
+                 executes is written to the head only (an older generation's plan is frozen). \
+                 Nothing was written."
+            )));
+        }
+    }
 
     // Cycle refusal (backlog 41d7b27a): `source -rel-> target` closes a cycle
     // exactly when `target` already reaches `source`.
@@ -298,16 +393,18 @@ pub async fn do_link_hierarchical(
     )
     .await
     .map_err(internal_error)?;
-    if let Some(grant) = grant {
+    for (workflow_id, grant) in grants {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
             auth,
             actor,
             "link_hierarchical",
-            source_id,
+            workflow_id,
             grant,
             serde_json::json!({
                 "edge_id": edge_row.id,
+                "source_id": source_id,
+                "source_type": source_type,
                 "relationship": params.relationship,
                 "target_id": target_id,
                 "target_type": target_type,
