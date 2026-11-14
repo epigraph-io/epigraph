@@ -13845,7 +13845,8 @@ async fn reverse_marked_duplicate(
 /// * the supersede cascade binds it the same way for the successor
 ///   ([`ClaimRepository::regenerate_superseded_edge_factors_conn`]).
 ///
-/// It is the body of migration 038's `auto_create_factor_from_edge`, over a
+/// It is the body of migration 038's `auto_create_factor_from_edge` (re-stated
+/// by 217 as a maintenance-owned definer, unchanged in meaning), over a
 /// set, and must stay that: a migration that changes the trigger's mapping,
 /// potentials, description or properties changes this too (the
 /// `unmark_duplicate` tests compare the re-minted rows with the trigger's).
