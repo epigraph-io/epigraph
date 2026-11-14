@@ -42,10 +42,18 @@ COLUMNS = ["backlog", "develop", "review", "accepted", "shipped"]
 STATUSES = ["idle", "queued", "running", "awaiting_review", "merging", "merged", "failed", "stopped"]
 # The claim's own backlog:* status labels (not the board's agent-run STATUSES above), most advanced first.
 BACKLOG_STATUS_PRECEDENCE = ("completed", "working", "pending")
-# A card's corroboration count: distinct other claims with a `corroborates` edge onto it
-# (link_epistemic corroborates, the edge for two claims that both stay current).
+# A card's corroboration count: distinct other current claims joined to it by an in-force `corroborates`
+# edge in EITHER direction. `corroborates` is symmetric (epigraph_core SYMMETRIC_CLAIM_RELATIONSHIPS) and is
+# stored in whichever orientation its writer chose, so a target-only read misses every edge written from the
+# backlog item's side. Read from GET /api/v1/claims/:id/context?list=edges, whose SQL
+# (ClaimContextRepository::epistemic_edges) applies both directions, `valid_to`, viewer visibility and the far
+# claim's is_current.
 CORROBORATION_RELATIONSHIP = "corroborates"
-# Stop asking for counts after this many failures in a row (the edges route is down, not one claim).
+# Page size of that read (the route's maximum) and the most pages one card may take; a claim with more
+# epistemic edges than that gets an unknown count, not a truncated one.
+CORROBORATION_PAGE_LIMIT = 200
+CORROBORATION_MAX_PAGES = 5
+# Stop asking for counts after this many failures in a row (the context route is down, not one claim).
 CORROBORATION_MAX_CONSECUTIVE_FAILURES = 3
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
@@ -712,27 +720,46 @@ def fetch_backlog_http(cfg: Config) -> List[Dict[str, Any]]:
     return out
 
 
-def fetch_corroboration_count(cfg: Config, claim_id: str) -> int:
-    """Distinct other claims with a `corroborates` edge onto `claim_id` that this token can read."""
-    qs = urllib.parse.urlencode({"target_id": claim_id, "relationship": CORROBORATION_RELATIONSHIP})
-    req = urllib.request.Request(cfg.api_base + "/api/v1/edges?" + qs,
-                                 headers={"Accept": "application/json", "Authorization": "Bearer " + cfg.token})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-    if not isinstance(body, list):
-        raise ValueError("edges route did not return a list")
-    sources = set()
-    for edge in body:
-        if not isinstance(edge, dict) or str(edge.get("relationship") or "").lower() != CORROBORATION_RELATIONSHIP:
-            continue
-        src = str(edge.get("source_id") or "").lower()
-        if src and src != claim_id.lower():
-            sources.add(src)
-    return len(sources)
+def fetch_corroboration_count(cfg: Config, claim_id: str) -> Optional[int]:
+    """Distinct other current claims joined to `claim_id` by an in-force `corroborates` edge, either direction.
+
+    Pages GET /api/v1/claims/<id>/context?list=edges. Returns None when the claim has more epistemic edges
+    than CORROBORATION_MAX_PAGES pages hold (a count cut short would understate); raises on a failed read.
+    """
+    headers = {"Accept": "application/json", "Authorization": "Bearer " + cfg.token}
+    base = "%s/api/v1/claims/%s/context?" % (cfg.api_base, urllib.parse.quote(claim_id, safe=""))
+    neighbours = set()
+    after: Optional[str] = None
+    for _ in range(CORROBORATION_MAX_PAGES):
+        params = {"list": "edges", "limit": CORROBORATION_PAGE_LIMIT}
+        if after:
+            params["after"] = after
+        req = urllib.request.Request(base + urllib.parse.urlencode(params), headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        page = body.get("edges") if isinstance(body, dict) else None
+        items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("context route did not return an edges page")
+        for edge in items:
+            if not isinstance(edge, dict) or str(edge.get("relationship") or "").lower() != CORROBORATION_RELATIONSHIP:
+                continue
+            neighbour = edge.get("neighbor")
+            nid = str(neighbour.get("id") or "").lower() if isinstance(neighbour, dict) else ""
+            if nid and nid != claim_id.lower():
+                neighbours.add(nid)
+        after = page.get("next_cursor")
+        if not after:
+            return len(neighbours)
+    return None
 
 
 def fetch_corroboration_counts(cfg: Config, claim_ids: List[str]) -> Dict[str, Optional[int]]:
-    """One count per claim; None where it could not be read. Never raises: counts are decoration."""
+    """One count per claim; None where it could not be read. Never raises: counts are decoration.
+
+    Only a failed read counts toward the consecutive-failure stop; a claim too large to count is a
+    successful read with an unknown answer, so a run of edge-heavy claims does not switch counting off.
+    """
     out: Dict[str, Optional[int]] = {}
     failures = 0
     for cid in claim_ids:
@@ -1492,7 +1519,7 @@ class App:
                 claims = fetch_backlog_claude(self.cfg)
                 source = "claude"
             elif source == "http":
-                # Only the http source can count corroborations (same token, the edges route); the claude source
+                # Only the http source can count corroborations (same token, the context route); the claude source
                 # leaves them unknown. A count that fails stays None and the card keeps its last known value.
                 ids = [c["id"] for c in (normalize_claim(x) for x in claims) if c]
                 counts = fetch_corroboration_counts(self.cfg, ids)
