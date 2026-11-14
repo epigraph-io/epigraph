@@ -644,6 +644,68 @@ fn parse_ingest_visibility(
     epigraph_core::VisibilityChoice::parse_str(visibility, group_id).map_err(invalid_params)
 }
 
+/// Whether a source under `licence` may have its verbatim text republished in
+/// `evidence.raw_content` (backlog 8709d128). An allowlist: public domain,
+/// CC0, and the CC BY / BY-SA family, case-insensitively. `None` (unknown),
+/// non-commercial (`-NC`) and no-derivatives (`-ND`) variants, and anything
+/// unrecognised are all-rights-reserved for this purpose: the graph is
+/// exported as a unit, so a licence that restricts reuse cannot ride along.
+#[must_use]
+pub fn passage_retention_permitted(licence: Option<&str>) -> bool {
+    let Some(licence) = licence else {
+        return false;
+    };
+    let id = licence.trim().to_ascii_uppercase().replace([' ', '_'], "-");
+    if id.contains("-NC") || id.contains("-ND") {
+        return false;
+    }
+    matches!(
+        id.as_str(),
+        "PUBLIC-DOMAIN" | "PD" | "CC0" | "CC-BY" | "CC-BY-SA"
+    ) || id.starts_with("CC0-")
+        || id.starts_with("CC-BY-")
+}
+
+/// The `raw_content` of the evidence row a document ingest writes for one
+/// planned claim. Always the citation, the passage's locator and the BLAKE3
+/// hash of the passage; the passage text itself only when the source's
+/// licence permits retention ([`passage_retention_permitted`]). A reader who
+/// holds the source re-derives the quote from the locator and checks it
+/// against the hash; a reader who does not was never licensed to see it.
+///
+/// The evidence row's `content_hash` is the hash of THIS string, so two
+/// different passages on one claim still produce two different rows.
+#[must_use]
+pub fn literature_evidence_body(
+    paper_title: &str,
+    doi: &str,
+    planned: &PlannedClaim,
+    licence: Option<&str>,
+) -> String {
+    let passage = planned
+        .supporting_text
+        .as_deref()
+        .unwrap_or(&planned.content);
+    let passage_hash = ContentHasher::to_hex(&ContentHasher::hash(passage.as_bytes()));
+    let locator = planned
+        .supporting_locator
+        .clone()
+        .unwrap_or_else(|| format!("level_{}", planned.level));
+    let mut body = format!(
+        "Source: {paper_title} (DOI: {doi}). Locator: {locator}. Passage BLAKE3: {passage_hash}."
+    );
+    match licence {
+        Some(licence) if passage_retention_permitted(Some(licence)) => {
+            body.push_str(&format!(" Licence: {licence}. Passage: '{passage}'"));
+        }
+        Some(licence) => {
+            body.push_str(&format!(" Passage not retained (licence: {licence})."));
+        }
+        None => body.push_str(" Passage not retained (licence unknown)."),
+    }
+    body
+}
+
 /// Resolve an ingest's visibility for its author: whose the claims are, and
 /// the team-write grant to stamp (D-V3). Pure definer reads on the pool. The
 /// home group stays `IngestTx::owner_decl`'s read-only resolution.
@@ -1241,6 +1303,12 @@ pub async fn do_ingest_document_reporting(
     // task was spawned, so the call above is an idempotent read of it.
     let resolution = resolve_ingest_visibility(server, author.agent_id(), choice).await?;
     let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
+    // The source's recorded licence decides whether evidence may keep the
+    // verbatim passage (backlog 8709d128). Read once, from the row, never
+    // from the extraction.
+    let licence = PaperRepository::licence(&mut *tx, paper_id)
+        .await
+        .map_err(internal_error)?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
@@ -1492,12 +1560,8 @@ pub async fn do_ingest_document_reporting(
         .map_err(internal_error)?;
 
         // New claim: write the supporting evidence and reasoning trace.
-        let evidence_text = planned
-            .supporting_text
-            .as_deref()
-            .unwrap_or(&planned.content);
         let formatted_evidence =
-            format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
+            literature_evidence_body(&paper_title, &doi, planned, licence.as_deref());
         let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
         let mut evidence = Evidence::new(
             signer_typed,
@@ -2267,6 +2331,12 @@ pub async fn do_ingest_document_spine(
     let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
     let mut tx =
         begin_ingest_tx(server, author, "ingest_document_spine", resolution.grant()).await?;
+    // The source's recorded licence decides whether evidence may keep the
+    // verbatim passage (backlog 8709d128). Read once, from the row, never
+    // from the extraction.
+    let licence = PaperRepository::licence(&mut *tx, paper_id)
+        .await
+        .map_err(internal_error)?;
 
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
@@ -2493,12 +2563,8 @@ pub async fn do_ingest_document_spine(
         .await
         .map_err(internal_error)?;
 
-        let evidence_text = planned
-            .supporting_text
-            .as_deref()
-            .unwrap_or(&planned.content);
         let formatted_evidence =
-            format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
+            literature_evidence_body(&paper_title, &doi, planned, licence.as_deref());
         let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
         let mut evidence = Evidence::new(
             signer_typed,
