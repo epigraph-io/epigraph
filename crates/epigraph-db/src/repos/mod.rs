@@ -18,6 +18,7 @@ pub mod atlas_layout;
 pub mod atlas_leaf;
 pub mod atlas_map;
 pub mod atlas_meaning;
+pub mod atlas_naming;
 pub mod atom_axiom;
 pub mod authored_by;
 pub mod authorization_code;
@@ -144,6 +145,7 @@ pub use atlas_map::{
     AtlasHierarchy, AtlasMap, AtlasMapRepository, LevelDoc, MapEpochs, MapLevel, NewMapRun,
 };
 pub use atlas_meaning::{AtlasMeaningRepository, ThemeMembers};
+pub use atlas_naming::{AtlasNamingRepository, FinishedRun, RunLevel, StoredName};
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
     LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
