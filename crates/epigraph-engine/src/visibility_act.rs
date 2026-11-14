@@ -21,10 +21,15 @@
 //! why a definer takes cache values from its caller). These functions are the
 //! ONE entry point both transports call (MCP `tools::visibility`, REST
 //! `routes::claim_visibility`): the definer, then, for every moved claim,
-//! [`edge_factor::recompute_claim_cached_belief`], whose fold now admits only
-//! what the moved claim's new audience may read, and which vacates the cache
-//! (the full-ignorance value) when nothing admissible is left. The caller commits after
-//! both, so the act and the refold commit together or not at all.
+//! [`edge_factor::recompute_widened_claim_cached_belief`], whose fold of the
+//! cache-owner frame admits only what the moved claim's new audience may
+//! read. When the owner frame has inputs and none of them is admissible, the
+//! cache is vacated (the full-ignorance value) even if ANOTHER frame of the
+//! claim still has an admissible input: the cached value is the owner frame's
+//! old fold, and the act has just widened who is served it. (An ordinary
+//! recompute vacates only when no frame has an admissible input.) The caller
+//! commits after both, so the act and the refold commit together or not at
+//! all.
 //!
 //! # Fail closed when the session cannot write the moved claim
 //!
@@ -45,8 +50,11 @@
 //!   non-procedural compound) is left as `recompute_claim_cached_belief` leaves
 //!   it: unchanged.
 //! * A claim whose owner frame has only inadmissible rows while ANOTHER frame
-//!   still has an admissible one is not vacated (the vacate rule's claim-wide gate), and
-//!   the owner frame's old fold stays.
+//!   still has an admissible one is vacated, not refolded from that other
+//!   frame: the cache owner rule still picks the owner frame, and the act
+//!   does not change it.
+//! * `claims.truth_value`, which some writers set from a fold, is not
+//!   recomputed.
 //! * Claims moved by 206 before this ran keep the value folded then.
 
 use epigraph_db::errors::RefusalKind;
@@ -154,7 +162,7 @@ async fn refold_moved(
         .into());
     }
     for claim_id in moved {
-        edge_factor::recompute_claim_cached_belief(&mut *conn, viewer, claim_id)
+        edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
             .await
             .map_err(VisibilityActError::Cache)?;
     }

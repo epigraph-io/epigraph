@@ -20,6 +20,13 @@
 //!   claim that never had that BBA. Its stored scoped folds
 //!   (`ds_combined_beliefs`, `ds_bayesian_divergence`) are deleted as stale,
 //!   and another claim's are kept.
+//! * backlog 31285392, the cache-owner frame: a claim whose `binary_truth`
+//!   (the frame that owns its cache) holds only inputs the new audience may
+//!   not read, while its `claim_validity` keeps an admissible one, is served
+//!   full ignorance after the act, not the old `binary_truth` fold. Pinned for
+//!   publicize (a BBA on evidence left behind) and for share (an edge-factor
+//!   BBA from a home-private source claim, through an edge the team cannot
+//!   read). An ordinary recompute leaves such a cache as it was.
 //! * the refold fails closed: an operated agent whose session does not itself
 //!   write the target team is refused, and nothing moves.
 
@@ -32,7 +39,10 @@ use common::*;
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
-use epigraph_engine::edge_factor::recompute_claim_cached_belief;
+use epigraph_engine::edge_factor::{
+    auto_wire_ds_for_edge, ensure_binary_frame, recompute_claim_cached_belief,
+    resolve_claim_validity_frame, EdgeFactorOutcome,
+};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::claims::submit_claim;
 use epigraph_mcp::tools::visibility::{publicize_claims, share_claims_with_team};
@@ -748,4 +758,175 @@ async fn an_act_whose_session_cannot_refold_the_moved_claim_is_refused(pool: PgP
         "nothing moved"
     );
     assert!(audit(&pool, "claim.shared_with_team").await.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31285392: the cache-owner frame left with no admissible input
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A BBA on `frame` of `claim`, by `agent`, citing `evidence`, with mass `t`
+/// on hypothesis 0 and the rest on the whole frame.
+async fn bba_on(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid, t: f64) {
+    let n: i32 = sqlx::query_scalar("SELECT array_length(hypotheses, 1) FROM frames WHERE id = $1")
+        .bind(frame)
+        .fetch_one(pool)
+        .await
+        .expect("frame size");
+    let all = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let mut masses = serde_json::Map::new();
+    masses.insert("0".to_string(), serde_json::json!(t));
+    masses.insert(all, serde_json::json!(1.0 - t));
+    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
+        .await
+        .expect("evidence perspective");
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        Some(evidence),
+        &serde_json::Value::Object(masses),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        Some(evidence),
+    )
+    .await
+    .expect("store a BBA");
+}
+
+/// `(binary_truth, claim_validity)` frame ids.
+async fn frames(pool: &PgPool) -> (Uuid, Uuid) {
+    let public = fixture::public_viewer(pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let binary = ensure_binary_frame(&mut conn, &public)
+        .await
+        .expect("binary_truth");
+    let validity = resolve_claim_validity_frame(&mut conn, &public)
+        .await
+        .expect("claim_validity");
+    (binary, validity)
+}
+
+async fn cache_frame(pool: &PgPool, claim: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("belief_frame_id")
+}
+
+/// Full ignorance on the binary frame: BetP 0.5, Bel 0, Pl 1.
+fn vacuous(c: &Cache) -> bool {
+    same(c, &(Some(0.5), Some(0.0), Some(1.0)))
+}
+
+/// Publicize: the team claim's cache is owned by `binary_truth`, whose only
+/// input cites evidence pinned in the team; its `claim_validity` input cites
+/// evidence that goes public with it. After the act a stranger is served full
+/// ignorance, not the team's `binary_truth` fold of the pinned evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_vacates_a_cache_whose_owner_frame_cites_only_evidence_left_behind(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (binary, validity) = frames(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "owner-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "owner-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = fixture::seed_group_claim(&pool, eve, t, "a team finding, two frames").await;
+    let open = fixture::seed_evidence(&pool, c, "observation").await;
+    let hidden = fixture::seed_evidence(&pool, c, "reference").await;
+    pin(&pool, hidden, eve).await;
+    bba_on(&pool, c, validity, eve, open, 0.7).await;
+    bba_on(&pool, c, binary, eve, hidden, 0.9).await;
+    refold(&pool, &s, eve, c).await;
+    let stale = cache(&pool, c).await;
+    assert!(
+        cache_frame(&pool, c).await == Some(binary) && stale.0.is_some_and(|p| p > 0.6),
+        "PREMISE: binary_truth owns the team's fold of the pinned evidence ({stale:?})"
+    );
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    assert_eq!(
+        tenancy(&pool, "evidence", open).await.0,
+        "public",
+        "PREMISE: the claim_validity input went public with the claim"
+    );
+    let served = served_cache(&pool, &s, carol, c).await;
+    assert!(
+        vacuous(&served),
+        "a stranger must be served full ignorance once binary_truth (the cache owner) has no \
+         input it may read; it was served {served:?}, the team's fold was {stale:?}"
+    );
+    assert_eq!(cache_frame(&pool, c).await, Some(binary), "owner unchanged");
+}
+
+/// Share: the private claim's `binary_truth` holds only an edge-factor BBA
+/// carrying a home-private source claim's belief through a home edge; its
+/// `claim_validity` input cites the claim's own evidence, which moves with it.
+/// After the share the edge is not the team's to read, and the teammate is
+/// served full ignorance, not the home fold that carries the source's belief.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_vacates_a_cache_whose_owner_frame_holds_only_a_home_edge_factor_bba(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (_, validity) = frames(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "owner-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "owner-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let source = fixture::seed_group_claim(&pool, alice, home, "a home-private source").await;
+    sqlx::query("UPDATE claims SET belief = 0.9, plausibility = 0.95 WHERE id = $1")
+        .bind(source)
+        .execute(&pool)
+        .await
+        .expect("the source's belief");
+    let c = fixture::seed_group_claim(&pool, alice, home, "a private finding, two frames").await;
+    let own = fixture::seed_evidence(&pool, c, "observation").await;
+    bba_on(&pool, c, validity, alice, own, 0.7).await;
+    let edge = fixture::seed_edge(&pool, source, c).await;
+    let wired = auto_wire_ds_for_edge(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer(&pool, alice).await,
+        edge,
+        alice,
+        source,
+        c,
+        "supports",
+    )
+    .await
+    .expect("wire the edge");
+    assert!(
+        matches!(wired, EdgeFactorOutcome::Wired),
+        "PREMISE: {wired:?}"
+    );
+    let (binary, _) = frames(&pool).await;
+    refold(&pool, &s, alice, c).await;
+    let stale = cache(&pool, c).await;
+    assert!(
+        cache_frame(&pool, c).await == Some(binary) && stale.0.is_some() && !vacuous(&stale),
+        "PREMISE: binary_truth owns the home fold of the source's belief ({stale:?})"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(t),
+        "PREMISE: moved"
+    );
+    assert!(
+        !reads_row(&pool, &s, bob, "edges", edge).await,
+        "PREMISE: the teammate cannot read the home edge"
+    );
+    let served = served_cache(&pool, &s, bob, c).await;
+    assert!(
+        vacuous(&served),
+        "the teammate must be served full ignorance once binary_truth (the cache owner) holds \
+         only the home edge's BBA; it was served {served:?}, the home fold was {stale:?}"
+    );
 }
