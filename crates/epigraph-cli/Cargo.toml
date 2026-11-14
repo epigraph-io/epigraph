@@ -390,6 +390,16 @@ name = "atlas_links"
 path = "tests/atlas_links.rs"
 required-features = ["db"]
 
+[[bin]]
+name = "atlas_nightly"
+path = "src/bin/atlas_nightly.rs"
+required-features = ["db"]
+
+[[test]]
+name = "atlas_nightly"
+path = "tests/atlas_nightly.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every

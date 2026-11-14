@@ -25,5 +25,7 @@
 //! hierarchies, only if its leaves re-assemble identically) or dropped, and
 //! reported; it never fails the night.
 
+pub mod build;
 pub mod incremental;
+pub mod leaves;
 pub mod previous;
