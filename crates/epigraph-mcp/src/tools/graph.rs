@@ -216,9 +216,9 @@ pub async fn traverse(
             label,
             truth_value: truth,
             // What `min_truth` was compared against: the DS pignistic
-            // probability, or `truth_value` when the node carries no DS cache
-            // (and always, on the default `min_truth = 0.0` path, where the
-            // lookup is skipped because it could not change the outcome).
+            // probability, or `truth_value` when the node carries no DS cache.
+            // On the default `min_truth = 0.0` path this is `truth_value` for
+            // now and is resolved in one batch after the walk.
             belief_score,
             depth,
         });
@@ -251,6 +251,40 @@ pub async fn traverse(
                         queue.push_back((e.target_id, depth + 1, vec![e.target_type]));
                     }
                 }
+            }
+        }
+    }
+
+    // On the default path (`min_truth` 0.0) the per-node lookup above is
+    // skipped, because it cannot change which nodes are admitted. It used to
+    // leave `belief_score` holding the AUTHORED `truth_value`, so the same
+    // claim read 0.40 here and 0.62 from `recall` (backlog 1574d9b4). One
+    // batched read after the walk fills in the score `recall` reports: the DS
+    // pignistic probability when the claim has DS state, else `truth_value`.
+    // A claim absent from the map keeps the `truth_value` already in hand
+    // (`effective_belief_batch`'s fall-back contract), as does every node if
+    // the read fails: the walk itself has succeeded.
+    if min_truth <= 0.0 {
+        let claim_ids: Vec<uuid::Uuid> = nodes
+            .iter()
+            .filter(|n| n.truth_value.is_some())
+            .filter_map(|n| n.id.parse().ok())
+            .collect();
+        match ClaimRepository::effective_belief_batch(&mut *read, viewer, &claim_ids).await {
+            Ok(beliefs) => {
+                for node in &mut nodes {
+                    let resolved = node
+                        .id
+                        .parse::<uuid::Uuid>()
+                        .ok()
+                        .and_then(|id| beliefs.get(&id));
+                    if let (Some(_), Some(score)) = (node.truth_value, resolved) {
+                        node.belief_score = Some(*score);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "traverse: belief lookup failed; belief_score falls back to truth_value");
             }
         }
     }
