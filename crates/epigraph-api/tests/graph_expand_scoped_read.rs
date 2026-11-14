@@ -804,3 +804,311 @@ async fn compound_neighborhood_center_kind_ignores_a_decomposition_the_viewer_ca
         "a centre whose only parent edge is hidden must be standalone to this viewer"
     );
 }
+
+// ── arm 4: the neighborhood expand's EDGE arrays describe the viewer's graph ──
+//
+// `F-edges-unfiltered`, continued. `nodes` comes from
+// `GraphViewRepository::neighborhood_compound_nodes`, which walks only the
+// `edges` rows the viewer can read. The three edge arrays beside it must walk
+// the SAME edges, or the response describes two graphs: a readable node with
+// readable edges served with no edges, which tells the viewer a hidden edge
+// exists, or a hidden edge between two readable nodes served outright.
+//
+// Every claim below is PUBLIC, so the `claims` and membership predicates
+// cannot act. Each hidden edge has its own tenancy forced to a stranger's
+// group, so only the edge predicate can withhold it, and each arm has a
+// calibration edge private to the VIEWER's own group that must be walked.
+
+/// An edge with its own tenancy FORCED to `(visibility, owner)` after the
+/// insert (migration 070's trigger stamps it from the endpoints otherwise).
+async fn edge_owned(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+    visibility: &str,
+    owner: Uuid,
+) {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, 'claim', $3, 'claim', $4)",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("seed edge");
+    sqlx::query(
+        "UPDATE edges SET visibility = $2, owner_group_id = $3, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(visibility)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("force edge tenancy");
+}
+
+async fn compound_expand(
+    pool: &PgPool,
+    agent: Uuid,
+    neighborhood_id: Uuid,
+) -> epigraph_api::routes::graph_neighborhood::CompoundResponse {
+    let out = neighborhood_expand(
+        ViewerExtractor(viewer_for(pool, agent).await),
+        State(split_state(pool).await),
+        Path(neighborhood_id),
+        Query(NeighborhoodExpandParams {
+            budget: 200,
+            mode: "compound".to_string(),
+        }),
+    )
+    .await
+    .expect("the neighborhood is in the latest run, so this must SERVE")
+    .0;
+    let NeighborhoodExpandResponse::Compound(compound) = out else {
+        panic!("mode=compound must select the compound arm of the untagged enum");
+    };
+    compound
+}
+
+/// `direct_edges` classifies compounds and standalones over the same edges as
+/// `nodes`, and does not serve a hidden edge between two served nodes.
+///
+/// - `a` has a hidden `decomposes_to` parent, `barren` a hidden child outside
+///   the neighborhood. `nodes` serves both as standalone, so their public
+///   `supports` edges to `x` must be served too. Classified over unfiltered
+///   `edges`, neither was in the compound universe and both edges vanished.
+/// - `y -> x` is hidden and must be absent; `x -> y` is private to the
+///   viewer's group and must be present.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhoods_expand_direct_edges_describe_the_graph_its_nodes_do(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "gx-de-mine").await;
+    let (_stranger, stranger_group) = seed_agent_with_group(&pool, "gx-de-theirs").await;
+    let world = world_group(&pool).await;
+
+    let a = seed_public_claim(&pool, viewer_agent, "gx de: atom with a hidden parent").await;
+    let p = seed_public_claim(&pool, viewer_agent, "gx de: the hidden parent").await;
+    let barren = seed_public_claim(&pool, viewer_agent, "gx de: member with a hidden child").await;
+    let z = seed_public_claim(&pool, viewer_agent, "gx de: the hidden child").await;
+    let x = seed_public_claim(&pool, viewer_agent, "gx de: standalone x").await;
+    let y = seed_public_claim(&pool, viewer_agent, "gx de: standalone y").await;
+
+    edge_owned(&pool, p, a, "decomposes_to", "group", stranger_group).await;
+    edge_owned(&pool, barren, z, "decomposes_to", "group", stranger_group).await;
+    edge_owned(&pool, a, x, "supports", "public", world).await;
+    edge_owned(&pool, barren, x, "supports", "public", world).await;
+    edge_owned(&pool, y, x, "contradicts", "group", stranger_group).await;
+    edge_owned(&pool, x, y, "supports", "group", viewer_group).await;
+
+    let run = seed_run(&pool, 4).await;
+    for member in [a, barren, x, y] {
+        join_neighborhood(&pool, &run, member).await;
+    }
+
+    let out = compound_expand(&pool, viewer_agent, run.neighborhood_id).await;
+    let kinds: Vec<(Uuid, &str)> = out.nodes.iter().map(|n| (n.id, n.kind.as_str())).collect();
+    for member in [a, barren, x, y] {
+        assert!(
+            kinds.contains(&(member, "standalone")),
+            "CALIBRATION: every member is served as standalone to this viewer \
+             ({member} missing); got {kinds:?}"
+        );
+    }
+    let direct: Vec<(Uuid, Uuid, &str)> = out
+        .direct_edges
+        .iter()
+        .map(|e| (e.source, e.target, e.relationship.as_str()))
+        .collect();
+
+    assert!(
+        direct.contains(&(x, y, "supports")),
+        "CALIBRATION: an edge private to the viewer's own group between two served \
+         nodes must be served; got {direct:?}"
+    );
+    assert!(
+        direct.contains(&(a, x, "supports")),
+        "a public edge from an atom whose only parent edge is hidden must be served: \
+         `nodes` serves the atom as standalone, and dropping its edges tells the \
+         viewer a hidden parent exists; got {direct:?}"
+    );
+    assert!(
+        direct.contains(&(barren, x, "supports")),
+        "a public edge from a member whose only child edge is hidden must be served; \
+         got {direct:?}"
+    );
+    assert!(
+        !direct.contains(&(y, x, "contradicts")),
+        "an edge only another group can read must not be served, even between two \
+         served nodes; got {direct:?}"
+    );
+    assert_eq!(
+        direct.len(),
+        3,
+        "exactly the three readable edges; got {direct:?}"
+    );
+}
+
+/// `induced_edges` and `structural_edges` aggregate only edges the viewer can
+/// read.
+///
+/// `c1` and `c2` are compounds through public `decomposes_to` edges onto the
+/// members `a1` and `a2`.
+///
+/// - induced: `a1 -> a2` is hidden and `a2 -> a1` is the viewer's own, so
+///   `c2 -> c1` is induced and `c1 -> c2` is not. `a2 -> a1` also projects
+///   onto `c4` (the viewer's edge) but not onto `c3` (a hidden parent edge).
+/// - shared_atom: `c3` (a compound through its public edge onto `a3`) parents
+///   `a1` through a HIDDEN edge, and `c4` (through `a4`) through the VIEWER's
+///   own, so `(c1, c4)` share an atom and `(c1, c3)` do not.
+/// - shared_ancestor: `c1` and `c2` have four common parents. `g` reaches `c1`
+///   through a hidden edge and `c2` through a public one, `g2` the other way
+///   round, so each side's edge predicate is needed whichever compound sorts
+///   first; `k` reaches both through public edges, but `k`'s own claim is
+///   private to the stranger; `h` reaches both through the viewer's own edges.
+///   The ancestor count is 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhoods_expand_induced_and_structural_edges_walk_only_readable_edges(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "gx-ie-mine").await;
+    let (stranger, stranger_group) = seed_agent_with_group(&pool, "gx-ie-theirs").await;
+    let world = world_group(&pool).await;
+
+    let mut public = Vec::new();
+    for label in [
+        "c1", "c2", "c3", "c4", "a1", "a2", "a3", "a4", "g", "g2", "h",
+    ] {
+        public.push(seed_public_claim(&pool, viewer_agent, &format!("gx ie: {label}")).await);
+    }
+    let [c1, c2, c3, c4, a1, a2, a3, a4, g, g2, h]: [Uuid; 11] =
+        public.try_into().expect("eleven public claims");
+    let k = seed_group_claim(&pool, stranger, stranger_group, "gx ie: their ancestor").await;
+
+    for (compound, atom) in [(c1, a1), (c2, a2), (c3, a3), (c4, a4)] {
+        edge_owned(&pool, compound, atom, "decomposes_to", "public", world).await;
+    }
+    edge_owned(&pool, a1, a2, "supports", "group", stranger_group).await;
+    edge_owned(&pool, a2, a1, "supports", "group", viewer_group).await;
+    edge_owned(&pool, c3, a1, "decomposes_to", "group", stranger_group).await;
+    edge_owned(&pool, c4, a1, "decomposes_to", "group", viewer_group).await;
+    edge_owned(&pool, g, c1, "decomposes_to", "group", stranger_group).await;
+    edge_owned(&pool, g, c2, "decomposes_to", "public", world).await;
+    edge_owned(&pool, g2, c1, "decomposes_to", "public", world).await;
+    edge_owned(&pool, g2, c2, "decomposes_to", "group", stranger_group).await;
+    for compound in [c1, c2] {
+        edge_owned(&pool, k, compound, "decomposes_to", "public", world).await;
+        edge_owned(&pool, h, compound, "decomposes_to", "group", viewer_group).await;
+    }
+
+    let run = seed_run(&pool, 4).await;
+    for member in [a1, a2, a3, a4] {
+        join_neighborhood(&pool, &run, member).await;
+    }
+
+    let out = compound_expand(&pool, viewer_agent, run.neighborhood_id).await;
+    let compounds: Vec<Uuid> = out
+        .nodes
+        .iter()
+        .filter(|n| n.kind == "compound")
+        .map(|n| n.id)
+        .collect();
+    for c in [c1, c2, c3, c4] {
+        assert!(
+            compounds.contains(&c),
+            "CALIBRATION: {c} is a compound through a readable edge; got {compounds:?}"
+        );
+    }
+
+    let induced: Vec<(Uuid, Uuid, i32)> = out
+        .induced_edges
+        .iter()
+        .map(|e| (e.source, e.target, e.atom_edge_count))
+        .collect();
+    assert!(
+        induced.contains(&(c2, c1, 1)),
+        "CALIBRATION: an atom edge private to the viewer's own group induces a \
+         compound edge; got {induced:?}"
+    );
+    assert!(
+        !induced.iter().any(|(s, t, _)| (*s, *t) == (c1, c2)),
+        "an atom edge only another group can read must not induce a compound edge; \
+         got {induced:?}"
+    );
+    assert!(
+        induced.contains(&(c2, c4, 1)),
+        "CALIBRATION: an atom projects onto a parent reached through the viewer's own \
+         edge; got {induced:?}"
+    );
+    assert!(
+        !induced.iter().any(|(s, t, _)| (*s, *t) == (c2, c3)),
+        "an atom must not project onto a parent reached only through a hidden edge; \
+         got {induced:?}"
+    );
+
+    let pair = |s: Uuid, t: Uuid| (s.min(t), s.max(t));
+    let structural: Vec<((Uuid, Uuid), &str, i32)> = out
+        .structural_edges
+        .iter()
+        .map(|e| ((e.source, e.target), e.kind.as_str(), e.atom_count))
+        .collect();
+    assert!(
+        structural.contains(&(pair(c1, c4), "shared_atom", 1)),
+        "CALIBRATION: compounds sharing an atom through the viewer's own edge are \
+         structurally linked; got {structural:?}"
+    );
+    assert!(
+        !structural
+            .iter()
+            .any(|(p, kind, _)| *p == pair(c1, c3) && *kind == "shared_atom"),
+        "compounds sharing an atom only through a hidden edge must not be linked; \
+         got {structural:?}"
+    );
+    assert!(
+        structural.contains(&(pair(c1, c2), "shared_ancestor", 1)),
+        "the shared-ancestor count must count only the ancestor the viewer can read \
+         through edges it can read (4 before: two hidden-edge ancestors and an \
+         unreadable ancestor were counted); got {structural:?}"
+    );
+}
+
+/// Atomic mode's `edges` walk only the edges the viewer can read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhoods_expand_atomic_edges_walk_only_readable_edges(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "gx-ae-mine").await;
+    let (_stranger, stranger_group) = seed_agent_with_group(&pool, "gx-ae-theirs").await;
+
+    let x = seed_public_claim(&pool, viewer_agent, "gx ae: x").await;
+    let y = seed_public_claim(&pool, viewer_agent, "gx ae: y").await;
+    edge_owned(&pool, x, y, "supports", "group", stranger_group).await;
+    edge_owned(&pool, y, x, "supports", "group", viewer_group).await;
+
+    let run = seed_run(&pool, 2).await;
+    join_neighborhood(&pool, &run, x).await;
+    join_neighborhood(&pool, &run, y).await;
+
+    let out = neighborhood_expand(
+        ViewerExtractor(viewer_for(&pool, viewer_agent).await),
+        State(split_state(&pool).await),
+        Path(run.neighborhood_id),
+        Query(NeighborhoodExpandParams {
+            budget: 200,
+            mode: "atomic".to_string(),
+        }),
+    )
+    .await
+    .expect("atomic mode must SERVE the neighborhood")
+    .0;
+    let NeighborhoodExpandResponse::Atomic(atomic) = out else {
+        panic!("mode=atomic must select the atomic arm of the untagged enum");
+    };
+    let edges: Vec<(Uuid, Uuid)> = atomic.edges.iter().map(|e| (e.source, e.target)).collect();
+    assert_eq!(
+        edges,
+        vec![(y, x)],
+        "exactly the edge private to the viewer's own group; the edge only another \
+         group can read must be absent"
+    );
+}

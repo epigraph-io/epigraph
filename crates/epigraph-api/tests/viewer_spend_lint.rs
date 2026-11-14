@@ -1286,24 +1286,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
-    // stamped: the neighborhood's edge projections, on the caller's stamped
-    // connection, are constrained in Rust to endpoints that survived the
-    // viewer-filtered node projection (PR-07); the edges' own predicate is
-    // F-edges-unfiltered.
-    (
-        "graph_neighborhood.rs",
-        "atomic_response",
-        &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    (
-        "graph_neighborhood.rs",
-        "compound_response",
-        &[
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-        ],
-    ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
     // unconverted no_unscoped_pool.rs site); every projection in
     // load_subgraph_conn splices the viewer except `agents` (untenanted).
