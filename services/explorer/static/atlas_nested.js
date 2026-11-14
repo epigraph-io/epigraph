@@ -14,9 +14,11 @@
  *   (cites, an agent's authorship) is a hairline and carries no flow.
  * - The one exception: evidence with no readable mass is served
  *   flow_basis none, weight 0 and sign 0 whatever it says, so a none edge
- *   takes its tone from its relationship (supports; refutes or contradicts).
- *   It is drawn as a thin solid line with no flow ("evidence, no stored
- *   mass"), apart from both exact flows and dashed estimates.
+ *   from an evidence node to a claim node takes its tone from its
+ *   relationship (supports; refutes or contradicts). It is drawn as a thin
+ *   solid line with no flow ("evidence, no stored mass"), apart from both
+ *   exact flows and dashed estimates. Any other none edge (an agent's, or
+ *   one from a claim) stays a neutral hairline whatever it is called.
  * - Positions are the precomputed ones: leafPositions and placeChildren are
  *   affine maps into the parent circle, with no simulation and no settle.
  * - Colour still means truth_value, as on the region and theme levels; no
@@ -98,9 +100,9 @@
   }
 
   /**
-   * The tone of a none edge that is evidence for or against its claim, from
-   * its relationship (either casing), or null for any other none edge (an
-   * agent's authorship). Its sign is 0, so the name is all there is.
+   * The tone of a none evidence-to-claim edge that is evidence for or
+   * against its claim, from its relationship (either casing), or null for
+   * any other relationship. Its sign is 0, so the name is all there is.
    */
   function noMassTone(relationship) {
     if (typeof relationship !== 'string') return null;
@@ -110,21 +112,26 @@
 
   /**
    * How a leaf edge is drawn. `basis` is exact | proxy | none; anything else
-   * counts as none. Returns {basis, width, alpha, dash, estimate, tone,
-   * direction, particles, flows, noMass}. For exact and proxy edges `tone` follows the
-   * sign whatever the weight; width, direction and particles need a weight
-   * above 0 and a non-zero sign. A none edge never flows; one that supports,
-   * refutes or contradicts is evidence with no stored mass (`noMass`), toned
-   * by that relationship and drawn NO_MASS_WIDTH wide at NO_MASS_ALPHA, so
-   * its colour reads where a hairline's would not.
+   * counts as none. `ends` = {source, target} are the kinds (claim |
+   * evidence | agent) of the edge's two leaf nodes. Returns {basis, width,
+   * alpha, dash, estimate, tone, direction, particles, flows, noMass}. For
+   * exact and proxy edges `tone` follows the sign whatever the weight; width,
+   * direction and particles need a weight above 0 and a non-zero sign. A none
+   * edge never flows; one from an evidence node to a claim node that
+   * supports, refutes or contradicts is evidence with no stored mass
+   * (`noMass`), toned by that relationship and drawn NO_MASS_WIDTH wide at
+   * NO_MASS_ALPHA, so its colour reads where a hairline's would not. Without
+   * `ends`, or with any other pair of kinds, a none edge is a neutral
+   * hairline: a name alone never makes an edge read as evidence.
    */
-  function edgeStyle(edge) {
+  function edgeStyle(edge, ends) {
     const e = edge || {};
     const basis = e.flow_basis === 'exact' || e.flow_basis === 'proxy' ? e.flow_basis : 'none';
     const weight = clamp01(e.flow_weight);
     const direction = flowDirection(e.sign);
     const flows = basis !== 'none' && weight > 0 && direction !== 0;
-    const massless = basis === 'none' ? noMassTone(e.relationship) : null;
+    const evidenceToClaim = !!ends && ends.source === 'evidence' && ends.target === 'claim';
+    const massless = basis === 'none' && evidenceToClaim ? noMassTone(e.relationship) : null;
     // Otherwise the tone comes from the sign alone: a contradicting link
     // stored with strength 0 still reads as opposing, though it carries no
     // flow.

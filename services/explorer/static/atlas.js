@@ -1390,6 +1390,13 @@
     }
   }
 
+  /** The kinds of an edge's two leaf nodes, which edgeStyle needs to tell evidence from the rest. */
+  function leafEnds(leaf, e) {
+    const s = leaf.childById.get(e.source);
+    const t = leaf.childById.get(e.target);
+    return { source: s ? s.sub : null, target: t ? t.sub : null };
+  }
+
   function drawLeafFlows(node, it, labels, now, moving) {
     const edges = node.doc.edges || [];
     // Thinner strokes in a dense leaf, so its flows stay legible.
@@ -1399,7 +1406,7 @@
       const s = node.childById.get(e.source);
       const t = node.childById.get(e.target);
       if (!s || !t) continue;
-      const style = NESTED.edgeStyle(e);
+      const style = NESTED.edgeStyle(e, leafEnds(node, e));
       const [sx, sy] = toScreen(s.x, s.y);
       const [tx, ty] = toScreen(t.x, t.y);
       const len = Math.hypot(tx - sx, ty - sy);
@@ -1551,7 +1558,7 @@
       for (const e of list) {
         const other = leaf.childById.get(otherEnd(e));
         if (!other) continue;
-        const style = NESTED.edgeStyle(e);
+        const style = NESTED.edgeStyle(e, leafEnds(leaf, e));
         const weight = style.flows
           ? ' · ' + (num(e.flow_weight) || 0).toFixed(2) + (style.estimate ? ' (estimate)' : '')
           : style.noMass

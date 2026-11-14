@@ -147,12 +147,20 @@ test('a signed link with weight 0 keeps its tone but carries no flow', () => {
 const sparse = () => {
   const leaf = fixture('team_leaf_sparse_mass');
   const kinds = new Map(leaf.nodes.map((n) => [n.id, n.kind]));
-  const fromEvidence = leaf.edges.filter((e) => kinds.get(e.source) === 'evidence');
+  const fromEvidence = leaf.edges.filter((e) => kinds.get(e.source) === 'evidence' && kinds.get(e.target) === 'claim');
   const rel = (e) => e.relationship.toLowerCase();
   return {
+    leaf,
     none: (r) => fromEvidence.filter((e) => e.flow_basis === 'none' && rel(e) === r),
     exact: fromEvidence.filter((e) => e.flow_basis === 'exact'),
   };
+};
+/** The ends atlas.js passes: the kinds of the edge's two leaf nodes. */
+const EV = { source: 'evidence', target: 'claim' };
+/** How a leaf edge is drawn, given its ends as the leaf serves them. */
+const styleIn = (doc, e) => {
+  const kinds = new Map(doc.nodes.map((n) => [n.id, n.kind]));
+  return N.edgeStyle(e, { source: kinds.get(e.source), target: kinds.get(e.target) });
 };
 
 /** A massless evidence edge: no flow at all, solid, and not an estimate. */
@@ -174,12 +182,12 @@ test('a none evidence edge that refutes gets the opposing tone and no flow', () 
   assert.ok(refutes.length > 0, 'the fixture holds a none refutes evidence edge');
   for (const e of refutes) {
     assert.equal(e.sign, 0, 'served with sign 0: the direction is in the relationship');
-    const s = N.edgeStyle(e);
+    const s = styleIn(sparse().leaf, e);
     assert.equal(s.tone, 'oppose', JSON.stringify(e));
     assertNoFlow(s, JSON.stringify(e));
   }
   // contradicts reads the same way, in either casing.
-  const c = N.edgeStyle(Object.assign({}, refutes[0], { relationship: 'CONTRADICTS' }));
+  const c = N.edgeStyle(Object.assign({}, refutes[0], { relationship: 'CONTRADICTS' }), EV);
   assert.equal(c.tone, 'oppose');
   assertNoFlow(c, 'contradicts');
 });
@@ -191,15 +199,15 @@ test('a none evidence edge that supports gets the supporting tone and no flow', 
   assert.ok(upper.length > 0, 'and one spelled SUPPORTS');
   for (const e of supports) {
     assert.equal(e.sign, 0);
-    const s = N.edgeStyle(e);
+    const s = styleIn(sparse().leaf, e);
     assert.equal(s.tone, 'support', JSON.stringify(e));
     assertNoFlow(s, JSON.stringify(e));
   }
 });
 
 test('a massless evidence line is told apart from exact flows and dashed estimates', () => {
-  const sup = N.edgeStyle(sparse().none('supports')[0]);
-  const opp = N.edgeStyle(sparse().none('refutes')[0]);
+  const sup = N.edgeStyle(sparse().none('supports')[0], EV);
+  const opp = N.edgeStyle(sparse().none('refutes')[0], EV);
   const others = [
     // exact flows, and an exact signed edge stored with weight 0
     N.edgeStyle(edge({ flow_basis: 'exact', sign: 1, flow_weight: 0.5 })),
@@ -222,7 +230,7 @@ test('an exact evidence edge is unchanged: its sign, not its relationship, sets 
   const exact = sparse().exact;
   assert.ok(exact.length > 0, 'the fixture keeps some exact evidence beside the none edges');
   for (const e of exact) {
-    const s = N.edgeStyle(e);
+    const s = styleIn(sparse().leaf, e);
     assert.equal(s.basis, 'exact');
     assert.equal(s.tone, e.sign > 0 ? 'support' : 'oppose', JSON.stringify(e));
     assert.equal(s.flows, e.flow_weight > 0, JSON.stringify(e));
@@ -236,18 +244,47 @@ test('an exact evidence edge is unchanged: its sign, not its relationship, sets 
     [1, 'refutes', 'support'],
     [-1, 'supports', 'oppose'],
   ]) {
-    const s = N.edgeStyle(edge({ flow_basis: 'exact', sign, flow_weight: 0.4, relationship: rel }));
+    const s = N.edgeStyle(edge({ flow_basis: 'exact', sign, flow_weight: 0.4, relationship: rel }), EV);
     assert.equal(s.tone, tone, rel);
     assert.equal(s.direction, sign, rel);
     assert.ok(s.flows && !s.noMass, rel);
   }
-  // A none edge that is not evidence for or against (an agent's authorship)
-  // stays neutral.
-  for (const rel of ['authored', 'AUTHORED', 'asserts']) {
-    const s = N.edgeStyle(edge({ flow_basis: 'none', sign: 0, flow_weight: 0, relationship: rel }));
+  // A none evidence edge that is not for or against stays neutral.
+  for (const rel of ['authored', 'AUTHORED', 'asserts', 'cites']) {
+    const s = N.edgeStyle(edge({ flow_basis: 'none', sign: 0, flow_weight: 0, relationship: rel }), EV);
     assert.equal(s.tone, 'neutral', rel);
     assert.ok(!s.noMass, rel);
   }
+});
+
+test('only an evidence-to-claim none edge reads as massless evidence; other ends stay neutral hairlines', () => {
+  const none = (relationship) => edge({ flow_basis: 'none', sign: 0, flow_weight: 0, relationship });
+  // The contract serves basis none for every pair of kinds but claim to
+  // claim, and does not limit the relationship name: a supports or refutes
+  // edge out of a claim or an agent, or into evidence, is not evidence for
+  // a claim, so it never takes a tone or the "no stored mass" line.
+  for (const ends of [
+    { source: 'claim', target: 'evidence' },
+    { source: 'agent', target: 'claim' },
+    { source: 'claim', target: 'agent' },
+    { source: 'evidence', target: 'evidence' },
+    { source: 'evidence', target: 'agent' },
+    { source: 'claim', target: 'claim' },
+    { source: null, target: 'claim' },
+    undefined,
+  ]) {
+    for (const rel of ['supports', 'SUPPORTS', 'refutes', 'contradicts']) {
+      const s = N.edgeStyle(none(rel), ends);
+      const why = rel + ' ' + JSON.stringify(ends);
+      assert.equal(s.tone, 'neutral', why);
+      assert.equal(s.noMass, false, why);
+      assert.equal(s.width, N.HAIRLINE, why);
+      assert.equal(s.flows, false, why);
+    }
+  }
+  // The same edges from evidence to a claim do read as massless evidence.
+  assert.equal(N.edgeStyle(none('refutes'), EV).tone, 'oppose');
+  assert.equal(N.edgeStyle(none('supports'), EV).tone, 'support');
 });
 
 test('the preview has a leaf with massless evidence for and against, drawn in tone', () => {
@@ -258,7 +295,7 @@ test('the preview has a leaf with massless evidence for and against, drawn in to
     const tones = new Set(
       d.edges
         .filter((e) => kinds.get(e.source) === 'evidence' && e.flow_basis === 'none')
-        .map((e) => N.edgeStyle(e))
+        .map((e) => styleIn(d, e))
         .filter((s) => s.noMass)
         .map((s) => s.tone),
     );
