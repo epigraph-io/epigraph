@@ -23,14 +23,14 @@
 //! `routes::claim_visibility`): the definer, then, for every moved claim,
 //! [`edge_factor::recompute_claim_cached_belief`], whose fold now admits only
 //! what the moved claim's new audience may read, and which vacates the cache
-//! (ruling R-80) when nothing admissible is left. The caller commits after
+//! (the full-ignorance value) when nothing admissible is left. The caller commits after
 //! both, so the act and the refold commit together or not at all.
 //!
 //! # Fail closed when the session cannot write the moved claim
 //!
 //! The refold writes `claims` on the caller's stamped session, under row
 //! security. A share admits a target team the caller writes only through its
-//! live human (D-V3, `epigraph_writable_teams` `via = 'operator'`), and the
+//! live human (the operator arm, `epigraph_writable_teams` `via = 'operator'`), and the
 //! caller's own stamp does not carry that team. After the move the session
 //! then cannot read or write the claim, the refold would silently match
 //! nothing, and the stale value would be served to the team. Every moved claim
@@ -45,7 +45,7 @@
 //!   non-procedural compound) is left as `recompute_claim_cached_belief` leaves
 //!   it: unchanged.
 //! * A claim whose owner frame has only inadmissible rows while ANOTHER frame
-//!   still has an admissible one is not vacated (R-80's claim-wide gate), and
+//!   still has an admissible one is not vacated (the vacate rule's claim-wide gate), and
 //!   the owner frame's old fold stays.
 //! * Claims moved by 206 before this ran keep the value folded then.
 

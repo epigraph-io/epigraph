@@ -48,7 +48,7 @@
 -- * publicize: the evidence-endpoint edges join 206's claim-endpoint edges in
 --   ONE selection and ONE recompute, so they take 206's meet exactly (widening
 --   allowed; two public endpoints give the recorded writer's group under
---   `epigraph_edge_writer_scope`, 120 / D8, else world). A PINNED evidence row
+--   `epigraph_edge_writer_scope`, 120, else world). A PINNED evidence row
 --   (110) stays `('group', pin owner)`, so an edge on it keeps that group.
 -- * share: visibility stays 'group', and an evidence row of a private claim is
 --   never public (moved or pinned), so no evidence-endpoint edge's meet can be
@@ -121,7 +121,7 @@
 --   one caller of both acts, `epigraph_engine::visibility_act`, refolds each
 --   moved claim in the same transaction, after this function returns and
 --   before the commit, through `edge_factor::recompute_claim_cached_belief`
---   (ruling R-80's vacate included), and refuses the whole act when the
+--   (the full-ignorance vacate included), and refuses the whole act when the
 --   session cannot write the claim it would refold.
 SET LOCAL lock_timeout = '3s';
 
