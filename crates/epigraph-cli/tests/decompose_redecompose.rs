@@ -134,6 +134,36 @@ async fn persist(
     .map_err(|e| e.to_string())
 }
 
+/// [`persist`] that also counts the atom submits it made.
+async fn persist_counting(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    parent: Uuid,
+    agent: Uuid,
+    d: &Decomposition,
+) -> (epigraph_cli::decompose::PersistOutcome, usize) {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p = pool.clone();
+    let c = calls.clone();
+    let out = persist_decomposition(pool, viewer, parent, d, None, move |text, _g| {
+        let p = p.clone();
+        c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move { Ok(claim_if_not_exists(&p, agent, &text).await) }
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .unwrap();
+    (out, calls.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_redecompose_selects_a_compound_atom(pool: PgPool) {
     let w = seed(&pool).await;
@@ -250,20 +280,28 @@ async fn an_atom_that_would_close_a_cycle_is_refused(pool: PgPool) {
         atoms: vec![PARAGRAPH.into(), "The pump failed.".into()],
         generality: vec![0, 0],
     };
-    let out = persist(&pool, &viewer, w.compound_atom, w.agent, &ancestor)
-        .await
-        .unwrap();
+    // Review M2: refused BEFORE any atom is POSTed. The real API records a
+    // derivation on a dedup hit, so a submit here would already have written
+    // the paragraph a derivation naming its own atom, and left the sibling
+    // atom behind as an orphan.
+    let (out, submits) =
+        persist_counting(&pool, &viewer, w.compound_atom, w.agent, &ancestor).await;
     assert_eq!(out.refused_cycle, Some(w.paragraph));
     assert_eq!(out.edges_created, 0);
+    assert_eq!(submits, 0, "no atom may be POSTed for a refused answer");
     // ...or the atom's own text: a self-loop.
     let itself = Decomposition {
         atoms: vec![COMPOUND_ATOM.into(), "The pump failed.".into()],
         generality: vec![0, 0],
     };
-    let out = persist(&pool, &viewer, w.compound_atom, w.agent, &itself)
-        .await
-        .unwrap();
+    let (out, submits) = persist_counting(&pool, &viewer, w.compound_atom, w.agent, &itself).await;
     assert_eq!(out.refused_cycle, Some(w.compound_atom));
+    assert_eq!(submits, 0, "no atom may be POSTed for a refused answer");
+    assert_eq!(
+        claims_with_content(&pool, "The pump failed.").await,
+        0,
+        "the sibling atom of a refused answer is not left behind as an orphan"
+    );
     assert_eq!(
         decomposes_count(&pool, w.compound_atom).await,
         0,

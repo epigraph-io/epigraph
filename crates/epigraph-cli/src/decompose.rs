@@ -840,11 +840,15 @@ mod db_writes {
         pub atom_claim_ids: Vec<Uuid>,
         pub edges_created: usize,
         pub skipped_singletons: usize,
-        /// Set when an atom id is the parent itself or one of its
-        /// `decomposes_to` ancestors: wiring it would close a cycle, so NO
-        /// edge was written for this parent (`atom_claim_ids` is then empty;
-        /// the atoms POSTed stay unwired and change nothing). A deterministic
-        /// refusal, not a failure: re-running the same answer refuses again.
+        /// Set to the parent or `decomposes_to` ancestor an atom would have
+        /// resolved to: wiring it would close a cycle, so NO edge was written
+        /// for this parent and `atom_claim_ids` is empty. In the usual case
+        /// (an atom text whose hash equals the parent's or an ancestor's) it
+        /// is caught BEFORE any atom is POSTed and nothing at all is written.
+        /// Only the backstop after the POSTs (an id the hash check could not
+        /// predict) leaves the posted atoms, and their derivation rows,
+        /// behind unwired. A deterministic refusal, not a failure: re-running
+        /// the same answer refuses again.
         pub refused_cycle: Option<Uuid>,
     }
 
@@ -895,6 +899,36 @@ mod db_writes {
         {
             return Err(format!("parent claim {parent_id} is not current").into());
         }
+        // Cycle guard, BEFORE any atom is POSTed (review M2). The atom POST
+        // dedups on `(content_hash, agent_id)` and records the atom's
+        // derivation on BOTH arms, so an atom text identical to the parent's
+        // or an ancestor's would hand back that claim AND write a derivation
+        // naming its own descendant as its source, with the sibling atoms
+        // left behind as orphans, before any id check could run. So every
+        // atom's hash is compared with the parent's and each visible
+        // ancestor's first, whatever their author (an atom equal to an
+        // ancestor's text is a degenerate answer even where the author
+        // differs and the API would not dedup it), and the whole answer is
+        // refused with nothing written. Likeliest under `--redecompose`,
+        // where the parent is itself an atom.
+        {
+            use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
+            let lineage =
+                R::decomposes_to_lineage_hashes(&mut *db.read(viewer).await?, viewer, parent_id)
+                    .await?;
+            for atom in &decomp.atoms {
+                let h = epigraph_crypto::ContentHasher::hash(atom.as_bytes());
+                if let Some((hit, _)) = lineage.iter().find(|(_, lh)| lh.as_slice() == h.as_slice())
+                {
+                    return Ok(PersistOutcome {
+                        atom_claim_ids: vec![],
+                        edges_created: 0,
+                        skipped_singletons: 0,
+                        refused_cycle: Some(*hit),
+                    });
+                }
+            }
+        }
         // Phase 1: submit EVERY atom before wiring ANY edge. The
         // `decomposes_to` edges are what take the parent out of the
         // undecomposed population; writing them per atom meant a submit that
@@ -927,13 +961,15 @@ mod db_writes {
             atom_ids.push(atom_id);
             gens.push(gen);
         }
-        // A `decomposes_to` edge onto the parent itself or onto one of its
-        // ancestors would close a cycle. `if_not_exists` on the atom POST can
-        // hand back such an id when the model returns a text identical to the
-        // parent's or an ancestor's (likeliest under `--redecompose`, where
-        // the parent is itself an atom). Refused before any edge is written,
-        // and reported as `refused_cycle` rather than as an error, so one such
-        // answer does not abort a scheduled run. The ancestor walk sees only
+        // Backstop for the guard above: a `decomposes_to` edge onto the
+        // parent itself or onto one of its ancestors would close a cycle, and
+        // the submit can still hand back such an id when the hash check above
+        // could not see it coming (a submit path that rewrites the text, or a
+        // lineage row the read missed). By then the atoms ARE posted, and the
+        // API has recorded their derivations, so this refuses only the EDGES:
+        // the posted atoms (and, for the matching one, its derivation row)
+        // stay. Reported as `refused_cycle` rather than as an error, so one
+        // such answer does not abort a scheduled run. Both walks see only
         // edges the viewer can see: on the `--as-agent` path a cycle through
         // an edge hidden from the agent is not caught.
         {
