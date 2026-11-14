@@ -998,6 +998,115 @@ pub async fn recall_with_context(
 /// Weight applied to `in_epistemic_degree` in the graph-expansion rerank
 /// formula: `similarity * (1 + GRAPH_EXPANSION_DEGREE_WEIGHT * in_degree)`.
 /// Matches the coefficient named in claim 29e789fd's design sketch.
+/// Parameters of `claim_context`: the structural context of ONE claim, by id.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaimContextParams {
+    #[schemars(
+        description = "UUID of the claim to describe: a paragraph, atom, section, workflow step or any submit_claim / memorize claim. Embedded or not."
+    )]
+    pub claim_id: String,
+    #[schemars(
+        description = "Sibling paragraphs to return (default 8), as in recall_with_context."
+    )]
+    pub siblings_limit: Option<u32>,
+    #[schemars(
+        description = "Corroborating neighbours to return (default 4), as in recall_with_context."
+    )]
+    pub corroborates_limit: Option<u32>,
+    #[schemars(
+        description = "Epistemic edges to return (default 4, minimum 1), as in recall_with_context."
+    )]
+    pub epistemic_limit: Option<u32>,
+    #[schemars(
+        description = "Neighbour paragraphs to return (default 16), as in recall_with_context."
+    )]
+    pub neighbor_paragraphs_limit: Option<u32>,
+    #[schemars(
+        description = "Optional lens frame UUID. Give it together with perspective_id to annotate the hit with that lens, as in recall_with_context."
+    )]
+    pub frame_id: Option<String>,
+    #[schemars(description = "Optional lens perspective UUID (with frame_id).")]
+    pub perspective_id: Option<String>,
+}
+
+/// What `claim_context` returns: the claim id asked for and that claim's hit,
+/// built by the same pipeline as a `recall_with_context` hit. `context` has
+/// every field such a hit has except `similarity`: nothing was searched, so
+/// there is no similarity to report.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimContextResponse {
+    pub claim_id: Uuid,
+    pub context: serde_json::Value,
+}
+
+/// `claim_context`: the document context of one claim (paper, section, atoms,
+/// siblings, epistemic edges), looked up BY ID.
+///
+/// `recall_with_context` returns this block only for search hits, so getting
+/// it for a known claim meant searching for the claim's own text and hoping it
+/// ranked first; a near-duplicate sometimes did, and a claim with no embedding
+/// was never returned at all (backlog 0720d208). This runs the same pipeline
+/// with the candidate pinned to `claim_id`, so the answer is that claim or
+/// nothing.
+///
+/// # Errors
+/// `invalid_params` for a malformed id, a half-given lens, and a claim that is
+/// absent or that the viewer cannot read (one answer for both, so the tool is
+/// not an existence oracle).
+pub async fn claim_context(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: ClaimContextParams,
+) -> Result<CallToolResult, McpError> {
+    let claim_id = crate::errors::parse_uuid(&params.claim_id)?;
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        let mut read = server.read_as(viewer, "claim_context").await?;
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
+            .await?;
+        read.commit().await.map_err(internal_error)?;
+    }
+    // The recall request with every retrieval option off. The query is empty
+    // and no vector is passed: a pinned read never reaches the kNN.
+    let recall_params: RecallWithContextParams = serde_json::from_value(serde_json::json!({
+        "query": "",
+        "frame_id": params.frame_id,
+        "perspective_id": params.perspective_id,
+    }))
+    .map_err(internal_error)?;
+    let response = recall_with_context_core(
+        server,
+        viewer,
+        &recall_params,
+        1536,
+        "",
+        1,
+        // No belief gate: the caller asked for this claim, whatever it scores.
+        f64::NEG_INFINITY,
+        params.siblings_limit.unwrap_or(8),
+        params.corroborates_limit.unwrap_or(4),
+        params.epistemic_limit.unwrap_or(4).max(1),
+        params.neighbor_paragraphs_limit.unwrap_or(16),
+        lens,
+        Some(claim_id),
+    )
+    .await?;
+    let hit = response
+        .results
+        .unwrap_or_default()
+        .into_iter()
+        .find(|h| h.paragraph_id == claim_id)
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+    let mut context = serde_json::to_value(&hit).map_err(internal_error)?;
+    if let Some(map) = context.as_object_mut() {
+        map.remove("similarity");
+    }
+    success_json(&ClaimContextResponse { claim_id, context })
+}
+
 const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 
 /// Stage 4 of [`recall_with_context_post_embed`]: fold graph-reachable
@@ -1142,6 +1251,52 @@ async fn recall_with_context_post_embed(
     neighbor_paragraphs_limit: u32,
     lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
+    let response = recall_with_context_core(
+        server,
+        viewer,
+        params,
+        centroid_dim,
+        pgvec,
+        limit,
+        min_truth,
+        siblings_limit,
+        corroborates_limit,
+        epistemic_limit,
+        neighbor_paragraphs_limit,
+        lens,
+        None,
+    )
+    .await?;
+    success_json(&response)
+}
+
+/// The retrieval-and-enrichment pipeline behind `recall_with_context`, and,
+/// with `pinned`, behind `claim_context`.
+///
+/// `pinned = Some(id)` replaces the candidate retrieval (stage 3) with the one
+/// claim `id`: no kNN, no query vector, so the hit is that claim and never a
+/// near-duplicate of it (backlog 0720d208). Everything after retrieval is the
+/// same code, so the hit carries exactly the enrichment a search hit carries.
+/// A claim the viewer cannot read has no core in the viewer-filtered batch
+/// fetch and yields an empty page, as a deleted one does. A pinned read is a
+/// lookup, not a recall: it writes no recall-audit row and returns no
+/// `recall_event_id`.
+#[allow(clippy::too_many_arguments)]
+async fn recall_with_context_core(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: &RecallWithContextParams,
+    centroid_dim: u32,
+    pgvec: &str,
+    limit: u32,
+    min_truth: f64,
+    siblings_limit: u32,
+    corroborates_limit: u32,
+    epistemic_limit: u32,
+    neighbor_paragraphs_limit: u32,
+    lens: Option<(Uuid, Uuid)>,
+    pinned: Option<Uuid>,
+) -> Result<RecallWithContextResponse, McpError> {
     // Validated before any retrieval runs, so a mistyped radius is reported
     // instead of being paid for and then discarded. Checked here rather than in
     // the wrapper because `__test_only::recall_with_context_with_pgvec` enters
@@ -1192,7 +1347,12 @@ async fn recall_with_context_post_embed(
         want
     };
     let flat_limit = pool as i64;
-    let mut raw_hits = if diverse {
+    let mut raw_hits = if let Some(claim_id) = pinned {
+        vec![epigraph_db::ClaimEmbeddingHit {
+            claim_id,
+            similarity: 1.0,
+        }]
+    } else if diverse {
         let max_themes = params.max_themes.unwrap_or(5).clamp(1, 50) as i32;
         let alpha = params.diversity_weight.unwrap_or(0.4);
         // Clamp candidate_pool at the request boundary so the caller sees
@@ -1303,7 +1463,7 @@ async fn recall_with_context_post_embed(
         // back from a partitioned request would look like the flag was ignored.
         let (results, epistemic_partition) =
             crate::types::split_epistemic(Vec::<RecallHit>::new(), params.epistemic_partition);
-        return success_json(&RecallWithContextResponse {
+        return Ok(RecallWithContextResponse {
             results,
             epistemic_partition,
             corpus_scope,
@@ -1792,33 +1952,40 @@ async fn recall_with_context_post_embed(
     // `tools::memory::recall`: spawned after the response is assembled so an
     // audit failure can never fail or delay a retrieval that already
     // succeeded. Id is minted here rather than read back from the insert.
-    let event_id = Uuid::new_v4();
-    spawn_recall_audit(
-        server,
-        event_id,
-        viewer.principal(),
-        &params.query,
-        pgvec,
-        serde_json::json!({
-            "limit": limit,
-            "min_truth": min_truth,
-            "centroid_dim": centroid_dim,
-            "diverse": params.diverse,
-            "rerank": params.rerank,
-            "graph_expansion_depth": params.graph_expansion_depth,
-            "exclude_contested": params.exclude_contested,
-            // See the empty-path literal above: the window is part of the
-            // question, so it has to survive into the audit row.
-            "since": params.since,
-            // Same argument: the radius changes WHICH paragraphs came back, so
-            // a retrieval whose diversity cut cannot be reconstructed from its
-            // audit row is an unauditable retrieval. `epistemic_partition` is
-            // deliberately absent — it regroups the response without changing
-            // the set.
-            "diversity_radius": params.diversity_radius,
-        }),
-        results.iter().map(|h| h.paragraph_id).collect(),
-    );
+    // A pinned read (`claim_context`) is a lookup by id, not a retrieval: there
+    // is no query to audit and nothing ranked, so it writes no audit row.
+    let event_id = if pinned.is_some() {
+        None
+    } else {
+        let event_id = Uuid::new_v4();
+        spawn_recall_audit(
+            server,
+            event_id,
+            viewer.principal(),
+            &params.query,
+            pgvec,
+            serde_json::json!({
+                "limit": limit,
+                "min_truth": min_truth,
+                "centroid_dim": centroid_dim,
+                "diverse": params.diverse,
+                "rerank": params.rerank,
+                "graph_expansion_depth": params.graph_expansion_depth,
+                "exclude_contested": params.exclude_contested,
+                // See the empty-path literal above: the window is part of the
+                // question, so it has to survive into the audit row.
+                "since": params.since,
+                // Same argument: the radius changes WHICH paragraphs came back, so
+                // a retrieval whose diversity cut cannot be reconstructed from its
+                // audit row is an unauditable retrieval. `epistemic_partition` is
+                // deliberately absent — it regroups the response without changing
+                // the set.
+                "diversity_radius": params.diversity_radius,
+            }),
+            results.iter().map(|h| h.paragraph_id).collect(),
+        );
+        Some(event_id)
+    };
 
     // Epistemic partitioning (backlog e7736ff6), in the same position as
     // `tools::memory::recall`'s: after the dispute post-pass (nothing is
@@ -1835,12 +2002,12 @@ async fn recall_with_context_post_embed(
     let (results, epistemic_partition) =
         crate::types::split_epistemic(results, params.epistemic_partition);
 
-    success_json(&RecallWithContextResponse {
+    Ok(RecallWithContextResponse {
         results,
         epistemic_partition,
         corpus_scope,
         centroid_dim_used: centroid_dim,
-        recall_event_id: Some(event_id.to_string()),
+        recall_event_id: event_id.map(|id| id.to_string()),
     })
 }
 
