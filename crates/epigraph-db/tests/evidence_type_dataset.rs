@@ -153,7 +153,7 @@ async fn datasets_by_claim_ids_returns_visible_dataset_rows_only(pool: PgPool) {
         .unwrap();
 
     let public = viewer_fixture::public_viewer(&pool).await;
-    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &public, &[claim, other])
+    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &public, &[claim, other], 32)
         .await
         .unwrap();
     let ids: Vec<Uuid> = got[&claim].iter().map(|d| d.evidence_id).collect();
@@ -169,7 +169,7 @@ async fn datasets_by_claim_ids_returns_visible_dataset_rows_only(pool: PgPool) {
     assert_eq!(json["file_count"], 12);
 
     let member = epigraph_db::Viewer::resolve(&pool, agent).await.unwrap();
-    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &member, &[claim])
+    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &member, &[claim], 32)
         .await
         .unwrap();
     assert_eq!(got[&claim].len(), 3, "the group member sees its own row");
@@ -196,6 +196,36 @@ async fn the_lineage_carries_dataset_properties(pool: PgPool) {
         serde_json::from_value(ds_row.dataset.clone().expect("dataset properties")).unwrap();
     assert_eq!(parsed, dataset("s3://b/run-9"));
     assert_eq!(lineage.evidence[&doc].dataset, None);
+}
+
+/// `get_claim` always includes a claim's datasets, so the read is capped per
+/// claim (review finding 6): the oldest `limit` rows, per claim, never more.
+#[sqlx::test(migrations = "../../migrations")]
+async fn datasets_by_claim_ids_caps_rows_per_claim(pool: PgPool) {
+    let agent = viewer_fixture::seed_agent_with_group(&pool, "c8beb101-cap")
+        .await
+        .0;
+    let a = viewer_fixture::seed_public_claim(&pool, agent, "c8beb101: cap a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, agent, "c8beb101: cap b").await;
+    let mut a_ids = Vec::new();
+    for i in 0..3 {
+        let e =
+            write_dataset_evidence(&pool, a, &format!("a run {i}"), &format!("s3://b/a-{i}")).await;
+        a_ids.push(Uuid::from(e.id));
+    }
+    let b_only = write_dataset_evidence(&pool, b, "b run", "s3://b/b-0").await;
+
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &viewer, &[a, b], 2)
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = got[&a].iter().map(|d| d.evidence_id).collect();
+    assert_eq!(ids, a_ids[..2].to_vec(), "the oldest two of claim a");
+    // The cap is per claim: claim b's row is not crowded out by claim a's.
+    assert_eq!(
+        got[&b].iter().map(|d| d.evidence_id).collect::<Vec<_>>(),
+        vec![Uuid::from(b_only.id)]
+    );
 }
 
 fn up_to(max: i64) -> sqlx::migrate::Migrator {

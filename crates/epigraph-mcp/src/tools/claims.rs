@@ -187,6 +187,12 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+/// The most dataset rows `get_claim` lists for one claim (the oldest first);
+/// a row is up to about 21 KB at the validator's bounds, so this keeps the
+/// response under about 700 KB however many rows are attached. More is
+/// reported as `datasets_truncated`.
+const GET_CLAIM_MAX_DATASETS: usize = 32;
+
 /// The evidence type a submission's evidence row is stored as.
 ///
 /// `evidence_type` is parsed (and so validated) whether or not a `dataset` is
@@ -1135,11 +1141,21 @@ pub async fn get_claim(
     // The claim's dataset evidence, always (possibly empty): the structured
     // fields a reader resolves and verifies the data by, without parsing
     // evidence_data (backlog c8beb101). Filtered per evidence row, as the URLs.
-    let datasets = EvidenceRepository::datasets_by_claim_ids(&mut *read, viewer, &[id])
-        .await
-        .map_err(internal_error)?
-        .remove(&id)
-        .unwrap_or_default();
+    // Capped (the oldest GET_CLAIM_MAX_DATASETS), since anyone who can attach
+    // evidence to the claim can attach dataset rows; one more is read so
+    // `datasets_truncated` can say there were more.
+    let mut datasets = EvidenceRepository::datasets_by_claim_ids(
+        &mut *read,
+        viewer,
+        &[id],
+        i64::try_from(GET_CLAIM_MAX_DATASETS + 1).unwrap_or(i64::MAX),
+    )
+    .await
+    .map_err(internal_error)?
+    .remove(&id)
+    .unwrap_or_default();
+    let datasets_truncated = datasets.len() > GET_CLAIM_MAX_DATASETS;
+    datasets.truncate(GET_CLAIM_MAX_DATASETS);
 
     // Additive lensed belief: compute the claim's belief under the chosen lens.
     // Frame/perspective existence is already validated, so a compute failure
@@ -1213,6 +1229,10 @@ pub async fn get_claim(
         lensed_belief: Option<LensedBelief>,
         source_urls: Vec<String>,
         datasets: Vec<epigraph_db::DatasetEvidence>,
+        /// Present (true) only when the claim has more dataset rows than
+        /// `datasets` lists.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        datasets_truncated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         authored_by: Option<epigraph_db::AuthoredBy>,
     }
@@ -1234,6 +1254,7 @@ pub async fn get_claim(
         lensed_belief,
         source_urls,
         datasets,
+        datasets_truncated,
         authored_by,
     })
 }

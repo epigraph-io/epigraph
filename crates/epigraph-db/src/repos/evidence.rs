@@ -895,8 +895,16 @@ impl EvidenceRepository {
     ///
     /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), as
     /// [`Self::source_urls_by_claim_ids`] is, and for its reason. A row whose
-    /// `properties` do not parse as a `Dataset` (a hand-written row) is
-    /// skipped rather than failing the read.
+    /// `properties` do not parse as a `Dataset` (a hand-written row, or a
+    /// sealed one, whose `properties` are blanked) is skipped rather than
+    /// failing the read.
+    ///
+    /// At most `limit_per_claim` rows per claim, the oldest first: a caller
+    /// that always includes the result (`get_claim`) cannot otherwise bound
+    /// its response, since anyone who can attach evidence to a claim can
+    /// attach dataset rows to it. Ask for one more than you will show to tell
+    /// whether there were more. The cap applies before the parse filter, so a
+    /// skipped row still counts against it.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -905,22 +913,31 @@ impl EvidenceRepository {
         executor: E,
         viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
+        limit_per_claim: i64,
     ) -> Result<std::collections::HashMap<Uuid, Vec<DatasetEvidence>>, DbError> {
         let mut out: std::collections::HashMap<Uuid, Vec<DatasetEvidence>> =
             std::collections::HashMap::new();
-        if claim_ids.is_empty() {
+        if claim_ids.is_empty() || limit_per_claim <= 0 {
             return Ok(out);
         }
         let sql = viewer.splice(
-            "SELECT e.claim_id, e.id, e.properties \
-             FROM evidence e \
-             WHERE e.claim_id = ANY($1) \
-               AND e.evidence_type = 'dataset' \
-               /* {VISIBILITY:e} */ \
-             ORDER BY e.claim_id, e.created_at, e.id",
-            2,
+            "SELECT claim_id, id, properties FROM ( \
+               SELECT e.claim_id, e.id, e.properties, e.created_at, \
+                      row_number() OVER ( \
+                        PARTITION BY e.claim_id ORDER BY e.created_at, e.id \
+                      ) AS rn \
+               FROM evidence e \
+               WHERE e.claim_id = ANY($1) \
+                 AND e.evidence_type = 'dataset' \
+                 /* {VISIBILITY:e} */ \
+             ) ranked \
+             WHERE rn <= $2 \
+             ORDER BY claim_id, created_at, id",
+            3,
         );
-        let mut q = sqlx::query_as::<_, (Uuid, Uuid, serde_json::Value)>(&sql).bind(claim_ids);
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, serde_json::Value)>(&sql)
+            .bind(claim_ids)
+            .bind(limit_per_claim);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
