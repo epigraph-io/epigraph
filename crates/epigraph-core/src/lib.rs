@@ -71,8 +71,8 @@ pub use extensions::{
 
 // Re-export domain types for convenience
 pub use domain::{
-    Activity, ActivityType, Agent, AgentId, Claim, ClaimId, DatasetEvidenceError,
-    DatasetManifestInput, Evidence, EvidenceId, EvidenceType, LearningEvent, LinkStrength,
-    Methodology, ReasoningTrace, SemanticLink, SemanticLinkId, SemanticLinkType, TraceId,
-    TraceInput, WorkflowState, MANIFEST_HASH_ALGORITHMS, STORED_EVIDENCE_TYPES,
+    Activity, ActivityType, Agent, AgentId, Claim, ClaimId, DatasetAttestation,
+    DatasetEvidenceError, DatasetManifestInput, Evidence, EvidenceId, EvidenceType, LearningEvent,
+    LinkStrength, Methodology, ReasoningTrace, SemanticLink, SemanticLinkId, SemanticLinkType,
+    TraceId, TraceInput, WorkflowState, MANIFEST_HASH_ALGORITHMS, STORED_EVIDENCE_TYPES,
 };

@@ -41,8 +41,8 @@ pub use activity::{Activity, ActivityType};
 pub use agent::Agent;
 pub use claim::Claim;
 pub use evidence::{
-    DatasetEvidenceError, DatasetManifestInput, Evidence, EvidenceType, MANIFEST_HASH_ALGORITHMS,
-    STORED_EVIDENCE_TYPES,
+    DatasetAttestation, DatasetEvidenceError, DatasetManifestInput, Evidence, EvidenceType,
+    DATASET_ATTESTATION_DOMAIN_V1, MANIFEST_HASH_ALGORITHMS, STORED_EVIDENCE_TYPES,
 };
 pub use ids::{AgentId, ClaimId, EvidenceId, TraceId};
 pub use learning_event::LearningEvent;

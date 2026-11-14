@@ -130,7 +130,55 @@ pub enum EvidenceType {
         /// Blob store ids of files of the dataset that were uploaded.
         #[serde(default)]
         blob_ids: Vec<String>,
+        /// The writing server's signature over these fields, bound to the
+        /// row's evidence and claim ids ([`EvidenceType::attest_dataset`]).
+        ///
+        /// The evidence row's own signature covers only its `content_hash`
+        /// (`BLAKE3(raw_content)`), so without this nothing signed the
+        /// manifest digest a reader checks the files against. Written by the
+        /// server, never accepted from a caller; absent on a row no server
+        /// signed (an HTTP write), which a reader treats as unverified.
+        /// Omitted from the serialised form when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<DatasetAttestation>,
     },
+}
+
+/// A signature over a dataset row's structured fields
+/// ([`EvidenceType::dataset_attestation_digest`]), stored beside them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatasetAttestation {
+    /// The signed-message scheme: `v1`
+    /// (`epigraph_crypto::signing_message(SignedEntity::Dataset, digest)`).
+    pub scheme: String,
+    /// The digest that was signed, lowercase hex. A verifier recomputes it
+    /// from the fields; this copy is for comparison and diagnostics only.
+    pub digest: String,
+    /// The Ed25519 signature, lowercase hex (128 characters).
+    pub signature: String,
+}
+
+/// Version prefix of the bytes [`EvidenceType::dataset_attestation_digest`]
+/// hashes. A new layout takes a new prefix; this one never changes.
+pub const DATASET_ATTESTATION_DOMAIN_V1: &[u8] = b"epigraph-dataset-attestation-v1\0";
+
+fn push_field(buf: &mut Vec<u8>, value: &str) {
+    // A u32 length prefix: every field is bounded far below 4 GiB by
+    // `EvidenceType::validate`, and the prefix keeps adjacent fields from
+    // running together ("ab"+"c" vs "a"+"bc").
+    #[allow(clippy::cast_possible_truncation)]
+    buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+fn push_opt(buf: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => buf.push(0),
+        Some(v) => {
+            buf.push(1);
+            push_field(buf, v);
+        }
+    }
 }
 
 /// The values the `evidence.evidence_type` column admits (the
@@ -272,6 +320,7 @@ impl EvidenceType {
                 .into_iter()
                 .map(|b| b.trim().to_string())
                 .collect(),
+            attestation: None,
         };
         built.validate()?;
         Ok(built)
@@ -297,6 +346,7 @@ impl EvidenceType {
             total_bytes: _,
             sample_id,
             blob_ids,
+            attestation: _,
         } = self
         else {
             return Ok(());
@@ -359,6 +409,132 @@ impl EvidenceType {
             ));
         }
         Ok(())
+    }
+
+    /// The digest a dataset row's [`DatasetAttestation`] signs, or `None` for
+    /// any other variant.
+    ///
+    /// BLAKE3 over [`DATASET_ATTESTATION_DOMAIN_V1`], the row's evidence id
+    /// and claim id (16 bytes each), then every field in declaration order:
+    /// text as a big-endian u32 length and its bytes, an optional text as
+    /// `0x00` (absent) or `0x01` and the text, counts as big-endian u64, and
+    /// `blob_ids` as a u32 count and each id. The attestation itself is not
+    /// hashed.
+    ///
+    /// The ids are what stop a valid dataset and its attestation being copied
+    /// onto another row or claim: the copy hashes to a different digest. A
+    /// byte layout rather than JSON, so a verifier in another language
+    /// reproduces it without a canonical-JSON library, and so JSONB's key
+    /// reordering cannot move it.
+    #[must_use]
+    pub fn dataset_attestation_digest(
+        &self,
+        evidence_id: EvidenceId,
+        claim_id: ClaimId,
+    ) -> Option<[u8; epigraph_crypto::HASH_SIZE]> {
+        let Self::Dataset {
+            root_uri,
+            manifest_uri,
+            manifest_blob_id,
+            manifest_hash,
+            hash_algorithm,
+            file_count,
+            total_bytes,
+            sample_id,
+            blob_ids,
+            attestation: _,
+        } = self
+        else {
+            return None;
+        };
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(DATASET_ATTESTATION_DOMAIN_V1);
+        buf.extend_from_slice(evidence_id.as_uuid().as_bytes());
+        buf.extend_from_slice(claim_id.as_uuid().as_bytes());
+        push_field(&mut buf, root_uri);
+        push_opt(&mut buf, manifest_uri.as_deref());
+        push_opt(&mut buf, manifest_blob_id.as_deref());
+        push_field(&mut buf, manifest_hash);
+        push_field(&mut buf, hash_algorithm);
+        buf.extend_from_slice(&file_count.to_be_bytes());
+        buf.extend_from_slice(&total_bytes.to_be_bytes());
+        push_opt(&mut buf, sample_id.as_deref());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.extend_from_slice(&(blob_ids.len() as u32).to_be_bytes());
+        for id in blob_ids {
+            push_field(&mut buf, id);
+        }
+        Some(epigraph_crypto::ContentHasher::hash(&buf))
+    }
+
+    /// Sign a dataset row's fields with `signer` and store the result as its
+    /// [`DatasetAttestation`], replacing any there was. Returns `false`, and
+    /// changes nothing, for any other variant.
+    pub fn attest_dataset(
+        &mut self,
+        evidence_id: EvidenceId,
+        claim_id: ClaimId,
+        signer: &epigraph_crypto::AgentSigner,
+    ) -> bool {
+        let Some(digest) = self.dataset_attestation_digest(evidence_id, claim_id) else {
+            return false;
+        };
+        let signature = signer.sign_entity(epigraph_crypto::SignedEntity::Dataset, &digest);
+        if let Self::Dataset { attestation, .. } = self {
+            *attestation = Some(DatasetAttestation {
+                scheme: "v1".to_string(),
+                digest: hex::encode(digest),
+                signature: hex::encode(signature),
+            });
+        }
+        true
+    }
+
+    /// Whether a dataset row's [`DatasetAttestation`] verifies under
+    /// `public_key` for these fields and these ids.
+    ///
+    /// `None` when there is nothing to check: not a dataset, or a dataset with
+    /// no attestation. `Some(false)` when the attestation is malformed, its
+    /// scheme is not `v1`, or the signature does not verify over the digest
+    /// recomputed from the CURRENT fields (an edited field, or a dataset
+    /// copied from another row, lands here). The stored `digest` copy is never
+    /// trusted.
+    #[must_use]
+    pub fn verify_dataset_attestation(
+        &self,
+        evidence_id: EvidenceId,
+        claim_id: ClaimId,
+        public_key: &[u8; epigraph_crypto::PUBLIC_KEY_SIZE],
+    ) -> Option<bool> {
+        let Self::Dataset {
+            attestation: Some(att),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let digest = self.dataset_attestation_digest(evidence_id, claim_id)?;
+        if att.scheme != "v1" {
+            return Some(false);
+        }
+        let Ok(sig) = hex::decode(&att.signature) else {
+            return Some(false);
+        };
+        let Ok(sig) = <[u8; SIGNATURE_SIZE]>::try_from(sig.as_slice()) else {
+            return Some(false);
+        };
+        let verified = epigraph_crypto::SignatureVerifier::verify_entity(
+            public_key,
+            epigraph_crypto::SignedEntity::Dataset,
+            &digest,
+            &sig,
+        );
+        // Only the v1 rung counts: a legacy bare-digest signature binds no
+        // entity kind, so it could have been made for any other purpose.
+        Some(matches!(
+            verified,
+            Ok(Some(epigraph_crypto::SignatureScheme::V1))
+        ))
     }
 
     /// The `evidence.evidence_type` column value this variant is stored
@@ -1268,6 +1444,7 @@ mod tests {
                 total_bytes: 4096,
                 sample_id: None,
                 blob_ids: vec![],
+                attestation: None,
             }
         );
         assert_eq!(parsed.validate(), Ok(()));
@@ -1385,9 +1562,11 @@ mod tests {
         );
     }
 
-    /// A dataset row signs and verifies through `Signable` like every other
-    /// variant, and the signature covers its structured fields: changing the
-    /// manifest digest or the file count after signing breaks verification.
+    /// A dataset row signs and verifies through the in-memory `Signable`
+    /// path like every other variant, and that signature covers its
+    /// structured fields. No stored signature is made this way (writers sign
+    /// `content_hash`); the stored binding of the fields is the
+    /// [`DatasetAttestation`], tested in `dataset_attestation_*` below.
     #[test]
     fn dataset_evidence_sign_verify_and_tamper() {
         let signer = AgentSigner::generate();
@@ -1440,10 +1619,13 @@ mod tests {
         }
     }
 
-    /// Canonicalisation stability: adding the Dataset variant must not move
-    /// the canonical digest of a row of an EXISTING variant, or every stored
-    /// signature over one would stop verifying. The digest is pinned to the
-    /// value the pre-Dataset code computes for the same fixed row.
+    /// Serialisation stability of the in-memory canonical form
+    /// (`EvidenceHashableContent`, which `Signable` signs): adding the Dataset
+    /// variant must not move it for a row of an EXISTING variant. The digest
+    /// is pinned to the value the pre-Dataset code computes for the same
+    /// fixed row. No STORED signature covers this form (writers sign
+    /// `content_hash = BLAKE3(raw_content)`, which this batch does not
+    /// touch), so this guards the serde shape, not a stored signature.
     #[test]
     fn existing_variant_canonical_digest_is_unchanged() {
         let doc = fixed_hashable(EvidenceType::Document {
@@ -1458,9 +1640,12 @@ mod tests {
         );
     }
 
-    /// The Dataset variant's own canonical form, pinned, so a later rename or
-    /// a serde attribute change on it is caught before it orphans the
-    /// signatures over stored dataset rows.
+    /// The Dataset variant's serialised form inside that in-memory canonical
+    /// form, pinned, so a later rename or serde attribute change on it is
+    /// caught. Also shows that an absent `attestation` is not serialised (the
+    /// value was pinned before the field existed). The stored binding of a
+    /// dataset's fields is pinned separately, by
+    /// `dataset_attestation_digest_is_pinned`.
     #[test]
     fn dataset_canonical_digest_is_pinned() {
         let ds = fixed_hashable(EvidenceType::dataset(dataset_input()).unwrap());
@@ -1469,5 +1654,228 @@ mod tests {
             hex::encode(digest),
             "9d8c3a769df35dda7a1018f31178b43d7c6856080026b0dbee3801f9ec09f5e9"
         );
+    }
+
+    // ============ Dataset attestation (backlog c8beb101, review finding 1) ============
+
+    fn attestation_ids() -> (EvidenceId, ClaimId) {
+        (
+            EvidenceId::from_uuid(uuid::Uuid::from_u128(0x11)),
+            ClaimId::from_uuid(uuid::Uuid::from_u128(0x22)),
+        )
+    }
+
+    fn attested_dataset(signer: &AgentSigner) -> EvidenceType {
+        let (e, c) = attestation_ids();
+        let mut ds = EvidenceType::dataset(dataset_input()).unwrap();
+        assert!(ds.attest_dataset(e, c, signer));
+        ds
+    }
+
+    /// The byte layout a verifier in another language reproduces, pinned
+    /// twice: as the explicit bytes, and as their BLAKE3. Moving a field,
+    /// dropping one, or changing an encoding orphans every stored attestation.
+    #[test]
+    fn dataset_attestation_digest_is_pinned() {
+        let (e, c) = attestation_ids();
+        let ds = EvidenceType::dataset(dataset_input()).unwrap();
+
+        let mut want = b"epigraph-dataset-attestation-v1\0".to_vec();
+        want.extend_from_slice(&0x11u128.to_be_bytes());
+        want.extend_from_slice(&0x22u128.to_be_bytes());
+        let field = |buf: &mut Vec<u8>, v: &str| {
+            buf.extend_from_slice(&u32::try_from(v.len()).unwrap().to_be_bytes());
+            buf.extend_from_slice(v.as_bytes());
+        };
+        field(&mut want, "s3://lab-runs/campaign-7/run-0042/");
+        want.push(1);
+        field(&mut want, "s3://lab-runs/campaign-7/run-0042/MANIFEST.b3");
+        want.push(0); // manifest_blob_id absent
+        field(&mut want, &format!("blake3:{B3_HEX}"));
+        field(&mut want, "blake3");
+        want.extend_from_slice(&1_204u64.to_be_bytes());
+        want.extend_from_slice(&73_014_444_032u64.to_be_bytes());
+        want.push(1);
+        field(&mut want, "sample-17");
+        want.extend_from_slice(&0u32.to_be_bytes()); // no blob ids
+
+        let digest = ds.dataset_attestation_digest(e, c).unwrap();
+        assert_eq!(digest, epigraph_crypto::ContentHasher::hash(&want));
+        assert_eq!(
+            hex::encode(digest),
+            "fddcab06eee69762021e4f6e9499c4315ec770448aab11c92ac27867407d5e0e"
+        );
+        // The attestation is not part of what it signs.
+        let signer = AgentSigner::from_bytes(&[7; 32]).unwrap();
+        assert_eq!(
+            attested_dataset(&signer).dataset_attestation_digest(e, c),
+            Some(digest)
+        );
+        // No other variant has one.
+        let doc = EvidenceType::Document {
+            source_url: None,
+            mime_type: "text/plain".to_string(),
+            checksum: None,
+        };
+        assert_eq!(doc.dataset_attestation_digest(e, c), None);
+    }
+
+    /// The review's tamper scenario: an edit to any signed field, or a valid
+    /// dataset plus attestation copied onto another row or claim, must not
+    /// verify. The converse (the untouched row verifies) keeps "never
+    /// verifies" from passing.
+    #[test]
+    fn dataset_attestation_verifies_and_catches_tamper_and_transplant() {
+        let signer = AgentSigner::from_bytes(&[7; 32]).unwrap();
+        let pk = signer.public_key();
+        let (e, c) = attestation_ids();
+        let ds = attested_dataset(&signer);
+        assert_eq!(ds.verify_dataset_attestation(e, c, &pk), Some(true));
+
+        type Edit = fn(&mut EvidenceType);
+        let edits: [(&str, Edit); 9] = [
+            ("root_uri", |d| {
+                if let EvidenceType::Dataset { root_uri, .. } = d {
+                    root_uri.push('x');
+                }
+            }),
+            ("manifest_uri", |d| {
+                if let EvidenceType::Dataset { manifest_uri, .. } = d {
+                    *manifest_uri = None;
+                }
+            }),
+            ("manifest_blob_id", |d| {
+                if let EvidenceType::Dataset {
+                    manifest_blob_id, ..
+                } = d
+                {
+                    *manifest_blob_id = Some("blob-1".to_string());
+                }
+            }),
+            ("manifest_hash", |d| {
+                if let EvidenceType::Dataset { manifest_hash, .. } = d {
+                    *manifest_hash = format!("blake3:{}", "0".repeat(64));
+                }
+            }),
+            ("hash_algorithm", |d| {
+                if let EvidenceType::Dataset { hash_algorithm, .. } = d {
+                    *hash_algorithm = "sha256".to_string();
+                }
+            }),
+            ("file_count", |d| {
+                if let EvidenceType::Dataset { file_count, .. } = d {
+                    *file_count += 1;
+                }
+            }),
+            ("total_bytes", |d| {
+                if let EvidenceType::Dataset { total_bytes, .. } = d {
+                    *total_bytes -= 1;
+                }
+            }),
+            ("sample_id", |d| {
+                if let EvidenceType::Dataset { sample_id, .. } = d {
+                    *sample_id = None;
+                }
+            }),
+            ("blob_ids", |d| {
+                if let EvidenceType::Dataset { blob_ids, .. } = d {
+                    blob_ids.push("blob-2".to_string());
+                }
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut tampered = ds.clone();
+            edit(&mut tampered);
+            assert_ne!(tampered, ds, "{field}: the edit must change the row");
+            assert_eq!(
+                tampered.verify_dataset_attestation(e, c, &pk),
+                Some(false),
+                "an edited {field} still verified"
+            );
+        }
+
+        // Transplant: the same fields and attestation on another row or claim.
+        let other_e = EvidenceId::from_uuid(uuid::Uuid::from_u128(0x33));
+        let other_c = ClaimId::from_uuid(uuid::Uuid::from_u128(0x44));
+        assert_eq!(ds.verify_dataset_attestation(other_e, c, &pk), Some(false));
+        assert_eq!(ds.verify_dataset_attestation(e, other_c, &pk), Some(false));
+
+        // Another key.
+        let stranger = AgentSigner::from_bytes(&[8; 32]).unwrap();
+        assert_eq!(
+            ds.verify_dataset_attestation(e, c, &stranger.public_key()),
+            Some(false)
+        );
+
+        // A signature over the right digest under another kind, or the bare
+        // digest (legacy), binds no dataset and must not verify.
+        let digest = ds.dataset_attestation_digest(e, c).unwrap();
+        for sig in [
+            signer.sign_entity(epigraph_crypto::SignedEntity::Evidence, &digest),
+            signer.sign(&digest),
+        ] {
+            let mut forged = ds.clone();
+            if let EvidenceType::Dataset {
+                attestation: Some(a),
+                ..
+            } = &mut forged
+            {
+                a.signature = hex::encode(sig);
+            }
+            assert_eq!(forged.verify_dataset_attestation(e, c, &pk), Some(false));
+        }
+
+        // Malformed or unknown-scheme attestations are refusals, not panics.
+        for mangle in [
+            |a: &mut DatasetAttestation| a.signature = "zz".to_string(),
+            |a: &mut DatasetAttestation| a.signature.truncate(10),
+            |a: &mut DatasetAttestation| a.scheme = "v2".to_string(),
+        ] {
+            let mut bad = ds.clone();
+            if let EvidenceType::Dataset {
+                attestation: Some(a),
+                ..
+            } = &mut bad
+            {
+                mangle(a);
+            }
+            assert_eq!(bad.verify_dataset_attestation(e, c, &pk), Some(false));
+        }
+
+        // Nothing to check: no attestation, or not a dataset.
+        let unsigned = EvidenceType::dataset(dataset_input()).unwrap();
+        assert_eq!(unsigned.verify_dataset_attestation(e, c, &pk), None);
+        let mut doc = EvidenceType::Document {
+            source_url: None,
+            mime_type: "text/plain".to_string(),
+            checksum: None,
+        };
+        assert!(!doc.attest_dataset(e, c, &signer));
+        assert_eq!(doc.verify_dataset_attestation(e, c, &pk), None);
+    }
+
+    /// The attestation survives the JSONB round trip the row's `properties`
+    /// take, and still verifies after it.
+    #[test]
+    fn dataset_attestation_round_trips_through_json() {
+        let signer = AgentSigner::from_bytes(&[7; 32]).unwrap();
+        let (e, c) = attestation_ids();
+        let ds = attested_dataset(&signer);
+        let json = serde_json::to_value(&ds).unwrap();
+        assert_eq!(json["attestation"]["scheme"], "v1");
+        assert_eq!(
+            json["attestation"]["signature"].as_str().unwrap().len(),
+            128
+        );
+        let back: EvidenceType = serde_json::from_value(json).unwrap();
+        assert_eq!(back, ds);
+        assert_eq!(
+            back.verify_dataset_attestation(e, c, &signer.public_key()),
+            Some(true)
+        );
+        // Absent: not serialised at all.
+        let unsigned =
+            serde_json::to_value(EvidenceType::dataset(dataset_input()).unwrap()).unwrap();
+        assert!(unsigned.get("attestation").is_none());
     }
 }
