@@ -1264,9 +1264,11 @@ pub struct SubmitDsEvidenceParams {
                        Known tags: 'intra_self_cite' (or the shorthand 'intra') applies the calibrated \
                        intra-locality discount on top of the evidence_type weight; 'cross' or 'unknown' \
                        apply no locality discount. Any other tag is stored as given, combined with NO \
-                       discount unless it begins with 'intra', and reported in the response's warnings. \
-                       Only consulted when `evidence_type` is also supplied — otherwise ignored (with a \
-                       warning) and the BBA is stored with locality_tag='unknown'. Default: 'unknown'."
+                       discount unless it begins with 'intra' (case-sensitive in the cached belief; a \
+                       perspective-scoped read lowercases it), and reported in the response's \
+                       unknown_locality_tag and warnings. A stored tag longer than 20 characters is \
+                       refused. Only consulted when `evidence_type` is also supplied — otherwise ignored \
+                       (with a warning) and the BBA is stored with locality_tag='unknown'. Default: 'unknown'."
     )]
     #[serde(default)]
     pub locality_tag: Option<String>,
@@ -2972,6 +2974,13 @@ pub struct DsEvidenceResponse {
     /// A matching sentence is in `warnings`. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unknown_keys: Vec<String>,
+    /// The supplied `locality_tag`, when it was stored but is outside the
+    /// locality vocabulary (`cross`, `intra`, `intra_self_cite`, `unknown`),
+    /// so the fold discounts it only if it begins with `intra`. A WARNING, not
+    /// a refusal; a matching sentence is in `warnings`. Kept apart from
+    /// `unknown_keys`, which names evidence-type keys only. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_locality_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

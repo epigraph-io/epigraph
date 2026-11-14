@@ -339,6 +339,7 @@ async fn submit_ds_evidence_reports_an_unknown_or_ignored_locality_tag(pool: PgP
         let c = insert_claim(&pool, &format!("86ee2d30 known locality {tag}")).await;
         let out = submit_with_locality(&server, &viewer, c, frame, Some("empirical"), tag).await;
         assert!(out.get("warnings").is_none(), "{tag}: {out}");
+        assert!(out.get("unknown_locality_tag").is_none(), "{tag}: {out}");
         if tag == "intra_self_cite" {
             intra_belief = out["belief"].as_f64();
         }
@@ -355,6 +356,10 @@ async fn submit_ds_evidence_reports_an_unknown_or_ignored_locality_tag(pool: PgP
         "the warning must name the tag and the consequence: {out}"
     );
     assert_eq!(stored_locality(&pool, c).await, "self-cite");
+    assert_eq!(
+        out["unknown_locality_tag"], "self-cite",
+        "the unknown tag must also come back machine-readable: {out}"
+    );
     assert_ne!(
         out["belief"].as_f64(),
         intra_belief,
@@ -366,5 +371,52 @@ async fn submit_ds_evidence_reports_an_unknown_or_ignored_locality_tag(pool: PgP
     let out = submit_with_locality(&server, &viewer, c, frame, None, "intra_self_cite").await;
     let w = out["warnings"][0].as_str().unwrap_or_default();
     assert!(w.contains("ignored"), "{out}");
+    assert!(out.get("unknown_locality_tag").is_none(), "{out}");
     assert_eq!(stored_locality(&pool, c).await, "unknown");
+}
+
+/// A stored `locality_tag` longer than the `varchar(20)` column used to reach
+/// the INSERT and fail as a redacted internal error. It is now refused as a
+/// parameter error before anything is written; the same tag sent without
+/// `evidence_type` is dropped, not stored, so it still succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_over_long_stored_locality_tag_is_a_parameter_error(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let frame = ensure_binary_frame(&mut pool.acquire().await.unwrap(), &viewer)
+        .await
+        .unwrap();
+
+    let c = insert_claim(&pool, "86ee2d30 over-long locality").await;
+    let p = serde_json::from_value(serde_json::json!({
+        "claim_id": c.to_string(),
+        "frame_id": frame.to_string(),
+        "hypothesis_index": 0,
+        "masses": {"0": 0.7, "0,1": 0.3},
+        "evidence_type": "empirical",
+        "locality_tag": "intra_methodological_overlap",
+    }))
+    .unwrap();
+    let err = tools::ds::submit_ds_evidence(&server, &viewer, p, None)
+        .await
+        .expect_err("a 28-character stored tag cannot fit varchar(20)");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains("20"), "{err:?}");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(c)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "a refusal writes nothing");
+
+    let out = submit_with_locality(
+        &server,
+        &viewer,
+        c,
+        frame,
+        None,
+        "intra_methodological_overlap",
+    )
+    .await;
+    assert_eq!(stored_locality(&pool, c).await, "unknown", "{out}");
 }
