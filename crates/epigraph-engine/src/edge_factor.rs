@@ -1808,7 +1808,8 @@ pub struct AtomCacheSettings {
 
 impl AtomCacheSettings {
     /// This process's settings: the two flags as read at startup
-    /// ([`crate::atom_items::modes`]), and O24 as ruled.
+    /// ([`crate::atom_items::modes`]), and the evidence-removal vacate as
+    /// ruled.
     #[must_use]
     pub fn current() -> Self {
         Self {
