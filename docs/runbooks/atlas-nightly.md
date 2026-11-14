@@ -9,8 +9,10 @@ Nothing in the repository installs it. Every step below is an operator step.
 
 ## What a night does
 
-1. **Themes.** Assigns every current, embedded, unthemed claim to its nearest
-   theme centroid (`ClaimThemeRepository::assign_unthemed_batch`). Themes over
+1. **Themes.** Assigns every embedded, unthemed claim (superseded ones too,
+   as `ClaimThemeRepository::assign_unthemed_batch` does; the dry run's
+   `themes.unthemed_embedded` counts the same set) to its nearest theme
+   centroid. Themes over
    W1's member cap (default 2,000) are REPORTED under `themes.over_cap`, never
    split: the theme split stays W1's operator-run tool
    (`scripts/theme_cap_split.py`, off-box compute).
@@ -18,8 +20,8 @@ Nothing in the repository installs it. Every step below is an operator step.
    REPEATABLE READ snapshot:
    - updates each theme's "by meaning" tree (a new claim joins the leaf with
      the nearest centroid) and "by links" tree (W5b mirrors, new links join
-     their neighbours' leaf), a leaf over the 100-node cap split on the box
-     by W3's fallback split (`resplit_leaves`);
+     their neighbours' leaf), a leaf over the 100-node cap or the contract's
+     1,024 edges split on the box by W3's fallback split (`resplit_leaves`);
    - builds real leaves (claims, agents, evidence, W7 flow weights);
    - then lays out only the changed levels (W6, warm-started) and names only
      the changed groups (W8, through the Claude CLI, `--max-calls` per map).
@@ -39,12 +41,16 @@ newer run was published while the night ran; nothing was written) or
 `failed`. Also per map:
 - `themes.built` (per theme: members, added, removed, leaves, resplit leaves,
   linked, mirrors), `themes.carried`, `themes.dropped`, `themes.unbuilt`;
-- `unembedded_members` (current members with no embedding: in no leaf);
+- `unembedded_members` (current themed claims the map may draw with no
+  embedding, in every theme, also one with no embedded member: in no leaf);
 - `layout.relaid` (the levels laid out again) and `naming.renamed` (the
   levels whose naming input changed), `naming.report.calls`.
 
-A theme whose update FAILS (for example a leaf past the contract's 1,024
-edges) does not fail the night. It is:
+A theme whose update FAILS does not fail the night. The one known cause is
+a single claim whose OWN agents and evidence carry more than the contract's
+1,024 edges among them: no split can bring one claim under the limit. (A
+leaf of several claims over 1,024 edges is split, not failed.) The theme
+is:
 - **carried**: the previous run's levels of that theme are kept, both
   hierarchies, when every node and edge of every carried leaf is still in
   that leaf assembled from what the map may draw now (claims that arrived
@@ -52,12 +58,19 @@ edges) does not fail the night. It is:
 - **dropped** from the run otherwise (a claim, agent, evidence row or edge
   of it left the map's audience: carrying it would leak it).
 
-Both list the error. A dropped or carried theme needs an operator build.
+Both list the error. For the single-claim case an operator build does NOT
+clear it (the build would store the same claim's leaf again): find the claim
+in the error, and reduce the edges among its attachments (retract duplicate
+or stale edges), after which the next night builds the theme. Any other
+error: rebuild the map (below) and file the error.
 
 Exit codes: 0 when every map was written, unchanged, skipped or a dry run;
 1 when a map failed or the night refused to start (the timer's alert fires);
-2 for an argument error. A second copy beside a running one prints
-`{"locked": true}` and exits 0.
+2 for an argument error; 75 when another copy (the timer's, or an
+operator's) holds the nightly lock: NOTHING ran, it prints `{"locked": true}`
+and says so on stderr; retry once the other copy has finished. The service
+unit counts 75 a success, so the timer firing beside a manual run does not
+alert.
 
 ## Before the first night: the operator build
 
@@ -72,6 +85,11 @@ atlas_links export --map team:<group> --meaning-from meaning.json --out <dir2>
 python3 scripts/atlas_links_core.py compute --from <dir2> --out links.json
 atlas_links apply --map team:<group> --meaning-from meaning.json --from links.json --apply
 ```
+
+`atlas_links apply --apply` (and `atlas_meaning apply --apply`) holds the
+map's publish lock for the whole build, so a night running meanwhile cannot
+publish over the rebuild: it waits, finds the newer run and writes nothing
+for that map (`"status": "superseded"`).
 
 An operator build stores skeleton levels (claim nodes only, placeholder
 positions, no names), and it is served as soon as it is applied: run
@@ -111,6 +129,13 @@ name the rest. Later nights call the model only for changed groups.
 
 ## Rollback
 
+Stop the timer first, or the next night rebuilds from the restored run and
+writes the same change again:
+
+```bash
+sudo systemctl stop epigraph-atlas-nightly.timer
+```
+
 A night writes one `atlas_map_runs` row per changed map (`run_id` in the
 summary). To undo it, delete that row as the maintenance login; its levels go
 with it (`ON DELETE CASCADE`) and the previous finished run is served again:
@@ -121,7 +146,8 @@ DELETE FROM atlas_map_runs WHERE id = '<run_id>';
 
 The pruned older runs are gone, so the rollback reaches back `--keep-runs - 1`
 nights. The theme assignment of step 1 is not rolled back by this; it only
-set `claims.theme_id` on claims that had none.
+set `claims.theme_id` on claims that had none. Once the cause is fixed,
+start the timer again (`sudo systemctl start epigraph-atlas-nightly.timer`).
 
 ## Enable the timer
 

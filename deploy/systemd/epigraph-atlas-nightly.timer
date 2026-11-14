@@ -1,9 +1,10 @@
 # Runs epigraph-atlas-nightly.service once a night (Atlas W9). A TEMPLATE:
 # see the service file and docs/runbooks/atlas-nightly.md.
 #
-# 04:30 local: after the 03:30 cross-source sweep and the 04:10 recall-event
-# prune, clear of the 01:00 and 02:00 backup windows, and in the slot the
-# paused 04:00 theme-maintenance task held (this job replaces it).
+# 04:30 local is a default, not a requirement: pick a quiet slot on the
+# host, clear of its backup window and of any other job that holds long
+# transactions on the database. This job replaces the paused
+# theme-maintenance task (docs/ops/theme-v2-promotion-runbook.md).
 
 [Unit]
 Description=Run the EpiGraph Atlas nightly map refresh

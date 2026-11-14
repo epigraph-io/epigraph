@@ -23,8 +23,10 @@
 //!    then prunes the map's old runs.
 //!
 //! A theme whose update fails is carried from the previous run (both
-//! hierarchies, only if its leaves re-assemble identically) or dropped, and
-//! reported; it never fails the night.
+//! hierarchies, only if every node and edge of every carried leaf is still
+//! in that leaf assembled from what the map may draw now: a subset check, so
+//! an operator build's skeleton leaves carry too) or dropped, and reported;
+//! it never fails the night.
 
 // W3's leaf assembly splits on the contract's edge limit without depending
 // on the contract crate; keep the two numbers one.

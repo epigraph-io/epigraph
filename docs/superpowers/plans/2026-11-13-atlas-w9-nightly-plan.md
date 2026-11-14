@@ -128,17 +128,17 @@ results, or let the nightly carry the map.
 
 | File | What |
 |---|---|
-| `crates/epigraph-db/src/repos/atlas_map.rs` | `prune_runs`, `lock_map_for_publish`, `maps_with_finished_runs`, `run_hierarchies` |
-| `crates/epigraph-db/src/repos/atlas_leaf.rs` | `node_labels` (agents, evidence under the map predicate) |
-| `crates/epigraph-db/src/repos/atlas_meaning.rs` | `unthemed_embedded_count`, `themes_over_member_cap` (viewer-spliced, no new exemption) |
+| `crates/epigraph-db/src/repos/atlas_map.rs` | `prune_runs`, `lock_map_for_publish`, `lock_map_for_build`/`unlock_map_for_build` (the operator applies' session lock), `maps_with_finished_runs`, `run_hierarchies` |
+| `crates/epigraph-db/src/repos/atlas_leaf.rs` | `node_labels` (agents, evidence under the map predicate); the edge limit as a split reason (`ATLAS_LEAF_EDGE_CAP`, `SplitReason::EdgeCap`, an edge-aware `fallback_split`) |
+| `crates/epigraph-db/src/repos/atlas_meaning.rs` | `unthemed_embedded_count`, `themes_over_member_cap`, `unembedded_members_on_map` (viewer-spliced, no new exemption) |
 | `crates/epigraph-db/src/repos/maintenance_lock.rs` | `ATLAS_NIGHTLY_LOCK_KEY` |
 | `crates/epigraph-cli/src/atlas_nightly/previous.rs` | pure: the previous run's trees from its stored rows |
 | `crates/epigraph-cli/src/atlas_nightly/incremental.rs` | pure: the meaning and links updates, collapse, re-mint |
 | `crates/epigraph-cli/src/atlas_nightly/leaves.rs` | the real leaf documents (W3 + W7 + labels) |
 | `crates/epigraph-cli/src/atlas_nightly/build.rs` | one map's night, the whole night, the summary |
 | `crates/epigraph-cli/src/bin/atlas_nightly.rs` | the binary, `MAINTENANCE_DATABASE_URL` only |
-| `crates/epigraph-cli/src/atlas_links/build.rs` | meaning levels switch by Jaccard |
-| `crates/epigraph-cli/src/atlas_meaning/build.rs` | the links-hiding guard |
+| `crates/epigraph-cli/src/atlas_links/build.rs` | meaning levels switch by Jaccard; the build lock around `apply_hierarchies` |
+| `crates/epigraph-cli/src/atlas_meaning/build.rs` | the links-hiding guard; the build lock around `apply_result` |
 | `crates/epigraph-cli/src/atlas_naming/build.rs` | the publish lock in `name_and_write` |
 | `deploy/systemd/epigraph-atlas-nightly.{service,timer}`, `epigraph-atlas-nightly-alert@.service` | the units (templates; not installed) |
 | `docs/runbooks/atlas-nightly.md` | dry run, apply, rollback, enabling the timer |
@@ -152,8 +152,12 @@ results, or let the nightly carry the map.
 | a run over a synthetic multi-team corpus completes; every stored level validates; both hierarchies; switches resolve; leaves carry real nodes, weights, positions and names (fake backend) | `a_night_over_two_teams_stores_real_validated_levels_in_both_hierarchies` |
 | two consecutive runs over unchanged input change nothing (variant: the second night writes NO run, makes 0 model calls, and its built documents equal the stored ones) | `a_second_night_over_unchanged_input_writes_nothing_and_calls_no_model` |
 | a run with new claims touches only the affected groups | `a_new_claim_relays_and_renames_only_its_leaf_and_ancestors` |
-| a drifted theme does not fail the night | `a_theme_that_fails_is_carried_and_the_night_completes`, `a_theme_that_fails_on_the_first_night_keeps_its_skeleton_levels`, `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
-| pruning keeps exactly K finished runs | `pruning_keeps_exactly_k_finished_runs_of_that_map_only` |
+| a drifted theme does not fail the night | `a_theme_that_fails_is_carried_and_the_night_completes`, `a_theme_that_fails_on_the_first_night_keeps_its_skeleton_levels`, `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` (trigger: ONE claim whose own attachments carry 1,090 edges, which no split can fix) |
+| a leaf over 1,024 edges is split, not frozen (review) | `a_leaf_over_the_edge_limit_is_split_not_frozen`; W3 unit tests `a_leaf_over_the_edge_limit_needs_a_split_on_edges`, `exactly_at_the_edge_limit_fits_and_one_over_splits`, `the_edge_split_counts_exactly_what_assembly_counts`, `one_claim_over_the_edge_limit_is_one_part_and_reports_its_edges` |
+| pruning keeps exactly K finished runs | `pruning_keeps_exactly_k_finished_runs_of_that_map_only` (the repository call), `the_nightly_prunes_its_map_to_keep_runs` (the nightly with `keep_runs = 2`) |
+| every run writer takes the publish lock (review) | `a_meaning_only_apply_waits_for_a_publish_and_then_sees_it`, `a_both_hierarchies_apply_waits_for_the_publish_lock` (`atlas_links.rs`), `a_night_that_finds_a_newer_run_at_publish_writes_nothing` |
+| unembedded claims counted per map in every theme (review) | `unembedded_members_are_counted_in_every_theme_of_the_map` |
+| the label read keeps the map predicate (review) | `node_labels_label_only_the_evidence_the_map_may_draw` (`epigraph-db/tests/atlas_leaf_repo.rs`) |
 | the units pass `systemd-analyze verify` / a syntax test | `atlas_nightly_units::*` |
 | (hand-off) standalone meaning apply cannot hide links | `a_meaning_only_apply_refuses_to_hide_a_links_run` |
 | (hand-off) deep meaning switch to the overlapping links group | `meaning_levels_switch_to_their_best_links_group` (pure) + the night's switch assertions |
@@ -186,11 +190,29 @@ database, then restored (`.mut/`-style script, not committed):
 | no single-child collapse | `an_emptied_leaf_is_dropped_and_its_single_child_parent_collapses` |
 | no neighbour vote | `a_new_unlinked_claim_lands_in_its_meaning_leafs_mirror_and_a_linked_one_by_its_neighbours` |
 
-Not mutation-proved: the publish lock (a race needs two concurrent
-publishers; W8's newer-run check is still proved by its own test), the
-evidence-label map predicate in `node_labels` (W3's read already keeps
-another team's evidence out of the node set, so the label read never sees
-one), and the `superseded` path.
+Added after the review (each applied alone, the target run on a fresh
+database, restored):
+
+| Mutation | Tests that went red |
+|---|---|
+| no `EdgeCap` in W3's assembly (the reviewed code) | `a_leaf_over_the_edge_limit_is_split_not_frozen` and the three W3 edge unit tests |
+| `fallback_split` does not cut on edges | the W3 edge unit tests |
+| the split ignores derived filer edges | `a_leaf_over_the_edge_limit_needs_a_split_on_edges`, `the_edge_split_counts_exactly_what_assembly_counts` |
+| `>=` for `>` in the split, or in the assembly | `exactly_at_the_edge_limit_fits_and_one_over_splits` |
+| (re-run on the single-claim trigger) a theme's error propagates | all three drift tests |
+| (re-run) carry without the check | `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
+| (re-run) carry requires equality | `a_theme_that_fails_on_the_first_night_keeps_its_skeleton_levels` |
+| `apply_result` takes no lock | `a_meaning_only_apply_waits_for_a_publish_and_then_sees_it` |
+| `apply_result` takes the lock late, inside its snapshot | `a_meaning_only_apply_waits_for_a_publish_and_then_sees_it` |
+| `apply_hierarchies` takes no lock | `a_both_hierarchies_apply_waits_for_the_publish_lock` |
+| the nightly skips its newer-run check | `a_night_that_finds_a_newer_run_at_publish_writes_nothing` |
+| the nightly does not prune | `the_nightly_prunes_its_map_to_keep_runs` |
+| `node_labels` without the map predicate | `node_labels_label_only_the_evidence_the_map_may_draw` |
+| the unembedded count summed over built themes (the reviewed code) | `unembedded_members_are_counted_in_every_theme_of_the_map` |
+
+Known limit: ONE claim whose own agents and evidence carry more than 1,024
+edges among them cannot be split; its theme is carried or dropped every
+night until those edges shrink (an operator build does not clear it).
 
 ## Needs prod measurement
 
