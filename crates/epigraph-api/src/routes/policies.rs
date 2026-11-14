@@ -240,6 +240,7 @@ pub async fn create_challenge(
         message: format!("Failed to look up existing challenge: {e}"),
     })?;
 
+    let created = existing.is_none();
     let id = match existing {
         Some(id) => id,
         None => sqlx::query_scalar(
@@ -277,7 +278,59 @@ pub async fn create_challenge(
         message: format!("Failed to create challenge: {e}"),
     })?;
 
+    // Embed the new challenge, post-commit and best-effort (CLAUDE.md
+    // "Embedding policy"), as `create_claim` does: generated with no
+    // transaction held, stored on the caller's stamp, the authority that just
+    // wrote the row. A repeat request created nothing and embeds nothing.
+    if created {
+        embed_new_challenge(&state, &viewer, id, &content).await;
+    }
+
     Ok(Json(serde_json::json!({ "id": id })))
+}
+
+/// The post-commit embed of a challenge `create_challenge` just inserted.
+/// Every failure is logged and swallowed: the challenge is stored either way.
+#[cfg(feature = "db")]
+async fn embed_new_challenge(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+    content: &str,
+) {
+    let Some(embedder) = state.embedding_service() else {
+        tracing::debug!(claim_id = %id, "no embedding service; challenge not embedded");
+        return;
+    };
+    let embedding = match embedder.generate(content).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(claim_id = %id, error = %e, "Failed to generate challenge embedding");
+            return;
+        }
+    };
+    let pgvector = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    match state
+        .store_claim_embedding_as(viewer, id, &pgvector, "create_challenge.embed")
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            claim_id = %id,
+            "challenge embedding matched no row (claim missing, sealed, superseded, or not \
+             writable by the caller); no vector stored"
+        ),
+        Err(e) => {
+            tracing::warn!(claim_id = %id, error = %e, "Failed to store challenge embedding");
+        }
+    }
 }
 
 /// GET /api/v1/policy-challenges/:id — fetch a challenge by ID.
