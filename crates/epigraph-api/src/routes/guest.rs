@@ -22,6 +22,16 @@
 //! | `GET /api/v1/guest/graph/themes/overview` | [`GuestThemesOverview`]: ids and public counts, no labels |
 //! | `GET /api/v1/guest/graph/themes/layout` | the authenticated layout body, read as the guest, with no theme or region label; the unplaced list is refused |
 //!
+//! # Off unless the operator switches it on
+//!
+//! The routes answer only when [`AppState::guest_reads`] is
+//! [`GuestReads::On`], which `bin/server.rs` reads from
+//! `EPIGRAPH_GUEST_READS=on`. Off (the default in every constructor), each
+//! answers a bare 404 with no body, as an unrouted path does. Rows were stored
+//! as `public` while that meant "any signed-in agent" (`docs/tenancy.md`, D3),
+//! so opening them to the internet is a deliberate act and not a side effect
+//! of a deploy.
+//!
 //! # A non-public id is an absent one
 //!
 //! The card and the ego answer a claim the guest may not read with the same
@@ -62,7 +72,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderValue},
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -75,12 +85,18 @@ use uuid::Uuid;
 
 use crate::errors::ApiError;
 use crate::routes::{finish_scoped_read, open_scoped_read};
-use crate::state::AppState;
+use crate::state::{AppState, GuestReads};
 
 /// The far-endpoint types the guest ego never shows. An `agent` is the filer,
 /// asserter or ingester of a claim; its display name is what the card leaves
 /// out.
 pub(crate) const GUEST_EGO_HIDDEN_TYPES: &[&str] = &["agent"];
+
+/// The answer of every guest route while the switch is off: a bare 404, the
+/// same status and empty body as a path no route matches.
+fn switched_off(state: &AppState) -> Option<Response> {
+    (state.guest_reads != GuestReads::On).then(|| no_store(StatusCode::NOT_FOUND.into_response()))
+}
 
 /// Mark a guest answer, success or error, as never stored by any cache.
 fn no_store(mut res: Response) -> Response {
@@ -184,6 +200,9 @@ async fn read_claim_card(
 
 /// `GET /api/v1/guest/claims/:id`
 pub async fn claim_card(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    if let Some(off) = switched_off(&state) {
+        return off;
+    }
     guest_answer(read_claim_card(&state, &Viewer::public_only(), id).await)
 }
 
@@ -197,6 +216,9 @@ pub async fn claim_ego(
     Path(id): Path<Uuid>,
     Query(params): Query<crate::routes::ego::EgoQuery>,
 ) -> Response {
+    if let Some(off) = switched_off(&state) {
+        return off;
+    }
     guest_answer(
         crate::routes::ego::claim_ego_as(
             &Viewer::public_only(),
@@ -286,6 +308,9 @@ pub async fn themes_overview(
     State(state): State<AppState>,
     Query(params): Query<GuestOverviewParams>,
 ) -> Response {
+    if let Some(off) = switched_off(&state) {
+        return off;
+    }
     guest_answer(read_overview(&state, &Viewer::public_only(), params).await)
 }
 
@@ -298,6 +323,9 @@ pub async fn themes_layout(
     State(state): State<AppState>,
     Query(q): Query<crate::routes::graph_layout::LayoutQuery>,
 ) -> Response {
+    if let Some(off) = switched_off(&state) {
+        return off;
+    }
     guest_answer(
         crate::routes::graph_layout::themes_layout_as(
             &Viewer::public_only(),

@@ -97,8 +97,9 @@ const PUBLIC_ALLOWLIST: &[&str] = &["/health", "/api/v1/openapi.json"];
 /// The GUEST reads (backlog `1deb9dbf`) are anonymous by design: a signed-out
 /// visitor or a link-card fetcher reads the public graph. Four GETs, each read
 /// as `Viewer::public_only()` (no group), so they serve public rows only and
-/// answer a non-public id exactly as an absent one. Their own tests are
-/// `tests/guest_public_reads.rs`.
+/// answer a non-public id exactly as an absent one. They answer only on a
+/// server started with `EPIGRAPH_GUEST_READS=on` (a bare 404 otherwise).
+/// Their own tests are `tests/guest_public_reads.rs`.
 ///
 /// Eighteen application routes + the 11 OAuth/discovery routes = 29 paths
 /// reachable with no `Authorization` header.
@@ -637,11 +638,16 @@ async fn allowlisted_routes_still_answer_anonymously() {
             .send()
             .await
             .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        // The test app is built without `EPIGRAPH_GUEST_READS=on`, so the
+        // guest route answers its switched-off 404. A bearer-wrapped route
+        // would answer 401 instead; the switched-on answers are
+        // `tests/guest_public_reads.rs`.
         assert_eq!(
             resp.status(),
-            reqwest::StatusCode::OK,
-            "GET {path} is a guest read (backlog 1deb9dbf) and must answer a \
-             signed-out caller; the bearer layer must not wrap it"
+            reqwest::StatusCode::NOT_FOUND,
+            "GET {path} is a guest read (backlog 1deb9dbf), off by default; it \
+             must reach its handler for a signed-out caller, so the bearer \
+             layer must not wrap it (a 401)"
         );
     }
 

@@ -37,6 +37,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::Router;
+use epigraph_api::state::GuestReads;
 use epigraph_api::{create_router, AgentRateLimiter, ApiConfig, AppState, RateLimitConfig};
 use epigraph_db::repos::atlas_layout::{
     LayoutBuild, LayoutLinkOut, LayoutRegionOut, LayoutThemeOut,
@@ -76,8 +77,14 @@ async fn production_state(pool: &PgPool) -> AppState {
     state
 }
 
+/// The production state with the guest switch ON, as a server started with
+/// `EPIGRAPH_GUEST_READS=on`.
 async fn router(pool: &PgPool) -> Router {
-    create_router(production_state(pool).await)
+    create_router(
+        production_state(pool)
+            .await
+            .with_guest_reads(GuestReads::On),
+    )
 }
 
 /// A signed-out GET: no `Authorization` header at all.
@@ -572,6 +579,41 @@ async fn the_signed_in_layout_keeps_its_labels(pool: PgPool) {
     assert_eq!(region["label"], "SECRET-derived region label");
 }
 
+// ── The switch ──
+
+/// The guest routes are OFF unless the operator switches them on: on a state
+/// built without the switch, every guest route answers the bare 404 of an
+/// unrouted path, and the same database read through a switched-on state
+/// serves the public claim (the positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn guest_reads_are_off_unless_switched_on(pool: PgPool) {
+    let (owner, _) = fixture::seed_agent_with_group(&pool, "switch-owner").await;
+    let claim = fixture::seed_public_claim(&pool, owner, "switch claim").await;
+    let paths = [
+        format!("/api/v1/guest/claims/{claim}"),
+        format!("/api/v1/guest/claims/{claim}/ego"),
+        "/api/v1/guest/graph/themes/overview".to_string(),
+        "/api/v1/guest/graph/themes/layout".to_string(),
+    ];
+
+    let off = create_router(production_state(&pool).await);
+    for path in &paths {
+        let (status, headers, text) = guest(&off, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {text}");
+        assert!(text.is_empty(), "{path}: an off route has no body: {text}");
+        assert!(
+            headers.get("content-type").is_none(),
+            "{path}: an off route looks unrouted"
+        );
+    }
+
+    let on = router(&pool).await;
+    for path in &paths {
+        let (status, _, text) = guest(&on, path).await;
+        assert_eq!(status, StatusCode::OK, "positive control {path}: {text}");
+    }
+}
+
 // ── The anonymous envelope ──
 
 /// Guest routes answer `Cache-Control: no-store`: a claim privatized after a
@@ -611,8 +653,11 @@ async fn guest_routes_are_rate_limited_per_address() {
         replenish_interval_secs: 60,
         enable_global_limit: false,
     });
-    let router =
-        create_router(AppState::with_db(pool, ApiConfig::default()).with_rate_limiter(limiter));
+    let router = create_router(
+        AppState::with_db(pool, ApiConfig::default())
+            .with_rate_limiter(limiter)
+            .with_guest_reads(GuestReads::On),
+    );
     let path = format!("/api/v1/guest/claims/{}", Uuid::new_v4());
     let send = |peer: &'static str| {
         let router = router.clone();

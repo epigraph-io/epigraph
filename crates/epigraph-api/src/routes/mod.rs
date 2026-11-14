@@ -1288,6 +1288,8 @@ pub fn create_router_with_extensions(
     // rows only, answer a non-public id exactly as an absent one, and withhold
     // the stored theme and region labels (see `routes/guest.rs`). They sit here
     // to carry this router's anonymous body limit and per-address rate limit.
+    // They are routed always but answer only when `AppState::guest_reads` is
+    // on (`EPIGRAPH_GUEST_READS=on`); off, each is a bare 404.
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(

@@ -310,7 +310,8 @@ pub async fn bearer_auth_middleware(
 ///
 /// The guest reads never take a viewer from this layer: they read as
 /// `Viewer::public_only()` (`routes/guest.rs`) whether or not a token is
-/// present, so a guest answer is the public graph for every caller.
+/// present, so a guest answer is the public graph for every caller. They
+/// answer only while `EPIGRAPH_GUEST_READS=on` (a bare 404 otherwise).
 ///
 /// It is still `optional` rather than absent because an allowlisted route may
 /// legitimately want to know *who* is calling when a token happens to be

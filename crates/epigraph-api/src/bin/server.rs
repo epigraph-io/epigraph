@@ -586,6 +586,7 @@ async fn main() {
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_bp_apply(bp_apply_from_env())
+            .with_guest_reads(guest_reads_from_env())
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
 
@@ -961,6 +962,33 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
             "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \
              claims (BP apply is retired; compounds are never written)"
         );
+    }
+    switch
+}
+
+/// `EPIGRAPH_GUEST_READS`, read once at boot: whether the anonymous guest
+/// reads under `/api/v1/guest/` answer (`epigraph_api::state::GuestReads`).
+/// OFF unless the value is exactly `on`; logged either way, so a journal
+/// shows whether the public graph is open to signed-out callers.
+#[cfg(feature = "db")]
+fn guest_reads_from_env() -> epigraph_api::state::GuestReads {
+    use epigraph_api::state::{GuestReads, GUEST_READS_ENV};
+    let raw = std::env::var(GUEST_READS_ENV).ok();
+    if GuestReads::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_GUEST_READS is set to a value that is neither `on` nor `off`: guest \
+             reads stay OFF on this process (only `on` enables them)"
+        );
+    }
+    let switch = GuestReads::parse(raw.as_deref());
+    if switch == GuestReads::On {
+        tracing::warn!(
+            "EPIGRAPH_GUEST_READS=on: every `visibility = 'public'` claim, edge and theme \
+             count is readable WITHOUT a credential under /api/v1/guest/"
+        );
+    } else {
+        tracing::info!("guest reads OFF: /api/v1/guest/ answers 404");
     }
     switch
 }
