@@ -2,6 +2,8 @@
 //! level of a synthetic two-hierarchy map gets its positions, is stored with
 //! the run's layout record, and reads back valid; the next run over the same
 //! input lays out only the leaf that changed and keeps every other level's
+//! stored positions; and a run in which one leaf gained a claim lays out that
+//! leaf and the levels above it (whose `claim_count` changed) again from their
 //! stored positions.
 //!
 //! The hierarchy stands in for W4's and W5's output, which do not exist on
@@ -30,6 +32,22 @@ use uuid::Uuid;
 
 /// Claims per leaf, by leaf index (the last leaf reaches the 100-node cap).
 const LEAF_CLAIMS: [usize; 6] = [5, 16, 27, 38, 49, 66];
+
+/// The id of the claim [`Change::OneMoreClaim`] adds, outside the sequence
+/// [`Ids`] hands out, so every other id stays the same.
+const EXTRA_CLAIM: Uuid = Uuid::from_u64_pair(0xA71A_5007, 1);
+
+/// What the next night changes in one leaf.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Change {
+    /// The support from claim 0 to claim 1 is gone (the only edge between
+    /// that pair): the leaf's input changes, no `claim_count` does.
+    CutFirstLink,
+    /// One more claim, asserted by the first agent and supported by the last
+    /// claim: the leaf's input and the `claim_count` of every level above it
+    /// change.
+    OneMoreClaim,
+}
 
 /// One stored level: its place in the tree and its document.
 struct Level {
@@ -63,14 +81,13 @@ struct LeafSpec<'a> {
     switch_to: Uuid,
     crumbs: &'a [(Uuid, u8)],
     n_claims: usize,
-    cut_first_link: bool,
+    change: Option<Change>,
 }
 
 /// A leaf of `n_claims` claims, one agent per five claims asserting them, one
 /// evidence row per three claims backing one claim each, and a chain of
 /// supports between consecutive claims plus a refutation every fourth claim.
-/// `cut_first_link` drops the support from claim 0 to claim 1 (the only edge
-/// between that pair).
+/// `change` applies one [`Change`].
 fn leaf_doc(ids: &mut Ids, spec: &LeafSpec<'_>) -> LeafLevel {
     let LeafSpec {
         hierarchy,
@@ -79,13 +96,15 @@ fn leaf_doc(ids: &mut Ids, spec: &LeafSpec<'_>) -> LeafLevel {
         switch_to,
         crumbs,
         n_claims,
-        cut_first_link,
+        change,
     } = *spec;
+    let cut_first_link = change == Some(Change::CutFirstLink);
     let claims: Vec<Uuid> = (0..n_claims).map(|_| ids.next()).collect();
     let n_agents = n_claims.div_ceil(5);
     let agents: Vec<Uuid> = (0..n_agents).map(|_| ids.next()).collect();
     let n_evidence = (n_claims / 3).min(100 - n_claims - n_agents);
     let evidence: Vec<Uuid> = (0..n_evidence).map(|_| ids.next()).collect();
+    let extra = (change == Some(Change::OneMoreClaim)).then_some(EXTRA_CLAIM);
 
     let mut nodes: Vec<Node> = claims
         .iter()
@@ -155,6 +174,23 @@ fn leaf_doc(ids: &mut Ids, spec: &LeafSpec<'_>) -> LeafLevel {
     }
     for (k, ev) in evidence.iter().enumerate() {
         edges.push(edge(*ev, claims[3 * k], "supports", FlowBasis::Exact, 1));
+    }
+    if let Some(id) = extra {
+        nodes.push(Node::Claim(ClaimNode {
+            id,
+            label: "synthetic claim added".into(),
+            x: 0.0,
+            y: 0.0,
+            truth_value: Some(0.5),
+        }));
+        edges.push(edge(agents[0], id, "asserts", FlowBasis::None, 0));
+        edges.push(edge(
+            claims[n_claims - 1],
+            id,
+            "supports",
+            FlowBasis::Proxy,
+            1,
+        ));
     }
 
     LeafLevel {
@@ -247,9 +283,10 @@ fn group_doc(
 }
 
 /// Both hierarchies of one theme: per hierarchy a root, two groups and six
-/// leaves, every position at a placeholder. `cut` names a (hierarchy, leaf
-/// index) whose first claim link is dropped.
-fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
+/// leaves, every position at a placeholder. `change` names a (hierarchy, leaf
+/// index) and what changes in that leaf; a group's `claim_count` counts the
+/// added claim.
+fn synthetic_map(theme: Uuid, change: Option<(Hierarchy, usize, Change)>) -> Vec<Level> {
     let mut ids = Ids(0);
     let roots: BTreeMap<Hierarchy, Uuid> = [Hierarchy::Meaning, Hierarchy::Links]
         .into_iter()
@@ -261,6 +298,12 @@ fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
         let other = roots[&h.other()];
         let (g1, g2) = (ids.next(), ids.next());
         let leaves: Vec<Uuid> = (0..6).map(|_| ids.next()).collect();
+        let change_of = |i: usize| match change {
+            Some((ch, ci, what)) if ch == h && ci == i => Some(what),
+            _ => None,
+        };
+        let claims_of =
+            |i: usize| LEAF_CLAIMS[i] + usize::from(change_of(i) == Some(Change::OneMoreClaim));
         let leaf = |ids: &mut Ids, i: usize, crumbs: &[(Uuid, u8)], parent: Uuid| Level {
             parent: Some(parent),
             doc: LevelDocument::Leaf(leaf_doc(
@@ -272,7 +315,7 @@ fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
                     switch_to: other,
                     crumbs,
                     n_claims: LEAF_CLAIMS[i],
-                    cut_first_link: cut == Some((h, i)),
+                    change: change_of(i),
                 },
             )),
         };
@@ -284,7 +327,7 @@ fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
         for i in 4..=5 {
             out.push(leaf(&mut ids, i, &[(root, 0), (g2, 1)], g2));
         }
-        let sum = |r: std::ops::RangeInclusive<usize>| r.map(|i| LEAF_CLAIMS[i]).sum::<usize>();
+        let sum = |r: std::ops::RangeInclusive<usize>| r.map(claims_of).sum::<usize>();
         out.push(Level {
             parent: Some(root),
             doc: LevelDocument::Group(group_doc(
@@ -294,7 +337,7 @@ fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
                 other,
                 &[(root, 0)],
                 &(1..=3)
-                    .map(|i| (leaves[i], ChildKind::Leaf, LEAF_CLAIMS[i]))
+                    .map(|i| (leaves[i], ChildKind::Leaf, claims_of(i)))
                     .collect::<Vec<_>>(),
             )),
         });
@@ -307,7 +350,7 @@ fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
                 other,
                 &[(root, 0)],
                 &(4..=5)
-                    .map(|i| (leaves[i], ChildKind::Leaf, LEAF_CLAIMS[i]))
+                    .map(|i| (leaves[i], ChildKind::Leaf, claims_of(i)))
                     .collect::<Vec<_>>(),
             )),
         });
@@ -322,7 +365,7 @@ fn synthetic_map(theme: Uuid, cut: Option<(Hierarchy, usize)>) -> Vec<Level> {
                 &[
                     (g1, ChildKind::Group, sum(1..=3)),
                     (g2, ChildKind::Group, sum(4..=5)),
-                    (leaves[0], ChildKind::Leaf, LEAF_CLAIMS[0]),
+                    (leaves[0], ChildKind::Leaf, claims_of(0)),
                 ],
             )),
         });
@@ -509,7 +552,10 @@ async fn every_level_of_a_synthetic_hierarchy_is_stored_with_valid_positions(poo
     let mut levels = synthetic_map(theme, None);
     assert_eq!(levels.len(), 18);
     let (run, report) = build_run(&pool, &mut levels, None).await;
-    assert_eq!((report.computed, report.reused), (18, 0));
+    assert_eq!(
+        (report.computed, report.warm_started, report.reused),
+        (18, 0, 0)
+    );
 
     let stored = read_back(&pool, run, &levels).await;
     assert_eq!(stored.len(), 18);
@@ -548,14 +594,13 @@ async fn a_rerun_lays_out_only_the_changed_leaf_and_keeps_every_other_stored_pos
         &run_params(&pool, run1).await,
         stored1.values().map(|(payload, _)| payload.clone()),
     );
-    let changed = (Hierarchy::Links, 3);
-    let mut second = synthetic_map(theme, Some(changed));
+    let mut second = synthetic_map(theme, Some((Hierarchy::Links, 3, Change::CutFirstLink)));
     let (run2, report) = build_run(&pool, &mut second, Some(&previous)).await;
     assert_ne!(run2, run1);
     assert_eq!(
-        (report.computed, report.reused),
-        (1, 17),
-        "only the changed leaf is laid out again"
+        (report.computed, report.warm_started, report.reused),
+        (1, 1, 17),
+        "only the changed leaf is laid out again, from its stored positions"
     );
 
     let stored2 = read_back(&pool, run2, &second).await;
@@ -588,4 +633,66 @@ async fn a_rerun_lays_out_only_the_changed_leaf_and_keeps_every_other_stored_pos
             );
         }
     }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_added_to_one_leaf_relays_it_and_its_ancestors_from_their_stored_positions(
+    pool: PgPool,
+) {
+    let theme = seed_theme(&pool).await;
+    let mut first = synthetic_map(theme, None);
+    let (run1, _) = build_run(&pool, &mut first, None).await;
+    let stored1 = read_back(&pool, run1, &first).await;
+    let previous = PreviousRun::new(
+        &run_params(&pool, run1).await,
+        stored1.values().map(|(payload, _)| payload.clone()),
+    );
+
+    // Leaf 2 of the meaning hierarchy (under g1, under the root) gains one
+    // claim, so its own input changes and so does the `claim_count` its
+    // parent and the theme root see.
+    let mut second = synthetic_map(theme, Some((Hierarchy::Meaning, 2, Change::OneMoreClaim)));
+    let (run2, report) = build_run(&pool, &mut second, Some(&previous)).await;
+    assert_eq!(
+        (report.computed, report.warm_started, report.reused),
+        (3, 3, 15),
+        "the leaf, its parent and the theme root are laid out again from their stored positions"
+    );
+
+    let stored2 = read_back(&pool, run2, &second).await;
+    let relaid: Vec<(Hierarchy, Uuid)> = stored2
+        .iter()
+        .filter(|(key, (_, doc))| positions(doc) != positions(&stored1[key].1))
+        .map(|(key, _)| *key)
+        .collect();
+    assert_eq!(relaid.len(), 3, "{relaid:?}");
+    let mut grown_leaf = 0;
+    for key in &relaid {
+        assert_eq!(key.0, Hierarchy::Meaning);
+        let (doc, was) = (&stored2[key].1, &stored1[key].1);
+        assert_laid_out(doc);
+        let (now, before) = (positions(doc), positions(was));
+        match doc {
+            LevelDocument::Leaf(_) => {
+                grown_leaf += 1;
+                assert!(now.contains_key(&EXTRA_CLAIM));
+                let moves: Vec<f64> = before
+                    .iter()
+                    .map(|(id, p)| dist((p.0, p.1), (now[id].0, now[id].1)))
+                    .collect();
+                let mean = moves.iter().sum::<f64>() / moves.len() as f64;
+                assert!(
+                    mean < 0.05,
+                    "the grown leaf's nodes moved {mean} on average"
+                );
+            }
+            LevelDocument::Group(_) => {
+                for (id, p) in &before {
+                    let d = dist((p.0, p.1), (now[id].0, now[id].1));
+                    assert!(d < p.2, "child {id} of {key:?} moved {d} (radius {})", p.2);
+                }
+            }
+        }
+    }
+    assert_eq!(grown_leaf, 1);
 }

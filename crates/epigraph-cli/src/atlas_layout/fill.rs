@@ -31,6 +31,18 @@
 //! or child id, and is not laid out again ([`FillReport::reused`]). Anything
 //! else is laid out ([`FillReport::computed`]).
 //!
+//! # Warm starts
+//!
+//! A level that is laid out again while the previous run (recorded under the
+//! same algorithm) stored a document of the same kind for it, sharing at
+//! least one node or child, starts from that document's positions
+//! ([`super::force::layout_leaf_from`], [`super::force::layout_group_from`];
+//! counted in [`FillReport::warm_started`]). This is what keeps the levels
+//! above a changed leaf still: one new claim changes the `claim_count` its
+//! parent, grandparent and theme root see, so their hashes change every
+//! night the map grows. A level with no such document (new, or the previous
+//! run was recorded under another algorithm) is laid out cold.
+//!
 //! `write_run` takes `params` when the run opens, so the build lays out every
 //! level in memory first, then writes the run with [`FillReport::record`]
 //! merged into its `params` ([`LayoutRecord::write_into`]), then its levels.
@@ -45,8 +57,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::force::{
-    group_input_hash, layout_group, layout_leaf, leaf_input_hash, GroupInput, LayoutError,
-    LayoutNodeKind, LeafInput, LAYOUT_ALGO,
+    group_input_hash, layout_group, layout_group_from, layout_leaf, layout_leaf_from,
+    leaf_input_hash, Circle, GroupInput, LayoutError, LayoutNodeKind, LeafInput, LAYOUT_ALGO,
 };
 
 /// The key of the layout record in a run's `params`.
@@ -195,6 +207,28 @@ impl PreviousRun {
         Self { record, levels }
     }
 
+    /// The previous document of `doc`'s level to start a new layout from:
+    /// one of the same kind, from a run recorded under this algorithm,
+    /// sharing at least one node or child id with `doc`.
+    fn warm_start(&self, doc: &LevelDocument) -> Option<&LevelDocument> {
+        self.record.as_ref()?;
+        let prev = self.levels.get(&(hierarchy_of(doc), doc.level_id()))?;
+        let shares = match (doc, prev) {
+            (LevelDocument::Leaf(now), LevelDocument::Leaf(was)) => {
+                let ids: std::collections::BTreeSet<Uuid> =
+                    was.nodes.iter().map(Node::id).collect();
+                now.nodes.iter().any(|n| ids.contains(&n.id()))
+            }
+            (LevelDocument::Group(now), LevelDocument::Group(was)) => {
+                let ids: std::collections::BTreeSet<Uuid> =
+                    was.children.iter().map(|c| c.id).collect();
+                now.children.iter().any(|c| ids.contains(&c.id))
+            }
+            _ => false,
+        };
+        shares.then_some(prev)
+    }
+
     /// The previous positions of `doc`'s level, when its hash is the one
     /// recorded and the previous document places every node or child `doc`
     /// has.
@@ -234,6 +268,8 @@ fn hierarchy_of(doc: &LevelDocument) -> Hierarchy {
 pub struct FillReport {
     /// Levels laid out in this call.
     pub computed: usize,
+    /// Of those, the levels started from the previous run's positions.
+    pub warm_started: usize,
     /// Levels that kept the previous run's positions.
     pub reused: usize,
     /// The record to store with the new run.
@@ -286,7 +322,8 @@ fn node_xy(node: &Node) -> (f64, f64) {
 /// Fill every position of `docs`: each leaf node's `x`, `y` and each group
 /// child's `x`, `y`, `r`. A level whose input hash `previous` recorded keeps
 /// the previous document's positions; every other level is laid out, seeded
-/// by its own group id.
+/// by its own group id, and started from the previous document's positions
+/// when `previous` has one for it (module docs, "Warm starts").
 ///
 /// The documents are otherwise untouched. Validating and measuring them
 /// (`LevelDocument::to_stored_json`) stays the writer's step.
@@ -314,17 +351,32 @@ pub fn fill_positions(
         hashes.push(hash);
     }
 
-    let (mut computed, mut reused) = (0, 0);
+    let (mut computed, mut warm_started, mut reused) = (0, 0, 0);
     for (doc, hash) in docs.iter_mut().zip(&hashes) {
         if let Some(prev) = previous.and_then(|p| p.reusable(doc, hash)) {
             copy_positions(doc, prev);
             reused += 1;
             continue;
         }
+        let warm = previous.and_then(|p| p.warm_start(doc));
+        warm_started += usize::from(warm.is_some());
         match doc {
             LevelDocument::Leaf(l) => {
                 let input = leaf_input(l).expect("hashed above");
-                let pos = layout_leaf(l.level_id, &input);
+                let pos = match warm {
+                    Some(LevelDocument::Leaf(was)) => {
+                        let at: BTreeMap<Uuid, [f64; 2]> = was
+                            .nodes
+                            .iter()
+                            .map(|n| {
+                                let (x, y) = node_xy(n);
+                                (n.id(), [x, y])
+                            })
+                            .collect();
+                        layout_leaf_from(l.level_id, &input, &at)
+                    }
+                    _ => layout_leaf(l.level_id, &input),
+                };
                 for n in &mut l.nodes {
                     let [x, y] = pos[&n.id()];
                     set_xy(n, x, y);
@@ -332,7 +384,26 @@ pub fn fill_positions(
             }
             LevelDocument::Group(g) => {
                 let input = group_input(g).expect("hashed above");
-                let placed = layout_group(g.level_id, &input);
+                let placed = match warm {
+                    Some(LevelDocument::Group(was)) => {
+                        let at: BTreeMap<Uuid, Circle> = was
+                            .children
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.id,
+                                    Circle {
+                                        x: c.x,
+                                        y: c.y,
+                                        r: c.r,
+                                    },
+                                )
+                            })
+                            .collect();
+                        layout_group_from(g.level_id, &input, &at)
+                    }
+                    _ => layout_group(g.level_id, &input),
+                };
                 for c in &mut g.children {
                     let p = placed[&c.id];
                     c.x = p.x;
@@ -345,6 +416,7 @@ pub fn fill_positions(
     }
     Ok(FillReport {
         computed,
+        warm_started,
         reused,
         record,
     })
@@ -478,7 +550,10 @@ mod tests {
     fn filled_fixture_levels_validate_and_keep_the_layout_bounds() {
         let mut docs = unplaced();
         let report = fill_positions(&mut docs, None).unwrap();
-        assert_eq!((report.computed, report.reused), (4, 0));
+        assert_eq!(
+            (report.computed, report.warm_started, report.reused),
+            (4, 0, 0)
+        );
         assert_eq!(report.record.hashes.len(), 4);
         for d in &docs {
             d.to_stored_json().unwrap_or_else(|v| panic!("{v}"));
@@ -566,7 +641,7 @@ mod tests {
             .unwrap();
         l.edges.remove(cut);
         let r2 = fill_positions(&mut again, Some(&prev)).unwrap();
-        assert_eq!((r2.computed, r2.reused), (1, 3));
+        assert_eq!((r2.computed, r2.warm_started, r2.reused), (1, 1, 3));
         let key = level_key(hierarchy_of(&again[changed]), again[changed].level_id());
         assert_ne!(r2.record.hashes[&key], r1.record.hashes[&key]);
         for (i, (now, was)) in again.iter().zip(&stored).enumerate() {
@@ -588,12 +663,13 @@ mod tests {
         old.algo = "atlas-w6-v0".into();
         let prev = previous_from(&old, &first);
         let r2 = fill_positions(&mut unplaced(), Some(&prev)).unwrap();
-        assert_eq!((r2.computed, r2.reused), (4, 0));
+        // Nor started from: a new algorithm lays every level out cold.
+        assert_eq!((r2.computed, r2.warm_started, r2.reused), (4, 0, 0));
 
         // The hash matches but the previous document is gone.
         let prev = previous_from(&r1.record, &first[1..]);
         let r3 = fill_positions(&mut unplaced(), Some(&prev)).unwrap();
-        assert_eq!((r3.computed, r3.reused), (1, 3));
+        assert_eq!((r3.computed, r3.warm_started, r3.reused), (1, 0, 3));
 
         // No record at all.
         let prev = PreviousRun::new(
@@ -601,14 +677,15 @@ mod tests {
             first.iter().map(|d| serde_json::to_value(d).unwrap()),
         );
         let r4 = fill_positions(&mut unplaced(), Some(&prev)).unwrap();
-        assert_eq!((r4.computed, r4.reused), (4, 0));
+        assert_eq!((r4.computed, r4.warm_started, r4.reused), (4, 0, 0));
     }
 
     #[test]
     fn a_previous_document_that_does_not_place_every_id_is_not_copied() {
         // A record whose hashes match, beside stored documents that do not
         // (a hand-edited or half-written previous run): each such level is
-        // laid out again instead of copied with holes.
+        // laid out again, from the positions the document does hold, instead
+        // of copied with holes.
         let mut first = unplaced();
         let r1 = fill_positions(&mut first, None).unwrap();
         let mut stored = first.clone();
@@ -629,9 +706,70 @@ mod tests {
         let prev = previous_from(&r1.record, &stored);
         let mut again = unplaced();
         let r2 = fill_positions(&mut again, Some(&prev)).unwrap();
-        assert_eq!((r2.computed, r2.reused), (2, 2));
-        assert_eq!(positions(&again[leaf]), positions(&first[leaf]));
-        assert_eq!(positions(&again[group]), positions(&first[group]));
+        assert_eq!((r2.computed, r2.warm_started, r2.reused), (2, 2, 2));
+        for i in [leaf, group] {
+            again[i].to_stored_json().unwrap_or_else(|v| panic!("{v}"));
+            let now = positions(&again[i]);
+            let was = positions(&first[i]);
+            assert_eq!(now.len(), was.len());
+            // The id the stored document lost is placed too, and the others
+            // stay near where they were.
+            let moved: Vec<f64> = now
+                .iter()
+                .zip(&was)
+                .map(|(a, b)| {
+                    assert_eq!(a.0, b.0);
+                    dist((a.1, a.2), (b.1, b.2))
+                })
+                .collect();
+            let mean = moved.iter().sum::<f64>() / moved.len() as f64;
+            assert!(mean < 0.1, "level {i}: mean move {mean}");
+        }
+    }
+
+    #[test]
+    fn a_child_that_gains_a_claim_relays_its_parent_from_the_stored_circles() {
+        // Atlas W6 review: a new claim in a leaf changes the `claim_count`
+        // its parent and every level above it see, so those levels miss the
+        // skip every night the map grows. They must start from the circles
+        // stored the night before, not from scratch.
+        let mut first = unplaced();
+        let r1 = fill_positions(&mut first, None).unwrap();
+        let root = first
+            .iter()
+            .position(|d| matches!(d, LevelDocument::Group(g) if g.children.len() >= 40))
+            .expect("the fixture theme root has 40 children");
+        let prev = previous_from(&r1.record, &first);
+
+        let mut again = unplaced();
+        let LevelDocument::Group(g) = &mut again[root] else {
+            unreachable!()
+        };
+        g.children[0].claim_count += 1;
+        let grown = g.children[0].id;
+        let r2 = fill_positions(&mut again, Some(&prev)).unwrap();
+        assert_eq!((r2.computed, r2.warm_started, r2.reused), (1, 1, 3));
+        again[root]
+            .to_stored_json()
+            .unwrap_or_else(|v| panic!("{v}"));
+
+        let (LevelDocument::Group(now), LevelDocument::Group(was)) = (&again[root], &first[root])
+        else {
+            unreachable!()
+        };
+        let before: BTreeMap<Uuid, (f64, f64, f64)> = was
+            .children
+            .iter()
+            .map(|c| (c.id, (c.x, c.y, c.r)))
+            .collect();
+        let mut max = 0.0_f64;
+        for c in now.children.iter().filter(|c| c.id != grown) {
+            let (x, y, r) = before[&c.id];
+            let d = dist((c.x, c.y), (x, y));
+            assert!(d < r, "child {} moved {d}, more than its radius {r}", c.id);
+            max = max.max(d);
+        }
+        assert!(max < 0.02, "a child moved {max}");
     }
 
     #[test]
