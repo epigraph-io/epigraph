@@ -97,8 +97,11 @@ edge names: with `h` = the claim's hypothesis index on that frame
 (`claim_frames.hypothesis_index` through `edge_factor::resolve_hypothesis_index`,
 0 when absent), `m({h})` for `supports` and `m({1 − h})` for `refutes`. It is
 the raw stored mass, with no `source_strength` discount (that discount is
-computed at fold time, not stored). A mass value outside [0, 1] or not a
-number makes the row unusable.
+computed at fold time, not stored). A mass value within 1e-9 of [0, 1] (the
+tolerance `epigraph_ds::mass` allows a BBA's sum) is float residue: it reads
+clamped into [0, 1], so a Θ of `-1e-17` does not void the row and a singleton
+of `1 + 1e-12` serves as exactly 1. A value further out, or not a finite
+number, makes the row unusable.
 
 **Several rows from one evidence row on one claim** (another agent, a copy of
 the BBA on a second frame) aggregate by the largest mass: a copy is not more
@@ -110,10 +113,23 @@ support, and a sum could leave [0, 1].
 weight 0, sign 0. The contract FORBIDS this today: `FlowBasis::for_kinds`
 (evidence, claim) is `exact`, and `validate_leaf`'s flow-basis check
 (`crates/epigraph-atlas-contract/src/lib.rs`) rejects any other basis; the
-schema's `flow_basis` description says the same. W7 does not fake a mass; the
-rule to change is that check (allow `none` for an evidence-to-claim edge with
-no stored mass the audience can read), or W10 must drop such edges. Reported
-to the operator; a test pins the exact violation.
+schema's `flow_basis` description says the same. W7 does not fake a mass.
+Reported to the operator; a test pins the exact violation.
+
+This is not only legacy rows: the convention learn and forget routes write a
+stored `evidence -SUPPORTS-> claim` / `-REFUTES->` edge and no evidence-keyed
+mass row, and the leaf draws evidence-to-claim edges of every relationship.
+
+**Recommended rule change (the contract's, not W7's):** the leaf validation
+accepts `none` as well as `exact` for an evidence-to-claim edge, still with
+weight 0 and sign 0 (the existing "no flow" check), and the schema's
+`flow_basis` text says so. The alternative, W10 dropping such edges, does not
+work on its own: the leaf validation counts an evidence node as anchored only
+through an edge to a claim, so an evidence node whose only claim edge has no
+mass would become an orphan and the leaf would still fail; dropping the node
+as well hides evidence the audience may read. When the rule changes,
+`an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it`
+is the test that flips.
 
 ### Every other edge (`flow_basis` = `none`)
 
@@ -156,6 +172,8 @@ The read runs on the build's snapshot transaction
 - the largest weight among collapsed ids wins; lower-casing re-collapses;
 - the exact mass: `h` = 1 on a binary frame, max over rows, a bad mass value
   is unusable;
+- float residue within 1e-9 of [0, 1] is clamped, not a bad row; a value
+  1e-6 out is still a bad row;
 - no usable row and a non-supports/refutes evidence edge are `none`.
 
 **DB tests** (`crates/epigraph-engine/tests/atlas_flow.rs`, fresh DB):
@@ -177,11 +195,17 @@ The read runs on the build's snapshot transaction
 - `an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it`;
 - `a_frame_or_hypothesis_index_the_audience_cannot_read_is_not_used` (added
   after the first probe run showed nothing seeded another team's frame or
-  index row).
+  index row);
+- `a_claim_link_row_the_map_cannot_read_is_an_error_not_a_strength` (added
+  after review): the strength read on its own, handed a W3 leaf plus one
+  extra claim-to-claim row id the map cannot read (another team's row, a row
+  the map's team owns with a co-owner, a team's row on the public map). Each
+  is `DbError::InvalidData`; the unmodified leaf and a readable extra id read.
 
 **Fail on the old code.** Each mutation applied to the committed tree, the
 unit tests and the DB target run (`--no-fail-fast`), then restored and
-`touch`ed. Measured on the pushed branch:
+`touch`ed. 23 probes before review, 4 after (the last four rows), measured
+on the branch:
 
 | Mutation | Tests that went red |
 |---|---|
@@ -205,7 +229,10 @@ unit tests and the DB target run (`--no-fail-fast`), then restored and
 | a re-collapse keeps the first edge, not the largest | `both_spellings_collapse_into_one_lower_cased_edge` |
 | no usable mass gives `exact` with weight 0 (an invented mass) | unit `evidence_edges_take_...`; `a_mass_row_...`, `an_evidence_edge_with_no_readable_mass_...` |
 | the stored strength ignored (fallback always) | 2 unit; `both_spellings_collapse_...`, `proxy_weights_do_not_move_...` |
-| strength read: `co_owner_group_id IS NULL` dropped | none: an equivalent mutant (the read only re-reads ids W3's audience-filtered read returned), recorded, not a gap |
+| strength read: `co_owner_group_id IS NULL` dropped | before review: none (equivalent end to end, since W3 only hands the read ids it already filtered). After review: `a_claim_link_row_the_map_cannot_read_...` at the co-owned case |
+| strength read: the whole edge predicate dropped | `a_claim_link_row_the_map_cannot_read_...` |
+| exact mass: the old strict [0, 1] check (no residue tolerance) | unit `float_residue_is_a_mass_...` (residue on Θ voids the row) |
+| exact mass: residue tolerated but not clamped | unit `float_residue_is_a_mass_...` (`1 + 1e-12` served) |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint`, `bba_retract_read_lint`,
 `pool_read_lint`, `viewer_ratchet`, `no_role_blind_belief_reads`. W7 writes
@@ -215,7 +242,7 @@ no edge, so `edge_writer_signing_ratchet` is not affected.
 
 | Criterion | Proof |
 |---|---|
-| every leaf edge carries a weight and an exact-or-proxy flag | `every_weighted_edge_passes_contract_validation` (DB) |
+| every leaf edge carries a weight and an exact-or-proxy flag | **Blocked** for an evidence-to-claim edge with no usable mass (it is `none`, which the v1 contract refuses; see "Evidence to claim" for the rule to change). Met for every other edge: `every_weighted_edge_passes_contract_validation` (DB) seeds a mass for every evidence edge, so it does not cover the blocked case; `an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it` pins it |
 | tests on a fixture with known masses | `exact_masses_on_a_fixture_with_known_bbas` (DB), the mass unit tests |
 | contradicting and refuting links carry negative sign | `contradicts_and_refutes_carry_negative_sign_and_the_engine_factor` (DB) |
 | (ruling) no belief factor in a proxy weight | `proxy_weights_do_not_move_when_any_belief_moves` (DB) and its mutation probes |
@@ -231,4 +258,11 @@ no edge, so `edge_writer_signing_ratchet` is not affected.
 - The range of `edges.properties.strength` on claim-to-claim edges, and which
   writers set it.
 - The count of evidence-to-claim edges outside supports/refutes, and of
-  `informs` claim-to-claim edges.
+  `informs` and `challenges` claim-to-claim edges (both sign 0 today: not on
+  the item's lists).
+- The count of convention evidence edges (no evidence-keyed mass row).
+- The count of evidence-keyed mass rows with any value more than 1e-9
+  outside [0, 1] (each voids its row).
+- The count of evidence-to-claim edges whose relationship disagrees with the
+  singleton the BBA puts its mass on (served as `exact` weight near 0 with
+  the edge's sign).

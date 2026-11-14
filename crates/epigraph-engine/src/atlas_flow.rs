@@ -31,8 +31,10 @@
 //! relationship, gets `none` (weight 0, sign 0). **The v1 contract refuses
 //! that**: `FlowBasis::for_kinds(evidence, claim)` is `exact`, and
 //! `LevelDocument::validate` rejects any other basis for that pair. No mass
-//! is invented to satisfy it; the contract rule (or W10's choice to drop such
-//! edges) is the operator's call.
+//! is invented to satisfy it. The rule to change is the contract's (accept
+//! `none` beside `exact` for that pair, weight 0 and sign 0): dropping the
+//! edge instead would leave an evidence node whose only claim edge it was
+//! unanchored, which the same validation also rejects.
 //!
 //! # Everything else: `none`
 //!
