@@ -2500,7 +2500,7 @@ pub async fn seal_commit(
             epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
         )
         .await
-            .map_err(plan_write_error)?;
+        .map_err(plan_write_error)?;
     }
 
     tx.commit()
@@ -2870,7 +2870,7 @@ pub async fn unseal_commit(
             epigraph_db::repos::privatization::EMBEDDING_RESTORE_JOB_ATTEMPTS,
         )
         .await
-            .map_err(plan_write_error)?;
+        .map_err(plan_write_error)?;
     }
 
     // Unsealing is the OTHER way a group answers a rotation: a claim whose
@@ -2899,7 +2899,7 @@ pub async fn unseal_commit(
             epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
         )
         .await
-            .map_err(plan_write_error)?;
+        .map_err(plan_write_error)?;
     }
 
     PrivatizationRepository::record_seal_audit_conn(
@@ -3511,7 +3511,7 @@ async fn dispatch(
         epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
     )
     .await
-        .map_err(plan_write_error)?;
+    .map_err(plan_write_error)?;
 
     tx.commit()
         .await
