@@ -49,6 +49,21 @@
 //! to `--retarget`, not to the LLM again. `--priority recent` is newest first.
 //! `--ids-file` names claims explicitly (one UUID per line, `#` comments).
 //!
+//! `--redecompose` (backlog c4a8436b) takes `--ids-file` claims WHATEVER their
+//! `decomposes_to` edges, so a compound ATOM, which the undecomposed
+//! population excludes by construction, can be split. It selects a claim
+//! only when `epigraph_core::atomicity::conjunct_screen` calls it compound
+//! (`--include-short`: any) and it has no in-force `decomposes_to` children
+//! (`--include-decomposed`: any; new atoms are then added beside them).
+//! Atoms are written as for any parent: deterministic ids (`if_not_exists`),
+//! existing edges kept, an atom that is the parent or one of its ancestors
+//! refused as a cycle. The ids come from the MCP `query_compound_claims` tool
+//! or the `compound-atom` label (`atomicity_sweep`). Afterwards the
+//! re-decomposed claim is a decomposed parent, so `--retarget` moves its
+//! contradicts/refutes edges onto the new atoms; challenges (their own
+//! table) are not moved. `--apply-plan` of a `--redecompose` plan needs
+//! `--redecompose` again; without it every line is refused.
+//!
 //! Two filters default ON: skip `backlog`-labelled claims
 //! (`--include-backlog`) and skip claims that look atomic, one sentence and
 //! ≤ 160 chars (`--include-short`, see `epigraph_cli::decompose::looks_atomic`).
@@ -186,9 +201,9 @@
 use clap::Parser;
 use epigraph_cli::decompose::{
     atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, verify_plan, visible_claim_count,
-    write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters,
-    PlanGaps, Priority, SingletonLedger,
+    run_decomposition_batches, select_candidates, select_redecompose_candidates, verify_plan_for,
+    visible_claim_count, write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb,
+    EligibilityFilters, PlanGaps, Population, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -307,6 +322,30 @@ struct Cli {
     /// resumed from them and re-checked, not re-asked of the LLM.
     #[arg(long, default_value_t = false)]
     include_marked: bool,
+    /// Re-decompose the --ids-file claims WHATEVER their decomposes_to edges,
+    /// so a compound atom (the target of such an edge) can be split. Selects
+    /// only claims the atomicity screen calls compound (--include-short: any)
+    /// that have no in-force decomposes_to children (--include-decomposed:
+    /// any). Pass it to --apply-plan too when applying a --redecompose plan.
+    #[arg(long, default_value_t = false)]
+    redecompose: bool,
+    /// With --redecompose: also select claims that already have in-force
+    /// decomposes_to children; new atoms are added beside them.
+    #[arg(long, default_value_t = false)]
+    include_decomposed: bool,
+}
+
+impl Cli {
+    /// The population this run may write atoms for.
+    fn population(&self) -> Population {
+        if self.redecompose {
+            Population::Redecompose {
+                include_decomposed: self.include_decomposed,
+            }
+        } else {
+            Population::Undecomposed
+        }
+    }
 }
 
 /// What this invocation does. Derived from the flags by [`resolve_mode`], a
@@ -380,6 +419,23 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
     if cli.as_agent.is_some() && cli.retarget {
         return Err(
             "--retarget runs only on the maintenance path; it does not apply to --as-agent".into(),
+        );
+    }
+    if cli.include_decomposed && !cli.redecompose {
+        return Err("--include-decomposed needs --redecompose".into());
+    }
+    if cli.redecompose && cli.retarget {
+        return Err(
+            "--redecompose selects claims to decompose; --retarget moves conflict edges (run \
+             it after the re-decomposition)"
+                .into(),
+        );
+    }
+    if cli.redecompose && cli.ids_file.is_none() && cli.apply_plan.is_none() {
+        return Err(
+            "--redecompose takes explicit ids: pass --ids-file (query_compound_claims or the \
+             compound-atom label lists them), or --apply-plan for a --redecompose plan"
+                .into(),
         );
     }
     if cli.include_judged_atomic && cli.singleton_ledger.is_none() {
@@ -1022,7 +1078,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 planned.len(),
                 path.display()
             );
-            let (ok, drifted) = verify_plan(db, viewer, planned).await?;
+            let (ok, drifted) = verify_plan_for(db, viewer, planned, cli.population()).await?;
             for (p, why) in &drifted {
                 eprintln!("REFUSED {}: {why:?}", p.claim_id);
             }
@@ -1067,21 +1123,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 limit
             };
-            let mut sel = select_candidates(
-                db,
-                viewer,
-                cli.priority.into(),
-                ids.as_deref(),
-                filters,
-                judged_atomic,
-                scan_limit,
-                cli.max_scan,
-            )
-            .await?;
+            let mut sel = match (cli.population(), ids.as_deref()) {
+                (Population::Redecompose { include_decomposed }, Some(ids)) => {
+                    select_redecompose_candidates(
+                        db,
+                        viewer,
+                        ids,
+                        filters,
+                        judged_atomic,
+                        limit,
+                        include_decomposed,
+                    )
+                    .await?
+                }
+                _ => {
+                    select_candidates(
+                        db,
+                        viewer,
+                        cli.priority.into(),
+                        ids.as_deref(),
+                        filters,
+                        judged_atomic,
+                        scan_limit,
+                        cli.max_scan,
+                    )
+                    .await?
+                }
+            };
             let eligible = cli
                 .count_eligible
                 .then(|| keep_within_limit(&mut sel, limit, scan_limit));
-            report_selection(&sel, ids.is_some(), cli.priority, eligible);
+            report_selection(&sel, ids.is_some(), cli.priority, eligible, cli.redecompose);
             if let Some(agent) = cli.as_agent {
                 // What the maintenance path's startup refusal protected: a
                 // job that cannot see the corpus must not read zero rows and
@@ -1269,6 +1341,7 @@ fn report_selection(
     explicit: bool,
     priority: PriorityArg,
     eligible: Option<EligibleCount>,
+    redecompose: bool,
 ) {
     use epigraph_cli::decompose::Ineligible;
     let count = |f: fn(&Ineligible) -> bool| sel.skipped.iter().filter(|(_, w)| f(w)).count();
@@ -1286,6 +1359,14 @@ fn report_selection(
         sel.scanned,
         sel.chosen.len(),
     );
+    if redecompose {
+        let not_compound = count(|w| matches!(w, Ineligible::NotCompound { .. }));
+        let split = count(|w| matches!(w, Ineligible::AlreadySplit { .. }));
+        eprintln!(
+            "selection: redecompose skipped_not_compound={not_compound} \
+             skipped_already_split={split}"
+        );
+    }
     if let Some(e) = eligible {
         eprintln!(
             "selection: eligible={}{} (parents that pass every filter, in {} rows read; the \
@@ -1307,10 +1388,18 @@ fn report_selection(
             eprintln!("SKIP {id} (named in --ids-file): {why}");
         }
         for id in &sel.not_undecomposed {
-            eprintln!(
-                "SKIP {id} (named in --ids-file): not in the undecomposed population \
-                 (absent, retired, telemetry, already decomposed, or an atom)"
-            );
+            if redecompose {
+                eprintln!(
+                    "SKIP {id} (named in --ids-file): absent, retired, invisible, telemetry \
+                     or 10 characters or fewer"
+                );
+            } else {
+                eprintln!(
+                    "SKIP {id} (named in --ids-file): not in the undecomposed population \
+                     (absent, retired, telemetry, already decomposed, or an atom; pass \
+                     --redecompose to split a compound atom)"
+                );
+            }
         }
         for id in &sel.over_limit {
             eprintln!(
@@ -1499,6 +1588,46 @@ mod tests {
             assert!(err.contains("--as-agent"), "{retarget:?}: {err}");
         }
         assert!(mode_of(&["--as-agent", "not-a-uuid"]).is_err());
+    }
+
+    /// `--redecompose` takes explicit ids (or a plan), never a paged crawl,
+    /// and is not a retarget mode; `--include-decomposed` needs it.
+    #[test]
+    fn redecompose_needs_explicit_ids_and_is_not_a_retarget_mode() {
+        use epigraph_cli::decompose::Population;
+        assert!(mode_of(&["--redecompose"])
+            .unwrap_err()
+            .contains("--ids-file"));
+        assert_eq!(
+            mode_of(&["--redecompose", "--ids-file", "ids.txt", "--dry-run"]).unwrap(),
+            Mode::Enumerate
+        );
+        assert!(matches!(
+            mode_of(&["--redecompose", "--apply-plan", "p.jsonl"]).unwrap(),
+            Mode::ApplyPlan(_)
+        ));
+        assert!(mode_of(&["--redecompose", "--ids-file", "i", "--retarget"])
+            .unwrap_err()
+            .contains("--retarget"));
+        assert!(mode_of(&["--include-decomposed", "--ids-file", "i"])
+            .unwrap_err()
+            .contains("--redecompose"));
+        let cli = Cli::try_parse_from([
+            "decompose_claims",
+            "--redecompose",
+            "--include-decomposed",
+            "--ids-file",
+            "i",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.population(),
+            Population::Redecompose {
+                include_decomposed: true
+            }
+        );
+        let plain = Cli::try_parse_from(["decompose_claims"]).unwrap();
+        assert_eq!(plain.population(), Population::Undecomposed);
     }
 
     /// No flags = the historical write run, `oldest` order.
