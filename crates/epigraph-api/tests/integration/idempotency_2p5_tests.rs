@@ -196,8 +196,8 @@ async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
 // submit/packet harness (Task 3): a submit-scoped Bearer token + JSON POST.
 // =============================================================================
 
-/// Mint a Bearer token carrying `epigraph:write` so it clears the
-/// `submit/packet` scope gate (mirrors `submit_persistence_tests::test_bearer_token`).
+/// Mint a Bearer token carrying `claims:write` so it clears the
+/// `submit/packet` scope gate (backlog f00d75ab) (mirrors `submit_persistence_tests::test_bearer_token`).
 fn submit_bearer_token() -> String {
     submit_bearer_token_for(Uuid::new_v4())
 }
@@ -213,7 +213,7 @@ fn submit_bearer_token_for(principal: Uuid) -> String {
     let (token, _) = jwt_config
         .issue_access_token(
             principal,
-            vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
+            vec!["claims:write".to_string(), "claims:read".to_string()],
             "service",
             Some(principal),
             Some(principal),
@@ -224,7 +224,7 @@ fn submit_bearer_token_for(principal: Uuid) -> String {
     token
 }
 
-/// POST a packet to `/api/v1/submit/packet` with an `epigraph:write` token,
+/// POST a packet to `/api/v1/submit/packet` with a `claims:write` token,
 /// returning (status, body string).
 async fn post_packet(router: &Router, packet: serde_json::Value) -> (StatusCode, String) {
     post_packet_with_token(router, packet, &submit_bearer_token()).await

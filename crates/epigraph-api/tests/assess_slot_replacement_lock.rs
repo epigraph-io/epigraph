@@ -70,6 +70,7 @@ async fn assess(
         .expect("resolve caller");
     let state = AppState::with_db(pool.clone(), ApiConfig::default());
     let Json(resp) = assess_claim(
+        write_scope(),
         epigraph_api::middleware::bearer::ViewerExtractor(viewer),
         State(state),
         Path(claim),
@@ -218,4 +219,26 @@ async fn concurrent_same_owner_calls_report_exactly_one_replacement(
         replaced[0].prior_pignistic_prob.is_some(),
         "the replaced row is the other call's committed assessment: {replaced:?}"
     );
+}
+
+/// The `claims:write` scope the write handlers now take as their first
+/// extractor (backlog f00d75ab). A direct handler call stands in for the
+/// bearer middleware, so it supplies the scope the route checks.
+fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
+    let principal = uuid::Uuid::new_v4();
+    epigraph_api::middleware::bearer::RequireScopeWrite(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: epigraph_api::middleware::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    )
 }

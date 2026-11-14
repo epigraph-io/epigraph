@@ -56,6 +56,8 @@ pub struct CreateHypothesisRequest {
 /// POST /api/v1/hypothesis — Create a hypothesis claim with VOI assessment.
 #[cfg(feature = "db")]
 pub async fn create_hypothesis(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<CreateHypothesisRequest>,
@@ -472,6 +474,8 @@ pub async fn hypothesis_status(
 /// POST /api/v1/hypothesis/:id/promote — Promote hypothesis to research_validity.
 #[cfg(feature = "db")]
 pub async fn promote_hypothesis(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

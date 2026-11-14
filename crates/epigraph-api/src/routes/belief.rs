@@ -1122,6 +1122,8 @@ pub async fn conflict_batch(
 /// `POST /api/v1/frames`
 #[cfg(feature = "db")]
 pub async fn create_frame(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<CreateFrameRequest>,
 ) -> Result<(StatusCode, Json<FrameResponse>), ApiError> {
@@ -1177,6 +1179,8 @@ pub async fn create_frame(
 /// `POST /api/v1/frames/:id/evidence`
 #[cfg(feature = "db")]
 pub async fn submit_evidence(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
@@ -2916,6 +2920,8 @@ pub async fn get_pignistic(
 /// `POST /api/v1/frames/:id/refine`
 #[cfg(feature = "db")]
 pub async fn refine_frame(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(parent_id): Path<Uuid>,

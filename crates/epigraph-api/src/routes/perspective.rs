@@ -125,6 +125,8 @@ fn default_limit() -> i64 {
 /// `POST /api/v1/perspectives`
 #[cfg(feature = "db")]
 pub async fn create_perspective(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<CreatePerspectiveRequest>,
 ) -> Result<(StatusCode, Json<PerspectiveResponse>), ApiError> {

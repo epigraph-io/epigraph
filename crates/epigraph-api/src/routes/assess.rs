@@ -113,6 +113,8 @@ pub struct ReplacedAssessment {
 /// `POST /api/v1/claims/:id/assess`
 #[cfg(feature = "db")]
 pub async fn assess_claim(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,

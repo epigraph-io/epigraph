@@ -563,6 +563,8 @@ async fn retain_visible_events(
 /// Auto-generates `id`, `graph_version` (monotonic), and `created_at`.
 /// Validates that `event_type` is non-empty and payload is within size limits.
 pub async fn create_event(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(_state): State<AppState>,
     Json(request): Json<CreateEventRequest>,
 ) -> Result<Json<GraphEvent>, ApiError> {
@@ -784,7 +786,27 @@ mod tests {
         Router::new()
             .route("/api/v1/events", get(list_events).post(create_event))
             .route("/api/v1/graph/snapshot/:version", get(graph_snapshot))
+            .layer(axum::Extension(write_auth()))
             .with_state(state)
+    }
+
+    /// What `bearer_auth_middleware` installs for a `claims:write` caller:
+    /// `POST` is gated on that scope (backlog f00d75ab).
+    fn write_auth() -> crate::middleware::bearer::AuthContext {
+        let principal = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: crate::middleware::bearer::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        }
     }
 
     /// Helper: POST an event and return the response status and body as `Vec<u8>`.

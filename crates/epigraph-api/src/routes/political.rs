@@ -945,6 +945,8 @@ pub async fn list_techniques(
 /// POST /api/v1/propaganda-techniques
 #[cfg(feature = "db")]
 pub async fn create_technique(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(req): Json<CreateTechniqueRequest>,
 ) -> Result<(StatusCode, Json<TechniqueResponse>), ApiError> {
@@ -1071,6 +1073,8 @@ pub async fn list_coalitions(
 /// POST /api/v1/coalitions
 #[cfg(feature = "db")]
 pub async fn create_coalition(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(req): Json<CreateCoalitionRequest>,
 ) -> Result<(StatusCode, Json<CoalitionResponse>), ApiError> {
