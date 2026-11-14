@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context};
 use clap::{Parser, Subcommand};
 use epigraph_cli::atlas_meaning::build::{apply_result, export_map, ExportOptions};
-use epigraph_cli::atlas_meaning::files::read_result;
+use epigraph_cli::atlas_meaning::files::{prepare_export_dir, read_result};
 use epigraph_cli::atlas_meaning::tree::parse_map_key;
 use epigraph_db::repos::atlas_leaf::ATLAS_LEAF_NODE_CAP;
 use uuid::Uuid;
@@ -65,7 +65,8 @@ enum Cmd {
         /// `public` or `team:<group uuid>`.
         #[arg(long)]
         map: String,
-        /// An existing, empty directory.
+        /// A new path (created 0700), or an existing empty directory with
+        /// no group or other permission bits. Every file is created 0600.
         #[arg(long)]
         out: PathBuf,
         /// Only this theme (repeatable); every theme the map draws otherwise.
@@ -113,13 +114,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Export { map, out, cap, .. } => {
             parse_map_key(map)?;
             check_cap(*cap)?;
-            let empty = std::fs::read_dir(out)
-                .with_context(|| format!("--out {} must be an existing directory", out.display()))?
-                .next()
-                .is_none();
-            if !empty {
-                bail!("--out {} is not empty", out.display());
-            }
+            prepare_export_dir(out)?;
         }
         Cmd::Apply { map, cap, .. } => {
             parse_map_key(map)?;

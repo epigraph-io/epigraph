@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use super::docs::level_documents;
 use super::files::{
-    index_attachments, write_index, write_theme, ExportIndex, ExportTheme, ResultDoc, EXPORT_FORMAT,
+    index_attachments, prepare_export_dir, write_index, write_theme, ExportIndex, ExportTheme,
+    ResultDoc, EXPORT_FORMAT,
 };
 use super::tree::{check_tree, map_key, resolve_tree, MeaningTree, ResolveStats};
 
@@ -42,7 +43,7 @@ fn parse_embedding(claim: Uuid, text: &str) -> anyhow::Result<Vec<f32>> {
         .with_context(|| format!("claim {claim} has an unreadable embedding"))
 }
 
-/// Write `opts.map`'s themes into `out` (an existing, empty directory) for
+/// Write `opts.map`'s themes into `out` for
 /// `atlas_meaning_core.py compute`: per theme, its current embedded members,
 /// their embeddings, and each member's attachment nodes after W3's per-claim
 /// cap, renumbered per theme. Writes nothing to the database. Returns the
@@ -51,14 +52,21 @@ fn parse_embedding(claim: Uuid, text: &str) -> anyhow::Result<Vec<f32>> {
 ///
 /// A theme with no embedded member is reported and not exported.
 ///
+/// `out` is made ready by [`prepare_export_dir`] first: a new path is created
+/// 0700, an existing directory must be empty and owner-only, and every file
+/// is created 0600, so the embeddings are never readable by another local
+/// user whatever the umask.
+///
 /// # Errors
-/// A database error, embeddings of different dimensions, or an I/O error.
+/// An export directory [`prepare_export_dir`] refuses, a database error,
+/// embeddings of different dimensions, or an I/O error.
 pub async fn export_map(
     conn: &mut PgConnection,
     viewer: &Viewer,
     opts: &ExportOptions,
     out: &Path,
 ) -> anyhow::Result<serde_json::Value> {
+    prepare_export_dir(out)?;
     let mut tx = conn.begin().await.context("begin the export transaction")?;
     let epochs = AtlasMapRepository::begin_build_snapshot(&mut tx, viewer, opts.map).await?;
     let themes = match &opts.themes {

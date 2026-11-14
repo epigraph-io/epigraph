@@ -11,8 +11,15 @@
 //! The JSON is compact, keys in the order Python writes them, so the Rust
 //! writer and `atlas_meaning_core.write_export` produce the same bytes
 //! (`tests/fixtures/atlas_meaning`).
+//!
+//! Embeddings approximate claim text, so the export is OWNER-ONLY from the
+//! moment it exists, whatever the umask: [`prepare_export_dir`] creates the
+//! directory 0700 (or accepts an existing one only when it is empty and has
+//! no group or other bits), and every file is created new with mode 0600.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{ensure, Context};
@@ -91,7 +98,62 @@ pub fn index_attachments(
     Ok((file, numbering.len()))
 }
 
-/// Write one theme's two files into `dir`.
+/// Make `dir` ready for an export, owner-only: a path that does not exist is
+/// created (not recursively) with mode 0700; an existing one must be a real
+/// directory (not a symlink), empty, with no group or other permission bits.
+/// An operator's directory is never chmod-ed: a readable one is refused.
+///
+/// # Errors
+/// A non-directory, a non-empty or group/other-accessible directory, or an
+/// I/O error.
+pub fn prepare_export_dir(dir: &Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("create the export directory {}", dir.display())),
+        Err(e) => Err(e).with_context(|| format!("stat {}", dir.display())),
+        Ok(meta) => {
+            ensure!(
+                meta.is_dir(),
+                "{} is not a directory (a symlink is refused too)",
+                dir.display()
+            );
+            let mode = meta.permissions().mode() & 0o777;
+            ensure!(
+                mode & 0o077 == 0,
+                "{} has mode {mode:o}: the export holds embeddings, which approximate claim \
+                 text, so it must be owner-only; pass a new path (created 0700) or chmod 700",
+                dir.display()
+            );
+            ensure!(
+                std::fs::read_dir(dir)
+                    .with_context(|| format!("read {}", dir.display()))?
+                    .next()
+                    .is_none(),
+                "{} is not empty",
+                dir.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Create `path` new (never overwrite, never follow a planted file) with
+/// mode 0600 and write `bytes`.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Write one theme's two files into `dir`, each created new with mode 0600.
 ///
 /// # Errors
 /// An embedding of another dimension, or an I/O error.
@@ -120,22 +182,19 @@ pub fn write_theme(
             raw.extend_from_slice(&v.to_le_bytes());
         }
     }
-    let json = dir.join(format!("{theme_id}.json"));
-    std::fs::write(&json, serde_json::to_vec(file)?)
-        .with_context(|| format!("write {}", json.display()))?;
-    let f32s = dir.join(format!("{theme_id}.f32"));
-    std::fs::write(&f32s, raw).with_context(|| format!("write {}", f32s.display()))?;
-    Ok(())
+    write_owner_only(
+        &dir.join(format!("{theme_id}.json")),
+        &serde_json::to_vec(file)?,
+    )?;
+    write_owner_only(&dir.join(format!("{theme_id}.f32")), &raw)
 }
 
-/// Write `export.json` into `dir`.
+/// Write `export.json` into `dir`, created new with mode 0600.
 ///
 /// # Errors
-/// An I/O error.
+/// An existing `export.json`, or an I/O error.
 pub fn write_index(dir: &Path, index: &ExportIndex) -> anyhow::Result<()> {
-    let path = dir.join("export.json");
-    std::fs::write(&path, serde_json::to_vec(index)?)
-        .with_context(|| format!("write {}", path.display()))
+    write_owner_only(&dir.join("export.json"), &serde_json::to_vec(index)?)
 }
 
 /// The result file `atlas_meaning_core.py compute` writes.
@@ -261,6 +320,80 @@ mod tests {
             .unwrap();
             assert!(tree.nodes.iter().any(|n| n.depth == 2), "the fixture nests");
         }
+    }
+
+    fn scratch() -> PathBuf {
+        std::env::temp_dir().join(format!("atlas-meaning-{}", Uuid::new_v4()))
+    }
+
+    /// A new export directory is created owner-only; an existing one is
+    /// accepted only empty and owner-only, never chmod-ed.
+    #[test]
+    fn the_export_directory_must_be_owner_only_and_empty() {
+        let new = scratch();
+        prepare_export_dir(&new).unwrap();
+        let mode = std::fs::metadata(&new).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "created {mode:o}");
+
+        let open = scratch();
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = prepare_export_dir(&open).unwrap_err().to_string();
+        assert!(err.contains("owner-only"), "{err}");
+        let mode = std::fs::metadata(&open).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "the operator's directory was changed");
+
+        std::fs::write(new.join("stray"), b"x").unwrap();
+        let err = prepare_export_dir(&new).unwrap_err().to_string();
+        assert!(err.contains("not empty"), "{err}");
+
+        let link = scratch();
+        std::os::unix::fs::symlink(&open, &link).unwrap();
+        assert!(prepare_export_dir(&link).is_err(), "a symlink is refused");
+        for d in [&new, &open] {
+            std::fs::remove_dir_all(d).ok();
+        }
+        std::fs::remove_file(&link).ok();
+    }
+
+    /// Every export file is created 0600 and never overwrites one already
+    /// there.
+    #[test]
+    fn export_files_are_created_new_and_owner_only() {
+        let dir = scratch();
+        prepare_export_dir(&dir).unwrap();
+        let theme = Uuid::from_u128(7);
+        let file = ThemeFile {
+            claim_ids: vec![Uuid::from_u128(1)],
+            attachments: vec![vec![]],
+        };
+        write_theme(&dir, theme, &file, &[vec![0.5, 0.25]], 2).unwrap();
+        let index = ExportIndex {
+            format: EXPORT_FORMAT.to_string(),
+            map: "public".to_string(),
+            hierarchy: "meaning".to_string(),
+            cap: 100,
+            seed: 42,
+            dim: 2,
+            themes: vec![],
+        };
+        write_index(&dir, &index).unwrap();
+        for name in [
+            format!("{theme}.json"),
+            format!("{theme}.f32"),
+            "export.json".into(),
+        ] {
+            let mode = std::fs::metadata(dir.join(&name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}: {mode:o}");
+        }
+        assert!(
+            write_index(&dir, &index).is_err(),
+            "an existing file was overwritten"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

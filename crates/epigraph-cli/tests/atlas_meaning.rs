@@ -204,9 +204,11 @@ async fn team_other(pool: &PgPool) -> Uuid {
 
 // ── the build, as the binary runs it ────────────────────────────────────────
 
+/// A fresh owner-only directory (the export refuses one others can read).
 fn tmpdir() -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
     let d = std::env::temp_dir().join(format!("atlas-meaning-test-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&d).unwrap();
+    std::fs::DirBuilder::new().mode(0o700).create(&d).unwrap();
     d
 }
 
@@ -751,6 +753,60 @@ async fn retired_and_unembedded_claims_are_not_members(pool: PgPool) {
         .embedded
         .iter()
         .all(|(_, e)| e.starts_with('[') && e.matches(',').count() == DIM - 1));
+}
+
+/// The export, run as the real binary under a typical umask (022), leaves
+/// nothing another local user can read: the directory it creates is 0700 and
+/// every file in it 0600. Embeddings approximate claim text. Also the box
+/// half end to end through the process an operator runs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_export_is_owner_only_under_umask_022(pool: PgPool) {
+    let c = Corpus::new(&pool).await;
+    let url = fixture::database_url_for(&pool).await;
+    let parent = tmpdir();
+    let out = parent.join("export");
+    let run = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"umask 022; exec "$0" "$@""#)
+        .arg(env!("CARGO_BIN_EXE_atlas_meaning"))
+        .args(["export", "--map", &map_key(AtlasMap::Team(c.team)), "--out"])
+        .arg(&out)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DATABASE_URL", &url)
+        .env("MAINTENANCE_DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .current_dir(&parent)
+        .output()
+        .expect("run atlas_meaning");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "export failed: {stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&run.stdout).expect("the report");
+    assert_eq!(report["exported_themes"], 1, "{report}");
+
+    let mode = |p: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    };
+    assert_eq!(mode(&out) & 0o077, 0, "the directory is {:o}", mode(&out));
+    let files: Vec<PathBuf> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        files.len(),
+        3,
+        "export.json and the theme's two files: {files:?}"
+    );
+    for f in &files {
+        assert_eq!(mode(f), 0o600, "{} is {:o}", f.display(), mode(f));
+    }
+    let file: ThemeFile =
+        serde_json::from_slice(&std::fs::read(out.join(format!("{}.json", c.theme))).unwrap())
+            .unwrap();
+    let got: BTreeSet<Uuid> = file.claim_ids.into_iter().collect();
+    assert_eq!(got, c.team_members());
+    std::fs::remove_dir_all(&parent).ok();
 }
 
 /// The binary refuses a malformed map or an out-of-range cap before it
