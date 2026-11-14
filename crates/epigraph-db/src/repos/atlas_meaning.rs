@@ -194,12 +194,16 @@ impl AtlasMeaningRepository {
     /// nightly's incremental assignment (W9) starts from; it needs no table
     /// of its own because every leaf document lists its claims.
     ///
-    /// One statement, a primary-key prefix scan of the run's levels, spliced
-    /// on the viewer.
+    /// Two statements, each a primary-key prefix scan of the run's levels,
+    /// spliced on the viewer: the first refuses a run that holds any level
+    /// of another schema version, because a later version's leaf shape would
+    /// match nothing in the second and read as an empty membership (every
+    /// claim "new") instead of an error.
     ///
     /// # Errors
-    /// `DbError::InvalidData` if a claim is in two leaves of the run (a
-    /// malformed run); `DbError::QueryFailed` if the statement fails.
+    /// `DbError::InvalidData` if the run holds a level of another schema
+    /// version, or a claim is in two leaves of the run (a malformed run);
+    /// `DbError::QueryFailed` if a statement fails.
     pub async fn leaf_membership(
         conn: &mut PgConnection,
         viewer: &Viewer,
@@ -208,6 +212,35 @@ impl AtlasMeaningRepository {
         hierarchy: AtlasHierarchy,
     ) -> Result<BTreeMap<Uuid, Uuid>, DbError> {
         let (owner, visibility) = map.tenancy();
+        let other_versions = viewer.splice(
+            "SELECT DISTINCT l.schema_version \
+               FROM atlas_map_levels l \
+              WHERE l.run_id = $1 AND l.hierarchy = $2 \
+                AND l.owner_group_id = $3 AND l.visibility = $4 \
+                AND l.schema_version <> $5 \
+                /* {VISIBILITY:l} */ \
+              ORDER BY 1",
+            6,
+        );
+        let mut q = sqlx::query_scalar::<_, i32>(&other_versions)
+            .bind(run_id)
+            .bind(hierarchy.as_str())
+            .bind(owner)
+            .bind(visibility)
+            .bind(LEAF_SCHEMA_VERSION);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let other = q.fetch_all(&mut *conn).await?;
+        if !other.is_empty() {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "run {run_id} holds {} levels of schema version(s) {other:?}; leaf \
+                     membership reads version {LEAF_SCHEMA_VERSION} only",
+                    hierarchy.as_str()
+                ),
+            });
+        }
         let sql = viewer.splice(
             "SELECT (n.value->>'id')::uuid, l.group_id \
                FROM atlas_map_levels l \

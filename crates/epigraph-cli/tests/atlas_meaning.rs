@@ -688,6 +688,20 @@ async fn leaf_membership_reads_back_every_claim(pool: PgPool) {
     .await
     .unwrap();
     assert!(none.is_empty());
+    // A level of a later schema version is an error, not an empty membership.
+    let bumped = sqlx::query(
+        "UPDATE atlas_map_levels SET schema_version = 2 \
+          WHERE run_id = $1 AND payload->>'kind' = 'group' AND level = 0",
+    )
+    .bind(run_id(&r))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(bumped.rows_affected(), 1, "the root level");
+    let err = AtlasMeaningRepository::leaf_membership(&mut conn, &viewer, map, run_id(&r), M)
+        .await
+        .expect_err("a v2 level");
+    assert!(err.to_string().contains("schema version"), "{err}");
 }
 
 /// A claim filed since the export makes the result stale: refused, nothing
