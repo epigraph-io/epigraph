@@ -530,7 +530,10 @@ const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 ///
 /// Everything else is debt. Do not add to it.
 const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
-    ("assess.rs", 1),
+    // 1 -> 0, key removed (backlog f78526ad): `assess_claim`'s
+    // `UPDATE claims SET embedding` became
+    // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
+    // with the caller's viewer (`AppState::store_claim_embedding_as`).
     ("belief.rs", 1),
     // 4 -> 3 (backlog 1e2315a9): `create_claim_core`'s post-commit
     // `UPDATE claims SET embedding` became

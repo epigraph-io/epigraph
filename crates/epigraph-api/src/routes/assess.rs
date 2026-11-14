@@ -4,7 +4,8 @@
 //! parameters, stores it on the canonical `claim_validity` frame (or an
 //! explicit `frame_id`), combines it with the claim's earlier assessments on
 //! that frame, refreshes the claim's cached belief under the
-//! one-frame-owns-the-cache rule, optionally generates an embedding, and
+//! one-frame-owns-the-cache rule, optionally generates an embedding (stored
+//! only on a claim the caller may write that is current and not sealed), and
 //! returns the framed belief update in one response.
 
 use crate::errors::ApiError;
@@ -614,17 +615,29 @@ pub async fn assess_claim(
                         .collect::<Vec<_>>()
                         .join(",")
                 );
-                let store_result =
-                    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                        .bind(&pgvector_str)
-                        .bind(claim_id)
-                        .execute(pool)
-                        .await;
-                if let Err(e) = store_result {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding");
-                    false
-                } else {
-                    true
+                // The shared writer on the caller's stamped transaction
+                // (backlog f78526ad): it locks the row, then refuses a sealed
+                // or superseded claim and one the caller cannot write. The
+                // bare `UPDATE claims SET embedding` this replaced carried
+                // none of that, so assessing a sealed claim put a
+                // plaintext-derived vector back on it.
+                match state
+                    .store_claim_embedding_as(&viewer, claim_id, &pgvector_str, "assess_claim")
+                    .await
+                {
+                    Ok(stored) => {
+                        if !stored {
+                            tracing::debug!(
+                                claim_id = %claim_id,
+                                "embedding not stored: claim sealed, superseded or not writable"
+                            );
+                        }
+                        stored
+                    }
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding");
+                        false
+                    }
                 }
             }
             Err(e) => {
