@@ -25,7 +25,14 @@ canonical pattern below is the post-S1 state.
 
 A row in `claims` is a **noun**: a stable-identity entity or
 assertion. Its canonical key is `(content_hash, agent_id)`, and
-there is at most one row per key. Examples:
+the writers are meant to keep one row per key. That is a writer
+contract, not a database constraint: migration 150 dropped
+`UNIQUE (content_hash, agent_id)` because the long-lived database
+holds duplicate groups it could never satisfy. The idempotent create
+paths take an advisory lock on the pair before they look for an
+existing row; a writer that inserts without it can still add a second
+row for the same key (the architecture doc linked below lists which
+writers take the lock). Examples:
 
 - "Evidence supports H₀ at confidence 0.8" (a textbook fact)
 - "Container `epiclaw-tg-7173612411` exists" (entity)

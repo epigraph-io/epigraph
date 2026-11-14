@@ -2,7 +2,7 @@
 
 **Status:** Canonical (S1 — 2026-04-25)
 **Owners:** epigraph-internal
-**Sub-projects:** S1 (this doc), S2 (backfill, future), S3a–S3d (writer migrations, future), S4 (apply migration 107, future)
+**Sub-projects:** S1 (this doc), S2 (backfill), S3a–S3d (writer migrations), S4 (the `UNIQUE (content_hash, agent_id)` constraint, abandoned by migration 150). Status of each is in "Sub-project map" below.
 
 ---
 
@@ -90,9 +90,11 @@ Two calls. Two transactions. Composes cleanly. A combined "create-claim-and-edge
 - `if_not_exists: true` × `privacy_tier != "public"` returns `400 Bad Request`. Encrypted claims store ciphertext keyed by group epoch; cross-group dedup on plaintext hash would either leak content equality across groups or no-op against the `[private]` placeholder. Encrypted submissions stay on the `if_not_exists: false` (raw insert) path until a future spec.
 - `if_not_exists: true` × `content_hash` override returns `400 Bad Request`. The override is a textbook-ingest-script feature that S3c retires; new callers should compute hashes server-side.
 
-### Pre-107 race window (acknowledged, not solved in S1)
+### The create race: closed by an advisory lock, not by a constraint
 
-Until migration 107 lands, the DB has no `(content_hash, agent_id)` UNIQUE constraint. Two concurrent `if_not_exists: true` requests for the same key can both find no existing row and both insert. Once 107 is applied, the second insert fails with a constraint violation; the handler catches that error and returns the existing row. S1 does not add advisory-lock serialization in the pre-107 window — the race window already exists for every claim-creation path today, S2 backfill cleans up any extra rows, and adding a per-key advisory lock now would be removed when 107 lands.
+The database has no `(content_hash, agent_id)` UNIQUE constraint (see "Migration sequence" below), so the one-row-per-key rule is a contract the writers keep. S1 left the race open, expecting the constraint to close it: two concurrent `if_not_exists: true` requests for the same key could both find no row and both insert. The constraint never became possible on the long-lived database, so the race is closed in the application instead: `ClaimRepository::create_or_get_signed` and `POST /claims` (`if_not_exists=false`) take a transaction-scoped advisory lock on the pair (`ClaimRepository::lock_content_hash_agent`) before their find, so two concurrent first creates serialize.
+
+Not every writer takes the lock, and a row written without it is not deduplicated by it. Writers that take it: the idempotent creates above, the legacy content-hash creates (`ClaimRepository::create`, `create_conn`, `create_with_tx`), `consolidate_act_conn`'s existing-merge probe and the `method_search` maintenance binary. Writers that do not: the unconditional INSERTs with no find (`create_strict`, supersede, `evolve_step`, `batch_create`, hypothesis creation), the deterministic-id paths (`create_with_id_if_absent`, the ingest-executor's workflow `add_step`), the policy-challenge route (its own lock, its own narrower find), and raw-SQL fixtures. The maintained list is `lock_content_hash_agent`'s doc comment ("Who takes it") and `migrations/README.md`, "Known schema drift: `uq_claims_content_hash_agent` (013)".
 
 ## Atomicity policy
 
@@ -137,12 +139,15 @@ Everything else moves with the head: `decomposes_to` in both directions, `contin
 
 ## Migration sequence
 
-- **Migration 106** (`migrations/106_security_and_hardening.sql`) — composite index, bp_messages factor_id index, `activities.agent_id` nullability comment + DROP NOT NULL. Applicable to the live DB today (idempotent or no-op against current state).
-- **Migration 107** (`migrations/107_claims_unique_content_hash_agent.sql`) — `UNIQUE (content_hash, agent_id)` on `claims`. **Will fail until S2 backfill completes.** Failure mode is loud and explicit (a `duplicate key value violates unique constraint` error); the migration is intentionally not wrapped with `NOT VALID` + later `VALIDATE`, because the constraint represents a real architectural invariant and any future apply attempt should refuse on a dirty table.
+S1 planned two files, numbered at the time as `106_security_and_hardening.sql` and `107_claims_unique_content_hash_agent.sql`. Neither name exists in this repository: here `106` is `106_community_membership_integrity.sql` and `107` is `107_operator_link.sql`, both unrelated. What this repository carries instead:
+
+- **Migration 013** (`migrations/013_code_review_hardening.sql`) holds the content of both planned files: the hardening items (the `bp_messages` `factor_id` index among them) and `ALTER TABLE claims ADD CONSTRAINT uq_claims_content_hash_agent UNIQUE (content_hash, agent_id)`. A database migrated from empty therefore had the constraint; the long-lived database recorded 013 as applied and did not have it.
+- **Migration 150** (`migrations/150_drop_uq_claims_content_hash_agent.sql`, decided 2026-10-12, backlog `00f1a517`) drops that constraint `IF EXISTS`, so no database carries it. Its header records why it cannot be restored (about 95k duplicate groups on the long-lived database, most of them supersession history that a full UNIQUE would force us to delete) and what replaces it: the advisory lock described under "The create race" above.
+- **Future target, not yet a migration:** a partial unique index `(content_hash, agent_id) WHERE is_current`, after the live duplicate groups are reconciled with `mark_duplicate`. `scripts/audit_claims_content_hash_agent.py` counts them, read-only. Do not re-add the full constraint (`migrations/README.md` explains the deploy outage that would cause).
 
 ## Writer dedup beyond content_hash (S3 cross-cutting)
 
-S1's `if_not_exists: true` primitive dedups on byte-identical content_hash. That catches every deterministic re-run — host provenance (whose hashes are stable by construction: `hash(container_name)`, `hash(task_id:status)`), agents re-submitting identical text, scripts re-posting cached content. It does **not** catch LLM-driven extractors that reword the same fact across runs. "Evidence supports H₀ at conf 0.8" and "the data supports the null hypothesis with confidence 0.8" hash to different values, both rows are written, and migration 107's UNIQUE constraint won't fire.
+S1's `if_not_exists: true` primitive dedups on byte-identical content_hash. That catches every deterministic re-run — host provenance (whose hashes are stable by construction: `hash(container_name)`, `hash(task_id:status)`), agents re-submitting identical text, scripts re-posting cached content. It does **not** catch LLM-driven extractors that reword the same fact across runs. "Evidence supports H₀ at conf 0.8" and "the data supports the null hypothesis with confidence 0.8" hash to different values, both rows are written, and no rule keyed on `(content_hash, agent_id)` would catch it.
 
 To keep the LLM-judged "same-as" pass to the long tail rather than the main path, S3 writers (especially S3c, which handles non-deterministic LLM extraction) implement layered dedup:
 
@@ -165,8 +170,8 @@ Architectural point: byte-equality dedup is necessary but insufficient for LLM-d
 ## Sub-project map
 
 - **S1 (this doc):** pattern + idempotent claim-create primitive + migration split. Done in PR #6.
-- **S2 (backfill):** convert each of the ~95,214 existing `(content_hash, agent_id)` duplicate groups into one canonical claim plus (N-1) timestamped verb-edges. Redirect the 413k existing edges, 95k MFs, and 2.3k evidence rows pointing at non-canonical rows. Pairs merged during backfill are labeled training data for tuning Layer 2's threshold (see "Writer dedup beyond content_hash" above). Future spec.
+- **S2 (backfill):** as planned, convert each of the ~95,214 existing `(content_hash, agent_id)` duplicate groups into one canonical claim plus (N-1) timestamped verb-edges, and redirect the 413k existing edges, 95k MFs, and 2.3k evidence rows pointing at non-canonical rows. Not carried out in that form: migration 150 (2026-10-12) records the duplicate groups as still present and most of them as supersession history that must be kept. What remains of S2 is reconciling the live duplicate groups with `mark_duplicate` ahead of the partial index.
 - **S3 (writers):** four sub-plans (S3a `epigraph-mcp`, S3b `epigraph-agent` `submit_claim` builtin, S3c V2 ingest scripts, S3d V2 `epigraph-nano/provenance.rs`). All implement layered dedup per the previous section; S3c specifically requires Layers 0–2 because LLM extraction non-determinism otherwise defeats Layer 0 alone. S3a runs first to stop new dups accumulating; S3b–S3d parallelisable with S2 once S3a deploys.
-- **S4 (apply migration 107):** one-liner once writers are clean and S2 has settled. User-authorized `sqlx migrate run`.
+- **S4 (the UNIQUE constraint):** abandoned. Migration 150 dropped the constraint instead of applying it; see "Migration sequence" for the advisory lock that replaces it and the partial index that may follow.
 
 Each sub-project gets its own brainstorm → spec → plan cycle.
