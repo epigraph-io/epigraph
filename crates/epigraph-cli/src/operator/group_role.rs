@@ -12,6 +12,11 @@
 //! is computed when a viewer is resolved, so it lapses at the window's end
 //! with no job.
 //!
+//! `group-roster` therefore prints two kinds of line: `MEMBER` for what the
+//! bindings derive, and `DIRECT` for the rows of the group's own roster
+//! (`group_memberships`, what `group-member add` writes), so one read answers
+//! "can this agent read or write the group, and through what".
+//!
 //! Each write calls ONE maintenance-only definer in one transaction,
 //! committed under `--apply` and rolled back otherwise (the audit row with
 //! it), so a dry run prints exactly what the definer decided. The transaction
@@ -250,6 +255,48 @@ pub async fn roster(
             agent,
             role,
             holder,
+        })
+        .collect())
+}
+
+/// One DIRECT member row of a group (`group_memberships`): a membership
+/// written to the roster itself, which no role binding derives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectRow {
+    /// The member.
+    pub agent: Uuid,
+    /// `admin`, `writer` or `reader`.
+    pub role: String,
+    /// When the row was written.
+    pub joined_at: DateTime<Utc>,
+}
+
+/// The direct member rows of `group` live at `at` (now when `None`): joined
+/// by then and not revoked by then. [`roster`] cannot show these: it lists
+/// only what the group's role bindings derive, so a roster check could not
+/// confirm a member added with `group-member add` (backlog f33bb29f).
+/// Read-only.
+///
+/// # Errors
+/// A statement failed.
+pub async fn direct_members(
+    conn: &mut PgConnection,
+    group: Uuid,
+    at: Option<DateTime<Utc>>,
+) -> anyhow::Result<Vec<DirectRow>> {
+    let rows: Vec<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT agent_id, role::text, joined_at FROM group_memberships           WHERE group_id = $1             AND joined_at <= COALESCE($2, now())             AND (revoked_at IS NULL OR revoked_at > COALESCE($2, now()))           ORDER BY role, agent_id",
+    )
+    .bind(group)
+    .bind(at)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(agent, role, joined_at)| DirectRow {
+            agent,
+            role,
+            joined_at,
         })
         .collect())
 }

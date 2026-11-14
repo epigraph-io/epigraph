@@ -2333,6 +2333,10 @@ epigraph-operator group-roster --group <id> [--at <RFC3339>]
 ```
 
 Without `--apply`, each verb's writes and audit row roll back.
+`group-roster` prints a `MEMBER` line per binding-derived member and a
+`DIRECT` line per live row of the group's own roster (what `group-member add`
+writes, and the admin a team group is created with); the last line counts both
+(`members=<derived> ... direct=<rows>`).
 `define-group-role` and `bind-group-role` bind a NON-ELEVATING catalog role to
 a group. Every registered human holding a live assignment of the role is then
 a member, computed and never written, and the membership lapses at the

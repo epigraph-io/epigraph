@@ -297,6 +297,79 @@ async fn define_grant_roster_and_end_on_a_maintenance_login(pool: PgPool) {
     drop_login(&pool, &login).await;
 }
 
+/// Backlog f33bb29f (2). `group-roster` lists the group's DIRECT member rows
+/// as well as what its bindings derive: the admin a team group is created
+/// with has no binding, so the roster used to print `members=0` for a group
+/// that has a live admin, and a roster check could not confirm a direct
+/// reader or writer. A revoked row is not listed, and `--at` before a row was
+/// written does not list it either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_roster_lists_direct_member_rows(pool: PgPool) {
+    let (owner, _) = fixture::seed_human_operator(&pool, "roster-owner").await;
+    let (reader, _) = fixture::seed_human_operator(&pool, "roster-reader").await;
+    let (gone, _) = fixture::seed_human_operator(&pool, "roster-revoked").await;
+    let group = team_group(&pool, "Synthetic Roster Team", owner).await;
+    for (agent, revoked) in [(reader, false), (gone, true)] {
+        sqlx::query(
+            "INSERT INTO group_memberships                  (group_id, agent_id, wrapped_key_share, epoch, role, revoked_at)              VALUES ($1, $2, ''::bytea, 0, 'reader', CASE WHEN $3 THEN now() END)",
+        )
+        .bind(group)
+        .bind(agent)
+        .bind(revoked)
+        .execute(&pool)
+        .await
+        .expect("direct member row");
+    }
+    let (login, dsn) = maintenance_login(&pool).await;
+    let g = group.to_string();
+
+    let roster = run_with(&["group-roster", "--group", &g], Some(&dsn));
+    assert_eq!(roster.code, 0, "{}", roster.show());
+    assert!(
+        roster
+            .stdout
+            .contains(&format!("DIRECT\tagent={owner}\trole=admin")),
+        "the creating admin: {}",
+        roster.show()
+    );
+    assert!(
+        roster
+            .stdout
+            .contains(&format!("DIRECT\tagent={reader}\trole=reader")),
+        "the direct reader: {}",
+        roster.show()
+    );
+    assert!(
+        !roster.stdout.contains(&gone.to_string()),
+        "a revoked row is not a member: {}",
+        roster.show()
+    );
+    assert!(
+        roster.stdout.contains("members=0\t") && roster.stdout.contains("\tdirect=2"),
+        "no binding, two direct rows: {}",
+        roster.show()
+    );
+
+    let before = run_with(
+        &[
+            "group-roster",
+            "--group",
+            &g,
+            "--at",
+            "2000-01-01T00:00:00Z",
+        ],
+        Some(&dsn),
+    );
+    assert_eq!(before.code, 0, "{}", before.show());
+    assert!(
+        before.stdout.contains("\tdirect=0") && !before.stdout.contains("DIRECT"),
+        "nobody had joined by then: {}",
+        before.show()
+    );
+
+    drop_login(&pool, &login).await;
+}
+
 /// A member role outside reader|writer is refused before any connection (no
 /// DSN is even configured); binding an audit-reading or elevating role is
 /// refused by the database (GRB01) with a non-zero exit and nothing written.
