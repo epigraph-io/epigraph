@@ -235,6 +235,17 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
 
     let scope = scope.ok_or_else(|| err("missing required `scope` field"))?;
 
+    // An IPv6 literal must be bracketed: `::1:8093` is ambiguous (is `8093`
+    // the port or the last group?) and `http://::1:8093/mcp` is no URL. Said
+    // as such, and refused even with `insecure_remote=1`, which would
+    // otherwise accept the unbracketed form only to fail at dial time.
+    if host.contains(':') && !host.starts_with('[') {
+        return Err(err(&format!(
+            "host `{host}` looks like an unbracketed IPv6 address; write it in brackets, \
+             e.g. `tcp:[::1]:8093`"
+        )));
+    }
+
     // Loopback is ENFORCED, not just advertised (backlog bcff7c2b): the dial
     // is cleartext http and carries the caller's own bearer.
     if !is_loopback_host(host) {
@@ -472,7 +483,11 @@ mod tests {
         // `::1:8093` is ambiguous (is `8093` the port or the last group?);
         // `http://::1:8093/mcp` is not a valid URL either. Require brackets.
         let err = parse_extensions(Some("ext=tcp:::1:8093;scope=x")).unwrap_err();
-        assert!(err.reason.contains("loopback"), "got: {}", err.reason);
+        assert!(err.reason.contains("brackets"), "got: {}", err.reason);
+        // The opt-in does not rescue it: the address could never be dialled.
+        let err =
+            parse_extensions(Some("ext=tcp:fe80::1:8093;scope=x;insecure_remote=1")).unwrap_err();
+        assert!(err.reason.contains("brackets"), "got: {}", err.reason);
     }
 
     #[test]
