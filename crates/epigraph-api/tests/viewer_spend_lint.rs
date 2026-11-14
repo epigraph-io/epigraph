@@ -193,6 +193,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query(UPDATE).execute",
         ],
     ),
+    // stamped (backlog 8a168dd6): the read runs on `AppState::read_as` with the
+    // caller's viewer; `security_events` has no in-query viewer predicate, so
+    // row security (`security_events_read`) is the filter, by design.
+    (
+        "audit.rs",
+        "query_security_events",
+        &["SecurityEventRepository::query"],
+    ),
     // stamped: the write transaction is stamped from the caller's viewer, and
     // the retract / un-retract definer (migration 184) selects the BBA only
     // when it is public or owned by a group in the session's read set, so an
