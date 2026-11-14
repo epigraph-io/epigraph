@@ -2082,7 +2082,7 @@ pub async fn submit_packet(
     // and overwriting the column for an unchanged claim is wasted work.
     #[cfg(feature = "db")]
     if !was_duplicate {
-        if let Some(ref embedding_service) = state.embedding_service {
+        if let Some(embedding_service) = state.storing_embedding_service() {
             if is_host_telemetry {
                 tracing::debug!(
                     claim_id = %claim_id,
@@ -2179,7 +2179,7 @@ pub async fn submit_packet(
     // already have an embedding or do not exist.
     #[cfg(feature = "db")]
     if !was_duplicate {
-        if let Some(ref embedding_service) = state.embedding_service {
+        if let Some(embedding_service) = state.storing_embedding_service() {
             for (i, evidence_submission) in packet.evidence.iter().enumerate() {
                 if let EvidenceTypeSubmission::Figure { ref caption, .. } =
                     evidence_submission.evidence_type
