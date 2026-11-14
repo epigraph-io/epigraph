@@ -233,10 +233,12 @@
 //!     its edge, as for 114's writer-owned rows). An edge whose only moving
 //!     endpoint is a WORKFLOW row (`variant_of` between generations,
 //!     `AUTHORED` from the author agent, `executes` into a LEFT claim) has no
-//!     claim endpoint for the cascade to meet: `epigraph_node_tenancy` treats a
-//!     workflow as tenancy-less (migration 183 left it so). Left public, it
-//!     would publish the existence, author and step links of a now private
-//!     plan. This tool narrows each such edge itself to the meet of the
+//!     claim endpoint for the cascade to meet: the cascade fires on a claim's
+//!     change only (since migration 219 it meets a workflow endpoint with the
+//!     workflow's own row, but nothing re-meets an edge when only its
+//!     workflow row changes). Left public, it would publish the existence,
+//!     author and step links of a now private plan. This tool narrows each
+//!     such edge itself to the meet of the
 //!     workflow row's new tuple and its other endpoint (restrict's
 //!     [`super::restrict::narrowed`]: kept when already narrower). That is an
 //!     explicit `('group', G)` declaration between non-group endpoints, which
@@ -1224,6 +1226,20 @@ fn moved_image(act: &Act, t: &Tenancy) -> BTreeSet<Uuid> {
         .collect()
 }
 
+/// `t` with the act's source replaced by its target, owner and co-owner (a
+/// co-owner equal to the new owner is dropped): the tuple a private row of the
+/// source's ends in once the act carries it, before any narrowing its other
+/// endpoints still require.
+fn moved_tuple(act: &Act, t: &Tenancy) -> Tenancy {
+    let swap = |g: Uuid| if g == act.source { act.target } else { g };
+    let owner = swap(t.owner);
+    Tenancy {
+        owner,
+        visibility: t.visibility.clone(),
+        co_owner: t.co_owner.map(swap).filter(|c| *c != owner),
+    }
+}
+
 /// `--catch-up`: the stray generations' OWN rows, the only rows its hand-off
 /// exemption covers ([`hand_off`]'s `own`).
 ///
@@ -1503,10 +1519,13 @@ async fn classify_narrowing(
             continue;
         }
         // The cascade re-meets every edge with a narrowing CLAIM endpoint,
-        // reading a workflow (or agent, paper) endpoint as ('public', world)
-        // and evidence as the cascade just left it. Any other edge with a
-        // changing endpoint is this tool's to narrow, to the meet of its
-        // endpoints' tuples (a workflow's own), unless it is already narrower.
+        // reading a workflow endpoint as its own row (migration 219; the
+        // batch writes the `workflows` rows before the claims, so a moving
+        // one is already in the TO state), an agent or paper endpoint as
+        // ('public', world), and evidence as the cascade just left it. Any
+        // other edge with a changing endpoint is this tool's to narrow, to the
+        // meet of its endpoints' tuples (a workflow's own), unless it is
+        // already narrower.
         let cascade = cand_claim(&e.source) || cand_claim(&e.target);
         if !cascade && !changing_node(&e.source) && !changing_node(&e.target) {
             out.kept
@@ -1517,7 +1536,7 @@ async fn classify_narrowing(
             match n.1.as_str() {
                 "claim" if candidates.contains(&n.0) => to_node.clone(),
                 "evidence" => ev_post.get(&n.0).cloned().unwrap_or_else(|| cur.clone()),
-                "workflow" if !cascade => {
+                "workflow" => {
                     if moving_wf.contains(&n.0) {
                         to_node.clone()
                     } else {
@@ -1535,6 +1554,17 @@ async fn classify_narrowing(
         );
         let post = if cascade {
             m.unwrap_or_else(|| e.tenancy.clone())
+        } else if e.tenancy.visibility != PUBLIC
+            && (act.from_private || (act.catch_up && stray.owns_edge(&e)))
+        {
+            // A private edge the source's rows carry moves with them: what it
+            // must keep requiring is its prior with the source replaced by the
+            // target ([`moved_tuple`], the image [`hand_off`] checks), not the
+            // prior itself. Since migration 219 an edge from a source-private
+            // workflow carries the source in its own tuple (co-owned with the
+            // target when its other end is already the target's), which the
+            // plain [`narrowed`] would keep as "already narrower".
+            narrowed(&moved_tuple(act, &e.tenancy), m)
         } else {
             narrowed(&e.tenancy, m)
         };
