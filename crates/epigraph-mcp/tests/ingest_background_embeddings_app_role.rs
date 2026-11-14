@@ -470,3 +470,34 @@ async fn a_server_with_no_embedding_provider_reports_nothing_queued(pool: PgPool
     );
     assert_eq!(server.background_tasks().running(), 0, "no embedding task");
 }
+
+/// An agent reads the tool descriptions, so every ingest tool that returns an
+/// embedding count must say it counts QUEUED embeddings, not stored vectors,
+/// and name the field (backlog fdacc14f).
+/// Verified to fail: on the commit before this test the file-path
+/// `ingest_document` description named no `claims_embedding_queued`.
+#[test]
+fn the_ingest_tool_descriptions_say_the_embedding_count_is_queued() {
+    let tools = EpiGraphMcpFull::static_tools();
+    let describe = |name: &str| -> String {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.as_deref().map(str::to_string))
+            .unwrap_or_else(|| panic!("tool {name} has a description"))
+    };
+    for (tool, field) in [
+        ("ingest_document", "claims_embedding_queued"),
+        ("ingest_document_inline", "claims_embedding_queued"),
+        ("ingest_document_spine", "paragraphs_embedding_queued"),
+    ] {
+        let text = describe(tool);
+        assert!(
+            text.contains(field)
+                && text.contains("QUEUED")
+                && text.contains("0 when this server has no embedding provider")
+                && text.contains("not vectors stored"),
+            "{tool}: {text}"
+        );
+    }
+}
