@@ -600,8 +600,8 @@ pub fn read_ordered(
         if super::workflow_submitter::is_manifest_file(p) {
             bail!(
                 "{} is a set-workflow-submitter manifest; reverse it with \
-                 `epigraph-operator set-workflow-submitter --reverse {}` (it records workflow \
-                 submitters, not row tenancy)",
+                 `epigraph-operator set-workflow-submitter --reverse {} --operator <uuid>` (it \
+                 records workflow submitters, not row tenancy)",
                 p.display(),
                 p.display()
             );

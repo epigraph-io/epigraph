@@ -322,9 +322,18 @@ async fn apply_and_reverse_restore_every_shape_exactly(pool: PgPool) {
         rr.show()
     );
 
-    // Reverse both: dry first, then applied, newest first.
+    // Reverse both: dry first, then applied, newest first, by a SECOND
+    // operator: the audit row must name the one reversing, not the run's.
+    let (op2, _) = fixture::seed_human_operator(&pool, "wfsub-operator-2").await;
+    let op2s = op2.to_string();
     let rev = |m: &Path, apply: bool| {
-        let mut a = vec!["set-workflow-submitter", "--reverse", m.to_str().unwrap()];
+        let mut a = vec![
+            "set-workflow-submitter",
+            "--reverse",
+            m.to_str().unwrap(),
+            "--operator",
+            op2s.as_str(),
+        ];
         if apply {
             a.extend(["--apply", "--reason", "test undo"]);
         }
@@ -357,6 +366,17 @@ async fn apply_and_reverse_restore_every_shape_exactly(pool: PgPool) {
             .len(),
         2
     );
+    let rev_rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'operator.workflow_submitter_reversed'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("reversal audit rows");
+    for (agent, details) in &rev_rows {
+        assert_eq!(*agent, Some(op2), "attributed to the reversing operator");
+        assert_eq!(details["original_operator"], serde_json::json!(op));
+    }
     let again = rev(&m1, true);
     assert_eq!(again.code, 0, "{}", again.show());
     assert!(
@@ -399,6 +419,8 @@ async fn a_row_changed_since_the_run_is_held_by_the_reversal(pool: PgPool) {
             "set-workflow-submitter",
             "--reverse",
             m.to_str().unwrap(),
+            "--operator",
+            op.as_str(),
             "--apply",
             "--reason",
             "undo",
@@ -521,6 +543,51 @@ fn both_verbs_keep_their_own_help_description() {
         first.starts_with("Set or correct the recorded SUBMITTER"),
         "set-workflow-submitter's help opens with {first:?}"
     );
+}
+
+/// A reversal is made under its own `--operator`, checked live: one whose
+/// registration was revoked since the run is refused and nothing is
+/// restored or audited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reversal_under_a_revoked_operator_is_refused(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (login, dsn) = maintenance_login(&pool).await;
+    let dir = scratch_dir();
+    let (s, op) = (fx.submitter.to_string(), fx.operator.to_string());
+    let m = dir.join("m.jsonl");
+    let mut args = set_args(&["--without-submitter"], &s, &op, &[]);
+    args.extend(apply_flags("2", m.to_str().unwrap()));
+    let r = run_with(&args, &dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
+    let after_run = all_metadata(&pool).await;
+    sqlx::query(
+        "UPDATE human_operators SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'test revocation' WHERE agent_id = $1",
+    )
+    .bind(fx.operator)
+    .execute(&pool)
+    .await
+    .expect("revoke the operator");
+    let rev = run_with(
+        &[
+            "set-workflow-submitter",
+            "--reverse",
+            m.to_str().unwrap(),
+            "--operator",
+            op.as_str(),
+            "--apply",
+            "--reason",
+            "undo",
+        ],
+        &dsn,
+    );
+    assert_eq!(rev.code, 1, "{}", rev.show());
+    assert!(rev.stderr.contains("human operator"), "{}", rev.show());
+    assert_eq!(all_metadata(&pool).await, after_run, "nothing restored");
+    assert!(audit(&pool, "operator.workflow_submitter_reversed")
+        .await
+        .is_empty());
+    drop_login(&pool, &login).await;
 }
 
 /// Authority over a lineage follows its head's submitter: selecting a

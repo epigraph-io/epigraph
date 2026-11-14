@@ -53,6 +53,9 @@
 //! key removed, or, for a prior `metadata` that was not an object, that whole
 //! prior value); a row already at its prior state is counted and left; a row
 //! in any other state (another writer changed it since) is HELD and left.
+//! The reversal takes its own `--operator`, checked live when it runs, and
+//! its audit row names that operator; the run's operator from the manifest
+//! header is kept in the details as `original_operator`.
 //! `reown-reverse` refuses this manifest and names this verb.
 
 use super::client_scope::Operator;
@@ -334,6 +337,24 @@ pub fn exit_code(r: &Report, opts: &Options) -> i32 {
     }
 }
 
+/// Refuse an `--operator` that is not a live registered human operator.
+async fn require_live_operator(conn: &mut PgConnection, operator: Uuid) -> anyhow::Result<()> {
+    let operator_live: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM human_operators \
+                         WHERE agent_id = $1 AND revoked_at IS NULL)",
+    )
+    .bind(operator)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !operator_live {
+        bail!(
+            "--operator {operator} is not a live registered human operator; refusing. Nothing \
+             was written."
+        );
+    }
+    Ok(())
+}
+
 /// Run the forward act.
 ///
 /// # Errors
@@ -358,20 +379,7 @@ pub async fn run(
             opts.submitter
         );
     }
-    let operator_live: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM human_operators \
-                         WHERE agent_id = $1 AND revoked_at IS NULL)",
-    )
-    .bind(opts.operator)
-    .fetch_one(&mut *conn)
-    .await?;
-    if !operator_live {
-        bail!(
-            "--operator {} is not a live registered human operator; refusing. Nothing was \
-             written.",
-            opts.operator
-        );
-    }
+    require_live_operator(conn, opts.operator).await?;
 
     let mut tx = conn.begin().await.context("beginning the transaction")?;
     let rows = lock_rows(&mut tx, &opts.selection).await?;
@@ -683,11 +691,13 @@ pub struct ReverseReport {
 /// Reverse one manifest (dry run unless `apply`).
 ///
 /// # Errors
-/// The manifest is not a current one, a statement fails, or (under
-/// `--apply`) the reason is blank. Nothing is committed then.
+/// The manifest is not a current one, `operator` is not a live registered
+/// human operator, a statement fails, or (under `--apply`) the reason is
+/// blank. Nothing is committed then.
 pub async fn reverse(
     conn: &mut PgConnection,
     path: &Path,
+    operator: Uuid,
     apply: bool,
     reason: &str,
     who: &Operator,
@@ -697,12 +707,10 @@ pub async fn reverse(
         bail!("--reverse --apply requires a non-empty --reason (recorded in the audit row)");
     }
     let m = read_manifest(path)?;
-    let operator = m
-        .header
-        .get("operator")
-        .and_then(Value::as_str)
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| anyhow!("{}: header has no operator", path.display()))?;
+    // The reversal is attributed to the operator making it, checked live
+    // now; the run's operator is kept in the details for the record.
+    let original_operator = m.header.get("operator").cloned().unwrap_or(Value::Null);
+    require_live_operator(conn, operator).await?;
     let ids: Vec<Uuid> = m.records.iter().map(|r| r.0).collect();
     let mut tx = conn.begin().await.context("beginning the transaction")?;
     let current: BTreeMap<Uuid, Value> = sqlx::query_as::<_, (Uuid, Value)>(
@@ -777,6 +785,7 @@ pub async fn reverse(
                 "tool": "epigraph-operator",
                 "command": "set-workflow-submitter --reverse",
                 "operator": operator_facts(who, operator),
+                "original_operator": original_operator,
                 "reason": reason.trim(),
                 "manifest_path": path.display().to_string(),
                 "manifest_sha256": sha256_hex(&bytes),

@@ -62,7 +62,8 @@
 //!     epigraph-operator set-workflow-submitter (--ids-file F | --canonical-names-file F | \
 //!         --without-submitter) --submitter <agent> --operator <uuid> [--force-reassign] \
 //!         [--apply --confirm-count N --manifest-out wf-sub-1.jsonl --ruling TEXT --reason TEXT]
-//!     epigraph-operator set-workflow-submitter --reverse wf-sub-1.jsonl [--apply --reason TEXT]
+//!     epigraph-operator set-workflow-submitter --reverse wf-sub-1.jsonl --operator <uuid> \
+//!         [--apply --reason TEXT]
 //!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
 //!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
 //!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
@@ -1239,9 +1240,10 @@ enum Command {
         /// The agent to record as submitter.
         #[arg(long, required_unless_present = "reverse", conflicts_with = "reverse")]
         submitter: Option<Uuid>,
-        /// The registered human operator this act is made under (audited).
-        #[arg(long, required_unless_present = "reverse", conflicts_with = "reverse")]
-        operator: Option<Uuid>,
+        /// The registered human operator this act (or this reversal) is
+        /// made under, checked live and named in the audit row.
+        #[arg(long)]
+        operator: Uuid,
         /// Replace a submitter another agent is recorded as.
         #[arg(long, conflicts_with = "reverse")]
         force_reassign: bool,
@@ -2812,6 +2814,7 @@ async fn main_inner() -> anyhow::Result<i32> {
                 let r = workflow_submitter::reverse(
                     &mut conn,
                     &path,
+                    op,
                     apply,
                     &reason,
                     &who,
@@ -2831,7 +2834,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             let opts = workflow_submitter::Options {
                 selection,
                 submitter: submitter.expect("clap requires --submitter"),
-                operator: op.expect("clap requires --operator"),
+                operator: op,
                 force_reassign,
                 apply,
                 confirm_count,
