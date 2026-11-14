@@ -163,3 +163,121 @@ async fn diverse_with_paper_doi_filter_is_rejected(pool: PgPool) {
     .await
     .expect("diverse=false with paper_doi_filter is accepted");
 }
+
+// ── 75920ad6 ────────────────────────────────────────────────────────────────
+
+/// Three cases on one corpus, in order:
+/// 1. every candidate below the floor → `below_confidence_floor` = 3 and
+///    `insufficient_confidence` = true, with an empty page;
+/// 2. one candidate above it too → the count still reports the 3 dropped, and
+///    the flag is false because something was returned;
+/// 3. the flag reads the min_truth gate, not final emptiness: when
+///    `exclude_contested` empties the page, the flag stays false.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_page_emptied_by_the_belief_floor_says_so(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    for (i, deg) in [1.0, 2.0, 3.0].into_iter().enumerate() {
+        seed_claim(
+            &pool,
+            agent,
+            &format!("b29 low-belief claim {i}"),
+            0.2,
+            Some(deg),
+        )
+        .await;
+    }
+
+    let body = recall(&pool, json!({ "min_truth": 0.3 }))
+        .await
+        .expect("recall");
+    assert_eq!(
+        body["results"],
+        json!([]),
+        "calibration: every candidate is below 0.3"
+    );
+    assert_eq!(
+        body["below_confidence_floor"].as_u64(),
+        Some(3),
+        "an empty page whose 3 candidates all fell below min_truth must count them; got {body}"
+    );
+    assert_eq!(
+        body["insufficient_confidence"].as_bool(),
+        Some(true),
+        "an empty page whose candidates all fell below min_truth must flag it; got {body}"
+    );
+
+    // The partitioned shape carries the same signal (top level, not per hit).
+    let body = recall(
+        &pool,
+        json!({ "min_truth": 0.3, "epistemic_partition": true }),
+    )
+    .await
+    .expect("recall partitioned");
+    assert_eq!(body["below_confidence_floor"].as_u64(), Some(3));
+    assert_eq!(body["insufficient_confidence"].as_bool(), Some(true));
+
+    // Case 2.
+    let strong = seed_claim(&pool, agent, "b29 well-believed claim", 0.9, Some(4.0)).await;
+    let body = recall(&pool, json!({ "min_truth": 0.3 }))
+        .await
+        .expect("recall");
+    assert_eq!(hit_ids(&body["results"]), vec![strong.to_string()]);
+    assert_eq!(
+        body["below_confidence_floor"].as_u64(),
+        Some(3),
+        "the dropped count is reported whether or not something survived; got {body}"
+    );
+    assert_eq!(
+        body["insufficient_confidence"].as_bool(),
+        Some(false),
+        "a page that returned a hit is not insufficient; got {body}"
+    );
+
+    // Case 3: contest the only survivor, then exclude contested hits.
+    let contester = seed_claim(&pool, agent, "b29 contesting claim", 0.9, None).await;
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'refutes')",
+    )
+    .bind(contester)
+    .bind(strong)
+    .execute(&pool)
+    .await
+    .expect("seed refutes edge");
+    let body = recall(
+        &pool,
+        json!({ "min_truth": 0.3, "exclude_contested": true }),
+    )
+    .await
+    .expect("recall");
+    assert_eq!(
+        body["results"],
+        json!([]),
+        "calibration: the survivor is contested"
+    );
+    assert_eq!(
+        body["insufficient_confidence"].as_bool(),
+        Some(false),
+        "exclude_contested, not the belief floor, emptied this page; got {body}"
+    );
+}
+
+/// No candidates at all: the floor dropped nothing, so the signal is 0/false
+/// and the page is the ordinary empty one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_empty_corpus_is_not_insufficient_confidence(pool: PgPool) {
+    let body = recall(&pool, json!({ "min_truth": 0.3 }))
+        .await
+        .expect("recall");
+    assert_eq!(body["results"], json!([]));
+    assert_eq!(
+        body["below_confidence_floor"].as_u64(),
+        Some(0),
+        "got {body}"
+    );
+    assert_eq!(
+        body["insufficient_confidence"].as_bool(),
+        Some(false),
+        "got {body}"
+    );
+}

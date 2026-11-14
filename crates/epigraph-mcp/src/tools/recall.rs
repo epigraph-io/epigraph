@@ -673,6 +673,19 @@ pub struct RecallWithContextResponse {
     pub epistemic_partition: Option<crate::types::EpistemicPartition<RecallHit>>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
+    /// How many retrieved candidates the `min_truth` belief floor dropped
+    /// from this page (backlog 75920ad6). Counts only that gate: a hit removed
+    /// by `exclude_contested` or `diversity_radius`, or one whose row vanished
+    /// mid-request, is not counted. `0` when the floor dropped nothing,
+    /// including on a page with no candidates at all.
+    pub below_confidence_floor: usize,
+    /// `true` exactly when candidates WERE retrieved but none cleared the
+    /// `min_truth` floor: "relevant material exists, none believed enough",
+    /// as distinct from "nothing relevant" (`false` with
+    /// `below_confidence_floor: 0`). Read from the floor alone, so a page
+    /// later emptied by `exclude_contested` or `diversity_radius` is not
+    /// reported as insufficient confidence.
+    pub insufficient_confidence: bool,
     /// Id the audit row for this retrieval is written under (backlog
     /// 8cbffa0e), so a caller can cite which recall fed a downstream decision.
     ///
@@ -1324,6 +1337,10 @@ async fn recall_with_context_post_embed(
             epistemic_partition,
             corpus_scope,
             centroid_dim_used: centroid_dim,
+            // No candidates: the floor had nothing to drop. This is the
+            // "nothing relevant" answer, not "insufficient confidence".
+            below_confidence_floor: 0,
+            insufficient_confidence: false,
             recall_event_id: Some(event_id.to_string()),
         });
     }
@@ -1497,6 +1514,9 @@ async fn recall_with_context_post_embed(
 
     // Stage 4 + 6: filter min_truth, drop hits whose core vanished, assemble.
     let mut results = Vec::with_capacity(raw_hits.len());
+    // Candidates the belief floor dropped (backlog 75920ad6). Only the
+    // `min_truth` drop below counts; a vanished core is not a confidence fact.
+    let mut below_confidence_floor = 0_usize;
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
         let (rerank_score, verdict) = rerank_meta
@@ -1514,6 +1534,7 @@ async fn recall_with_context_post_embed(
             .copied()
             .unwrap_or(core.truth_value);
         if belief_score < min_truth {
+            below_confidence_floor += 1;
             continue;
         }
         // No paper attribution is NOT a reason to drop the hit (drain U082,
@@ -1625,6 +1646,9 @@ async fn recall_with_context_post_embed(
             created_at: Some(core.created_at),
         });
     }
+    // Read here, straight after the floor and before any later filter, so the
+    // flag means "the floor emptied the page" and nothing else.
+    let insufficient_confidence = below_confidence_floor > 0 && results.is_empty();
 
     // Bounded lens post-pass: when a lens is active, annotate each already-built
     // hit with its lensed belief, keyed by paragraph_id. This does NOT touch
@@ -1856,6 +1880,8 @@ async fn recall_with_context_post_embed(
         epistemic_partition,
         corpus_scope,
         centroid_dim_used: centroid_dim,
+        below_confidence_floor,
+        insufficient_confidence,
         recall_event_id: Some(event_id.to_string()),
     })
 }
