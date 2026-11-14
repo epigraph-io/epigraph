@@ -57,6 +57,17 @@ jobs:
       # model, and pretending otherwise with a second identical-privilege role
       # would assert a separation that is not there.
       MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      # Migration 216 (backlog 0512ca33): the tenancy seed escape hatch needs an
+      # EXPLICIT grant of epigraph_seed; a superuser no longer takes it by
+      # implication. The #[sqlx::test] harness connects as this superuser and
+      # its fixtures insert undeclared claims and root rows, so the "Run
+      # migrations" step's epigraph-migrate grants the role to itself. Roles
+      # are cluster-wide, so every per-test database inherits the grant. Local
+      # gates that copy this job's env into their epigraph-migrate run get it
+      # too. NEVER set this for a deployed service login.
+      # tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch
+      # names the remedy when the grant is missing.
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
       SQLX_OFFLINE: "true"
       # The claim fixtures in crates/epigraph-mcp/tests/common/mod.rs DROP
       # uq_claims_content_hash_agent and run a table-wide dedup DELETE on
@@ -594,6 +605,9 @@ jobs:
     env:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      # Migration 216: see the `test` job. The Python fixtures write through the
+      # same superuser, so the migrate step grants it epigraph_seed.
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
       SQLX_OFFLINE: "true"
       CARGO_BUILD_JOBS: "2"
     steps:

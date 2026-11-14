@@ -231,7 +231,9 @@ WARN:
 - `connecting as a role other than epigraph_app ...` (production connects
   as `epigraph_app`);
 - `this connection can take migration 074's epigraph_seed escape hatch ...`
-  (a superuser is a member of every role, including `epigraph_seed`);
+  (only if this login was GRANTed `epigraph_seed`; since migration 216 a
+  superuser is not a member by implication), or, on a superuser without the
+  grant, `connected as a SUPERUSER that holds no grant of epigraph_seed ...`;
 - `operator binding is NOT ARMED on this database: ...` (arming is a
   production step, described in `docs/deploy.md`);
 - `EPIGRAPH_API_SIGNING_KEY_FILE is not set: HTTP edge writers insert their edges UNSIGNED ...`

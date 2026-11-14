@@ -151,10 +151,16 @@ create a FRESH database whose name ends in `_test` and migrate it from empty.
 
 ```bash
 createdb -U epigraph <name>_test
+EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1 \
 MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test \
   cargo run -p epigraph-api --bin epigraph-migrate
 DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test cargo test ...
 ```
+
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1` grants `epigraph_seed` to the migrating
+login (migration 216: the tenancy seed escape hatch the fixtures rely on needs
+an explicit grant, a superuser no longer counts). The grant is cluster-wide, so
+it also covers `#[sqlx::test]` databases. Never set it for a deployed login.
 
 `#[sqlx::test]` suites are unaffected (each test gets its own database, migrated
 from empty); this matters for the suites that read `DATABASE_URL` directly. The

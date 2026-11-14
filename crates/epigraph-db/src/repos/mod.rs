@@ -85,6 +85,7 @@ pub mod revoked_access_token;
 pub mod role_assignment;
 pub mod scoped_belief;
 pub mod security_event;
+pub mod seed_posture;
 pub mod semantic_link;
 pub mod sheaf;
 pub mod span;
