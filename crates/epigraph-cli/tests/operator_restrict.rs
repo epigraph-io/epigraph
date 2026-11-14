@@ -942,6 +942,80 @@ async fn a_non_world_owned_claim_is_held_unless_allowed(pool: PgPool) {
     assert_eq!(row(&pool, "claims", personal).await, grp(fx.target));
 }
 
+/// Backlog 57e9be7a: a public claim ALREADY owned by the target group (the
+/// operator's own group, where an MCP or HTTP write lands it) is narrowed in
+/// place: `('public', T)` -> `('group', T)`, its rows following it, with every
+/// invariant holding; and the reversal puts every row back. Before the fix the
+/// plan counted it eligible while the UPDATE's owner filter moved 0 rows, so
+/// the batch rolled back ("UPDATE claims moved 0 row(s), the batch planned 1").
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_claim_already_owned_by_the_target_narrows_in_place(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let own = fixture::seed_public_claim(&pool, fx.operator, "public in the target already").await;
+    exec(
+        &pool,
+        &format!(
+            "UPDATE claims SET owner_group_id = '{}' WHERE id = '{own}'",
+            fx.target
+        ),
+    )
+    .await;
+    let ev = evidence(&pool, own, "its evidence").await;
+    assert_eq!(row(&pool, "claims", own).await, publ(fx.target));
+    assert_eq!(row(&pool, "evidence", ev).await, publ(fx.target));
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[own]);
+    let before = snapshot(&pool, true).await;
+
+    let dry = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: &["--allow-non-world-owner"],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("1 requested, 1 eligible, 0 held"),
+        "{}",
+        dry.show()
+    );
+
+    let mf = dir.join("m.jsonl");
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &["--allow-non-world-owner"],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "claims", own).await, grp(fx.target));
+    assert_eq!(
+        row(&pool, "evidence", ev).await,
+        grp(fx.target),
+        "the claim's evidence narrows with it"
+    );
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "narrow in place then reverse",
+    );
+}
+
 /// A target that does not exist, is not active, or that the operator does not
 /// administer is refused before anything is written.
 #[sqlx::test(migrations = "../../migrations")]
