@@ -146,6 +146,9 @@ fn base_params() -> ClaimQueryParams {
         content_contains: None,
         methodology: None,
         evidence_type: None,
+        theme_id: None,
+        after: None,
+        include_edges: None,
     }
 }
 

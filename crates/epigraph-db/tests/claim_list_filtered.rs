@@ -171,8 +171,10 @@ async fn count_and_list_agree_across_every_predicate(pool: PgPool) {
         created_after: Some(ts(2026, 1, 2)),
         created_before: Some(ts(2026, 1, 11)),
         ids: Some(&ids),
+        theme_id: None,
         sort_by: ClaimSortField::TruthValue,
         sort_order: ClaimSortOrder::Asc,
+        after: None,
     };
 
     let count = ClaimRepository::count_filtered(&pool, &viewer, &filter)

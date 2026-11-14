@@ -17,6 +17,8 @@ use crate::errors::ApiError;
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
+use epigraph_db::repos::claim::LabelCursor;
+#[cfg(feature = "db")]
 use epigraph_db::ClaimRepository;
 
 use crate::middleware::bearer::ViewerExtractor;
@@ -113,6 +115,51 @@ pub struct ClaimQueryParams {
     /// Filter by evidence type (requires claim to have evidence of this type).
     /// Values: document, observation, testimony, computation, reference, figure, conversational
     pub evidence_type: Option<String>,
+
+    /// Only claims in this theme (`claims.theme_id`).
+    #[serde(default)]
+    pub theme_id: Option<Uuid>,
+
+    /// Opaque keyset cursor: the previous page's `next_cursor`, passed back
+    /// unchanged. Returns the claims strictly after that page's last row in
+    /// the `(created_at, id)` order `sort_order` names, so a page boundary
+    /// does not drift under concurrent writes. Only with `sort_by=created_at`
+    /// (the default), and not with a non-zero `offset`.
+    #[serde(default)]
+    pub after: Option<String>,
+
+    /// Also return the epistemic edges among the page's claims (`edges`):
+    /// in-force, readable `claim -> claim` edges whose both ends are on the
+    /// page, in [`TIMELINE_EDGE_RELATIONSHIPS`].
+    #[serde(default)]
+    pub include_edges: Option<bool>,
+}
+
+/// The relationships `include_edges` lists: the epistemic set plus `cites`,
+/// the set the Atlas layout counts (`ATLAS_DEFAULT_RELATIONSHIPS`).
+pub const TIMELINE_EDGE_RELATIONSHIPS: &[&str] = &[
+    "supports",
+    "corroborates",
+    "elaborates",
+    "generalizes",
+    "specializes",
+    "contradicts",
+    "refutes",
+    "cites",
+];
+
+/// Most edges `include_edges` returns for one page (oldest first);
+/// `edges_truncated` says when more exist.
+pub const MAX_TIMELINE_EDGES: usize = 1000;
+
+/// One epistemic edge between two claims of the page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimPageEdge {
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relationship: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Summary representation of a claim for list responses
@@ -166,6 +213,22 @@ pub struct ClaimListResponse {
 
     /// The offset that was applied
     pub offset: u32,
+
+    /// Keyset cursor of the next page (pass back as `after`): present on a
+    /// full `created_at`-ordered page, `null` on a short one (the end) and on
+    /// a `truth_value`-ordered page.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+
+    /// With `include_edges=true`: the epistemic edges among this page's
+    /// claims. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<Vec<ClaimPageEdge>>,
+
+    /// With `include_edges=true`: more than [`MAX_TIMELINE_EDGES`] such edges
+    /// exist. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges_truncated: Option<bool>,
 }
 
 // ============================================================================
@@ -321,6 +384,33 @@ pub async fn list_claims_query(
         }
     }
 
+    // ---- Validate the keyset cursor ----
+    let after = match params.after.as_deref() {
+        None | Some("") => None,
+        Some(token) => {
+            if offset > 0 {
+                return Err(ApiError::ValidationError {
+                    field: "after".to_string(),
+                    reason: "`after` cannot be combined with a non-zero `offset`".to_string(),
+                });
+            }
+            if sort_by != "created_at" {
+                return Err(ApiError::ValidationError {
+                    field: "after".to_string(),
+                    reason: "`after` pages only `sort_by=created_at`".to_string(),
+                });
+            }
+            Some(LabelCursor::decode(token).ok_or_else(|| {
+                ApiError::ValidationError {
+                    field: "after".to_string(),
+                    reason: "malformed `after` cursor; pass back a page's `next_cursor` \
+                             unchanged"
+                        .to_string(),
+                }
+            })?)
+        }
+    };
+
     // ---- The one viewer-stamped connection every read below runs on ----
     //
     // Acquired HERE and not at the top of the function: the seven validation
@@ -406,6 +496,8 @@ pub async fn list_claims_query(
         created_after: params.created_after,
         created_before: params.created_before,
         ids: id_filter.as_deref(),
+        theme_id: params.theme_id,
+        after,
         sort_by: match sort_by.as_str() {
             "truth_value" => epigraph_db::ClaimSortField::TruthValue,
             _ => epigraph_db::ClaimSortField::CreatedAt,
@@ -433,6 +525,53 @@ pub async fn list_claims_query(
             .await
             .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
 
+    // The next page's cursor: the last row of a FULL created_at page (a short
+    // page is the end of the set).
+    let next_cursor = (sort_by == "created_at" && rows.len() >= limit as usize)
+        .then(|| rows.last())
+        .flatten()
+        .map(|c| {
+            LabelCursor {
+                created_at: c.created_at,
+                id: c.id.as_uuid(),
+            }
+            .encode()
+        });
+
+    // The edges among the page, on the same stamped connection, so both ends
+    // are rows this caller was just served.
+    let (edges, edges_truncated) = if params.include_edges.unwrap_or(false) {
+        let page_ids: Vec<Uuid> = rows.iter().map(|c| c.id.as_uuid()).collect();
+        let mut found = epigraph_db::EdgeRepository::among_claims(
+            &mut *read,
+            &viewer,
+            &page_ids,
+            TIMELINE_EDGE_RELATIONSHIPS,
+            MAX_TIMELINE_EDGES as i64 + 1,
+        )
+        .await
+        .map_err(|e| scoped_read_failure(&e, "Edge query failed"))?;
+        let truncated = found.len() > MAX_TIMELINE_EDGES;
+        found.truncate(MAX_TIMELINE_EDGES);
+        (
+            Some(
+                found
+                    .into_iter()
+                    .map(|e| ClaimPageEdge {
+                        id: e.id,
+                        source_id: e.source_id,
+                        target_id: e.target_id,
+                        relationship: e.relationship,
+                        created_at: e.created_at,
+                    })
+                    .collect(),
+            ),
+            Some(truncated),
+        )
+    } else {
+        (None, None)
+    };
+
     crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
     let paginated: Vec<ClaimSummary> = rows
@@ -454,6 +593,9 @@ pub async fn list_claims_query(
         total,
         limit,
         offset,
+        next_cursor,
+        edges,
+        edges_truncated,
     }))
 }
 
@@ -652,6 +794,9 @@ pub async fn list_claims_query(
             total: 0,
             limit,
             offset,
+            next_cursor: None,
+            edges: None,
+            edges_truncated: None,
         }));
     }
 
@@ -759,6 +904,9 @@ pub async fn list_claims_query(
         total,
         limit,
         offset,
+        next_cursor: None,
+        edges: None,
+        edges_truncated: None,
     }))
 }
 

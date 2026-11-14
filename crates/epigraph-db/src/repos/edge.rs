@@ -76,6 +76,16 @@ pub const EDGE_IN_FORCE: &str = "(e.valid_to IS NULL OR e.valid_to > now())";
 /// `EDGE_IN_FORCE`.
 pub const EDGE_IN_FORCE_UNALIASED: &str = "(valid_to IS NULL OR valid_to > now())";
 
+/// One edge of [`EdgeRepository::among_claims`].
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct EdgeAmongClaims {
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relationship: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// A row from the edges table
 #[derive(Debug, Clone)]
 pub struct EdgeRow {
@@ -2392,6 +2402,52 @@ impl EdgeRepository {
                 valid_to: row.valid_to,
             })
             .collect())
+    }
+
+    /// The edges among a set of claims, for a reader that shows a page of
+    /// claims with the links between them (the claims timeline): every
+    /// in-force `claim -> claim` edge whose BOTH endpoints are in `claim_ids`,
+    /// whose `lower(relationship)` is one of `relationships`, and which
+    /// `viewer` may read (the edge's own tenancy, not only its endpoints').
+    /// Oldest first, then id; at most `limit` rows. The caller passes only ids
+    /// it has already read under the same viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids, relationships))]
+    pub async fn among_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        relationships: &[&str],
+        limit: i64,
+    ) -> Result<Vec<EdgeAmongClaims>, DbError> {
+        if claim_ids.is_empty() || relationships.is_empty() || limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            &format!(
+                "SELECT e.id, e.source_id, e.target_id, e.relationship, e.created_at \
+                   FROM edges e \
+                  WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
+                    AND e.source_id = ANY($1) AND e.target_id = ANY($1) \
+                    AND lower(e.relationship) = ANY($2) \
+                    AND {EDGE_IN_FORCE} \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                  ORDER BY e.created_at, e.id \
+                  LIMIT $3"
+            ),
+            4,
+        );
+        let rels: Vec<String> = relationships.iter().map(|r| r.to_lowercase()).collect();
+        let mut q = sqlx::query_as::<_, EdgeAmongClaims>(&sql)
+            .bind(claim_ids)
+            .bind(rels)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// List edges with AND-composed filters.
