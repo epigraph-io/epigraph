@@ -154,6 +154,10 @@ pub struct PaperListItem {
     pub authors_ingested_by: Option<Uuid>,
     /// The claims any ingest of the paper asserts, each once, whose
     /// assertion is in force and readable and which the caller can read.
+    /// Superseded claims count (the paper stated them, as
+    /// `PaperRepository::list_asserted_claims` lists them), so this can
+    /// exceed the paper's `claim_count` on `GET /api/v1/sources/overview`,
+    /// which counts a scope's CURRENT claims only.
     pub claim_count: i64,
     /// Every readable ingest of the paper, oldest first, at most 10.
     pub ingestions: Vec<PaperIngestionItem>,

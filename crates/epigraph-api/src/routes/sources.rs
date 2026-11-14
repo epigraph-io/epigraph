@@ -89,7 +89,10 @@ pub struct SourceItem {
     pub kind: String,
     /// The paper id, the host, or the agent id.
     pub key: String,
-    /// The caller's readable current claims this source stated.
+    /// The caller's readable current claims this source stated. CURRENT
+    /// only, since the overview describes a scope as it stands; a paper's
+    /// `claim_count` on `GET /api/v1/papers` also counts its superseded
+    /// claims, so the two can differ for one paper.
     pub claim_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paper: Option<SourcePaper>,
