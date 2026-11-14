@@ -10,8 +10,10 @@ cannot drift apart.
 
     test-shard.py matrix               JSON matrix for `strategy.matrix` (every shard)
     test-shard.py matrix --base REF    the same, holding only the shards that a
-                                       change since REF affects (see below)
-    test-shard.py affected --base REF  explain that selection, for a human
+                                       change since REF affects (see below),
+                                       uncommitted and untracked files included
+    test-shard.py affected [--base] REF  that matrix on stdout, and why each
+                                       shard was selected on stderr
     test-shard.py args <shard-id>      cargo arguments for one shard
     test-shard.py doc <shard-id>       the package whose doc tests the shard runs,
                                        or nothing
@@ -701,18 +703,24 @@ def run_flags(ids, whole, full):
     return flags
 
 
-def changed_paths(root, base):
+def changed_paths(root, base, worktree=False):
     """Paths changed between the merge base of `base` and HEAD, and HEAD.
 
+    With `worktree`, also the uncommitted and the untracked (not ignored)
+    files: a local gate tests the working tree, not HEAD, so selecting from
+    HEAD alone would leave an uncommitted change untested and pass.
     `--no-renames`: a file moved out of a crate is a change to that crate too.
     Raises CalledProcessError when `base` is unknown (a shallow clone)."""
-    out = subprocess.run(
-        ["git", "-C", root, "diff", "--no-renames", "--name-only", f"{base}...HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return [f for f in out.splitlines() if f]
+    commands = [["diff", "--no-renames", "--name-only", f"{base}...HEAD"]]
+    if worktree:
+        commands += [["diff", "--no-renames", "--name-only", "HEAD"], ["ls-files", "--others", "--exclude-standard"]]
+    paths = set()
+    for command in commands:
+        out = subprocess.run(
+            ["git", "-C", root] + command, check=True, capture_output=True, text=True
+        ).stdout
+        paths.update(f for f in out.splitlines() if f)
+    return sorted(paths)
 
 
 def head_is_merge(root):
@@ -824,7 +832,7 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
             reason = "HEAD is not a merge commit, so HEAD^1 is not the PR's base"
         else:
             try:
-                changed = changed_paths(root, base)
+                changed = changed_paths(root, base, worktree=bool(env.get("DIFF_WORKTREE")))
             except subprocess.CalledProcessError as e:
                 reason = f"cannot diff against {base}: {(e.stderr or '').strip()}"
     if reason is None:
@@ -966,20 +974,26 @@ def main(argv):
             ok = False
             print("FAIL EXTRA_JOBS: not workspace members:", unknown)
         return 0 if ok else 1
-    if mode in ("matrix", "affected") and "--base" in argv:
+    base = None
+    if mode == "affected" and len(argv) == 3 and not argv[2].startswith("-"):
+        base = argv[2]
+    elif mode in ("matrix", "affected") and "--base" in argv:
         i = argv.index("--base")
         if i + 1 >= len(argv):
             print("--base needs a ref", file=sys.stderr)
             return 2
-        d = decide(root, pkgs, shards, {"GITHUB_EVENT_NAME": "pull_request", "DIFF_BASE": argv[i + 1]})
-        if mode == "matrix":
-            print(json.dumps(d["matrix"]))
-        else:
-            explain(d, sys.stdout)
-        return 0
-    if mode == "affected":
-        print("affected needs --base REF", file=sys.stderr)
+        base = argv[i + 1]
+    elif mode == "affected":
+        print("affected needs a base ref: affected [--base] REF", file=sys.stderr)
         return 2
+    if base is not None:
+        # A local run: the working tree is what gets tested.
+        env = {"GITHUB_EVENT_NAME": "pull_request", "DIFF_BASE": base, "DIFF_WORKTREE": "1"}
+        d = decide(root, pkgs, shards, env)
+        if mode == "affected":
+            explain(d, sys.stderr)
+        print(json.dumps(d["matrix"]))
+        return 0
     if mode == "matrix":
         print(json.dumps(matrix_for(shards, list(shards))))
         return 0
