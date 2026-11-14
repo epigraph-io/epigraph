@@ -895,7 +895,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // env -> empty registry -> the gateway behaves exactly as pre-federation.
     // A malformed EPIGRAPH_MCP_EXTENSIONS is a hard boot error (fail fast rather
     // than silently drop an extension); a tool-name COLLISION between two
-    // extensions is likewise fatal (ambiguous routing). An individual extension
+    // extensions, or between an extension and a kernel tool, is likewise fatal
+    // (ambiguous routing; `build` reserves the kernel's names). An individual extension
     // being unreachable at startup is NOT fatal — it is logged and mounted
     // unhealthy inside `build`.
     let ext_env = std::env::var("EPIGRAPH_MCP_EXTENSIONS").ok();
@@ -946,7 +947,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         tracing::info!(
             reconnect_interval_secs = reconnect_interval.as_secs(),
-            "Federation gateway: reconnect timer started for unhealthy extensions"
+            "Federation gateway: reconnect timer started (re-lists mounted extensions, \
+             re-dials unhealthy ones)"
         );
         federation.spawn_reconnect_loop(reconnect_interval);
     }

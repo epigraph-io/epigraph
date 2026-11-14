@@ -21,6 +21,12 @@
 //!   so this is the sole scope gate for them.
 //! - **`prefix=<str>`** — OPTIONAL. Prepended to each federated tool name to
 //!   avoid collisions with kernel tools or other extensions.
+//! - **`call_timeout_secs=<n>`** — OPTIONAL, a positive whole number of seconds
+//!   (default [`DEFAULT_CALL_TIMEOUT`], 300 s). How long the gateway waits for
+//!   this extension to answer one proxied `tools/call` before it stops waiting
+//!   and tells the caller so (backlog 7ea4bd74). Without a bound, a downstream
+//!   that accepted the call and never answered held the caller's request open
+//!   for as long as the connection lived.
 //! - **`insecure_remote=1`** — OPTIONAL, and the only accepted value is `1`.
 //!   Without it the host MUST be loopback: an IPv4 address in `127.0.0.0/8`,
 //!   `[::1]`, or `localhost` (any case). The gateway dials `http://{addr}/mcp`
@@ -38,10 +44,18 @@
 //! extension).
 
 use std::fmt;
+use std::time::Duration;
 
 /// The transport scheme prefix for the v1 loopback-TCP transport. UDS is a
 /// documented fast-follow and is intentionally rejected here.
 const TCP_SCHEME: &str = "tcp:";
+
+/// How long the gateway waits for one proxied `tools/call` when the entry sets
+/// no `call_timeout_secs=`. Generous on purpose: a federated tool may do real
+/// work (episcience's `synthesize` composes with a model), and a bound that
+/// cuts a healthy call off is worse than a slow answer. The bound exists so a
+/// downstream that never answers cannot hold a caller's request open forever.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Parsed configuration for one mounted downstream extension MCP.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +72,9 @@ pub struct ExtensionConfig {
     pub scope: String,
     /// Optional tool-name prefix to avoid collisions.
     pub prefix: Option<String>,
+    /// How long the gateway waits for one proxied `tools/call` to answer
+    /// (`call_timeout_secs=`, default [`DEFAULT_CALL_TIMEOUT`]).
+    pub call_timeout: Duration,
 }
 
 /// Failure while parsing `EPIGRAPH_MCP_EXTENSIONS`. Carries the offending entry
@@ -188,6 +205,7 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
     // Remaining fields are order-independent `key=value` pairs.
     let mut scope: Option<String> = None;
     let mut prefix: Option<String> = None;
+    let mut call_timeout: Option<Duration> = None;
     let mut insecure_remote = false;
     let mut insecure_remote_seen = false;
     for field in fields {
@@ -212,6 +230,19 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
                 }
                 prefix = Some(value.to_string());
             }
+            "call_timeout_secs" => {
+                if call_timeout.is_some() {
+                    return Err(err("duplicate `call_timeout_secs` field"));
+                }
+                let secs = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|s| *s > 0)
+                    .ok_or_else(|| {
+                        err("`call_timeout_secs` must be a positive whole number of seconds")
+                    })?;
+                call_timeout = Some(Duration::from_secs(secs));
+            }
             "insecure_remote" => {
                 if insecure_remote_seen {
                     return Err(err("duplicate `insecure_remote` field"));
@@ -227,7 +258,8 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
             }
             other => {
                 return Err(err(&format!(
-                    "unknown field `{other}` (expected `scope`, `prefix` or `insecure_remote`)"
+                    "unknown field `{other}` (expected `scope`, `prefix`, `call_timeout_secs` or \
+                     `insecure_remote`)"
                 )));
             }
         }
@@ -271,6 +303,7 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
         addr: addr.to_string(),
         scope,
         prefix,
+        call_timeout: call_timeout.unwrap_or(DEFAULT_CALL_TIMEOUT),
     })
 }
 
@@ -300,6 +333,7 @@ mod tests {
                 addr: "127.0.0.1:8093".into(),
                 scope: "episcience:tools".into(),
                 prefix: None,
+                call_timeout: DEFAULT_CALL_TIMEOUT,
             }]
         );
     }
@@ -317,6 +351,7 @@ mod tests {
                 addr: "127.0.0.1:8093".into(),
                 scope: "episcience:tools".into(),
                 prefix: Some("episcience__".into()),
+                call_timeout: DEFAULT_CALL_TIMEOUT,
             }]
         );
     }
@@ -537,6 +572,48 @@ mod tests {
             "the error names the SECOND entry: {}",
             err.entry
         );
+    }
+
+    #[test]
+    fn call_timeout_secs_sets_the_call_timeout() {
+        let cfgs = parse_extensions(Some(
+            "episcience=tcp:127.0.0.1:8093;scope=episcience:tools;call_timeout_secs=45",
+        ))
+        .unwrap();
+        assert_eq!(cfgs[0].call_timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn call_timeout_defaults_when_absent() {
+        let cfgs =
+            parse_extensions(Some("episcience=tcp:127.0.0.1:8093;scope=episcience:tools")).unwrap();
+        assert_eq!(cfgs[0].call_timeout, DEFAULT_CALL_TIMEOUT);
+    }
+
+    /// Zero would refuse every call before it could answer, and anything not
+    /// a whole number of seconds is a typo; both are refused at boot.
+    #[test]
+    fn call_timeout_secs_must_be_a_positive_whole_number() {
+        for bad in ["0", "-5", "1.5", "soon"] {
+            let err = parse_extensions(Some(&format!(
+                "episcience=tcp:127.0.0.1:8093;scope=x;call_timeout_secs={bad}"
+            )))
+            .unwrap_err();
+            assert!(
+                err.reason.contains("positive whole number"),
+                "`{bad}` must be refused: {}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_call_timeout_secs_is_error() {
+        let err = parse_extensions(Some(
+            "episcience=tcp:127.0.0.1:8093;scope=x;call_timeout_secs=5;call_timeout_secs=6",
+        ))
+        .unwrap_err();
+        assert!(err.reason.contains("duplicate"), "got: {}", err.reason);
     }
 
     #[test]

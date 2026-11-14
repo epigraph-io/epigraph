@@ -715,6 +715,21 @@ impl EpiGraphMcpFull {
         Self::tool_router().list_all()
     }
 
+    /// The name of every kernel tool: the names no federated extension may
+    /// export (backlog 351d3def). `FederationRegistry::build` reserves them, so a
+    /// clash fails the gateway's boot instead of listing the name twice and
+    /// routing it only to the kernel.
+    ///
+    /// Taken from [`static_tools`](Self::static_tools), the full router, rather
+    /// than any one server's: a read-only server's router has the same names.
+    #[must_use]
+    pub fn kernel_tool_names() -> HashSet<String> {
+        Self::static_tools()
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect()
+    }
+
     /// Look up the required scope for `tool_name` and verify the
     /// caller has it. Returns `Err` with a JSON-RPC-style error if:
     /// - no `AuthContext` is attached (token validation never ran or
@@ -808,6 +823,82 @@ impl EpiGraphMcpFull {
             code: rmcp::model::ErrorCode::INVALID_REQUEST,
             message: std::borrow::Cow::Owned(message),
             data: None,
+        }
+    }
+
+    /// The caller's answer to a failed federated `tools/call` (backlog
+    /// 7ea4bd74). Before this every failure was `internal_error`'s redacted
+    /// "internal error", including the downstream's own designed refusals
+    /// ("widget 42 is out of range"), which left the caller nothing to act on.
+    ///
+    /// - The downstream ANSWERED with an MCP error
+    ///   ([`FederationError::Downstream`]): returned as-is (code, message,
+    ///   data). It is the extension's reply to this caller's own request,
+    ///   made under this caller's own token. Except an internal error
+    ///   (`-32603`), whose message is redacted as this server redacts its own:
+    ///   a downstream's internal error is where its driver text lands.
+    /// - The gateway could not open a session, or found no route
+    ///   ([`FederationError::Connect`], [`FederationError::Timeout`],
+    ///   [`FederationError::NoRoute`]): "extension `<name>` unavailable".
+    /// - The call broke off without an answer ([`FederationError::Request`]),
+    ///   or gave none within the extension's `call_timeout_secs=`
+    ///   ([`FederationError::CallTimeout`]): says so, and that it may have run.
+    ///
+    /// The designed messages name the extension and never the error's own
+    /// text, which carries the dialed URI (deployment topology); that goes to
+    /// the server log ([`crate::errors::internal_error_logged`]).
+    #[must_use]
+    pub fn federated_call_error(
+        extension: &str,
+        tool: &str,
+        err: crate::federation::client::FederationError,
+    ) -> McpError {
+        use crate::federation::client::FederationError;
+        match err {
+            // An internal error is the one answer NOT passed through: a
+            // downstream's `-32603` is where its own driver and provider text
+            // ends up (episcience's `internal_error` puts `format!("…: {e}")`
+            // in the message), which `errors.rs` keeps from every caller of
+            // this server. Its message goes to the server log instead.
+            FederationError::Downstream(answer)
+                if answer.code == rmcp::model::ErrorCode::INTERNAL_ERROR =>
+            {
+                crate::errors::internal_error_logged(
+                    format!(
+                        "Federated tool '{tool}' failed with an internal error in extension \
+                         '{extension}'; the detail is in the server log."
+                    ),
+                    answer.message,
+                )
+            }
+            FederationError::Downstream(answer) => answer,
+            FederationError::Connect { .. }
+            | FederationError::Timeout(..)
+            | FederationError::ListTimeout(_)
+            | FederationError::NoRoute(_) => crate::errors::internal_error_logged(
+                format!(
+                    "Federated tool '{tool}' is unavailable: extension '{extension}' unavailable \
+                     (the gateway could not open a session with it: it is down, or it refused \
+                     this caller's token). Retry once it is back; nothing was sent to it."
+                ),
+                err,
+            ),
+            FederationError::CallTimeout(waited) => crate::errors::internal_error_logged(
+                format!(
+                    "Federated tool '{tool}' failed: extension '{extension}' gave no answer \
+                     within {} s, so the gateway stopped waiting. The call may still complete \
+                     there; check before calling it again.",
+                    waited.as_secs()
+                ),
+                err,
+            ),
+            FederationError::Request(_) => crate::errors::internal_error_logged(
+                format!(
+                    "Federated tool '{tool}' failed: the call to extension '{extension}' broke \
+                     off before it answered. The call may or may not have run there."
+                ),
+                err,
+            ),
         }
     }
 
@@ -1062,7 +1153,8 @@ impl EpiGraphMcpFull {
 
     /// The tools listed to one caller (elevation plan EL-11): every kernel
     /// tool [`crate::tools::elevation::listed`] admits, then every federated
-    /// tool. `auth` is `None` on stdio; over HTTP it must already carry the
+    /// tool when [`Self::lists_federated_tools`] says this caller can call one.
+    /// `auth` is `None` on stdio; over HTTP it must already carry the
     /// switch and the elevation ([`Self::listing_auth`], or `call_tool`'s
     /// dispatch for `list_mcp_tools`). The ONE manifest rule `list_tools` and
     /// `list_mcp_tools` share, so neither can bypass the other.
@@ -1087,8 +1179,25 @@ impl EpiGraphMcpFull {
             .into_iter()
             .filter(|t| crate::tools::elevation::listed(t.name.as_ref(), &caller))
             .collect();
-        tools.extend(self.federation.list_federated_tools());
+        if Self::lists_federated_tools(http, auth) {
+            tools.extend(self.federation.list_federated_tools());
+        }
         tools
+    }
+
+    /// Whether a caller is listed the federated tools: only one that
+    /// presented a bearer token, over HTTP (backlog b6559e75).
+    ///
+    /// `call_tool` proxies a federated call under the CALLER's own bearer,
+    /// and refuses one it has no bearer to forward. A caller without one
+    /// (stdio, which carries no `AuthContext`; an HTTP listener with no auth
+    /// layer; the unauthenticated listener, whose injected context is
+    /// principal-less and comes with no token) would be shown tools it can
+    /// never call, and the manifest would mislead every client that plans from
+    /// it.
+    #[must_use]
+    pub fn lists_federated_tools(http: bool, auth: Option<&epigraph_auth::AuthContext>) -> bool {
+        http && auth.is_some_and(|a| !crate::auth::is_principal_less(a))
     }
 
     /// Replace the admin-scope switch's cache with one whose reads stand for
@@ -3106,7 +3215,12 @@ impl ServerHandler for EpiGraphMcpFull {
                     return Err(err);
                 }
                 // (b) require the caller's raw bearer to forward downstream.
+                // A refusal like (0) and (a), so audited like them (backlog
+                // b6559e75): reachable over HTTP by a caller the gates above
+                // admit with no token, the unauthenticated listener's.
                 let Some(token) = raw_token else {
+                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
+                        .await;
                     return Err(McpError {
                         code: rmcp::model::ErrorCode::INVALID_REQUEST,
                         message: std::borrow::Cow::Borrowed(
@@ -3120,14 +3234,15 @@ impl ServerHandler for EpiGraphMcpFull {
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
                 // (d) proxy to the downstream on a fresh caller-token session.
-                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
-                // handler's error type directly (no further conversion).
+                // A failure is answered by `federated_call_error`: the
+                // downstream's own MCP error as-is, a designed message naming
+                // the extension otherwise (backlog 7ea4bd74).
                 return self
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map(rmcp::model::CallToolResponse::from)
-                    .map_err(crate::errors::internal_error);
+                    .map_err(|e| Self::federated_call_error(&ext_name, &request.name, e));
             }
 
             // Neither a kernel tool nor a federated route: a ROUTING failure.
@@ -3295,9 +3410,9 @@ impl ServerHandler for EpiGraphMcpFull {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         // Kernel tools first, then every federated tool the gateway currently
-        // advertises. Static-first mirrors `call_tool`'s resolution order: a
-        // kernel tool always wins a name clash (the operator resolves clashes
-        // between an extension and the kernel with a `prefix=`).
+        // advertises. The two never share a name: the registry refuses an
+        // extension tool named like a kernel tool (at boot, and leaves it
+        // unrouted on a reconnect; backlog 351d3def).
         //
         // The kernel list is THIS caller's (elevation plan EL-11, D2):
         // `sudo`/`unsudo` only to a holder of a live elevating role, and an
@@ -3321,8 +3436,8 @@ impl ServerHandler for EpiGraphMcpFull {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        // Static router first (kernel tools win name clashes, as in call_tool),
-        // then fall back to a federated tool from the routing map.
+        // Static router first, as in call_tool, then a federated tool from the
+        // routing map. The registry never routes a kernel tool's name.
         self.tool_router.get(name).cloned().or_else(|| {
             self.federation
                 .list_federated_tools()

@@ -450,9 +450,9 @@ For the others, anything else is off.
 | `EPIGRAPH_MCP_CONNECTOR_ELEVATION` | off | `on` lets the HTTP transport elevate connector-mode sessions. Leave it unset (section 10). |
 | `EPIGRAPH_RUN_TOKENS` | `off` | As for the API. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | As for the API. |
-| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. See `crates/epigraph-mcp/src/federation/config.rs`. |
-| `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. |
-| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | How often an unhealthy extension is re-dialled. |
+| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. An extension that exports a kernel tool's name (or another extension's) is a boot error too; set a `prefix=` on it. `call_timeout_secs=<n>` on an entry bounds each proxied `tools/call` (default 300). See `crates/epigraph-mcp/src/federation/config.rs`. |
+| `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. Every reconnect tick re-lists each mounted extension with it, so it must stay valid for the life of the process: an expired token demotes every extension until it is re-minted and the gateway restarted. |
+| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | How often each mounted extension is re-listed (a failure demotes it, a changed list swaps its routes) and each unhealthy one re-dialled. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
 | `RUST_LOG` | `epigraph_mcp=info,tenancy=info` | Log filter, to stderr. `rmcp*` is capped at INFO regardless. |
