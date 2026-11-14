@@ -25,19 +25,14 @@ async fn main() {
     // after this ships. `ci.yml` is updated in the same PR to set both, so CI
     // exercises the new variable; the fallback exists for the operator who has
     // not split the credentials yet.
-    let (url, var) = match std::env::var("MIGRATION_DATABASE_URL") {
-        Ok(u) => (u, "MIGRATION_DATABASE_URL"),
-        Err(_) => {
-            let u = std::env::var("DATABASE_URL")
-                .expect("MIGRATION_DATABASE_URL or DATABASE_URL environment variable required");
-            tracing::warn!(
-                "MIGRATION_DATABASE_URL is unset; falling back to DATABASE_URL. Migrations \
-                 need DDL privilege, which the application role must not have -- see \
-                 docs/deploy.md."
-            );
-            (u, "DATABASE_URL")
-        }
-    };
+    //
+    // The rule is `epigraph_api::migrate::select_migration_dsn`, shared with
+    // the server's EPIGRAPH_MIGRATE_ON_BOOT path; a blank value is unset.
+    let dsn = epigraph_api::migrate::migration_dsn_from_env().unwrap_or_else(|e| panic!("{e}"));
+    if dsn.fell_back() {
+        tracing::warn!("{}", epigraph_api::migrate::MIGRATION_DSN_FALLBACK_WARNING);
+    }
+    let (url, var) = (dsn.url, dsn.var);
     tracing::info!(dsn_var = var, "resolved migration DSN");
     // Log the host but not credentials.
     let host_hint = url.split('@').nth(1).unwrap_or("<unknown>");
@@ -58,7 +53,7 @@ async fn main() {
     // Pinned with this reason in `crates/epigraph-db/tests/no_unmaintained_dsn.rs`.
     let pool = epigraph_db::PgPool::connect(&url)
         .await
-        .expect("PgPool::connect to DATABASE_URL failed");
+        .unwrap_or_else(|e| panic!("PgPool::connect to {var} failed: {e}"));
     // Issue #492: a database AHEAD of this binary's embedded migration set is
     // refused unless the operator opts in, by flag or by env. Either spelling
     // suffices; both are named in the refusal text.

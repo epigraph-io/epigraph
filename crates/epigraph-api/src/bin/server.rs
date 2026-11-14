@@ -450,16 +450,53 @@ async fn main() {
         if epigraph_api::should_migrate_on_boot(
             std::env::var("EPIGRAPH_MIGRATE_ON_BOOT").ok().as_deref(),
         ) {
+            // On the MIGRATION DSN, not on the request pool (backlog
+            // e1b96df7): migrating needs DDL privilege, which the application
+            // role must not have, so on a deployment that has split the
+            // credentials the request pool cannot migrate at all. Same rule as
+            // `epigraph-migrate`: MIGRATION_DATABASE_URL, falling back to
+            // DATABASE_URL with a WARN.
+            let dsn = match epigraph_api::migrate::migration_dsn_from_env() {
+                Ok(dsn) => dsn,
+                Err(reason) => {
+                    eprintln!("ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set: {reason}");
+                    std::process::exit(1);
+                }
+            };
+            if dsn.fell_back() {
+                tracing::warn!("{}", epigraph_api::migrate::MIGRATION_DSN_FALLBACK_WARNING);
+            }
+            tracing::info!(
+                dsn_var = dsn.var,
+                "migrating on boot over the migration DSN"
+            );
+            // MAINTENANCE-DSN-EXEMPT: a short-lived pool on the MIGRATION DSN
+            // (DDL privilege, a different and stronger role than the
+            // maintenance one), built only under EPIGRAPH_MIGRATE_ON_BOOT and
+            // closed below, before this process serves anything.
+            let migration_pool = match epigraph_db::PgPool::connect(&dsn.url).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database \
+                         ({}) cannot be reached: {e}",
+                        dsn.var
+                    );
+                    std::process::exit(1);
+                }
+            };
             // Same schema-head checks as `epigraph-migrate` (issue #492): a
             // database carrying migrations this binary does not embed is
             // refused unless EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD opts in to the
             // rollback case.
-            let report = epigraph_api::run_migrations(
-                &pool,
+            let migrated = epigraph_api::run_migrations(
+                &migration_pool,
                 epigraph_api::migrate::MigrateOptions::from_env(),
             )
-            .await
-            .unwrap_or_else(|e| panic!("Failed to apply pending migrations: {e}"));
+            .await;
+            migration_pool.close().await;
+            let report =
+                migrated.unwrap_or_else(|e| panic!("Failed to apply pending migrations: {e}"));
             tracing::info!(
                 db_head = report.db_head,
                 binary_head = report.binary_head,

@@ -439,7 +439,7 @@ For the others, anything else is off.
 | `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
-| `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot and panics on failure. The supported path is `epigraph-migrate`. |
+| `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot, on a short-lived pool on `MIGRATION_DATABASE_URL` (falling back to `DATABASE_URL` with a WARN, as `epigraph-migrate` does), closed before it serves. A migration DSN it cannot reach → exit 1, naming the variable; a failed migration panics. The DDL credential is then in the server's environment for as long as it runs, so the supported path is `epigraph-migrate`. |
 | `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD` | off | The deliberate-rollback opt-in, for any entry point that migrates (section 4). |
 | `EPIGRAPH_REQUIRE_SIGNATURES` | off | Enforces Ed25519 payload signatures on `POST /api/v1/submit/packet` only (section 7). |
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
@@ -497,7 +497,7 @@ not to the API.
 
 | Flag / variable | Meaning |
 |---|---|
-| `MIGRATION_DATABASE_URL` | The migration DSN. Unset → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
+| `MIGRATION_DATABASE_URL` | The migration DSN, for `epigraph-migrate` and the server's `EPIGRAPH_MIGRATE_ON_BOOT`. Unset or blank → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
 | `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` | The deliberate-rollback opt-in (section 4). |
 
 ### `drain_jobs` and `replay_deferred_cascades`
@@ -547,7 +547,9 @@ the empty string, skips. Booting without migrating logs
 Several migrations (074, 075 and 084 among them) `RAISE` when their
 preconditions do not hold, and the boot-time call site panics on failure, so
 an unattended boot-time apply turns a precondition failure into a crash loop.
-Keep migration an explicit step.
+Keep migration an explicit step. When it is set, the server migrates on the
+migration DSN by the same rule as `epigraph-migrate` below (not on its request
+pool, whose role has no DDL privilege), on a pool it closes before serving.
 
 `epigraph-migrate` reads `MIGRATION_DATABASE_URL`, falling back to
 `DATABASE_URL` with a `WARN`. That WARN is shown only when `RUST_LOG` enables
@@ -4483,6 +4485,7 @@ Do not improvise it against a live database without that entry's context.
 | `REFUSING: this PostgreSQL server's pgvector is X (the version CREATE EXTENSION would install) ...` / `REFUSING: this PostgreSQL server has no pgvector extension ...` | A fresh database on a server whose pgvector is missing or older than 0.8.0. Install a current pgvector and migrate again; nothing was applied. |
 | `ERROR: REFUSING: the pgvector extension is not installed in this database ...` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
 | `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
+| `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
 | `refusing to serve: RLS posture assertion failed` | The API connects as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |
 | `operator binding NOT ENFORCED for the writer on this privileged DSN: ...`, then `ERROR: refusing to start: ...` | A request unit on a privileged DSN against an armed database. Point it at the `epigraph_app` login. |

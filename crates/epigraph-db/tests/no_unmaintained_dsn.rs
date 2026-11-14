@@ -159,6 +159,16 @@ const EXEMPT: &[(&str, &str)] = &[
          deliberate.",
     ),
     (
+        "crates/epigraph-api/src/bin/server.rs",
+        "Backlog e1b96df7. Its request pool is a ScopedPool; the one PgPool::connect is the \
+         EPIGRAPH_MIGRATE_ON_BOOT path, which migrates on MIGRATION_DATABASE_URL (falling back \
+         to DATABASE_URL with a WARN, the epigraph-migrate rule) instead of on the request \
+         pool. Migrating needs DDL privilege, which neither the application role nor \
+         epigraph_maintenance holds, so a maintenance constructor would be the wrong \
+         credential. The pool is built only when the operator opts in, and closed before the \
+         process serves a request.",
+    ),
+    (
         "scripts/subcluster_outliers.py",
         "Read-only by design on the epigraph_ro role; its docstring states 'script never \
          writes' as a property callers rely on. Threading MAINTENANCE_DATABASE_URL in would \
