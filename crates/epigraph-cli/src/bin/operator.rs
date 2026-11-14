@@ -149,8 +149,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Grant a platform role (migration 123) to a REGISTERED HUMAN for an
-    /// explicit window. Agents never hold a role (CUS01); once a custodian
-    /// exists every grant names a live custodian as --granted-by (CUS03).
+    /// explicit window. Agents never hold a role (CUS01).
+    ///
+    /// Which variant applies is decided by the database's state, so measure
+    /// first (`list-role-assignments --role role:platform-custodian`, and
+    /// `list-passkeys --person <grantor>`):
+    ///
+    /// * no live custodian: the BOOTSTRAP grant, with no --granted-by
+    ///   (giving one fails CUS03, the grantor holds no live custodian
+    ///   assignment);
+    /// * a live custodian exists: --granted-by <a live custodian> is required
+    ///   (CUS03 without it);
+    /// * the grantor holds a live passkey (migration 130): also --act <a
+    ///   CONFIRMED role.grant act with exactly these flags> (ELV10 without
+    ///   it).
     GrantRole {
         /// A catalog role: `role:platform-custodian`, `role:auditor`, or one
         /// `define-group-role` added (migration 165).
