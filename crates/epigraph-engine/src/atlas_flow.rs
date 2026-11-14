@@ -28,13 +28,12 @@
 //! the row's two-hypothesis frame). See [`exact_mass`].
 //!
 //! An evidence-to-claim edge with no usable mass row, or with another
-//! relationship, gets `none` (weight 0, sign 0). **The v1 contract refuses
-//! that**: `FlowBasis::for_kinds(evidence, claim)` is `exact`, and
-//! `LevelDocument::validate` rejects any other basis for that pair. No mass
-//! is invented to satisfy it. The rule to change is the contract's (accept
-//! `none` beside `exact` for that pair, weight 0 and sign 0): dropping the
-//! edge instead would leave an evidence node whose only claim edge it was
-//! unanchored, which the same validation also rejects.
+//! relationship, gets `none` (weight 0, sign 0); no mass is invented. The v1
+//! contract accepts `none` beside `exact` for that pair
+//! (`FlowBasis::allows`), and the evidence node still counts as attached to
+//! its claim. A `none` edge keeps its direction only in its relationship,
+//! served lower-cased like every other: a `REFUTES` edge with no mass is
+//! served `refutes`, sign 0, so a reader styles it from the name.
 //!
 //! # Everything else: `none`
 //!

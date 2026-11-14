@@ -1023,10 +1023,11 @@ async fn every_weighted_edge_passes_contract_validation(pool: PgPool) {
 
 /// An evidence-to-claim edge whose evidence has no mass row the audience can
 /// read is `none` (weight 0, sign 0): no mass is invented. The v1 contract
-/// refuses that basis for an evidence-to-claim pair, and this pins exactly
-/// the rule that would have to change (or W10 must drop the edge).
+/// accepts `none` beside `exact` for an evidence-to-claim pair, so the leaf,
+/// with this edge as its evidence node's only claim edge, passes validation
+/// and encodes for storage.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it(pool: PgPool) {
+async fn an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates(pool: PgPool) {
     let t = team(&pool, "flow-t").await;
     let f = agent(&pool).await;
     let (_scoped, system) = fixture::bypass(&pool).await;
@@ -1040,20 +1041,14 @@ async fn an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses
         swb(find(&edges, ev, a, "supports")),
         (0, 0.0, FlowBasis::None)
     );
-    let index = edges
-        .iter()
-        .position(|e| e.source == ev)
-        .expect("the evidence edge");
-    let doc = document(&set, edges, map);
-    let err = doc
-        .validate()
-        .expect_err("the contract refuses none for evidence to claim");
     assert_eq!(
-        err.0,
-        vec![format!(
-            "/edges/{index}/flow_basis: an edge from Evidence to Claim has basis Exact, not None"
-        )]
+        edges.iter().filter(|e| e.source == ev).count(),
+        1,
+        "the massless edge is the evidence node's only edge"
     );
+    let doc = document(&set, edges, map);
+    doc.to_stored_json()
+        .expect("the leaf with a none evidence edge validates and encodes");
 }
 
 /// Force a co-owned edge: owner `owner`, co-owner `co_owner`.
