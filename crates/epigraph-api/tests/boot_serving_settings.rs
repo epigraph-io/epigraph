@@ -7,7 +7,9 @@
 //! - the listener binds `EPIGRAPH_BIND_ADDR`;
 //! - every response carries an `x-request-id`;
 //! - the anonymous routers hold a body to 64 KiB (413 above it);
-//! - SIGTERM drains and exits 0 instead of killing the process.
+//! - SIGTERM drains and exits 0 instead of killing the process: a request in
+//!   flight at the signal is answered, and one still in flight when the grace
+//!   ends is abandoned so the process exits anyway.
 //!
 //! The parsing rules and the timeout's 408 are unit-tested next to them in
 //! `src/serving.rs`.
@@ -158,6 +160,98 @@ mod served_binary {
             big.status, 413,
             "a 100 KiB anonymous body must be refused by the 64 KiB limit, not read: {}",
             big.body
+        );
+    }
+
+    /// Open a `POST /oauth/token` and send its head plus only the first half
+    /// of its body, so the request is in flight (its handler is reading the
+    /// body) until the rest is written.
+    async fn half_sent_request(port: u16) -> (tokio::net::TcpStream, &'static [u8]) {
+        use tokio::io::AsyncWriteExt;
+        const BODY: &[u8] = b"grant_type=client_credentials&client_id=b33-drain-probe";
+        let (first, rest) = BODY.split_at(BODY.len() / 2);
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        let head = format!(
+            "POST /oauth/token HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            BODY.len()
+        );
+        stream.write_all(head.as_bytes()).await.expect("write head");
+        stream.write_all(first).await.expect("write half the body");
+        stream.flush().await.expect("flush");
+        // Let the server read the head and enter the handler.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        // CALIBRATION: nothing has been answered yet, so the request really is
+        // waiting on its body (a handler that answered early would make the
+        // drain tests below vacuous).
+        let mut probe = [0u8; 64];
+        match stream.try_read(&mut probe) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("answered or closed before the body was complete: {other:?}"),
+        }
+        (stream, rest)
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_request_in_flight_at_sigterm_is_answered_before_exit(pool: PgPool) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut server = start(&pool, &[("EPIGRAPH_SHUTDOWN_GRACE_SECS", "20")]).await;
+        let (mut stream, rest) = half_sent_request(server.port).await;
+
+        let terminated =
+            tokio::task::spawn_blocking(move || server.terminate(Duration::from_secs(40)));
+        // The signal is handled and the drain has begun; the request is
+        // still open. Finish it: a server that stopped on the signal without
+        // draining has closed this connection, and there is no response.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = stream.write_all(rest).await;
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut raw)).await;
+        let text = String::from_utf8_lossy(&raw).into_owned();
+
+        let (status, log) = terminated.await.expect("join");
+        assert!(
+            text.starts_with("HTTP/1.1 "),
+            "the in-flight request got no response after SIGTERM: {text:?}\n{log}"
+        );
+        let status = status.unwrap_or_else(|| panic!("still running 40s after SIGTERM:\n{log}"));
+        assert_eq!(status.code(), Some(0), "{status}:\n{log}");
+        assert!(log.contains("SIGTERM received"), "{log}");
+        assert!(
+            log.contains("every in-flight request finished"),
+            "the drain must end because the request finished, not the grace:\n{log}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_request_still_in_flight_when_the_grace_ends_does_not_hold_the_exit(pool: PgPool) {
+        let mut server = start(&pool, &[("EPIGRAPH_SHUTDOWN_GRACE_SECS", "2")]).await;
+        // Never finished: without the grace bound the drain waits for it
+        // until the 300 s request timeout.
+        let (_stream, _rest) = half_sent_request(server.port).await;
+
+        let started = std::time::Instant::now();
+        let (status, log) =
+            tokio::task::spawn_blocking(move || server.terminate(Duration::from_secs(20)))
+                .await
+                .expect("join");
+        let took = started.elapsed();
+        let status = status.unwrap_or_else(|| {
+            panic!(
+                "still running 20s after SIGTERM with a 2s grace: the drain is unbounded:\n{log}"
+            )
+        });
+        assert_eq!(status.code(), Some(0), "{status}:\n{log}");
+        assert!(
+            took >= Duration::from_secs(2),
+            "exited {took:?} after SIGTERM, before the 2s grace: it did not drain:\n{log}"
+        );
+        assert!(
+            log.contains("shutdown grace elapsed"),
+            "the abandoned request must be said:\n{log}"
         );
     }
 
