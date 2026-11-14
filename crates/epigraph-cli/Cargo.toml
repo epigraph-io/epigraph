@@ -376,6 +376,20 @@ name = "atlas_naming"
 path = "tests/atlas_naming.rs"
 required-features = ["db"]
 
+# Atlas W5: the "by links" hierarchy's export, and the apply that writes both
+# hierarchies into one run (maintenance DSN).
+[[bin]]
+name = "atlas_links"
+path = "src/bin/atlas_links.rs"
+required-features = ["db"]
+
+# Atlas W5: the "by links" hierarchy's export and apply, in process, and the
+# binary's argument refusals.
+[[test]]
+name = "atlas_links"
+path = "tests/atlas_links.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every

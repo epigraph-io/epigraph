@@ -140,8 +140,12 @@ pub fn prepare_export_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Create `path` new (never overwrite, never follow a planted file) with
-/// mode 0600 and write `bytes`.
-fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+/// mode 0600 and write `bytes`. The "by links" export writes its files
+/// through it too.
+///
+/// # Errors
+/// An existing file at `path`, or an I/O error.
+pub fn write_owner_only(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
