@@ -1,0 +1,29 @@
+# Template for the pre-commit sensitive-data check (scripts/check_sensitive.py).
+#
+# Copy this file to .check_sensitive_local.yaml at the checkout root (that name
+# is gitignored; linked worktrees fall back to the main checkout's copy) and
+# replace the placeholders with the real org-specific terms to keep out of
+# commits: internal project and host names, cluster names, account aliases.
+# NEVER commit the real list -- it is itself sensitive.
+#
+# Generic AWS rules (resource ids, EC2 hostnames, ARN account ids) are built in
+# and apply even without this file.
+#
+# Supported format (a strict YAML subset; anything else blocks the commit):
+#   terms:     literal strings, matched case-insensitively anywhere in a line
+#   patterns:  Python regexes, matched case-insensitively; single-quote them
+#
+# Entries starting with `example-` are placeholders: the check ignores them
+# (and says how many it ignored), so a verbatim copy of this file adds no org
+# terms. Real entries must not start with `example-`. This template is scanned
+# like any other tracked file, so a real term typed into it blocks the commit.
+#
+# Findings print only path:line and the entry number (e.g. "org term #2"),
+# never the matched text.
+
+terms:
+  - example-internal-project
+  - example-cluster-name
+
+patterns:
+  - 'example-host-[0-9]+'

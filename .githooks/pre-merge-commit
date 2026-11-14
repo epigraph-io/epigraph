@@ -1,0 +1,8 @@
+#!/bin/sh
+# Sensitive-data check for merge commits. `git merge` runs pre-merge-commit,
+# not pre-commit, when it records a merge without conflicts; the index then
+# holds the merge result, and the scan covers everything it adds over HEAD
+# (all incoming content). Same scanner as .githooks/pre-commit; see scripts/README.md.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+exec python3 "$(dirname "$0")/../scripts/check_sensitive.py"
