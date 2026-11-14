@@ -425,6 +425,28 @@ pub struct UpdateWithEvidenceParams {
 
 // ── Provenance ──
 
+/// Parameters for MCP `resolve_claim_id_prefix` (backlog `30d8b667`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveClaimIdPrefixParams {
+    #[schemars(
+        description = "The abbreviated claim id: 8 to 32 hex digits from the start of the uuid \
+                       (e.g. 30d8b667, or 30d8b667-0ca4; hyphens and case are ignored). A full \
+                       uuid resolves to itself."
+    )]
+    pub prefix: String,
+
+    #[schemars(description = "Most matches to return (default 10, at most 50).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Parameters for MCP `lint_claim_id_citations` (backlog `30d8b667`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LintClaimIdCitationsParams {
+    #[schemars(description = "The UUID of the claim whose text to lint")]
+    pub claim_id: String,
+}
+
 /// Parameters for MCP `export_provenance_prov_o` (backlog `4ba388eb`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExportProvenanceProvOParams {

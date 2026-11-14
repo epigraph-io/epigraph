@@ -1485,6 +1485,32 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Resolve an abbreviated claim id (the 8-hex form prose and backlog items cite, e.g. 30d8b667; 8 to 32 hex digits, hyphens and case ignored) to the claims whose ids start with it. Returns {prefix, matches: [{id, content (first 300 characters), content_truncated, is_current}], ambiguous (more than one match), truncated (more than limit exist)}; matches are in id order, every one of them when the prefix is ambiguous. Only claims you may read are matches: a prefix naming only claims you cannot read returns no match, exactly like one naming nothing. Fewer than 8 hex digits, or any non-hex character, is refused as invalid params."
+    )]
+    async fn resolve_claim_id_prefix(
+        &self,
+        Parameters(params): Parameters<crate::types::ResolveClaimIdPrefixParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claim_ids::resolve_claim_id_prefix(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Lint a claim's text for claim-id citations that are not wired as edges. Extracts every full uuid and every standalone 8-hex-digit token from the claim's content (distinct, first appearance first, at most 100; longer hex runs such as commit shas and hashes are not citations), resolves each to the claims you may read, and classifies it: wired (a claim it names shares a live edge with this claim, either direction, any relationship), unwired (it names exactly one other claim and no edge joins them), ambiguous (several claims, none wired), unresolved (names no claim you can read: not an id, or one you cannot see), self (names only this claim). Returns {claim_id, citations: [{token, status, matches}], unwired: [tokens], tokens_truncated}. Read-only; it never writes the missing edge. A claim you cannot read is reported as not found."
+    )]
+    async fn lint_claim_id_citations(
+        &self,
+        Parameters(params): Parameters<crate::types::LintClaimIdCitationsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claim_ids::lint_claim_id_citations(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false. The signature is also checked against the attested agent_keys rows (signing, identity-legacy) of the claim's signer and author, because a server running with a separate signing key records its IDENTITY key as agents.public_key and signs with a registered signing key. Only a key ADMITTED when the claim was created verifies: an attested key whose status and validity window admit created_at, or the signer's agents.public_key only when no agent_keys row carries those bytes, so a revoked, pending or out-of-window key verifies nothing (signature_valid=false). key_bound says whether the verifying key is an attested key of the claim's AUTHOR that was valid when the claim was created; key_kind names it (signing, identity-legacy, or unattested when only the signer's agents.public_key verifies; null when nothing verifies). signature_scheme names the signed message: v1 (the digest tagged as a claim, so an evidence or edge signature over the same digest never verifies here) or legacy (the bare digest, written before v1; it binds no entity type); null when nothing verifies. A claim authored by an HTTP caller and signed by the server reports key_bound=false: the key is the server's, not the author's. An identity-legacy key is derived from public inputs, so a signature under it is forgeable even when bound. key_bound covers only blake3(content): the signature names no author or date, and created_at is writer-set, so a direct database write can copy a bound signature onto another row with the same content."
     )]
     async fn verify_claim(

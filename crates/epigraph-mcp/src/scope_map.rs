@@ -81,6 +81,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("plan_label_dedup", "claims:read"),
     ("probe_label_dedup", "claims:read"),
     ("label_dedup_index_view", "claims:read"),
+    // Abbreviated-id resolution and the citation lint (backlog 30d8b667):
+    // viewer-stamped SELECTs only.
+    ("lint_claim_id_citations", "claims:read"),
+    ("resolve_claim_id_prefix", "claims:read"),
     ("query_claims_by_methodology", "claims:read"),
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
