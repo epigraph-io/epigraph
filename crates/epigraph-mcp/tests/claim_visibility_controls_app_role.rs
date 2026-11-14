@@ -680,6 +680,93 @@ async fn a_team_admin_publicizes_and_others_are_refused(pool: PgPool) {
     assert_eq!(events[0].1["claim_ids"], serde_json::json!([c.to_string()]));
 }
 
+/// Publicizing a claim a GROUP plan executes leaves that plan's `executes`
+/// edge the plan's (migration 219): 206's re-meet reads both endpoints
+/// through `epigraph_node_tenancy`, which now answers a workflow endpoint
+/// with its own row, so the meet of a group plan and a now-public claim is
+/// still the plan's group. A PUBLIC plan's edge onto the same claim widens
+/// with it (calibration: the re-meet ran).
+///
+/// Verified to fail with the `workflow` arm removed from 219's
+/// `epigraph_node_tenancy`: the group plan's edge goes public with the claim,
+/// readable by anyone, naming a plan only the team reads.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicizing_a_claim_a_group_plan_executes_keeps_the_plans_edge_the_plans(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, _) = fixture::seed_agent_with_group(&pool, "vis-writer").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "vis-admin").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = claim_of(
+        &write_as(
+            &pool,
+            &s,
+            alice,
+            submit("a step a team plan runs", None, None),
+        )
+        .await
+        .expect("team claim"),
+    );
+    assert_eq!(tenancy(&pool, "claims", c).await, ("group".to_string(), t));
+    let plan = |name: &'static str, visibility: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO workflows (id, canonical_name, goal, generation, metadata, \
+                                        visibility, owner_group_id) \
+                 VALUES ($1, $2, $3, 0, '{}'::jsonb, $4, $5)",
+            )
+            .bind(id)
+            .bind(format!("{name}-{id}"))
+            .bind(format!("goal of {name}"))
+            .bind(visibility)
+            .bind(t)
+            .execute(&pool)
+            .await
+            .expect("the plan's row");
+            let edge: Uuid = sqlx::query_scalar(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                    relationship) \
+                 VALUES ($1, 'workflow', $2, 'claim', 'executes') RETURNING id",
+            )
+            .bind(id)
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .expect("the plan's executes edge");
+            edge
+        }
+    };
+    let group_edge = plan("team-plan", "group").await;
+    let public_edge = plan("public-plan", "public").await;
+    assert_eq!(
+        tenancy(&pool, "edges", group_edge).await,
+        ("group".to_string(), t),
+        "CALIBRATION: the team plan's edge is the team's"
+    );
+
+    publicize(&pool, &s, eve, &[c])
+        .await
+        .expect("the admin publishes");
+    assert_eq!(
+        tenancy(&pool, "claims", c).await.0,
+        "public",
+        "CALIBRATION: the claim is public"
+    );
+    assert_eq!(
+        tenancy(&pool, "edges", public_edge).await.0,
+        "public",
+        "CALIBRATION: the public plan's edge widened with the claim"
+    );
+    assert_eq!(
+        tenancy(&pool, "edges", group_edge).await,
+        ("group".to_string(), t),
+        "the team plan's edge stays the team's: publicizing the step does not publish who runs it"
+    );
+}
+
 /// A sealed claim is refused, even for the admin, and stays group-only. The
 /// app role still cannot widen a claim by a direct UPDATE: 074 holds.
 #[sqlx::test(migrations = "../../migrations")]
