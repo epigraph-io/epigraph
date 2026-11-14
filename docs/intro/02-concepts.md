@@ -155,7 +155,13 @@ Practical implication for new code: never generate an Ed25519 keypair at runtime
 
 ## 3 — Beliefs and DST
 
-EpiGraph does not store a single scalar "truth" for each claim. Instead, every claim that has been judged carries a **Dempster-Shafer mass function** over a frame of discernment, and beliefs are projected from that mass function on demand. This matters because real-world evidence is often partial, conflicting, or missing entirely, and a single scalar cannot distinguish "we think it's 0.5" from "we have no idea, so we are reporting 0.5".
+EpiGraph does not treat a single scalar as a claim's belief. Every claim row does carry one scalar, `truth_value` (`NOT NULL`, default 0.5). A claim that has been judged also carries **Dempster-Shafer mass functions** over a frame of discernment, stored per `(claim, frame)`, and its belief is their combination. This matters because real-world evidence is often partial, conflicting, or missing entirely, and a single scalar cannot distinguish "we think it's 0.5" from "we have no idea, so we are reporting 0.5".
+
+Which number you are served depends on the read:
+
+- **Unframed `get_belief`** returns the combination cached on the claim row (`belief`, `plausibility`, `pignistic_prob`, and the two diagnostic masses). The cache holds ONE frame's combination, recorded in `claims.belief_frame_id`. A cache recompute (`recompute_claim_cached_belief` in `crates/epigraph-engine/src/edge_factor.rs`) picks that frame as `binary_truth` when the claim has evidence there, else `claim_validity`, else the frame already recorded, else the frame of the claim's earliest evidence.
+- **Framed `get_belief`** (a `frame_id`, optionally a perspective) recombines the stored mass functions on that frame at read time.
+- **A claim no Dempster-Shafer write has touched** has no cache. `get_belief` then reports an interval rebuilt from `truth_value` (`belief = pignistic_prob = truth_value`, `plausibility = 1.0`), so that an unassessed claim does not read as a refuted one.
 
 A frame of discernment is the finite set of mutually-exclusive hypotheses the claim ranges over — `{H0, H1}` for a binary fact, or a longer list for multi-class assertions. A mass function assigns probability mass to *subsets* of the frame (focal elements), not just to singletons; mass on the full frame represents ignorance. Mass that does not fit anywhere lands in two diagnostic buckets: `mass_on_conflict` (combination produced contradictory evidence) and `mass_on_missing` (the writer ran out of evidence to attribute). DST handles "we do not know yet" cleanly because ignorance is a first-class quantity, not a synthetic prior.
 
@@ -170,7 +176,7 @@ The canonical scalar belief score in EpiGraph is **BetP** — pignistic probabil
   "pignistic_prob": 0.78,
   "mass_on_conflict": 0.04,
   "mass_on_missing": 0.00,
-  "source": "combined"
+  "source": "cached"
 }
 ```
 
@@ -189,9 +195,11 @@ The fields decode like this:
 - `mass_on_missing` tracks mass that the writer could not attribute
   to any focal set — open-world ignorance, distinct from the
   "neither side" ignorance counted under `ignorance`.
-- `source` reports how the value was assembled (`"stored"`,
-  `"combined"`, etc.) so callers can tell whether they got a fresh
-  combination or a cached value.
+- `source` reports how the value was assembled: `"cached"` for an
+  unframed read (the claim row's cache, or the `truth_value` fallback
+  described above), `"recomputed"` or `"recomputed_perspective"` for a
+  framed read, and `"no_bbas"` when the frame holds no mass function
+  for the claim.
 
 The struct lives at `BeliefResponse` in `crates/epigraph-mcp/src/types.rs`.
 
@@ -201,16 +209,22 @@ When evidence from multiple sources is combined, the writer
 ignorance) before applying Dempster combination — this is the
 correct way to fuse evidence under uncertainty per Shenoy-Shafer.
 The `submit_ds_evidence` MCP tool exposes the `reliability`
-parameter directly; multiple combination methods are wired in
-(`Dempster`, `Conjunctive`, `YagerOpen`, `YagerClosed`,
-`DuboisPrade`, `Inagaki`) and `compare_methods` projects all of
-them so you can see how sensitive a claim is to the choice.
+parameter directly. A claim's belief is always recomputed by one
+shared Dempster fold. `submit_ds_evidence` still accepts a
+`combination_method` (`Dempster`, `Conjunctive`, `YagerOpen`,
+`YagerClosed`, `DuboisPrade`, `Inagaki`), but the parameter is
+deprecated: the name is validated, stored on the mass function and
+echoed back as `method_used`, and has no effect on belief; any value
+other than `Dempster` adds a warning to the response. The other
+rules are implemented in `crates/epigraph-ds`, and the read-only
+`compare_methods` tool runs all six over a claim's stored mass
+functions so you can see how sensitive it is to the choice.
 
-Scalar Bayesian belief propagation was tried earlier and removed: multiplying scalar truth values along edges collapses them toward zero independently of how strong the evidence actually is (see user-memory `project_bp_cdst_primary.md` and `feedback_pignistic_not_bayesian.md`). The deprecated `truth_value` column is still present in some rows for back-compat; do not order claims by it. The `bp_messages` table that backed the scalar engine is dead and a candidate for drop (`project_bp_messages_dead.md`).
+Scalar propagation is no longer what belief is served from, but it has not been removed from the tree. Multiplying scalar truth values along edges collapses them toward zero independently of how strong the evidence actually is, which is why the Dempster-Shafer path is primary. What remains: the loopy belief-propagation engine (`crates/epigraph-engine/src/bp.rs`) is reachable through `POST /api/v1/bp/propagate` as a read-only diagnostic (a request to write its results is refused with 409 unless the server was started with `EPIGRAPH_BP_APPLY=on`), and a few HTTP paths still write `truth_value` through the deprecated `BayesianUpdater`: a packet submission's initial truth, the workflow outcome report, and forgetting a convention. The deprecated `truth_value` column is still present in some rows for back-compat; do not order claims by it. The `bp_messages` table that backed the scalar engine is dead and a candidate for drop (`project_bp_messages_dead.md`).
 
-Math kept at intro level: full DST adds operations like Yager normalisation (re-attributing conflict mass to ignorance), Dubois-Prade combination (used when sources are not independent), and discounting with `mass_on_missing` to model open-world ignorance. Those live in the deeper architecture docs — for the intro, hold onto the three-bucket story: belief, plausibility, ignorance, with BetP as the scalar projection you sort by.
+Math kept at intro level: full DST adds operations like Yager normalisation (re-attributing conflict mass to ignorance), Dubois-Prade combination (each conflicting pair's mass goes to the union of the two sets), the cautious rule (for sources that are not independent), and discounting with `mass_on_missing` to model open-world ignorance. Those live in `crates/epigraph-ds/src/combination.rs` — for the intro, hold onto the three-bucket story: belief, plausibility, ignorance, with BetP as the scalar projection you sort by.
 
-**See also:** the LANL Open World DST paper (LA-UR-25-23655) — user-memory `reference_lanl_open_world_dst.md` — for the practitioner's foundation; [`crates/epigraph-mcp/src/tools/ds.rs`](../../crates/epigraph-mcp/src/tools/ds.rs) for `submit_ds_evidence`, `get_belief`, and `compare_methods`; user-memory `feedback_pignistic_not_bayesian.md` for the BetP-first rule; user-memory `project_bp_cdst_primary.md` for why CDST replaced scalar BP.
+**See also:** the LANL Open World DST paper (LA-UR-25-23655) for the practitioner's foundation; [`crates/epigraph-mcp/src/tools/ds.rs`](../../crates/epigraph-mcp/src/tools/ds.rs) for `submit_ds_evidence`, `get_belief`, and `compare_methods`; [`crates/epigraph-engine/src/belief_query.rs`](../../crates/epigraph-engine/src/belief_query.rs) for the unframed and framed reads.
 
 ---
 
