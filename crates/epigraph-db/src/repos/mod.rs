@@ -87,6 +87,7 @@ pub mod scoped_belief;
 pub mod security_event;
 pub mod semantic_link;
 pub mod sheaf;
+pub mod sources;
 pub mod span;
 pub mod structural;
 pub mod system_agent;
@@ -246,6 +247,9 @@ pub use recall_event::{
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
+pub use sources::{
+    SourceRow, SourcesCursor, SourcesQuery, SourcesRepository, MAX_SOURCES_PAGE, SOURCE_KINDS,
+};
 pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};

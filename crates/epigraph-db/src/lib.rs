@@ -184,6 +184,9 @@ pub use repos::{
     AUTHORED_REPLACES_KEY, AUTHORED_REPLACES_KEY_RESERVED,
 };
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
+pub use repos::{
+    SourceRow, SourcesCursor, SourcesQuery, SourcesRepository, MAX_SOURCES_PAGE, SOURCE_KINDS,
+};
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};

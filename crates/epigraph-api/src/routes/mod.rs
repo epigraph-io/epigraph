@@ -130,6 +130,8 @@ pub mod reasoning;
 pub mod revoke_signature;
 #[cfg(feature = "db")]
 pub mod search;
+#[cfg(feature = "db")]
+pub mod sources;
 pub mod spans;
 pub mod staging;
 #[cfg(feature = "db")]
@@ -313,7 +315,8 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
 }
 
 /// Response headers for a route whose every response is viewer-scoped
-/// (`POST /api/v1/search/semantic`): its body depends on who asks, so no
+/// (`POST /api/v1/search/semantic`, `GET /api/v1/papers`,
+/// `GET /api/v1/sources/overview`): its body depends on who asks, so no
 /// shared cache may store it, and a private cache must key on the credential.
 ///
 /// * `Cache-Control: private, no-store`.
@@ -926,7 +929,17 @@ pub fn create_router_with_extensions(
             get(cross_source::get_cross_source_matches),
         )
         .route("/api/v1/edges", get(edges::list_edges))
-        .route("/api/v1/papers", get(papers::list_papers))
+        .route(
+            "/api/v1/papers",
+            get(papers::list_papers).layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
+        // Who said what across a scope, with the caller's counts (backlog
+        // da4a8bc1).
+        .route(
+            "/api/v1/sources/overview",
+            get(sources::sources_overview)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
         .route(
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
