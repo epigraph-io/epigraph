@@ -42,27 +42,34 @@
 //!    similar names; `claim_clusters` (tenancy-bearing) is not `graph_clusters`
 //!    (not tenancy-bearing).
 //!
-//! # Residual: the `edges` traversals — narrowed by PR-13, not closed
+//! # The `edges` traversals — filtered
 //!
-//! **Corrected.** This section used to say "the `edges` traversals inside these
-//! projections are unfiltered" without exception. That was already stale:
-//! [`subgraph_edges`] has been filtered since PR-07 (finding M8), and it is now
-//! filtered with [`Viewer::edge_predicate_fragment`] via
-//! `/* {EDGE_VISIBILITY:edges} */`.
-//!
-//! What remains unfiltered is the `edges` joins *inside the node projections* —
+//! [`subgraph_edges`] has been filtered since PR-07 (finding M8), with
+//! [`Viewer::edge_predicate_fragment`] via `/* {EDGE_VISIBILITY:edges} */`
+//! since PR-13. The `edges` joins *inside the node projections* —
 //! [`expand_cluster_nodes`], [`neighborhood_compound_nodes`],
 //! [`neighborhood_atomic_nodes`], [`neighborhood_compound_groups`] and
-//! [`compound_neighbors`]. These have never carried a marker, so PR-13's
-//! conversion (which rewrote the fragment every already-filtered `edges` read
-//! uses) does not reach them: they need a predicate ADDED, with the join-vs-
-//! WHERE placement reasoning each one needs, not a fragment swapped.
+//! [`compound_neighbors`] — carried no marker until backlog batch B08 added one
+//! to each (`F-edges-unfiltered`). They disclosed *structure* (which ids relate
+//! to which, and degree counts), never content, because the returned rows were
+//! already claims-filtered.
 //!
-//! The residual is bounded in the same way it always was: the returned rows are
-//! claims-filtered, so it discloses *structure* (which ids relate to which) and
-//! never content. It stays open finding `F-edges-unfiltered` in
-//! `docs/tenancy/progress.json`, re-scoped there to name these five functions
-//! rather than "all traversals".
+//! Each marker's placement follows one rule: the result must equal what the
+//! statement returns on a graph WITHOUT the edges the viewer cannot read.
+//!
+//! * In a `JOIN`'s `WHERE`, or a scalar subquery's `WHERE`, the edge simply is
+//!   not walked.
+//! * In a `LEFT JOIN ... ON` that COUNTS or MAPS (`expand_cluster_nodes`'s
+//!   degree, `compound_neighbors`' projection onto a parent compound), the
+//!   predicate goes in the `ON`: in `WHERE` it would drop the left row, a
+//!   readable claim, whenever every edge it has is hidden.
+//! * Inside a `NOT EXISTS` that CLASSIFIES a readable row (`standalone_nodes`,
+//!   `center_atoms`), the predicate goes inside it. A hidden edge then no
+//!   longer changes the classification, which is the point: the row being
+//!   classified is already readable, so no unreadable row is admitted by the
+//!   suppression failing to fire. This is NOT the fail-open shape the
+//!   `visibility.rs` module doc warns about, where a filtered `LEFT JOIN` is
+//!   used to SUPPRESS a row that must stay suppressed.
 //!
 //! [`subgraph_edges`]: GraphViewRepository::subgraph_edges
 //! [`expand_cluster_nodes`]: GraphViewRepository::expand_cluster_nodes
@@ -269,6 +276,10 @@ impl GraphViewRepository {
     /// Backs `GET /api/v1/graph/clusters/:id/expand`. `degree_relationships`
     /// is the relationship allowlist used for the degree ordering.
     ///
+    /// The degree counts only edges the viewer can read. The edge predicate is
+    /// in the `LEFT JOIN`'s `ON`, not in `WHERE`: a member whose every edge is
+    /// hidden keeps a degree of 0 instead of being dropped.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, degree_relationships))]
@@ -286,6 +297,7 @@ impl GraphViewRepository {
                 FROM claim_cluster_membership m
                 LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
                                   AND e.relationship = ANY($3)
+                                  /* {EDGE_VISIBILITY:e} */
                 WHERE m.cluster_id = $1 AND m.run_id = $2 /* {VISIBILITY:m} */
                 GROUP BY m.claim_id
             )
@@ -322,6 +334,13 @@ impl GraphViewRepository {
     /// look filtered in review and leak through the other — which is why the
     /// marker is written per-`FROM`, not per-statement.
     ///
+    /// Every `edges` read carries `{EDGE_VISIBILITY:e}`, including the two
+    /// `NOT EXISTS` probes in `standalone_nodes`: an atom whose only
+    /// `decomposes_to` edge is hidden is served as standalone, exactly as if
+    /// the edge did not exist. Unfiltered, the probe would drop that readable
+    /// atom from the response, and its absence would tell the viewer a hidden
+    /// edge exists.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -341,7 +360,7 @@ impl GraphViewRepository {
                 SELECT e.source_id AS compound_id, e.target_id AS atom_id
                 FROM edges e
                 JOIN atoms a ON a.claim_id = e.target_id
-                WHERE e.relationship = 'decomposes_to'
+                WHERE e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */
             ),
             compound_nodes AS (
                 SELECT cta.compound_id AS id, COUNT(*)::int AS atom_count
@@ -351,8 +370,8 @@ impl GraphViewRepository {
             standalone_nodes AS (
                 SELECT a.claim_id AS id
                 FROM atoms a
-                WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = a.claim_id AND e.relationship = 'decomposes_to')
-                  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = a.claim_id AND e.relationship = 'decomposes_to')
+                WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = a.claim_id AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
+                  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = a.claim_id AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
             )
             SELECT c.id, COALESCE(c.content, c.id::text) AS label, 'compound'::text AS kind,
                    cn.atom_count, c.pignistic_prob,
@@ -376,6 +395,9 @@ impl GraphViewRepository {
 
     /// Claim-level nodes belonging to one precomputed neighborhood.
     ///
+    /// `compound_id` is a projected identifier, so its subquery walks only a
+    /// `decomposes_to` edge the viewer can read.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -389,7 +411,9 @@ impl GraphViewRepository {
             SELECT c.id,
                    COALESCE(c.content, c.id::text) AS label,
                    (SELECT e.source_id FROM edges e
-                    WHERE e.target_id = c.id AND e.relationship = 'decomposes_to' LIMIT 1) AS compound_id,
+                    WHERE e.target_id = c.id AND e.relationship = 'decomposes_to'
+                      /* {EDGE_VISIBILITY:e} */
+                    LIMIT 1) AS compound_id,
                    c.pignistic_prob,
                    (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id
             FROM claim_neighborhood_membership m
@@ -430,7 +454,8 @@ impl GraphViewRepository {
             FROM edges e
             JOIN claims c ON c.id = e.source_id
             JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id AND m.neighborhood_id = $1
-            WHERE e.relationship = 'decomposes_to' /* {VISIBILITY:c} */ /* {VISIBILITY:m} */
+            WHERE e.relationship = 'decomposes_to'
+              /* {VISIBILITY:c} */ /* {VISIBILITY:m} */ /* {EDGE_VISIBILITY:e} */
             GROUP BY 1, 2
             "#,
             2,
@@ -474,6 +499,12 @@ impl GraphViewRepository {
     /// compound (or themselves if standalone); the centre's own projection is
     /// excluded so the result carries no self-loops.
     ///
+    /// All four `edges` reads are filtered. `center_atoms`' positive arm and
+    /// its `NOT EXISTS` carry the SAME predicate, so the centre is "its
+    /// readable children, or itself when it has none". The projection
+    /// `LEFT JOIN edges d` carries it in the `ON`: an atom whose parent edge is
+    /// hidden stands as itself rather than projecting onto that parent.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -492,11 +523,12 @@ impl GraphViewRepository {
                 SELECT e.target_id AS atom_id
                 FROM edges e, seed
                 WHERE e.source_id = seed.center AND e.relationship = 'decomposes_to'
+                  /* {EDGE_VISIBILITY:e} */
                 UNION
                 SELECT seed.center FROM seed
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM edges WHERE source_id = (SELECT center FROM seed)
-                    AND relationship = 'decomposes_to'
+                    SELECT 1 FROM edges ce WHERE ce.source_id = (SELECT center FROM seed)
+                    AND ce.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:ce} */
                 )
             ),
             epistemic_edges AS (
@@ -508,7 +540,7 @@ impl GraphViewRepository {
                 JOIN edge_to_factor_type(e.relationship) ft ON ft.forward_strength > 0
                 JOIN center_atoms ca
                     ON ca.atom_id = e.source_id OR ca.atom_id = e.target_id
-                WHERE e.source_id != e.target_id
+                WHERE e.source_id != e.target_id /* {EDGE_VISIBILITY:e} */
             ),
             projected AS (
                 SELECT
@@ -519,6 +551,7 @@ impl GraphViewRepository {
                 LEFT JOIN edges d
                     ON d.target_id = ee.other_atom_id
                     AND d.relationship = 'decomposes_to'
+                    /* {EDGE_VISIBILITY:d} */
             )
             SELECT
                 c.id,
