@@ -242,6 +242,38 @@ impl AtlasMeaningRepository {
         Ok(q.fetch_all(&mut *conn).await?)
     }
 
+    /// The stored `truth_value` of each claim of `claim_ids` that `map` may
+    /// draw: a leaf claim node's colour value, as the region and theme levels
+    /// serve it, and nothing more (it never enters a flow weight). Ids the
+    /// map may not draw are absent, so their node carries no value.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn claim_truth_values(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        claim_ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, f64>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.truth_value \
+               FROM claims c \
+              WHERE c.id = ANY($1) \
+                AND (c.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND c.visibility = 'group' \
+                         AND c.owner_group_id = $2)) \
+                /* {VISIBILITY:c} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql)
+            .bind(claim_ids)
+            .bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?.into_iter().collect())
+    }
+
     /// The text of each claim of `claim_ids` that `map` may draw, for a leaf
     /// node's label. Ids the map may not draw are absent.
     ///

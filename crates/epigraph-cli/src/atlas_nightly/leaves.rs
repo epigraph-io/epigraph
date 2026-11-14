@@ -67,6 +67,13 @@ pub fn node_set(rows: &LeafRows, claims: &[Uuid], cap: usize) -> anyhow::Result<
 /// whitespace-collapsed and clipped to the contract's label length. The
 /// edges are W7's, weighed from `inputs`. Positions are left at 0 for W6.
 ///
+/// Each claim's `truth_value` is its stored one from `truths`
+/// (`AtlasMeaningRepository::claim_truth_values`, read under the map's
+/// predicate): the colour value only, as at the region and theme levels. It
+/// is never an input to a flow weight (the edges above are weighed before and
+/// without it). A claim `truths` does not hold, or a value outside [0, 1],
+/// carries none.
+///
 /// # Errors
 /// A claim of `set` the skeleton does not label.
 pub fn fill_leaf(
@@ -75,6 +82,7 @@ pub fn fill_leaf(
     inputs: &FlowInputs,
     agents: &BTreeMap<Uuid, String>,
     evidence: &BTreeMap<Uuid, String>,
+    truths: &BTreeMap<Uuid, f64>,
 ) -> anyhow::Result<()> {
     let claim_labels: BTreeMap<Uuid, String> = leaf
         .nodes
@@ -95,7 +103,10 @@ pub fn fill_leaf(
                     .with_context(|| format!("claim {} has no label in the skeleton", n.id))?,
                 x: 0.0,
                 y: 0.0,
-                truth_value: None,
+                truth_value: truths
+                    .get(&n.id)
+                    .copied()
+                    .filter(|t| (0.0..=1.0).contains(t)),
             }),
             LeafNodeKind::Agent => Node::Agent(PlainNode {
                 id: n.id,
@@ -189,6 +200,7 @@ mod tests {
             &FlowInputs::default(),
             &BTreeMap::new(),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         let kinds: Vec<_> = leaf.nodes.iter().map(Node::kind).collect();
@@ -204,6 +216,74 @@ mod tests {
             Node::Evidence(e) => e.label == EVIDENCE_FALLBACK,
         }));
         epigraph_atlas_contract::LevelDocument::Leaf(leaf)
+            .validate()
+            .expect("a filled leaf validates");
+    }
+
+    /// A leaf claim's `truth_value` is its stored one; a claim the truth read
+    /// did not return (not drawable on the map) carries none, never a
+    /// default, and the value never changes an edge's weight.
+    #[test]
+    fn a_claims_truth_value_is_its_stored_one_and_none_without_one() {
+        let (c, d, ag) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let mut rows = LeafRows::default();
+        rows.claims.insert(c, Some(ag));
+        rows.claims.insert(d, Some(ag));
+        rows.agents.insert(ag);
+        rows.edges
+            .push(epigraph_db::repos::atlas_leaf::StoredLeafEdge {
+                id: Uuid::from_u128(9),
+                source: LeafNode::claim(c),
+                target: LeafNode::claim(d),
+                relationship: "supports".into(),
+            });
+        let set = node_set(&rows, &[c, d], 100).unwrap();
+        let skeleton =
+            serde_json::from_value::<epigraph_atlas_contract::LevelDocument>(serde_json::json!({
+                "kind": "leaf", "schema_version": 1, "map_scope": "public", "map_group_id": null,
+                "hierarchy": "meaning", "theme_id": Uuid::nil(), "run_id": Uuid::nil(),
+                "level_id": Uuid::from_u128(5), "depth": 0, "name": null, "needs_naming": true,
+                "breadcrumbs": [], "switch": {"hierarchy": "links", "level_id": Uuid::from_u128(6)},
+                "nodes": [
+                    {"kind": "claim", "id": c, "label": "c", "x": 0.0, "y": 0.0, "truth_value": null},
+                    {"kind": "claim", "id": d, "label": "d", "x": 0.0, "y": 0.0, "truth_value": null}
+                ],
+                "edges": [], "outgoing": []
+            }))
+            .unwrap();
+        let epigraph_atlas_contract::LevelDocument::Leaf(skeleton) = skeleton else {
+            panic!("a leaf")
+        };
+        let fill = |truths: &BTreeMap<Uuid, f64>| {
+            let mut leaf = skeleton.clone();
+            fill_leaf(
+                &mut leaf,
+                &set,
+                &FlowInputs::default(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                truths,
+            )
+            .unwrap();
+            leaf
+        };
+        let truth = |leaf: &LeafLevel, id: Uuid| {
+            leaf.nodes.iter().find_map(|n| match n {
+                Node::Claim(x) if x.id == id => Some(x.truth_value),
+                _ => None,
+            })
+        };
+        let only_c = fill(&BTreeMap::from([(c, 0.13)]));
+        assert_eq!(truth(&only_c, c), Some(Some(0.13)));
+        assert_eq!(truth(&only_c, d), Some(None), "no stored value, no value");
+        let both = fill(&BTreeMap::from([(c, 0.91), (d, 0.02)]));
+        assert_eq!(truth(&both, c), Some(Some(0.91)));
+        assert_eq!(truth(&both, d), Some(Some(0.02)));
+        assert_eq!(
+            both.edges, only_c.edges,
+            "a truth value never moves a weight"
+        );
+        epigraph_atlas_contract::LevelDocument::Leaf(both)
             .validate()
             .expect("a filled leaf validates");
     }

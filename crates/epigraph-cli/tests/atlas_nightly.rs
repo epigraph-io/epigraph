@@ -1865,3 +1865,45 @@ async fn a_leaf_over_the_outgoing_cap_keeps_its_heaviest_targets_and_the_night_r
         assert!(!out.iter().any(|o| o.0 == root_id(map, h, themes[0])));
     }
 }
+
+/// Done when: a leaf claim's `truth_value` is its stored one (the colour
+/// value; `claims.truth_value` is NOT NULL, so every drawn claim has one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn leaf_claims_carry_their_stored_truth_value(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let l = Linked::new(&pool).await;
+    for (i, c) in l.a.iter().chain(&l.t).enumerate() {
+        sqlx::query("UPDATE claims SET truth_value = $2 WHERE id = $1")
+            .bind(c)
+            .bind(0.01 * (i as f64 + 1.0))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    l.build(&pool, &viewer).await;
+    night(&pool, &viewer, &namer(), &opts()).await;
+    let stored: BTreeMap<Uuid, f64> = sqlx::query_as::<_, (Uuid, f64)>(
+        "SELECT id, truth_value FROM claims WHERE theme_id = ANY($1)",
+    )
+    .bind(vec![l.x1, l.x2])
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let run = latest(&pool, l.map()).await;
+    let mut seen = 0;
+    for h in [M, L] {
+        for doc in docs_of(&pool, run, h).await.values() {
+            if let LevelDocument::Leaf(x) = doc {
+                for n in &x.nodes {
+                    if let Node::Claim(c) = n {
+                        assert_eq!(c.truth_value, Some(stored[&c.id]), "claim {}", c.id);
+                        seen += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(seen, 2 * stored.len());
+}

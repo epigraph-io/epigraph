@@ -131,7 +131,8 @@ fn tree_documents(
 }
 
 /// Make every leaf of `docs` real: W3's node set, W7's weighted edges, the
-/// agent and evidence labels; then check every document against the
+/// agent and evidence labels, each claim's stored `truth_value` (the colour
+/// value only, read under the map's predicate); then check every document against the
 /// contract (a leaf over the edge cap fails here).
 async fn real_leaves(
     tx: &mut PgConnection,
@@ -164,10 +165,19 @@ async fn real_leaves(
     let evidence: Vec<Uuid> = evidence.into_iter().collect();
     let (agent_labels, evidence_labels) =
         AtlasLeafRepository::node_labels(tx, viewer, map, &agents, &evidence).await?;
+    let claims: Vec<Uuid> = sets
+        .iter()
+        .flatten()
+        .flat_map(|s| s.nodes.iter().filter(|n| n.kind == LeafNodeKind::Claim))
+        .map(|n| n.id)
+        .collect::<BTreeSet<Uuid>>()
+        .into_iter()
+        .collect();
+    let truths = AtlasMeaningRepository::claim_truth_values(tx, viewer, map, &claims).await?;
     for (doc, set) in docs.iter_mut().zip(&sets) {
         if let (LevelDocument::Leaf(l), Some(set)) = (doc, set) {
             let inputs = AtlasFlowRepository::read_flow_inputs(tx, viewer, map, set).await?;
-            fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels)?;
+            fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
         }
     }
     for doc in docs.iter() {

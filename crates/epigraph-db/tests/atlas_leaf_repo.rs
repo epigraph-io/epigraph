@@ -1220,3 +1220,54 @@ async fn map_claim_links_return_only_claim_edges_the_map_may_draw(pool: PgPool) 
     );
     assert!(u_links.contains(&(tc[2], tc[0], "supports".to_string())));
 }
+
+/// Atlas W9's leaf claim colour value: `claim_truth_values` returns the
+/// stored `truth_value` of the claims the map may draw, and nothing for a
+/// claim it may not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_truth_values_read_only_the_claims_the_map_may_draw(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let u = team(&pool, "team-u").await;
+    let world = fixture::world_group(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let filer = agent(&pool).await;
+    let tc = claims(&pool, filer, "group", t, 1).await[0];
+    let uc = claims(&pool, filer, "group", u, 1).await[0];
+    let pc = claims(&pool, filer, "public", world, 1).await[0];
+    for (id, tv) in [(tc, 0.13_f64), (uc, 0.91), (pc, 0.42)] {
+        sqlx::query("UPDATE claims SET truth_value = $2 WHERE id = $1")
+            .bind(id)
+            .bind(tv)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let ids = [tc, uc, pc];
+    let mut conn = pool.acquire().await.unwrap();
+    let on_t = epigraph_db::AtlasMeaningRepository::claim_truth_values(
+        &mut conn,
+        &system,
+        AtlasMap::Team(t),
+        &ids,
+    )
+    .await
+    .expect("claim_truth_values");
+    assert_eq!(
+        on_t.into_iter().collect::<Vec<_>>(),
+        {
+            let mut want = vec![(tc, 0.13), (pc, 0.42)];
+            want.sort_by_key(|(id, _)| *id);
+            want
+        },
+        "team T's map reads T's and public claims only"
+    );
+    let on_public = epigraph_db::AtlasMeaningRepository::claim_truth_values(
+        &mut conn,
+        &system,
+        AtlasMap::Public,
+        &ids,
+    )
+    .await
+    .expect("claim_truth_values");
+    assert_eq!(on_public.into_iter().collect::<Vec<_>>(), vec![(pc, 0.42)]);
+}
