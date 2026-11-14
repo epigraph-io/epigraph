@@ -349,3 +349,61 @@ async fn abstract_mode_retires_nothing_and_runs_no_cascade(pool: PgPool) {
         .expect("edge");
     assert_eq!(target, s2, "the source keeps its edge");
 }
+
+/// A `claims:write` caller's authority over EVERY pair is checked before any
+/// source is marked. The caller owns the survivor and the first duplicate, but
+/// the second duplicate is a public claim owned by a group it cannot write: the
+/// call is refused and the first duplicate stays current. Without the
+/// per-pair pre-check, the first duplicate would be marked and committed
+/// before the second pair was refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_checks_authority_over_every_pair_before_marking(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (caller, auth, viewer) = common::seed_caller(&pool, &["claims:write"]).await;
+    let own_group = common::personal_group_of(&pool, caller).await;
+    let survivor = seed_claim(&pool, "the caller's restated fact", 0.6).await;
+    let dup_own = seed_claim(&pool, "the caller's restated fact, again", 0.5).await;
+    let dup_foreign = seed_claim(&pool, "someone else's restatement", 0.5).await;
+    common::stamp_group_private(&pool, survivor, own_group).await;
+    common::stamp_group_private(&pool, dup_own, own_group).await;
+    let stranger = common::seed_agent(&pool).await;
+    let stranger_group = common::personal_group_of(&pool, stranger).await;
+    sqlx::query("UPDATE claims SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+        .bind(dup_foreign)
+        .bind(stranger_group)
+        .execute(&pool)
+        .await
+        .expect("make the foreign duplicate public and stranger-owned");
+
+    let err = consolidate_claims(
+        &server,
+        &viewer,
+        params(
+            "identity",
+            &[survivor, dup_own, dup_foreign],
+            "",
+            Some(survivor),
+        ),
+        Some(&auth),
+    )
+    .await
+    .expect_err("a pair the caller cannot write refuses the whole identity call");
+    assert!(
+        !err.message.contains("already marked"),
+        "the refusal comes from the pre-check, before any source was marked: {}",
+        err.message
+    );
+    for id in [survivor, dup_own, dup_foreign] {
+        assert_eq!(
+            standing(&pool, id).await,
+            (None, true),
+            "source {id} is untouched: nothing is marked when any pair is refused"
+        );
+    }
+    assert_eq!(identity_edges(&pool, dup_own, survivor).await, 0);
+}
