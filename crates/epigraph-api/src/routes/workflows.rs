@@ -855,17 +855,7 @@ pub async fn get_workflow(
     }
 
     // ── 2. Fall through to legacy flat-workflow claims ───────────────────────
-    let sql = viewer.splice(
-        "SELECT c.id, c.content, c.truth_value, c.properties \
-         FROM claims c WHERE c.id = $1 AND 'workflow' = ANY(c.labels) /* {VISIBILITY:c} */",
-        2,
-    );
-    let mut q = sqlx::query_as::<_, WorkflowContentRow>(&sql).bind(workflow_id);
-    if let Some(g) = viewer.group_bind() {
-        q = q.bind(g);
-    }
-    let row = q
-        .fetch_optional(&mut *read)
+    let row = epigraph_db::WorkflowRepository::flat_workflow_claim(&mut read, &viewer, workflow_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to fetch workflow claim: {e}"),
@@ -1129,20 +1119,18 @@ pub async fn report_outcome(
         crate::errors::write_refused("workflow claim")
     };
 
-    // The counters are read on the transaction that writes them.
-    let workflow = sqlx::query_as::<_, WorkflowRow>(
-        "SELECT id, truth_value, properties FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // The counters are read on the transaction that writes them, through the
+    // caller's viewer predicate as well as the transaction's row security.
+    let workflow =
+        epigraph_db::WorkflowRepository::flat_workflow_claim(&mut tx, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch workflow: {e}"),
+            })?
+            .ok_or(ApiError::NotFound {
+                entity: "workflow".into(),
+                id: workflow_id.to_string(),
+            })?;
 
     let before_truth = workflow.truth_value.unwrap_or(0.5);
 
@@ -2871,27 +2859,6 @@ async fn auto_wire_inserted_edges(
              no edge-factor BBA until a recompute reaches them"
         );
     }
-}
-
-// ── Internal types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    truth_value: Option<f64>,
-    properties: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowContentRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    content: String,
-    truth_value: Option<f64>,
-    properties: Option<serde_json::Value>,
 }
 
 // ── add_step / delete_step ──────────────────────────────────────────────────

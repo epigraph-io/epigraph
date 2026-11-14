@@ -294,6 +294,20 @@ pub struct NewHierarchicalOutcomeReport<'a> {
 
 pub struct WorkflowRepository;
 
+/// A legacy flat workflow: a `claims` row labelled `workflow`, as
+/// [`WorkflowRepository::flat_workflow_claim`] returns it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FlatWorkflowClaim {
+    /// `claims.id`.
+    pub id: Uuid,
+    /// `claims.content` (often JSON text).
+    pub content: String,
+    /// `claims.truth_value`.
+    pub truth_value: Option<f64>,
+    /// `claims.properties` (the outcome counters live here).
+    pub properties: Option<serde_json::Value>,
+}
+
 impl WorkflowRepository {
     /// Insert a row into the `workflows` table (added in migration 020) with
     /// the tenancy `decl` names. Used by the workflow-ingest plan walk.
@@ -2395,6 +2409,38 @@ impl WorkflowRepository {
             2,
         );
         let mut q = sqlx::query_as::<_, FrozenPlanRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
+    /// The LEGACY flat workflow `id` — a `claims` row labelled `workflow` — as
+    /// `viewer` reads it; `None` for a claim `viewer` may not read, exactly as
+    /// for an unknown id or a claim without the label. Run it on `viewer`'s
+    /// STAMPED connection (a `ScopedRead` or a `ScopedTx`), so the in-query
+    /// predicate and the row security agree.
+    ///
+    /// Moved here from two inline statements in `epigraph-api`'s
+    /// `routes/workflows.rs`: `get_workflow`'s flat fallback, which already
+    /// spliced the same predicate in the route layer, and `report_outcome`'s
+    /// counter read on its write transaction, which had no predicate of its own
+    /// and relied on the handler's earlier viewer-filtered existence check plus
+    /// the transaction's row security.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn flat_workflow_claim(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<FlatWorkflowClaim>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.content, c.truth_value, c.properties \
+             FROM claims c WHERE c.id = $1 AND 'workflow' = ANY(c.labels) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FlatWorkflowClaim>(&sql).bind(id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

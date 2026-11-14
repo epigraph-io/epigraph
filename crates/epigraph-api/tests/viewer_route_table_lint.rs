@@ -212,14 +212,14 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
 ///
-/// Seven handler sites across four files read `tier_a` claim content inline
-/// in the route layer with no `Viewer` spliced into the statement:
-/// `clusters.rs` (2), `policies.rs` (2), `search.rs` (1) and `workflows.rs`
-/// (2). It was ten across seven before backlog 67c905a3 retired
-/// `conflicts.rs`, `embeddings.rs` and `political.rs` (see the comment on each
-/// removal below); this paragraph said "twelve" from before `workflows.rs` went
-/// 4 -> 2. It was thirteen across eight before `tenancy/fix-security-track`
-/// retired `hypothesis.rs`'s. Before PR-14
+/// Four handler sites across two files read `tier_a` claim content inline in
+/// the route layer with no `Viewer` spliced into the statement: `clusters.rs`
+/// (2) and `policies.rs` (2). It was ten across seven before backlog 67c905a3
+/// retired `conflicts.rs`, `embeddings.rs`, `political.rs`, `search.rs` and the
+/// rest of `workflows.rs` (see the comment on each removal below); this
+/// paragraph said "twelve" from before `workflows.rs` went 4 -> 2. It was
+/// thirteen across eight before `tenancy/fix-security-track` retired
+/// `hypothesis.rs`'s. Before PR-14
 /// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
 /// become live disclosure the moment ownership is transcribed into the tenancy
 /// columns, with nothing behind them."* That prediction is not stale — it has
@@ -304,20 +304,15 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, marking
     // `c` in the `WHERE` so the mean and the `HAVING` threshold both see only
     // visible claims, on the caller's `read_as` connection.
-    // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
-    // forward-only scan could not see. Its in-code comment argues it is not a
-    // live leak — the ids come from the viewer-filtered
-    // `ClaimThemeRepository::claims_in_themes_at_dim_since`, which splices
-    // `{VISIBILITY:c}` onto the joined `claims` (PR-29 re-pointed the route at
-    // that repo method directly; it previously named the engine wrapper
-    // `candidates_in_themes_at_dim`, whose body was the same call), or, for a
-    // request pinned with `theme_id`, from the equally spliced
-    // `ClaimThemeRepository::claims_in_theme_exact_at_dim` — and that
-    // derivation looks sound. It is
-    // registered anyway: the argument is a caller-side invariant with nothing
-    // enforcing it, which is precisely the kind of reasoning this register
-    // exists to keep visible rather than to accept silently.
-    ("search.rs", 1),
+    // `search.rs` was 1 and is now 0, so it is gone from the register (backlog
+    // 67c905a3). The site was the `format!`-built `full_sql` in
+    // `semantic_search`'s diverse arm. That statement was safe only by a
+    // caller-side derivation, with nothing enforcing it: every id came out of
+    // one of two viewer-spliced theme reads. It is now
+    // `ClaimRepository::semantic_selected_claims(.., &viewer, ..)`, which marks
+    // `c` itself, on the same `read_as` connection. The result set is unchanged
+    // for today's two sources of ids; the marker is what keeps a third source
+    // from reopening the read.
     // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
     // claims` for the goal fallback became a `get_by_id_with_labels` read
     // through the caller's viewer.
@@ -325,7 +320,14 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // (it projected `claims.properties`) moved to
     // `WorkflowRepository::plan_step_claim_ids`, with its viewer predicates,
     // run on a transaction stamped with the caller's viewer.
-    ("workflows.rs", 2),
+    // 2 -> 0, key removed (backlog 67c905a3). Both remaining statements read
+    // the legacy flat workflow claim, and both now call
+    // `WorkflowRepository::flat_workflow_claim(conn, &viewer, id)`, which marks
+    // `c`. `get_workflow`'s flat fallback already spliced that predicate in the
+    // route layer, so for it this is a move. `report_outcome`'s counter read on
+    // its stamped write transaction had no predicate, but the handler 404s an
+    // unreadable workflow first, through the caller's viewer, so it was not a
+    // live disclosure either. Neither move changes a response.
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
