@@ -1208,18 +1208,41 @@ mod tests {
 
     #[test]
     fn a_full_leaf_lays_out_within_the_time_bound() {
-        // The contract's cap (100 nodes) with dense edges (W10a allows 1024).
+        // The contract's cap (100 nodes) with dense edges (W10a allows 1024),
+        // cold and warm-started.
+        //
+        // The item's bound is 50 ms per leaf on one core, which is what the
+        // nightly's optimised build must meet: it is asserted in a release
+        // build (`cargo test --release`, run by the W6 gate). A debug build
+        // (CI's parallel workspace job, on small shared runners) runs about
+        // ten times slower and asserts ten times the bound, which still
+        // catches a layout that is an order of magnitude too slow without
+        // failing on a busy runner.
+        let bound = if cfg!(debug_assertions) {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(50)
+        };
         let (_, input) = random_leaf(5, 100, 400);
         assert_eq!(input.nodes().len(), 100);
+        let cold = layout_leaf(seed(), &input);
         let mut best = Duration::MAX;
+        let mut best_warm = Duration::MAX;
         for _ in 0..5 {
             let t = Instant::now();
             let pos = layout_leaf(seed(), &input);
             best = best.min(t.elapsed());
             assert_eq!(pos.len(), 100);
+            let t = Instant::now();
+            let pos = layout_leaf_from(seed(), &input, &cold);
+            best_warm = best_warm.min(t.elapsed());
+            assert_eq!(pos.len(), 100);
         }
-        eprintln!("atlas W6: a 100-node leaf took {best:?} (best of 5)");
-        assert!(best < Duration::from_millis(50), "took {best:?}");
+        eprintln!(
+            "atlas W6: a 100-node leaf took {best:?} cold, {best_warm:?} warm (best of 5, bound {bound:?})"
+        );
+        assert!(best < bound, "took {best:?}");
+        assert!(best_warm < bound, "warm took {best_warm:?}");
     }
 
     #[test]
