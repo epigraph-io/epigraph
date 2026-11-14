@@ -829,16 +829,15 @@ mod tests {
             .collect()
     }
 
+    /// A factor as `cdst_bp_iteration` takes it.
+    type Factor = (Uuid, FactorPotential, Vec<Uuid>);
+
     /// Backlog 15582602: one target `t` with three supporters (each its own
     /// alternative-set class) and a mutual-exclusion partner `x`, whose
     /// anti-support message carries no source. The supporters' messages are
     /// chosen so their pairwise conflicts straddle the adaptive threshold:
     /// the order the fold meets them changes the result.
-    fn order_sensitive_fixture() -> (
-        Uuid,
-        Vec<(Uuid, FactorPotential, Vec<Uuid>)>,
-        HashMap<Uuid, MassFunction>,
-    ) {
+    fn order_sensitive_fixture() -> (Uuid, Vec<Factor>, HashMap<Uuid, MassFunction>) {
         let t = Uuid::from_u128(0x10);
         let (a, b, c, x) = (
             Uuid::from_u128(0x20),
