@@ -2122,6 +2122,21 @@ async fn an_unsealed_claim_regains_its_embedding_when_the_job_is_drained(pool: P
          would never route this job to it"
     );
     let mut job = pending_embedding_job(&pool, claim).await;
+    // The unseal's re-embedding job has a RETRY budget (backlog 1320b4e3). With
+    // the one attempt every privatization job carries, a single transient
+    // provider error (a 429, a 503, a timeout) failed it for good and left the
+    // restored claim with no vector; the drain's retry ladder never applied.
+    assert!(
+        job.retry_count == 0 && job.max_retries > 1,
+        "the unseal enqueued its embedding_generation job with retry_count={} and \
+         max_retries={}: one transient provider error would fail it permanently",
+        job.retry_count,
+        job.max_retries
+    );
+    assert_eq!(
+        i64::from(job.max_retries),
+        i64::from(epigraph_db::repos::privatization::EMBEDDING_RESTORE_JOB_ATTEMPTS)
+    );
     epigraph_jobs::JobHandler::handle(&handler, &job)
         .await
         .expect("the embedding job must succeed for an unsealed claim");
