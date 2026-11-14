@@ -398,6 +398,13 @@ pub async fn submit_ds_evidence(
         }
         _ => Vec::new(),
     };
+    // The same silent-failure class for `locality_tag` (backlog 86ee2d30):
+    // a tag outside the vocabulary is stored and folded as cross (no
+    // discount), and a tag sent without `evidence_type` is dropped.
+    warnings.extend(locality_tag_warning(
+        calibrated_evidence_type.is_some(),
+        params.locality_tag.as_deref(),
+    ));
 
     // Migration 114: on a public claim this caller does not own, the BBA is the
     // caller's own row, but the claim's frame assignment and its cached belief
@@ -743,6 +750,44 @@ async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, 
         .ok()
         .flatten()
         .is_some_and(|m| m.contains_key(&et.to_lowercase()))
+}
+
+/// The warning a `submit_ds_evidence` call earns for its `locality_tag`, if
+/// any (backlog 86ee2d30). Never a refusal, like the `evidence_type` warning.
+///
+/// - Sent without `evidence_type`: the tag is dropped and the BBA stored with
+///   `"unknown"` (see the reliability fork in [`submit_ds_evidence`]). Sending
+///   `"unknown"` itself changes nothing, so it earns no warning.
+/// - Sent with `evidence_type` but outside
+///   [`epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS`]: stored as given,
+///   and the fold discounts it only if it begins with `intra`.
+fn locality_tag_warning(
+    evidence_type_supplied: bool,
+    locality_tag: Option<&str>,
+) -> Option<String> {
+    let tag = locality_tag?;
+    if !evidence_type_supplied {
+        return (tag != "unknown").then(|| {
+            format!(
+                "locality_tag={tag:?} was ignored: it is only consulted together with \
+                 evidence_type, so this BBA was stored with locality_tag \"unknown\" and no \
+                 locality discount."
+            )
+        });
+    }
+    if epigraph_engine::edge_factor::is_known_locality_tag(tag) {
+        return None;
+    }
+    let effect = if tag.starts_with("intra") {
+        "it begins with \"intra\", so the intra-locality discount still applies"
+    } else {
+        "it is combined as cross-source evidence, with NO locality discount"
+    };
+    Some(format!(
+        "locality_tag={tag:?} is not in the locality vocabulary; it was stored as given, and \
+         {effect}. Known tags: {}.",
+        epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS.join(", ")
+    ))
 }
 
 /// The `warnings` a `submit_ds_evidence` call earns by sending a deprecated
@@ -1172,6 +1217,35 @@ mod tests {
             .expect_err(&format!("{masses} must be refused"));
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{masses}");
         err.message.into_owned()
+    }
+
+    /// Backlog 86ee2d30: a `locality_tag` outside the vocabulary, or one sent
+    /// without `evidence_type`, used to change the belief (or not) with no
+    /// signal. Each case names what the fold does with it.
+    #[test]
+    fn locality_tag_warning_names_what_the_fold_does() {
+        for tag in ["cross", "intra", "intra_self_cite", "unknown"] {
+            assert_eq!(locality_tag_warning(true, Some(tag)), None, "{tag}");
+        }
+        assert_eq!(locality_tag_warning(true, None), None);
+        assert_eq!(locality_tag_warning(false, None), None);
+        assert_eq!(locality_tag_warning(false, Some("unknown")), None);
+
+        let w = locality_tag_warning(true, Some("self-cite")).expect("misspelt intra tag");
+        assert!(
+            w.contains("\"self-cite\"")
+                && w.contains("NO locality discount")
+                && w.contains("intra_self_cite"),
+            "{w}"
+        );
+        // Case-sensitive, like the fold's `starts_with("intra")`.
+        let w = locality_tag_warning(true, Some("Intra_self_cite")).expect("capitalised");
+        assert!(w.contains("NO locality discount"), "{w}");
+        let w = locality_tag_warning(true, Some("intra_other")).expect("unlisted intra tag");
+        assert!(w.contains("discount still applies"), "{w}");
+
+        let w = locality_tag_warning(false, Some("intra_self_cite")).expect("dropped tag");
+        assert!(w.contains("ignored") && w.contains("evidence_type"), "{w}");
     }
 
     /// Backlog 2fe81d61: on the write path an unparseable focal key became the

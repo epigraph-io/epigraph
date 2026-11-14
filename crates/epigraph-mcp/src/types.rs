@@ -1260,11 +1260,13 @@ pub struct SubmitDsEvidenceParams {
     pub evidence_type: Option<String>,
 
     #[schemars(
-        description = "Locality classification of this evidence vs. the claim's asserting paper: \
-                       'intra' (self-cite / methodological overlap) applies the calibrated intra-locality \
-                       discount on top of the evidence_type weight; 'cross' or 'unknown' apply no locality \
-                       discount. Only consulted when `evidence_type` is also supplied — otherwise ignored \
-                       and the BBA is stored with locality_tag='unknown' as before. Default: 'unknown'."
+        description = "Locality classification of this evidence vs. the claim's asserting paper. \
+                       Known tags: 'intra_self_cite' (or the shorthand 'intra') applies the calibrated \
+                       intra-locality discount on top of the evidence_type weight; 'cross' or 'unknown' \
+                       apply no locality discount. Any other tag is stored as given, combined with NO \
+                       discount unless it begins with 'intra', and reported in the response's warnings. \
+                       Only consulted when `evidence_type` is also supplied — otherwise ignored (with a \
+                       warning) and the BBA is stored with locality_tag='unknown'. Default: 'unknown'."
     )]
     #[serde(default)]
     pub locality_tag: Option<String>,
