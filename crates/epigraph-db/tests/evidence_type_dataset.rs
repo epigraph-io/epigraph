@@ -1,5 +1,6 @@
-//! `dataset` evidence (backlog c8beb101): migration 229 and its undo, and the
-//! repository write and read-back.
+//! `dataset` evidence (backlog c8beb101): migration 229 and its undo, the
+//! repository write and read-back, and the per-row-filtered read behind
+//! `get_claim`'s `datasets`.
 //!
 //! Before 229, `evidence_type_valid` (migration 001) admitted seven names and
 //! not `dataset`, so every dataset row was refused with 23514. Each test here
@@ -10,7 +11,7 @@ mod viewer_fixture;
 use epigraph_core::{
     AgentId, ClaimId, DatasetManifestInput, Evidence, EvidenceType, STORED_EVIDENCE_TYPES,
 };
-use epigraph_db::EvidenceRepository;
+use epigraph_db::{EvidenceRepository, LineageRepository};
 use sqlx::PgPool;
 use std::collections::BTreeSet;
 use uuid::Uuid;
@@ -128,6 +129,73 @@ async fn the_check_admits_exactly_the_stored_vocabulary(pool: PgPool) {
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("23514")
     );
+}
+
+/// `get_claim`'s read: dataset rows only, per claim, oldest first, filtered
+/// PER ROW so a group-private dataset row on a public claim stays hidden from
+/// a viewer outside the group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn datasets_by_claim_ids_returns_visible_dataset_rows_only(pool: PgPool) {
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "c8beb101-read").await;
+    let claim = viewer_fixture::seed_public_claim(&pool, agent, "c8beb101: two runs").await;
+    let other = viewer_fixture::seed_public_claim(&pool, agent, "c8beb101: no datasets").await;
+    let first = write_dataset_evidence(&pool, claim, "run 1", "s3://b/run-1").await;
+    let second = write_dataset_evidence(&pool, claim, "run 2", "s3://b/run-2").await;
+    // A non-dataset row on the same claim is not a dataset.
+    viewer_fixture::seed_evidence(&pool, claim, "document").await;
+    // A dataset row pinned to the group: a public reader must not see it.
+    let hidden = write_dataset_evidence(&pool, claim, "run 3", "s3://b/run-3").await;
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(Uuid::from(hidden.id))
+        .bind(group)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let public = viewer_fixture::public_viewer(&pool).await;
+    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &public, &[claim, other])
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = got[&claim].iter().map(|d| d.evidence_id).collect();
+    assert_eq!(ids, vec![Uuid::from(first.id), Uuid::from(second.id)]);
+    assert_eq!(got[&claim][0].dataset, dataset("s3://b/run-1"));
+    assert!(!got.contains_key(&other), "{got:?}");
+
+    // Serialised flat, with the variant's tag: the shape get_claim returns.
+    let json = serde_json::to_value(&got[&claim][0]).unwrap();
+    assert_eq!(json["evidence_id"], Uuid::from(first.id).to_string());
+    assert_eq!(json["type"], "dataset");
+    assert_eq!(json["manifest_hash"], format!("blake3:{B3_HEX}"));
+    assert_eq!(json["file_count"], 12);
+
+    let member = epigraph_db::Viewer::resolve(&pool, agent).await.unwrap();
+    let got = EvidenceRepository::datasets_by_claim_ids(&pool, &member, &[claim])
+        .await
+        .unwrap();
+    assert_eq!(got[&claim].len(), 3, "the group member sees its own row");
+}
+
+/// The lineage read behind `get_provenance` carries a dataset row's fields,
+/// and nothing for any other evidence type.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lineage_carries_dataset_properties(pool: PgPool) {
+    let agent = viewer_fixture::seed_agent_with_group(&pool, "c8beb101-lin")
+        .await
+        .0;
+    let claim = viewer_fixture::seed_public_claim(&pool, agent, "c8beb101: lineage").await;
+    let ds = write_dataset_evidence(&pool, claim, "run 9", "s3://b/run-9").await;
+    let doc = viewer_fixture::seed_evidence(&pool, claim, "document").await;
+
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let lineage = LineageRepository::get_lineage_conn(&mut conn, &viewer, claim, Some(1), Some(10))
+        .await
+        .unwrap();
+    let ds_row = &lineage.evidence[&Uuid::from(ds.id)];
+    let parsed: EvidenceType =
+        serde_json::from_value(ds_row.dataset.clone().expect("dataset properties")).unwrap();
+    assert_eq!(parsed, dataset("s3://b/run-9"));
+    assert_eq!(lineage.evidence[&doc].dataset, None);
 }
 
 fn up_to(max: i64) -> sqlx::migrate::Migrator {

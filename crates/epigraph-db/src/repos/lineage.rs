@@ -89,6 +89,11 @@ pub struct LineageEvidence {
     pub claim_id: Uuid,
     pub evidence_type: String,
     pub content_hash: Vec<u8>,
+    /// The row's `properties` (the serialised `EvidenceType::Dataset`) when it
+    /// is `dataset` evidence, so a provenance reader can resolve and verify
+    /// the data without a second read (backlog c8beb101); `None` for every
+    /// other evidence type, whose `properties` the lineage never carried.
+    pub dataset: Option<serde_json::Value>,
 }
 
 /// Trace data in lineage result
@@ -158,6 +163,7 @@ struct EvidenceQueryRow {
     claim_id: Uuid,
     evidence_type: String,
     content_hash: Vec<u8>,
+    dataset: Option<serde_json::Value>,
 }
 
 /// Row for trace queries
@@ -566,7 +572,8 @@ impl LineageRepository {
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
             r#"
-            SELECT id, claim_id, evidence_type, content_hash
+            SELECT id, claim_id, evidence_type, content_hash,
+                   CASE WHEN evidence_type = 'dataset' THEN properties END AS dataset
             FROM evidence
             WHERE claim_id = ANY($1)
               /* {VISIBILITY:evidence} */
@@ -588,6 +595,7 @@ impl LineageRepository {
                 claim_id: row.claim_id,
                 evidence_type: row.evidence_type,
                 content_hash: row.content_hash,
+                dataset: row.dataset,
             };
             evidence_map.insert(row.id, evidence);
             claim_evidence_map
@@ -1089,7 +1097,8 @@ impl LineageRepository {
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
             r#"
-            SELECT id, claim_id, evidence_type, content_hash
+            SELECT id, claim_id, evidence_type, content_hash,
+                   CASE WHEN evidence_type = 'dataset' THEN properties END AS dataset
             FROM evidence
             WHERE claim_id = ANY($1)
               /* {VISIBILITY:evidence} */
@@ -1111,6 +1120,7 @@ impl LineageRepository {
                 claim_id: row.claim_id,
                 evidence_type: row.evidence_type,
                 content_hash: row.content_hash,
+                dataset: row.dataset,
             };
             evidence_map.insert(row.id, evidence);
             claim_evidence_map

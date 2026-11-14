@@ -19,6 +19,19 @@ pub struct EvidenceSourceIdentity {
     pub source_url: Option<String>,
 }
 
+/// One `dataset` evidence row, as [`EvidenceRepository::datasets_by_claim_ids`]
+/// returns it (backlog c8beb101).
+///
+/// Serialises flat: `evidence_id` beside the variant's own fields and its
+/// `type: "dataset"` tag, which is the shape `get_claim` returns.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DatasetEvidence {
+    pub evidence_id: Uuid,
+    /// Always an [`EvidenceType::Dataset`].
+    #[serde(flatten)]
+    pub dataset: EvidenceType,
+}
+
 /// Result row for [`EvidenceRepository::provided_for_claim_as_of`].
 ///
 /// `evidence_type` and `created_at` are projected even though today's only
@@ -868,6 +881,61 @@ impl EvidenceRepository {
             let urls = out.entry(claim_id).or_default();
             if !urls.contains(&url) {
                 urls.push(url);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `dataset` evidence of each of `claim_ids` that `viewer` can see,
+    /// keyed by claim id, oldest first (backlog c8beb101).
+    ///
+    /// Backs `get_claim`'s `datasets`: the structured fields a reader needs to
+    /// resolve and verify a dataset (root, manifest location, manifest digest
+    /// with its algorithm, counts) without parsing `raw_content`.
+    ///
+    /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), as
+    /// [`Self::source_urls_by_claim_ids`] is, and for its reason. A row whose
+    /// `properties` do not parse as a `Dataset` (a hand-written row) is
+    /// skipped rather than failing the read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn datasets_by_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<DatasetEvidence>>, DbError> {
+        let mut out: std::collections::HashMap<Uuid, Vec<DatasetEvidence>> =
+            std::collections::HashMap::new();
+        if claim_ids.is_empty() {
+            return Ok(out);
+        }
+        let sql = viewer.splice(
+            "SELECT e.claim_id, e.id, e.properties \
+             FROM evidence e \
+             WHERE e.claim_id = ANY($1) \
+               AND e.evidence_type = 'dataset' \
+               /* {VISIBILITY:e} */ \
+             ORDER BY e.claim_id, e.created_at, e.id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, serde_json::Value)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        for (claim_id, evidence_id, properties) in q.fetch_all(executor).await? {
+            match serde_json::from_value::<EvidenceType>(properties) {
+                Ok(dataset @ EvidenceType::Dataset { .. }) => {
+                    out.entry(claim_id).or_default().push(DatasetEvidence {
+                        evidence_id,
+                        dataset,
+                    });
+                }
+                _ => tracing::warn!(
+                    %evidence_id,
+                    "dataset evidence row whose properties are not a Dataset; skipped"
+                ),
             }
         }
         Ok(out)

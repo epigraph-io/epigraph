@@ -487,6 +487,7 @@ mod tests {
                         claim_id: id,
                         evidence_type: "testimony".into(),
                         content_hash: vec![],
+                        dataset: None,
                     },
                 );
             }
