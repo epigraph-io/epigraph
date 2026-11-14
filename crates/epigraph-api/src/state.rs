@@ -479,11 +479,10 @@ pub struct AppState {
     pub edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
 }
 
-/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
-pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
-
 /// Whether `POST /api/v1/bp/propagate` may write its results to `claims`
-/// (`apply_updates: true`).
+/// (`apply_updates: true`): `EPIGRAPH_BP_APPLY`, the
+/// [`epigraph_engine::belief_modes`] flag, parsed there once per process
+/// (backlog 820c15f1), so `/health`'s `bp_apply` and the gate are one value.
 ///
 /// BP apply is RETIRED under atom-level belief (SPEC §6.2, hazard H4): a
 /// whole-graph loopy-BP run rewrote claim caches, compounds included, with
@@ -493,63 +492,15 @@ pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
 /// then it writes atoms only (a compound is a query over its atoms and has no
 /// cache of its own to write). Read-only BP runs stay available as a
 /// diagnostic whatever this says.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum BpApply {
-    /// `apply_updates: true` is refused (409). The default everywhere.
-    #[default]
-    Off,
-    /// `apply_updates: true` writes BP's values to the non-compound claims
-    /// the caller can see.
-    On,
-}
+///
+/// `Off` (the default everywhere): `apply_updates: true` is refused (409).
+/// `On`: it writes BP's values to the non-compound claims the caller can see.
+/// ONLY the value `on` (trimmed, any case) switches it on; `true`, `1` or a
+/// typo leave it off and are reported at boot.
+pub use epigraph_engine::belief_modes::BpApply;
 
-impl BpApply {
-    /// The switch's parse, apart from the environment: ONLY the exact value
-    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
-    /// `1` or a typo leave it OFF, so a mistyped value fails closed.
-    #[must_use]
-    pub fn parse(raw: Option<&str>) -> Self {
-        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
-            Self::On
-        } else {
-            Self::Off
-        }
-    }
-
-    /// Whether `raw` is SET to a value that is neither `on` nor `off`
-    /// (trimmed, case-insensitive): a value [`Self::parse`] silently reads as
-    /// OFF, which the server warns about at boot. Unset or blank is the plain
-    /// default and is not flagged.
-    #[must_use]
-    pub fn is_unrecognised(raw: Option<&str>) -> bool {
-        raw.map(str::trim).is_some_and(|v| {
-            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
-        })
-    }
-}
-
-#[cfg(test)]
-mod bp_apply_switch_tests {
-    use super::BpApply;
-
-    #[test]
-    fn only_on_switches_bp_apply_on() {
-        for on in ["on", "ON", " On "] {
-            assert_eq!(BpApply::parse(Some(on)), BpApply::On, "{on:?}");
-            assert!(!BpApply::is_unrecognised(Some(on)), "{on:?}");
-        }
-        // Values an operator might mean as "yes" stay OFF, and are flagged.
-        for typo in ["true", "1", "yes", "enabled", "onn"] {
-            assert_eq!(BpApply::parse(Some(typo)), BpApply::Off, "{typo:?}");
-            assert!(BpApply::is_unrecognised(Some(typo)), "{typo:?}");
-        }
-        for off in [None, Some(""), Some("  "), Some("off"), Some("OFF")] {
-            assert_eq!(BpApply::parse(off), BpApply::Off, "{off:?}");
-            assert!(!BpApply::is_unrecognised(off), "{off:?}");
-        }
-        assert_eq!(BpApply::default(), BpApply::Off);
-    }
-}
+/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
+pub const BP_APPLY_ENV: &str = BpApply::ENV;
 
 /// API configuration options
 #[derive(Clone)]

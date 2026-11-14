@@ -466,7 +466,8 @@ impl RunSettings {
                 AtomFoldMode::AefStandalone => "aef_standalone",
                 AtomFoldMode::Aef => "aef",
             },
-            compound_source_edges: match CompoundSourceEdges::current() {
+            compound_source_edges: match epigraph_engine::atom_items::modes().compound_source_edges
+            {
                 CompoundSourceEdges::Frozen => "frozen",
                 CompoundSourceEdges::Excluded => "excluded",
             },

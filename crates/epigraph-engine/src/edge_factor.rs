@@ -1807,13 +1807,14 @@ pub struct AtomCacheSettings {
 }
 
 impl AtomCacheSettings {
-    /// This process's settings: the two flags as read at startup, and O24 as
+    /// This process's settings: the two flags as read at startup
+    /// ([`crate::atom_items::modes`]), and the evidence-removal vacate as
     /// ruled.
     #[must_use]
     pub fn current() -> Self {
         Self {
-            fold: crate::atom_items::AtomFoldMode::current(),
-            compound_source_edges: crate::atom_items::CompoundSourceEdges::current(),
+            fold: crate::atom_items::modes().atom_fold,
+            compound_source_edges: crate::atom_items::modes().compound_source_edges,
             vacate_on_evidence_removal: true,
         }
     }
@@ -2203,6 +2204,22 @@ pub async fn ensure_binary_frame(
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Uuid, String> {
     ensure_binary_frame_row(conn, viewer).await.map(|r| r.id)
+}
+
+/// The canonical `binary_truth` frame's id, when it exists and `viewer` can
+/// read it. Read-only: unlike [`ensure_binary_frame`] it never creates the
+/// frame, so a read path can call it.
+///
+/// # Errors
+/// The frame lookup fails.
+pub async fn find_binary_frame(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Option<Uuid>, String> {
+    FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
+        .await
+        .map(|row| row.map(|r| r.id))
+        .map_err(|e| format!("get_by_name: {e}"))
 }
 
 /// [`ensure_binary_frame`], returning the frame row (its `properties` carry

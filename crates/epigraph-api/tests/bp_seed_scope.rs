@@ -42,12 +42,13 @@ use viewer_fixture::{
     scoped_pool, seed_agent_with_group, seed_evidence, seed_human_operator, seed_public_claim,
 };
 
-async fn frame(pool: &PgPool, name: &str) -> Uuid {
+/// The canonical `binary_truth` frame, the only frame whose BBAs seed BP.
+async fn frame(pool: &PgPool) -> Uuid {
     epigraph_db::FrameRepository::create(
         pool,
-        name,
+        "binary_truth",
         None,
-        &["supported".to_string(), "unsupported".to_string()],
+        &["TRUE".to_string(), "FALSE".to_string()],
     )
     .await
     .expect("frame")
@@ -70,16 +71,39 @@ async fn factor(pool: &PgPool, frame: Uuid, a: Uuid, b: Uuid) {
 
 /// A stored BBA on `claim`: `t` on "supported", the rest on the frame.
 async fn bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Option<Uuid>, t: f64) {
+    stored_bba(
+        pool,
+        claim,
+        frame,
+        agent,
+        evidence,
+        &serde_json::json!({"0": t, "0,1": 1.0 - t}),
+        1.0,
+    )
+    .await;
+}
+
+/// A stored BBA with explicit masses and a stored `source_strength` (no
+/// `evidence_type`, so the stored strength is its reliability).
+async fn stored_bba(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    agent: Uuid,
+    evidence: Option<Uuid>,
+    masses: &serde_json::Value,
+    source_strength: f64,
+) {
     epigraph_db::MassFunctionRepository::store_with_perspective(
         pool,
         claim,
         frame,
         Some(agent),
         evidence,
-        &serde_json::json!({"0": t, "0,1": 1.0 - t}),
+        masses,
         None,
         Some("auto_wire"),
-        Some(1.0),
+        Some(source_strength),
         None,
         "unknown",
         evidence,
@@ -139,7 +163,7 @@ async fn cached_betp(pool: &PgPool, claim: Uuid) -> Option<f64> {
 async fn public_claim_with_a_narrowed_bba(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid, f64) {
     let (member, group) = seed_agent_with_group(pool, "r22-bp-seed-member").await;
     let (stranger, _) = seed_agent_with_group(pool, "r22-bp-seed-stranger").await;
-    let frame = frame(pool, "r22_bp_seed_frame").await;
+    let frame = frame(pool).await;
     // The member authors both claims so that an applying run may write them.
     let target = seed_public_claim(pool, member, "r22 bp seed target").await;
     let partner = seed_public_claim(pool, member, "r22 bp seed partner").await;
@@ -228,7 +252,7 @@ async fn link(pool: &PgPool, agent: Uuid, human: Uuid) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_bp_seed_never_multiplies_two_agents_of_one_human(pool: PgPool) {
-    let frame = frame(&pool, "r36_bp_seed_frame").await;
+    let frame = frame(&pool).await;
     let (human, _) = seed_human_operator(&pool, "r36-bp-human").await;
     let (one, _) = seed_agent_with_group(&pool, "r36-bp-one").await;
     let (two, _) = seed_agent_with_group(&pool, "r36-bp-two").await;
@@ -289,4 +313,93 @@ async fn a_bp_seed_never_multiplies_two_agents_of_one_human(pool: PgPool) {
         .await
         .expect("count");
     assert_eq!(rows, 2, "history kept: both sibling rows stay stored");
+}
+
+/// Backlog 42be8a60: a claim's BP seed is the fold of its `binary_truth`
+/// BBAs, each discounted by its reliability, as the served fold computes it.
+///
+/// The seed used to parse every row of the claim on BP's binary frame by
+/// index, whatever frame it was stored on, and to skip the discount. So a
+/// BBA on a three-hypothesis frame was folded in as support, and a row's
+/// reliability was ignored.
+///
+/// Isolated components again (a seeded claim, an unseeded partner), so equal
+/// seeds give equal BP values.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bp_seed_folds_only_binary_truth_bbas_each_discounted(pool: PgPool) {
+    let frame = frame(&pool).await;
+    let three = epigraph_db::FrameRepository::create(
+        &pool,
+        "bp_seed_three_hypotheses",
+        None,
+        &["a".to_string(), "b".to_string(), "c".to_string()],
+    )
+    .await
+    .expect("three-hypothesis frame")
+    .id;
+    let (author, _) = seed_agent_with_group(&pool, "bp-seed-frame-author").await;
+    let (other, _) = seed_agent_with_group(&pool, "bp-seed-frame-other").await;
+    let claim = |label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let c = seed_public_claim(&pool, author, label).await;
+            let p = seed_public_claim(&pool, author, &format!("{label} partner")).await;
+            factor(&pool, frame, c, p).await;
+            c
+        }
+    };
+    let plain = claim("bp seed frame plain").await;
+    let with_off_frame = claim("bp seed frame plus a three-hypothesis BBA").await;
+    let weak = claim("bp seed frame weak source").await;
+    let pre_discounted = claim("bp seed frame pre-discounted").await;
+
+    bba(&pool, plain, frame, author, None, 0.6).await;
+    bba(&pool, with_off_frame, frame, author, None, 0.6).await;
+    // On the three-hypothesis frame: 0.9 on {a}, 0.1 on {a, b}. Both focal
+    // sets are also valid indices on the binary frame ({supported} and
+    // the whole frame), so the old parse read it as strong support.
+    stored_bba(
+        &pool,
+        with_off_frame,
+        three,
+        other,
+        None,
+        &serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        1.0,
+    )
+    .await;
+    // 0.6 from a source of reliability 0.3: Shafer's discount leaves 0.18 on
+    // {supported}, exactly the row below at full reliability.
+    stored_bba(
+        &pool,
+        weak,
+        frame,
+        author,
+        None,
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        0.3,
+    )
+    .await;
+    bba(&pool, pre_discounted, frame, author, None, 0.6 * 0.3).await;
+
+    let body = run(&pool, author, frame, false, false).await;
+    let (p, o, w, d) = (
+        served(&body, plain),
+        served(&body, with_off_frame),
+        served(&body, weak),
+        served(&body, pre_discounted),
+    );
+    assert!(
+        (p - 0.5).abs() > 1e-3 && (p - d).abs() > 1e-3,
+        "PREMISE: the seeds move BP values apart ({p} plain, {d} pre-discounted): {body}"
+    );
+    assert!(
+        (o - p).abs() < 1e-9,
+        "a BBA stored on a three-hypothesis frame seeded BP as binary support: {o} vs {p}"
+    );
+    assert!(
+        (w - d).abs() < 1e-9,
+        "a BP seed ignored its row's reliability: {w}, expected the discounted {d} (full \
+         strength gives {p})"
+    );
 }

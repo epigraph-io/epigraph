@@ -47,109 +47,40 @@ pub enum AxiomMode {
 
 /// `EPIGRAPH_COMPOUND_SOURCE_EDGES` (SPEC §6.3, §10.2): whether edge-factor
 /// rows whose edge SOURCE is a compound stay in the [`AxiomMode::Display`]
-/// fold. Spelled as PR-G0's `belief_modes::CompoundSourceEdges`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum CompoundSourceEdges {
-    /// Kept, read one-sided on positive relationships (the default).
-    #[default]
-    Frozen,
-    /// Dropped from every fold.
-    Excluded,
-}
-
-impl CompoundSourceEdges {
-    /// The environment variable this switch is read from.
-    pub const ENV: &'static str = "EPIGRAPH_COMPOUND_SOURCE_EDGES";
-
-    /// Parse one value: trimmed, case-insensitive; `None` when it is neither
-    /// `frozen` nor `excluded`.
-    #[must_use]
-    pub fn parse_value(raw: &str) -> Option<Self> {
-        let v = raw.trim();
-        if v.eq_ignore_ascii_case("frozen") {
-            Some(Self::Frozen)
-        } else if v.eq_ignore_ascii_case("excluded") {
-            Some(Self::Excluded)
-        } else {
-            None
-        }
-    }
-
-    /// This process's setting: [`Self::ENV`], read once. Unset, blank or an
-    /// unrecognised value is the default, [`Self::Frozen`] (an unrecognised
-    /// one is logged).
-    #[must_use]
-    pub fn current() -> Self {
-        static CELL: std::sync::OnceLock<CompoundSourceEdges> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| read_flag(Self::ENV, Self::parse_value))
-    }
-}
-
+/// fold. `Frozen` (the default) keeps them, read one-sided on positive
+/// relationships; `Excluded` drops them from every fold.
+///
 /// `EPIGRAPH_ATOM_FOLD` (SPEC §10.2): which atoms the single cache writer
-/// folds with the AEF. Spelled as PR-G0's `belief_modes::AtomFold`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum AtomFoldMode {
-    /// Today's per-site folds, for every atom (the default).
-    #[default]
-    Legacy,
-    /// The AEF for standalone atoms; leaves keep the legacy fold.
-    AefStandalone,
-    /// The AEF for every atom.
-    Aef,
-}
+/// folds with the AEF. `Legacy` (the default) keeps today's per-site folds for
+/// every atom, `AefStandalone` folds standalone atoms with the AEF, `Aef`
+/// every atom.
+///
+/// Both are the [`crate::belief_modes`] types, parsed there once per process
+/// (backlog 820c15f1); this process's values are [`modes`]`()`.
+pub use crate::belief_modes::{AtomFold as AtomFoldMode, CompoundSourceEdges};
 
-impl AtomFoldMode {
-    /// The environment variable this switch is read from.
-    pub const ENV: &'static str = "EPIGRAPH_ATOM_FOLD";
-
-    /// Parse one value: trimmed, case-insensitive; `None` when it is none of
-    /// `legacy`, `aef_standalone`, `aef`.
-    #[must_use]
-    pub fn parse_value(raw: &str) -> Option<Self> {
-        let v = raw.trim();
-        [
-            ("legacy", Self::Legacy),
-            ("aef_standalone", Self::AefStandalone),
-            ("aef", Self::Aef),
-        ]
-        .into_iter()
-        .find(|(spelling, _)| v.eq_ignore_ascii_case(spelling))
-        .map(|(_, mode)| mode)
-    }
-
-    /// This process's setting: [`Self::ENV`], read once. Unset, blank or an
-    /// unrecognised value is the default, [`Self::Legacy`] (an unrecognised
-    /// one is logged): a typo never enables the AEF.
-    #[must_use]
-    pub fn current() -> Self {
-        static CELL: std::sync::OnceLock<AtomFoldMode> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| read_flag(Self::ENV, Self::parse_value))
-    }
-}
-
-/// Read one switch from the environment ([`flag_value`]).
-pub(crate) fn read_flag<T: Default + std::fmt::Debug>(
-    env: &str,
-    parse: fn(&str) -> Option<T>,
-) -> T {
-    flag_value(env, std::env::var(env).ok().as_deref(), parse)
-}
-
-/// One switch's value from its raw setting: unset or blank is the default; an
-/// unrecognised value is the default too, and is logged.
-fn flag_value<T: Default + std::fmt::Debug>(
-    env: &str,
-    raw: Option<&str>,
-    parse: fn(&str) -> Option<T>,
-) -> T {
-    match raw {
-        Some(raw) if !raw.trim().is_empty() => parse(raw).unwrap_or_else(|| {
-            let fallback = T::default();
-            tracing::warn!(flag = env, value = %raw, ?fallback, "unrecognised belief mode; using the default");
-            fallback
-        }),
-        _ => T::default(),
-    }
+/// This process's belief modes, as the atom-cache writer and the other
+/// engine readers act on them: [`crate::belief_modes::current`], the one read
+/// of the environment.
+///
+/// The first call also logs every flag set to a value none of its spellings
+/// match (each runs its default), once per process, under this crate's
+/// target. A process that journals its modes at boot logs them there too;
+/// one that does not (a job runner, a CLI bin) still warns about a typo the
+/// first time it folds.
+pub fn modes() -> &'static crate::belief_modes::BeliefModes {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        for flag in crate::belief_modes::unrecognised() {
+            tracing::warn!(
+                flag = flag.env,
+                value = %flag.value,
+                running = flag.running,
+                "unrecognised belief mode; using the default"
+            );
+        }
+    });
+    crate::belief_modes::current()
 }
 
 /// What a row is, for the mode filters.
@@ -327,7 +258,7 @@ impl EvidencedInterval {
 
 /// The AEF input rows of each requested atom, as `viewer` sees them, in
 /// `mode`, under the lens `ctx`. Reads the process's
-/// [`CompoundSourceEdges::current`]; [`atom_axiom_rows_under`] takes it
+/// [`modes`]`().compound_source_edges`; [`atom_axiom_rows_under`] takes it
 /// explicitly.
 ///
 /// # Errors
@@ -339,7 +270,7 @@ pub async fn atom_axiom_rows(
     mode: AxiomMode,
     ctx: &FramedBeliefContext,
 ) -> Result<HashMap<Uuid, Vec<AxiomRow>>, String> {
-    atom_axiom_rows_under(conn, viewer, ids, mode, ctx, CompoundSourceEdges::current()).await
+    atom_axiom_rows_under(conn, viewer, ids, mode, ctx, modes().compound_source_edges).await
 }
 
 /// [`atom_axiom_rows`] under an explicit [`CompoundSourceEdges`] setting.
@@ -1080,35 +1011,6 @@ mod tests {
             Some(CompoundSourceEdges::Excluded)
         );
         assert_eq!(CompoundSourceEdges::parse_value("exclude"), None);
-    }
-
-    /// The environment wrapper: unset, blank and unrecognised settings are
-    /// the default; a recognised one is parsed (trimmed, any case).
-    #[test]
-    fn an_unset_blank_or_unrecognised_switch_is_the_default() {
-        let fold = |raw| flag_value(AtomFoldMode::ENV, raw, AtomFoldMode::parse_value);
-        let edges = |raw| {
-            flag_value(
-                CompoundSourceEdges::ENV,
-                raw,
-                CompoundSourceEdges::parse_value,
-            )
-        };
-        for raw in [
-            None,
-            Some(""),
-            Some("   "),
-            Some("aef-standalone"),
-            Some("on"),
-        ] {
-            assert_eq!(fold(raw), AtomFoldMode::Legacy, "{raw:?}");
-        }
-        assert_eq!(fold(Some(" AEF ")), AtomFoldMode::Aef);
-        assert_eq!(fold(Some("aef_standalone")), AtomFoldMode::AefStandalone);
-        for raw in [None, Some(" "), Some("exclude")] {
-            assert_eq!(edges(raw), CompoundSourceEdges::Frozen, "{raw:?}");
-        }
-        assert_eq!(edges(Some("Excluded")), CompoundSourceEdges::Excluded);
     }
 
     /// Ruling O24 is ruled yes: the process settings vacate an atom whose AEF

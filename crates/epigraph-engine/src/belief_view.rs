@@ -49,12 +49,14 @@
 //!
 //! # `EPIGRAPH_COMPOUND_BELIEF`
 //!
-//! [`CompoundBeliefMode`] is read once per process. `legacy` (the default)
-//! serves today's values and computes nothing new; `shadow` serves today's
-//! values and adds a `shadow` view beside them on `get_belief`. The
-//! `progressive` and `strict` modes, which change served values, are not
-//! recognised here: until they are wired, either spelling falls back to
-//! `legacy` (and is logged), so no setting can move a served value.
+//! [`CompoundBeliefMode`] is what this build serves for the configured
+//! [`crate::belief_modes::CompoundBelief`], which `belief_modes` reads once
+//! per process. `legacy` (the default) serves today's values and computes
+//! nothing new; `shadow` serves today's values and adds a `shadow` view
+//! beside them on `get_belief`. The `progressive` and `strict` modes, which
+//! change served values, are not wired in this build: either one serves
+//! `legacy`, and the process logs that once, so no setting can move a served
+//! value. `/health` reports the configured mode, not the served one.
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -291,7 +293,8 @@ pub struct BeliefView {
     pub inputs: InputSummary,
 }
 
-/// `EPIGRAPH_COMPOUND_BELIEF` (SPEC §7.1, §10.2).
+/// What `get_belief` serves for `EPIGRAPH_COMPOUND_BELIEF` (SPEC §7.1,
+/// §10.2) in this build: see [`Self::serving`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CompoundBeliefMode {
@@ -303,31 +306,51 @@ pub enum CompoundBeliefMode {
 }
 
 impl CompoundBeliefMode {
-    /// The environment variable this switch is read from.
-    pub const ENV: &'static str = "EPIGRAPH_COMPOUND_BELIEF";
+    /// The environment variable the configured mode is read from.
+    pub const ENV: &'static str = crate::belief_modes::CompoundBelief::ENV;
 
-    /// Parse one value: trimmed, case-insensitive; `None` when it is neither
-    /// `legacy` nor `shadow`.
+    /// What this build serves for the configured `mode`. `progressive` and
+    /// `strict` are not wired yet and serve [`Self::Legacy`], spelled out
+    /// here so a new configured mode cannot fall through to one silently.
     #[must_use]
-    pub fn parse_value(raw: &str) -> Option<Self> {
-        let v = raw.trim();
-        if v.eq_ignore_ascii_case("legacy") {
-            Some(Self::Legacy)
-        } else if v.eq_ignore_ascii_case("shadow") {
-            Some(Self::Shadow)
-        } else {
-            None
+    pub const fn serving(mode: crate::belief_modes::CompoundBelief) -> Self {
+        use crate::belief_modes::CompoundBelief;
+        match mode {
+            CompoundBelief::Legacy | CompoundBelief::Progressive | CompoundBelief::Strict => {
+                Self::Legacy
+            }
+            CompoundBelief::Shadow => Self::Shadow,
         }
     }
 
-    /// This process's setting: [`Self::ENV`], read once. Unset, blank or an
-    /// unrecognised value (including the not-yet-wired `progressive` and
-    /// `strict`) is the default, [`Self::Legacy`]; an unrecognised one is
-    /// logged.
+    /// This process's served mode: [`Self::serving`] the configured mode
+    /// ([`crate::atom_items::modes`], the one read of the environment). A
+    /// configured mode this build does not act on is logged once.
     #[must_use]
     pub fn current() -> Self {
-        static CELL: std::sync::OnceLock<CompoundBeliefMode> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| crate::atom_items::read_flag(Self::ENV, Self::parse_value))
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let configured = crate::atom_items::modes().compound_belief;
+        let serving = Self::serving(configured);
+        if configured.as_str() != serving.as_str() {
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    flag = crate::belief_modes::CompoundBelief::ENV,
+                    configured = configured.as_str(),
+                    serving = serving.as_str(),
+                    "compound belief mode is not acted on in this build; serving the legacy values"
+                );
+            });
+        }
+        serving
+    }
+
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Shadow => "shadow",
+        }
     }
 }
 
@@ -335,22 +358,36 @@ impl CompoundBeliefMode {
 mod tests {
     use super::*;
 
+    /// Every configured mode maps to what this build serves: only `shadow`
+    /// adds anything, and the modes that change served values are not wired,
+    /// so they serve legacy. The spellings agree with the configured ones.
     #[test]
-    fn only_legacy_and_shadow_are_recognised_and_legacy_is_the_default() {
+    fn only_shadow_adds_a_view_and_unwired_modes_serve_legacy() {
+        use crate::belief_modes::CompoundBelief;
         assert_eq!(CompoundBeliefMode::default(), CompoundBeliefMode::Legacy);
-        assert_eq!(
-            CompoundBeliefMode::parse_value(" Shadow "),
-            Some(CompoundBeliefMode::Shadow)
-        );
-        assert_eq!(
-            CompoundBeliefMode::parse_value("LEGACY"),
-            Some(CompoundBeliefMode::Legacy)
-        );
-        // The modes that change served values are not wired here, so no
-        // spelling of them (or a typo) can select anything but the default.
-        for raw in ["progressive", "strict", "shadows", "on", ""] {
-            assert_eq!(CompoundBeliefMode::parse_value(raw), None, "{raw:?}");
+        for mode in CompoundBelief::ALL {
+            let serving = CompoundBeliefMode::serving(*mode);
+            let expected = if *mode == CompoundBelief::Shadow {
+                CompoundBeliefMode::Shadow
+            } else {
+                CompoundBeliefMode::Legacy
+            };
+            assert_eq!(serving, expected, "{mode}");
+            assert_eq!(
+                serde_json::to_value(serving).unwrap(),
+                serving.as_str(),
+                "{mode}"
+            );
         }
+        assert_eq!(
+            CompoundBeliefMode::serving(CompoundBelief::Legacy).as_str(),
+            CompoundBelief::Legacy.as_str()
+        );
+        assert_eq!(
+            CompoundBeliefMode::serving(CompoundBelief::Shadow).as_str(),
+            CompoundBelief::Shadow.as_str()
+        );
+        assert_eq!(CompoundBeliefMode::ENV, "EPIGRAPH_COMPOUND_BELIEF");
     }
 
     #[test]
