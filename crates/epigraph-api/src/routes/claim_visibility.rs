@@ -143,6 +143,18 @@ fn respond(outcomes: Vec<epigraph_db::VisibilityActOutcome>) -> Json<VisibilityA
     })
 }
 
+/// A widening act's failure: a refusal or database error as every
+/// visibility route maps it, a failed cached-belief refold as a 500 (the
+/// transaction is dropped, so nothing was changed).
+fn act_error(e: epigraph_engine::visibility_act::VisibilityActError) -> ApiError {
+    match e {
+        epigraph_engine::visibility_act::VisibilityActError::Db(e) => ApiError::from(e),
+        epigraph_engine::visibility_act::VisibilityActError::Cache(message) => {
+            ApiError::InternalError { message }
+        }
+    }
+}
+
 /// `POST /api/v1/claims/publicize`
 ///
 /// # Errors
@@ -157,7 +169,16 @@ pub async fn publicize_claims(
     require_write(auth_ctx, "POST /api/v1/claims/publicize")?;
     bounded(&body.claim_ids)?;
     let mut tx = state.write_as(&viewer, "publicize_claims").await?;
-    let outcomes = ClaimRepository::publicize_conn(&mut tx, &body.claim_ids, &body.reason).await?;
+    // The act and the moved claims' cached-belief refold, in this transaction
+    // (`epigraph_engine::visibility_act`; backlog 31285392).
+    let outcomes = epigraph_engine::visibility_act::publicize_claims(
+        &mut tx,
+        &viewer,
+        &body.claim_ids,
+        &body.reason,
+    )
+    .await
+    .map_err(act_error)?;
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit: {e}"),
     })?;
@@ -177,13 +198,15 @@ pub async fn share_claims_with_team(
     require_write(auth_ctx, "POST /api/v1/claims/share-with-team")?;
     bounded(&body.claim_ids)?;
     let mut tx = state.write_as(&viewer, "share_claims_with_team").await?;
-    let outcomes = ClaimRepository::share_with_team_conn(
+    let outcomes = epigraph_engine::visibility_act::share_claims_with_team(
         &mut tx,
+        &viewer,
         &body.claim_ids,
         body.group_id,
         &body.reason,
     )
-    .await?;
+    .await
+    .map_err(act_error)?;
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit: {e}"),
     })?;

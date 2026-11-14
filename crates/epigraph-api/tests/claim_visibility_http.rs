@@ -4,7 +4,8 @@
 //! `POST /api/v1/claims/publicize`, `PUT /api/v1/agents/me/default-group` and
 //! (migration 209) `PUT /api/v1/agents/:id/default-group`,
 //! each on a transaction stamped from the caller as `epigraph_app`
-//! (`connect_downgraded_for_tests`). The raw `db_pool` is the harness
+//! (`connect_downgraded_for_tests`), and (migration 215) the publicize refold
+//! of the published claim's cached belief. The raw `db_pool` is the harness
 //! superuser, used only to seed and to read state back.
 #![cfg(feature = "db")]
 
@@ -464,4 +465,115 @@ async fn an_operator_sets_its_agents_default_private_over_rest(pool: PgPool) {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["set_by"], "self", "{body}");
     assert_eq!(default_of(human).await, (None, true));
+}
+
+/// A BBA on (`claim`, binary frame) by `agent`, citing `evidence`.
+async fn bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid, m: Value) {
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
+        .await
+        .expect("evidence perspective");
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        Some(evidence),
+        &m,
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        Some(evidence),
+    )
+    .await
+    .expect("store a BBA");
+}
+
+async fn belief_cache(pool: &PgPool, claim: Uuid) -> (Option<f64>, Option<f64>, Option<f64>) {
+    sqlx::query_as("SELECT pignistic_prob, belief, plausibility FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("cache")
+}
+
+/// Backlog 31285392 over REST: `POST /api/v1/claims/publicize` refolds the
+/// published claim's cached belief for its new audience in the same
+/// transaction. The team claim's cache folded a supporting BBA and a refuting
+/// one citing evidence an operator pinned to the team; after the publicize
+/// the claim serves exactly the fold of a public control claim that carries
+/// only the supporting BBA. Against 206 as built the team's fold, refuting
+/// BBA included, stays the public value.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_over_http_refolds_the_belief_for_the_public(pool: PgPool) {
+    let (addr, _stop) = spawn_app(&pool).await;
+    let t = team(&pool, "http-team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "http-admin").await;
+    add_member(&pool, t, eve, "admin").await;
+    let eve_viewer = epigraph_db::Viewer::resolve(&pool, eve)
+        .await
+        .expect("viewer");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&mut conn, &eve_viewer)
+        .await
+        .expect("binary_truth");
+    let support = json!({"0": 0.8, "0,1": 0.2});
+
+    let c = fixture::seed_group_claim(&pool, eve, t, "http team finding").await;
+    let ev = fixture::seed_evidence(&pool, c, "observation").await;
+    let hidden = fixture::seed_evidence(&pool, c, "reference").await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: hidden')",
+    )
+    .bind(hidden)
+    .bind(eve)
+    .execute(&pool)
+    .await
+    .expect("pin");
+    bba(&pool, c, binary, eve, ev, support.clone()).await;
+    bba(&pool, c, binary, eve, hidden, json!({"1": 0.9, "0,1": 0.1})).await;
+
+    let control = fixture::seed_public_claim(&pool, eve, "http public control").await;
+    let cev = fixture::seed_evidence(&pool, control, "observation").await;
+    bba(&pool, control, binary, eve, cev, support).await;
+
+    for claim in [c, control] {
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, &eve_viewer, claim)
+            .await
+            .expect("fold");
+    }
+    drop(conn);
+    let stale = belief_cache(&pool, c).await;
+    let expected = belief_cache(&pool, control).await;
+    let near = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => (a - b).abs() < 1e-6,
+        _ => false,
+    };
+    assert!(
+        !near(stale.0, expected.0),
+        "PREMISE: the team fold took in the pinned BBA ({stale:?} vs {expected:?})"
+    );
+
+    let (status, body) = send(
+        addr,
+        reqwest::Method::POST,
+        "/api/v1/claims/publicize",
+        eve,
+        json!({"claim_ids": [c], "reason": "publish"}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let served = belief_cache(&pool, c).await;
+    assert_eq!(
+        belief_cache(&pool, control).await,
+        expected,
+        "the control is untouched by the act"
+    );
+    assert!(
+        near(served.0, expected.0) && near(served.1, expected.1) && near(served.2, expected.2),
+        "the published claim serves the fold of its public sources ({served:?}), not the \
+         team's ({stale:?}); control {expected:?}"
+    );
 }

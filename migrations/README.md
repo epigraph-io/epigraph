@@ -2645,6 +2645,45 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **215**: public `share_publicize_cascade` (backlog 3b505b5c and the
+  scoped half of 31285392; `docs/tenancy/share-with-team.md` section 4.6).
+  Re-states 206's `epigraph_publicize_claims(uuid[], text)` and
+  `epigraph_share_claims_with_team(uuid[], uuid, text)` with the same
+  signatures, classification, refusals and outcomes, and three more cascade
+  steps in both: an edge whose endpoint is a moved claim's EVIDENCE row is
+  re-met from its endpoints when its tuple was its meet (arm (d) and 206 only
+  re-met claim-endpoint edges; publicize may widen it with 206's writer-scope
+  rule, share never needs to); a `harvester_sources` row whose fragments all
+  agree after the move takes their pair by 173's derivation rule, and one
+  whose fragments disagree is left and counted (`harvester_sources_held`;
+  the spec's open question 10); and every `ds_combined_beliefs` and
+  `ds_bayesian_divergence` row of a moved claim is deleted as stale, as 184's
+  retraction does. Grants `epigraph_maintenance` DELETE on
+  `ds_bayesian_divergence` for that. The audit rows gain
+  `evidence_edges_rewritten`, `harvester_sources_moved`,
+  `harvester_sources_held`, `scoped_beliefs_cleared` and
+  `divergence_rows_cleared`, and say `migration` 215. The claim's own cached
+  belief is refolded in Rust by `epigraph_engine::visibility_act`, the one
+  caller of both acts, in the same transaction. When the claim's cache-owner
+  frame keeps no input the new audience may read, the cache is set to full
+  ignorance even if another frame has an admissible input (an ordinary
+  recompute vacates only when no frame has one). It refuses the act when the
+  session cannot write a moved claim. Pinned by
+  `epigraph-mcp/tests/claim_visibility_cascade_app_role.rs`,
+  `epigraph-api/tests/claim_visibility_http.rs`
+  (`publicize_over_http_refolds_the_belief_for_the_public`),
+  `epigraph-db/tests/writer_owned_edges.rs` (the writer scope is still read
+  twice by publicize and not by share) and
+  `epigraph-db/tests/share_publicize_cascade_undo.rs`. Undo:
+  `docs/runbooks/215-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 215, restoring both 206 bodies byte for byte, and revokes
+  the DELETE); it leaves the rows as 215 moved them. Checked before claiming:
+  slot 215 assigned to this batch; no migration on main or an origin branch
+  carries a `215`. **Deploy order:** migrate and roll out the 215 binary
+  together (a 206..214 binary leaves the cached belief folded for the old
+  audience; a 215 binary on a 206 body leaves the edges, sources and scoped
+  folds behind). **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 
