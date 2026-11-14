@@ -782,6 +782,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          maintenance role (ADS02) and the table's own trigger audits the change.",
     ),
     (
+        "authored_by.rs",
+        "agents_at",
+        "READ through migration 199's two definers, `epigraph_operator_bound_at` (the binding \
+         record, shown to every reader of the paper or claim) and \
+         `epigraph_agent_prompt_snapshot_at` (gated on the SESSION's own principal and the \
+         ruled audience), plus `agents.display_name` (077's `agents_identity`: every session). \
+         No tenant row; the caller's tenancy decided which agents are asked about, in the \
+         viewer-taking `for_papers_ingestions` on the same stamped connection.",
+    ),
+    (
         "bug_report.rs",
         "list_mine_conn",
         "READ through migration 207's principal-bound app-callable definer \

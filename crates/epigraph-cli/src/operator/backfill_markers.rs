@@ -196,8 +196,9 @@ pub const OPERATION: &str = "backfill-ingest-markers";
 pub const EVENT_APPLY: &str = "ingest_marker.backfill";
 /// `security_events.event_type` of an applied reversal.
 pub const EVENT_REVERSE: &str = "ingest_marker.backfill_reverse";
-/// The `tool` / `pipeline` of the ingest records this writes.
-pub const TOOL: &str = "backfill-ingest-markers";
+/// The `tool` / `pipeline` of the ingest records this writes. The tool is
+/// `epigraph_db::BACKFILL_INGEST_TOOL`, the one name readers mark `derived`.
+pub const TOOL: &str = epigraph_db::BACKFILL_INGEST_TOOL;
 pub const PIPELINE: &str = "legacy-backfill";
 /// How long after a claim its extraction trace may be written and still
 /// prove the claim was created by that extraction (the walk writes both in

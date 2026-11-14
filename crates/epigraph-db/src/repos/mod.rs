@@ -133,8 +133,8 @@ pub use atlas_layout::{
 };
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
-    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
-    PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperIngestion, PaperIngestions, PaperRef,
+    PromptSnapshotAt, PromptSnapshotAudience, MAX_PAPER_INGESTIONS, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
@@ -159,9 +159,10 @@ pub use claim_context::{
 pub use claim_ingest::{
     credited_agent_end, ingest_only_edge_refusal, is_agent_attribution,
     staged_provenance_refusal_sql, ClaimIngestRecord, ClaimIngestRepository, ClaimIngests,
-    CreditedEnd, AGENT_ATTRIBUTION_REFUSAL, AGENT_SOURCE_AUTHORSHIP, AGENT_TARGET_AUTHORSHIP,
-    CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY, INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED,
-    INGEST_RECORD_RELATIONSHIP, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
+    CreditedEnd, PaperIngestRecord, AGENT_ATTRIBUTION_REFUSAL, AGENT_SOURCE_AUTHORSHIP,
+    AGENT_TARGET_AUTHORSHIP, BACKFILL_INGEST_TOOL, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
+    INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
+    OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
 };
 pub use claim_ingest::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 pub use claim_theme::{

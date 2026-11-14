@@ -1,6 +1,7 @@
 #![cfg(feature = "db")]
-//! `GET /api/v1/papers` carries each paper's authors and its claim count,
-//! as the CALLER's viewer sees them (backlog fe75ef36).
+//! `GET /api/v1/papers` carries each paper's authors, its claim count and
+//! its ingestion block, as the CALLER's viewer sees them (backlogs fe75ef36,
+//! b7354adc).
 //!
 //! Every request goes through the full router with a real bearer, on an
 //! `AppState` whose pools are both the APPLICATION ROLE, so a row the caller
@@ -15,7 +16,12 @@
 //!   not listed;
 //! * `claim_count` counts each claim any ingest of the paper asserts once,
 //!   only while the assertion is in force and both the assertion and the
-//!   claim are readable by the caller.
+//!   claim are readable by the caller;
+//! * `ingestions` lists every readable ingest of the paper once, oldest
+//!   first, at its EARLIEST record, with the ingester's human at that time,
+//!   the prompt snapshot only for the snapshot's audience, and `derived` on a
+//!   record the legacy backfill wrote; an ingest whose assertion the caller
+//!   cannot read is not listed.
 
 mod common;
 mod viewer_fixture;
@@ -24,13 +30,16 @@ use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
 use epigraph_api::create_router;
 use epigraph_api::state::{ApiConfig, AppState};
-use epigraph_db::{ScopedPool, SessionGucMode};
+use epigraph_db::{
+    AgentIdentityRepository, AgentRepository, IdentityRegistration, PromptFile,
+    PromptSnapshotAudience, ScopedPool, SessionGucMode, PROMPT_SNAPSHOT_AUDIENCE,
+};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
-use viewer_fixture::{database_url_for, downgraded_pool};
+use viewer_fixture::{as_role, database_url_for, downgraded_pool};
 
 async fn app_role_state(pool: &PgPool) -> AppState {
     let url = database_url_for(pool).await;
@@ -42,6 +51,13 @@ async fn app_role_state(pool: &PgPool) -> AppState {
     let mut state = AppState::with_db(raw, ApiConfig::default());
     state.scoped = Some(scoped);
     state
+}
+
+fn random32() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    out[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    out
 }
 
 async fn named(pool: &PgPool, agent: Uuid, name: &str) {
@@ -57,6 +73,51 @@ async fn agent(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     let (id, group) = viewer_fixture::seed_agent_with_group(pool, name).await;
     named(pool, id, name).await;
     (id, group)
+}
+
+async fn human(pool: &PgPool, name: &str) -> Uuid {
+    let (id, _) = agent(pool, name).await;
+    viewer_fixture::make_human_operator(pool, id).await;
+    id
+}
+
+async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let out = as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_operator(&mut conn, agent, operator).await;
+        (conn, r)
+    })
+    .await
+    .expect("the maintenance role links the agent");
+    assert!(out.link_live, "CALIBRATION: the manual link is live");
+}
+
+/// A registered identity (so it has a prompt snapshot) linked to `operator`.
+async fn registered_agent(pool: &PgPool, operator: Uuid, name: &str) -> (Uuid, Uuid) {
+    let pubkey = random32();
+    let reg = IdentityRegistration {
+        identity_pubkey: pubkey,
+        parent_agent_id: None,
+        model: "test-model-9".to_string(),
+        prompt_hash: blake3::hash(&pubkey).to_hex().to_string(),
+        group_folder: "g-papers".to_string(),
+        signing_pubkey: Some(random32()),
+        identity_md: PromptFile::Absent,
+        global_claude_md: PromptFile::Absent,
+        group_claude_md: PromptFile::Stored(b"group rules\n".to_vec()),
+        learned_md: PromptFile::Absent,
+        in_prompt: json!({"global_claude_md": false, "group_claude_md": true, "learned_md": false}),
+        runner_version: Some("runner-test".to_string()),
+        host_sha: None,
+    };
+    let out = as_role(pool, "epigraph_identity_attestor", |mut conn| async move {
+        let r = AgentIdentityRepository::register(&mut conn, &reg).await;
+        (conn, r)
+    })
+    .await
+    .expect("the attestor registers");
+    link(pool, out.agent_id, operator).await;
+    named(pool, out.agent_id, name).await;
+    (out.agent_id, out.snapshot_id)
 }
 
 async fn paper(pool: &PgPool, doi: &str, title: &str) -> Uuid {
@@ -320,5 +381,105 @@ async fn a_paper_lists_one_ingests_authors_and_counts_only_readable_claims(pool:
         item["claim_count"],
         json!(3),
         "c1 still via the other ingest: {item}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paper_names_each_ingest_with_its_human_model_and_date(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let operator = human(&pool, "Operator Fixture").await;
+    let (stranger, _) = agent(&pool, "stranger").await;
+    let (member, group) = agent(&pool, "member").await;
+    let (ingester, snapshot) = registered_agent(&pool, operator, "ingest-agent").await;
+    let (legacy, _) = agent(&pool, "legacy-principal").await;
+    let (private_ingester, _) = agent(&pool, "private-ingester").await;
+    let doc = paper(&pool, "10.5555/papers.ingestion", "Ingestion Paper").await;
+
+    let c1 = viewer_fixture::seed_public_claim(&pool, ingester, "ingestion claim 1").await;
+    let c2 = viewer_fixture::seed_public_claim(&pool, ingester, "ingestion claim 2").await;
+    let (_, r1) = ingest(&pool, "ingest_document", doc, c1, ingester, true).await;
+    let (_, r2) = ingest(&pool, "ingest_document", doc, c2, ingester, true).await;
+    // Two records of one ingest: the block is at the EARLIEST.
+    set_edge_created_at(&pool, r2, "2099-02-01T00:00:00Z").await;
+    let first_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM edges WHERE id = $1")
+            .bind(r1)
+            .fetch_one(&pool)
+            .await
+            .expect("first record time");
+
+    // A record the legacy backfill wrote.
+    let (_, rl) = ingest(&pool, "backfill-ingest-markers", doc, c1, legacy, false).await;
+    set_edge_created_at(&pool, rl, "2099-03-01T00:00:00Z").await;
+
+    // An ingest whose ASSERTION only the member's group can read (its record
+    // stays public): the record counts only beside its own readable
+    // assertion.
+    let (pa, pr) = ingest(&pool, "ingest_document", doc, c2, private_ingester, false).await;
+    make_group_private(&pool, pa, group).await;
+    set_edge_created_at(&pool, pr, "2099-04-01T00:00:00Z").await;
+
+    let mine = by_doi(&state, operator, "10.5555/papers.ingestion").await;
+    let got = mine["ingestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{mine}"));
+    assert_eq!(got.len(), 2, "one entry per readable ingest: {mine}");
+    let block = &got[0];
+    assert_eq!(
+        block["ingested_by"],
+        json!({"id": ingester, "display_name": "ingest-agent"}),
+        "{mine}"
+    );
+    assert_eq!(
+        block["human"],
+        json!({"id": operator, "display_name": "Operator Fixture"}),
+        "{mine}"
+    );
+    let at: chrono::DateTime<chrono::Utc> = serde_json::from_value(block["ingested_at"].clone())
+        .unwrap_or_else(|e| panic!("ingested_at {e}: {mine}"));
+    assert_eq!(at, first_at, "the earliest record: {mine}");
+    assert_eq!(block["tool"], json!("ingest_document"), "{mine}");
+    assert_eq!(block["pipeline"], json!("test-pipeline"), "{mine}");
+    assert_eq!(block["derived"], json!(false), "{mine}");
+    let snap = &block["prompt_snapshot"];
+    assert_eq!(snap["snapshot_id"], json!(snapshot), "{mine}");
+    assert_eq!(snap["model"], json!("test-model-9"), "{mine}");
+    assert!(snap.get("text").is_none(), "no prompt text: {mine}");
+
+    let legacy_block = &got[1];
+    assert_eq!(legacy_block["ingested_by"]["id"], json!(legacy), "{mine}");
+    assert_eq!(legacy_block["derived"], json!(true), "{mine}");
+    assert_eq!(legacy_block["human"], Value::Null, "{mine}");
+    assert_eq!(mine["ingestions_truncated"], json!(false), "{mine}");
+
+    let theirs = by_doi(&state, stranger, "10.5555/papers.ingestion").await;
+    let tb = &theirs["ingestions"][0];
+    assert_eq!(tb["ingested_by"], block["ingested_by"], "{theirs}");
+    assert_eq!(tb["human"], block["human"], "every reader sees the human");
+    match PROMPT_SNAPSHOT_AUDIENCE {
+        PromptSnapshotAudience::OperatorAndAdmins => assert_eq!(
+            tb["prompt_snapshot"],
+            Value::Null,
+            "gated: a stranger does not see the snapshot: {theirs}"
+        ),
+        PromptSnapshotAudience::ClaimReaders => assert_eq!(&tb["prompt_snapshot"], snap),
+    }
+    assert_eq!(
+        theirs["ingestions"].as_array().map(Vec::len),
+        Some(2),
+        "the private ingest is not the stranger's: {theirs}"
+    );
+
+    let members = by_doi(&state, member, "10.5555/papers.ingestion").await;
+    let ids: Vec<Value> = members["ingestions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{members}"))
+        .iter()
+        .map(|b| b["ingested_by"]["id"].clone())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![json!(ingester), json!(legacy), json!(private_ingester)],
+        "oldest first, the private ingest for its group: {members}"
     );
 }

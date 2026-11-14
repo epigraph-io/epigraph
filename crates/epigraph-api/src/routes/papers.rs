@@ -9,13 +9,15 @@
 //! # Tenancy: the listing reads as the caller; the writer does not
 //!
 //! `GET /api/v1/papers` returns, beside each `papers` row, the paper's
-//! authors and its claim count, and both depend on who asks: an assertion or
-//! a claim the caller cannot read is neither counted nor listed. So `list_papers` takes a
+//! authors, its claim count and its ingestion block, and every one of those
+//! depends on who asks: an assertion, a claim or an ingest record the caller
+//! cannot read is neither counted nor listed. So `list_papers` takes a
 //! [`ViewerExtractor`](crate::middleware::bearer::ViewerExtractor) and runs
 //! every statement, the `papers` page included, on ONE viewer-stamped
 //! connection ([`AppState::read_as`]); the enrichment reads live in the repo
 //! layer (`PaperRepository::{count_readable_claims_of_papers,
-//! first_ingest_principals, list_authors_bounded}`), where the visibility
+//! first_ingest_principals, list_authors_bounded}`,
+//! `AuthoredByRepository::for_papers_ingestions`), where the visibility
 //! markers apply. `ViewerExtractor` refuses a token with no agent id (401);
 //! every token the server issues carries one (`oauth::token::principal_agent_id`).
 //!
@@ -81,6 +83,13 @@ fn default_limit() -> i64 {
     20
 }
 
+/// An agent, as `GET /api/v1/agents/:id` names it.
+#[derive(Serialize, Debug, Clone)]
+pub struct PaperAgentRef {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+}
+
 /// One author of a listed paper, from its `authored` edge.
 #[derive(Serialize, Debug, Clone)]
 pub struct PaperAuthorItem {
@@ -94,6 +103,35 @@ pub struct PaperAuthorItem {
     /// On a pending author only: the ingester that named them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub named_by: Option<Uuid>,
+}
+
+/// The prompt snapshot an ingesting agent ran (never the prompt text).
+#[derive(Serialize, Debug, Clone)]
+pub struct PaperPromptSnapshot {
+    pub snapshot_id: Uuid,
+    pub model: String,
+    pub prompt_hash: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One ingest of a listed paper.
+#[derive(Serialize, Debug, Clone)]
+pub struct PaperIngestionItem {
+    /// The ingesting agent.
+    pub ingested_by: PaperAgentRef,
+    /// The human that agent was bound to at `ingested_at`, for every reader.
+    pub human: Option<PaperAgentRef>,
+    /// The snapshot it ran then; `null` unless the caller is in the
+    /// snapshot's audience (the agent's human and admins), and when none was
+    /// active.
+    pub prompt_snapshot: Option<PaperPromptSnapshot>,
+    /// The ingest's earliest readable record of the paper.
+    pub ingested_at: chrono::DateTime<chrono::Utc>,
+    pub tool: Option<String>,
+    pub pipeline: Option<String>,
+    /// The record was derived after the fact by the legacy ingest-marker
+    /// backfill, not written by the ingest itself.
+    pub derived: bool,
 }
 
 /// One paper of `GET /api/v1/papers`: the row, and what the caller may read
@@ -117,6 +155,9 @@ pub struct PaperListItem {
     /// The claims any ingest of the paper asserts, each once, whose
     /// assertion is in force and readable and which the caller can read.
     pub claim_count: i64,
+    /// Every readable ingest of the paper, oldest first, at most 10.
+    pub ingestions: Vec<PaperIngestionItem>,
+    pub ingestions_truncated: bool,
 }
 
 /// Paginated paper response
@@ -264,8 +305,8 @@ pub async fn create_paper(
 ///
 /// GET /api/v1/papers?doi=10.1234/example&limit=20&offset=0
 ///
-/// Each item carries the paper's authors and claim count as the caller's
-/// viewer sees them ([`PaperListItem`]). Every statement runs on one
+/// Each item carries the paper's authors, claim count and ingestions as the
+/// caller's viewer sees them ([`PaperListItem`]). Every statement runs on one
 /// viewer-stamped connection (module doc).
 #[cfg(feature = "db")]
 pub async fn list_papers(
@@ -379,8 +420,21 @@ pub async fn list_papers(
     )
     .await
     .map_err(enrich)?;
+    let mut ingestions = epigraph_db::AuthoredByRepository::for_papers_ingestions(
+        &mut read,
+        &viewer,
+        &ids,
+        epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
+    )
+    .await
+    .map_err(enrich)?;
+
     crate::routes::finish_scoped_read(read, "list_papers").await?;
 
+    let agent_ref = |a: epigraph_db::AuthorRef| PaperAgentRef {
+        id: a.id,
+        display_name: a.display_name,
+    };
     let items = papers
         .into_iter()
         .map(|paper| {
@@ -407,6 +461,7 @@ pub async fn list_papers(
                     plain.push(item);
                 }
             }
+            let block = ingestions.remove(&id).unwrap_or_default();
             PaperListItem {
                 paper,
                 authors: plain,
@@ -414,6 +469,25 @@ pub async fn list_papers(
                 authors_truncated,
                 authors_ingested_by: firsts.get(&id).map(|p| p.ingested_by),
                 claim_count: counts.get(&id).copied().unwrap_or(0),
+                ingestions: block
+                    .ingestions
+                    .into_iter()
+                    .map(|i| PaperIngestionItem {
+                        ingested_by: agent_ref(i.ingested_by),
+                        human: i.human.map(agent_ref),
+                        prompt_snapshot: i.prompt_snapshot.map(|s| PaperPromptSnapshot {
+                            snapshot_id: s.snapshot_id,
+                            model: s.model,
+                            prompt_hash: s.prompt_hash,
+                            started_at: s.started_at,
+                        }),
+                        ingested_at: i.ingested_at,
+                        tool: i.tool,
+                        pipeline: i.pipeline,
+                        derived: i.derived,
+                    })
+                    .collect(),
+                ingestions_truncated: block.truncated,
             }
         })
         .collect();

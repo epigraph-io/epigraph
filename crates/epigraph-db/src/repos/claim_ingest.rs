@@ -104,6 +104,35 @@ pub const INGEST_RECORD_KEYS_RESERVED: &str =
      reserved for the document ingest's own records (which ingest created a claim, who \
      ingested a document, which authors it named); nothing was written";
 
+/// The ingest-written marker `tool` of the records the operator's legacy
+/// ingest-marker backfill (`epigraph-operator backfill-ingest-markers`)
+/// writes: a record DERIVED from pre-record ingest edges, not written by the
+/// ingest itself. Readers mark such a record `derived`. The marker is
+/// unforgeable for application sessions (migration 198's guard), so this
+/// tool name cannot be claimed by an ordinary write.
+pub const BACKFILL_INGEST_TOOL: &str = "backfill-ingest-markers";
+
+/// One ingest of a paper as [`ClaimIngestRepository::first_ingests_of_papers`]
+/// reads it: the ingester's EARLIEST readable record on the paper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperIngestRecord {
+    /// The ingesting agent.
+    pub ingested_by: Uuid,
+    /// Its earliest readable record of the paper (the ingest's transaction
+    /// time).
+    pub first_recorded_at: DateTime<Utc>,
+    /// That record's ingest-written marker `tool` (`ingest_document`,
+    /// `ingest_document_spine`, [`BACKFILL_INGEST_TOOL`]); `None` for a
+    /// label-form marker.
+    pub tool: Option<String>,
+    /// That record's `pipeline` stamp.
+    pub pipeline: Option<String>,
+    /// The record was derived after the fact rather than written by the
+    /// ingest: its marker names [`BACKFILL_INGEST_TOOL`], or it carries the
+    /// backfill's label-form marker instead of the ingest's property.
+    pub derived: bool,
+}
+
 /// Most claims one [`ClaimIngestRepository::for_claims`] call reads.
 pub const FOR_CLAIMS_CAP: usize = 200;
 /// Most records listed per claim (oldest first).
@@ -346,6 +375,113 @@ impl ClaimIngestRepository {
                 entry.records.push(record);
             }
             entry.truncated = total > RECORDS_PER_CLAIM_CAP;
+        }
+        Ok(out)
+    }
+
+    /// The ingests of each of `paper_ids` that `viewer` may read, one entry
+    /// per ingester at its EARLIEST readable record, oldest first, at most
+    /// `per_paper` per paper, plus whether more exist. A record counts under
+    /// the read contract of [`Self::for_claims`] (marked, in force, its own
+    /// ingester's in-force assertion of the same claim from the same paper
+    /// readable, the record and the claim readable), so a caller never learns
+    /// of an ingest whose assertion it cannot read. A paper with no readable
+    /// record is absent. One statement for the whole page.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn first_ingests_of_papers(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        paper_ids: &[Uuid],
+        per_paper: i64,
+    ) -> Result<HashMap<Uuid, (Vec<PaperIngestRecord>, bool)>, DbError> {
+        let mut out: HashMap<Uuid, (Vec<PaperIngestRecord>, bool)> = HashMap::new();
+        if paper_ids.is_empty() || per_paper <= 0 {
+            return Ok(out);
+        }
+        let in_force = |alias: &str| EDGE_IN_FORCE.replace("e.", &format!("{alias}."));
+        let sql = viewer.splice(
+            &format!(
+                "SELECT k.paper_id, k.ingested_by, k.first_at, k.tool, k.pipeline, \
+                        k.derived, k.total \
+                   FROM (SELECT f.*, \
+                                row_number() OVER (PARTITION BY f.paper_id \
+                                                   ORDER BY f.first_at, f.ingested_by) AS n, \
+                                count(*) OVER (PARTITION BY f.paper_id) AS total \
+                           FROM (SELECT DISTINCT ON (r.source_id, r.properties ->> '{by}') \
+                                        r.source_id AS paper_id, \
+                                        (r.properties ->> '{by}')::uuid AS ingested_by, \
+                                        r.created_at AS first_at, \
+                                        r.properties -> '{marker}' ->> 'tool' AS tool, \
+                                        r.properties ->> 'pipeline' AS pipeline, \
+                                        COALESCE(r.properties -> '{marker}' ->> 'tool' = $3, \
+                                                 true) AS derived \
+                                   FROM edges r \
+                                   JOIN claims c ON c.id = r.target_id \
+                                  WHERE r.source_id = ANY($1::uuid[]) \
+                                    AND r.source_type = 'paper' AND r.target_type = 'claim' \
+                                    AND r.relationship = '{rel}' \
+                                    AND r.properties ->> '{by}' ~ '{uuid_re}' \
+                                    AND {marked_r} \
+                                    AND {marker_by_r} = r.properties ->> '{by}' \
+                                    AND {in_force_r} \
+                                    AND EXISTS ( \
+                                        SELECT 1 FROM edges a \
+                                         WHERE a.source_id = r.source_id \
+                                           AND a.source_type = 'paper' \
+                                           AND a.target_id = r.target_id \
+                                           AND a.target_type = 'claim' \
+                                           AND a.relationship = 'asserts' AND {in_force_a} \
+                                           AND {marked_a} AND {same_ingest_ar} \
+                                           /* {{EDGE_VISIBILITY:a}} */) \
+                                    /* {{EDGE_VISIBILITY:r}} */ \
+                                    /* {{VISIBILITY:c}} */ \
+                                  ORDER BY r.source_id, r.properties ->> '{by}', \
+                                           r.created_at, r.id) f) k \
+                  WHERE k.n <= $2 \
+                  ORDER BY k.paper_id, k.n",
+                by = INGESTED_BY_PROPERTY,
+                marker = crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY,
+                uuid_re = "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$",
+                rel = INGEST_RECORD_RELATIONSHIP,
+                in_force_r = in_force("r"),
+                in_force_a = in_force("a"),
+                marked_r = crate::repos::ingest_written::ingest_written_edge_sql("r"),
+                marker_by_r = crate::repos::ingest_written::ingest_written_by_sql("r"),
+                marked_a = crate::repos::ingest_written::ingest_written_edge_sql("a"),
+                same_ingest_ar = crate::repos::ingest_written::same_ingest_sql("a", "r"),
+            ),
+            4,
+        );
+        type Row = (
+            Uuid,
+            Uuid,
+            DateTime<Utc>,
+            Option<String>,
+            Option<String>,
+            bool,
+            i64,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(paper_ids)
+            .bind(per_paper)
+            .bind(BACKFILL_INGEST_TOOL);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        for (paper, ingested_by, first_recorded_at, tool, pipeline, derived, total) in
+            q.fetch_all(&mut *conn).await?
+        {
+            let entry = out.entry(paper).or_default();
+            entry.0.push(PaperIngestRecord {
+                ingested_by,
+                first_recorded_at,
+                tool,
+                pipeline,
+                derived,
+            });
+            entry.1 = total > per_paper;
         }
         Ok(out)
     }

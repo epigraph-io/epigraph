@@ -99,7 +99,8 @@ pub use repos::{
     AgentNameMatch, AgentRef, AgentSearchHit, AuthorNode, AuthorRef, AuthoredBy,
     AuthoredByRepository, CardCounts, CardRole, Corroboration, Filer, FindAgentQuery,
     FindAgentResult, Ingester, LiteratureAuthorship, MatchTier, PaperAuthor, PaperAuthorship,
-    PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
+    PaperIngestion, PaperIngestions, PaperRef, PromptSnapshotAt, PromptSnapshotAudience,
+    MAX_PAPER_INGESTIONS, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
@@ -153,11 +154,12 @@ pub use repos::{
     create_ingest_written_edge_if_absent_conn, credited_agent_end, ingest_only_edge_refusal,
     ingest_written, ingest_written_by_sql, ingest_written_edge_sql, is_agent_attribution,
     same_ingest_sql, staged_provenance_refusal_sql, without_ingest_marker, ClaimIngestRecord,
-    ClaimIngestRepository, ClaimIngests, CreditedEnd, AGENT_ATTRIBUTION_REFUSAL,
-    AGENT_SOURCE_AUTHORSHIP, AGENT_TARGET_AUTHORSHIP, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
-    INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
-    INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
-    INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
+    ClaimIngestRepository, ClaimIngests, CreditedEnd, PaperIngestRecord, AGENT_ATTRIBUTION_REFUSAL,
+    AGENT_SOURCE_AUTHORSHIP, AGENT_TARGET_AUTHORSHIP, BACKFILL_INGEST_TOOL, CREATED_CLAIM_PROPERTY,
+    INGESTED_BY_PROPERTY, INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED,
+    INGEST_RECORD_RELATIONSHIP, INGEST_WRITTEN_BY_FIELD, INGEST_WRITTEN_KEY_RESERVED,
+    INGEST_WRITTEN_PROPERTY, INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES, OPERATED_BY_REFUSAL,
+    OPERATED_BY_RELATIONSHIP,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
