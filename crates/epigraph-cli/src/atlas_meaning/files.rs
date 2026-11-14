@@ -208,8 +208,56 @@ pub struct ResultDoc {
     pub seed: u64,
     /// numpy, scikit-learn, umap-learn and python versions of the compute
     /// host: ids persist across runs only while the clustering reproduces.
-    pub versions: serde_json::Value,
+    pub versions: ComputeVersions,
     pub themes: Vec<ResultTheme>,
+}
+
+/// The library versions a result was computed with
+/// (`atlas_meaning_core._versions`). It comes from the off-box file and is
+/// stored in the run's `params` (which every session reads on the public
+/// map), so it is typed: these four keys only, each a short version string
+/// or null ([`ComputeVersions::check`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputeVersions {
+    #[serde(default)]
+    pub numpy: Option<String>,
+    #[serde(default, rename = "scikit-learn")]
+    pub scikit_learn: Option<String>,
+    #[serde(default, rename = "umap-learn")]
+    pub umap_learn: Option<String>,
+    #[serde(default)]
+    pub python: Option<String>,
+}
+
+/// The longest version string a result may carry.
+pub const MAX_VERSION_LEN: usize = 64;
+
+impl ComputeVersions {
+    /// Refuse a version that is not a short version string (ASCII
+    /// alphanumerics and `.+-_`, at most [`MAX_VERSION_LEN`] bytes).
+    ///
+    /// # Errors
+    /// A version string that is too long or holds another character.
+    pub fn check(&self) -> anyhow::Result<()> {
+        for (key, v) in [
+            ("numpy", &self.numpy),
+            ("scikit-learn", &self.scikit_learn),
+            ("umap-learn", &self.umap_learn),
+            ("python", &self.python),
+        ] {
+            let Some(v) = v else { continue };
+            ensure!(
+                !v.is_empty()
+                    && v.len() <= MAX_VERSION_LEN
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b)),
+                "the result's {key} version is not a version string ({} bytes)",
+                v.len()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One theme of a result.
@@ -236,6 +284,9 @@ pub fn read_result(path: &Path) -> anyhow::Result<ResultDoc> {
         path.display(),
         doc.format
     );
+    doc.versions
+        .check()
+        .with_context(|| format!("{}", path.display()))?;
     Ok(doc)
 }
 
@@ -518,8 +569,39 @@ mod tests {
         other.map = "public".to_string();
         assert!(merge_results(vec![a.clone(), other]).is_err(), "map");
         let mut other = b;
-        other.versions = serde_json::json!({"numpy": "0.0.1"});
+        other.versions.numpy = Some("0.0.1".to_string());
         assert!(merge_results(vec![a, other]).is_err(), "versions");
+    }
+
+    /// The off-box `versions` is typed: an unknown key, a non-string or an
+    /// over-long or odd version string is refused, so nothing arbitrary
+    /// reaches the run's params.
+    #[test]
+    fn a_result_with_arbitrary_versions_is_refused() {
+        let committed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixture().join("result.json")).unwrap()).unwrap();
+        let bad = [
+            serde_json::json!({"numpy": "1.26.4", "note": "x"}),
+            serde_json::json!({"numpy": {"nested": true}}),
+            serde_json::json!({"numpy": "1".repeat(MAX_VERSION_LEN + 1)}),
+            serde_json::json!({"python": "3.12 <script>"}),
+            serde_json::json!({"python": ""}),
+        ];
+        for v in bad {
+            let mut doc = committed.clone();
+            doc["versions"] = v.clone();
+            let path = std::env::temp_dir().join(format!("atlas-meaning-{}.json", Uuid::new_v4()));
+            std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert!(read_result(&path).is_err(), "{v} was accepted");
+            std::fs::remove_file(&path).ok();
+        }
+        let mut doc = committed;
+        doc["versions"] = serde_json::json!({"umap-learn": null, "python": "3.12.3"});
+        let path = std::env::temp_dir().join(format!("atlas-meaning-{}.json", Uuid::new_v4()));
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let ok = read_result(&path).expect("null and missing versions are allowed");
+        assert_eq!(ok.versions.python.as_deref(), Some("3.12.3"));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

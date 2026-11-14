@@ -21,7 +21,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use epigraph_cli::atlas_meaning::build::{apply_result, export_map, ExportOptions};
-use epigraph_cli::atlas_meaning::files::{ExportIndex, ResultDoc, ResultTheme, ThemeFile};
+use epigraph_cli::atlas_meaning::files::{
+    ComputeVersions, ExportIndex, ResultDoc, ResultTheme, ThemeFile,
+};
 use epigraph_cli::atlas_meaning::tree::{group_id, map_key, root_id, WireGroup, WireKind};
 use epigraph_db::repos::atlas_leaf::{assemble_leaf, AtlasLeafRepository, LeafOutcome};
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap};
@@ -246,7 +248,7 @@ fn result(map: AtlasMap, themes: Vec<ResultTheme>) -> ResultDoc {
         hierarchy: "meaning".to_string(),
         cap: CAP,
         seed: 42,
-        versions: serde_json::json!({}),
+        versions: ComputeVersions::default(),
         themes,
     }
 }

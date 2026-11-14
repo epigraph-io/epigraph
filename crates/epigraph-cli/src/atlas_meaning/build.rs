@@ -189,6 +189,7 @@ pub async fn resolve_result(
         "the result is for the {:?} hierarchy",
         result.hierarchy
     );
+    result.versions.check()?;
     ensure!(
         result.cap <= cap,
         "the result was computed for a cap of {}, over this apply's {cap}",
