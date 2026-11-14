@@ -699,9 +699,19 @@ fn is_cc_jurisdiction_port(port: &str) -> bool {
 /// The `raw_content` of the evidence row a document ingest writes for one
 /// planned claim. Always the citation, the passage's locator and the BLAKE3
 /// hash of the passage; the passage text itself only when the source's
-/// licence permits retention ([`passage_retention_permitted`]). A reader who
-/// holds the source re-derives the quote from the locator and checks it
-/// against the hash; a reader who does not was never licensed to see it.
+/// licence permits retention ([`passage_retention_permitted`]).
+///
+/// For a Tier-1 extraction (one carrying `source_text` and byte spans) a
+/// reader who holds the source re-derives the quote from the locator's span
+/// and checks it against the hash. For a Tier-2 extraction the locator names
+/// the extractor's section/paragraph path and section title only, and the
+/// hash covers the extracted text, which need not match the source byte for
+/// byte; there the hash pins what was extracted, not a reproducible span.
+///
+/// This removes the passage from the evidence row only. A level-2 paragraph
+/// claim's own `content` is still the paragraph text (see
+/// `epigraph_ingest::document::builder::build_ingest_plan`), which is a
+/// separate decision.
 ///
 /// The evidence row's `content_hash` is the hash of THIS string, so two
 /// different passages on one claim still produce two different rows.

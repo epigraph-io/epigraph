@@ -178,6 +178,8 @@ fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
 /// The [`PlannedClaim::supporting_locator`] of a section or paragraph node:
 /// its extraction path, the section title a reader can find in the source,
 /// and the byte span into `source_text` when the extractor supplied one.
+/// Only a Tier-1 extraction has that span; a Tier-2 locator indexes the
+/// extractor's output, not the source document.
 #[must_use]
 pub fn passage_locator(path: &str, section_title: &str, span: Option<&ByteSpan>) -> String {
     let mut locator = format!("{path} ({section_title:?})");

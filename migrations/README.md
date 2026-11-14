@@ -2659,10 +2659,16 @@ restart.
   CHECK `papers_licence_nonblank` (refuses an empty or padded value). The
   document ingest writers (`do_ingest_document`, `do_ingest_document_spine`)
   READ it to decide whether an evidence row may keep the verbatim source
-  passage (`passage_retention_permitted`: public domain, CC0, CC BY and
-  CC BY-SA; never `-NC`/`-ND`); otherwise the row carries the citation, a
-  locator and the passage's BLAKE3 hash only. Ingest never writes the column:
-  an operator sets it. `papers` carries no tenancy, so no policy changes.
+  passage (`passage_retention_permitted`: an exact allowlist of public
+  domain, CC0, CC BY and CC BY-SA SPDX ids; never NC/ND, and free text fails
+  closed); otherwise the row carries the citation, a locator and the
+  passage's BLAKE3 hash only. Ingest never writes the column; by convention
+  an operator sets it (not enforced: the application role keeps UPDATE on
+  the REGISTRY table `papers`). `papers` carries no tenancy, so no policy
+  changes. Sets `lock_timeout = '3s'`. **Scope:** evidence rows only; a
+  level-2 paragraph claim's `content` still holds the paragraph text. The
+  locator's byte span (a reproducible hash check) exists for Tier-1
+  extractions only.
   Pinned by `epigraph-mcp/tests/ingest_evidence_passage_retention.rs`. Undo:
   `docs/runbooks/226-undo.sql` (loses every recorded licence; roll back every
   226 binary first). **Deploy order:** migrate before rolling out the 226
