@@ -142,6 +142,32 @@ fn with_increments((alpha, beta): (f64, f64), increments: Option<(f64, f64)>) ->
     }
 }
 
+/// The version of frame `frame_id` as the viewer reads it, for a divergence
+/// row's `frame_version`. Best-effort, under its own savepoint: a refused read
+/// is logged and reads as `None`, and never aborts the caller's transaction.
+///
+/// # Errors
+/// Only when the savepoint cannot be opened or closed.
+pub async fn frame_version(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    frame_id: Uuid,
+    context: &str,
+) -> Result<Option<i32>, sqlx::Error> {
+    let mut sp = conn.begin().await?;
+    match epigraph_db::FrameRepository::get_by_id(&mut *sp, viewer, frame_id).await {
+        Ok(row) => {
+            sp.commit().await?;
+            Ok(row.map(|f| f.version))
+        }
+        Err(e) => {
+            tracing::warn!("{context}: frame version read refused: {e}");
+            sp.rollback().await?;
+            Ok(None)
+        }
+    }
+}
+
 /// Store one `ds_bayesian_divergence` row for `(claim_id, frame_id)`:
 /// `pignistic_prob`, `bayesian_posterior` and their
 /// [`kl_divergence_bernoulli`]. Returns whether the row was stored.

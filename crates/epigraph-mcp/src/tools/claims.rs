@@ -1730,10 +1730,14 @@ pub async fn update_with_evidence(
     )
     .await
     .map_err(internal_error)?;
-    let frame_version = epigraph_db::FrameRepository::get_by_id(&mut *tx, viewer, ds.frame_id)
-        .await
-        .map_err(internal_error)?
-        .map(|f| f.version);
+    let frame_version = epigraph_engine::ds_divergence::frame_version(
+        &mut tx,
+        viewer,
+        ds.frame_id,
+        "update_with_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
     epigraph_engine::ds_divergence::record_divergence(
         &mut tx,
         claim_id,
