@@ -206,7 +206,8 @@ pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use graph_view::{
     AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GqlColumn, GqlCondition,
     GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk, GraphNodeRow, GraphViewRepository,
-    SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+    InducedEdgeRow, NeighborhoodEdgeRow, StructuralEdgeRow, SubgraphClaimRow, SubgraphEdgeRow,
+    SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use ingest_written::{
     create_ingest_written_edge_if_absent_conn, ingest_written_by_sql, ingest_written_edge_sql,

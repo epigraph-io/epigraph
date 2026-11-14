@@ -212,8 +212,9 @@ pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::graph_view::{
     AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GqlColumn, GqlCondition,
-    GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk, GraphNodeRow, SubgraphClaimRow,
-    SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+    GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk, GraphNodeRow, InducedEdgeRow,
+    NeighborhoodEdgeRow, StructuralEdgeRow, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow,
+    SubgraphTraceRow,
 };
 pub use repos::mass_function::{
     cached_combination_slot_holds_input, delete_edge_bbas, CachedBelief, EdgeBbaCascade,

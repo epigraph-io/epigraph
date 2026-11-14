@@ -206,13 +206,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "unretract_bba",
         &["MassFunctionRepository::unretract_conn"],
     ),
-    // open finding: F-aggregate-existence-oracles (the frame's conflict
-    // aggregate over mass_functions).
-    (
-        "belief.rs",
-        "frame_conflict",
-        &["sqlx::query_as(SELECT).fetch_one"],
-    ),
     // gated (parent frame) then write.
     (
         "belief.rs",
@@ -734,16 +727,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AtlasLayoutRepository::resolve_sides",
             "AtlasLayoutRepository::run",
-        ],
-    ),
-    // open finding: F-aggregate-existence-oracles (the two decomposes_to
-    // counts deciding center_kind).
-    (
-        "graph_neighborhood.rs",
-        "claim_compound_neighborhood",
-        &[
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
     // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
@@ -1308,24 +1291,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "db_pool.acquire",
             "sqlx::query_scalar(SELECT).fetch_optional",
-        ],
-    ),
-    // stamped: the neighborhood's edge projections, on the caller's stamped
-    // connection, are constrained in Rust to endpoints that survived the
-    // viewer-filtered node projection (PR-07); the edges' own predicate is
-    // F-edges-unfiltered.
-    (
-        "graph_neighborhood.rs",
-        "atomic_response",
-        &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    (
-        "graph_neighborhood.rs",
-        "compound_response",
-        &[
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
         ],
     ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an

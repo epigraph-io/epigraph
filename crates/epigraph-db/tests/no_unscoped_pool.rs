@@ -1041,9 +1041,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 92, row-level security is OFF on both and neither carries a policy, so
     // stamping that connection narrows nothing. The stamp is for the `claims` /
     // `edges` / `claim_neighborhood_membership` reads that follow. (2) The seven
-    // inline edge/membership aggregates in this file remain viewer-less in the
-    // statement; `F-edges-unfiltered` owns that and conversion neither closes
-    // nor worsens it. What DID change beyond the counter is that
+    // inline edge/membership aggregates in this file stayed viewer-less in the
+    // statement at conversion; backlog batch B08 later moved the four edge
+    // statements into `GraphViewRepository` with the edge predicate
+    // (`F-edges-unfiltered`), and conversion neither closed nor worsened it. What DID change beyond the counter is that
     // `compound_response` and `atomic_response` moved from `pool: &PgPool` to
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.

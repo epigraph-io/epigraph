@@ -2093,7 +2093,9 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// whose executor conversion shard 5 changed from `&PgPool` to a borrowed
 /// connection taken from `AppState::read_as`. Nothing about the SQL moved and
 /// the disposition is unchanged; what moved is the session it runs on. The
-/// other rows are unstamped as before.
+/// other rows are unstamped as before. (Backlog batch B08 later moved both
+/// clauses into `graph_view.rs::neighborhood_direct_edges`, each now carrying
+/// the edge predicate; the disposition is unchanged.)
 ///
 /// # CORRECTION: the general mechanism does not hold for the two `edges` WRITE guards
 ///
