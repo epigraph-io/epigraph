@@ -25,12 +25,16 @@
 //!
 //! `MAINTENANCE_DATABASE_URL` must be SET and its login must bypass row
 //! security (a team map is built from that team's private rows). A second
-//! copy beside a running one takes no lock, prints `{"locked": true}` and
-//! exits 0.
+//! copy beside a running one does nothing: it prints `{"locked": true}`, says
+//! so on stderr and exits [`EXIT_LOCKED`] (75), so an operator's manual run
+//! cannot be mistaken for one that ran; the timer's unit counts 75 a success
+//! (`SuccessExitStatus=75`), so a timer firing beside a manual run alerts
+//! no one.
 //!
 //! Exit 0: every map built, unchanged or skipped (a dry run included).
 //! Exit 1: a map failed, or a refusal before any map ran (the timer's
-//! `OnFailure=` alert fires). Exit 2: an argument error.
+//! `OnFailure=` alert fires). Exit 2: an argument error. Exit 75: another
+//! copy holds the lock; nothing ran (retry once it has finished).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +47,10 @@ use epigraph_cli::atlas_naming::backend::{
 };
 use epigraph_cli::atlas_nightly::build::{run_night, NightOptions};
 use epigraph_db::repos::maintenance_lock::{try_take, ATLAS_NIGHTLY_LOCK_KEY};
+
+/// The exit status of a copy that found another holding the lock
+/// (`EX_TEMPFAIL`): nothing ran.
+const EXIT_LOCKED: i32 = 75;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -152,7 +160,11 @@ async fn main() -> anyhow::Result<()> {
     let (conn, viewer) = session.split();
     if !try_take(conn, ATLAS_NIGHTLY_LOCK_KEY).await? {
         println!("{}", serde_json::json!({"locked": true}));
-        return Ok(());
+        eprintln!(
+            "atlas_nightly: another copy holds the nightly lock; nothing ran. Retry once it has \
+             finished (journalctl -u epigraph-atlas-nightly)."
+        );
+        std::process::exit(EXIT_LOCKED);
     }
 
     let cli_backend;

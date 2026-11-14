@@ -26,6 +26,9 @@ Group=epigraph-atlas
 EnvironmentFile=/etc/epigraph/atlas-nightly.env
 Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/atlas_nightly --apply --max-calls 400 --keep-runs 3
+# 75: another copy (an operator's manual run) holds the nightly lock and
+# this one did nothing. Not a failure: no alert.
+SuccessExitStatus=75
 # The window: a night that has not finished in three hours is killed and
 # counted failed (the alert fires); the snapshot it held is released.
 TimeoutStartSec=3h

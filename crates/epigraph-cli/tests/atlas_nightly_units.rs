@@ -81,6 +81,12 @@ fn the_units_say_what_the_runbook_promises() {
         !service["Service"].contains_key("ProtectHome"),
         "the naming CLI signs in from the service user's home"
     );
+    // A copy that found the nightly lock held exits 75 having done nothing
+    // (the binary's EXIT_LOCKED): not a failure, so no alert.
+    let ok_codes: Vec<&str> = one(&service, "Service", "SuccessExitStatus")
+        .split_whitespace()
+        .collect();
+    assert!(ok_codes.contains(&"75"), "{ok_codes:?}");
     let on_failure = one(&service, "Unit", "OnFailure");
     assert_eq!(on_failure, "epigraph-atlas-nightly-alert@%n.service");
     let alert = parse(&read(ALERT));
