@@ -29,6 +29,7 @@ pub mod memory;
 pub mod novelty_gate;
 pub mod paper_queries;
 pub mod perspectives;
+pub mod prov_export;
 pub mod provenance;
 pub mod provenance_chain;
 pub mod rdf;

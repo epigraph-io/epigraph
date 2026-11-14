@@ -1746,7 +1746,7 @@ impl EpiGraphMcpFull {
         crate::tools::claims::patch_claim(self, viewer, params, auth).await
     }
 
-    // ── Provenance (1 tool) ──
+    // ── Provenance (3 tools) ──
 
     #[tool(
         description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order. Walks derivation edges only: supports/elaborates/decomposes_to (incoming) and supersedes (to the predecessor the claim replaced). Contradicts, refutes and cross-source corroborations are not ancestry and are not walked — use get_neighborhood for those."
@@ -1759,6 +1759,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::provenance::get_provenance(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Export one claim's provenance as a W3C PROV-O JSON-LD document (the same document the export_provenance operator CLI writes): the claim and its derived_from-family ancestors (up to max_depth, default 5, at most 20) as prov:Entity, one hop of supersedes predecessors, each claim's authoring agent as prov:Agent with a prov:Attribution, and the edges among them as prov:Relation with the internal relationship mapped to its PROV-O predicate (derived_from -> prov:wasDerivedFrom, supersedes -> prov:wasRevisionOf, ...; unmapped relationships are omitted). Read-only. The export holds only claims you may read: a claim you cannot read is absent from every list and its id appears nowhere in the document, even when a visible edge points at it. A root claim you cannot read is reported as not found, the same as an id that names nothing."
+    )]
+    async fn export_provenance_prov_o(
+        &self,
+        Parameters(params): Parameters<crate::types::ExportProvenanceProvOParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::prov_export::export_provenance_prov_o(self, viewer, params).await
     }
 
     #[tool(

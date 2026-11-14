@@ -425,6 +425,20 @@ pub struct UpdateWithEvidenceParams {
 
 // ── Provenance ──
 
+/// Parameters for MCP `export_provenance_prov_o` (backlog `4ba388eb`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportProvenanceProvOParams {
+    #[schemars(description = "The UUID of the claim whose provenance to export")]
+    pub claim_id: String,
+
+    #[schemars(
+        description = "Maximum ancestor depth to walk over derived_from-family edges. Default 5, \
+                       clamped to 1..=20."
+    )]
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetProvenanceParams {
     #[schemars(description = "The UUID of the claim to get provenance for")]

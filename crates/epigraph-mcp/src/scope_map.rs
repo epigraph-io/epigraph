@@ -36,6 +36,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("embedding_neighborhood_density", "claims:read"),
     ("entity_neighborhood", "claims:read"),
     ("evaluate_workflow_promotion", "claims:read"),
+    // PROV-O JSON-LD export (backlog 4ba388eb): SELECTs only, on the caller's
+    // viewer-stamped read, so a read-scoped principal can export what it can read.
+    ("export_provenance_prov_o", "claims:read"),
     ("find_agent", "claims:read"),
     ("find_cross_source_matches", "claims:read"),
     ("find_workflow", "claims:read"),
