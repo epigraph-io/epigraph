@@ -1594,13 +1594,17 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
                 message: format!("Failed to deserialize job payload: {e}"),
             })?;
 
+        // A payload of another variant will never become an embedding job, so
+        // retrying it only spends the budget: permanent.
         let EpiGraphJob::EmbeddingGeneration { claim_id } = epigraph_job else {
-            return Err(JobError::ProcessingFailed {
+            return Err(JobError::PermanentFailure {
                 message: "Expected EmbeddingGeneration job".to_string(),
             });
         };
 
-        // Step 2: Get the claim text from the service
+        // Step 2: Get the claim text from the service. `None` stays TRANSIENT:
+        // the service also answers `None` when it could not get a connection
+        // or the read failed, which a later run may not hit.
         let claim_text = self
             .embedding_service
             .get_claim_text(claim_id)
@@ -1616,9 +1620,7 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
             .embedding_service
             .generate_and_store(claim_id, &claim_text)
             .await
-            .map_err(|e| JobError::ProcessingFailed {
-                message: e.to_string(),
-            })?;
+            .map_err(embedding_job_error)?;
 
         let execution_duration = start.elapsed();
 
@@ -1663,6 +1665,27 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
         // Exponential backoff: 2^attempt seconds, capped at 1 hour
         let secs = 2u64.saturating_pow(attempt).min(3600);
         Duration::from_secs(secs)
+    }
+}
+
+/// Classify an [`EmbeddingJobError`] for the runner's retry decision
+/// ([`JobError::should_retry`]).
+///
+/// Permanent: the claim is gone, sealed or retired (`NotFound`,
+/// `ClaimNotFound`: a re-run reads the same row), its text is empty, or the
+/// provider returns the wrong dimension (a configuration error a retry does not
+/// change). Transient: a provider or database error (`ApiError`) and a rate
+/// limit, which a later run may not hit.
+fn embedding_job_error(e: EmbeddingJobError) -> JobError {
+    let message = e.to_string();
+    match e {
+        EmbeddingJobError::NotFound { .. }
+        | EmbeddingJobError::ClaimNotFound { .. }
+        | EmbeddingJobError::EmptyText
+        | EmbeddingJobError::DimensionMismatch { .. } => JobError::PermanentFailure { message },
+        EmbeddingJobError::RateLimitExceeded { .. } | EmbeddingJobError::ApiError { .. } => {
+            JobError::ProcessingFailed { message }
+        }
     }
 }
 

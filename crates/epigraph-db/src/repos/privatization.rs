@@ -471,7 +471,11 @@ pub const PRIVATIZATION_JOB_ATTEMPTS: i32 = 1;
 /// The attempt budget of the unseal's `embedding_generation` jobs: the first
 /// attempt plus two retries for a transient provider error (a 429, a 503, a
 /// timeout), each on a later drain run (backlog 1320b4e3). The handler is
-/// idempotent, and a permanent error still fails the job at once.
+/// idempotent. A permanent error fails the job at once:
+/// `ConfigurableEmbeddingHandler` classifies a claim that is sealed, retired or
+/// gone by the time it stores, empty text, a dimension mismatch and a payload
+/// of another variant as permanent. Missing claim TEXT stays transient, because
+/// the service also reports a failed read that way.
 pub const EMBEDDING_RESTORE_JOB_ATTEMPTS: i32 = 3;
 
 /// A persisted plan row, as migration 087's SELECT policy admits it.
