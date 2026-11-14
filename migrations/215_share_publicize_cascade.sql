@@ -120,9 +120,11 @@
 --   values from its caller rather than computing them). So it is NOT here: the
 --   one caller of both acts, `epigraph_engine::visibility_act`, refolds each
 --   moved claim in the same transaction, after this function returns and
---   before the commit, through `edge_factor::recompute_claim_cached_belief`
---   (the full-ignorance vacate included), and refuses the whole act when the
---   session cannot write the claim it would refold.
+--   before the commit, through
+--   `edge_factor::recompute_widened_claim_cached_belief` (which sets the cache
+--   to full ignorance when the cache-owner frame keeps no input the new
+--   audience may read), and refuses the whole act when the session cannot
+--   write the claim it would refold.
 SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================

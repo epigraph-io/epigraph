@@ -2664,7 +2664,10 @@ restart.
   `harvester_sources_held`, `scoped_beliefs_cleared` and
   `divergence_rows_cleared`, and say `migration` 215. The claim's own cached
   belief is refolded in Rust by `epigraph_engine::visibility_act`, the one
-  caller of both acts, in the same transaction; it refuses the act when the
+  caller of both acts, in the same transaction. When the claim's cache-owner
+  frame keeps no input the new audience may read, the cache is set to full
+  ignorance even if another frame has an admissible input (an ordinary
+  recompute vacates only when no frame has one). It refuses the act when the
   session cannot write a moved claim. Pinned by
   `epigraph-mcp/tests/claim_visibility_cascade_app_role.rs`,
   `epigraph-api/tests/claim_visibility_http.rs`
