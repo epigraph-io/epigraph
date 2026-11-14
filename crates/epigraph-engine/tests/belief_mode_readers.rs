@@ -12,10 +12,11 @@
 //! - Backlog fcc33cb1: the table said `bp_apply`, `compound_belief` and
 //!   `compound_source_edges` were not acted on, when the code did act on them.
 //!   Code acts on a flag by reading its field of the modes the process read:
-//!   `belief_modes::current().<key>`, or the atom-cache writer's
-//!   `atom_items::modes().<key>`.
-//!   [`the_acted_on_table_says_yes_for_every_flag_the_code_reads`] fails when
-//!   such a read exists while the flag's table row says "no".
+//!   `belief_modes::current().<key>`, the atom-cache writer's
+//!   `atom_items::modes().<key>`, or `<key>` off a `let` binding of either.
+//!   [`the_acted_on_table_matches_the_flags_the_code_reads`] fails when such a
+//!   read exists while the flag's table row says "no", and when a row says it
+//!   is acted on while no production code reads it.
 //!
 //! The scan is plain text over every `crates/*/src` file, with comments and
 //! `#[cfg(test)] mod` blocks excluded (`support/rust_sources.rs`).
@@ -81,19 +82,105 @@ fn flag_parses(src: &str) -> Vec<String> {
     hits
 }
 
-/// Whether one file's production code acts on the flag reported as `key`.
+/// `code` as tokens: identifiers (and numbers), `::`, and every other
+/// non-whitespace character on its own, so a read that rustfmt split over
+/// lines is the same token run as one written on a single line.
+fn tokens(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = code.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            let mut word = c.to_string();
+            while let Some(&n) = chars.peek().filter(|n| n.is_alphanumeric() || **n == '_') {
+                word.push(n);
+                chars.next();
+            }
+            out.push(word);
+        } else if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            out.push("::".to_string());
+        } else {
+            out.push(c.to_string());
+        }
+    }
+    out
+}
+
+/// Whether `toks[i..]` is a call of the modes the process read:
+/// `current()` or `modes()`, bare (imported) or as `belief_modes::current()` /
+/// `atom_items::modes()`. A `Foo::current()` of some other type is not one.
+fn is_modes_call(toks: &[String], i: usize) -> bool {
+    let call = matches!(toks.get(i).map(String::as_str), Some("current" | "modes"))
+        && toks.get(i + 1).map(String::as_str) == Some("(")
+        && toks.get(i + 2).map(String::as_str) == Some(")");
+    if !call {
+        return false;
+    }
+    if i >= 1 && toks[i - 1] == "::" {
+        return i >= 2 && matches!(toks[i - 2].as_str(), "belief_modes" | "atom_items");
+    }
+    true
+}
+
+/// The names production code binds to the modes the process read:
+/// `let m = belief_modes::current();` or `let mut m = *atom_items::modes();`.
+fn modes_bindings(toks: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        if tok != "let" {
+            continue;
+        }
+        let mut j = i + 1;
+        if toks.get(j).map(String::as_str) == Some("mut") {
+            j += 1;
+        }
+        let Some(name) = toks.get(j) else { continue };
+        if toks.get(j + 1).map(String::as_str) != Some("=") {
+            continue;
+        }
+        // The right-hand side up to the `;`: `[*|&] [path ::]* current ( ) ;`.
+        let mut k = j + 2;
+        while matches!(toks.get(k).map(String::as_str), Some("*" | "&")) {
+            k += 1;
+        }
+        while toks.get(k + 1).map(String::as_str) == Some("::") {
+            k += 2;
+        }
+        if is_modes_call(toks, k) && toks.get(k + 3).map(String::as_str) == Some(";") {
+            names.push(name.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Whether one file's production code acts on the flag reported as `key`:
+/// `<key>` read off `belief_modes::current()` / `atom_items::modes()`
+/// directly, or off a `let` binding of either.
+///
+/// A token scan: passing the whole struct to a function that reads the field
+/// is credited to that function's file, not the caller's.
 fn reads_flag(src: &str, key: &str) -> bool {
-    let flat = squeezed(&production_code(src));
-    ["current().", "modes()."].iter().any(|via| {
-        let needle = format!("{via}{key}");
-        flat.match_indices(&needle).any(|(i, _)| {
-            // `current().atom_fold` must not also match `current().atom_fold_x`.
-            !flat[i + needle.len()..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    let toks = tokens(&production_code(src));
+    let field_at = |i: usize| {
+        toks.get(i).map(String::as_str) == Some(".")
+            && toks.get(i + 1).map(String::as_str) == Some(key)
+    };
+    let direct = (0..toks.len()).any(|i| is_modes_call(&toks, i) && field_at(i + 3));
+    let bindings = modes_bindings(&toks);
+    direct
+        || (0..toks.len()).any(|i| {
+            bindings.contains(&toks[i]) && field_at(i + 1) && (i == 0 || toks[i - 1] != ".")
         })
-    })
+}
+
+/// Whether a table cell says the flag is not acted on.
+fn says_no(acted: &str) -> bool {
+    acted == "no" || acted.starts_with("no:")
 }
 
 /// The table rows of `belief_modes.rs`'s module doc: variable -> the "acted
@@ -137,7 +224,7 @@ fn no_belief_flag_is_read_outside_belief_modes() {
 }
 
 #[test]
-fn the_acted_on_table_says_yes_for_every_flag_the_code_reads() {
+fn the_acted_on_table_matches_the_flags_the_code_reads() {
     let root = workspace_root();
     let doc = std::fs::read_to_string(root.join(READER)).expect("read belief_modes.rs");
     let table = acted_on_table(&doc);
@@ -157,11 +244,17 @@ fn the_acted_on_table_says_yes_for_every_flag_the_code_reads() {
             .filter(|(_, src)| reads_flag(src, field.key))
             .map(|(file, _)| file.as_str())
             .collect();
-        if !readers.is_empty() && (acted == "no" || acted.starts_with("no:")) {
+        if !readers.is_empty() && says_no(acted) {
             stale.push(format!(
                 "{}: the table says {acted:?}, but {} read it",
                 field.env,
                 readers.join(", ")
+            ));
+        }
+        if readers.is_empty() && !says_no(acted) {
+            stale.push(format!(
+                "{}: the table says {acted:?}, but no production code reads it",
+                field.env
             ));
         }
     }
@@ -208,6 +301,25 @@ mod tests {
         "atom_fold"
     ));
     assert!(!reads_flag("let m = current().atom_fold_x;", "atom_fold"));
+
+    // A field read off a binding of the modes, the other way code acts on a flag.
+    let bound =
+        "fn f() {\n    let m = crate::belief_modes::current();\n    if m.bp_apply == On {}\n}\n";
+    assert!(reads_flag(bound, "bp_apply"));
+    assert!(!reads_flag(bound, "atom_fold"));
+    assert!(reads_flag(
+        "let mut modes = *atom_items::modes(); let x = modes.atom_fold;",
+        "atom_fold"
+    ));
+    // Another type's `current()`, and a longer name ending in the binding's.
+    assert!(!reads_flag(
+        "let m = AtomCacheSettings::current(); let x = m.compound_source_edges;",
+        "compound_source_edges"
+    ));
+    assert!(!reads_flag(
+        "let m = belief_modes::current(); let x = item.bp_apply;",
+        "bp_apply"
+    ));
 
     let table = acted_on_table(
         "//! | `EPIGRAPH_BP_APPLY` | `off`, `on` | `off` | no: still writes |\n\
