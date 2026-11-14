@@ -104,7 +104,8 @@ pub struct ClaimQueryParams {
     pub methodology: Option<String>,
 
     /// Filter by evidence type (requires claim to have evidence of this type).
-    /// Values: document, observation, testimony, computation, reference, figure, conversational
+    /// Values: document, observation, testimony, computation, reference, figure,
+    /// conversational, dataset (`epigraph_core::STORED_EVIDENCE_TYPES`)
     pub evidence_type: Option<String>,
 }
 
