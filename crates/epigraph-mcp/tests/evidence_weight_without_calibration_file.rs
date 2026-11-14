@@ -210,6 +210,7 @@ async fn report_workflow_outcome_weights_its_observation_from_the_served_calibra
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: claim_id.to_string(),
             success: true,
             execution_log: vec![StepExecution {

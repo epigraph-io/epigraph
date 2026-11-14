@@ -20,6 +20,7 @@ async fn stored_step_truth(pool: &PgPool, confidence: Option<f64>) -> f64 {
         &server,
         &viewer,
         StoreWorkflowParams {
+            force_new: None,
             tenancy: None,
             goal: format!("confidence probe goal {}", Uuid::new_v4()),
             steps: vec![step.clone()],

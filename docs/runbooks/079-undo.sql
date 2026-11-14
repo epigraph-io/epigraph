@@ -138,7 +138,10 @@ DECLARE t text;
           'harvester_sources','harvester_audit_reports',
           -- ---- workflow rows (183) ---------------------------------------
           -- FORCEd by 183 with its tenancy columns, same precedent and reason.
-          'workflows'];
+          'workflows',
+          -- ---- hierarchical outcome reports (221) ------------------------
+          -- FORCEd by 221 at creation, same precedent and reason.
+          'workflow_outcome_reports'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

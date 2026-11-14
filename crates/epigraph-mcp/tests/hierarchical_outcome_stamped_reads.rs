@@ -194,6 +194,7 @@ async fn report(
         server,
         viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             execution_log: execution_log(indices),
@@ -453,6 +454,7 @@ async fn a_member_resolves_the_appended_step_after_the_plan(pool: PgPool) {
         &server,
         &w.member,
         epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            idempotency_key: None,
             workflow_id: w.workflow_id.to_string(),
             success: true,
             step_executions: [0usize, 1, 2]
@@ -909,6 +911,7 @@ async fn refusals(
         server,
         viewer,
         epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             step_executions: [0usize, 1]
@@ -932,6 +935,7 @@ async fn refusals(
         server,
         viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             execution_log: execution_log(&[0, 1]),

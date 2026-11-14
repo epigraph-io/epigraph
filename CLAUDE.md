@@ -123,9 +123,10 @@ each run used to collapse into the prior run's claim and the time series was
 lost (backlog `a3e63a12`, `0a97ba24`).
 
 A claim carrying any label in `novelty_gate::STATUS_CLAIM_LABELS` (`telemetry`,
-the scheduled writers' `norcal-rfp-*-status` / `grant-*-status` labels, and
-the older bare `gen-status`, `generator-summary`, `review-status`,
-`revise-status`, `research-scan`) is exempt: `novelty_gate::decide` pins its
+the scheduled writers' `norcal-rfp-*-status` / `grant-*-status` labels,
+`journal-status` for the daily journal's dated summary, and the older bare
+`gen-status`, `generator-summary`, `review-status`, `revise-status`,
+`research-scan`) is exempt: `novelty_gate::decide` pins its
 effective threshold to 0.0. Suppression only; the fixed 0.15 `near-duplicate`
 soft-flag still applies.
 
@@ -133,7 +134,7 @@ soft-flag still applies.
   status label, and add a new label to `STATUS_CLAIM_LABELS` (exact match).
   Do not rely on passing `novelty_threshold=0` on every call.
 - Keep the list to *shape* labels. Topic labels (`graph-integrity`,
-  `maintenance`, `rfp`) stay out: exempting a topic disables dedup for genuine
+  `maintenance`, `rfp`, `daily-journal`) stay out: exempting a topic disables dedup for genuine
   content on that topic.
 - Adding a gated write path? `decide` takes `labels` as a required argument.
   Pass the caller's real labels, never `&[]` as a placeholder.

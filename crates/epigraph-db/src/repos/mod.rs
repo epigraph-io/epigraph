@@ -250,13 +250,17 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    ExecutedClaim, FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow, HierarchicalWorkflowRow,
-    ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository,
+    hierarchical_outcome_variance, validate_outcome_idempotency_key, ExecutedClaim,
+    FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow, HierarchicalOutcomeCounters,
+    HierarchicalOutcomeRecord, HierarchicalOutcomeResult, HierarchicalWorkflowRow,
+    NewHierarchicalOutcomeReport, ResolvedStep, ScoredHierarchicalWorkflowRow,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories
-pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
+pub use behavioral_execution::{
+    BehavioralExecutionRepository, BehavioralExecutionRow, DeviationReasonSummary,
+};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
 pub use edge_signature::{
