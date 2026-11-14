@@ -47,8 +47,8 @@ use uuid::Uuid;
 /// reviewers, revisers, cross-generator dedup, the grant run summary), plus
 /// `telemetry` (per-run observations such as url-discovery and A/E filter
 /// drops) and the bare forms the same reporters used before their labels were
-/// prefixed.
-const STATUS_LABELS_IN_USE: [&str; 13] = [
+/// prefixed, and the daily journal's dated summary.
+const STATUS_LABELS_IN_USE: [&str; 14] = [
     "telemetry",
     "gen-status",
     "generator-summary",
@@ -62,6 +62,10 @@ const STATUS_LABELS_IN_USE: [&str; 13] = [
     "grant-gen-status",
     "grant-run-status",
     "grant-dedup-status",
+    // The dated daily-journal summary (backlog ea5fdd7f). Its topic label,
+    // `daily-journal`, stays in TOPIC_LABELS: the control arm below proves a
+    // journal entry carrying only that label is still suppressed.
+    "journal-status",
 ];
 
 /// Labels that co-occur with status claims but say what a claim is ABOUT, not
