@@ -25,6 +25,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// Read-only window into a workflow's recent behavioral executions, newest
 /// first: per-run `success`, `quality`, `tool_pattern`, `deviation_count`, and
 /// `step_beliefs` (per-step `deviation_reason`), plus a `window_success_rate`.
+/// With `include_deviation_summary`, also the per-step `deviation_reason`s
+/// rolled up by step lineage over `window_days`
+/// (`BehavioralExecutionRepository::deviation_summary`), the input an
+/// `evolve_step` proposal starts from.
 /// This is the telemetry the workflow-evolution proposer reads before
 /// proposing a variant; an invalid `workflow_id` errors rather than returning
 /// an empty set (which would read as "no runs" and mislead the proposer).
@@ -42,11 +46,30 @@ pub async fn get_workflow_executions(
     let workflow_id = parse_uuid(params.workflow_id.trim())?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
+    let window_days = params.window_days.unwrap_or(30).clamp(1, 365);
+
     let mut read = server.read_as(viewer, "get_workflow_executions").await?;
     let rows =
         BehavioralExecutionRepository::recent_executions(&mut *read, viewer, workflow_id, limit)
             .await
             .map_err(internal_error)?;
+    // Backlog 0a2ed32d: the per-step deviation telemetry rolled up by step
+    // lineage, read on the same stamped read as the rows.
+    let deviation_summary = if params.include_deviation_summary.unwrap_or(false) {
+        Some(
+            BehavioralExecutionRepository::deviation_summary(
+                &mut *read,
+                viewer,
+                workflow_id,
+                window_days,
+                20,
+            )
+            .await
+            .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
     read.commit().await.map_err(internal_error)?;
 
     let returned = rows.len();
@@ -74,12 +97,19 @@ pub async fn get_workflow_executions(
         })
         .collect();
 
-    success_json(&serde_json::json!({
+    let mut response = serde_json::json!({
         "workflow_id": workflow_id,
         "returned": returned,
         "window_success_rate": window_success_rate,
         "executions": executions,
-    }))
+    });
+    if let Some(summary) = deviation_summary {
+        response["deviation_summary"] = serde_json::json!({
+            "window_days": window_days,
+            "reasons": summary,
+        });
+    }
+    success_json(&response)
 }
 
 /// Evaluate whether a workflow variant is statistically ready to be promoted

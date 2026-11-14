@@ -901,6 +901,18 @@ pub struct GetWorkflowExecutionsParams {
 
     #[schemars(description = "Max executions to return, newest first (default 20, max 100)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Also return `deviation_summary`: this hierarchical workflow's per-step deviation_reason telemetry rolled up by step lineage over the last `window_days` days, one entry per (step_lineage_id, trimmed reason) with occurrences, first_seen, last_seen and latest_step_claim_id, most frequent first (at most 20). A reason that recurs on one lineage is an evolve_step candidate; nothing is written. Only deviated hierarchical step rows count; a flat workflow claim has none. Default false."
+    )]
+    #[serde(default)]
+    pub include_deviation_summary: Option<bool>,
+
+    #[schemars(
+        description = "Window for deviation_summary, in days back from now (default 30, clamped to 1-365)."
+    )]
+    #[serde(default)]
+    pub window_days: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

@@ -258,7 +258,9 @@ pub use workflow::{
 };
 
 // Privacy / encryption repositories
-pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
+pub use behavioral_execution::{
+    BehavioralExecutionRepository, BehavioralExecutionRow, DeviationReasonSummary,
+};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
 pub use edge_signature::{
