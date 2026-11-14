@@ -1,5 +1,7 @@
 pub mod atlas_layout;
 #[cfg(feature = "db")]
+pub mod atlas_links;
+#[cfg(feature = "db")]
 pub mod atlas_meaning;
 #[cfg(feature = "db")]
 pub mod backfill_factors;
