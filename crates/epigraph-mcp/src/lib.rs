@@ -19,6 +19,7 @@ pub mod signing_identity;
 pub mod stdio_transport;
 pub mod tools;
 pub mod types;
+pub mod unauthenticated_reader;
 pub mod write_identity;
 
 pub use server::{EpiGraphMcpFull, SessionFactory};

@@ -299,6 +299,21 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 - A TCP `--listen` address requires `--jwt-secret`. A `unix:/abs/path`
   listener may use `--allow-unauthenticated-http` instead, because its file
   permissions are the trust gate; TCP may not.
+- An `--allow-unauthenticated-http` listener reads PUBLIC rows only. No
+  request on it names a caller, so it acts as a dedicated agent that belongs
+  to no group (`mcp-unauthenticated-reader`, created on first boot), and it
+  refuses every content call if that agent is ever given a group membership
+  (revoke it to reopen the listener). That refusal is fail-closed on purpose,
+  and it means any holder of `groups:admin` on a group can close every
+  read-only listener on the database by adding `mcp-unauthenticated-reader`
+  to that group; nothing is exposed, and revoking the membership reopens the
+  listener. Its write tools are refused, it records no `OPERATED_BY`
+  auth-lineage edge (nobody authenticated), and `recall` audit rows on it are
+  dropped (the reader has no personal group to own them). Group reads
+  and writes go through a `--jwt-secret` listener. With
+  `--allow-unauthenticated-writes` the listener instead acts as its own signer
+  agent: its callers write as that agent and read with that agent's groups,
+  so keep that opt-in to a trusted local socket.
 - The HTTP listener rejects any request whose `Host` (or `Origin`) is outside
   its allowlist. The list always holds `localhost`, `127.0.0.1`, `::1` and
   the `--listen` authority. Behind a reverse proxy that preserves the
@@ -426,7 +441,7 @@ For the others, anything else is off.
 | `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
 | `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | Required for a TCP `--listen`. At least 32 bytes. The same secret as the API. |
-| `--allow-unauthenticated-http`, `--allow-unauthenticated-writes` | off | Unix-socket listeners only. Writes are then authored by the listener's own unlinked signer. |
+| `--allow-unauthenticated-http`, `--allow-unauthenticated-writes` | off | Unix-socket listeners only. Without `--allow-unauthenticated-writes` the listener is read-only and public-only (a zero-membership reader agent). With it, writes are authored by the listener's own unlinked signer, whose groups its callers also read. |
 | `--allowed-host` / `EPIGRAPH_MCP_ALLOWED_HOSTS` | — | Extra `Host`/`Origin` names for the HTTP listener. |
 | `--read-only` | off | Query tools only. |
 | `--operator-id` / `EPIGRAPH_OPERATOR_ID` | unset | Records `signer --OPERATED_BY--> operator` at startup. stdio only, with a declared identity. The link function is maintenance-only, so the startup fails on an application DSN; run `epigraph-operator link` from the host instead (section 9). |
@@ -435,7 +450,7 @@ For the others, anything else is off.
 | `EPIGRAPH_MCP_CONNECTOR_ELEVATION` | off | `on` lets the HTTP transport elevate connector-mode sessions. Leave it unset (section 10). |
 | `EPIGRAPH_RUN_TOKENS` | `off` | As for the API. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | As for the API. |
-| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error. See `crates/epigraph-mcp/src/federation/`. |
+| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. See `crates/epigraph-mcp/src/federation/config.rs`. |
 | `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. |
 | `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | How often an unhealthy extension is re-dialled. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |

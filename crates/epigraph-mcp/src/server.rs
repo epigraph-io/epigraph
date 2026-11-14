@@ -3217,8 +3217,23 @@ impl ServerHandler for EpiGraphMcpFull {
         // writes NO edge. Best-effort + memoized inside the helper (per process
         // on the HTTP listener; see `seen_auth_lineage`); borrow `auth_owned`
         // here (it is MOVED just below into `context`).
-        self.record_auth_lineage(auth_owned.as_ref().and_then(|a| a.agent_id))
-            .await;
+        //
+        // A principal-less context (`auth::is_principal_less`, the
+        // `--allow-unauthenticated-http` listener) writes NO edge either: no
+        // token was presented, so nobody authenticated and "acted on behalf
+        // of" would be false. Its injected principal is the listener's own
+        // reader agent (read-only) or the server agent itself (write opt-in;
+        // that edge is a self-loop `edges_no_self_loop` refuses anyway). An
+        // edge to the reader would also give the server agent a second
+        // OPERATED_BY target, which the operator-link functions read as the
+        // fingerprint of a shared HTTP signer and refuse to link.
+        self.record_auth_lineage(
+            auth_owned
+                .as_ref()
+                .filter(|a| !crate::auth::is_principal_less(a))
+                .and_then(|a| a.agent_id),
+        )
+        .await;
 
         // Propagate the HTTP-side `AuthContext` (set by
         // `auth::bearer_auth_middleware` and forwarded by

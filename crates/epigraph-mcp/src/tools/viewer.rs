@@ -85,14 +85,15 @@
 //! and hand-minted service tokens.
 //!
 //! The `--allow-unauthenticated-http` listener is NOT in that population: its
-//! injected context now carries `agent_id: Some(server_agent_id)`
-//! (`auth.rs::unauthenticated_context`), so it resolves the server's own viewer
-//! — the same arm stdio takes. That is the change plan §4.12 assigns to PR-09,
-//! and it is a **widening**, not a hardening: every holder of that listener's
-//! shared bearer token now reads with the server agent's group set instead of a
-//! nil principal's empty one. It is inert on today's corpus (migration 062
-//! defaults `visibility` to `'public'` and backfills nothing) and becomes
-//! load-bearing the moment PR-12's backfill writes the first `'group'` row.
+//! injected context carries an agent principal (`auth.rs::unauthenticated_context`).
+//! PR-09 made that the server's own agent, which was a **widening**: every
+//! holder of that listener's shared credential read with the server agent's
+//! group set. Backlog fe514fc3 (operator decision) narrowed it again: on the
+//! READ-ONLY listener (the default) the principal is a dedicated agent with no
+//! group (`crate::unauthenticated_reader`), so it reads public rows only, and
+//! [`request_viewer`] refuses such a context whose viewer carries any group.
+//! The `--allow-unauthenticated-writes` opt-in keeps the server agent, whose
+//! writes its callers author.
 //!
 //! **The stdio arm widens by exactly the same amount, and for the same
 //! reason.** `server.rs::agent_id` now calls
@@ -170,6 +171,12 @@ pub async fn request_viewer(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<Viewer, McpError> {
     let principal = match auth {
+        // The `--allow-unauthenticated-http` listener whose principal did not
+        // resolve: no token was presented, so "re-mint the token" would point
+        // at the wrong cause.
+        Some(a) if a.agent_id.is_none() && crate::auth::is_principal_less(a) => {
+            return Err(unresolved_listener_principal());
+        }
         Some(a) => a.agent_id.ok_or_else(|| {
             McpError::invalid_request(
                 concat!(
@@ -246,7 +253,68 @@ pub async fn request_viewer(
             ))
         }
     }
-    viewer.map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e))
+    let viewer =
+        viewer.map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e))?;
+    if auth.is_some_and(is_read_only_principal_less) {
+        refuse_a_grouped_principal_less_viewer(&viewer)?;
+    }
+    Ok(viewer)
+}
+
+/// The refusal on the `--allow-unauthenticated-http` listener when its
+/// injected principal has not resolved (`unauthenticated_reader::listener_principal`
+/// logs why). On the read-only listener the usual cause is a group membership
+/// someone granted the reader agent, which `UnauthenticatedReader::resolve`
+/// refuses to read with (fail-closed, backlog fe514fc3).
+fn unresolved_listener_principal() -> McpError {
+    McpError::invalid_request(
+        concat!(
+            "refused: the unauthenticated listener's principal did not resolve, so it ",
+            "has no read authority; the server log says why. On the read-only listener ",
+            "the usual cause is a group membership held by the reader agent ",
+            "(mcp-unauthenticated-reader), which reads public rows only: revoke that ",
+            "agent's group memberships."
+        )
+        .to_string(),
+        None,
+    )
+}
+
+/// Whether `auth` is the READ-ONLY `--allow-unauthenticated-http` context: no
+/// token was presented (`auth::is_principal_less`) and it carries no write
+/// scope (`auth::UnauthenticatedWrites::Refused`). The same test
+/// `EpiGraphMcpFull::write_identity` applies before it refuses a write.
+fn is_read_only_principal_less(auth: &epigraph_auth::AuthContext) -> bool {
+    crate::auth::is_principal_less(auth) && !auth.has_scope("claims:write")
+}
+
+/// The read-only unauthenticated listener reads PUBLIC rows only (backlog
+/// fe514fc3): its viewer must be a scoped one over ZERO groups. Its principal
+/// is the dedicated zero-membership agent (`unauthenticated_reader`), whose
+/// resolution already refuses a membership; this re-checks on every call, so
+/// a membership granted to that agent after boot (or a wiring that injects
+/// some other agent) refuses the call instead of reading with that group.
+/// Elevated and bypass viewers carry no scoped group bind and are refused too.
+fn refuse_a_grouped_principal_less_viewer(viewer: &Viewer) -> Result<(), McpError> {
+    if viewer.group_bind().is_some_and(<[uuid::Uuid]>::is_empty) {
+        return Ok(());
+    }
+    let principal = viewer
+        .principal()
+        .map_or_else(|| "none".to_string(), |p| p.to_string());
+    tracing::error!(
+        principal = %principal,
+        "refusing a read on the --allow-unauthenticated-http listener: its principal resolved \
+         to a viewer with group access, and that listener reads public rows only"
+    );
+    Err(McpError::invalid_request(
+        format!(
+            "refused: the unauthenticated listener reads public rows only, and its principal \
+             {principal} resolved to a viewer with group access. Revoke that agent's group \
+             memberships, or use an authenticated (--jwt-secret) listener"
+        ),
+        None,
+    ))
 }
 
 /// The refusal of a delegated run token whose delegation is not live: one

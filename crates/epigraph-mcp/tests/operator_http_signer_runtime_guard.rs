@@ -489,10 +489,15 @@ async fn spawn_principal_less_listener(
         )
         .with_scoped_pool(scoped.clone()),
     );
-    let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
+    // The principal exactly as `main` builds it: the zero-membership reader on
+    // the read-only listener, the signer on the write opt-in (backlog
+    // fe514fc3).
+    let principal = epigraph_mcp::unauthenticated_reader::listener_principal(
+        writes,
         probe as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
+        pool.clone(),
     )
-    .with_writes(writes);
+    .await;
     let service = StreamableHttpService::new(
         move || {
             Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
@@ -602,10 +607,12 @@ async fn principal_less_caller_on_a_retired_signer_cannot_retire_the_humans_item
 
     // A READ, which the scope gate admits on BOTH listener kinds, so this is
     // the call that reaches `refuse_linked_http_signer` on the default
-    // (read-only) listener too. The signer is still that listener's READ
-    // principal: a group membership that predates the retire would widen what
-    // its callers read, so the linked-signer gate must refuse reads as well,
-    // naming the human, and must not serve the claim.
+    // (read-only) listener too. On the write opt-in the signer is that
+    // listener's READ principal, so a group membership that predates the
+    // retire would widen what its callers read; on the read-only listener the
+    // principal is the zero-membership reader (backlog fe514fc3), and the
+    // linked-signer gate still refuses every call, reads included, naming the
+    // human, and does not serve the claim.
     let read_after_link = call_named(
         &client,
         &url,
