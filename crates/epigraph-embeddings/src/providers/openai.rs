@@ -42,6 +42,7 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 const MAX_BATCH_SIZE: usize = 2048;
 
 /// Base URL of the `OpenAI` API when the config names none.
+#[cfg(feature = "openai")]
 const DEFAULT_API_BASE: &str = "https://api.openai.com";
 
 /// Bounded retry for transient `OpenAI` failures.
@@ -158,6 +159,7 @@ impl OpenAiProvider {
 
     /// The API base URL: `ProviderConfig::OpenAi::api_base_url`, or the public
     /// `OpenAI` endpoint when that is unset.
+    #[cfg(feature = "openai")]
     fn api_base(&self) -> &str {
         match &self.config.provider {
             crate::config::ProviderConfig::OpenAi {

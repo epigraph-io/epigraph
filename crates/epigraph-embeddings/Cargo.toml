@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Internal crates
-epigraph-core = { workspace = true }
-
 # Async runtime
 tokio = { workspace = true }
 async-trait = "0.1"  # Async trait support for EmbeddingService
@@ -17,9 +14,6 @@ async-trait = "0.1"  # Async trait support for EmbeddingService
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-# Identifiers
-uuid = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
