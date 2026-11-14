@@ -6,7 +6,7 @@
 //! 2. **Fair Quota**: Each agent gets their configured rate limit
 //! 3. **Bypass Routes**: Health checks are exempt from rate limiting
 //! 4. **Retry Guidance**: 429 responses include Retry-After header
-//! 5. **IP Fallback**: Unauthenticated requests are rate-limited by IP
+//! 5. **Peer Keying**: Unauthenticated requests are rate-limited by TCP peer
 
 use axum::{response::IntoResponse, Json};
 
@@ -22,6 +22,18 @@ use axum::{
 use epigraph_api::{AgentRateLimiter, RateLimitConfig};
 #[cfg(not(feature = "db"))]
 use tower::ServiceExt;
+
+/// The connect info `axum::serve(.., into_make_service_with_connect_info)`
+/// attaches: the TCP peer is the rate-limit key for an anonymous request.
+/// (`X-Forwarded-For` is not: it is client-written unless the peer is a
+/// configured trusted proxy.)
+#[cfg(not(feature = "db"))]
+fn peer(ip: impl AsRef<str>) -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+    axum::extract::ConnectInfo(std::net::SocketAddr::new(
+        ip.as_ref().parse().expect("test peer ip"),
+        0,
+    ))
+}
 
 // ============================================================================
 // Test Infrastructure
@@ -75,7 +87,7 @@ async fn test_first_request_always_succeeds() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/test")
-        .header("X-Forwarded-For", "192.168.1.1")
+        .extension(peer("192.168.1.1"))
         .body(Body::empty())
         .unwrap();
 
@@ -127,7 +139,7 @@ async fn test_exceeding_rate_limit_returns_429() {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/test")
-            .header("X-Forwarded-For", "192.168.1.100")
+            .extension(peer("192.168.1.100"))
             .body(Body::empty())
             .unwrap();
 
@@ -199,7 +211,7 @@ async fn test_health_endpoint_bypasses_rate_limiting() {
         let request = Request::builder()
             .method(Method::GET)
             .uri("/health")
-            .header("X-Forwarded-For", "192.168.1.200")
+            .extension(peer("192.168.1.200"))
             .body(Body::empty())
             .unwrap();
 
@@ -253,7 +265,7 @@ async fn test_different_ips_have_separate_quotas() {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/test")
-            .header("X-Forwarded-For", "10.0.0.1")
+            .extension(peer("10.0.0.1"))
             .body(Body::empty())
             .unwrap();
 
@@ -272,7 +284,7 @@ async fn test_different_ips_have_separate_quotas() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/test")
-        .header("X-Forwarded-For", "10.0.0.2")
+        .extension(peer("10.0.0.2"))
         .body(Body::empty())
         .unwrap();
 
@@ -324,7 +336,7 @@ async fn test_429_response_contains_error_details() {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/test")
-            .header("X-Forwarded-For", "192.168.1.150")
+            .extension(peer("192.168.1.150"))
             .body(Body::empty())
             .unwrap();
 
@@ -405,7 +417,7 @@ async fn test_global_rate_limit_protection() {
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/test")
-            .header("X-Forwarded-For", format!("192.168.{}.1", i))
+            .extension(peer(format!("192.168.{}.1", i)))
             .body(Body::empty())
             .unwrap();
 
@@ -459,7 +471,7 @@ async fn test_rate_limit_headers_on_success() {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/test")
-        .header("X-Forwarded-For", "192.168.1.50")
+        .extension(peer("192.168.1.50"))
         .body(Body::empty())
         .unwrap();
 

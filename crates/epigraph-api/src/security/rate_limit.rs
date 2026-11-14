@@ -16,8 +16,126 @@ use chrono::{DateTime, Utc};
 use epigraph_core::domain::AgentId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
+
+/// The reverse proxies whose `X-Forwarded-For` this process believes.
+///
+/// A rate-limit key taken from `X-Forwarded-For` is only as honest as the hop
+/// that wrote it. Every hop to the LEFT of the last one a trusted proxy
+/// appended was written by the client, so it can be anything. The middleware
+/// therefore reads the header only when the TCP peer is in this set, and then
+/// takes the right-most hop that is not itself a trusted proxy
+/// (`middleware::rate_limit`). With an empty set the header is ignored and the
+/// TCP peer is the key.
+///
+/// Entries are single addresses or CIDR prefixes. IPv4-mapped IPv6 addresses
+/// (`::ffff:a.b.c.d`) are matched as IPv4.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProxies {
+    nets: Vec<(IpAddr, u8)>,
+}
+
+impl TrustedProxies {
+    /// Trust no proxy: the TCP peer is always the client.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Trust the loopback interface only (`127.0.0.0/8`, `::1`): a reverse
+    /// proxy on the same host. No remote client can be a loopback peer.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self {
+            nets: vec![
+                (IpAddr::from([127, 0, 0, 0]), 8),
+                (IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]), 128),
+            ],
+        }
+    }
+
+    /// Parse a comma-separated list of addresses and CIDR prefixes, or the
+    /// literal `none`. Whitespace around entries is ignored; an empty entry,
+    /// an unparseable address and an out-of-range prefix are errors, so a
+    /// typo refuses rather than silently trusting less (or more) than meant.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("none") {
+            return Ok(Self::none());
+        }
+        let mut nets = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(format!("empty entry in trusted-proxy list {raw:?}"));
+            }
+            let (addr, prefix) = match entry.split_once('/') {
+                Some((a, p)) => (a, Some(p)),
+                None => (entry, None),
+            };
+            let ip: IpAddr = addr
+                .parse()
+                .map_err(|_| format!("{entry:?} is not an IP address or CIDR prefix"))?;
+            let ip = ip.to_canonical();
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            let len = match prefix {
+                None => max,
+                Some(p) => p
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|l| *l <= max)
+                    .ok_or_else(|| format!("{entry:?} has an invalid prefix length"))?,
+            };
+            nets.push((ip, len));
+        }
+        Ok(Self { nets })
+    }
+
+    /// Whether `ip` is one of the trusted proxies.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.nets
+            .iter()
+            .any(|(net, len)| prefix_matches(*net, *len, ip))
+    }
+
+    /// Whether the set is empty (`X-Forwarded-For` is never read).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty()
+    }
+}
+
+impl std::fmt::Display for TrustedProxies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.nets.is_empty() {
+            return f.write_str("none");
+        }
+        let list: Vec<String> = self
+            .nets
+            .iter()
+            .map(|(ip, len)| format!("{ip}/{len}"))
+            .collect();
+        f.write_str(&list.join(","))
+    }
+}
+
+fn prefix_matches(net: IpAddr, len: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            u32::from(n) & mask == u32::from(i) & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            u128::from(n) & mask == u128::from(i) & mask
+        }
+        _ => false,
+    }
+}
 
 /// Error returned when rate limit is exceeded
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -84,6 +202,9 @@ struct TokenBucket {
     refill_rate: f64,
     /// Last time tokens were refilled
     last_refill: DateTime<Utc>,
+    /// Last time a refusal from this bucket was recorded
+    /// ([`AgentRateLimiter::should_record_rejection`])
+    last_recorded: Option<DateTime<Utc>>,
 }
 
 impl TokenBucket {
@@ -94,6 +215,7 @@ impl TokenBucket {
             max_tokens: max_tokens as f64,
             refill_rate: refill_rate_per_second,
             last_refill: Utc::now(),
+            last_recorded: None,
         }
     }
 
@@ -126,11 +248,190 @@ impl TokenBucket {
         }
     }
 
+    /// Whether a refusal from this bucket is due to be recorded, marking it
+    /// recorded if so.
+    fn take_record_slot(&mut self, now: DateTime<Utc>) -> bool {
+        match self.last_recorded {
+            Some(t)
+                if now.signed_duration_since(t).num_seconds() < REJECTION_RECORD_INTERVAL_SECS =>
+            {
+                false
+            }
+            _ => {
+                self.last_recorded = Some(now);
+                true
+            }
+        }
+    }
+
     /// Get current available tokens (for testing/monitoring)
     #[allow(dead_code)]
     fn available_tokens(&mut self) -> f64 {
         self.refill();
         self.tokens
+    }
+}
+
+/// `on` (default) or `off`: whether the server installs a rate limiter.
+pub const RATE_LIMIT_ENV: &str = "EPIGRAPH_RATE_LIMIT";
+/// Requests per minute per bucket (principal or client address).
+pub const RATE_LIMIT_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_RPM";
+/// Requests per minute across all buckets; unset or `off` disables the
+/// global limit.
+pub const RATE_LIMIT_GLOBAL_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM";
+/// The reverse proxies whose `X-Forwarded-For` is believed ([`TrustedProxies`]).
+pub const TRUSTED_PROXIES_ENV: &str = "EPIGRAPH_TRUSTED_PROXIES";
+/// [`RATE_LIMIT_RPM_ENV`]'s default: 10 requests a second sustained, with a
+/// burst of a full minute's worth.
+pub const DEFAULT_RATE_LIMIT_RPM: u32 = 600;
+
+/// A blank value is treated as unset.
+fn blank_is_unset(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// The server's rate-limit configuration, read once at boot from the
+/// `EPIGRAPH_RATE_LIMIT*` and `EPIGRAPH_TRUSTED_PROXIES` variables.
+///
+/// [`Self::parse`] takes the raw values so it is testable without touching
+/// process environment; [`Self::from_env`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitSettings {
+    /// Whether a limiter is installed at all.
+    pub enabled: bool,
+    /// True when [`RATE_LIMIT_ENV`] held a value that is neither `on` nor
+    /// `off` (the limiter stays ON; the caller should warn).
+    pub unrecognised_switch: bool,
+    /// Requests per minute per bucket.
+    pub per_key_rpm: u32,
+    /// Requests per minute across all buckets, if limited.
+    pub global_rpm: Option<u32>,
+    /// Whose `X-Forwarded-For` is believed. Unset means loopback only (a
+    /// reverse proxy on this host); `none` trusts no proxy.
+    pub trusted_proxies: TrustedProxies,
+}
+
+impl RateLimitSettings {
+    /// Parse the raw variable values (`None` = unset; blank = unset).
+    ///
+    /// A number or proxy list that does not parse is an error rather than a
+    /// default: a typo in a limit or a proxy list should refuse to boot, not
+    /// silently serve a different limit or collapse every client behind the
+    /// proxy into one bucket.
+    pub fn parse(
+        switch: Option<&str>,
+        per_key_rpm: Option<&str>,
+        global_rpm: Option<&str>,
+        trusted_proxies: Option<&str>,
+    ) -> Result<Self, String> {
+        let (enabled, unrecognised_switch) = match blank_is_unset(switch) {
+            None => (true, false),
+            Some(v) if v.eq_ignore_ascii_case("on") => (true, false),
+            Some(v) if v.eq_ignore_ascii_case("off") => (false, false),
+            Some(_) => (true, true),
+        };
+
+        let rpm = |name: &str, raw: &str| {
+            raw.parse::<u32>()
+                .ok()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| format!("{name}={raw:?} is not a positive whole number"))
+        };
+        let per_key_rpm = match blank_is_unset(per_key_rpm) {
+            None => DEFAULT_RATE_LIMIT_RPM,
+            Some(v) => rpm(RATE_LIMIT_RPM_ENV, v)?,
+        };
+        let global_rpm = match blank_is_unset(global_rpm) {
+            None => None,
+            Some(v) if v.eq_ignore_ascii_case("off") => None,
+            Some(v) => Some(rpm(RATE_LIMIT_GLOBAL_RPM_ENV, v)?),
+        };
+        let trusted_proxies = match blank_is_unset(trusted_proxies) {
+            None => TrustedProxies::loopback(),
+            Some(v) => {
+                TrustedProxies::parse(v).map_err(|e| format!("{TRUSTED_PROXIES_ENV}: {e}"))?
+            }
+        };
+
+        Ok(Self {
+            enabled,
+            unrecognised_switch,
+            per_key_rpm,
+            global_rpm,
+            trusted_proxies,
+        })
+    }
+
+    /// Read and parse the variables from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        let var = |name: &str| std::env::var(name).ok();
+        Self::parse(
+            var(RATE_LIMIT_ENV).as_deref(),
+            var(RATE_LIMIT_RPM_ENV).as_deref(),
+            var(RATE_LIMIT_GLOBAL_RPM_ENV).as_deref(),
+            var(TRUSTED_PROXIES_ENV).as_deref(),
+        )
+    }
+
+    /// The limiter these settings describe, or `None` when disabled.
+    #[must_use]
+    pub fn build(&self) -> Option<AgentRateLimiter> {
+        if !self.enabled {
+            return None;
+        }
+        Some(
+            AgentRateLimiter::new(RateLimitConfig {
+                default_rpm: self.per_key_rpm,
+                global_rpm: self.global_rpm.unwrap_or(u32::MAX),
+                replenish_interval_secs: 1,
+                enable_global_limit: self.global_rpm.is_some(),
+            })
+            .with_trusted_proxies(self.trusted_proxies.clone()),
+        )
+    }
+}
+
+/// Seconds between two recorded refusals of one bucket
+/// ([`AgentRateLimiter::should_record_rejection`]).
+pub const REJECTION_RECORD_INTERVAL_SECS: i64 = 60;
+
+/// How many per-key buckets a limiter tracks before it prunes ([`BucketMap`]).
+pub const DEFAULT_MAX_TRACKED_KEYS: usize = 100_000;
+
+/// The least time between two prune passes over a full map: a pass is
+/// O(tracked keys), and a flood of new keys at the cap would otherwise pay it
+/// on every request.
+const PRUNE_INTERVAL_MS: i64 = 1_000;
+
+/// The per-key buckets, bounded.
+///
+/// A key is any client the middleware can tell apart, so an anonymous client
+/// that rotates its address mints keys at will. At `max` keys the map first
+/// drops every bucket that has refilled to capacity (lossless: a full bucket
+/// behaves exactly like a fresh one). If that frees nothing, a NEW key is
+/// charged to one shared overflow bucket until a later prune frees a slot;
+/// tracked keys, including throttled ones, keep their own buckets and debts.
+#[derive(Debug, Default)]
+struct BucketMap {
+    map: HashMap<AgentId, TokenBucket>,
+    overflow: Option<TokenBucket>,
+    last_prune: Option<DateTime<Utc>>,
+}
+
+impl BucketMap {
+    /// Drop refilled buckets, at most once per [`PRUNE_INTERVAL_MS`].
+    fn prune(&mut self) {
+        let now = Utc::now();
+        if let Some(last) = self.last_prune {
+            if now.signed_duration_since(last).num_milliseconds() < PRUNE_INTERVAL_MS {
+                return;
+            }
+        }
+        self.last_prune = Some(now);
+        self.map.retain(|_, bucket| {
+            bucket.refill();
+            bucket.tokens < bucket.max_tokens
+        });
     }
 }
 
@@ -144,12 +445,17 @@ impl TokenBucket {
 pub struct AgentRateLimiter {
     /// Configuration
     config: RateLimitConfig,
-    /// Per-agent token buckets
-    agent_buckets: Arc<RwLock<HashMap<AgentId, TokenBucket>>>,
+    /// Per-agent token buckets, bounded by `max_tracked_keys`
+    agent_buckets: Arc<RwLock<BucketMap>>,
+    /// The most per-key buckets tracked at once ([`BucketMap`])
+    max_tracked_keys: usize,
     /// Global token bucket
     global_bucket: Arc<RwLock<TokenBucket>>,
     /// Custom limits per agent (requests per minute)
     agent_limits: Arc<RwLock<HashMap<AgentId, u32>>>,
+    /// Proxies whose `X-Forwarded-For` the HTTP middleware believes when it
+    /// keys an anonymous request. Empty by default: the TCP peer is the key.
+    trusted_proxies: TrustedProxies,
 }
 
 impl AgentRateLimiter {
@@ -163,10 +469,43 @@ impl AgentRateLimiter {
 
         Self {
             config,
-            agent_buckets: Arc::new(RwLock::new(HashMap::new())),
+            agent_buckets: Arc::new(RwLock::new(BucketMap::default())),
+            max_tracked_keys: DEFAULT_MAX_TRACKED_KEYS,
             global_bucket: Arc::new(RwLock::new(global_bucket)),
             agent_limits: Arc::new(RwLock::new(HashMap::new())),
+            trusted_proxies: TrustedProxies::none(),
         }
+    }
+
+    /// Cap the number of per-key buckets tracked at once (builder pattern;
+    /// at least 1). See [`BucketMap`] for what happens at the cap.
+    #[must_use]
+    pub fn with_max_tracked_keys(mut self, max: usize) -> Self {
+        self.max_tracked_keys = max.max(1);
+        self
+    }
+
+    /// How many per-key buckets are tracked now (never above the cap).
+    #[must_use]
+    pub fn tracked_keys(&self) -> usize {
+        self.agent_buckets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map
+            .len()
+    }
+
+    /// Set the proxies whose `X-Forwarded-For` is believed (builder pattern).
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxies) -> Self {
+        self.trusted_proxies = trusted_proxies;
+        self
+    }
+
+    /// The proxies whose `X-Forwarded-For` is believed.
+    #[must_use]
+    pub fn trusted_proxies(&self) -> &TrustedProxies {
+        &self.trusted_proxies
     }
 
     /// Create a rate limiter with default configuration
@@ -188,13 +527,17 @@ impl AgentRateLimiter {
     /// * `Ok(())` if the request is allowed
     /// * `Err(RateLimitError)` if the rate limit is exceeded
     pub fn check(&self, agent_id: &AgentId) -> Result<(), RateLimitError> {
-        // Check global limit first
+        // Per-key limit FIRST. A request it refuses must not spend a global
+        // token, or one throttled client that keeps retrying drains the global
+        // bucket and every other client is refused with it. (A request the
+        // global limit then refuses has spent its key's token; that only
+        // under-serves a client while the whole service is over its limit.)
+        self.check_agent(agent_id)?;
+
         if self.config.enable_global_limit {
             self.check_global()?;
         }
-
-        // Check per-agent limit
-        self.check_agent(agent_id)
+        Ok(())
     }
 
     /// Check global rate limit
@@ -212,26 +555,76 @@ impl AgentRateLimiter {
 
     /// Check per-agent rate limit
     fn check_agent(&self, agent_id: &AgentId) -> Result<(), RateLimitError> {
-        let mut buckets = self
+        // Read the limit BEFORE taking the bucket lock: `set_agent_limit`
+        // takes the limits lock and then the bucket lock, so holding the
+        // bucket lock while reading limits could deadlock against it.
+        let limit = self.get_agent_limit(agent_id);
+        let mut guard = self
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let limit = self.get_agent_limit(agent_id);
+        let buckets = &mut *guard;
 
-        let bucket = buckets
-            .entry(*agent_id)
-            .or_insert_with(|| TokenBucket::new(limit, limit as f64 / 60.0));
+        if !buckets.map.contains_key(agent_id) && buckets.map.len() >= self.max_tracked_keys {
+            buckets.prune();
+        }
+        let bucket =
+            if buckets.map.contains_key(agent_id) || buckets.map.len() < self.max_tracked_keys {
+                buckets
+                    .map
+                    .entry(*agent_id)
+                    .or_insert_with(|| TokenBucket::new(limit, limit as f64 / 60.0))
+            } else {
+                let rpm = self.config.default_rpm;
+                buckets
+                    .overflow
+                    .get_or_insert_with(|| TokenBucket::new(rpm, rpm as f64 / 60.0))
+            };
+        let bucket_limit = bucket.max_tokens as u32;
 
         bucket.try_consume().map_err(|retry_after| {
             // Calculate approximate current rate (tokens used)
-            let used_tokens = (limit as f64 - bucket.tokens).max(0.0) as u32;
+            let used_tokens = (bucket.max_tokens - bucket.tokens).max(0.0) as u32;
             RateLimitError::AgentLimitExceeded {
                 agent_id: *agent_id,
                 retry_after_secs: retry_after,
-                current_rate: used_tokens.min(limit) + 1, // +1 for the current request
-                limit,
+                current_rate: used_tokens.min(bucket_limit) + 1, // +1 for the current request
+                limit: bucket_limit,
             }
         })
+    }
+
+    /// Whether the caller should RECORD this refusal (audit event, database
+    /// row, info log): true for the first refusal of a bucket in each
+    /// [`REJECTION_RECORD_INTERVAL_SECS`] window, false for the rest.
+    ///
+    /// Every refusal is still answered 429. Recording each one would let a
+    /// single client turn its own refusals into unbounded write load and flush
+    /// every other event out of a bounded in-memory audit log. A key charged
+    /// to the shared overflow bucket shares its window.
+    pub fn should_record_rejection(&self, err: &RateLimitError) -> bool {
+        let now = Utc::now();
+        match err {
+            RateLimitError::AgentLimitExceeded { agent_id, .. } => {
+                let mut guard = self
+                    .agent_buckets
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let buckets = &mut *guard;
+                match buckets.map.get_mut(agent_id) {
+                    Some(bucket) => bucket.take_record_slot(now),
+                    None => buckets
+                        .overflow
+                        .as_mut()
+                        .is_none_or(|bucket| bucket.take_record_slot(now)),
+                }
+            }
+            RateLimitError::GlobalLimitExceeded { .. } => self
+                .global_bucket
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_record_slot(now),
+        }
     }
 
     /// Get the rate limit for a specific agent
@@ -264,7 +657,7 @@ impl AgentRateLimiter {
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(bucket) = buckets.get_mut(&agent_id) {
+        if let Some(bucket) = buckets.map.get_mut(&agent_id) {
             bucket.max_tokens = rpm as f64;
             bucket.refill_rate = rpm as f64 / 60.0;
         }
@@ -285,17 +678,32 @@ impl AgentRateLimiter {
     /// before hitting their limit.
     #[must_use]
     pub fn remaining_quota(&self, agent_id: &AgentId) -> u32 {
-        let mut buckets = self
+        // Limit first, bucket lock second: the order `check_agent` uses. Taking
+        // the limits lock while holding the bucket lock inverts
+        // `set_agent_limit`'s order and can deadlock against it.
+        let limit = self.get_agent_limit(agent_id);
+        let mut guard = self
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let buckets = &mut *guard;
 
-        if let Some(bucket) = buckets.get_mut(agent_id) {
+        if let Some(bucket) = buckets.map.get_mut(agent_id) {
             bucket.refill();
             bucket.tokens as u32
+        } else if buckets.map.len() >= self.max_tracked_keys {
+            // An untracked key at the cap is charged to the shared overflow
+            // bucket (`check_agent`), so that bucket's tokens are its quota.
+            match buckets.overflow.as_mut() {
+                Some(bucket) => {
+                    bucket.refill();
+                    bucket.tokens as u32
+                }
+                None => self.config.default_rpm,
+            }
         } else {
-            // Agent hasn't made any requests yet, they have their full quota
-            self.get_agent_limit(agent_id)
+            // Not tracked and room to be: its first request gets a full bucket.
+            limit
         }
     }
 
@@ -305,7 +713,7 @@ impl AgentRateLimiter {
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        buckets.remove(agent_id);
+        buckets.map.remove(agent_id);
     }
 
     /// Reset global rate limit (for testing or admin use)
@@ -341,15 +749,22 @@ impl AgentRateLimiter {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             bucket.last_refill -= duration;
+            if let Some(t) = bucket.last_recorded.as_mut() {
+                *t -= duration;
+            }
         }
 
         {
-            let mut buckets = self
+            let mut guard = self
                 .agent_buckets
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for bucket in buckets.values_mut() {
+            let buckets = &mut *guard;
+            for bucket in buckets.map.values_mut().chain(buckets.overflow.as_mut()) {
                 bucket.last_refill -= duration;
+                if let Some(t) = bucket.last_recorded.as_mut() {
+                    *t -= duration;
+                }
             }
         }
     }
@@ -359,14 +774,9 @@ impl std::fmt::Debug for AgentRateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentRateLimiter")
             .field("config", &self.config)
-            .field(
-                "agent_buckets_count",
-                &self
-                    .agent_buckets
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .len(),
-            )
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("agent_buckets_count", &self.tracked_keys())
+            .field("max_tracked_keys", &self.max_tracked_keys)
             .finish()
     }
 }
@@ -388,6 +798,271 @@ mod tests {
         let mut bucket = TokenBucket::new(1, 0.1);
         assert!(bucket.try_consume().is_ok());
         assert!(bucket.try_consume().is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_parse_addresses_and_prefixes() {
+        let t = TrustedProxies::parse(" 192.0.2.1, 198.51.100.0/24 ,2001:db8::/32").unwrap();
+        assert!(t.contains("192.0.2.1".parse().unwrap()));
+        assert!(!t.contains("192.0.2.2".parse().unwrap()));
+        assert!(t.contains("198.51.100.77".parse().unwrap()));
+        assert!(!t.contains("198.51.101.1".parse().unwrap()));
+        assert!(t.contains("2001:db8:1::5".parse().unwrap()));
+        assert!(!t.contains("2001:db9::1".parse().unwrap()));
+        // IPv4-mapped IPv6 peers match their IPv4 entry.
+        assert!(t.contains("::ffff:192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxies_refuse_malformed_lists() {
+        assert!(TrustedProxies::parse("192.0.2.1,").is_err());
+        assert!(TrustedProxies::parse("not-an-ip").is_err());
+        assert!(TrustedProxies::parse("192.0.2.0/33").is_err());
+        assert!(TrustedProxies::parse("2001:db8::/129").is_err());
+        assert!(TrustedProxies::parse("none").unwrap().is_empty());
+        assert!(TrustedProxies::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("203.0.113.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn loopback_trusts_only_loopback() {
+        let t = TrustedProxies::loopback();
+        assert!(t.contains("127.0.0.1".parse().unwrap()));
+        assert!(t.contains("127.8.9.10".parse().unwrap()));
+        assert!(t.contains("::1".parse().unwrap()));
+        assert!(!t.contains("203.0.113.1".parse().unwrap()));
+        assert!(!t.contains("::2".parse().unwrap()));
+    }
+
+    fn key(n: u128) -> AgentId {
+        AgentId::from_uuid(uuid::Uuid::from_u128(n))
+    }
+
+    fn per_key(rpm: u32) -> AgentRateLimiter {
+        AgentRateLimiter::new(RateLimitConfig {
+            default_rpm: rpm,
+            global_rpm: 1_000_000,
+            replenish_interval_secs: 60,
+            enable_global_limit: false,
+        })
+    }
+
+    /// bd5c0f40: one bucket per distinct key, forever, is a memory leak an
+    /// anonymous client drives by rotating its address. Buckets that have
+    /// refilled are indistinguishable from fresh ones, so dropping them at
+    /// the cap loses nothing.
+    #[test]
+    fn the_bucket_map_is_capped_and_refilled_buckets_are_pruned() {
+        let limiter = per_key(2).with_max_tracked_keys(4);
+        for n in 0..4 {
+            limiter.check(&key(n)).unwrap();
+        }
+        assert_eq!(limiter.tracked_keys(), 4);
+        // Every bucket refills fully.
+        limiter.advance_time(chrono::Duration::minutes(2));
+        for n in 4..8 {
+            // Each newcomer gets a bucket of its OWN (2 requests, then 429):
+            // the refilled buckets made room, so nobody lands in the shared
+            // overflow bucket.
+            limiter.check(&key(n)).unwrap();
+            limiter.check(&key(n)).unwrap();
+            assert!(limiter.check(&key(n)).is_err());
+            assert!(limiter.tracked_keys() <= 4, "map grew past its cap");
+        }
+    }
+
+    /// When every tracked bucket is still draining, nothing can be dropped
+    /// without forgiving a client its debt. New keys then share ONE overflow
+    /// bucket, so the map stays bounded and a client already being throttled
+    /// stays throttled.
+    #[test]
+    fn at_the_cap_new_keys_share_an_overflow_bucket() {
+        let limiter = per_key(2).with_max_tracked_keys(2);
+        for n in 0..2 {
+            limiter.check(&key(n)).unwrap();
+            limiter.check(&key(n)).unwrap();
+            assert!(limiter.check(&key(n)).is_err());
+        }
+        // The overflow bucket holds default_rpm (2) between all newcomers.
+        limiter.check(&key(100)).unwrap();
+        limiter.check(&key(101)).unwrap();
+        assert!(
+            limiter.check(&key(102)).is_err(),
+            "the third newcomer at the cap is charged to the spent overflow bucket"
+        );
+        assert!(limiter.tracked_keys() <= 2, "map grew past its cap");
+        assert!(
+            limiter.check(&key(0)).is_err(),
+            "a tracked, throttled key keeps its debt"
+        );
+    }
+
+    /// The middleware reports `remaining_quota` on every served response. For
+    /// a key charged to the overflow bucket that is the overflow bucket's
+    /// balance, not a fresh key's full quota.
+    #[test]
+    fn an_overflow_charged_key_reports_the_overflow_balance() {
+        let limiter = per_key(2).with_max_tracked_keys(1);
+        limiter.check(&key(0)).unwrap();
+        // Two newcomers at the cap spend the shared overflow bucket (2).
+        limiter.check(&key(100)).unwrap();
+        limiter.check(&key(101)).unwrap();
+        assert_eq!(
+            limiter.remaining_quota(&key(101)),
+            0,
+            "an overflow-charged key whose shared bucket is spent has no quota left"
+        );
+    }
+
+    /// `set_agent_limit` takes the limits lock, then the bucket lock.
+    /// `remaining_quota` for an untracked key must not take them the other
+    /// way round, or the two deadlock and every later request blocks on the
+    /// limiter. Two threads race the pair; a deadlock shows as a timeout.
+    #[test]
+    fn remaining_quota_does_not_deadlock_against_set_agent_limit() {
+        let limiter = per_key(2).with_max_tracked_keys(1);
+        limiter.check(&key(0)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let quota = limiter.clone();
+        let setter = limiter.clone();
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200_000 {
+                // Untracked key: the branch that reads the limit.
+                let _ = quota.remaining_quota(&key(7));
+            }
+            let _ = tx.send(());
+        });
+        std::thread::spawn(move || {
+            for n in 0..200_000u32 {
+                setter.set_agent_limit(key(7), 2 + n % 3);
+            }
+            let _ = tx2.send(());
+        });
+        for _ in 0..2 {
+            rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("remaining_quota and set_agent_limit deadlocked");
+        }
+    }
+
+    /// A request the per-key limit refuses must not spend a global token.
+    /// Otherwise one throttled client, retrying, drains the global bucket and
+    /// every other client gets 429 too: the limiter becomes the DoS.
+    #[test]
+    fn a_throttled_key_cannot_drain_the_global_bucket() {
+        let limiter = AgentRateLimiter::new(RateLimitConfig {
+            default_rpm: 1,
+            global_rpm: 3,
+            replenish_interval_secs: 60,
+            enable_global_limit: true,
+        });
+        limiter.check(&key(1)).unwrap();
+        for _ in 0..10 {
+            assert!(matches!(
+                limiter.check(&key(1)),
+                Err(RateLimitError::AgentLimitExceeded { .. })
+            ));
+        }
+        limiter
+            .check(&key(2))
+            .expect("another client is within both limits");
+        limiter
+            .check(&key(3))
+            .expect("the global bucket still has its third token");
+        assert!(matches!(
+            limiter.check(&key(4)),
+            Err(RateLimitError::GlobalLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_once_per_key_per_window() {
+        let limiter = per_key(1);
+        limiter.check(&key(1)).unwrap();
+        let err = limiter.check(&key(1)).unwrap_err();
+        assert!(limiter.should_record_rejection(&err), "first refusal");
+        let err = limiter.check(&key(1)).unwrap_err();
+        assert!(!limiter.should_record_rejection(&err), "same window");
+        // Another key's refusal is its own.
+        limiter.check(&key(2)).unwrap();
+        let other = limiter.check(&key(2)).unwrap_err();
+        assert!(limiter.should_record_rejection(&other));
+        // A window later the same key is recorded again.
+        limiter.advance_time(chrono::Duration::seconds(
+            REJECTION_RECORD_INTERVAL_SECS + 1,
+        ));
+        limiter.check(&key(1)).unwrap();
+        let err = limiter.check(&key(1)).unwrap_err();
+        assert!(limiter.should_record_rejection(&err), "next window");
+        // The global bucket has its own window.
+        let g = RateLimitError::GlobalLimitExceeded {
+            retry_after_secs: 1,
+        };
+        assert!(limiter.should_record_rejection(&g));
+        assert!(!limiter.should_record_rejection(&g));
+    }
+
+    #[test]
+    fn settings_default_to_on_with_loopback_proxies_and_no_global_limit() {
+        let s = RateLimitSettings::parse(None, None, None, None).unwrap();
+        assert!(s.enabled && !s.unrecognised_switch);
+        assert_eq!(s.per_key_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert_eq!(s.global_rpm, None);
+        assert_eq!(s.trusted_proxies, TrustedProxies::loopback());
+        let limiter = s.build().expect("on by default");
+        assert_eq!(limiter.config().default_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert!(!limiter.config().enable_global_limit);
+        // Blank is unset.
+        assert_eq!(
+            RateLimitSettings::parse(Some(" "), Some(""), Some(""), Some("")).unwrap(),
+            s
+        );
+    }
+
+    #[test]
+    fn settings_parse_every_variable() {
+        let s =
+            RateLimitSettings::parse(Some("ON"), Some("30"), Some("5000"), Some("192.0.2.0/24"))
+                .unwrap();
+        let limiter = s.build().unwrap();
+        assert_eq!(limiter.config().default_rpm, 30);
+        assert_eq!(limiter.config().global_rpm, 5000);
+        assert!(limiter.config().enable_global_limit);
+        assert!(limiter
+            .trusted_proxies()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(!limiter
+            .trusted_proxies()
+            .contains("127.0.0.1".parse().unwrap()));
+
+        let off = RateLimitSettings::parse(Some("off"), None, None, None).unwrap();
+        assert!(!off.enabled);
+        assert!(off.build().is_none());
+
+        // An unrecognised switch stays ON (fail safe) and says so.
+        let odd = RateLimitSettings::parse(Some("disabled"), None, None, None).unwrap();
+        assert!(odd.enabled && odd.unrecognised_switch);
+
+        let none = RateLimitSettings::parse(None, None, Some("off"), Some("none")).unwrap();
+        assert_eq!(none.global_rpm, None);
+        assert!(none.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn settings_refuse_malformed_values() {
+        for (rpm, global, proxies) in [
+            (Some("0"), None, None),
+            (Some("fast"), None, None),
+            (None, Some("-1"), None),
+            (None, None, Some("192.0.2.1,")),
+            (None, None, Some("proxy.internal")),
+        ] {
+            assert!(
+                RateLimitSettings::parse(None, rpm, global, proxies).is_err(),
+                "{rpm:?} {global:?} {proxies:?} must refuse"
+            );
+        }
     }
 
     #[test]

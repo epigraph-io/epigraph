@@ -9,38 +9,41 @@
 //!
 //! # Rate Limiting Strategy
 //!
-//! - **Authenticated requests**: Rate limited by agent ID
-//! - **Unauthenticated requests**: Rate limited by client IP
+//! - **Authenticated requests**: Rate limited by principal (agent, else client)
+//! - **Unauthenticated requests**: Rate limited by TCP peer, or behind a
+//!   configured trusted proxy by the right-most untrusted X-Forwarded-For hop
 //! - **Health endpoints**: Exempt from rate limiting
 
 // UNSCOPED-POOL-EXEMPT: One `db_pool.clone()` handed to a detached task that records security
-// events. It runs after the rate-limit decision and outside any request's viewer scope, and rate
-// limiting precedes authentication, so the request may have no principal to scope to at all.
+// events. It runs after the rate-limit decision and outside any request's viewer scope, and on the
+// anonymous routers (the allowlist without a token, OAuth) the request has no principal to scope
+// to at all.
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use epigraph_core::domain::AgentId;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
 
+use crate::middleware::AuthContext;
 use crate::security::audit::SecurityAuditLog;
-use crate::security::{RateLimitError, SecurityEvent};
+use crate::security::{RateLimitError, SecurityEvent, TrustedProxies};
 use crate::state::AppState;
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/// Header for forwarded client IP (from reverse proxy)
+/// Header for forwarded client IP, read only from a trusted proxy
 const X_FORWARDED_FOR: &str = "X-Forwarded-For";
 
-/// Header for real IP (alternative to X-Forwarded-For)
+/// Header for real IP, read only from a trusted proxy that sent no X-Forwarded-For
 const X_REAL_IP: &str = "X-Real-IP";
 
 /// Routes that bypass rate limiting.
@@ -87,12 +90,11 @@ impl IntoResponse for RateLimitResponse {
                 .parse()
                 .expect("Numeric retry_after is valid header"),
         );
-        // Never cached. This middleware wraps the whole merged router, so a 429
-        // never passes through the inner routers' layers; on /oauth/* and
-        // /.well-known/* that includes `routes::oauth_response_headers`, whose
-        // no-store / no-cache RFC 6749 section 5.1 requires there. Set here, on
-        // every route's 429: a refusal that a cache replayed would refuse a
-        // client after its window has reopened.
+        // Never cached, on every route's 429: a refusal that a cache replayed
+        // would refuse a client after its window has reopened. (On /oauth/*
+        // and /.well-known/* `routes::oauth_response_headers` wraps this layer
+        // and sets the same RFC 6749 section 5.1 headers; elsewhere nothing
+        // else would.)
         response.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
@@ -110,43 +112,95 @@ impl IntoResponse for RateLimitResponse {
 // Helper Functions
 // ============================================================================
 
-/// Extract client IP from request headers or connection info
+/// The client address an anonymous request is charged to.
 ///
-/// Priority:
-/// 1. X-Forwarded-For (first IP in chain)
-/// 2. X-Real-IP
-/// 3. Connected peer address (fallback)
+/// 1. The TCP peer, from the `ConnectInfo<SocketAddr>` that `bin/server.rs`
+///    serves with (`into_make_service_with_connect_info`).
+/// 2. Only when that peer is a trusted proxy ([`TrustedProxies`]): the
+///    right-most `X-Forwarded-For` hop that is not itself a trusted proxy,
+///    walking right to left across every `X-Forwarded-For` header in order.
+///    Each trusted proxy APPENDS the address it received the request from, so
+///    hops to the left of the last untrusted one were written by the client
+///    and are never read. If every hop is a trusted proxy, the left-most is
+///    the client. A hop that does not parse ends the walk at the last trusted
+///    hop seen. With no `X-Forwarded-For` at all, a trusted proxy's
+///    `X-Real-IP` is used.
 ///
-/// # Security Note
+/// Before backlog bd5c0f40 this read the FIRST `X-Forwarded-For` hop (or
+/// `X-Real-IP`) from any peer. Both are client-written, so a client that
+/// changed the header on every request got a fresh bucket every time.
 ///
-/// X-Forwarded-For can be spoofed by clients. In production, ensure
-/// your reverse proxy overwrites this header with the actual client IP.
-fn extract_client_ip(request: &Request<Body>) -> Option<IpAddr> {
-    // Try X-Forwarded-For first
-    if let Some(forwarded) = request.headers().get(X_FORWARDED_FOR) {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            // X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
-            // The first one is the original client
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse() {
+/// `None` only when the request carries no `ConnectInfo` (a router driven
+/// without `into_make_service_with_connect_info`, e.g. in a test).
+fn client_ip(request: &Request<Body>, trusted: &TrustedProxies) -> Option<IpAddr> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()?
+        .0
+        .ip()
+        .to_canonical();
+    if !trusted.contains(peer) {
+        return Some(peer);
+    }
+
+    let hops: Vec<&str> = request
+        .headers()
+        .get_all(X_FORWARDED_FOR)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+
+    if hops.is_empty() {
+        let real_ip = request
+            .headers()
+            .get(X_REAL_IP)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical());
+        return Some(real_ip.unwrap_or(peer));
+    }
+
+    let mut last_trusted = peer;
+    for hop in hops.iter().rev() {
+        match hop.parse::<IpAddr>() {
+            Ok(ip) => {
+                let ip = ip.to_canonical();
+                if !trusted.contains(ip) {
                     return Some(ip);
                 }
+                last_trusted = ip;
             }
+            Err(_) => return Some(last_trusted),
         }
     }
+    Some(last_trusted)
+}
 
-    // Try X-Real-IP
-    if let Some(real_ip) = request.headers().get(X_REAL_IP) {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse() {
-                return Some(ip);
-            }
-        }
+/// The bucket a request is charged to.
+///
+/// 1. The authenticated principal: the `AuthContext` a bearer layer inserted
+///    (its agent, else its OAuth client). `routes::create_router` places this
+///    middleware INSIDE `bearer_auth_middleware` (protected router) and
+///    `optional_bearer_auth_middleware` (anonymous allowlist), so a token
+///    presented there is already verified when this runs.
+/// 2. A `VerifiedAgent` (Ed25519-signed request), where a router installs
+///    `signature_verification_middleware`; no production router does.
+/// 3. The client address ([`client_ip`]).
+///
+/// `None` when none of these is available.
+fn rate_limit_key(request: &Request<Body>, trusted: &TrustedProxies) -> Option<AgentId> {
+    if let Some(auth) = request.extensions().get::<AuthContext>() {
+        return Some(AgentId::from_uuid(auth.agent_id.unwrap_or(auth.client_id)));
     }
-
-    // No header found - connection info would need ConnectInfo extractor
-    // which requires additional setup. Return None for now.
-    None
+    if let Some(agent) = request
+        .extensions()
+        .get::<crate::middleware::VerifiedAgent>()
+    {
+        return Some(agent.agent_id);
+    }
+    client_ip(request, trusted).map(ip_to_agent_id)
 }
 
 /// Check if a route should bypass rate limiting
@@ -160,24 +214,27 @@ fn should_bypass_rate_limit(path: &str, method: &Method) -> bool {
     BYPASS_ROUTES.iter().any(|route| path.starts_with(route))
 }
 
-/// Generate a rate limit key from client IP
+/// The bucket key of a client address.
+///
+/// Injective, not hashed: the address bytes are the key, so two clients can
+/// never share a bucket by collision. An IPv6 client is keyed by its /64,
+/// the smallest prefix a site is normally assigned; keying the full address
+/// would hand one host 2^64 buckets.
 fn ip_to_agent_id(ip: IpAddr) -> AgentId {
-    // Convert IP to a deterministic AgentId for rate limiting purposes
-    // This uses a hash of the IP address as the UUID
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    ip.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    // Create a UUID v4-like ID from the hash (not a real UUID, but deterministic)
-    let bytes = hash.to_le_bytes();
-    let mut uuid_bytes = [0u8; 16];
-    uuid_bytes[..8].copy_from_slice(&bytes);
-    uuid_bytes[8..16].copy_from_slice(&bytes); // Duplicate for full 16 bytes
-
-    AgentId::from_uuid(uuid::Uuid::from_bytes(uuid_bytes))
+    let mut bytes = [0u8; 16];
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            bytes[0] = 4;
+            bytes[1..5].copy_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            bytes[0] = 6;
+            bytes[1..9].copy_from_slice(&v6.octets()[..8]);
+        }
+    }
+    // A fixed tail keeps address keys apart from (random) principal UUIDs.
+    bytes[12..16].copy_from_slice(b"rlip");
+    AgentId::from_uuid(uuid::Uuid::from_bytes(bytes))
 }
 
 // ============================================================================
@@ -227,32 +284,18 @@ pub async fn rate_limit_middleware(
         }
     };
 
-    // Extract client identifier
-    // Priority: VerifiedAgent (if present) > IP address > fallback
-    //
-    // PR-03 note: the `VerifiedAgent` arm is now permanently `None` in
-    // production. `VerifiedAgent` is inserted only by
-    // `middleware::auth::signature_verification_middleware`, whose sole
-    // production caller (`middleware::require_signature`) was deleted with the
-    // router inversion. It is kept rather than collapsed to IP-only because the
-    // middleware integration tests still exercise this precedence, and because
-    // PR-07 will replace it with the `ViewerExtractor` principal — which is a
-    // strictly better rate-limit key than the client IP and restores the
-    // intent of this branch.
-    let agent_id = request
-        .extensions()
-        .get::<crate::middleware::VerifiedAgent>()
-        .map(|agent| agent.agent_id)
-        .or_else(|| extract_client_ip(&request).map(ip_to_agent_id))
-        .unwrap_or_else(|| {
-            // Fallback: use a fixed ID for requests without identifiable source
-            // This is a security concern - should be logged
-            tracing::warn!(
-                path = %path,
-                "Rate limiting request without identifiable client - using fallback ID"
-            );
-            AgentId::from_uuid(uuid::Uuid::nil())
-        });
+    // Which bucket: principal > signed agent > client address
+    // ([`rate_limit_key`]). The nil fallback is reachable only for a router
+    // served WITHOUT connect info, which `bin/server.rs` never does; it is one
+    // shared bucket, so it is logged.
+    let agent_id = rate_limit_key(&request, rate_limiter.trusted_proxies()).unwrap_or_else(|| {
+        tracing::warn!(
+            path = %path,
+            "Rate limiting request without identifiable client - using fallback ID \
+             (is the router served with into_make_service_with_connect_info?)"
+        );
+        AgentId::from_uuid(uuid::Uuid::nil())
+    });
 
     // Check rate limit
     if let Err(err) = rate_limiter.check(&agent_id) {
@@ -275,6 +318,21 @@ pub async fn rate_limit_middleware(
                 rate_limiter.config().global_rpm,
             ),
         };
+
+        // Record the refusal (in-memory audit event, database row, info log)
+        // once per bucket per window, not once per 429: a client being
+        // refused must not be able to turn its refusals into write load.
+        if !rate_limiter.should_record_rejection(&err) {
+            tracing::debug!(
+                path = %path,
+                agent_id = %agent_id,
+                "Rate limit exceeded (already recorded this window)"
+            );
+            return Err(RateLimitResponse {
+                retry_after_secs: retry_after,
+                message,
+            });
+        }
 
         // Log rate limit exceeded event to audit log (in-memory)
         let correlation_id = Uuid::new_v4().to_string();
@@ -409,6 +467,119 @@ mod tests {
 
         // Just verify it doesn't panic and produces an ID
         assert!(!id.to_string().is_empty());
+    }
+
+    fn req(peer: Option<&str>, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut b = Request::builder().uri("/x");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut r = b.body(Body::empty()).unwrap();
+        if let Some(p) = peer {
+            r.extensions_mut()
+                .insert(ConnectInfo(p.parse::<SocketAddr>().unwrap()));
+        }
+        r
+    }
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn forwarding_headers_from_an_untrusted_peer_are_ignored() {
+        let none = TrustedProxies::none();
+        let r = req(
+            Some("203.0.113.5:1"),
+            &[
+                ("X-Forwarded-For", "198.51.100.1"),
+                ("X-Real-IP", "198.51.100.2"),
+            ],
+        );
+        assert_eq!(client_ip(&r, &none), ip("203.0.113.5"));
+    }
+
+    #[test]
+    fn trusted_proxy_hops_are_walked_right_to_left() {
+        let t = TrustedProxies::parse("192.0.2.0/24").unwrap();
+        // Two X-Forwarded-For headers are one list, in order.
+        let r = req(
+            Some("192.0.2.1:1"),
+            &[
+                ("X-Forwarded-For", "198.51.100.1, 203.0.113.9"),
+                ("X-Forwarded-For", "192.0.2.7"),
+            ],
+        );
+        assert_eq!(client_ip(&r, &t), ip("203.0.113.9"));
+        // Every hop trusted: the left-most is the client.
+        let r = req(
+            Some("192.0.2.1:1"),
+            &[("X-Forwarded-For", "192.0.2.8, 192.0.2.9")],
+        );
+        assert_eq!(client_ip(&r, &t), ip("192.0.2.8"));
+        // An unparseable hop stops the walk at the last trusted hop.
+        let r = req(
+            Some("192.0.2.1:1"),
+            &[("X-Forwarded-For", "198.51.100.1, junk, 192.0.2.9")],
+        );
+        assert_eq!(client_ip(&r, &t), ip("192.0.2.9"));
+        // No X-Forwarded-For: a trusted proxy's X-Real-IP, else the proxy.
+        let r = req(Some("192.0.2.1:1"), &[("X-Real-IP", "203.0.113.44")]);
+        assert_eq!(client_ip(&r, &t), ip("203.0.113.44"));
+        let r = req(Some("192.0.2.1:1"), &[]);
+        assert_eq!(client_ip(&r, &t), ip("192.0.2.1"));
+    }
+
+    #[test]
+    fn no_connect_info_means_no_client_address() {
+        let r = req(None, &[("X-Forwarded-For", "198.51.100.1")]);
+        assert_eq!(client_ip(&r, &TrustedProxies::loopback()), None);
+    }
+
+    #[test]
+    fn the_principal_outranks_the_address() {
+        let agent = Uuid::new_v4();
+        let client = Uuid::new_v4();
+        let mut r = req(Some("203.0.113.5:1"), &[]);
+        let jwt = crate::oauth::JwtConfig::from_secret(b"0123456789abcdef0123456789abcdef");
+        let (tok, _) = jwt
+            .issue_access_token(
+                client,
+                vec![],
+                "agent",
+                None,
+                Some(agent),
+                chrono::Duration::minutes(1),
+                epigraph_auth::AccessTokenBinding::NONE,
+            )
+            .unwrap();
+        let ctx: AuthContext = jwt.validate_token(&tok).unwrap().into();
+        r.extensions_mut().insert(ctx.clone());
+        assert_eq!(
+            rate_limit_key(&r, &TrustedProxies::none()),
+            Some(AgentId::from_uuid(agent))
+        );
+        // A token with no agent is keyed by its client.
+        let mut ctx = ctx;
+        ctx.agent_id = None;
+        r.extensions_mut().insert(ctx);
+        assert_eq!(
+            rate_limit_key(&r, &TrustedProxies::none()),
+            Some(AgentId::from_uuid(client))
+        );
+    }
+
+    #[test]
+    fn ipv6_keys_cover_the_slash_64_and_v4_mapped_is_v4() {
+        let a = ip_to_agent_id("2001:db8:1:2::1".parse().unwrap());
+        let b = ip_to_agent_id("2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap());
+        let c = ip_to_agent_id("2001:db8:1:3::1".parse().unwrap());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(
+            ip_to_agent_id("::ffff:192.0.2.1".parse().unwrap()),
+            ip_to_agent_id("192.0.2.1".parse().unwrap())
+        );
     }
 
     #[test]
