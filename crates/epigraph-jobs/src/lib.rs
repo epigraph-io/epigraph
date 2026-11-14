@@ -471,6 +471,16 @@ pub struct JobRunner {
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Write a job's state back to its queue from the worker loop, logging (not
+/// dropping) a queue error: the loop has no caller to return it to, and a
+/// silently lost write leaves the row in whatever state the queue last held.
+async fn write_back(queue: &dyn JobQueue, job: &Job) {
+    if let Err(e) = queue.update(job).await {
+        tracing::error!(job_id = %job.id, job_type = %job.job_type, state = %job.state,
+            error = %e, "job runner: could not write the job's state back to the queue");
+    }
+}
+
 impl JobRunner {
     /// Create a new job runner with the specified worker count.
     ///
@@ -535,69 +545,92 @@ impl JobRunner {
                     }
 
                     // Try to get a job
-                    if let Some(mut job) = queue.dequeue().await {
-                        // Find handler for this job type
-                        if let Some(handler) = handlers.get(&job.job_type) {
-                            // Check if we've exceeded max retries.
-                            //
-                            // Path A — the dequeue handed us a job that was
-                            // already at retry_count >= max_retries. Mark it
-                            // failed, but PRESERVE any prior error_message
-                            // that earlier retry attempts captured. Replacing
-                            // it with a generic "Maximum retries exceeded"
-                            // hides the actual stage failure; instead we
-                            // append.
+                    let Some(mut job) = queue.dequeue().await else {
+                        // No jobs available, sleep briefly
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    };
+
+                    // A job of a type this runner has no handler for is failed
+                    // with the reason. A persistent queue has already flipped
+                    // the row to `running`; writing nothing back would strand
+                    // it there with no handler ever to finish it, and putting
+                    // it back to `pending` would hand it straight out again at
+                    // the head of the queue (backlog 99dc2bbd).
+                    let Some(handler) = handlers.get(&job.job_type) else {
+                        let err = JobError::NoHandler {
+                            job_type: job.job_type.clone(),
+                        };
+                        tracing::error!(job_id = %job.id, job_type = %job.job_type,
+                            "job runner: no handler registered; failing the job");
+                        let now = Utc::now();
+                        job.state = JobState::Failed;
+                        job.error_message = Some(err.to_string());
+                        job.updated_at = now;
+                        job.completed_at = Some(now);
+                        write_back(queue.as_ref(), &job).await;
+                        continue;
+                    };
+
+                    // Check if we've exceeded max retries.
+                    //
+                    // Path A — the dequeue handed us a job that was already at
+                    // retry_count >= max_retries. Mark it failed, but PRESERVE
+                    // any prior error_message that earlier retry attempts
+                    // captured. Replacing it with a generic "Maximum retries
+                    // exceeded" hides the actual stage failure; instead we
+                    // append.
+                    if job.retry_count >= job.max_retries {
+                        job.state = JobState::Failed;
+                        let prior = job.error_message.clone().unwrap_or_default();
+                        job.error_message = Some(if prior.is_empty() {
+                            "Maximum retries exceeded (no prior error captured)".to_string()
+                        } else {
+                            format!("Maximum retries exceeded; last error: {prior}")
+                        });
+                        write_back(queue.as_ref(), &job).await;
+                        continue;
+                    }
+
+                    // Transition to Running (a persistent queue's dequeue
+                    // already did; the refused Running -> Running is moot).
+                    let _ = job.transition_to(JobState::Running);
+
+                    // Execute handler
+                    match handler.handle(&job).await {
+                        Ok(_result) => {
+                            let _ = job.transition_to(JobState::Completed);
+                            write_back(queue.as_ref(), &job).await;
+                        }
+                        Err(e) => {
+                            job.retry_count += 1;
+                            job.error_message = Some(e.to_string());
+
                             if job.retry_count >= job.max_retries {
                                 job.state = JobState::Failed;
-                                let prior = job.error_message.clone().unwrap_or_default();
-                                job.error_message = Some(if prior.is_empty() {
-                                    "Maximum retries exceeded (no prior error captured)".to_string()
-                                } else {
-                                    format!("Maximum retries exceeded; last error: {prior}")
-                                });
-                                let _ = queue.update(&job).await;
-                                continue;
+                                job.updated_at = Utc::now();
+                                job.completed_at = Some(Utc::now());
+                            } else {
+                                // Reset to Pending for retry after backoff
+                                job.state = JobState::Pending;
+                                job.started_at = None;
+                                job.updated_at = Utc::now();
+
+                                // Apply backoff before re-enqueueing
+                                let backoff = handler.backoff(job.retry_count - 1);
+                                tokio::time::sleep(backoff).await;
                             }
+                            write_back(queue.as_ref(), &job).await;
 
-                            // Transition to Running
-                            let _ = job.transition_to(JobState::Running);
-
-                            // Execute handler
-                            match handler.handle(&job).await {
-                                Ok(_result) => {
-                                    let _ = job.transition_to(JobState::Completed);
-                                    let _ = queue.update(&job).await;
-                                }
-                                Err(e) => {
-                                    job.retry_count += 1;
-                                    job.error_message = Some(e.to_string());
-
-                                    if job.retry_count >= job.max_retries {
-                                        job.state = JobState::Failed;
-                                        job.updated_at = Utc::now();
-                                        job.completed_at = Some(Utc::now());
-                                    } else {
-                                        // Reset to Pending for retry after backoff
-                                        job.state = JobState::Pending;
-                                        job.started_at = None;
-                                        job.updated_at = Utc::now();
-
-                                        // Apply backoff before re-enqueueing
-                                        let backoff = handler.backoff(job.retry_count - 1);
-                                        tokio::time::sleep(backoff).await;
-                                    }
-                                    let _ = queue.update(&job).await;
-
-                                    // Re-enqueue for retry if not failed
-                                    if job.state == JobState::Pending {
-                                        let _ = queue.enqueue(job).await;
-                                    }
+                            // Re-enqueue for retry if not failed
+                            if job.state == JobState::Pending {
+                                let job_id = job.id;
+                                if let Err(e) = queue.enqueue(job).await {
+                                    tracing::error!(%job_id, error = %e,
+                                        "job runner: could not re-enqueue a job for its retry");
                                 }
                             }
                         }
-                    } else {
-                        // No jobs available, sleep briefly
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
             });
