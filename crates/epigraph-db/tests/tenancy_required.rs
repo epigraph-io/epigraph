@@ -11,33 +11,37 @@
 //!
 //! # The one thing that makes every assertion here non-vacuous
 //!
-//! Migration 074's escape hatch is
-//! `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`. The test harness
-//! connects as a **superuser**, and a superuser satisfies `pg_has_role` for
-//! every role — so on the default connection every undeclared write takes arm
-//! 4 and succeeds. A file that only ever wrote on the default connection could
-//! not observe the `23502` this migration exists to raise, and would pass on a
-//! tree where 074 had never been applied.
+//! The escape hatch is taken when the session user holds an EXPLICIT grant of
+//! `epigraph_seed` (`epigraph_session_is_seed()`, migration 216; before 216
+//! it was `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`, which every
+//! superuser satisfies without a grant). The test harness is granted the
+//! role (`epigraph-migrate` with `EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1`, set
+//! in CI's job env), so on the default connection every undeclared write
+//! takes arm 4 and succeeds. A file that only ever wrote on the default
+//! connection could not observe the `23502` this migration exists to raise,
+//! and would pass on a tree where 074 had never been applied.
 //!
 //! So the refusal assertions run inside
 //! [`fixture::as_role`]`(pool, "epigraph_app", …)`, which issues
 //! **`SET SESSION AUTHORIZATION`** — not `SET ROLE`. `SET ROLE` changes only
 //! `current_user`; the trigger reads `session_user`, so under `SET ROLE` the
-//! session is still the superuser and arm 4 still fires. That was measured, not
-//! assumed, and it is the single easiest way to write a green vacuous version
-//! of this file.
+//! session is still the harness role and arm 4 still fires. That was measured,
+//! not assumed, and it is the single easiest way to write a green vacuous
+//! version of this file.
 //!
-//! # And the corollary for anyone running the suite as a non-superuser
+//! # And the corollary for anyone running the suite on their own cluster
 //!
-//! The ~180 test fixtures across this workspace that insert claims without
-//! naming the tenancy columns survive 074 **because the harness role is a
-//! superuser**, not because of any grant. The plan's *Files* line says
-//! "`epigraph_seed` granted to the test harness pools"; on this host and in CI
-//! (`POSTGRES_USER: epigraph` on a stock `pgvector/pgvector:pg16`) that grant
-//! is implied and no `pg_auth_members` row exists. A harness that connects as a
-//! non-superuser needs `GRANT epigraph_seed TO <role>` or those fixtures start
-//! raising `23502`. [`the_harness_role_can_take_the_seed_escape_hatch`] asserts
-//! the precondition so the failure names itself.
+//! The ~180 test fixtures across this workspace that insert claims or root
+//! rows without naming the tenancy columns survive 074 **because the harness
+//! role is granted `epigraph_seed`**. Until migration 216 a superuser harness
+//! needed no grant, because `pg_has_role` implied it; that implication is
+//! exactly the defect 216 closes (backlog 0512ca33: superuser-DSN services
+//! stamping production rows onto the memberless seed group). A harness
+//! without the grant sees those fixtures raise `23502`. Run
+//! `GRANT epigraph_seed TO <harness role>` once per cluster, or migrate with
+//! `EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1`.
+//! [`the_harness_role_can_take_the_seed_escape_hatch`] asserts the
+//! precondition so the failure names itself.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -320,22 +324,26 @@ async fn a5_every_tenancy_trigger_is_enabled(pool: PgPool) {
 /// about to fail too, and they will fail with the same `23502` — but scattered
 /// across a hundred unrelated test names. Asserting it once, here, is what
 /// makes that diagnosable.
+///
+/// Asked through `epigraph_session_is_seed()`, the function the three
+/// `*_require_tenancy` bodies consult since migration 216, not through
+/// `pg_has_role`, which a superuser satisfies without any grant and which is
+/// therefore no longer the question the triggers ask.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_harness_role_can_take_the_seed_escape_hatch(pool: PgPool) {
-    let ok: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
-            AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER')",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("seed membership probe");
+    let ok: bool = sqlx::query_scalar("SELECT public.epigraph_session_is_seed()")
+        .fetch_one(&pool)
+        .await
+        .expect("seed membership probe");
 
     assert!(
         ok,
-        "the test harness role must satisfy migration 074 arm 4, or every fixture in \
-         this workspace that inserts a claim without naming (visibility, \
-         owner_group_id) starts raising 23502. On a superuser connection this holds \
-         implicitly; on a non-superuser harness run `GRANT epigraph_seed TO <role>`."
+        "the test harness role must hold an EXPLICIT grant of epigraph_seed, or every \
+         fixture in this workspace that inserts a claim or a root row without naming \
+         (visibility, owner_group_id) starts raising 23502. Since migration 216 a \
+         superuser is NOT a seed by implication. Run `GRANT epigraph_seed TO <harness \
+         role>` once on this cluster, or migrate it with \
+         EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1 (CI's job env sets it)."
     );
 }
 
@@ -388,7 +396,7 @@ async fn an_undeclared_claim_insert_by_the_app_role_raises_23502_with_the_hint(p
     );
 }
 
-/// The same insert on the harness (seed-satisfying) role succeeds and lands on
+/// The same insert on the harness (explicitly seed-granted) role succeeds and lands on
 /// `('public', <seed group>)`, **not** on the world group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_same_insert_as_the_seed_role_succeeds_on_the_seed_group(pool: PgPool) {

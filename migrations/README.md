@@ -2645,6 +2645,43 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **216**: `seed_escape_explicit_membership` (backlog 0512ca33). Migration
+  074's seed escape hatch asked `pg_has_role(session_user, 'epigraph_seed',
+  'MEMBER')`, which is true of EVERY superuser, so every superuser-DSN
+  session stamped its undeclared rows `('public', <memberless seed group>)`
+  instead of raising 23502. Adds `epigraph_session_is_seed()` (plain invoker
+  SQL function, `pg_catalog, pg_temp`, PUBLIC EXECUTE kept: true only for an
+  explicit `pg_auth_members` chain to `epigraph_seed` whose every edge confers
+  the role, `inherit_option OR set_option`; never reads `rolsuper`; an
+  ADMIN-only edge does not count; needs PostgreSQL 16) and re-states 074's
+  `epigraph_claims_require_tenancy`, `epigraph_derived_require_tenancy` and
+  `epigraph_root_require_tenancy` byte for byte except the seed condition (and
+  the claims body's arm-4 comment). A superuser with no grant now gets 23502 on
+  an undeclared claim, root row or parentless derived row. `CREATE OR REPLACE`
+  keeps the bodies' owner (`epigraph_maintenance`), ACL and 074 search_path. The
+  API boot probes ask the same question (`epigraph_db::repos::seed_posture`).
+  **Test harness:** the `#[sqlx::test]` superuser now needs the grant;
+  `epigraph-migrate` issues `GRANT epigraph_seed TO <session user>` after a
+  successful run when `EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF` is set, which CI's
+  `test` and `python` job env set (gates that copy the job env inherit it).
+  Pinned by `epigraph-db/tests/seed_escape_explicit_membership.rs`,
+  `tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch`,
+  `locked_decisions.rs::d1_the_stamping_trigger_is_the_final_form` and
+  `epigraph-api/tests/seed_grant_and_boot_probes.rs`. Undo:
+  `docs/runbooks/216-undo.sql` (tested: run twice, it returns every `public`
+  function to its definition below 216); it RE-OPENS the defect. **Deploy
+  precondition:** applying 216 turns a superuser-DSN writer's undeclared write
+  from a silent seed stamp into a 23502 write failure. Before applying, measure
+  `owner_group_id = '00000000-0000-0000-0000-00000000dead'` rows per tier-A
+  table by `created_at` (recent ones name the writers still relying on the
+  hatch), move those writers onto a role that declares tenancy, and confirm no
+  deployed login holds a grant of `epigraph_seed` (`SELECT member::regrole FROM
+  pg_auth_members WHERE roleid = 'epigraph_seed'::regrole` returns no rows).
+  Never set `EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF` on a deployed migrator.
+  Re-owning the rows already stamped onto the seed group is separate operator
+  data work. Checked before claiming: slot 216 assigned to this batch; no
+  migration on main carries a `216`. **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

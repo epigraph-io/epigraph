@@ -66,10 +66,14 @@ path other than those is a NEW writer that was added without one — see
 table and the code path; do not add a `DEFAULT`.
 
 **If you are seeing this from a test:** most test fixtures insert claims
-directly. Migration 074 arm 4 gives them an escape hatch — as the database role
-`epigraph_seed`, an undeclared insert succeeds and yields `('public', <seed
-group>)`. That is what the seed group is *for*, and it is why ~160 test
-statements do not need rewriting.
+directly. Migration 074 arm 4 gives them an escape hatch — as a member of the
+database role `epigraph_seed`, an undeclared insert succeeds and yields
+`('public', <seed group>)`. That is what the seed group is *for*, and it is why
+~160 test statements do not need rewriting. Since migration 216 the membership
+must be an **explicit grant**: a superuser no longer counts by implication. If
+every fixture in your run raises `23502`, your harness role lacks the grant:
+`GRANT epigraph_seed TO <harness role>` once per cluster, or migrate with
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1` (CI's job env sets it).
 
 **What you must not do** is stamp the seed group from application code, or from
 the backfill. Seed has no `group_memberships` rows by design, so a
@@ -186,7 +190,12 @@ fixtures only. An undeclared insert by a member of that role yields
 `('public', <seed group>)` rather than raising. It is **role membership**, not a
 GUC an application can `SET`, it is keyed on `session_user` (so `SET ROLE` does
 not reach it — `SET SESSION AUTHORIZATION` does), it is revocable with one
-`REVOKE`, and every row it stamps is greppable:
+`REVOKE`, and every row it stamps is greppable. Since migration 216 the
+membership is an **explicit** `pg_auth_members` grant chain that confers the
+role (`epigraph_session_is_seed()`): a superuser is NOT a member by implication
+(before 216 it was, through `pg_has_role`, so every superuser-DSN service
+stamped its undeclared rows onto the seed group), and an ADMIN-only grant does
+not count. A deployed cluster must grant it to no service login.
 
 ```sql
 SELECT count(*) FROM claims
