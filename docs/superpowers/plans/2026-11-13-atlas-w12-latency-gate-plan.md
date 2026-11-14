@@ -207,3 +207,44 @@ the old scan measured 34 ms and the gate could not see it.
 process (and not a cold OS page cache: the seed has just written the rows).
 Prod's buffer-cache state, concurrent load, real leaf sizes once W9 assembles
 leaves, and the network between browser and server are not measured.
+
+## Review fixes (2026-11-14)
+
+- **The claim-to-leaf fix is on #813.** It was cherry-picked onto
+  `feat/atlas-w10`, and this branch merged that back, so W10 cannot ship the
+  whole-run scan whichever PR merges first.
+- **The harnesses read as `epigraph_app`.** The kernel gate and
+  `atlas_maps_route_test` build their `ScopedPool` with
+  `connect_downgraded_for_tests(.., "epigraph_app")`, so the `<table>_tenancy`
+  row policies are evaluated as in prod. Each asserts the pool's
+  `session_user`. A cold sample's fresh connection also pays one
+  `SET SESSION AUTHORIZATION`, so cold is slightly overstated.
+- **A scaling rule.** Warm claim-to-leaf p95 may cost at most 3 times warm
+  leaf p95, measured on the same machine in the same run (`scaling_verdict`).
+  On a remote lane under `epigraph_app`, the old SQL gave claim_leaf warm p95
+  116.76 ms, INSIDE the 120 ms budget. Only the ratio (7.08) turned it red.
+- **The repo-level visibility test.** `leaves_of_claim_refuses_on_its_own_predicates`
+  runs on a session that bypasses row security, so the claim and level
+  predicates are the only guard.
+- **Opt-in timing marks.** atlas.js marks only when the page set
+  `window.__ATLAS_TIMING__`. The browser script sets it with an init script.
+
+Re-measured under `epigraph_app`, p95 in ms (warm / cold):
+
+| Type | small, debug (CI shape) | full, release (staging shape) |
+|---|---|---|
+| root | 5.6 / 58.2 | 9.2 / 28.9 |
+| group | 5.4 / 58.3 | 9.1 / 29.5 |
+| leaf | 16.0 / 73.0 | 12.4 / 38.6 |
+| switch | 15.8 / 25.4 | 12.1 / 26.6 |
+| claim_leaf | 19.1 / 77.7 | 19.8 / 83.6 |
+| themes | 6.1 / 58.3 | 13.0 / 31.4 |
+| maps | 4.7 / 56.3 | 5.0 / 25.3 |
+| claim_leaf / leaf (warm) | 1.20 | 1.59 |
+
+At full scale, row security costs about 4 to 6 ms warm per level read over
+the superuser numbers above. Everything stays within budget.
+
+Browser (preview, headless Chrome, 5 rounds, flag set): want-to-drawn p95 was
+20.0 ms for group, 20.4 for leaf and 17.3 for switch. Without the flag the
+script exits 2 with no samples.
