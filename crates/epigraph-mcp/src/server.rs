@@ -1824,11 +1824,17 @@ impl EpiGraphMcpFull {
                        the merge committed and the edge migration is recorded for replay) or \
                        failed. A merge carries no belief inputs over and has no un-mark. \
                        mode=abstract: ONE caller-synthesized, more general claim is written \
-                       and linked to each source by a generalizes edge; no source is retired \
-                       and no edge moves. For merge and abstract the caller supplies \
-                       merged_content; the server never calls an LLM. ALL-OR-NOTHING: on any \
-                       error no new claim is written and no source is retired, so retrying a \
-                       failed call is safe. The new claim is authored by the calling agent \
+                       and linked to each source by a generalizes edge that moves no belief \
+                       (it is marked moves_belief=false, so the abstraction's confidence is \
+                       not fed back into its own sources); no source is retired and no edge \
+                       moves. For merge and abstract the caller supplies merged_content; the \
+                       server never calls an LLM. Merge and abstract are ALL-OR-NOTHING: on \
+                       any error no new claim is written and no source is retired, so retrying \
+                       a failed call is safe. Identity is NOT all-or-nothing: each source is \
+                       marked in its own transaction, so if a concurrent write refuses one \
+                       part-way the sources already marked stay marked (the error names them) \
+                       and a blind retry fails on them with 'not current'; re-send only the \
+                       unmarked sources. The new claim is authored by the calling agent \
                        (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio). \
                        A source owned by a group the calling agent cannot write, or sources \
                        spanning two owner groups, is refused \
