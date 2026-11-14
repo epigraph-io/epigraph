@@ -47,6 +47,23 @@ pub struct ScreenRow {
     /// Distinct current parents that reach this claim through an in-force
     /// `decomposes_to` edge, edge and parent both visible to the viewer.
     pub parents: i64,
+    /// [`Self::children`] further restricted to the claim's AUDIENCE: edges
+    /// and children that EVERY reader of this claim can see. For a public
+    /// claim that is public edges onto public children; for a group claim,
+    /// also edges and children owned by its own group alone (an edge
+    /// co-owned with another group is visible to fewer readers than the
+    /// claim, so it does not count). Equal to `children` whenever nothing
+    /// narrower than the claim is involved.
+    ///
+    /// What a label written on the claim may be derived from: the
+    /// compound-atom sweep runs as the bypass viewer, and a label built from
+    /// `children`/`parents` there would disclose, to every reader of the
+    /// claim, structure some of them cannot see (review M1, backlog
+    /// `72850d43`).
+    pub audience_children: i64,
+    /// [`Self::parents`] restricted to the claim's audience, as
+    /// [`Self::audience_children`].
+    pub audience_parents: i64,
 }
 
 /// Which claims [`AtomicityScreenRepository::page`] walks.
@@ -97,7 +114,43 @@ impl AtomicityScreenRepository {
                        AND (u.valid_to IS NULL OR u.valid_to > now())
                        AND COALESCE(p.is_current, true) = true
                        /* {EDGE_VISIBILITY:u} */
-                       /* {VISIBILITY:p} */) AS parents
+                       /* {VISIBILITY:p} */) AS parents,
+                   (SELECT count(DISTINCT xd.target_id) FROM edges xd
+                      JOIN claims xk ON xk.id = xd.target_id
+                     WHERE xd.source_id = c.id
+                       AND xd.relationship = 'decomposes_to'
+                       AND xd.target_type = 'claim'
+                       AND (xd.valid_to IS NULL OR xd.valid_to > now())
+                       AND COALESCE(xk.is_current, true) = true
+                       /* {EDGE_VISIBILITY:xd} */
+                       /* {VISIBILITY:xk} */
+                       -- AUDIENCE: only what every reader of c can see.
+                       AND (xd.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xd.owner_group_id = c.owner_group_id
+                                AND (xd.co_owner_group_id IS NULL
+                                     OR xd.co_owner_group_id = c.owner_group_id)))
+                       AND (xk.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xk.owner_group_id = c.owner_group_id))) AS audience_children,
+                   (SELECT count(DISTINCT xu.source_id) FROM edges xu
+                      JOIN claims xp ON xp.id = xu.source_id
+                     WHERE xu.target_id = c.id
+                       AND xu.relationship = 'decomposes_to'
+                       AND xu.source_type = 'claim'
+                       AND (xu.valid_to IS NULL OR xu.valid_to > now())
+                       AND COALESCE(xp.is_current, true) = true
+                       /* {EDGE_VISIBILITY:xu} */
+                       /* {VISIBILITY:xp} */
+                       -- AUDIENCE: only what every reader of c can see.
+                       AND (xu.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xu.owner_group_id = c.owner_group_id
+                                AND (xu.co_owner_group_id IS NULL
+                                     OR xu.co_owner_group_id = c.owner_group_id)))
+                       AND (xp.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xp.owner_group_id = c.owner_group_id))) AS audience_parents
             FROM unnest($1::uuid[]) WITH ORDINALITY AS want(id, ord)
             JOIN claims c ON c.id = want.id
             WHERE true
@@ -147,7 +200,43 @@ impl AtomicityScreenRepository {
                        AND (u.valid_to IS NULL OR u.valid_to > now())
                        AND COALESCE(p.is_current, true) = true
                        /* {EDGE_VISIBILITY:u} */
-                       /* {VISIBILITY:p} */) AS parents
+                       /* {VISIBILITY:p} */) AS parents,
+                   (SELECT count(DISTINCT xd.target_id) FROM edges xd
+                      JOIN claims xk ON xk.id = xd.target_id
+                     WHERE xd.source_id = c.id
+                       AND xd.relationship = 'decomposes_to'
+                       AND xd.target_type = 'claim'
+                       AND (xd.valid_to IS NULL OR xd.valid_to > now())
+                       AND COALESCE(xk.is_current, true) = true
+                       /* {EDGE_VISIBILITY:xd} */
+                       /* {VISIBILITY:xk} */
+                       -- AUDIENCE: only what every reader of c can see.
+                       AND (xd.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xd.owner_group_id = c.owner_group_id
+                                AND (xd.co_owner_group_id IS NULL
+                                     OR xd.co_owner_group_id = c.owner_group_id)))
+                       AND (xk.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xk.owner_group_id = c.owner_group_id))) AS audience_children,
+                   (SELECT count(DISTINCT xu.source_id) FROM edges xu
+                      JOIN claims xp ON xp.id = xu.source_id
+                     WHERE xu.target_id = c.id
+                       AND xu.relationship = 'decomposes_to'
+                       AND xu.source_type = 'claim'
+                       AND (xu.valid_to IS NULL OR xu.valid_to > now())
+                       AND COALESCE(xp.is_current, true) = true
+                       /* {EDGE_VISIBILITY:xu} */
+                       /* {VISIBILITY:xp} */
+                       -- AUDIENCE: only what every reader of c can see.
+                       AND (xu.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xu.owner_group_id = c.owner_group_id
+                                AND (xu.co_owner_group_id IS NULL
+                                     OR xu.co_owner_group_id = c.owner_group_id)))
+                       AND (xp.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xp.owner_group_id = c.owner_group_id))) AS audience_parents
             FROM claims c
             WHERE COALESCE(c.is_current, true) = true
               AND length(c.content) > 10
@@ -220,7 +309,43 @@ impl AtomicityScreenRepository {
                        AND (u.valid_to IS NULL OR u.valid_to > now())
                        AND COALESCE(p.is_current, true) = true
                        /* {EDGE_VISIBILITY:u} */
-                       /* {VISIBILITY:p} */) AS parents
+                       /* {VISIBILITY:p} */) AS parents,
+                   (SELECT count(DISTINCT xd.target_id) FROM edges xd
+                      JOIN claims xk ON xk.id = xd.target_id
+                     WHERE xd.source_id = c.id
+                       AND xd.relationship = 'decomposes_to'
+                       AND xd.target_type = 'claim'
+                       AND (xd.valid_to IS NULL OR xd.valid_to > now())
+                       AND COALESCE(xk.is_current, true) = true
+                       /* {EDGE_VISIBILITY:xd} */
+                       /* {VISIBILITY:xk} */
+                       -- AUDIENCE: only what every reader of c can see.
+                       AND (xd.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xd.owner_group_id = c.owner_group_id
+                                AND (xd.co_owner_group_id IS NULL
+                                     OR xd.co_owner_group_id = c.owner_group_id)))
+                       AND (xk.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xk.owner_group_id = c.owner_group_id))) AS audience_children,
+                   (SELECT count(DISTINCT xu.source_id) FROM edges xu
+                      JOIN claims xp ON xp.id = xu.source_id
+                     WHERE xu.target_id = c.id
+                       AND xu.relationship = 'decomposes_to'
+                       AND xu.source_type = 'claim'
+                       AND (xu.valid_to IS NULL OR xu.valid_to > now())
+                       AND COALESCE(xp.is_current, true) = true
+                       /* {EDGE_VISIBILITY:xu} */
+                       /* {VISIBILITY:xp} */
+                       -- AUDIENCE: only what every reader of c can see.
+                       AND (xu.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xu.owner_group_id = c.owner_group_id
+                                AND (xu.co_owner_group_id IS NULL
+                                     OR xu.co_owner_group_id = c.owner_group_id)))
+                       AND (xp.visibility = 'public'
+                            OR (c.visibility <> 'public'
+                                AND xp.owner_group_id = c.owner_group_id))) AS audience_parents
             FROM claims c
             WHERE COALESCE(c.is_current, true) = true
               AND $2 = ANY(c.labels)

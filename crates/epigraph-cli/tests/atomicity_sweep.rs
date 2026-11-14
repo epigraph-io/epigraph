@@ -149,3 +149,94 @@ async fn a_capped_sweep_unlabels_nothing(pool: PgPool) {
         "a capped walk cannot judge a label stale"
     );
 }
+
+/// A `decomposes_to` edge forced private to `group` (single owner). INSERT
+/// then UPDATE: migration 070's trigger rewrites the tenancy columns on
+/// INSERT and does not fire for an UPDATE of them alone (see the fixture's
+/// `seed_edge_owned_by`).
+async fn decomposes_owned_by(pool: &PgPool, source: Uuid, target: Uuid, group: Uuid) {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'decomposes_to') RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(pool)
+    .await
+    .expect("decomposes_to edge");
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("privatise the edge");
+}
+
+/// Review M1: the sweep reads as the bypass viewer, but the label it writes
+/// is read by everyone who can read the claim, so it must be decided only
+/// from edges and neighbours all of them can see. Run with the BYPASS viewer
+/// (the binary's shape): a scoped or public viewer would hide the private
+/// edge on the old code too and prove nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_label_is_derived_only_from_edges_every_reader_can_see(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "b42audience").await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let public = |t: &'static str| fixture::seed_public_claim(&pool, agent, t);
+
+    // (a) A public compound atom whose ONLY parent edge is group-private: a
+    // stranger is told it has no parent, so a public label would disclose
+    // the hidden decomposition.
+    let parent_a = public("The pump failed. The backup took over. The alarm rang.").await;
+    let hidden_parent_atom = public("The pump failed, but the backup took over.").await;
+    decomposes_owned_by(&pool, parent_a, hidden_parent_atom, group).await;
+
+    // (b) A public compound atom with a public parent whose ONLY child is
+    // group-private: to every reader outside the group it is an unsplit
+    // compound atom, and the hidden child must not withhold the label.
+    let parent_b = public("The valve stuck. The operator reset it. The line restarted.").await;
+    let hidden_child_atom = public("The valve stuck, and the operator reset it.").await;
+    decomposes(&pool, parent_b, hidden_child_atom).await;
+    let private_child =
+        fixture::seed_group_claim(&pool, agent, group, "The valve stuck at noon.").await;
+    decomposes_owned_by(&pool, hidden_child_atom, private_child, group).await;
+
+    // (c) Calibration: a GROUP compound atom whose parent edge belongs to its
+    // own group is labelled; every reader of the atom can see that edge.
+    let parent_c = fixture::seed_group_claim(
+        &pool,
+        agent,
+        group,
+        "The fan stopped. The room overheated. The servers throttled.",
+    )
+    .await;
+    let group_atom = fixture::seed_group_claim(
+        &pool,
+        agent,
+        group,
+        "The fan stopped, and the room overheated.",
+    )
+    .await;
+    decomposes_owned_by(&pool, parent_c, group_atom, group).await;
+
+    // A stale label on (a), written by a run that counted the hidden edge,
+    // comes off.
+    set_labels(&pool, hidden_parent_atom, &[COMPOUND_ATOM_LABEL]).await;
+
+    let run = sweep(&pool, &viewer, true, 1_000_000).await.unwrap();
+    assert!(
+        !has(&labels(&pool, hidden_parent_atom).await),
+        "a label built from a hidden parent edge discloses it: {run:?}"
+    );
+    assert!(run.unlabelled.contains(&hidden_parent_atom), "{run:?}");
+    assert!(
+        has(&labels(&pool, hidden_child_atom).await),
+        "a hidden child must not decide a public label: {run:?}"
+    );
+    assert!(
+        has(&labels(&pool, group_atom).await),
+        "an edge inside the atom's own group is visible to all its readers: {run:?}"
+    );
+}

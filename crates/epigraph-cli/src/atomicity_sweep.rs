@@ -10,6 +10,20 @@
 //! calls it compound. The label is
 //! [`epigraph_core::atomicity::COMPOUND_ATOM_LABEL`].
 //!
+//! # The label is derived only from what its readers can see
+//!
+//! The sweep reads as the maintenance bypass viewer, so it sees every edge.
+//! The label it writes is visible to every reader of the claim. Deciding it
+//! from all edges would disclose hidden structure: a public atom whose only
+//! parent is group-private would carry a public `compound-atom` label while
+//! a stranger is told it has no parent, and a private child under a public
+//! compound atom would keep (or take away) the label. So both edge counts
+//! [`qualifies`] reads are the AUDIENCE counts
+//! (`ScreenRow::audience_parents` / `audience_children`): edges and
+//! neighbours that every reader of the claim can see. `claim_role.rs`'s
+//! "structure, no viewer filter" rule is for internal decisions; a label is
+//! a disclosure.
+//!
 //! The sweep is idempotent and self-cleaning: a second run over an unchanged
 //! graph changes nothing, and a labelled atom that is re-decomposed
 //! (`decompose_claims --redecompose`) loses the label on the next run. Labels
@@ -47,12 +61,14 @@ pub struct SweepReport {
     pub scan_capped: bool,
 }
 
-/// Whether `row` qualifies for the compound-atom label (see the module docs).
+/// Whether `row` qualifies for the compound-atom label (see the module docs):
+/// decided from the AUDIENCE edge counts only, never from structure some
+/// reader of the claim cannot see.
 #[must_use]
 pub fn qualifies(row: &ScreenRow) -> bool {
     row.is_current
-        && row.parents > 0
-        && row.children == 0
+        && row.audience_parents > 0
+        && row.audience_children == 0
         && conjunct_screen(&row.content).is_compound()
 }
 
