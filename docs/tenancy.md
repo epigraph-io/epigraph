@@ -143,8 +143,17 @@ Every tier-A table carries two columns, both `NOT NULL` and — from migration
 | `visibility` | `'public'` or `'group'` |
 | `owner_group_id` | a real `groups.id` |
 
-`'public'` under D3 means *any authenticated agent*, not *anonymous*. A public
-row still carries a real owner group: `visibility` says who may read it,
+`'public'` under D3 meant *any authenticated agent*, not *anonymous*. Since the
+guest read surface (backlog `1deb9dbf`) it can also mean *anyone*: the Atlas
+design (`docs/superpowers/specs/2026-11-04-epigraph-explorer-atlas-design.md`,
+§5) gives signed-out callers, including link-card fetchers, the public graph.
+`GET /api/v1/guest/*` serves a public claim's card and ego and the theme
+overview and layout, read as `Viewer::public_only()`, and answers a non-public
+id exactly as an absent one. Those routes are OFF unless the server is started
+with `EPIGRAPH_GUEST_READS=on`. Rows were written as `public` while it meant
+"signed-in readers only", so switching it on opens all of them to the internet;
+check the public corpus first. With the switch off, D3 holds as written. A
+public row still carries a real owner group: `visibility` says who may read it,
 `owner_group_id` says who owns it. Pairing `'group'` with the `world` or `seed`
 group is refused outright (`<table>_group_needs_real_group`) — both are
 memberless by design, so such a row is a black hole nobody, including its
