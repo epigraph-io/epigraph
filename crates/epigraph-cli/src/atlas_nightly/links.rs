@@ -87,7 +87,9 @@ pub struct LinksReport {
     /// Claims found in two leaves of one hierarchy (a malformed run); their
     /// links are left out in that hierarchy.
     pub ambiguous_claims: usize,
-    /// Outside targets cut from group levels over [`MAX_GROUP_TARGETS`].
+    /// Outside targets cut from group levels: those over
+    /// [`MAX_GROUP_TARGETS`], and those every bundle of which the
+    /// [`MAX_GROUP_BUNDLES`] cut removed.
     pub dropped_targets: usize,
     /// Bundles cut from group levels: those to a cut target, and those over
     /// [`MAX_GROUP_BUNDLES`].
@@ -321,6 +323,9 @@ fn fill_hierarchy(
                     .map(|((_, target), _)| *target)
                     .filter(|t| !children.contains(t))
                     .collect();
+                // A target the bundle cut left with no bundle is cut too (its
+                // links are already in `dropped_links`).
+                report.dropped_targets += kept_targets.difference(&used).count();
                 g.bundles = bundles
                     .into_iter()
                     .map(|((source, target), t)| Bundle {
@@ -750,6 +755,65 @@ mod tests {
         assert_eq!(report.dropped_targets, 0);
         // Child 0's heavier bundles are all kept.
         assert_eq!(b.iter().filter(|x| x.0 == kids[0]).count(), 17);
+        for d in &docs {
+            d.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_target_the_bundle_cap_leaves_with_no_bundle_is_reported_as_cut() {
+        // 128 leaf children, each linked once to 16 of 159 outside targets
+        // (2,048 bundles, the cap, every target reached by several
+        // children), and the last child also to a 160th target X, with the
+        // largest id: 2,049 bundles of one link each. The cut takes the
+        // lightest with the largest key, (last child, X), X's only bundle,
+        // so X goes too and is counted.
+        let t1 = id(T1);
+        let kids: Vec<Uuid> = (0..128).map(|i| id(0x1_0000 + i)).collect();
+        let x = id(0x3_0000 + 999);
+        let mut docs = vec![group(
+            t1,
+            &[],
+            id(R),
+            &kids
+                .iter()
+                .map(|k| (*k, ChildKind::Leaf))
+                .collect::<Vec<_>>(),
+        )];
+        let mut links = Vec::new();
+        for (i, k) in kids.iter().enumerate() {
+            let claims: Vec<Uuid> = (0..17)
+                .map(|j| id(0x2_0000 + i as u128 * 0x100 + j))
+                .collect();
+            docs.push(leaf(t1, &[id(R)], *k, &claims));
+            for j in 0..16_u128 {
+                let target = (i as u128 * 16 + j) % 159;
+                links.push((
+                    claims[j as usize],
+                    id(0x3_0000 + target),
+                    "supports".to_string(),
+                ));
+            }
+            if i == 127 {
+                links.push((claims[16], x, "supports".to_string()));
+            }
+        }
+        for t in (0..159_u128).chain([999]) {
+            docs.push(leaf(
+                id(0x4_0000 + t),
+                &[],
+                id(0x3_0000 + t),
+                &[id(0x3_0000 + t)],
+            ));
+        }
+        let report = fill_cross_links(&mut docs, &links).unwrap();
+        let kept: BTreeSet<Uuid> = targets(&docs, id(R)).into_iter().map(|t| t.0).collect();
+        assert_eq!(bundles(&docs, id(R)).len(), MAX_GROUP_BUNDLES);
+        assert_eq!(kept.len(), 159);
+        assert!(!kept.contains(&x), "X kept with no bundle");
+        assert_eq!(report.dropped_bundles, 1);
+        assert_eq!(report.dropped_targets, 1, "{report:?}");
+        assert_eq!(report.dropped_links, 1, "{report:?}");
         for d in &docs {
             d.validate().unwrap();
         }
