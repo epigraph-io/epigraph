@@ -402,8 +402,14 @@ def test_targets(root, pkgs, dirs):
     return out
 
 
-def scan_reads(root, pkgs, dirs, files, read=None):
+def scan_reads(root, pkgs, dirs, files, read=None, gone=()):
     """What each package's sources read from outside its own directory.
+
+    `files` is the tree being tested (HEAD). `gone` are paths that may exist
+    only on the other side of the diff: the change's paths, so a literal
+    naming a file the change deletes or renames away still counts as a read
+    of it. Without them a PR deleting `docs/tenancy.md` selects nothing, and
+    the tests that read it fail first on main.
 
     Returns (reads, walkers). `reads` is a list of
     (package, kind, pattern, reach, test targets, source file): kind "prefix"
@@ -418,12 +424,13 @@ def scan_reads(root, pkgs, dirs, files, read=None):
             with open(os.path.join(root, f), encoding="utf-8", errors="replace") as fh:
                 return fh.read()
     tracked = set(files)
+    known = tracked | set(gone)
     tracked_dirs = set()
-    for f in files:
+    for f in known:
         while "/" in f:
             f = f.rsplit("/", 1)[0]
             tracked_dirs.add(f)
-    top = {f.split("/", 1)[0] for f in files}
+    top = {f.split("/", 1)[0] for f in known}
     top_dirs = {d for d in top if d in tracked_dirs} - {"crates"}
     package_roots = set(dirs.values())
     roots = test_targets(root, pkgs, dirs)
@@ -437,7 +444,7 @@ def scan_reads(root, pkgs, dirs, files, read=None):
         return texts[f]
 
     def exists(path):
-        return path in tracked or path in tracked_dirs
+        return path in known or path in tracked_dirs
 
     def reach(name, f, before_cfg_test):
         """(reach, targets) of a read made by file `f` of package `name`."""
@@ -825,7 +832,7 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
     if reason is None:
         dirs = package_dirs(root, pkgs)
         if reads is None:
-            reads, _walkers = scan_reads(root, pkgs, dirs, git_files(root))
+            reads, _walkers = scan_reads(root, pkgs, dirs, git_files(root), gone=changed)
         whole, partial = affected(changed, pkgs, dirs, reads)
         ids = shards_for(shards, whole)
         # A package one of the selected shards already runs in full needs no

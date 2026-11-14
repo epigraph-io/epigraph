@@ -178,6 +178,22 @@ class AffectedSelection(unittest.TestCase):
             d = pr_plan([path])
             self.assertIn("no_unmaintained_dsn", d["partial"].get("epigraph-db", {}), path)
 
+    def test_deleting_a_file_a_test_reads_still_runs_that_test(self):
+        # The PR's HEAD no longer has docs/tenancy.md; the tests that read it
+        # (and would fail on main) must still be selected. decide() computes
+        # the reads itself here, against HEAD's file list without the file.
+        from unittest import mock
+
+        root, pkgs, shards = workspace()
+        present = pr_plan(["docs/tenancy.md"])
+        self.assertTrue(present["partial"], "the fixture file is no longer read by any test")
+        head = [f for f in ts.git_files(root) if f != "docs/tenancy.md"]
+        with mock.patch.object(ts, "git_files", return_value=head):
+            env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_HEAD_REF": "feature/x"}
+            gone = ts.decide(root, pkgs, shards, env, changed=["docs/tenancy.md"])
+        self.assertEqual(gone["partial"], present["partial"])
+        self.assertEqual(gone["ids"], [ts.SCANS])
+
     def test_a_package_a_selected_shard_covers_gets_no_scan_targets(self):
         # A db source change selects workspace-rest (jobs etc. depend on db),
         # which runs epigraph-crypto in full, so crypto's ratchet is not also
@@ -287,6 +303,18 @@ class SourceScanDetection(unittest.TestCase):
         self.assertNotIn("beta", {r[0] for r in reads})
         whole, partial = ts.affected(["scripts/new.py"], pkgs, dirs, reads)
         self.assertEqual((whole, set(partial)), ({}, {"alpha"}))
+
+    def test_a_read_of_a_deleted_file_is_still_a_read(self):
+        files = dict(self.BASE)
+        files["crates/alpha/tests/scan.rs"] = 'fn f(root: &Path) { root.join("docs/runbooks/2-undo.sql"); }\n'
+        root, pkgs, dirs, names = self.tree(files)
+        # 2-undo.sql exists only in the base: the change deletes it.
+        reads, _ = ts.scan_reads(root, pkgs, dirs, names)
+        self.assertEqual(reads, [])
+        reads, _ = ts.scan_reads(root, pkgs, dirs, names, gone=["docs/runbooks/2-undo.sql"])
+        whole, partial = ts.affected(["docs/runbooks/2-undo.sql"], pkgs, dirs, reads)
+        self.assertEqual(whole, {})
+        self.assertEqual({p: set(ts_) for p, ts_ in partial.items()}, {"alpha": {"scan"}})
 
     def test_the_real_tree_declares_every_walker(self):
         self.assertEqual(reads()[1], set(ts.WALKERS))
