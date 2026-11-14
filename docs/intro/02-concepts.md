@@ -285,6 +285,24 @@ A **perspective** is a *viewpoint*: an agent-owned (or community-owned) lens tha
 ]
 ```
 
+The `perspectives` table also has a second, internal use that is not a
+viewpoint. A machine-written mass function is keyed by
+`(claim, frame, agent, perspective)`, and `mass_functions.perspective_id`
+is a foreign key, so the kernel creates a synthetic perspective row to
+give each such mass function its own slot:
+
+- one per epistemic edge: `name = 'edge_factor'`,
+  `perspective_type = 'edge'`, and the row's `id` is the edge's id
+  (`PerspectiveRepository::ensure_edge_perspective`);
+- one per evidence row or assessment slot: `name = 'evidence_grounded'`,
+  `perspective_type = 'evidence'`; for an evidence row it shares the
+  evidence id (`PerspectiveRepository::ensure_evidence_perspective`).
+
+These rows are slots, not lenses. `list_perspectives` does not filter
+them out (`PerspectiveRepository::list` has no `perspective_type`
+predicate), so on a graph with epistemic edges or evidence its output
+includes rows of those two types; skip them when you choose a lens.
+
 A **theme** is a topical cluster derived from semantic clustering
 over claim embeddings. Themes are stored as rows in `claim_themes`
 (`label`, `description`, `centroid` vector, `claim_count`), and
@@ -306,7 +324,8 @@ label.
 Rule of thumb:
 
 - A **frame** is *what is being judged* — a fixed hypothesis space.
-- A **perspective** is *who is judging* — an agent's or group's lens.
+- A **perspective** is *who is judging* — an agent's or group's lens
+  (apart from the internal `edge` and `evidence` rows above).
 - A **theme** is *what topic* the claims are about — a cluster label.
 
 They are orthogonal. A single claim can sit in one frame, be

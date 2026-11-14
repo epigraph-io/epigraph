@@ -74,7 +74,7 @@ A level-2 claim in the hierarchical extraction tree: a contiguous span of source
 
 ## perspective
 
-A named viewpoint — typically an agent's or a group's — under which belief and challenges can be projected separately. Perspectives let the graph carry disagreement explicitly: the same atom can have different BetP values from different perspectives without one overwriting the other. [see 02-concepts.md §4 (Perspectives, frames, themes)](02-concepts.md#4--perspectives-frames-themes)
+A named viewpoint — typically an agent's or a group's — under which belief and challenges can be projected separately. Perspectives let the graph carry disagreement explicitly: the same atom can have different BetP values from different perspectives without one overwriting the other. The `perspectives` table also holds internal rows of type `edge` and `evidence`, one per epistemic edge or evidence row, which only key a mass function and are not viewpoints. [see 02-concepts.md §4 (Perspectives, frames, themes)](02-concepts.md#4--perspectives-frames-themes)
 
 ## pignistic probability
 
