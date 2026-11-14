@@ -119,9 +119,10 @@ Start here:
 - [`docs/intro/02-concepts.md`](docs/intro/02-concepts.md): noun-claims and
   verb-edges, agents and signing, Dempster-Shafer beliefs, perspectives,
   hierarchical extraction, and backlog discipline.
+- [`docs/intro/03-walkthroughs.md`](docs/intro/03-walkthroughs.md): one
+  domain set up end to end, a repository's commit and PR history ingested
+  with `ingest_git`: its config keys, three worked commits and one merged PR.
 - [`docs/intro/04-glossary.md`](docs/intro/04-glossary.md): vocabulary.
-  (The numbering skips `03`: the walkthroughs page planned under that number
-  was not written.)
 - [`docs/intro/05-next-steps.md`](docs/intro/05-next-steps.md): pointers for
   contributors, operators and downstream projects.
 
@@ -150,7 +151,9 @@ Design:
 Newest first. Each line gives the commit that changed this file. Where a
 commit reached `main` through a merge, the PR is given as "via #N".
 
-- 2026-11-04 (this revision, PR #764): rewrote the file for a reader new to the
+- 2026-11-14 (backlog 2c2b335d): listed the new `docs/intro/03-walkthroughs.md`
+  and dropped the note that the numbering skips `03`.
+- 2026-11-04 (PR #764): rewrote the file for a reader new to the
   project, checked against `main` at 5fcd75087.
   - Added a table of the binaries.
   - The quickstart now migrates as a PostgreSQL superuser, the layout CI
