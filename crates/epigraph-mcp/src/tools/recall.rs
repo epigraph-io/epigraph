@@ -1121,6 +1121,24 @@ async fn apply_graph_expansion(
     Ok(combined)
 }
 
+/// Refuse `diverse=true` together with `paper_doi_filter`.
+///
+/// The diverse pipeline draws its candidates from the selected themes
+/// (`candidates_in_themes_at_dim`), which has no DOI predicate, so the filter
+/// used to be dropped without a word and the caller got claims from any paper
+/// while believing the result was scoped to one. Refused, as `recall` refuses
+/// `theme_id` beside `include_workflows`, until the predicate is wired.
+fn reject_diverse_with_paper_doi_filter(params: &RecallWithContextParams) -> Result<(), McpError> {
+    if params.diverse.unwrap_or(false) && params.paper_doi_filter.is_some() {
+        return Err(invalid_params(
+            "paper_doi_filter cannot be combined with diverse=true: the diverse pipeline \
+             selects candidates by theme and cannot restrict them to one paper. Drop \
+             paper_doi_filter, or set diverse=false for a paper-scoped search.",
+        ));
+    }
+    Ok(())
+}
+
 /// Post-embedding pipeline: shared by `recall_with_context` and the
 /// `__test_only::recall_with_context_with_pgvec` entry point that lets
 /// integration tests skip the OpenAI embedder (no API key available in
@@ -1152,6 +1170,8 @@ async fn recall_with_context_post_embed(
         .map(crate::types::validate_diversity_radius)
         .transpose()
         .map_err(invalid_params)?;
+    // Same placement, for the same reason.
+    reject_diverse_with_paper_doi_filter(params)?;
 
     // Every read of the pipeline on ONE connection stamped with the caller's
     // viewer: on the plain pool row security admits public rows only, so a
@@ -1173,11 +1193,9 @@ async fn recall_with_context_post_embed(
     //    `claims.embedding[_3072]`.
     //
     // The `paper_doi_filter` does NOT apply to the diverse path —
-    // candidates_in_themes_at_dim has no DOI predicate. If the caller
-    // provides BOTH `diverse=true` AND `paper_doi_filter`, the filter is
-    // currently ignored on the diverse path. TODO(diverse-recall): wire
-    // paper_doi_filter into candidates_in_themes_at_dim or reject the
-    // combination at param-parse time.
+    // candidates_in_themes_at_dim has no DOI predicate — so the combination
+    // was refused above (`reject_diverse_with_paper_doi_filter`) and
+    // `paper_doi_filter` is always `None` inside the `diverse` arm below.
     let diverse = params.diverse.unwrap_or(false);
     // Stage 3 sizing. When rerank is on, OVER-FETCH the flat candidate pool
     // (`want * pool_factor`, clamped to [want, 200]) so the cross-encoder has a
@@ -2846,6 +2864,39 @@ mod tests {
     use epigraph_db::{AgentRepository, GroupMembershipRepository, GroupRepository, ScopedPool};
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    /// `diverse=true` used to drop `paper_doi_filter` silently (backlog
+    /// a2991ea6): the caller got claims from any paper. The combination is
+    /// refused; each option alone is not.
+    #[test]
+    fn diverse_with_paper_doi_filter_is_refused() {
+        let params = |v: serde_json::Value| -> super::RecallWithContextParams {
+            serde_json::from_value(v).expect("params deserialize")
+        };
+
+        let err = super::reject_diverse_with_paper_doi_filter(&params(serde_json::json!({
+            "query": "q", "diverse": true, "paper_doi_filter": "10.1000/example"
+        })))
+        .expect_err("diverse=true with paper_doi_filter must be refused");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("paper_doi_filter") && err.message.contains("diverse"),
+            "the error must name both options: {}",
+            err.message
+        );
+
+        for ok in [
+            serde_json::json!({"query": "q", "diverse": true}),
+            serde_json::json!({"query": "q", "paper_doi_filter": "10.1000/example"}),
+            serde_json::json!({"query": "q", "diverse": false, "paper_doi_filter": "10.1000/example"}),
+            serde_json::json!({"query": "q"}),
+        ] {
+            assert!(
+                super::reject_diverse_with_paper_doi_filter(&params(ok.clone())).is_ok(),
+                "must stay accepted: {ok}"
+            );
+        }
+    }
 
     /// A `ScopedPool` over the `#[sqlx::test]` database. The URL is derived from
     /// the pool's connect options rather than `SELECT current_database()`

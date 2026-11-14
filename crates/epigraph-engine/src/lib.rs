@@ -42,7 +42,6 @@ pub mod diverse_retrieval;
 pub mod diverse_select;
 pub mod domain_decay;
 pub mod edge_factor;
-pub mod embedder;
 pub mod epistemic_interval;
 pub mod error_mass;
 pub mod errors;

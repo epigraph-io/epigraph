@@ -1204,7 +1204,7 @@ pub struct SubmitDsEvidenceParams {
     // permissive as the handler.
     #[schemars(
         with = "std::collections::BTreeMap<String, serde_json::Number>",
-        description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance."
+        description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance. Refused unless every key parses, every index is inside the frame, no mass is negative, and the masses sum to 1."
     )]
     pub masses: serde_json::Value,
 
@@ -2249,6 +2249,9 @@ pub struct IngestDocumentSpineResponse {
     pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
+    /// The number of spine claims QUEUED for background embedding when the
+    /// response was built, not the number embedded (the same meaning as
+    /// `IngestDocumentResponse::claims_embedded`).
     pub paragraphs_embedded: usize,
     /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
     /// as new in this ingest. Atomize exactly these paragraphs, then call
@@ -2296,28 +2299,49 @@ pub struct StructureSourceParams {
 
 /// Parameters for the `link_hierarchical` MCP tool.
 ///
-/// Wires two existing claims with one of the structural relationships emitted
-/// by the hierarchical ingest pipeline (`decomposes_to`, `section_follows`,
-/// `continues_argument`). Mirrors the contract of
-/// `POST /api/v1/edges/hierarchical` but bypasses HTTP and goes directly
-/// through the repo layer, which keeps per-chapter chapter-to-book wiring
-/// working when the HTTP API binary is unavailable.
-#[derive(Debug, Deserialize, JsonSchema)]
+/// Wires two existing entities with one of the structural, belief-neutral
+/// relationships: the document structure the hierarchical ingest pipeline
+/// emits (`decomposes_to`, `section_follows`, `continues_argument`, claim to
+/// claim), or a workflow reference (`executes`, `invokes`, `depends_on`;
+/// backlogs 03d87e3a and 41d7b27a). Endpoints are claims unless
+/// `source_type` / `target_type` say otherwise. Mirrors the contract of
+/// `POST /api/v1/edges/hierarchical` for the claim relationships but bypasses
+/// HTTP and goes directly through the repo layer, which keeps per-chapter
+/// chapter-to-book wiring working when the HTTP API binary is unavailable.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct LinkHierarchicalParams {
     #[schemars(
-        description = "UUID of the source claim. Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused. Either refusal writes nothing."
+        description = "UUID of the source entity (a claim unless source_type says otherwise). Written with YOUR agent's authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio): a group-private claim of your own group works; a group-private claim you cannot read reports not found, and one owned by a group your agent cannot write is refused. Either refusal writes nothing."
     )]
     pub source_claim_id: String,
 
     #[schemars(
-        description = "UUID of the target claim. Same authority rule as source_claim_id: own-group private claims work, another group's private claim is not found or refused, and nothing is written."
+        description = "UUID of the target entity (a claim unless target_type says otherwise). Same authority rule as source_claim_id: own-group private claims work, another group's private claim is not found or refused, and nothing is written."
     )]
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Structural relationship type. One of: decomposes_to, section_follows, continues_argument."
+        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused). None of them moves belief."
     )]
     pub relationship: String,
+
+    #[schemars(
+        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes and depends_on take \"workflow\" here (invokes also \"claim\", for a step claim). A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
+    )]
+    #[serde(default)]
+    pub source_type: Option<String>,
+
+    #[schemars(
+        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes and depends_on take \"workflow\" here; executes takes \"claim\"."
+    )]
+    #[serde(default)]
+    pub target_type: Option<String>,
+
+    #[schemars(
+        description = "invokes only: the 0-based step index of the source workflow at which the sub-workflow is invoked. Stored on the edge as properties.at_step."
+    )]
+    #[serde(default)]
+    pub at_step: Option<u32>,
 
     #[schemars(
         with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
@@ -2494,7 +2518,7 @@ pub struct LinkEpistemicParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or the structural relations that move no belief: cites, and qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief). Use qualifies, not contradicts, for a caveat that limits where the target holds without saying it is false. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or the structural relations that move no belief: cites, qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief), and EQUIVALENT_TO (the two claims say the same thing and both stay current; moves no belief), in that exact upper-case spelling. Use qualifies, not contradicts, for a caveat that limits where the target holds without saying it is false. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 
@@ -2581,6 +2605,12 @@ pub struct IngestDocumentResponse {
     /// `authors[].pending_ingested_by`).
     pub ingested_by: String,
     pub claims_ingested: usize,
+    /// The number of claims QUEUED for background embedding when the response
+    /// was built, NOT the number embedded. The embedding loop is spawned and
+    /// the response returns before any embed call has run, so this is non-zero
+    /// even when every embed then fails (for example with no embedding
+    /// provider configured); a failure is only logged. The name is kept
+    /// because it is the wire field.
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
     pub relationships_created: usize,

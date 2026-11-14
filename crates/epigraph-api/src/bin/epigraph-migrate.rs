@@ -96,6 +96,19 @@ async fn main() {
             report.ahead, report.db_head, report.binary_head
         );
     }
+    // Backlog e30316ae: the kernel needs pgvector >= 0.8.0 and nothing checked
+    // it. Checked after migrating (001 creates the extension on a fresh
+    // database) and before the `migrations: ok` marker, so a refused run never
+    // prints it. This binary only: the server does not refuse to boot on it.
+    let pgvector = match epigraph_api::migrate::check_pgvector_version(&pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "pgvector version check FAILED");
+            eprintln!("migrations: FAILED: migrations were applied, but {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(pgvector = %pgvector, "pgvector version ok");
     tracing::info!(
         db_head_before = report.db_head_before,
         db_head = report.db_head,
