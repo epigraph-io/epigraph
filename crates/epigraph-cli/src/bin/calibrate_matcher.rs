@@ -66,6 +66,33 @@ enum EmbeddingMode {
     Auto,
 }
 
+/// `--contamination-ledger`: dump the already-decided candidates as JSON.
+async fn write_contamination_ledger(path: &Path) -> anyhow::Result<()> {
+    use epigraph_engine::matching::contamination::contamination_ledger;
+    let maint = epigraph_cli::MaintenancePool::connect("calibrate_matcher")
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let entries = contamination_ledger(maint.pool()).await?;
+    let report = serde_json::json!({
+        "protocol": "tests/cross_source/prompts_v1.md",
+        "generated_at": chrono::Utc::now(),
+        "rule": "verifier_verdict IS NOT NULL OR decided_at IS NOT NULL \
+                 OR status IN ('promoted','rejected')",
+        "contaminated": entries.len(),
+        "entries": entries,
+    });
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    serde_json::to_writer_pretty(BufWriter::new(File::create(path)?), &report)?;
+    eprintln!(
+        "Contamination ledger: {} decided candidate(s) -> {}",
+        entries.len(),
+        path.display()
+    );
+    Ok(())
+}
+
 // ── SciFact record types ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -166,11 +193,25 @@ struct Args {
     /// rule of thumb; for SciFact's ~1400 claims, 37 is a reasonable start.
     #[arg(long, default_value_t = 40)]
     theme_k: usize,
+
+    /// Write the contamination ledger to this path and exit, instead of
+    /// running the SciFact sweep. The ledger lists every `match_candidates`
+    /// row that already carries a verifier verdict or a human decision; the
+    /// adjudication protocol (`tests/cross_source/prompts_v1.md` §5) excludes
+    /// those pairs from the headline precision figure. Connects through
+    /// `MAINTENANCE_DATABASE_URL` (corpus-wide by construction: a ledger that
+    /// sees one tenant's rows would under-report contamination). Without this
+    /// flag the binary never touches a database.
+    #[arg(long)]
+    contamination_ledger: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(path) = &args.contamination_ledger {
+        return write_contamination_ledger(path).await;
+    }
     let claims = load_claims(&args.data_dir)?;
     eprintln!("Loaded {} SciFact claims", claims.len());
 
