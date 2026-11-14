@@ -799,6 +799,136 @@ async fn themes_expand_hides_private_members_and_their_aggregates_from_a_non_mem
     );
 }
 
+/// `(id, label)` of each listed neighbourhood, in response order.
+fn nbr_labels(body: &Value) -> Vec<(Uuid, String)> {
+    body["neighborhoods"]
+        .as_array()
+        .expect("neighborhoods array")
+        .iter()
+        .map(|n| {
+            (
+                n["id"]
+                    .as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .expect("id"),
+                n["label"].as_str().expect("label is a string").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Stored labels an older clustering job wrote are not served as stored: a
+/// bare UUID (that job's dominant frame id, computed over private members
+/// too) and the positional `neighborhood-N` are re-emitted as
+/// `neighborhood-K`, K the row's position in the CALLER's list. Otherwise a
+/// non-member reads the private member's frame id out of the label, and a
+/// gap in the numbering tells them a neighbourhood is hidden. A real name is
+/// served as stored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_expand_renumbers_stored_placeholder_and_uuid_labels_over_the_callers_view(
+    pool: PgPool,
+) {
+    let url = fixture::database_url_for(&pool).await;
+    let owner = Uuid::new_v4();
+    let stranger = Uuid::new_v4();
+
+    let theme = seed_theme(&pool, "label theme", 50).await;
+    let pub_a = seed_member(&pool, theme, owner, "public member a").await;
+    let priv_b = seed_member(&pool, theme, owner, "owner's private member b").await;
+    let pub_c1 = seed_member(&pool, theme, owner, "public member c1").await;
+    let pub_c2 = seed_member(&pool, theme, owner, "public member c2").await;
+    let priv_d = seed_member(&pool, theme, owner, "owner's private member d").await;
+    let mut pub_e = Vec::new();
+    for i in 0..3 {
+        pub_e.push(seed_member(&pool, theme, owner, &format!("public member e{i}")).await);
+    }
+    common::seed_private_ownership(&pool, priv_b, owner).await;
+    common::seed_private_ownership(&pool, priv_d, owner).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0', 'h1']) RETURNING id",
+    )
+    .bind(format!("label-private-frame-{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+        .bind(priv_b)
+        .bind(frame)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let run = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 0, FALSE)",
+    )
+    .bind(run)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Stored labels as an older job (UUID, positional) and the labeller
+    // (a real name) wrote them. Readable sizes fix the stranger's order:
+    // N4 (3) > N3 (2) > N1 (1), with N2 hidden.
+    let named = format!("Named by the labeller {}", Uuid::new_v4().simple());
+    let n1 = seed_neighborhood(&pool, run, theme, &frame.to_string(), &[pub_a, priv_b]).await;
+    let n2 = seed_neighborhood(&pool, run, theme, "neighborhood-2", &[priv_d]).await;
+    let n3 = seed_neighborhood(&pool, run, theme, "neighborhood-3", &[pub_c1, pub_c2]).await;
+    let n4 = seed_neighborhood(&pool, run, theme, &named, &pub_e).await;
+
+    common::seed_claim_with_agent(&pool, "stranger's own unthemed claim", stranger).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let path = format!("/api/v1/graph/themes/{theme}/expand");
+
+    // The rule, checked per position for both callers: a real name as stored,
+    // everything else `neighborhood-<position>`.
+    let expect = |listed: &[(Uuid, String)]| -> Vec<(Uuid, String)> {
+        listed
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                let label = if *id == n4 {
+                    named.clone()
+                } else {
+                    format!("neighborhood-{}", i + 1)
+                };
+                (*id, label)
+            })
+            .collect()
+    };
+
+    // Owner (calibration): all four are listed, and the UUID is renumbered
+    // for the owner too, since it is no name.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, owner_text) = get(addr, &path, Some(&owner_token)).await;
+    assert_eq!(status, 200, "{owner_text}");
+    let owner_labels = nbr_labels(&json(&owner_text));
+    let mut owner_ids: Vec<Uuid> = owner_labels.iter().map(|(id, _)| *id).collect();
+    owner_ids.sort();
+    let mut want_ids = vec![n1, n2, n3, n4];
+    want_ids.sort();
+    assert_eq!(owner_ids, want_ids, "CALIBRATION: {owner_text}");
+    assert_eq!(owner_labels, expect(&owner_labels), "{owner_text}");
+
+    // Stranger: N4, N3, N1 in that order, numbered with no gap for N2.
+    let stranger_token = common::mint_token_with_agent(&["claims:read"], stranger);
+    let (status, text) = get(addr, &path, Some(&stranger_token)).await;
+    assert_eq!(status, 200, "{text}");
+    let labels = nbr_labels(&json(&text));
+    assert_eq!(
+        labels,
+        vec![
+            (n4, named.clone()),
+            (n3, "neighborhood-2".to_string()),
+            (n1, "neighborhood-3".to_string()),
+        ],
+        "{text}"
+    );
+    assert!(
+        !text.contains(&frame.to_string()),
+        "the private member's frame id leaks through N1's stored label: {text}"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn themes_expand_requires_a_bearer(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;

@@ -153,9 +153,13 @@ pub struct ThemeVisibleSummaryRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ThemeNeighborhoodRow {
     pub id: Uuid,
-    /// `graph_neighborhoods.label` as stored: `neighborhood-N` from the
-    /// clustering job until `scripts/label_themes_llm.py --neighborhoods`
-    /// names it from public members only.
+    /// `graph_neighborhoods.label` once `scripts/label_themes_llm.py
+    /// --neighborhoods` has named it from public members only. A stored
+    /// positional placeholder (`neighborhood-N`) or a bare UUID (the dominant
+    /// frame id an older clustering job stored, computed over private members
+    /// too) is never returned: it is re-emitted as `neighborhood-K`, K being
+    /// the row's position in THIS viewer's list, so neither the frame nor a
+    /// gap left by a hidden neighbourhood reaches the caller.
     pub label: String,
     /// Current members the viewer can read, never the stored `size`.
     pub size: i32,
@@ -425,7 +429,13 @@ impl GraphViewRepository {
                 FROM members
                 GROUP BY neighborhood_id
             )
-            SELECT n.id, n.label, a.size, a.mean_betp,
+            SELECT n.id,
+                   CASE WHEN n.label ~ '^neighborhood-[0-9]+$'
+                          OR n.label ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        THEN 'neighborhood-' || row_number() OVER (ORDER BY a.size DESC, n.id)
+                        ELSE n.label
+                   END AS label,
+                   a.size, a.mean_betp,
                    (SELECT mb.frame_id FROM members mb
                     WHERE mb.neighborhood_id = a.neighborhood_id AND mb.frame_id IS NOT NULL
                     GROUP BY mb.frame_id
