@@ -153,8 +153,38 @@ the committed export bytes; the committed result passes the Rust checks.
 - `apply_refuses_a_forged_or_drifted_links_result`;
 - `the_binary_refuses_a_bad_map_or_cap_before_connecting` (no DB).
 
-Each new test is proved red on a mutation of the code it covers; the table
-is filled in on the branch.
+**Fail on old code** (measured on the branch: each mutation applied alone,
+the affected targets run, then restored and `touch`ed):
+
+| Mutation | Tests that went red |
+|---|---|
+| Python: no connected-component cut (Louvain straight away) | `test_a_fitting_component_is_never_split_across_leaves` |
+| Python: no embedding fallback (cut a dense community in half by position) | `test_a_clique_over_the_cap_is_split_by_embedding`, the two fixture tests |
+| Python: unlinked claims in one bucket | `test_a_theme_with_no_links_mirrors_every_meaning_leaf`, and every test on the realistic theme (it is refused) |
+| Python: input not sorted by id | `test_rerun_reproduces_every_group_id` |
+| Python: weight summed per claim | `test_every_leaf_weight_is_within_the_cap` and the realistic-theme tests |
+| Python: a set of units that fits is not a leaf | `test_many_small_components_keep_the_root_fanout_bounded` and others |
+| Python: T never grows (fanout unbounded) | `test_many_small_components_keep_the_root_fanout_bounded`, the fixture tests |
+| Python: no affinity merge (first-fit only) | `test_parts_of_one_component_are_packed_together` |
+| Python: validate skips the mirror rule | `test_validate_tree_refuses_a_malformed_tree[mirror_split, mirror_with_linked_claim, unlinked_in_linked_leaf]` |
+| W3 edge read without `co_owner_group_id IS NULL` | `no_co_owned_or_other_team_edge_counts_as_a_link` and four more DB tests |
+| W3 edge read without the owner check | `no_co_owned_or_other_team_edge_counts_as_a_link` |
+| `counted_links` without the relationship filter | `only_counted_claim_links_between_members_count` |
+| `is_counted` without lower-casing | `only_counted_claim_links_between_members_count` |
+| `check_mirrors` a no-op | `mirrors_hold_exactly_their_meaning_leafs_unlinked_claims`, `a_single_root_leaf_needs_no_mirror`, `apply_refuses_a_forged_or_drifted_links_result`, `no_co_owned_or_other_team_edge_counts_as_a_link`, `every_leaf_fits_and_unlinked_claims_mirror_their_meaning_leaf` |
+| switch: every level to the meaning root | `switch_targets_pick_the_best_jaccard_meaning_group` |
+| switch: no depth tie-break | `a_switch_tie_goes_to_the_deeper_group_then_the_smaller_id` (the first probe survived on uuid luck; the comparator test was added for it) |
+| links documents switch to the root's target only | `the_root_switch_round_trips_between_the_hierarchies` |
+| apply does not write the meaning levels into the run | `the_root_switch_round_trips_between_the_hierarchies`, `stored_documents_of_both_hierarchies_validate`, `every_leaf_fits_and_unlinked_claims_mirror_their_meaning_leaf` |
+| links resolve skips W3's re-check | `every_leaf_fits_and_unlinked_claims_mirror_their_meaning_leaf`, `a_second_apply_reproduces_every_links_group_id` |
+| export writes every claim's embedding | `the_writer_reproduces_the_committed_export_bytes`, `no_co_owned_or_other_team_edge_counts_as_a_link` |
+| export numbers every meaning leaf 0 | `no_co_owned_or_other_team_edge_counts_as_a_link` |
+| apply without the theme-set check | `apply_refuses_a_forged_or_drifted_links_result` |
+
+**Not tested end to end:** a database export computed by the Python core
+and applied back (as for W4: the build hosts have no numpy; the halves meet
+through the committed fixture, whose export bytes the Rust writer reproduces
+and whose result passes the Rust tree and mirror checks).
 
 ## "Done when" → proof
 
