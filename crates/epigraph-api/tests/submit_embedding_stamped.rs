@@ -310,6 +310,17 @@ async fn packet_by_an_allowlisted_service_client_embeds_claim_and_figure(pool: P
         "the packet's figure evidence carries an embedding after a 201"
     );
     logs_assert(no_store_refusal);
+
+    // Backlog 7b3722b5: the route used to copy every submitted claim, content
+    // included, into the process's in-memory propagation orchestrator, which
+    // has no eviction and whose propagation could reach nothing. A successful
+    // submit must leave that graph empty.
+    let orchestrator = state.propagation_orchestrator.read().await;
+    assert_eq!(
+        orchestrator.dag().node_count(),
+        0,
+        "a submitted packet must not be retained in the in-memory propagation DAG"
+    );
 }
 
 /// The `AuthContext` the bearer middleware injects for a human operator's

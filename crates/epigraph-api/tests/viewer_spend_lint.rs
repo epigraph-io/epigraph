@@ -1092,16 +1092,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // write: propagation for the claim this request just persisted through
-    // the viewer (`persist_packet`); `validate_packet` runs no tenancy read.
+    // no SQL: `validate_packet` runs no tenancy read. `propagate_from` left
+    // this list with the in-memory orchestrator registration it ran on
+    // (backlog 7b3722b5).
     // The two post-commit embedding UPDATEs (claim, figure evidence) now
     // receive the viewer (`AppState::store_claim_embedding_as` /
     // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
-    (
-        "submit.rs",
-        "submit_packet",
-        &["propagate_from", "validate_packet"],
-    ),
+    ("submit.rs", "submit_packet", &["validate_packet"]),
     // gated (`write_target_of`) then write.
     (
         "versioning.rs",
