@@ -363,6 +363,12 @@ name = "atlas_naming"
 path = "src/bin/atlas_naming.rs"
 required-features = ["db"]
 
+# Atlas W8: the naming step on a fresh database, with a recording backend.
+[[test]]
+name = "atlas_naming"
+path = "tests/atlas_naming.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
