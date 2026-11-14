@@ -27,6 +27,10 @@
 //!   remove the row. Each such arm carries a CALIBRATION assertion on a public
 //!   row, so an empty answer cannot pass it.
 //!
+//! The leaderboard, which no other suite reaches through the router, also gets
+//! an HTTP arm through `create_router`: an agentless bearer gets 401, and the
+//! member and the stranger each see what the direct arms say they should.
+//!
 //! `#[sqlx::test]` hands every test a fresh database migrated from empty.
 
 mod viewer_fixture;
@@ -402,5 +406,114 @@ async fn inflation_leaderboard_does_not_rank_on_a_strangers_private_claims(pool:
         rows.iter().all(|(agent, _)| *agent != p.member),
         "an agent whose only inflation claims the stranger cannot read must not be \
          ranked: {rows:?}"
+    );
+}
+
+// ── The leaderboard through the router ──
+//
+// The arms above call the handler directly, so they cannot see what the live
+// router does before it: the bearer middleware, and the `ViewerExtractor` this
+// change added. This arm sends real HTTP through `create_router` on the same
+// split state. On the old handler (no extractor, raw pool) its first assertion
+// fails, because an agentless bearer got 200, and so does its member
+// assertion, because the raw pool's row security hides the member's own rows.
+
+/// A bearer for the in-process app, signed with the dev secret
+/// `ApiConfig::default()` verifies. `agent: None` is a token that
+/// authenticates but names no agent, which has no `Viewer`.
+fn bearer(agent: Option<Uuid>) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".to_string()],
+            "agent",
+            None,
+            agent,
+            chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("test JWT issued");
+    token
+}
+
+async fn serve(state: AppState) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    let app = epigraph_api::routes::create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .expect("serve");
+    });
+    (addr, tx)
+}
+
+async fn leaderboard_http(
+    client: &reqwest::Client,
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> (u16, serde_json::Value) {
+    let resp = client
+        .get(format!("http://{addr}/api/v1/inflation-index/leaderboard"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let body = resp.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+fn ranked_agents(body: &serde_json::Value) -> Vec<Uuid> {
+    body.as_array()
+        .unwrap_or_else(|| panic!("leaderboard body must be an array: {body}"))
+        .iter()
+        .map(|v| {
+            v["agent_id"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .expect("agent_id")
+        })
+        .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn inflation_leaderboard_over_http_needs_an_agent_and_reads_as_the_caller(pool: PgPool) {
+    let (p, state) = leaderboard_plant(&pool, "board-http").await;
+    let (addr, _shutdown) = serve(state).await;
+    let client = reqwest::Client::new();
+
+    let (status, body) = leaderboard_http(&client, addr, &bearer(None)).await;
+    assert_eq!(
+        status, 401,
+        "a bearer that names no agent has no viewer to read as: {body}"
+    );
+
+    let (status, body) = leaderboard_http(&client, addr, &bearer(Some(p.stranger))).await;
+    assert_eq!(status, 200, "stranger: {body}");
+    let stranger_sees = ranked_agents(&body);
+    assert!(
+        stranger_sees.contains(&p.public_author),
+        "CALIBRATION: the public author must be ranked for the stranger: {body}"
+    );
+    assert!(
+        !stranger_sees.contains(&p.member),
+        "the stranger must not see an agent ranked only on claims it cannot read: {body}"
+    );
+
+    let (status, body) = leaderboard_http(&client, addr, &bearer(Some(p.member))).await;
+    assert_eq!(status, 200, "member: {body}");
+    assert!(
+        ranked_agents(&body).contains(&p.member),
+        "the member must be ranked on its own private claims over HTTP too: {body}"
     );
 }
