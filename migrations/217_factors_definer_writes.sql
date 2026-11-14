@@ -61,9 +61,11 @@
 --      also revokes that privilege's column grants.
 --
 -- As the definers' owner the mint now reads `claims` through
--- `epigraph_definer_bypass()`, so an endpoint the session cannot see that is
--- superseded is skipped too (before, an RLS-hidden superseded endpoint read as
--- current and was minted over).
+-- `epigraph_definer_bypass()`. That is not observable from an application
+-- session: 001's invoker `validate_edge_reference` already refuses an edge to
+-- an endpoint the session cannot see, so every endpoint the mint reads is one
+-- the session could read too (measured: such an INSERT fails "Edge target
+-- references nonexistent claim").
 --
 -- NOT CHANGED HERE: the application role can still move any factor between
 -- frames (`frame_id`), and `bp_messages` stays application-writable (118's
