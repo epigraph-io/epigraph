@@ -166,8 +166,12 @@ signed token** (the downstream re-validates it), so the middleware also inserts
 `RawBearerToken(pub String)` into the request extensions alongside `AuthContext`.
 `call_tool` pulls it from `context.extensions.get::<http::request::Parts>()` →
 `parts.extensions.get::<RawBearerToken>()`. Present only on the HTTP path: **stdio has no
-bearer**, so a federated `tools/call` over stdio has no token to forward and is rejected
-(federated tools list over stdio, but cannot be invoked).
+bearer**, so a federated `tools/call` over stdio has no token to forward and is rejected,
+with a `denied:<ext>:<tool>` audit event like every other federated refusal. Federated
+tools are therefore listed only to a caller that presented a bearer over HTTP
+(`EpiGraphMcpFull::lists_federated_tools`): not over stdio, and not on the
+unauthenticated listener, whose principal-less context carries no token (backlog
+b6559e75).
 
 ### Scope gate (federated tools only)
 

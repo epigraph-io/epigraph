@@ -1062,7 +1062,8 @@ impl EpiGraphMcpFull {
 
     /// The tools listed to one caller (elevation plan EL-11): every kernel
     /// tool [`crate::tools::elevation::listed`] admits, then every federated
-    /// tool. `auth` is `None` on stdio; over HTTP it must already carry the
+    /// tool when [`Self::lists_federated_tools`] says this caller can call one.
+    /// `auth` is `None` on stdio; over HTTP it must already carry the
     /// switch and the elevation ([`Self::listing_auth`], or `call_tool`'s
     /// dispatch for `list_mcp_tools`). The ONE manifest rule `list_tools` and
     /// `list_mcp_tools` share, so neither can bypass the other.
@@ -1087,8 +1088,25 @@ impl EpiGraphMcpFull {
             .into_iter()
             .filter(|t| crate::tools::elevation::listed(t.name.as_ref(), &caller))
             .collect();
-        tools.extend(self.federation.list_federated_tools());
+        if Self::lists_federated_tools(http, auth) {
+            tools.extend(self.federation.list_federated_tools());
+        }
         tools
+    }
+
+    /// Whether a caller is listed the federated tools: only one that
+    /// presented a bearer token, over HTTP (backlog b6559e75).
+    ///
+    /// `call_tool` proxies a federated call under the CALLER's own bearer,
+    /// and refuses one it has no bearer to forward. A caller without one
+    /// (stdio, which carries no `AuthContext`; an HTTP listener with no auth
+    /// layer; the unauthenticated listener, whose injected context is
+    /// principal-less and comes with no token) would be shown tools it can
+    /// never call, and the manifest would mislead every client that plans from
+    /// it.
+    #[must_use]
+    pub fn lists_federated_tools(http: bool, auth: Option<&epigraph_auth::AuthContext>) -> bool {
+        http && auth.is_some_and(|a| !crate::auth::is_principal_less(a))
     }
 
     /// Replace the admin-scope switch's cache with one whose reads stand for
@@ -3106,7 +3124,12 @@ impl ServerHandler for EpiGraphMcpFull {
                     return Err(err);
                 }
                 // (b) require the caller's raw bearer to forward downstream.
+                // A refusal like (0) and (a), so audited like them (backlog
+                // b6559e75): reachable over HTTP by a caller the gates above
+                // admit with no token, the unauthenticated listener's.
                 let Some(token) = raw_token else {
+                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
+                        .await;
                     return Err(McpError {
                         code: rmcp::model::ErrorCode::INVALID_REQUEST,
                         message: std::borrow::Cow::Borrowed(
