@@ -74,3 +74,59 @@ fn the_engine_defines_no_embedding_client() {
          epigraph_embeddings::EmbeddingService"
     );
 }
+
+/// Every cargo feature this crate declares gates something.
+///
+/// `local = []` claimed to "enable local embedding model support" while no
+/// `cfg(feature = "local")` existed anywhere and `LocalProvider` (a hash stub,
+/// not a model) was exported unconditionally (backlog 9785198e). An empty
+/// feature is a promise the build does not keep.
+#[test]
+fn every_declared_feature_gates_code() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("manifest");
+    let features_table = manifest
+        .split("\n[features]\n")
+        .nth(1)
+        .expect("a [features] table")
+        .split("\n[")
+        .next()
+        .unwrap_or_default();
+    let features: Vec<&str> = features_table
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k.trim()))
+        .filter(|k| !k.is_empty() && !k.starts_with('#') && *k != "default")
+        .collect();
+    assert!(
+        features.contains(&"openai"),
+        "CALIBRATION: the [features] parse found {features:?}, not this crate's table"
+    );
+    let sources: String = production_sources()
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("crates/epigraph-embeddings/"))
+        .map(|(_, text)| text)
+        .collect();
+    let ungated: Vec<&str> = features
+        .into_iter()
+        .filter(|f| !sources.contains(&format!("feature = \"{f}\"")))
+        .collect();
+    assert!(
+        ungated.is_empty(),
+        "epigraph-embeddings declares features that gate no code: {ungated:?}"
+    );
+}
+
+/// The hash stub that posed as a local model is gone from the public surface.
+#[test]
+fn no_local_provider_is_exported() {
+    let offenders: Vec<String> = production_sources()
+        .into_iter()
+        .filter(|(_, text)| text.contains("LocalProvider"))
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "LocalProvider is a deterministic hash, not a model; use MockProvider in tests: \
+         {offenders:?}"
+    );
+}

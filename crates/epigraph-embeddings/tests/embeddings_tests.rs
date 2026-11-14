@@ -9,7 +9,7 @@
 //! 2. Generate embedding is deterministic for same input
 //! 3. Batch generate embeddings handles multiple texts
 //! 4. Embedding dimension is configurable
-//! 5. Fallback to local model if API fails
+//! 5. Fallback provider is used when the primary fails
 //! 6. Embedding cache prevents duplicate API calls
 //! 7. Store embedding persists to pgvector table
 //! 8. Get embedding retrieves stored vector
@@ -32,8 +32,8 @@
 
 use epigraph_embeddings::providers::MockProviderWithFallback;
 use epigraph_embeddings::{
-    EmbeddingCache, EmbeddingConfig, EmbeddingError, EmbeddingService, LocalProvider, MockProvider,
-    Normalizer, RateLimiter, SimilarClaim, TokenUsage,
+    EmbeddingCache, EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, Normalizer,
+    RateLimiter, SimilarClaim, TokenUsage,
 };
 use uuid::Uuid;
 
@@ -57,12 +57,6 @@ fn create_mock_provider_with_dimension(dimension: usize) -> MockProvider {
 fn create_failing_mock_provider(failure_rate: f32) -> MockProvider {
     let config = EmbeddingConfig::openai(1536);
     MockProvider::new(config).with_failures(failure_rate)
-}
-
-/// Create a local provider for fallback testing
-fn create_local_provider() -> LocalProvider {
-    let config = EmbeddingConfig::local(1536);
-    LocalProvider::new(config).unwrap()
 }
 
 // ============================================================================
@@ -279,25 +273,19 @@ async fn test_embedding_dimension_is_configurable() {
 }
 
 // ============================================================================
-// Test 5: Fallback to Local Model if API Fails
+// Test 5: Fallback Provider if the Primary Fails
 // ============================================================================
 
-/// **Test 5**: Fallback to local model if API fails
+/// **Test 5**: Fallback provider is used when the primary fails
 ///
 /// **Evidence**: Resilience requires graceful degradation
 /// **Reasoning**: System should remain functional when external APIs fail
 #[tokio::test]
-async fn test_fallback_to_local_model_on_api_failure() {
-    // Create a primary provider that always fails
-    let _failing_primary = create_failing_mock_provider(1.0);
-
-    // Create a local fallback that succeeds
-    let _local_fallback = create_local_provider();
-
-    // Create provider with fallback
+async fn test_fallback_provider_used_on_primary_failure() {
+    // A primary that always fails, with a mock fallback that succeeds
     let config = EmbeddingConfig::openai(1536);
     let primary_with_fallback = MockProviderWithFallback::new(
-        MockProvider::new(config.clone()).with_failures(1.0),
+        create_failing_mock_provider(1.0),
         Some(MockProvider::new(config)),
     );
 

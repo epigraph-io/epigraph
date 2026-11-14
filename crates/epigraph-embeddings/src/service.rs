@@ -64,7 +64,7 @@ impl SimilarClaim {
 ///
 /// This trait defines the complete interface for working with embeddings
 /// in the `EpiGraph` system. Implementations may use different backends
-/// (`OpenAI`, local models, etc.) but must conform to this interface.
+/// (`OpenAI`, Jina, the test mock) but must conform to this interface.
 #[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
 pub trait EmbeddingService: Send + Sync {

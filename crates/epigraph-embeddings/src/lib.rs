@@ -27,10 +27,10 @@
 //! # Architecture
 //!
 //! The embedding service is designed with:
-//! - **Provider abstraction**: Support for `OpenAI`, local models, or custom backends
+//! - **Provider abstraction**: `OpenAI` and Jina backends, plus a deterministic
+//!   `MockProvider` for tests and keyless development (there is no local model)
 //! - **Caching**: Prevent duplicate API calls for identical text
 //! - **Rate limiting**: Respect API rate limits to prevent throttling
-//! - **Fallback**: Graceful degradation to local models when API fails
 //! - **Normalization**: All embeddings are unit vectors for consistent similarity
 //!
 //! # Core Types
@@ -74,9 +74,7 @@ pub use service::{
 };
 
 // Re-export provider implementations
-pub use providers::{
-    JinaProvider, LocalProvider, MockMultimodalProvider, MockProvider, OpenAiProvider,
-};
+pub use providers::{JinaProvider, MockMultimodalProvider, MockProvider, OpenAiProvider};
 
 // Re-export utility types
 pub use cache::EmbeddingCache;

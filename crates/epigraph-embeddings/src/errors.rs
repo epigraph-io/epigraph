@@ -74,10 +74,6 @@ pub enum EmbeddingError {
     #[error("Cache error: {0}")]
     CacheError(String),
 
-    /// Local model error
-    #[error("Local model error: {0}")]
-    LocalModelError(String),
-
     /// Provider not available (for fallback scenarios)
     #[error("Provider not available: {provider}")]
     ProviderUnavailable {
