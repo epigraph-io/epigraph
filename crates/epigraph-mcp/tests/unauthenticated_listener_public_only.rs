@@ -25,7 +25,10 @@
 //!   `a_membership_granted_to_the_reader_after_boot_closes_the_listener` (the
 //!   group claim is served);
 //! * deleting `UnauthenticatedReader::resolve`'s membership check fails
-//!   `a_reader_that_holds_a_membership_does_not_resolve`.
+//!   `a_reader_that_holds_a_membership_does_not_resolve`;
+//! * deleting `call_tool`'s principal-less filter on `record_auth_lineage`
+//!   fails `a_call_on_the_read_only_listener_records_no_auth_lineage` (the
+//!   edge `server --OPERATED_BY--> reader` is written).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -265,9 +268,10 @@ async fn a_group_row_of_the_server_agent_is_invisible_on_the_read_only_listener(
 
     let hidden = get_claim(&client, &l.url, &session, 3, private).await;
     assert!(
-        !hidden.contains("fe514fc3 server-group row"),
-        "a claim in the server agent's group must NOT be served to an unauthenticated \
-         caller:\n{hidden}"
+        !hidden.contains("fe514fc3 server-group row")
+            && hidden.contains(&format!("claim {private} not found")),
+        "a claim in the server agent's group must read as NOT FOUND to an unauthenticated \
+         caller (not as some other error):\n{hidden}"
     );
 
     // And the reader is still in no group after serving requests: nothing on
@@ -275,6 +279,53 @@ async fn a_group_row_of_the_server_agent_is_invisible_on_the_read_only_listener(
     let reader = reader_agent(&pool).await.expect("the reader was created");
     assert_ne!(reader, server_agent);
     assert_eq!(live_memberships(&pool, reader).await, 0);
+}
+
+async fn operated_by_edges_from(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND source_type = 'agent' \
+         AND relationship = 'OPERATED_BY'",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("OPERATED_BY edge count")
+}
+
+/// Review of fe514fc3: nobody authenticates on this listener, so a tool call
+/// on it records no `OPERATED_BY` auth-lineage edge. Before the reader agent
+/// the would-be edge was a server-agent self-loop that `edges_no_self_loop`
+/// refuses; with the reader it would be a real edge `server --OPERATED_BY-->
+/// reader`, a second lineage target that the operator-link functions read as
+/// a shared HTTP signer. Driven through the real `call_tool`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_call_on_the_read_only_listener_records_no_auth_lineage(pool: PgPool) {
+    let l = spawn(pool.clone(), 0x54, UnauthenticatedWrites::Refused).await;
+    let server_agent = l.server.server_agent_id().await.expect("server agent");
+    let public = fixture::seed_public_claim(&pool, server_agent, "fe514fc3 lineage row").await;
+
+    let client = reqwest::Client::new();
+    let session = handshake(&client, &l.url).await;
+    let served = get_claim(&client, &l.url, &session, 2, public).await;
+    assert!(
+        served.contains("fe514fc3 lineage row"),
+        "CALIBRATION: the call reached `call_tool` and was served:\n{served}"
+    );
+
+    assert_eq!(
+        operated_by_edges_from(&pool, server_agent).await,
+        0,
+        "a principal-less call must record no OPERATED_BY edge from the server agent"
+    );
+    let reader = reader_agent(&pool).await.expect("the reader was created");
+    let into_reader: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'OPERATED_BY'",
+    )
+    .bind(reader)
+    .fetch_one(&pool)
+    .await
+    .expect("edges into the reader");
+    assert_eq!(into_reader, 0, "nothing acts on behalf of the reader");
 }
 
 /// Fail-closed after boot: a membership granted to the reader once the
@@ -324,6 +375,7 @@ async fn a_reader_that_holds_a_membership_does_not_resolve(pool: PgPool) {
         .await
         .expect_err("a reader with a membership must not resolve");
     assert!(err.contains("must hold none"), "{err}");
+
 }
 
 /// The wiring `main` uses: the read-only listener injects the dedicated
