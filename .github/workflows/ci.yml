@@ -894,3 +894,32 @@ jobs:
           SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: .github/scripts/gitleaks-scan.sh "$SCAN_BASE" "$SCAN_HEAD"
+
+  # Gates the MESSAGES of the commits a change adds (E1 e-mail address, E2
+  # developer home path, E3 IP-encoding host or public IPv4 fail the job;
+  # missing sections, a non-protocol subject and a Verification that records no
+  # run only warn). The history of this public repository is permanent, so an
+  # identifying detail in a message cannot be taken back once merged.
+  # Only <base>..<head> is scanned: existing history already contains findings
+  # and cannot be rewritten, so scanning all of it would fail every change.
+  commit-message-lint:
+    name: Commit message lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The PR's base commit must be present for a <base>..<head> range.
+          fetch-depth: 0
+      - name: Self-test the lint
+        run: .github/scripts/test-commit-message-lint.sh
+      - name: Lint the commits this change adds
+        env:
+          # SHAs reach the script through env, never interpolated into the
+          # shell body. On a push, `before` is all zeros when the push created
+          # the branch; the script then lints the head commit alone.
+          SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: python3 .github/scripts/commit-message-lint.py "$SCAN_BASE" "$SCAN_HEAD"

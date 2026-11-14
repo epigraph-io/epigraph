@@ -421,4 +421,19 @@ security(crypto): use constant-time comparison in signature verification
 - cargo test passes; manual review confirms no early returns in the verify path
 ```
 
+### Commit-message lint
+
+CI (`.github/scripts/commit-message-lint.py`, job `Commit message lint`) reads
+only the non-merge commits a change adds, and refuses three things: an e-mail
+address outside a trailer (placeholder domains and `noreply@anthropic.com`
+excepted); a home-directory path (`/home/<name>/`, `/Users/<name>/`) whose name
+is not generic (`user`, `runner`, `dev`, `you`, `me`, `USER`); and a wildcard-DNS
+host that encodes an address, or a bare public IPv4 outside the documentation,
+loopback and private ranges. It only warns about a Verification section that
+says "Not run", "CI to confirm" or "to be run", a subject outside
+`<type>(<scope>): <text>`, and a message with none of the three sections. A
+commit whose Verification records something that was not run should say so with
+a line starting `Unverified:`, which silences that warning. Output is redacted,
+never the offending value.
+
 <!-- END epistemic-commit-protocol -->
