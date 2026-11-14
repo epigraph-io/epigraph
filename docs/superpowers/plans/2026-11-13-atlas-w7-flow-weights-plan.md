@@ -21,6 +21,26 @@ carries W2, plus W1 and W10a. W7 adds no migration.
 - **A map draws an edge only when its whole audience may read the edge row**
   (W3 applies this; a co-owned edge is on no single-team map).
 
+## Operator rulings 2026-11-13
+
+- **The contract accepts `none` for an evidence-to-claim edge with no
+  readable mass.** The W10a contract now allows `flow_basis` = `none` (weight
+  0, sign 0) on an evidence-to-claim edge when the map's audience can read no
+  mass row keyed by that evidence on that claim, or when the relationship is
+  not `supports` or `refutes` (`FlowBasis::allows`). The blocker this plan
+  reported is gone: W7's `none` evidence edges validate, and the flipped test
+  `an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates`
+  proves it through `LevelDocument::to_stored_json`.
+- **A `none` evidence edge keeps its direction in its relationship.** The
+  contract reads the direction of such an edge from its relationship name,
+  not its sign (which is 0). W7 serves every relationship lower-cased,
+  including a `none` evidence edge, so a legacy `REFUTES` row with no mass is
+  served `refutes`, sign 0, weight 0, and the front end can style refuting
+  evidence that carries no mass. New DB test:
+  `a_refutes_evidence_edge_with_no_readable_mass_is_served_refutes_with_basis_none`.
+  W7's code already lower-cased every relationship before choosing a basis,
+  so this pins the behaviour; it did not need a code change.
+
 ## What this item delivers
 
 A build-time function over W3's `LeafNodeSet` that returns the contract's
@@ -110,26 +130,22 @@ support, and a sum could leave [0, 1].
 **Sign** is +1 for `supports`, -1 for `refutes`.
 
 **No usable mass row, or another relationship:** `flow_basis` = `none`,
-weight 0, sign 0. The contract FORBIDS this today: `FlowBasis::for_kinds`
-(evidence, claim) is `exact`, and `validate_leaf`'s flow-basis check
-(`crates/epigraph-atlas-contract/src/lib.rs`) rejects any other basis; the
-schema's `flow_basis` description says the same. W7 does not fake a mass.
-Reported to the operator; a test pins the exact violation.
+weight 0, sign 0. W7 does not fake a mass. The contract accepts this
+(`FlowBasis::allows` admits `none` beside `exact` for evidence to claim; see
+"Operator rulings 2026-11-13"), and the evidence node still counts as
+attached to its claim. The served relationship is lower-cased like every
+other, so a `none` edge's direction (`supports` or `refutes`) is in its name.
 
 This is not only legacy rows: the convention learn and forget routes write a
 stored `evidence -SUPPORTS-> claim` / `-REFUTES->` edge and no evidence-keyed
 mass row, and the leaf draws evidence-to-claim edges of every relationship.
 
-**Recommended rule change (the contract's, not W7's):** the leaf validation
-accepts `none` as well as `exact` for an evidence-to-claim edge, still with
-weight 0 and sign 0 (the existing "no flow" check), and the schema's
-`flow_basis` text says so. The alternative, W10 dropping such edges, does not
-work on its own: the leaf validation counts an evidence node as anchored only
-through an edge to a claim, so an evidence node whose only claim edge has no
-mass would become an orphan and the leaf would still fail; dropping the node
-as well hides evidence the audience may read. When the rule changes,
-`an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it`
-is the test that flips.
+Before the contract change, the v1 contract refused `none` for this pair,
+and this plan recommended the rule the contract then adopted (accept `none`
+beside `exact`, weight 0 and sign 0). Dropping such edges instead would not
+have worked: the leaf validation counts an evidence node as attached only
+through an edge to a claim, so an evidence node whose only claim edge had no
+mass would have become an orphan.
 
 ### Every other edge (`flow_basis` = `none`)
 
@@ -192,7 +208,14 @@ The read runs on the build's snapshot transaction
 - `contradicts_and_refutes_carry_negative_sign_and_the_engine_factor`;
 - `cites_weighs_zero_even_with_a_stored_strength`;
 - `both_spellings_collapse_into_one_lower_cased_edge`;
-- `an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it`;
+- `an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates`
+  (renamed and flipped after the contract change; it had pinned the
+  contract's refusal);
+- `a_refutes_evidence_edge_with_no_readable_mass_is_served_refutes_with_basis_none`
+  (added after the contract change): a stored `REFUTES` evidence edge whose
+  only mass row belongs to another team is served on the public map as
+  `refutes`, `none`, sign 0, weight 0, and the leaf encodes; control: on the
+  owning team's map the same edge is `exact`, sign -1, weight 0.6;
 - `a_frame_or_hypothesis_index_the_audience_cannot_read_is_not_used` (added
   after the first probe run showed nothing seeded another team's frame or
   index row);
@@ -227,12 +250,23 @@ on the branch:
 | several rows aggregate by min, not max | unit `evidence_edges_take_...`; `exact_masses_...`, `a_frame_or_hypothesis_index_...` |
 | relationship not lower-cased | 3 unit; 4 DB tests incl. `every_weighted_edge_passes_contract_validation` |
 | a re-collapse keeps the first edge, not the largest | `both_spellings_collapse_into_one_lower_cased_edge` |
-| no usable mass gives `exact` with weight 0 (an invented mass) | unit `evidence_edges_take_...`; `a_mass_row_...`, `an_evidence_edge_with_no_readable_mass_...` |
+| no usable mass gives `exact` with weight 0 (an invented mass) | unit `evidence_edges_take_...`; `a_mass_row_...`, `an_evidence_edge_with_no_readable_mass_...` (re-run after the contract change, see below) |
 | the stored strength ignored (fallback always) | 2 unit; `both_spellings_collapse_...`, `proxy_weights_do_not_move_...` |
 | strength read: `co_owner_group_id IS NULL` dropped | before review: none (equivalent end to end, since W3 only hands the read ids it already filtered). After review: `a_claim_link_row_the_map_cannot_read_...` at the co-owned case |
 | strength read: the whole edge predicate dropped | `a_claim_link_row_the_map_cannot_read_...` |
 | exact mass: the old strict [0, 1] check (no residue tolerance) | unit `float_residue_is_a_mass_...` (residue on Θ voids the row) |
 | exact mass: residue tolerated but not clamped | unit `float_residue_is_a_mass_...` (`1 + 1e-12` served) |
+
+**Probes after the contract change** (DB target, fresh database, each
+mutation restored and `touch`ed):
+
+| Mutation | Tests that went red |
+|---|---|
+| the contract's old rule (`FlowBasis::allows` without the evidence-to-claim `none` clause) | `an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates`, `a_refutes_evidence_edge_..._basis_none` (both at `to_stored_json`) |
+| a `none` evidence edge served under its stored spelling | `a_refutes_evidence_edge_..._basis_none` (relationship `REFUTES`, not `refutes`) |
+| a `none` refutes evidence edge given sign -1 | `a_refutes_evidence_edge_..._basis_none` |
+| an evidence edge with no usable mass left out | both new tests, `a_mass_row_the_audience_cannot_read_does_not_contribute` |
+| no usable mass gives `exact` with weight 0 (an invented mass, which the contract would now also accept) | `an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates` (at its `none` assertion), `a_refutes_evidence_edge_..._basis_none`, `a_mass_row_the_audience_cannot_read_does_not_contribute` |
 
 **Lints**: `no_unscoped_pool`, `visibility_lint`, `bba_retract_read_lint`,
 `pool_read_lint`, `viewer_ratchet`, `no_role_blind_belief_reads`. W7 writes
@@ -242,7 +276,8 @@ no edge, so `edge_writer_signing_ratchet` is not affected.
 
 | Criterion | Proof |
 |---|---|
-| every leaf edge carries a weight and an exact-or-proxy flag | **Blocked** for an evidence-to-claim edge with no usable mass (it is `none`, which the v1 contract refuses; see "Evidence to claim" for the rule to change). Met for every other edge: `every_weighted_edge_passes_contract_validation` (DB) seeds a mass for every evidence edge, so it does not cover the blocked case; `an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses_it` pins it |
+| every leaf edge carries a weight and a basis that pass contract validation | Met. `every_weighted_edge_passes_contract_validation` (DB: claim links, evidence edges with masses, authorship, the filer edge, a provenance row); `an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates` (DB: an evidence edge with no mass, `none`, through `to_stored_json`) |
+| a `none` evidence edge keeps its direction in its relationship | `a_refutes_evidence_edge_with_no_readable_mass_is_served_refutes_with_basis_none` (DB) |
 | tests on a fixture with known masses | `exact_masses_on_a_fixture_with_known_bbas` (DB), the mass unit tests |
 | contradicting and refuting links carry negative sign | `contradicts_and_refutes_carry_negative_sign_and_the_engine_factor` (DB) |
 | (ruling) no belief factor in a proxy weight | `proxy_weights_do_not_move_when_any_belief_moves` (DB) and its mutation probes |
