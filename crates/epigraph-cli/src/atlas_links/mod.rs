@@ -10,7 +10,8 @@
 //! supports, refutes, contradicts, cites, elaborates, corroborates or
 //! decomposes_to (either spelling), read through W3's leaf read, so only
 //! edges the map may draw: public, or the team's own with no co-owner
-//! (ATLAS-R3b). A co-owned or other-team edge never shapes a team map.
+//! (a co-owned edge is readable only by members of both groups). A co-owned
+//! or other-team edge never shapes a team map.
 //!
 //! **Unlinked claims (W5b):** a member with no counted link goes into a links
 //! leaf that MIRRORS its "by meaning" leaf: exactly the unlinked claims of

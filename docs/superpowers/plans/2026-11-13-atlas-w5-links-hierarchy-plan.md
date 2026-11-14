@@ -31,7 +31,7 @@ meaning" leaf (W5b). Both hierarchies are written into ONE run.
   claim, both ends members of the theme, `lower(relationship)` in
   {supports, refutes, contradicts, cites, elaborates, corroborates,
   decomposes_to}, not a self-loop. W3's read already carries the map edge
-  rule (ATLAS-R3b): public, or owned by the team with NO co-owner. So no
+  rule: public, or owned by the team with NO co-owner. So no
   co-owned or other-team edge can reach the graph, and the rule lives in one
   place (W3's module doc asks every later edge read to use it).
 - **One run for both hierarchies.** The serving read takes a map's latest

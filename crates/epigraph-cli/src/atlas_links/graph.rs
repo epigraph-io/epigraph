@@ -37,8 +37,10 @@ pub fn is_counted(rel: &str) -> bool {
 ///
 /// `rows` is W3's read ([`AtlasLeafRepository::read_leaf_rows`]), so every
 /// edge in it already passed the MAP edge rule: public, or owned by the team
-/// with no co-owner (ATLAS-R3b). A co-owned edge, another team's edge or a
-/// retracted one is never in `rows` and so never a link here. Keeping the
+/// with no co-owner (a co-owned edge is readable only by members of both
+/// groups, so no single team's map draws it). A co-owned edge, another
+/// team's edge or a retracted one is never in `rows` and so never a link
+/// here. Keeping the
 /// read in one place means an edge hidden from a leaf cannot shape the
 /// grouping.
 ///
