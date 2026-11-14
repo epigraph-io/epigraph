@@ -32,9 +32,23 @@
 //! # The input hash
 //!
 //! [`leaf_input_hash`] and [`group_input_hash`] digest the algorithm tag, every
-//! constant, the seed and the normalised input: exactly what the positions
-//! depend on. The nightly stores them with the run and skips a level whose
-//! hash has not changed (see `super::fill`).
+//! constant, the seed and the normalised input: exactly what a cold layout
+//! ([`layout_leaf`], [`layout_group`]) depends on. The nightly stores them
+//! with the run and skips a level whose hash has not changed (see
+//! `super::fill`), copying its stored positions.
+//!
+//! # Warm starts
+//!
+//! A level whose input did change is laid out again from its previous
+//! positions ([`layout_leaf_from`], [`layout_group_from`]), so one new claim
+//! does not rearrange its leaf, its parent and every level above. A warm
+//! result depends on the previous positions too, so it is deterministic in
+//! `(seed, input, previous)` but is not a function of the input hash alone.
+//! The hash stays the skip key regardless: it says which input the stored
+//! positions were made for, and the skip copies them rather than recomputing.
+//! Folding the previous positions into the hash would make every warm-started
+//! level miss the skip on every later night, since its previous positions
+//! change each time it is laid out.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -45,7 +59,9 @@ use uuid::Uuid;
 use super::math::round4;
 
 /// The algorithm tag every input hash starts with. Change it whenever the
-/// arithmetic changes, so a stored layout is not reused under new rules.
+/// arithmetic changes, so a stored layout is not reused under new rules: a
+/// run recorded under another tag is neither copied nor warm-started from
+/// (`super::fill`), so every level is laid out cold again.
 pub const LAYOUT_ALGO: &str = "atlas-w6-v1";
 
 /// A leaf's nodes lie inside this disc (after rounding).
@@ -75,6 +91,14 @@ const LEAF_GRAVITY: f64 = 0.05;
 /// The first iteration's largest step; it cools linearly to 0.
 const LEAF_START_TEMPERATURE: f64 = 0.1;
 
+/// The first iteration's largest step when a leaf starts from its previous
+/// positions ([`layout_leaf_from`]): a hundredth of the cold start's, so the
+/// nodes that were already placed settle where they were. Measured on random
+/// leaves of 40 and 99 nodes, one node or edge added or removed: the placed
+/// nodes move 0.02 on average and at most 0.05 (a cold relayout: about 0.2
+/// and up to 0.8).
+const LEAF_WARM_TEMPERATURE: f64 = 0.001;
+
 /// Upper bound on collision sweeps (they usually stop after a few).
 const COLLISION_SWEEPS: usize = 1000;
 
@@ -95,6 +119,16 @@ const GROUP_LINK_PULL: f64 = 0.1;
 
 /// How hard every child is pulled toward the centre, per iteration.
 const GROUP_GRAVITY: f64 = 0.02;
+
+/// Iterations of a group level started from its previous circles
+/// ([`layout_group_from`]).
+const GROUP_WARM_ITERATIONS: usize = 50;
+
+/// The pull toward the centre per warm iteration: weak, so the gaps left by
+/// a removed or shrunk child close over a few nights without reordering.
+/// Measured on random levels of 30 to 128 children, one child grown by one
+/// claim: no other child moves more than 0.014 (a cold relayout: up to 1.3).
+const GROUP_WARM_GRAVITY: f64 = 0.0005;
 
 /// The smallest radius a child gets (the contract needs `r > 0`).
 pub const GROUP_MIN_RADIUS: f64 = 1e-4;
@@ -282,7 +316,8 @@ fn hash_header(h: &mut Sha256, part: &[u8], seed: Uuid, constants: &[f64], count
 
 /// Lower-hex SHA-256 of everything [`layout_leaf`] depends on: the algorithm
 /// tag, its constants, `seed` and the normalised `input`. Two inputs with the
-/// same hash get the same positions.
+/// same hash get the same cold positions (a warm start also depends on the
+/// previous positions; see the module docs).
 #[must_use]
 pub fn leaf_input_hash(seed: Uuid, input: &LeafInput) -> String {
     let mut h = Sha256::new();
@@ -404,6 +439,42 @@ fn centre(p: &mut [[f64; 2]]) {
 /// Cost: `O(n^2)` per iteration; the contract caps a leaf at 100 nodes.
 #[must_use]
 pub fn layout_leaf(seed: Uuid, input: &LeafInput) -> BTreeMap<Uuid, [f64; 2]> {
+    leaf_layout(seed, input, None)
+}
+
+/// Lay out one leaf again, starting from its `previous` positions (the
+/// previous night's stored document), so a leaf that gained or lost a node or
+/// an edge keeps its shape instead of being laid out from scratch.
+///
+/// A node `previous` places starts there; a new node starts at the mean of
+/// its placed neighbours (offset by its seeded point, so two new nodes never
+/// coincide), or at its seeded point when no neighbour is placed. The start
+/// is centred and scaled to where the forces balance (the stored positions
+/// were scaled to fit the disc), the force iterations run at
+/// [`LEAF_WARM_TEMPERATURE`] instead of the cold start's, and the fit and the
+/// collision sweeps are the cold layout's, so
+/// every bound of [`layout_leaf`] holds. Entries of `previous` that are not
+/// nodes of `input` are ignored. With no node in common it is
+/// [`layout_leaf`].
+///
+/// Deterministic in `(seed, input, previous)`: the same three give the same
+/// bytes. The positions are not a function of `input` alone, which is why the
+/// skip in `super::fill` keys on the input hash and copies the stored
+/// positions rather than recomputing them.
+#[must_use]
+pub fn layout_leaf_from(
+    seed: Uuid,
+    input: &LeafInput,
+    previous: &BTreeMap<Uuid, [f64; 2]>,
+) -> BTreeMap<Uuid, [f64; 2]> {
+    leaf_layout(seed, input, Some(previous))
+}
+
+fn leaf_layout(
+    seed: Uuid,
+    input: &LeafInput,
+    previous: Option<&BTreeMap<Uuid, [f64; 2]>>,
+) -> BTreeMap<Uuid, [f64; 2]> {
     let n = input.nodes.len();
     let mut out = BTreeMap::new();
     if n == 0 {
@@ -425,22 +496,40 @@ pub fn layout_leaf(seed: Uuid, input: &LeafInput) -> BTreeMap<Uuid, [f64; 2]> {
         .map(|(a, b)| (index[a], index[b]))
         .collect();
 
-    let mut p: Vec<[f64; 2]> = input
-        .nodes
-        .iter()
-        .map(|(id, _)| {
-            let s = start_point(seed, *id);
-            [s[0] * 0.5, s[1] * 0.5]
-        })
-        .collect();
-
     // The disc's area (PI is a compile-time constant, not a libm call).
     let area = std::f64::consts::PI * LEAF_RADIUS * LEAF_RADIUS;
     let k = LEAF_K_SCALE * (area / n as f64).sqrt();
     let k2 = k * k;
+
+    let seeded = |id: Uuid| {
+        let s = start_point(seed, id);
+        [s[0] * 0.5, s[1] * 0.5]
+    };
+    let previous = previous.filter(|prev| input.nodes.iter().any(|(id, _)| prev.contains_key(id)));
+    let mut p: Vec<[f64; 2]> = match previous {
+        None => input.nodes.iter().map(|(id, _)| seeded(*id)).collect(),
+        Some(prev) => warm_leaf_start(input, &edges, prev, k, seeded),
+    };
+    if previous.is_some() {
+        // The stored positions were fitted to the disc; take them back to the
+        // scale at which the forces balance, so the warm iterations move only
+        // what changed instead of rescaling everything unevenly.
+        centre(&mut p);
+        let s = equilibrium_scale(&p, &edges, k);
+        for q in &mut p {
+            q[0] *= s;
+            q[1] *= s;
+        }
+    }
+    let start_temperature = if previous.is_some() {
+        LEAF_WARM_TEMPERATURE
+    } else {
+        LEAF_START_TEMPERATURE
+    };
+
     let mut disp = vec![[0.0_f64; 2]; n];
     for it in 0..LEAF_ITERATIONS {
-        let t = LEAF_START_TEMPERATURE * (1.0 - it as f64 / LEAF_ITERATIONS as f64);
+        let t = start_temperature * (1.0 - it as f64 / LEAF_ITERATIONS as f64);
         for d in disp.iter_mut() {
             *d = [0.0, 0.0];
         }
@@ -505,6 +594,95 @@ pub fn layout_leaf(seed: Uuid, input: &LeafInput) -> BTreeMap<Uuid, [f64; 2]> {
         out.insert(*id, [round4(q[0]), round4(q[1])]);
     }
     out
+}
+
+/// The uniform scale `s` at which the leaf forces on `p` (centred) balance
+/// radially. The virial of the forces is `n(n-1)/2 * k^2` from repulsion
+/// (scale-free), minus `s^3 * sum over edges of d^3 / k` from attraction,
+/// minus `s^2 * sum of LEAF_GRAVITY * |p|^2 / k` from gravity; the root of
+/// that cubic is found by a fixed number of Newton steps (`+ - * /` only).
+/// 1 when there is nothing to balance.
+fn equilibrium_scale(p: &[[f64; 2]], edges: &[(usize, usize)], k: f64) -> f64 {
+    let n = p.len() as f64;
+    let rep = n * (n - 1.0) / 2.0 * k * k;
+    let mut att = 0.0;
+    for &(a, b) in edges {
+        let dx = p[a][0] - p[b][0];
+        let dy = p[a][1] - p[b][1];
+        let d2 = dx * dx + dy * dy;
+        att += d2 * d2.sqrt() / k;
+    }
+    let grav: f64 = p
+        .iter()
+        .map(|q| LEAF_GRAVITY * (q[0] * q[0] + q[1] * q[1]) / k)
+        .sum();
+    if !(att + grav > 0.0 && (att + grav).is_finite()) {
+        return 1.0;
+    }
+    let mut s = 1.0_f64;
+    for _ in 0..60 {
+        let f = att * s * s * s + grav * s * s - rep;
+        let df = 3.0 * att * s * s + 2.0 * grav * s;
+        if df <= 0.0 || !df.is_finite() {
+            break;
+        }
+        let next = s - f / df;
+        s = if next > 0.0 { next } else { s / 2.0 };
+    }
+    if s.is_finite() && s > 0.0 {
+        s
+    } else {
+        1.0
+    }
+}
+
+/// The warm starting points of a leaf: a placed node where it was, a new
+/// node at the mean of its placed neighbours plus a quarter of the ideal edge
+/// length along its seeded direction, or at its seeded point.
+fn warm_leaf_start(
+    input: &LeafInput,
+    edges: &[(usize, usize)],
+    prev: &BTreeMap<Uuid, [f64; 2]>,
+    k: f64,
+    seeded: impl Fn(Uuid) -> [f64; 2],
+) -> Vec<[f64; 2]> {
+    let placed: Vec<Option<[f64; 2]>> = input
+        .nodes
+        .iter()
+        .map(|(id, _)| prev.get(id).copied())
+        .collect();
+    let mut sum = vec![[0.0_f64; 2]; placed.len()];
+    let mut count = vec![0usize; placed.len()];
+    for &(a, b) in edges {
+        for (me, other) in [(a, b), (b, a)] {
+            if placed[me].is_none() {
+                if let Some(q) = placed[other] {
+                    sum[me][0] += q[0];
+                    sum[me][1] += q[1];
+                    count[me] += 1;
+                }
+            }
+        }
+    }
+    input
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| match placed[i] {
+            Some(q) => q,
+            None if count[i] > 0 => {
+                // `seeded` is half the unit start point, so this is a
+                // quarter of `k` along it.
+                let s = seeded(*id);
+                let c = count[i] as f64;
+                [
+                    sum[i][0] / c + s[0] * k * 0.5,
+                    sum[i][1] / c + s[1] * k * 0.5,
+                ]
+            }
+            None => seeded(*id),
+        })
+        .collect()
 }
 
 /// Push points apart until none are closer than [`LEAF_SPACING`] and none is
@@ -575,6 +753,44 @@ fn floor4(r: f64) -> f64 {
 /// fills the fit disc.
 #[must_use]
 pub fn layout_group(seed: Uuid, input: &GroupInput) -> BTreeMap<Uuid, Circle> {
+    group_layout(seed, input, None)
+}
+
+/// Place one group level's children again, starting from their `previous`
+/// circles (the previous night's stored document), so a level whose
+/// children grew, shrank, came or went keeps its arrangement instead of being
+/// placed from scratch.
+///
+/// Every child's radius is computed from its size as in [`layout_group`].
+/// A child `previous` places starts at its previous centre, taken back into
+/// the frame before the fit: the cold layout's radii have squares summing to
+/// [`GROUP_FILL`], so the previous fit scaled them by
+/// `sqrt(sum of previous r^2 / GROUP_FILL)`, summed over every previous
+/// circle. A new child starts just outside the placed ones, in the direction
+/// of its linked placed siblings (weighted by link strength) or else of its
+/// seeded point. Then [`GROUP_WARM_ITERATIONS`] rounds of a weak pull toward
+/// the centre ([`GROUP_WARM_GRAVITY`]) and one collision sweep each, the
+/// collision sweeps, the centring and the fit of [`layout_group`], so every
+/// bound of it holds. There is no link pull and no cold-start contraction, so
+/// a grown child pushes only its neighbours aside. Entries of `previous` that
+/// are not children of `input` are left out of the placement (but counted in
+/// the scale). With no child in common it is [`layout_group`].
+///
+/// Deterministic in `(seed, input, previous)`.
+#[must_use]
+pub fn layout_group_from(
+    seed: Uuid,
+    input: &GroupInput,
+    previous: &BTreeMap<Uuid, Circle>,
+) -> BTreeMap<Uuid, Circle> {
+    group_layout(seed, input, Some(previous))
+}
+
+fn group_layout(
+    seed: Uuid,
+    input: &GroupInput,
+    previous: Option<&BTreeMap<Uuid, Circle>>,
+) -> BTreeMap<Uuid, Circle> {
     let m = input.children.len();
     let mut out = BTreeMap::new();
     if m == 0 {
@@ -589,18 +805,6 @@ pub fn layout_group(seed: Uuid, input: &GroupInput) -> BTreeMap<Uuid, Circle> {
     let scale = (GROUP_FILL / total).sqrt();
     let mut r: Vec<f64> = w.iter().map(|x| x.sqrt() * scale).collect();
 
-    let mut p: Vec<[f64; 2]> = if m == 1 {
-        vec![[0.0, 0.0]]
-    } else {
-        input
-            .children
-            .iter()
-            .map(|(id, _)| {
-                let s = start_point(seed, *id);
-                [s[0] * 0.5, s[1] * 0.5]
-            })
-            .collect()
-    };
     let index: BTreeMap<Uuid, usize> = input
         .children
         .iter()
@@ -616,29 +820,60 @@ pub fn layout_group(seed: Uuid, input: &GroupInput) -> BTreeMap<Uuid, Circle> {
         })
         .collect();
 
+    let warm = if m > 1 {
+        previous.and_then(|prev| warm_group_start(seed, input, &r, &links, prev))
+    } else {
+        None
+    };
+    let is_warm = warm.is_some();
+    let mut p: Vec<[f64; 2]> = if m == 1 {
+        vec![[0.0, 0.0]]
+    } else if let Some(p) = warm {
+        p
+    } else {
+        input
+            .children
+            .iter()
+            .map(|(id, _)| {
+                let s = start_point(seed, *id);
+                [s[0] * 0.5, s[1] * 0.5]
+            })
+            .collect()
+    };
+
     if m > 1 {
-        for it in 0..GROUP_ITERATIONS {
-            let alpha = 1.0 - it as f64 / GROUP_ITERATIONS as f64;
-            for &(a, b, strength) in &links {
-                let dx = p[b][0] - p[a][0];
-                let dy = p[b][1] - p[a][1];
-                let d = (dx * dx + dy * dy).sqrt();
-                let gap = d - (r[a] + r[b] + GROUP_PADDING);
-                if gap <= 0.0 || d < COINCIDENT {
-                    continue;
+        if is_warm {
+            for _ in 0..GROUP_WARM_ITERATIONS {
+                for q in &mut p {
+                    q[0] -= q[0] * GROUP_WARM_GRAVITY;
+                    q[1] -= q[1] * GROUP_WARM_GRAVITY;
                 }
-                let pull = gap * GROUP_LINK_PULL * strength * alpha;
-                let (sa, sb) = (w[b] / (w[a] + w[b]), w[a] / (w[a] + w[b]));
-                p[a][0] += dx / d * pull * sa;
-                p[a][1] += dy / d * pull * sa;
-                p[b][0] -= dx / d * pull * sb;
-                p[b][1] -= dy / d * pull * sb;
+                separate_circles_once(&mut p, &r, &w);
             }
-            for q in &mut p {
-                q[0] -= q[0] * GROUP_GRAVITY * alpha;
-                q[1] -= q[1] * GROUP_GRAVITY * alpha;
+        } else {
+            for it in 0..GROUP_ITERATIONS {
+                let alpha = 1.0 - it as f64 / GROUP_ITERATIONS as f64;
+                for &(a, b, strength) in &links {
+                    let dx = p[b][0] - p[a][0];
+                    let dy = p[b][1] - p[a][1];
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let gap = d - (r[a] + r[b] + GROUP_PADDING);
+                    if gap <= 0.0 || d < COINCIDENT {
+                        continue;
+                    }
+                    let pull = gap * GROUP_LINK_PULL * strength * alpha;
+                    let (sa, sb) = (w[b] / (w[a] + w[b]), w[a] / (w[a] + w[b]));
+                    p[a][0] += dx / d * pull * sa;
+                    p[a][1] += dy / d * pull * sa;
+                    p[b][0] -= dx / d * pull * sb;
+                    p[b][1] -= dy / d * pull * sb;
+                }
+                for q in &mut p {
+                    q[0] -= q[0] * GROUP_GRAVITY * alpha;
+                    q[1] -= q[1] * GROUP_GRAVITY * alpha;
+                }
+                separate_circles_once(&mut p, &r, &w);
             }
-            separate_circles_once(&mut p, &r, &w);
         }
         for _ in 0..COLLISION_SWEEPS {
             if !separate_circles_once(&mut p, &r, &w) {
@@ -683,6 +918,72 @@ pub fn layout_group(seed: Uuid, input: &GroupInput) -> BTreeMap<Uuid, Circle> {
         );
     }
     out
+}
+
+/// The warm starting centres of a group level, in the frame before the fit
+/// ([`layout_group_from`]), or `None` when `prev` places no child of
+/// `input` or holds no positive radius.
+fn warm_group_start(
+    seed: Uuid,
+    input: &GroupInput,
+    r: &[f64],
+    links: &[(usize, usize, f64)],
+    prev: &BTreeMap<Uuid, Circle>,
+) -> Option<Vec<[f64; 2]>> {
+    let sum_r2: f64 = prev.values().map(|c| c.r * c.r).sum();
+    if !(sum_r2 > 0.0 && sum_r2.is_finite()) {
+        return None;
+    }
+    let f_prev = (sum_r2 / GROUP_FILL).sqrt();
+    let placed: Vec<Option<[f64; 2]>> = input
+        .children
+        .iter()
+        .map(|(id, _)| prev.get(id).map(|c| [c.x / f_prev, c.y / f_prev]))
+        .collect();
+    if placed.iter().all(Option::is_none) {
+        return None;
+    }
+    let extent = placed
+        .iter()
+        .zip(r)
+        .filter_map(|(q, ri)| q.map(|q| (q[0] * q[0] + q[1] * q[1]).sqrt() + ri))
+        .fold(0.0_f64, f64::max);
+
+    let mut pull = vec![[0.0_f64; 2]; placed.len()];
+    for &(a, b, strength) in links {
+        for (me, other) in [(a, b), (b, a)] {
+            if placed[me].is_none() {
+                if let Some(q) = placed[other] {
+                    pull[me][0] += q[0] * strength;
+                    pull[me][1] += q[1] * strength;
+                }
+            }
+        }
+    }
+    Some(
+        input
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                if let Some(q) = placed[i] {
+                    return q;
+                }
+                let mut d = pull[i];
+                let mut len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                if len < COINCIDENT {
+                    d = start_point(seed, *id);
+                    len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                }
+                if len < COINCIDENT {
+                    d = split_direction(i, i + 1);
+                    len = 1.0;
+                }
+                let reach = extent + r[i] + GROUP_PADDING;
+                [d[0] / len * reach, d[1] / len * reach]
+            })
+            .collect(),
+    )
 }
 
 /// One sweep pushing apart every pair of circles closer than their radii plus
@@ -1188,5 +1489,200 @@ mod tests {
             "{c:?}"
         );
         assert!(layout_group(seed(), &GroupInput::new([], []).unwrap()).is_empty());
+    }
+
+    // ── warm starts ─────────────────────────────────────────────────────────
+
+    /// How far the children both maps place moved, leaving out `skip`:
+    /// (how many moved more than their own previous radius, the largest
+    /// move, the mean move).
+    fn moved(
+        before: &BTreeMap<Uuid, Circle>,
+        after: &BTreeMap<Uuid, Circle>,
+        skip: Option<Uuid>,
+    ) -> (usize, f64, f64) {
+        let (mut beyond, mut n, mut max, mut sum) = (0, 0, 0.0_f64, 0.0);
+        for (id, a) in after {
+            let Some(b) = before.get(id) else { continue };
+            if Some(*id) == skip {
+                continue;
+            }
+            let d = dist([a.x, a.y], [b.x, b.y]);
+            beyond += usize::from(d > b.r);
+            n += 1;
+            max = max.max(d);
+            sum += d;
+        }
+        (beyond, max, sum / n as f64)
+    }
+
+    fn resized(input: &GroupInput, id: Uuid, size: impl Fn(u64) -> u64) -> GroupInput {
+        GroupInput::new(
+            input
+                .children()
+                .iter()
+                .map(|(c, s)| (*c, if *c == id { size(*s) } else { *s })),
+            input.links().iter().copied(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_group_relaid_from_its_previous_circles_keeps_them_where_they_were() {
+        // Atlas W6 review: one new claim in a leaf changes `claim_count` on
+        // every level above it, and a cold relayout of a level of 60 or more
+        // children moved nearly every circle by most of the disc.
+        for m in [30usize, 60, 128] {
+            let input = random_group(500 + m as u64, m, 2 * m);
+            let night1 = layout_group(seed(), &input);
+            let first = input.children()[0].0;
+            let added = Uuid::from_u64_pair(77, 77);
+            let cases = [
+                // (what changed, the level now, skip, max move, mean move)
+                (
+                    "one more claim",
+                    resized(&input, first, |s| s + 1),
+                    Some(first),
+                    0.02,
+                    0.01,
+                ),
+                (
+                    "twice the claims",
+                    resized(&input, first, |s| s * 2),
+                    Some(first),
+                    0.1,
+                    0.03,
+                ),
+                (
+                    "a child removed",
+                    GroupInput::new(
+                        input.children()[1..].iter().copied(),
+                        input
+                            .links()
+                            .iter()
+                            .copied()
+                            .filter(|(a, b, _)| *a != first && *b != first),
+                    )
+                    .unwrap(),
+                    None,
+                    0.1,
+                    0.02,
+                ),
+                (
+                    "a child added",
+                    GroupInput::new(
+                        input.children().iter().copied().chain([(added, 500)]),
+                        input.links().iter().copied().chain([(added, first, 5)]),
+                    )
+                    .unwrap(),
+                    None,
+                    0.2,
+                    0.1,
+                ),
+            ];
+            for (what, now, skip, max_bound, mean_bound) in cases {
+                let night2 = layout_group_from(seed(), &now, &night1);
+                assert_packed(&now, &night2);
+                let (beyond, max, mean) = moved(&night1, &night2, skip);
+                assert!(
+                    max < max_bound && mean < mean_bound,
+                    "m {m}, {what}: largest move {max}, mean {mean}"
+                );
+                if what == "one more claim" {
+                    assert_eq!(beyond, 0, "m {m}: a circle moved more than its radius");
+                }
+                // Deterministic in (seed, input, previous).
+                assert_eq!(
+                    format!("{night2:?}"),
+                    format!("{:?}", layout_group_from(seed(), &now, &night1))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_group_with_nothing_in_common_with_its_previous_circles_is_laid_out_cold() {
+        let input = random_group(31, 40, 80);
+        let unrelated = layout_group(seed(), &random_group(32, 40, 80));
+        assert_eq!(
+            layout_group_from(seed(), &input, &unrelated),
+            layout_group(seed(), &input)
+        );
+        assert_eq!(
+            layout_group_from(seed(), &input, &BTreeMap::new()),
+            layout_group(seed(), &input)
+        );
+        let a = Uuid::from_u64_pair(0, 1);
+        let one = GroupInput::new([(a, 7)], []).unwrap();
+        let prev = BTreeMap::from([(
+            a,
+            Circle {
+                x: 0.5,
+                y: 0.0,
+                r: 0.1,
+            },
+        )]);
+        assert_eq!(
+            layout_group_from(seed(), &one, &prev),
+            layout_group(seed(), &one)
+        );
+    }
+
+    #[test]
+    fn a_leaf_relaid_from_its_previous_positions_keeps_them_where_they_were() {
+        for n in [40usize, 99] {
+            let (ids, input) = random_leaf(900 + n as u64, n, n * 2);
+            let night1 = layout_leaf(seed(), &input);
+            let new = Uuid::from_u64_pair(88, 88);
+            let cases = [
+                (
+                    "a node and its edge added",
+                    LeafInput::new(
+                        input
+                            .nodes()
+                            .iter()
+                            .copied()
+                            .chain([(new, LayoutNodeKind::Claim)]),
+                        input.edges().iter().copied().chain([(new, ids[0])]),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "an edge removed",
+                    LeafInput::new(
+                        input.nodes().iter().copied(),
+                        input.edges()[1..].iter().copied(),
+                    )
+                    .unwrap(),
+                ),
+            ];
+            for (what, now) in cases {
+                let night2 = layout_leaf_from(seed(), &now, &night1);
+                assert_eq!(night2.len(), now.nodes().len());
+                assert!(min_pair_distance(&night2) >= LEAF_MIN_DISTANCE);
+                assert!(night2
+                    .values()
+                    .all(|q| (q[0] * q[0] + q[1] * q[1]).sqrt() <= LEAF_RADIUS));
+                let (mut max, mut sum) = (0.0_f64, 0.0);
+                for (id, q) in &night1 {
+                    let d = dist(*q, night2[id]);
+                    max = max.max(d);
+                    sum += d;
+                }
+                let mean = sum / night1.len() as f64;
+                assert!(
+                    max < 0.1 && mean < 0.03,
+                    "n {n}, {what}: largest move {max}, mean {mean}"
+                );
+                assert_eq!(night2, layout_leaf_from(seed(), &now, &night1));
+            }
+        }
+        // Nothing in common: the cold layout.
+        let (_, input) = random_leaf(3, 30, 45);
+        let (_, other) = random_leaf(4, 30, 45);
+        assert_eq!(
+            layout_leaf_from(seed(), &input, &layout_leaf(seed(), &other)),
+            layout_leaf(seed(), &input)
+        );
     }
 }
