@@ -50,6 +50,17 @@ async fn export(
     caller: Uuid,
     claim: Uuid,
 ) -> Result<Value, epigraph_mcp::errors::McpError> {
+    export_limited(server, pool, caller, claim, None, None).await
+}
+
+async fn export_limited(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    caller: Uuid,
+    claim: Uuid,
+    max_nodes: Option<usize>,
+    max_content_chars: Option<usize>,
+) -> Result<Value, epigraph_mcp::errors::McpError> {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
     export_provenance_prov_o(
         server,
@@ -57,6 +68,8 @@ async fn export(
         ExportProvenanceProvOParams {
             claim_id: claim.to_string(),
             max_depth: None,
+            max_nodes,
+            max_content_chars,
         },
     )
     .await
@@ -206,4 +219,86 @@ async fn a_hidden_root_is_refused_exactly_like_an_absent_one(pool: PgPool) {
         "hidden and absent must be indistinguishable"
     );
     assert_eq!(hidden.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+}
+
+/// Backlog 4ba388eb review: depth alone bounds nothing on a hub claim, so the
+/// tool caps the claim set nearest-first. A CHAIN (root <- near <- far), not a
+/// fan, so keeping the furthest ancestors instead of the nearest fails here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_node_cap_keeps_the_nearest_claims_and_says_so(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "b41prov-cap").await;
+    let root = fixture::seed_public_claim(&pool, member, "cap root").await;
+    let near = fixture::seed_public_claim(&pool, member, "cap near ancestor").await;
+    let far = fixture::seed_public_claim(&pool, member, "cap far ancestor").await;
+    public_edge(&pool, near, root, "derived_from").await;
+    public_edge(&pool, far, near, "derived_from").await;
+
+    let whole = export_limited(&server, &pool, member, root, Some(3), None)
+        .await
+        .expect("export");
+    assert_eq!(whole["truncated"], false, "nothing was cut: {whole}");
+    assert_eq!(entity_ids(&whole).len(), 3);
+
+    let doc = export_limited(&server, &pool, member, root, Some(2), None)
+        .await
+        .expect("export");
+    let mut want = vec![format!("claim:{root}"), format!("claim:{near}")];
+    want.sort();
+    assert_eq!(entity_ids(&doc), want, "root and its nearest ancestor kept");
+    assert_eq!(doc["truncated"], true, "a cut export says so");
+    assert_eq!(doc["limits"]["max_nodes"], 2);
+    assert!(has_relation(&doc, "prov:wasDerivedFrom", root, near));
+    assert!(
+        !doc.to_string().contains(&far.to_string()),
+        "a cut claim is named nowhere, not even as a relation endpoint: {doc}"
+    );
+}
+
+/// A hidden claim neither takes a slot nor sets `truncated`: the stranger's
+/// candidate set holds three claims (root, public ancestor, and the hidden
+/// supersedes predecessor), its readable set two, and a cap of two cuts
+/// nothing it could read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_candidate_takes_no_slot_and_sets_no_flag(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let g = seed(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "b41prov-slot").await;
+
+    let doc = export_limited(&server, &pool, stranger, g.root, Some(2), None)
+        .await
+        .expect("export");
+    let mut want = vec![
+        format!("claim:{}", g.root),
+        format!("claim:{}", g.public_ancestor),
+    ];
+    want.sort();
+    assert_eq!(entity_ids(&doc), want);
+    assert_eq!(
+        doc["truncated"], false,
+        "the flag must not reveal that a hidden claim was there: {doc}"
+    );
+}
+
+/// Content is clipped by characters (a multibyte character sits on the
+/// boundary), and the clipped entity says so with its original length.
+#[sqlx::test(migrations = "../../migrations")]
+async fn content_is_clipped_per_entity_and_flagged(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "b41prov-clip").await;
+    let long = format!("{}{}", "a".repeat(49), "é".repeat(30));
+    let root = fixture::seed_public_claim(&pool, member, &long).await;
+
+    let doc = export_limited(&server, &pool, member, root, None, Some(50))
+        .await
+        .expect("export");
+    let entity = &doc["entities"][0];
+    assert_eq!(entity["content"], format!("{}é", "a".repeat(49)));
+    assert_eq!(entity["content_truncated"], true);
+    assert_eq!(entity["content_chars"], 79);
+
+    // The default budget (500) leaves it whole and unflagged.
+    let doc = export(&server, &pool, member, root).await.expect("export");
+    assert_eq!(doc["entities"][0]["content"], long);
+    assert!(doc["entities"][0].get("content_truncated").is_none());
 }

@@ -96,6 +96,8 @@ async fn run(
         viewer,
         cli.claim_id,
         cli.max_depth,
+        // The operator CLI exports the whole lineage, as it always has.
+        epigraph_engine::export::prov::ProvExportLimits::default(),
     )
     .await?;
     let pretty = serde_json::to_string_pretty(&document)?;

@@ -26,7 +26,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_engine::export::prov::export_provenance_prov_o;
+use epigraph_engine::export::prov::{export_provenance_prov_o, ProvExportLimits};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -113,9 +113,15 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
     let supersedes_edge_id = insert_edge(&pool, child_claim, prior_claim, "supersedes").await;
 
     let mut conn = pool.acquire().await.expect("acquire");
-    let document = export_provenance_prov_o(&mut conn, &viewer, child_claim, Some(5))
-        .await
-        .expect("export should succeed");
+    let document = export_provenance_prov_o(
+        &mut conn,
+        &viewer,
+        child_claim,
+        Some(5),
+        ProvExportLimits::default(),
+    )
+    .await
+    .expect("export should succeed");
 
     // All three claims — root (ancestor), child (root of the export), and
     // prior (reached only via the one-hop supersedes expansion) — must be

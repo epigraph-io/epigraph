@@ -481,11 +481,30 @@ pub struct ExportProvenanceProvOParams {
     pub claim_id: String,
 
     #[schemars(
-        description = "Maximum ancestor depth to walk over derived_from-family edges. Default 5, \
-                       clamped to 1..=20."
+        description = "Maximum ancestor depth to walk. The walk follows every claim-to-claim \
+                       edge INTO a claim, of any relationship (not only derived_from). \
+                       Default 5, clamped to 1..=20. A depth cutoff is NOT reported in \
+                       `truncated`."
     )]
     #[serde(default)]
     pub max_depth: Option<i32>,
+
+    #[schemars(
+        description = "Maximum number of claims kept as entities, nearest-first (the root, \
+                       then ancestors by ascending depth, then supersedes predecessors). \
+                       Default 50, clamped to 1..=200. Only claims you can read count. The \
+                       document reports `truncated: true` when this cap cut it."
+    )]
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+
+    #[schemars(
+        description = "Per-claim content character budget. Default 500, clamped to \
+                       50..=4000. Entities whose content was cut carry \
+                       `content_truncated: true` and the original `content_chars`."
+    )]
+    #[serde(default)]
+    pub max_content_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
