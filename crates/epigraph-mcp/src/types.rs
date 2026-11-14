@@ -1204,7 +1204,7 @@ pub struct SubmitDsEvidenceParams {
     // permissive as the handler.
     #[schemars(
         with = "std::collections::BTreeMap<String, serde_json::Number>",
-        description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance."
+        description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance. Refused unless every key parses, every index is inside the frame, no mass is negative, and the masses sum to 1."
     )]
     pub masses: serde_json::Value,
 

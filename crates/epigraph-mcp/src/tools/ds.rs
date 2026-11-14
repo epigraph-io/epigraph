@@ -51,7 +51,11 @@ fn parse_masses_json(
 ///   turns it into the empty set, i.e. CONFLICT mass, so `{"true": 0.6,
 ///   "true,false": 0.4}` was stored as `{"": 0.4}`;
 /// - two keys naming the same focal element (`"0,1"` and `"1,0"`) are refused
-///   rather than the later one silently replacing the earlier.
+///   rather than the later one silently replacing the earlier;
+/// - the masses are validated by `MassFunction::new`: no negative or NaN
+///   mass, no focal element outside the frame, and a sum of 1. Nothing
+///   downstream checks (there is no constraint on `mass_functions.masses`),
+///   so `{"0": 3.0}` was stored and folded by every later recompute.
 fn parse_submitted_masses(
     frame: &FrameOfDiscernment,
     masses_json: &serde_json::Value,
@@ -74,7 +78,11 @@ fn parse_submitted_masses(
             )));
         }
     }
-    Ok(MassFunction::from_raw(frame.clone(), masses))
+    // `MassFunction::new`, as the HTTP twin (`POST /frames/:id/evidence`)
+    // builds it: every mass non-negative and not NaN, every focal element
+    // inside the frame, the masses summing to 1.
+    MassFunction::new(frame.clone(), masses)
+        .map_err(|e| invalid_params(format!("invalid mass function: {e}")))
 }
 
 /// Apply combination method to two mass functions via `redistribute()`.
@@ -1197,5 +1205,36 @@ mod tests {
                 "{ok}: every key is its own focal element"
             );
         }
+    }
+
+    /// Backlog 0b4a135f: the write path stored masses that do not sum to 1,
+    /// are negative or above 1, or sit on a focal element outside the frame.
+    /// The HTTP twin (`POST /frames/:id/evidence`) refuses all of them through
+    /// `MassFunction::new`.
+    #[test]
+    fn submitted_masses_are_validated_like_the_http_twin() {
+        for (masses, needle) in [
+            (serde_json::json!({"0": 3.0}), "sum"),
+            (serde_json::json!({"0": 0.6}), "sum"),
+            (serde_json::json!({"0": 0.6, "0,1": 0.6}), "sum"),
+            (serde_json::json!({"0": -0.2, "0,1": 1.2}), "Negative"),
+            (serde_json::json!({"7": 1.0}), "outside frame"),
+            (serde_json::json!({"~7": 1.0}), "outside frame"),
+            (serde_json::json!({}), "sum"),
+        ] {
+            let msg = refusal(masses.clone());
+            assert!(
+                msg.starts_with("invalid mass function:") && msg.contains(needle),
+                "{masses}: expected a '{needle}' refusal, got: {msg}"
+            );
+        }
+
+        let ok = parse_submitted_masses(
+            &binary_frame(),
+            &serde_json::json!({"0": 0.7, "1": 0.1, "0,1": 0.2}),
+        )
+        .expect("a valid BBA is accepted");
+        let total: f64 = ok.masses().values().sum();
+        assert!((total - 1.0).abs() < 1e-9);
     }
 }
