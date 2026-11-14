@@ -17,7 +17,7 @@ or hides it. Use this page to decide.
 | Many identical restatements across the corpus | `sweep_semantic_duplicates`, an operator job (the CLI on the maintenance connection; a request-serving MCP server refuses it) | Dry-run by default. It collapses only claims with identical content (the same hash), across tenants, onto the survivor it picks (highest truth value, then earliest), through the same act as `mark_duplicate`, with rule `exact_restatement`. Near-duplicates come back as merge candidates for `consolidate_claims`. |
 | 2 to 20 claims that should become ONE new, merged claim | `consolidate_claims` | A new claim is written, and the sources supersede into it. Their edges move to it, but their belief inputs do not (no belief cascade follows). There is no identity edge and no un-mark. Sources spanning two owner groups are refused. |
 | A claim whose content is wrong or out of date | `supersede_claim` | A new version replaces it. |
-| Two claims that say the same thing but should BOTH stay current (two sources, two scopes, two owners) | An `EQUIVALENT_TO` edge (HTTP `POST /api/v1/edges`, scope `edges:write`, that exact casing; no MCP tool writes it). Or `link_epistemic` with `corroborates` when one should support the other's belief. | Nothing is retired. `EQUIVALENT_TO` moves no belief. `corroborates` does. |
+| Two claims that say the same thing but should BOTH stay current (two sources, two scopes, two owners) | An `EQUIVALENT_TO` edge: MCP `link_epistemic` with `relationship: "EQUIVALENT_TO"`, or HTTP `POST /api/v1/edges` (scope `edges:write`), in that exact upper-case spelling (the lower-case `equivalent_to` creates a belief-propagation factor). Or `link_epistemic` with `corroborates` when one should support the other's belief. | Nothing is retired. `EQUIVALENT_TO` moves no belief. `corroborates` does. |
 | Items of an operational index family (a lead list, a tracker): duplicates, past-due items, partial retirements | `plan_label_dedup`, then `apply_label_dedup` | Duplicates are marked through `mark_duplicate`'s act, and the rest is label bookkeeping. See [label-dedup.md](label-dedup.md). |
 
 ## An un-mark is an operator job
@@ -98,7 +98,7 @@ deferred, and the replay timer applies it.
     the index view nor an un-mark follows it.
   - A plain `same_as` is NOT belief-neutral: between two current claims it
     creates a belief-propagation evidential-support factor (strength 0.95).
-    Use `EQUIVALENT_TO` for a neutral equivalence link.
+    Use `EQUIVALENT_TO` (MCP `link_epistemic`) for a neutral equivalence link.
 - **Label dedup is for index families only.**
   - Every family a profile names must declare `family_kind: "index"`, and the
     operator must allowlist it (`EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES`).

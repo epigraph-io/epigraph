@@ -98,6 +98,7 @@ const GRAPH_VIEW_RELATIONSHIPS: &[&str] = &[
     // Equivalence / variants
     "same_as",
     "equivalent_to",
+    "EQUIVALENT_TO",
     "analogous",
     "variant_of",
     "definitional_variant_of",
@@ -916,6 +917,9 @@ mod tests {
         // Equivalence / variants
         "same_as",
         "equivalent_to",
+        // The belief-neutral equivalence link, stored upper case by HTTP
+        // `POST /api/v1/edges` and MCP `link_epistemic` (backlog f07e9624).
+        "EQUIVALENT_TO",
         "analogous",
         "variant_of",
         "definitional_variant_of",

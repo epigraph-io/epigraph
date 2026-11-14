@@ -888,6 +888,130 @@ async fn qualifies_edge_is_created_but_does_not_move_belief(pool: PgPool) {
     assert_eq!(edge_count(&pool, hub, caveat, "qualifies").await, 1);
 }
 
+// ── EQUIVALENT_TO is accepted (belief-neutral equivalence) — backlog f07e9624 ──
+
+/// `A EQUIVALENT_TO B`: the two claims say the same thing and BOTH stay
+/// current. Before this, no MCP tool wrote the link (only HTTP
+/// `POST /api/v1/edges`), so agents reached for `same_as` or `corroborates`,
+/// and both MOVE belief: the `edges_auto_factor` trigger maps `same_as` (and
+/// the lower-case `equivalent_to`) to a 0.95 `evidential_support` BP factor.
+///
+/// Pins the three neutral halves on a target that already carries a belief:
+/// no BBA, no change to the target's pignistic probability, and no BP factor
+/// row keyed on the edge. The relationship is stored in its exact upper-case
+/// spelling: a writer that lower-cased it would land on `equivalent_to`, which
+/// the factor trigger DOES map, and this test would see the factor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn equivalent_to_edge_is_created_without_belief_or_bp_factor(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let evidence = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let twin = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let hub = seed_claim(&pool, "restated finding", 0.5).await;
+
+    let support = do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: evidence.to_string(),
+            target_claim_id: hub.to_string(),
+            relationship: "supports".to_string(),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .expect("supports wire succeeds");
+    assert!(
+        parse_response(&support).belief_wired,
+        "fixture: the supports edge must wire, so the hub has a belief to protect"
+    );
+    let before = read_betp(&pool, hub)
+        .await
+        .expect("hub has a pignistic_prob after the supports wire");
+
+    let result = do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: twin.to_string(),
+            target_claim_id: hub.to_string(),
+            relationship: "EQUIVALENT_TO".to_string(),
+            properties: None,
+        },
+        None,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "link_epistemic must accept 'EQUIVALENT_TO', got {result:?}"
+    );
+    let resp = parse_response(&result.unwrap());
+    assert!(resp.was_created, "first EQUIVALENT_TO call must create the edge");
+    assert_eq!(resp.relationship, "EQUIVALENT_TO");
+    assert!(
+        !resp.belief_wired,
+        "EQUIVALENT_TO is belief-neutral — it must NOT wire belief"
+    );
+    assert_eq!(
+        edge_count(&pool, twin, hub, "EQUIVALENT_TO").await,
+        1,
+        "stored in the exact upper-case spelling"
+    );
+    assert_eq!(
+        edge_count(&pool, twin, hub, "equivalent_to").await,
+        0,
+        "must not be folded to the lower-case spelling the factor trigger maps"
+    );
+
+    let after = read_betp(&pool, hub).await.expect("hub keeps its belief");
+    assert!(
+        (after - before).abs() < 1e-12,
+        "an EQUIVALENT_TO edge must not move the target's belief: {before} -> {after}"
+    );
+    let bbas: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1::uuid")
+            .bind(&resp.edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count EQUIVALENT_TO BBAs");
+    assert_eq!(bbas, 0, "no mass function may be materialized for EQUIVALENT_TO");
+    let factors: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM factors WHERE properties->>'source_edge_id' = $1",
+    )
+    .bind(&resp.edge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count BP factors keyed on the edge");
+    assert_eq!(
+        factors, 0,
+        "no BP factor may be created for an EQUIVALENT_TO edge (it is the neutral link)"
+    );
+}
+
+/// The contract text an agent reads names the neutral equivalence link.
+#[test]
+fn the_contract_advertises_equivalent_to_as_belief_neutral() {
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let tool = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "link_epistemic")
+        .expect("link_epistemic is registered")
+        .clone();
+    let description = tool["description"].as_str().expect("description");
+    let relationship = tool["inputSchema"]["properties"]["relationship"]["description"]
+        .as_str()
+        .expect("relationship parameter has a description");
+    for (what, text) in [("description", description), ("relationship", relationship)] {
+        assert!(
+            text.contains("EQUIVALENT_TO (the two claims say the same thing and both stay current; moves no belief)"),
+            "link_epistemic's {what} must advertise EQUIVALENT_TO as belief-neutral; got: {text}"
+        );
+    }
+}
+
 // ── validation: supersedes is excluded (belongs to supersede_claim) ─────────
 
 #[sqlx::test(migrations = "../../migrations")]

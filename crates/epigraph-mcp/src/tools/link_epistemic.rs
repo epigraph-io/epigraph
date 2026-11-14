@@ -110,7 +110,17 @@ fn is_epistemic_relationship(s: &str) -> bool {
 /// ruling), and an optional condition can ride in the edge's `properties`.
 /// `get_neighborhood` returns every relationship unfiltered, so a claim's
 /// qualifiers already travel with it there.
-pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites", "qualifies"];
+///
+/// `EQUIVALENT_TO` (backlog f07e9624) is the belief-neutral EQUIVALENCE link:
+/// the two claims say the same thing and BOTH stay current. It is stored in
+/// that exact upper-case spelling, as the HTTP edges route stores it, and must
+/// stay so: the `edges_auto_factor` trigger maps `same_as` and the lower-case
+/// `equivalent_to` to an `evidential_support` BP factor, and has no row for
+/// `EQUIVALENT_TO`. `canonical_relationship` folds only the four case-folded
+/// relationships, so this spelling reaches the allow-list unchanged. Whether
+/// the two spellings should become one relationship is an operator ruling and
+/// is not decided here.
+pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites", "qualifies", "EQUIVALENT_TO"];
 
 fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
