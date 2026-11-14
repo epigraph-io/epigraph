@@ -36,6 +36,11 @@
 -- Stripping the passages already stored is a separate data repair.
 -- Undo: docs/runbooks/226-undo.sql.
 
+-- ADD COLUMN and the CHECK take ACCESS EXCLUSIVE on `papers`, which every
+-- ingest touches: fail fast rather than queue every reader behind a
+-- long-running ingest transaction (as 199 and 208 do).
+SET LOCAL lock_timeout = '3s';
+
 ALTER TABLE public.papers
     ADD COLUMN IF NOT EXISTS licence text;
 
