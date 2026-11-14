@@ -800,3 +800,169 @@ async fn a_downstream_mcp_error_is_carried_whole() {
         Ok(_) => panic!("the failing tool cannot have succeeded"),
     }
 }
+
+// ── Backlog c19cdae0: a mounted extension is re-listed and demoted ──────────
+//
+// `reconnect_tick` used to visit only unhealthy extensions, so a mounted one
+// was advertised with its boot-time tool list for the life of the process.
+// The controlled stub marks every `tools/list` answer cacheable for an hour,
+// so these tests also fail if the discovery client answers from rmcp's
+// response cache instead of asking the extension.
+
+fn listed_names(federation: &SharedFederation) -> Vec<String> {
+    federation
+        .list_federated_tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
+/// Mutation: return before phase 1 in `reconnect_tick` (the pre-fix tick) ->
+/// the extension stays listed after it has gone, and this fails. So does
+/// leaving the discovery session's response cache on (the cached list answers).
+#[tokio::test]
+async fn a_mounted_extension_that_goes_away_is_demoted_and_comes_back() {
+    let (addr, control) = stub::spawn_controlled_stub(&["vanishing_probe"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("flaky", &addr, None)], "discovery-tok")
+            .await
+            .expect("build against a reachable stub"),
+    );
+    assert_eq!(listed_names(&federation), vec!["vanishing_probe"]);
+
+    control.set_alive(false);
+    federation.reconnect_tick().await;
+    assert!(
+        listed_names(&federation).is_empty(),
+        "an extension that has gone away must stop being listed"
+    );
+    assert!(federation.route_config("vanishing_probe").is_none());
+    assert_eq!(
+        federation.unhealthy_extension_candidates("vanishing_probe"),
+        vec!["flaky".to_string()],
+        "it is now reported as a configured-but-unreachable extension"
+    );
+
+    control.set_alive(true);
+    federation.reconnect_tick().await;
+    assert_eq!(
+        listed_names(&federation),
+        vec!["vanishing_probe"],
+        "and it is routed again once it is back"
+    );
+}
+
+/// Mutation: as above -> the added tool is never listed, and this fails.
+#[tokio::test]
+async fn a_mounted_extensions_changed_tool_list_is_swapped_in() {
+    let (addr, control) = stub::spawn_controlled_stub(&["kept_probe", "dropped_probe"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("growing", &addr, None)], "discovery-tok")
+            .await
+            .expect("build against a reachable stub"),
+    );
+
+    control.set_tools(&["kept_probe", "added_probe"]);
+    federation.reconnect_tick().await;
+
+    assert_eq!(
+        listed_names(&federation),
+        vec!["kept_probe", "added_probe"],
+        "the re-listed tools replace the boot-time ones"
+    );
+    assert!(
+        federation.route_config("dropped_probe").is_none(),
+        "a tool the extension dropped must stop routing"
+    );
+    let result = federation
+        .invoke("added_probe", "tok", None)
+        .await
+        .expect("a tool the extension added is callable");
+    assert_eq!(
+        result.content[0].as_text().unwrap().text,
+        "stub handled `added_probe`"
+    );
+}
+
+/// A re-list against an extension whose `tools/list` never answers is bounded
+/// and demotes it, so the loop does not stall for every other extension.
+///
+/// Mutation: drop the `tokio::time::timeout` from `client::list_all_tools_on`
+/// -> the tick never returns, the 60 s deadline fires, and this fails.
+#[tokio::test]
+async fn a_re_list_that_never_answers_is_bounded_and_demotes() {
+    let (addr, control) = stub::spawn_controlled_stub(&["wedged_probe"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("wedged", &addr, None)], "discovery-tok")
+            .await
+            .expect("build against a reachable stub"),
+    );
+    control.set_hang_list(true);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        federation.reconnect_tick(),
+    )
+    .await
+    .expect("a tick against a wedged extension must be bounded");
+    assert!(
+        listed_names(&federation).is_empty(),
+        "an extension that cannot answer tools/list is demoted"
+    );
+}
+
+/// A call whose session cannot be opened because the extension is down
+/// demotes it at once, through the discovery check, without waiting for a
+/// tick.
+///
+/// Mutation: drop the `recheck` in `SharedFederation::invoke` -> the tool
+/// stays listed until the next tick, and this fails.
+#[tokio::test]
+async fn a_call_to_an_extension_that_is_down_demotes_it() {
+    let (addr, control) = stub::spawn_controlled_stub(&["down_probe"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("down", &addr, None)], "discovery-tok")
+            .await
+            .expect("build against a reachable stub"),
+    );
+    control.set_alive(false);
+    assert!(
+        federation.invoke("down_probe", "tok", None).await.is_err(),
+        "CALIBRATION: the call fails"
+    );
+    assert!(
+        listed_names(&federation).is_empty(),
+        "the extension is demoted by the failed call"
+    );
+}
+
+/// The per-call session is opened under the CALLER's token, so a downstream
+/// that refuses one caller fails that call the same way an outage would. It
+/// must not take the extension away from every other caller.
+///
+/// Mutation: demote on a `Connect` error directly, without the discovery
+/// re-check -> the extension is demoted by one caller's token, and this fails.
+#[tokio::test]
+async fn one_callers_refused_token_does_not_demote_the_extension() {
+    let (addr, _control) = stub::spawn_controlled_stub(&["guarded_probe"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("guarded", &addr, None)], "discovery-tok")
+            .await
+            .expect("build against a reachable stub"),
+    );
+    assert!(
+        federation
+            .invoke("guarded_probe", stub::REJECTED_BEARER, None)
+            .await
+            .is_err(),
+        "CALIBRATION: the downstream refuses this caller's token"
+    );
+    assert_eq!(
+        listed_names(&federation),
+        vec!["guarded_probe"],
+        "one caller's refused token must not demote the extension"
+    );
+    federation
+        .invoke("guarded_probe", "a-token-it-accepts", None)
+        .await
+        .expect("and other callers still reach it");
+}

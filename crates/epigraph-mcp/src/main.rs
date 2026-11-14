@@ -947,7 +947,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         tracing::info!(
             reconnect_interval_secs = reconnect_interval.as_secs(),
-            "Federation gateway: reconnect timer started for unhealthy extensions"
+            "Federation gateway: reconnect timer started (re-lists mounted extensions, \
+             re-dials unhealthy ones)"
         );
         federation.spawn_reconnect_loop(reconnect_interval);
     }

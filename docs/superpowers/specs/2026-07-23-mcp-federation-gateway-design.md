@@ -206,6 +206,13 @@ either clash with a `prefix=`.
 
 - Downstream socket down at startup → its tools are **absent** from `tools/list`
   (logged); gateway serves everything else. Reconnect on a timer; tools reappear.
+- A mounted downstream is **re-listed** on every tick of the same timer (backlog
+  c19cdae0): a failed `tools/list` demotes it (its tools stop being listed and routed, and
+  the same tick re-dials it), and a changed list swaps its routes in one write. A per-call
+  session that cannot be opened triggers the same check at once, through the gateway's own
+  discovery session, so one caller's refused token never demotes it for everyone. Every
+  discovery `tools/list` is bounded (`LIST_TOOLS_TIMEOUT`, 10 s) and bypasses rmcp's
+  client response cache, which would otherwise answer the check from memory.
 - Downstream errors mid-call → the downstream's own MCP error reaches the caller
   **unchanged** (code, message, data); `EpiGraphMcpFull::federated_call_error` (backlog
   7ea4bd74). A downstream the gateway cannot open a session with is answered "extension

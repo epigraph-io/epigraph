@@ -10,7 +10,9 @@
 //! The behaviour is driven by [`StubControl`], shared between the test and
 //! every session the stub serves:
 //!
-//! - `tools`: the names `tools/list` advertises, read on every list;
+//! - `tools`: the names `tools/list` advertises, read on every list. Each
+//!   answer says it may be cached for an hour, publicly: a gateway whose
+//!   discovery client honoured that would never see a change or an outage;
 //! - `alive = false`: every HTTP request gets `503`, as if the process were
 //!   gone (new dials fail, and so does a request on an existing session);
 //! - `hang_list = true`: `tools/list` never answers;
@@ -26,8 +28,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    ServerCapabilities, ServerConfig, Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    ListToolsResult, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -98,7 +100,9 @@ impl ServerHandler for ControlledStub {
                 .into_iter()
                 .map(|n| Tool::new(n, "controlled stub tool", obj.clone()))
                 .collect(),
-        ))
+        )
+        .with_ttl_ms(60 * 60 * 1000)
+        .with_cache_scope(CacheScope::Public))
     }
 
     async fn call_tool(

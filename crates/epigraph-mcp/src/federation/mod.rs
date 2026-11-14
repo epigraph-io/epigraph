@@ -91,6 +91,11 @@ pub struct MountedExtension {
     pub tools: Vec<Tool>,
     /// Whether the discovery session is currently believed healthy.
     pub healthy: bool,
+    /// Bumped on every change to this mount (promotion, demotion, a swapped
+    /// tool list). A reconnect pass snapshots it before its unlocked network
+    /// I/O and applies its result only if it is unchanged, so a stale result
+    /// never overwrites a fresher one (see [`SharedFederation::reconnect_tick`]).
+    generation: u64,
 }
 
 impl MountedExtension {
@@ -228,6 +233,7 @@ impl FederationRegistry {
                             client: Some(session),
                             tools,
                             healthy: true,
+                            generation: 0,
                         }
                     }
                     Err(e) => {
@@ -243,6 +249,7 @@ impl FederationRegistry {
                             client: None,
                             tools: Vec::new(),
                             healthy: false,
+                            generation: 0,
                         }
                     }
                 },
@@ -259,6 +266,7 @@ impl FederationRegistry {
                         client: None,
                         tools: Vec::new(),
                         healthy: false,
+                        generation: 0,
                     }
                 }
             };
@@ -363,13 +371,104 @@ impl FederationRegistry {
     /// the registry lock before doing any network I/O — see that method for why
     /// holding a lock across the dial would be worse than the bug it fixes.
     #[must_use]
-    fn unhealthy_targets(&self) -> Vec<(usize, ExtensionConfig)> {
+    fn unhealthy_targets(&self) -> Vec<(usize, ExtensionConfig, u64)> {
         self.extensions
             .iter()
             .enumerate()
             .filter(|(_, ext)| !ext.healthy)
-            .map(|(index, ext)| (index, ext.config.clone()))
+            .map(|(index, ext)| (index, ext.config.clone(), ext.generation))
             .collect()
+    }
+
+    /// Every extension currently mounted healthy, each with a clone of its
+    /// discovery session's peer and its generation: the **read half** of a
+    /// re-list pass, owned so the lock is dropped before the `tools/list`.
+    #[must_use]
+    fn healthy_targets(&self) -> Vec<RelistTarget> {
+        (0..self.extensions.len())
+            .filter_map(|index| self.relist_target(index))
+            .collect()
+    }
+
+    /// [`healthy_targets`](Self::healthy_targets) for one extension, or `None`
+    /// when it is not mounted healthy.
+    #[must_use]
+    fn relist_target(&self, index: usize) -> Option<RelistTarget> {
+        let ext = self.extensions.get(index)?;
+        let client = ext.client.as_ref().filter(|_| ext.healthy)?;
+        Some(RelistTarget {
+            index,
+            config: ext.config.clone(),
+            peer: client.peer().clone(),
+            generation: ext.generation,
+        })
+    }
+
+    /// The **write half** of a re-list of healthy extension `index`
+    /// (backlog c19cdae0), applied only if the mount's generation is still the
+    /// one the re-list was planned from.
+    ///
+    /// - The `tools/list` failed: the extension is demoted
+    ///   ([`demote`](Self::demote)). Its tools stop being listed and routed
+    ///   now, rather than being advertised until the process restarts.
+    /// - It answered with a changed list: its routes are swapped for the new
+    ///   one in this one write (under the lock, so no reader sees a half-swap),
+    ///   through the same [`admit`](Self::admit) rule a reconnect uses.
+    /// - It answered with the same list: nothing changes, and nothing is
+    ///   logged, so a clash `admit` already reported is not re-reported every
+    ///   tick.
+    fn apply_relist(
+        &mut self,
+        index: usize,
+        generation: u64,
+        listed: Result<Vec<Tool>, FederationError>,
+    ) {
+        if self.extensions[index].generation != generation || !self.extensions[index].healthy {
+            return;
+        }
+        let tools = match listed {
+            Ok(tools) => tools,
+            Err(e) => {
+                self.demote(index, &e);
+                return;
+            }
+        };
+        let (admitted, skipped) = self.partition_admissible(index, tools);
+        if admitted == self.extensions[index].tools {
+            return;
+        }
+        self.log_skipped(index, &skipped);
+        self.routes.retain(|_, owner| *owner != index);
+        for tool in &admitted {
+            self.routes.insert(tool.name.to_string(), index);
+        }
+        let ext = &mut self.extensions[index];
+        tracing::info!(
+            extension = %ext.config.name,
+            tool_count = admitted.len(),
+            previous_tool_count = ext.tools.len(),
+            "federation: extension's tool list changed; routes swapped"
+        );
+        ext.tools = admitted;
+        ext.generation += 1;
+    }
+
+    /// Demote extension `index` to unhealthy: drop its discovery session, its
+    /// cached tools and every route it owns. The next
+    /// [`reconnect_tick`](SharedFederation::reconnect_tick) re-dials it.
+    fn demote(&mut self, index: usize, cause: &dyn std::fmt::Display) {
+        self.routes.retain(|_, owner| *owner != index);
+        let ext = &mut self.extensions[index];
+        tracing::warn!(
+            extension = %ext.config.name,
+            error = %cause,
+            "federation: extension's discovery session failed; demoted unhealthy \
+             (its tools are no longer listed or routed until it reconnects)"
+        );
+        ext.client = None;
+        ext.tools = Vec::new();
+        ext.healthy = false;
+        ext.generation += 1;
     }
 
     /// The token used to (re)establish discovery sessions.
@@ -387,7 +486,19 @@ impl FederationRegistry {
     /// [`admit`](Self::admit)) rather than errored: reconnect must never take
     /// down the running gateway, and the collision is refused at the next
     /// `build`. The rest of the extension's tools are routed.
-    fn apply_reconnect(&mut self, index: usize, session: ExtensionClient, tools: Vec<Tool>) {
+    ///
+    /// Applied only if the mount is still unhealthy at the `generation` the
+    /// reconnect was planned from; otherwise the fresh `session` is dropped.
+    fn apply_reconnect(
+        &mut self,
+        index: usize,
+        generation: u64,
+        session: ExtensionClient,
+        tools: Vec<Tool>,
+    ) {
+        if self.extensions[index].generation != generation || self.extensions[index].healthy {
+            return;
+        }
         let tools = self.admit(index, tools);
         for tool in &tools {
             self.routes.insert(tool.name.to_string(), index);
@@ -401,6 +512,7 @@ impl FederationRegistry {
         ext.client = Some(session);
         ext.tools = tools;
         ext.healthy = true;
+        ext.generation += 1;
     }
 
     /// The subset of `tools` extension `index` may route at runtime: every one
@@ -414,39 +526,73 @@ impl FederationRegistry {
     /// are the live ones, because the snapshot a reconnect was planned from
     /// may be stale.
     fn admit(&self, index: usize, tools: Vec<Tool>) -> Vec<Tool> {
-        let extension = &self.extensions[index].config.name;
-        tools
+        let (admitted, skipped) = self.partition_admissible(index, tools);
+        self.log_skipped(index, &skipped);
+        admitted
+    }
+
+    /// [`admit`](Self::admit) without the logging: the admitted tools, and
+    /// each skipped name with the extension that keeps it (`None`: the
+    /// kernel).
+    fn partition_admissible(
+        &self,
+        index: usize,
+        tools: Vec<Tool>,
+    ) -> (Vec<Tool>, Vec<(String, Option<usize>)>) {
+        let mut skipped = Vec::new();
+        let admitted = tools
             .into_iter()
             .filter(|tool| {
                 let name = tool.name.as_ref();
                 if self.reserved.contains(name) {
-                    tracing::warn!(
-                        extension = %extension,
-                        tool = %name,
-                        "federation: tool not routed, the kernel already registers this name; \
-                         set a `prefix=` on the extension"
-                    );
+                    skipped.push((name.to_string(), None));
                     return false;
                 }
                 match self.routes.get(name) {
                     Some(&owner) if owner != index => {
-                        tracing::warn!(
-                            extension = %extension,
-                            tool = %name,
-                            owner = %self.extensions[owner].config.name,
-                            "federation: tool not routed, another mounted extension routes \
-                             this name; set a distinct `prefix=`"
-                        );
+                        skipped.push((name.to_string(), Some(owner)));
                         false
                     }
                     _ => true,
                 }
             })
-            .collect()
+            .collect();
+        (admitted, skipped)
+    }
+
+    fn log_skipped(&self, index: usize, skipped: &[(String, Option<usize>)]) {
+        let extension = &self.extensions[index].config.name;
+        for (name, owner) in skipped {
+            match owner {
+                None => tracing::warn!(
+                    extension = %extension,
+                    tool = %name,
+                    "federation: tool not routed, the kernel already registers this name; \
+                     set a `prefix=` on the extension"
+                ),
+                Some(owner) => tracing::warn!(
+                    extension = %extension,
+                    tool = %name,
+                    owner = %self.extensions[*owner].config.name,
+                    "federation: tool not routed, another mounted extension routes \
+                     this name; set a distinct `prefix=`"
+                ),
+            }
+        }
     }
 }
 
-/// Default period between reconnect attempts for unhealthy extensions.
+/// One healthy extension's discovery peer, snapshotted for a re-list with no
+/// lock held. See [`FederationRegistry::healthy_targets`].
+struct RelistTarget {
+    index: usize,
+    config: ExtensionConfig,
+    peer: rmcp::Peer<rmcp::RoleClient>,
+    generation: u64,
+}
+
+/// Default period between reconnect passes: each re-lists the healthy
+/// extensions and re-dials the unhealthy ones.
 pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A shareable handle to the registry. The gateway constructs one
@@ -532,7 +678,7 @@ impl SharedFederation {
             .read()
             .unhealthy_targets()
             .into_iter()
-            .map(|(_, cfg)| (cfg.name, cfg.prefix))
+            .map(|(_, cfg, _)| (cfg.name, cfg.prefix))
             .collect();
         narrow_unhealthy_candidates(&pairs, tool_name)
     }
@@ -551,34 +697,90 @@ impl SharedFederation {
         // Resolve the route to an OWNED config, then drop the guard before the
         // downstream round-trip (the `std` guard is `!Send`, so this is enforced
         // rather than merely intended).
-        let Some(config) = self.route_config(effective_name) else {
+        let Some((index, config)) = self.route_entry(effective_name) else {
             return Err(FederationError::NoRoute(effective_name.to_string()));
         };
         let downstream_name = match config.prefix.as_deref() {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
-        client::invoke_once(
+        let result = client::invoke_once(
             &config.addr,
             caller_token,
             downstream_name,
             arguments,
             config.call_timeout,
         )
-        .await
+        .await;
+        // The per-call session could not be opened (backlog c19cdae0). That is
+        // not proof the extension is down: the session is opened under the
+        // CALLER's token, and a downstream that refuses this one caller's
+        // token fails the same way. So check through the gateway's own
+        // discovery session, which demotes only if that fails too; one
+        // caller's bad token never takes the extension away from the others.
+        if matches!(
+            result,
+            Err(FederationError::Connect { .. } | FederationError::Timeout(..))
+        ) {
+            self.recheck(index).await;
+        }
+        result
     }
 
-    /// One reconnect pass: re-dial every extension currently mounted unhealthy
-    /// and, on success, route its tools. Healthy extensions are untouched.
+    /// The `(index, config)` of the extension routing `effective_name`, owned.
+    fn route_entry(&self, effective_name: &str) -> Option<(usize, ExtensionConfig)> {
+        let guard = self.read();
+        let index = *guard.routes.get(effective_name)?;
+        Some((index, guard.extensions[index].config.clone()))
+    }
+
+    /// Re-list extension `index` through its discovery session now, demoting
+    /// it if that fails. A no-op unless it is mounted healthy.
+    async fn recheck(&self, index: usize) {
+        let Some(target) = self.read().relist_target(index) else {
+            return;
+        };
+        self.relist(target).await;
+    }
+
+    /// One re-list: `tools/list` on `target`'s discovery peer with no lock
+    /// held, then [`FederationRegistry::apply_relist`] under the write lock.
+    async fn relist(&self, target: RelistTarget) {
+        let listed = client::list_all_tools_on(&target.peer)
+            .await
+            .map(|raw| FederationRegistry::prefix_tools(&target.config, raw));
+        self.write()
+            .apply_relist(target.index, target.generation, listed);
+    }
+
+    /// One reconnect pass, in two phases.
     ///
-    /// Structured as snapshot → (unlocked) network I/O → apply, so no lock is
-    /// held across an `.await`.
+    /// 1. **Re-list every healthy extension** (backlog c19cdae0) through its
+    ///    discovery session: a failure demotes it, a changed list swaps its
+    ///    routes (see [`FederationRegistry::apply_relist`]). Before this the
+    ///    tick touched only unhealthy extensions, so the gateway advertised a
+    ///    boot-time tool list for the life of the process: tools the extension
+    ///    had dropped stayed listed, tools it had added never appeared, and an
+    ///    extension that had gone away stayed listed as if it were up.
+    /// 2. **Re-dial every extension mounted unhealthy**, including one phase 1
+    ///    just demoted, so an extension that restarted (whose old session the
+    ///    new process does not know) is back within the same tick.
+    ///
+    /// Each phase is snapshot → (unlocked) network I/O → apply, so no lock is
+    /// held across an `.await`, and every network step is bounded
+    /// ([`client::HANDSHAKE_TIMEOUT`], [`client::LIST_TOOLS_TIMEOUT`]), so one
+    /// wedged extension cannot stall the loop for the others.
     pub async fn reconnect_tick(&self) {
+        let healthy = self.read().healthy_targets();
+        for target in healthy {
+            self.relist(target).await;
+        }
+
         let (targets, token) = {
             let guard = self.read();
             (guard.unhealthy_targets(), guard.discovery_token())
         };
-        for (index, config) in targets {
+        for (index, config, generation) in targets {
             let session = match client::discovery_session(&config.addr, &token).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -594,7 +796,8 @@ impl SharedFederation {
                 }
             };
             let tools = FederationRegistry::prefix_tools(&config, raw);
-            self.write().apply_reconnect(index, session, tools);
+            self.write()
+                .apply_reconnect(index, generation, session, tools);
         }
     }
 

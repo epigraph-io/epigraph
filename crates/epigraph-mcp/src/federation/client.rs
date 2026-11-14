@@ -6,9 +6,13 @@
 //!
 //! - **Discovery** ([`discovery_session`]): one long-lived client session per
 //!   extension, authenticated with a gateway *service* token. It drives
-//!   `list_all_tools` for the routing cache and is periodically health-checked /
-//!   reconnected. Persisting it avoids a fresh TCP + `initialize` handshake on
-//!   every list.
+//!   `list_all_tools` for the routing cache. Every reconnect tick re-lists it
+//!   (the health check: a failure demotes the extension, a changed list swaps
+//!   its routes) and re-dials it when unhealthy; see
+//!   `SharedFederation::reconnect_tick`. Persisting it avoids a fresh TCP +
+//!   `initialize` handshake on every list. Its rmcp response cache is OFF: a
+//!   cached `tools/list`, or rmcp's stale-on-error fallback, would answer the
+//!   health check from memory and hide both a change and an outage.
 //! - **Invocation** ([`invoke_once`]): a fresh, ephemeral session per federated
 //!   `tools/call`, authenticated with the *caller's* raw bearer so the
 //!   downstream sees the real principal (not the gateway). The session is
@@ -37,7 +41,7 @@ use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::RoleClient;
+use rmcp::{ClientCacheConfig, Peer, RoleClient};
 
 /// How long to wait for the `initialize` handshake before giving up on a
 /// downstream extension. Deliberately short: a healthy loopback extension
@@ -45,6 +49,12 @@ use rmcp::RoleClient;
 /// process or a mis-routed port, and we would rather log-and-skip than block
 /// gateway startup or a caller's request.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one `tools/list` on a discovery session may take, at boot, on a
+/// reconnect and on every re-list. The reconnect loop visits extensions one
+/// after another, so an unbounded list against a wedged extension would stall
+/// it for every other extension too.
+pub const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The largest single response event the gateway accepts from a downstream
 /// extension: 16 MiB, rmcp 3.9's default, set explicitly in [`connect`].
@@ -101,6 +111,10 @@ pub enum FederationError {
     #[error("request to extension failed: {0}")]
     Request(String),
 
+    /// A discovery `tools/list` gave no answer within [`LIST_TOOLS_TIMEOUT`].
+    #[error("extension gave no tools/list answer within {0:?}")]
+    ListTimeout(Duration),
+
     /// The downstream accepted the `tools/call` and gave no answer within the
     /// extension's `call_timeout_secs=` (backlog 7ea4bd74). The gateway stopped
     /// waiting and dropped the session; the call may still complete there.
@@ -147,7 +161,12 @@ pub async fn discovery_session(
     addr: &str,
     discovery_token: &str,
 ) -> Result<ExtensionClient, FederationError> {
-    connect(addr, Some(discovery_token)).await
+    let session = connect(addr, Some(discovery_token)).await?;
+    session
+        .peer()
+        .set_response_cache_config(ClientCacheConfig::disabled())
+        .await;
+    Ok(session)
 }
 
 /// List every tool the extension advertises over its discovery session,
@@ -155,13 +174,22 @@ pub async fn discovery_session(
 ///
 /// # Errors
 /// [`FederationError::Downstream`] or [`FederationError::Request`] if the
-/// downstream `tools/list` fails.
+/// downstream `tools/list` fails; [`FederationError::ListTimeout`] if it gives
+/// no answer within [`LIST_TOOLS_TIMEOUT`].
 pub async fn list_all_tools(client: &ExtensionClient) -> Result<Vec<Tool>, FederationError> {
-    client
-        .peer()
-        .list_all_tools()
-        .await
-        .map_err(FederationError::from_service)
+    list_all_tools_on(client.peer()).await
+}
+
+/// [`list_all_tools`] on a discovery session's [`Peer`], which the registry
+/// clones out from under its lock so the list runs with no lock held.
+///
+/// # Errors
+/// As [`list_all_tools`].
+pub async fn list_all_tools_on(peer: &Peer<RoleClient>) -> Result<Vec<Tool>, FederationError> {
+    match tokio::time::timeout(LIST_TOOLS_TIMEOUT, peer.list_all_tools()).await {
+        Ok(listed) => listed.map_err(FederationError::from_service),
+        Err(_elapsed) => Err(FederationError::ListTimeout(LIST_TOOLS_TIMEOUT)),
+    }
 }
 
 /// Proxy a single `tools/call` to the extension at `addr` on a **fresh**

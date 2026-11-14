@@ -856,6 +856,7 @@ impl EpiGraphMcpFull {
             FederationError::Downstream(answer) => answer,
             FederationError::Connect { .. }
             | FederationError::Timeout(..)
+            | FederationError::ListTimeout(_)
             | FederationError::NoRoute(_) => crate::errors::internal_error_logged(
                 format!(
                     "Federated tool '{tool}' is unavailable: extension '{extension}' unavailable \
