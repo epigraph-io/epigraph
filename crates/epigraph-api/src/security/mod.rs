@@ -21,4 +21,4 @@ pub use keys::{
     AgentKey, KeyError, KeyManager, KeyRepository, KeyRevocationRequest, KeyRotationRequest,
     KeyStatus, KeyType, Signature,
 };
-pub use rate_limit::{AgentRateLimiter, RateLimitConfig, RateLimitError};
+pub use rate_limit::{AgentRateLimiter, RateLimitConfig, RateLimitError, TrustedProxies};

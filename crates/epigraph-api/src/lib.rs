@@ -31,6 +31,7 @@ pub use routes::{create_router, create_router_with_extensions};
 pub use security::{
     AgentKey, AgentRateLimiter, KeyError, KeyRevocationRequest, KeyRotationRequest, KeyStatus,
     KeyType, RateLimitConfig, RateLimitError, SecurityAuditLog, SecurityEvent, SecurityEventFilter,
+    TrustedProxies,
 };
 pub use services::{SubmissionService, ValidationService};
 pub use state::{

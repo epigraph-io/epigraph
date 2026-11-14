@@ -16,8 +16,126 @@ use chrono::{DateTime, Utc};
 use epigraph_core::domain::AgentId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
+
+/// The reverse proxies whose `X-Forwarded-For` this process believes.
+///
+/// A rate-limit key taken from `X-Forwarded-For` is only as honest as the hop
+/// that wrote it. Every hop to the LEFT of the last one a trusted proxy
+/// appended was written by the client, so it can be anything. The middleware
+/// therefore reads the header only when the TCP peer is in this set, and then
+/// takes the right-most hop that is not itself a trusted proxy
+/// (`middleware::rate_limit`). With an empty set the header is ignored and the
+/// TCP peer is the key.
+///
+/// Entries are single addresses or CIDR prefixes. IPv4-mapped IPv6 addresses
+/// (`::ffff:a.b.c.d`) are matched as IPv4.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedProxies {
+    nets: Vec<(IpAddr, u8)>,
+}
+
+impl TrustedProxies {
+    /// Trust no proxy: the TCP peer is always the client.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Trust the loopback interface only (`127.0.0.0/8`, `::1`): a reverse
+    /// proxy on the same host. No remote client can be a loopback peer.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self {
+            nets: vec![
+                (IpAddr::from([127, 0, 0, 0]), 8),
+                (IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]), 128),
+            ],
+        }
+    }
+
+    /// Parse a comma-separated list of addresses and CIDR prefixes, or the
+    /// literal `none`. Whitespace around entries is ignored; an empty entry,
+    /// an unparseable address and an out-of-range prefix are errors, so a
+    /// typo refuses rather than silently trusting less (or more) than meant.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("none") {
+            return Ok(Self::none());
+        }
+        let mut nets = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(format!("empty entry in trusted-proxy list {raw:?}"));
+            }
+            let (addr, prefix) = match entry.split_once('/') {
+                Some((a, p)) => (a, Some(p)),
+                None => (entry, None),
+            };
+            let ip: IpAddr = addr
+                .parse()
+                .map_err(|_| format!("{entry:?} is not an IP address or CIDR prefix"))?;
+            let ip = ip.to_canonical();
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            let len = match prefix {
+                None => max,
+                Some(p) => p
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|l| *l <= max)
+                    .ok_or_else(|| format!("{entry:?} has an invalid prefix length"))?,
+            };
+            nets.push((ip, len));
+        }
+        Ok(Self { nets })
+    }
+
+    /// Whether `ip` is one of the trusted proxies.
+    #[must_use]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.nets
+            .iter()
+            .any(|(net, len)| prefix_matches(*net, *len, ip))
+    }
+
+    /// Whether the set is empty (`X-Forwarded-For` is never read).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty()
+    }
+}
+
+impl std::fmt::Display for TrustedProxies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.nets.is_empty() {
+            return f.write_str("none");
+        }
+        let list: Vec<String> = self
+            .nets
+            .iter()
+            .map(|(ip, len)| format!("{ip}/{len}"))
+            .collect();
+        f.write_str(&list.join(","))
+    }
+}
+
+fn prefix_matches(net: IpAddr, len: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(n), IpAddr::V4(i)) => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            u32::from(n) & mask == u32::from(i) & mask
+        }
+        (IpAddr::V6(n), IpAddr::V6(i)) => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            u128::from(n) & mask == u128::from(i) & mask
+        }
+        _ => false,
+    }
+}
 
 /// Error returned when rate limit is exceeded
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -150,6 +268,9 @@ pub struct AgentRateLimiter {
     global_bucket: Arc<RwLock<TokenBucket>>,
     /// Custom limits per agent (requests per minute)
     agent_limits: Arc<RwLock<HashMap<AgentId, u32>>>,
+    /// Proxies whose `X-Forwarded-For` the HTTP middleware believes when it
+    /// keys an anonymous request. Empty by default: the TCP peer is the key.
+    trusted_proxies: TrustedProxies,
 }
 
 impl AgentRateLimiter {
@@ -166,7 +287,21 @@ impl AgentRateLimiter {
             agent_buckets: Arc::new(RwLock::new(HashMap::new())),
             global_bucket: Arc::new(RwLock::new(global_bucket)),
             agent_limits: Arc::new(RwLock::new(HashMap::new())),
+            trusted_proxies: TrustedProxies::none(),
         }
+    }
+
+    /// Set the proxies whose `X-Forwarded-For` is believed (builder pattern).
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxies) -> Self {
+        self.trusted_proxies = trusted_proxies;
+        self
+    }
+
+    /// The proxies whose `X-Forwarded-For` is believed.
+    #[must_use]
+    pub fn trusted_proxies(&self) -> &TrustedProxies {
+        &self.trusted_proxies
     }
 
     /// Create a rate limiter with default configuration
@@ -359,6 +494,7 @@ impl std::fmt::Debug for AgentRateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentRateLimiter")
             .field("config", &self.config)
+            .field("trusted_proxies", &self.trusted_proxies)
             .field(
                 "agent_buckets_count",
                 &self
@@ -388,6 +524,41 @@ mod tests {
         let mut bucket = TokenBucket::new(1, 0.1);
         assert!(bucket.try_consume().is_ok());
         assert!(bucket.try_consume().is_err());
+    }
+
+    #[test]
+    fn trusted_proxies_parse_addresses_and_prefixes() {
+        let t = TrustedProxies::parse(" 192.0.2.1, 198.51.100.0/24 ,2001:db8::/32").unwrap();
+        assert!(t.contains("192.0.2.1".parse().unwrap()));
+        assert!(!t.contains("192.0.2.2".parse().unwrap()));
+        assert!(t.contains("198.51.100.77".parse().unwrap()));
+        assert!(!t.contains("198.51.101.1".parse().unwrap()));
+        assert!(t.contains("2001:db8:1::5".parse().unwrap()));
+        assert!(!t.contains("2001:db9::1".parse().unwrap()));
+        // IPv4-mapped IPv6 peers match their IPv4 entry.
+        assert!(t.contains("::ffff:192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trusted_proxies_refuse_malformed_lists() {
+        assert!(TrustedProxies::parse("192.0.2.1,").is_err());
+        assert!(TrustedProxies::parse("not-an-ip").is_err());
+        assert!(TrustedProxies::parse("192.0.2.0/33").is_err());
+        assert!(TrustedProxies::parse("2001:db8::/129").is_err());
+        assert!(TrustedProxies::parse("none").unwrap().is_empty());
+        assert!(TrustedProxies::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("203.0.113.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn loopback_trusts_only_loopback() {
+        let t = TrustedProxies::loopback();
+        assert!(t.contains("127.0.0.1".parse().unwrap()));
+        assert!(t.contains("127.8.9.10".parse().unwrap()));
+        assert!(t.contains("::1".parse().unwrap()));
+        assert!(!t.contains("203.0.113.1".parse().unwrap()));
+        assert!(!t.contains("::2".parse().unwrap()));
     }
 
     #[test]
