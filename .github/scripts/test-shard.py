@@ -181,10 +181,15 @@ HOSTED_RUNNER = "ubuntu-latest"
 UNLIMITED_PARALLEL = 256
 
 
+# The workspace this script belongs to (it lives in .github/scripts/), so a
+# run from another directory plans this tree and not the cwd's.
+MANIFEST = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Cargo.toml"))
+
+
 def load():
     """(repository root, {package name: cargo metadata package})."""
     out = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", MANIFEST],
         check=True,
         capture_output=True,
         text=True,
