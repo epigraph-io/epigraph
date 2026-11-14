@@ -171,6 +171,12 @@ pub async fn request_viewer(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<Viewer, McpError> {
     let principal = match auth {
+        // The `--allow-unauthenticated-http` listener whose principal did not
+        // resolve: no token was presented, so "re-mint the token" would point
+        // at the wrong cause.
+        Some(a) if a.agent_id.is_none() && crate::auth::is_principal_less(a) => {
+            return Err(unresolved_listener_principal());
+        }
         Some(a) => a.agent_id.ok_or_else(|| {
             McpError::invalid_request(
                 concat!(
@@ -253,6 +259,25 @@ pub async fn request_viewer(
         refuse_a_grouped_principal_less_viewer(&viewer)?;
     }
     Ok(viewer)
+}
+
+/// The refusal on the `--allow-unauthenticated-http` listener when its
+/// injected principal has not resolved (`unauthenticated_reader::listener_principal`
+/// logs why). On the read-only listener the usual cause is a group membership
+/// someone granted the reader agent, which `UnauthenticatedReader::resolve`
+/// refuses to read with (fail-closed, backlog fe514fc3).
+fn unresolved_listener_principal() -> McpError {
+    McpError::invalid_request(
+        concat!(
+            "refused: the unauthenticated listener's principal did not resolve, so it ",
+            "has no read authority; the server log says why. On the read-only listener ",
+            "the usual cause is a group membership held by the reader agent ",
+            "(mcp-unauthenticated-reader), which reads public rows only: revoke that ",
+            "agent's group memberships."
+        )
+        .to_string(),
+        None,
+    )
 }
 
 /// Whether `auth` is the READ-ONLY `--allow-unauthenticated-http` context: no

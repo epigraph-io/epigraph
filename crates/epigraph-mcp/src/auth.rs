@@ -599,9 +599,9 @@ impl UnauthenticatedPrincipal {
                 tracing::error!(
                     error = %e,
                     cooldown_secs = self.cooldown.as_secs(),
-                    "could not resolve the server agent id for \
-                     --allow-unauthenticated-http; content tools on that listener \
-                     will refuse (no agent principal) until it resolves"
+                    "could not resolve the --allow-unauthenticated-http listener's \
+                     principal; content tools on that listener will refuse until it \
+                     resolves"
                 );
                 None
             }

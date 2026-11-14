@@ -303,7 +303,13 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
   request on it names a caller, so it acts as a dedicated agent that belongs
   to no group (`mcp-unauthenticated-reader`, created on first boot), and it
   refuses every content call if that agent is ever given a group membership
-  (revoke it to reopen the listener). Its write tools are refused. Group reads
+  (revoke it to reopen the listener). That refusal is fail-closed on purpose,
+  and it means any holder of `groups:admin` on a group can close every
+  read-only listener on the database by adding `mcp-unauthenticated-reader`
+  to that group; nothing is exposed, and revoking the membership reopens the
+  listener. Its write tools are refused, it records no `OPERATED_BY`
+  auth-lineage edge (nobody authenticated), and `recall` audit rows on it are
+  dropped (the reader has no personal group to own them). Group reads
   and writes go through a `--jwt-secret` listener. With
   `--allow-unauthenticated-writes` the listener instead acts as its own signer
   agent: its callers write as that agent and read with that agent's groups,

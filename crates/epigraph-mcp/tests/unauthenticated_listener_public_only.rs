@@ -376,6 +376,21 @@ async fn a_reader_that_holds_a_membership_does_not_resolve(pool: PgPool) {
         .expect_err("a reader with a membership must not resolve");
     assert!(err.contains("must hold none"), "{err}");
 
+    // Through the listener: the call is refused with the real cause (the
+    // reader's membership), not "re-mint the token", since no token exists.
+    let l = spawn(pool.clone(), 0x55, UnauthenticatedWrites::Refused).await;
+    let server_agent = l.server.server_agent_id().await.expect("server agent");
+    let public = fixture::seed_public_claim(&pool, server_agent, "fe514fc3 unresolved").await;
+    let client = reqwest::Client::new();
+    let session = handshake(&client, &l.url).await;
+    let refused = get_claim(&client, &l.url, &session, 2, public).await;
+    assert!(
+        !refused.contains("fe514fc3 unresolved")
+            && refused.contains("principal did not resolve")
+            && refused.contains("revoke that agent's group memberships")
+            && !refused.contains("Re-mint the token"),
+        "an unresolved listener principal must be refused naming its cause:\n{refused}"
+    );
 }
 
 /// The wiring `main` uses: the read-only listener injects the dedicated

@@ -170,7 +170,7 @@ pub async fn listener_principal(
             tracing::error!(
                 error = %e,
                 "could not resolve the --allow-unauthenticated-http principal at boot; \
-                 content tools on that listener refuse (no agent principal) until a later \
+                 content tools on that listener refuse (principal did not resolve) until a later \
                  request resolves it"
             );
             principal
