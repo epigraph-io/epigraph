@@ -245,9 +245,14 @@ fn create_test_app_no_sig() -> axum::Router {
 /// state.rs when `EPIGRAPH_JWT_SECRET` is not set, so it works against
 /// the test app router without any env-var setup.
 fn test_bearer_token() -> String {
+    test_bearer_token_for(Uuid::new_v4())
+}
+
+/// [`test_bearer_token`] bound to a chosen `principal`: the idempotency cache
+/// is per caller (backlog 449bc6c1), so a retry must come from the same one.
+fn test_bearer_token_for(principal: Uuid) -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
-    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
             principal,
@@ -352,16 +357,22 @@ fn create_valid_packet(agent_id: Uuid) -> EpistemicPacket {
 
 /// Make a POST request to the submit packet endpoint
 async fn submit_packet(app: axum::Router, packet: &EpistemicPacket) -> (StatusCode, String) {
+    submit_packet_as(app, packet, &test_bearer_token()).await
+}
+
+/// [`submit_packet`] with a caller-chosen bearer token.
+async fn submit_packet_as(
+    app: axum::Router,
+    packet: &EpistemicPacket,
+    bearer: &str,
+) -> (StatusCode, String) {
     let body = serde_json::to_string(packet).expect("Failed to serialize packet");
 
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", test_bearer_token()),
-        )
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
         .body(Body::from(body))
         .unwrap();
 
@@ -1376,14 +1387,18 @@ async fn test_idempotency_returns_same_claim_id() {
     let mut packet = create_valid_packet(agent_id);
     packet.claim.idempotency_key = Some(idempotency_key.clone());
 
+    // One caller for both submissions: the idempotency store is keyed per
+    // principal (backlog 449bc6c1).
+    let bearer = test_bearer_token();
+
     // First submission
-    let (status1, body1) = submit_packet(app.clone(), &packet).await;
+    let (status1, body1) = submit_packet_as(app.clone(), &packet, &bearer).await;
 
     assert_eq!(status1, StatusCode::CREATED);
     let response1: SubmitPacketResponse = serde_json::from_str(&body1).unwrap();
 
     // Second submission with same idempotency key
-    let (status2, body2) = submit_packet(app, &packet).await;
+    let (status2, body2) = submit_packet_as(app, &packet, &bearer).await;
 
     // Should succeed (either 200 OK or 201 Created depending on implementation)
     assert!(

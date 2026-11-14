@@ -270,9 +270,14 @@ fn create_test_router(pool: PgPool) -> Router {
 /// state.rs when `EPIGRAPH_JWT_SECRET` is not set, so it works against
 /// the test app router without any env-var setup.
 fn test_bearer_token() -> String {
+    test_bearer_token_for(Uuid::new_v4())
+}
+
+/// [`test_bearer_token`] bound to a chosen `principal`: the idempotency cache
+/// is per caller (backlog 449bc6c1), so a retry must come from the same one.
+fn test_bearer_token_for(principal: Uuid) -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
-    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
             principal,
@@ -296,6 +301,15 @@ async fn submit_packet_request(pool: &PgPool, packet: &EpistemicPacket) -> (Stat
 /// Send a packet through an existing router (for idempotency/concurrency tests
 /// that need to share in-memory state across requests)
 async fn send_packet(router: &Router, packet: &EpistemicPacket) -> (StatusCode, String) {
+    send_packet_as(router, packet, &test_bearer_token()).await
+}
+
+/// [`send_packet`] with a caller-chosen bearer token.
+async fn send_packet_as(
+    router: &Router,
+    packet: &EpistemicPacket,
+    bearer: &str,
+) -> (StatusCode, String) {
     // These tests post as a token principal that is not the packet's author
     // and read back with a public viewer, so they name `public` explicitly:
     // the default is team, else the author's private home
@@ -313,10 +327,7 @@ async fn send_packet(router: &Router, packet: &EpistemicPacket) -> (StatusCode, 
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", test_bearer_token()),
-        )
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
         .body(Body::from(body))
         .expect("Failed to build request");
 
@@ -993,11 +1004,13 @@ async fn test_idempotency_returns_same_ids_without_reinsert(pool: PgPool) {
         .await
         .expect("Count should succeed");
 
-    // Share a single router so the in-memory idempotency store persists
+    // Share a single router so the in-memory idempotency store persists, and
+    // one caller: the store is keyed per principal (backlog 449bc6c1).
     let router = create_test_router(pool.clone());
+    let bearer = test_bearer_token();
 
     // Act: First submission
-    let (status1, body1) = send_packet(&router, &packet).await;
+    let (status1, body1) = send_packet_as(&router, &packet, &bearer).await;
 
     assert_eq!(
         status1,
@@ -1014,7 +1027,7 @@ async fn test_idempotency_returns_same_ids_without_reinsert(pool: PgPool) {
     );
 
     // Act: Second submission with same idempotency key (same router = same store)
-    let (status2, body2) = send_packet(&router, &packet).await;
+    let (status2, body2) = send_packet_as(&router, &packet, &bearer).await;
 
     // Should return success (either 200 or 201)
     assert!(
