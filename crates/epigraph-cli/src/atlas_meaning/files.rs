@@ -239,6 +239,67 @@ pub fn read_result(path: &Path) -> anyhow::Result<ResultDoc> {
     Ok(doc)
 }
 
+/// Merge the results of a batched export (one `compute` per `--theme-id`
+/// batch) into the one result an apply takes: every file must be for the same
+/// map, hierarchy, cap and seed, computed with the same library versions (ids
+/// persist only while the clustering reproduces), and no theme may appear
+/// twice. The themes come out sorted by id. One result is returned as is.
+///
+/// # Errors
+/// No result, a mismatch, or a theme in two results.
+pub fn merge_results(results: Vec<ResultDoc>) -> anyhow::Result<ResultDoc> {
+    let mut it = results.into_iter();
+    let mut merged = it.next().context("no result to apply")?;
+    let mut seen: std::collections::BTreeSet<Uuid> = std::collections::BTreeSet::new();
+    for t in &merged.themes {
+        ensure!(
+            seen.insert(t.theme_id),
+            "theme {} is in a result twice",
+            t.theme_id
+        );
+    }
+    for r in it {
+        ensure!(
+            (&r.format, &r.map, &r.hierarchy, r.cap, r.seed)
+                == (
+                    &merged.format,
+                    &merged.map,
+                    &merged.hierarchy,
+                    merged.cap,
+                    merged.seed
+                ),
+            "results differ in format, map, hierarchy, cap or seed: ({}, {}, {}, {}, {}) and \
+             ({}, {}, {}, {}, {})",
+            merged.format,
+            merged.map,
+            merged.hierarchy,
+            merged.cap,
+            merged.seed,
+            r.format,
+            r.map,
+            r.hierarchy,
+            r.cap,
+            r.seed
+        );
+        ensure!(
+            r.versions == merged.versions,
+            "results were computed with different library versions: {:?} and {:?}",
+            merged.versions,
+            r.versions
+        );
+        for t in r.themes {
+            ensure!(
+                seen.insert(t.theme_id),
+                "theme {} is in two results",
+                t.theme_id
+            );
+            merged.themes.push(t);
+        }
+    }
+    merged.themes.sort_by_key(|t| t.theme_id);
+    Ok(merged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +482,44 @@ mod tests {
         assert_eq!(file.attachments, vec![vec![0], vec![0, 1], vec![]]);
         let text = String::from_utf8(serde_json::to_vec(&file).unwrap()).unwrap();
         assert!(!text.contains(&a.to_string()) && !text.contains(&e.to_string()));
+    }
+
+    fn split_fixture_result() -> (ResultDoc, ResultDoc) {
+        let mut a = read_result(&fixture().join("result.json")).unwrap();
+        let mut theme = a.themes[0].clone();
+        theme.theme_id = Uuid::from_u128(1);
+        let mut b = a.clone();
+        b.themes = vec![theme];
+        a.themes[0].theme_id = Uuid::from_u128(2);
+        (a, b)
+    }
+
+    /// Batched results merge into one, themes sorted; a mismatch or a theme
+    /// in two batches is refused.
+    #[test]
+    fn batch_results_merge_only_when_they_agree() {
+        let (a, b) = split_fixture_result();
+        let merged = merge_results(vec![a.clone(), b.clone()]).unwrap();
+        let ids: Vec<Uuid> = merged.themes.iter().map(|t| t.theme_id).collect();
+        assert_eq!(ids, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+
+        assert!(
+            merge_results(vec![a.clone(), a.clone()]).is_err(),
+            "a theme twice"
+        );
+        assert!(merge_results(vec![]).is_err());
+        let mut other = b.clone();
+        other.seed += 1;
+        assert!(merge_results(vec![a.clone(), other]).is_err(), "seed");
+        let mut other = b.clone();
+        other.cap -= 1;
+        assert!(merge_results(vec![a.clone(), other]).is_err(), "cap");
+        let mut other = b.clone();
+        other.map = "public".to_string();
+        assert!(merge_results(vec![a.clone(), other]).is_err(), "map");
+        let mut other = b;
+        other.versions = serde_json::json!({"numpy": "0.0.1"});
+        assert!(merge_results(vec![a, other]).is_err(), "versions");
     }
 
     #[test]

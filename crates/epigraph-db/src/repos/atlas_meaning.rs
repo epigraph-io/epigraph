@@ -87,6 +87,38 @@ impl AtlasMeaningRepository {
         Ok(q.fetch_all(&mut *conn).await?)
     }
 
+    /// Every theme with at least one current, EMBEDDED claim `map` may draw,
+    /// sorted: exactly the themes `export` writes, so the themes a run of the
+    /// map must hold. A theme whose drawable members all lack an embedding
+    /// has no tree.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn embedded_theme_ids_on_map(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT DISTINCT c.theme_id \
+               FROM claims c \
+              WHERE c.theme_id IS NOT NULL \
+                AND c.embedding IS NOT NULL \
+                AND COALESCE(c.is_current, true) \
+                AND (c.visibility = 'public' \
+                     OR ($1::uuid IS NOT NULL AND c.visibility = 'group' \
+                         AND c.owner_group_id = $1)) \
+                /* {VISIBILITY:c} */ \
+              ORDER BY 1",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
     /// The current members of `theme_id` that `map` may draw: the embedded
     /// ones with their embeddings, sorted by id, and how many have none.
     ///

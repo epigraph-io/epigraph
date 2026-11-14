@@ -154,14 +154,23 @@ pub struct ResolvedTheme {
 
 /// Check `result` against `map`'s rows in the build's snapshot and resolve
 /// each theme's tree with W3: the result's map and hierarchy must be these,
-/// its cap at most `cap`, each theme's leaves exactly the theme's current
+/// its cap at most `cap`, its themes EXACTLY the themes the map draws with an
+/// embedded member now ([`AtlasMeaningRepository::embedded_theme_ids_on_map`],
+/// what `export` writes), each theme's leaves exactly the theme's current
 /// embedded members now, every id the minted one; a leaf W3 finds over `cap`
 /// is split on the box. Call it on the build's transaction, after
 /// `begin_build_snapshot`.
 ///
+/// The theme set is checked because a run is the WHOLE map: the serving read
+/// takes the latest finished run of a map, so a run holding some themes would
+/// hide every other theme's levels. A batched export (`--theme-id`) is
+/// computed per batch and the results merged ([`super::files::merge_results`])
+/// into one apply.
+///
 /// # Errors
 /// Any refusal of [`check_tree`] or [`resolve_tree`], a result for another
-/// map, hierarchy or a larger cap, a theme named twice, or a database error.
+/// map, hierarchy or a larger cap, a theme named twice, a result that lacks a
+/// theme the map draws or names one it does not, or a database error.
 pub async fn resolve_result(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -186,13 +195,39 @@ pub async fn resolve_result(
         result.cap
     );
     let mut seen = BTreeSet::new();
-    let mut out = Vec::with_capacity(result.themes.len());
     for t in &result.themes {
         ensure!(
             seen.insert(t.theme_id),
             "theme {} is in the result twice",
             t.theme_id
         );
+    }
+    let drawn: BTreeSet<Uuid> = AtlasMeaningRepository::embedded_theme_ids_on_map(tx, viewer, map)
+        .await?
+        .into_iter()
+        .collect();
+    let missing: Vec<&Uuid> = drawn.difference(&seen).collect();
+    ensure!(
+        missing.is_empty(),
+        "the result lacks {} of the {} themes map {} draws (first: {}); a run is the whole map \
+         and would hide the others, so export every theme (or merge every batch's result into \
+         one apply with repeated --from)",
+        missing.len(),
+        drawn.len(),
+        map_key(map),
+        missing[0]
+    );
+    let extra: Vec<&Uuid> = seen.difference(&drawn).collect();
+    ensure!(
+        extra.is_empty(),
+        "the result names {} theme(s) map {} does not draw with an embedded member now \
+         (first: {})",
+        extra.len(),
+        map_key(map),
+        extra[0]
+    );
+    let mut out = Vec::with_capacity(result.themes.len());
+    for t in &result.themes {
         let members = AtlasMeaningRepository::theme_members(tx, viewer, map, t.theme_id).await?;
         let ids: BTreeSet<Uuid> = members.embedded.iter().map(|(id, _)| *id).collect();
         let tree = check_tree(map, HIERARCHY, t.theme_id, &t.groups, &ids)?;

@@ -5,8 +5,15 @@
 //! ```text
 //! atlas_meaning export --map M --out DIR [--theme-id T]... [--cap 100] [--seed 42]
 //! python3 scripts/atlas_meaning_core.py compute --from DIR --out result.json   # anywhere
-//! atlas_meaning apply  --map M --from result.json [--cap 100] [--apply]
+//! atlas_meaning apply  --map M --from result.json [--from result2.json]... [--cap 100] [--apply]
 //! ```
+//!
+//! A run is the WHOLE map: `apply` refuses a result that lacks any theme the
+//! map draws with an embedded member (the latest finished run is what is
+//! served, so a partial run would hide the other themes). To keep exports
+//! small, export in `--theme-id` batches into separate directories, compute
+//! each, and apply all the results at once with repeated `--from`; they must
+//! share map, cap, seed and library versions.
 //!
 //! * `export` writes, per theme the map draws, its current embedded members'
 //!   ids and embeddings and each member's agents and evidence (after W3's
@@ -37,7 +44,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context};
 use clap::{Parser, Subcommand};
 use epigraph_cli::atlas_meaning::build::{apply_result, export_map, ExportOptions};
-use epigraph_cli::atlas_meaning::files::{prepare_export_dir, read_result};
+use epigraph_cli::atlas_meaning::files::{merge_results, prepare_export_dir, read_result};
 use epigraph_cli::atlas_meaning::tree::parse_map_key;
 use epigraph_db::repos::atlas_leaf::ATLAS_LEAF_NODE_CAP;
 use uuid::Uuid;
@@ -82,9 +89,11 @@ enum Cmd {
     Apply {
         #[arg(long)]
         map: String,
-        /// The result file `atlas_meaning_core.py compute` wrote.
-        #[arg(long = "from")]
-        from: PathBuf,
+        /// The result file `atlas_meaning_core.py compute` wrote. Repeat it
+        /// to apply the results of a batched export together: the run must
+        /// hold every theme the map draws.
+        #[arg(long = "from", required = true)]
+        from: Vec<PathBuf>,
         /// The leaf node cap every leaf must fit (at most 100).
         #[arg(long, default_value_t = ATLAS_LEAF_NODE_CAP)]
         cap: usize,
@@ -166,7 +175,11 @@ async fn main() -> anyhow::Result<()> {
             cap,
             apply,
         } => {
-            let result = read_result(&from)?;
+            let result = merge_results(
+                from.iter()
+                    .map(|p| read_result(p))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            )?;
             apply_result(conn, viewer, parse_map_key(&map)?, &result, cap, apply).await?
         }
     };

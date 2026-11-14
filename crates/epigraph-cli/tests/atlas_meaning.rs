@@ -707,6 +707,70 @@ async fn apply_refuses_a_result_whose_members_drifted(pool: PgPool) {
     assert_eq!(runs, 0, "nothing written");
 }
 
+/// A run is the WHOLE map (the latest finished run is what is served): a
+/// result that lacks a theme the map draws with an embedded member is refused
+/// and nothing is written. Themes the map does not draw (only another team's
+/// claims, or only unembedded members) are not required, and a result naming
+/// one is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_refuses_a_result_that_lacks_a_theme_the_map_draws(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = AtlasMap::Team(c.team);
+    let filer = agent(&pool).await;
+    // Not drawn on this team's map: another team's theme, and a theme whose
+    // members have no embedding (a retired claim has none either:
+    // chk_deprecated_no_embedding).
+    let theirs = theme(&pool).await;
+    claims(&pool, theirs, filer, ("group", c.other), 5, Some(300)).await;
+    let bare = theme(&pool).await;
+    claims(&pool, bare, filer, ("group", c.team), 2, None).await;
+    // Drawn: a second theme of the team's own claims.
+    let second = theme(&pool).await;
+    let members: BTreeSet<Uuid> = claims(&pool, second, filer, ("group", c.team), 6, Some(500))
+        .await
+        .into_iter()
+        .collect();
+
+    let runs = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM atlas_map_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let err = apply(&pool, &viewer, map, &result(map, vec![by_blob(map, &c)]))
+        .await
+        .expect_err("a theme is missing");
+    assert!(err.to_string().contains("lacks 1 of the 2 themes"), "{err}");
+    assert_eq!(runs(pool.clone()).await, 0, "nothing written");
+
+    let foreign = coarse(map, theirs, &BTreeSet::new());
+    let err = apply(
+        &pool,
+        &viewer,
+        map,
+        &result(
+            map,
+            vec![by_blob(map, &c), coarse(map, second, &members), foreign],
+        ),
+    )
+    .await
+    .expect_err("a theme the map does not draw");
+    assert!(err.to_string().contains("does not draw"), "{err}");
+    assert_eq!(runs(pool.clone()).await, 0, "nothing written");
+
+    let report = apply(
+        &pool,
+        &viewer,
+        map,
+        &result(map, vec![by_blob(map, &c), coarse(map, second, &members)]),
+    )
+    .await
+    .expect("every drawn theme");
+    assert_eq!(report["params"]["themes"], 2, "{report}");
+    assert_eq!(runs(pool.clone()).await, 1);
+}
+
 /// An id that is not the minted one is refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn apply_refuses_a_forged_group_id(pool: PgPool) {
