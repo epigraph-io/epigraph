@@ -1004,6 +1004,70 @@ async fn an_ancestor_is_held_to_its_certificates_validity_when_it_confirmed() {
     }
 }
 
+/// The window an ancestor is held to includes its ROOT's: an ancestor that
+/// confirmed while its leaf was valid but before the root it verifies to was
+/// valid anchors nothing, on both branches (an Android ancestor and a packed
+/// one). Both roots are valid from 10 days ago, every leaf from 30 days ago.
+/// CALIBRATION: confirming 5 days ago (inside both windows) counts, and the
+/// packed anchor admits on its own.
+/// Mutation: `chain_valid_at` checking the stored chain without the root
+/// (the `der.push(root.ca().to_der()` dropped) -> both 20-days-ago cases
+/// admit.
+#[tokio::test]
+async fn an_ancestor_is_held_to_its_roots_validity_when_it_confirmed() {
+    let (now, day) = (now_unix(), 86_400);
+    let (root_from, root_to) = (now - 10 * day, now + 365 * day);
+    let vendor = TestAttestation::with_root_validity("Allowlisted", root_from, root_to);
+    let google = TestAttestation::with_root_validity("Android", root_from, root_to);
+    let rp = attested(Some((&vendor, &[MODEL])), Some(&google), true);
+    let person = Uuid::new_v4();
+    let leaf_window = (now - 30 * day, now + 365 * day);
+
+    // An Android ancestor registered with a leaf valid from 30 days ago.
+    let (options, state) = rp.start_registration(person, "op", "Op").unwrap();
+    let mut phone_key = SoftAuthenticator::new(MODEL).hardware();
+    let created = phone_key
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let phone = rp
+        .finish_registration(
+            &google.android_key_with(
+                &phone_key,
+                &created,
+                true,
+                &AndroidKeyOpts {
+                    leaf_validity: Some(leaf_window),
+                    ..AndroidKeyOpts::default()
+                },
+            ),
+            &state,
+        )
+        .expect("CALIBRATION: the phone registers (both windows cover now)");
+    // A packed ancestor whose stored leaf is valid from 30 days ago.
+    let (_, packed) = packed_first(&rp, &vendor).await;
+    let packed = with_stored_chain(
+        &packed,
+        &[vendor.leaf_der_valid(leaf_window.0, leaf_window.1)],
+    );
+
+    let (mut key, anchor_reg) = packed_first(&rp, &vendor).await;
+    let mut anchor = confirmed_anchor(&rp, &mut key, &anchor_reg, person).await;
+    assert_eq!(rp.check_anchor(&anchor), Ok(()), "CALIBRATION: the anchor");
+    for (branch, ancestor) in [("android", &phone), ("packed", &packed)] {
+        for (when, expected, label) in [
+            (now - 5 * day, Ok(()), "inside both windows"),
+            (
+                now - 20 * day,
+                Err(AnchorRefusal::LineageNotAttested),
+                "inside the leaf's window, before the root's",
+            ),
+        ] {
+            anchor.anchor_lineage = vec![lineage_entry_at(ancestor, unix(when))];
+            assert_eq!(rp.check_anchor(&anchor), expected, "{branch}: {label}");
+        }
+    }
+}
+
 // =====================================================================
 // P779M-1: on the anchored path, an Android key whose standing cannot be
 // checked is refused, not silently recorded `none`
