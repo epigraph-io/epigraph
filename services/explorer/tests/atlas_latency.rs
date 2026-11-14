@@ -474,7 +474,8 @@ async fn the_bff_meets_its_share_of_the_latency_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_kernel_turns_the_bff_gate_red() {
     let levels = levels();
-    let (control, _) = measure(&levels, Duration::ZERO, 6, 1).await;
+    // 20 warm samples, so the control's p95 is not just its slowest one.
+    let (control, _) = measure(&levels, Duration::ZERO, 20, 3).await;
     let green = verdict(&control, &all_expected(), BFF_SHARE);
     assert!(green.is_empty(), "the control run is red: {green:?}");
     let (slow, _) = measure(&levels, 2 * BFF_SHARE, 6, 1).await;
