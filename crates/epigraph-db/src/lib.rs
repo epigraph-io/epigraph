@@ -190,6 +190,8 @@ pub use repos::AtlasLayoutRepository;
 pub use repos::AtlasMapRepository;
 // The Atlas leaf node sets (Atlas W3).
 pub use repos::AtlasLeafRepository;
+// The rows behind the Atlas leaf flow weights (Atlas W7).
+pub use repos::AtlasFlowRepository;
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
     ClaimContextRepository, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ContextClaimRow,
