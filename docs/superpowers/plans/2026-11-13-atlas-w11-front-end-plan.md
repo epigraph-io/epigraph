@@ -177,8 +177,14 @@ What this item does about it:
   that `refutes` or `contradicts` (either casing) takes the opposing tone. It is drawn as a
   thin solid line with no particles and no arrow (`NO_MASS_WIDTH`, wider than a hairline so
   the colour reads, thinner than any flow), set apart from exact flows and dashed estimates.
-  Any other `none` edge (an agent's authorship) stays a neutral hairline. `edgeStyle`
-  carries the stroke alpha as well, so what a viewer sees is decided, and tested, in one place.
+  This holds only for an edge from an evidence node to a claim node: `edgeStyle` takes the
+  kinds of both ends, and any other `none` edge (an agent's authorship, or a schema-valid
+  `supports` edge out of a claim or into evidence) stays a neutral hairline whatever it is
+  called, so a non-evidence edge never reads as evidence. `edgeStyle` carries the stroke alpha
+  as well, so what a viewer sees is decided, and tested, in one place; the canvas draws with
+  that width, dash and alpha, and only a flow gets an arrow or particles.
+- **Help text.** The leaf panel's help text says that thick solid evidence lines carry stored
+  mass and thin solid ones with no dots have none we can read, matching the legend.
 - **Legend.** The leaf legend gains "evidence, no stored mass". The side panel lists such an
   edge with "no stored mass" where a flow shows its weight.
 - **Tests.** The node tests read the `none` edges from the committed `team_leaf_sparse_mass`
@@ -187,8 +193,14 @@ What this item does about it:
   - a supporting edge (including one spelled `SUPPORTS`) gets the supporting tone and no flow;
   - the massless line differs from exact flows (including an exact edge stored with weight 0)
     and from dashed estimates;
-  - an exact edge is unchanged, and still follows its sign when its name disagrees.
-  A Rust page test checks the legend entry and its stylesheet class.
+  - an exact edge is unchanged, and still follows its sign when its name disagrees;
+  - a `none` edge between any other pair of kinds (claim to evidence, agent to claim, and so
+    on), or with its ends unknown, stays a neutral hairline even when it says `supports` or
+    `refutes`.
+  A Rust page test checks the legend entry and its stylesheet class. A static test of
+  `atlas.js` pins that the canvas strokes with the style's width, dash and alpha, gates the
+  arrow and particles on a flow, passes both ends' kinds to every `edgeStyle` call, and that
+  the leaf help text mentions evidence with no stored mass.
 - **Preview.** No preview leaf had a `none` evidence edge, so the generator now serves one
   team leaf (the second theme, the root's second leaf, and its twin in the other hierarchy)
   with the fixture's rule. Every evidence edge there is `none` except those of every fourth
