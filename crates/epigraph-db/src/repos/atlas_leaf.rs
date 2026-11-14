@@ -104,7 +104,7 @@
 //! `agent -asserts-> claim` ([`DERIVED_FILER_RELATIONSHIP`]) from
 //! `claims.agent_id`.
 //!
-//! Three contract rules this node set does NOT yet enforce; W7/W10, which
+//! Two contract rules this node set does NOT yet enforce; W7/W10, which
 //! assemble the served level document, must:
 //!
 //! * **direction**: a [`LeafEdge`] points the way its stored row points; the
@@ -113,9 +113,15 @@
 //! * **relationship spelling**: the contract requires `^[A-Za-z][A-Za-z0-9_]*$`
 //!   and at most 32 characters, while `edges.relationship` is `varchar(100)`
 //!   with only a non-empty check; the name is passed through unchecked, so a
-//!   name outside the pattern must be dropped or mapped before validation;
-//! * **edge limit**: the contract allows at most 1,024 edges per leaf.
-//!   [`LeafCounts::edges`] reports the count; nothing here splits on it.
+//!   name outside the pattern must be dropped or mapped before validation.
+//!
+//! The contract's **edge limit** ([`ATLAS_LEAF_EDGE_CAP`], 1,024 per leaf)
+//! IS enforced, as a second split reason (Atlas W9): a leaf of two or more
+//! claims whose edges exceed it needs a split ([`SplitReason::EdgeCap`]), and
+//! [`fallback_split`] cuts on edges as well as nodes. A leaf of ONE claim
+//! whose own attachments carry more edges cannot be split: it is returned as
+//! [`LeafOutcome::Fits`] with [`LeafCounts::edges`] over the limit, and the
+//! contract refuses the document it makes (the caller reports it).
 //!
 //! # Determinism
 //!
@@ -138,6 +144,12 @@ use crate::visibility::Viewer;
 /// The design's cap: at most 100 nodes (claims, agents and evidence counted
 /// together) in one leaf.
 pub const ATLAS_LEAF_NODE_CAP: usize = 100;
+
+/// The contract's edge limit: at most 1,024 edges (stored ones collapsed by
+/// (source, target, relationship), derived filer edges included) in one
+/// leaf. Equal to `epigraph_atlas_contract::MAX_LEAF_EDGES` (this crate does
+/// not depend on the contract; epigraph-cli's tests pin the two together).
+pub const ATLAS_LEAF_EDGE_CAP: usize = 1024;
 
 /// The relationship of a derived filer edge (`agent -> claim` from
 /// `claims.agent_id`): the stored spelling of the same fact.
@@ -358,6 +370,9 @@ impl LeafNodeSet {
 pub enum SplitReason {
     /// Claims + agents + evidence exceed the cap.
     NodeCap,
+    /// The nodes fit, but the edges among them exceed
+    /// [`ATLAS_LEAF_EDGE_CAP`] and the leaf holds two or more claims.
+    EdgeCap,
 }
 
 /// The split request: the leaf is over the cap.
@@ -395,7 +410,16 @@ struct LeafIndex<'r> {
     by_claim_id: BTreeMap<Uuid, Vec<Uuid>>,
     /// Unordered (agent, claim) pairs a stored authorship edge already links.
     authorship_pairs: BTreeSet<(Uuid, Uuid)>,
+    /// node -> the indexes into `rows.edges` of the stored edges at it (the
+    /// split's incremental edge count).
+    edges_at: BTreeMap<LeafNode, Vec<usize>>,
+    /// filer agent -> the claims it filed.
+    claims_of_filer: BTreeMap<Uuid, Vec<Uuid>>,
 }
+
+/// One edge of a leaf as [`LeafIndex::edges_among`] keys it: (source, target,
+/// relationship).
+type EdgeKey<'r> = (LeafNode, LeafNode, &'r str);
 
 impl<'r> LeafIndex<'r> {
     fn new(rows: &'r LeafRows) -> Self {
@@ -462,13 +486,71 @@ impl<'r> LeafIndex<'r> {
             .map(|(c, s)| (c, s.into_iter().collect()))
             .collect();
 
+        let mut edges_at: BTreeMap<LeafNode, Vec<usize>> = BTreeMap::new();
+        for (i, e) in rows.edges.iter().enumerate() {
+            edges_at.entry(e.source).or_default().push(i);
+            if e.target != e.source {
+                edges_at.entry(e.target).or_default().push(i);
+            }
+        }
+        let mut claims_of_filer: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
+        for (&claim, &filer) in &rows.claims {
+            if let Some(f) = filer {
+                claims_of_filer.entry(f).or_default().push(claim);
+            }
+        }
+
         Self {
             rows,
             agents_of,
             evidence_of,
             by_claim_id,
             authorship_pairs,
+            edges_at,
+            claims_of_filer,
         }
+    }
+
+    /// The edge keys [`Self::edges_among`] would count for `nodes` that touch
+    /// a node of `added` (each of which is in `nodes`): stored edges with
+    /// both ends in `nodes`, and derived filer edges whose claim or filer is
+    /// new. With `added == nodes` it is every key of the leaf, so the split
+    /// counts edges exactly as [`Self::assemble`] does.
+    fn edge_keys_touching(
+        &self,
+        nodes: &BTreeSet<LeafNode>,
+        added: &[LeafNode],
+    ) -> BTreeSet<EdgeKey<'r>> {
+        let mut out = BTreeSet::new();
+        for n in added {
+            for &i in self.edges_at.get(n).map_or(&[][..], Vec::as_slice) {
+                let e = &self.rows.edges[i];
+                if nodes.contains(&e.source) && nodes.contains(&e.target) {
+                    out.insert((e.source, e.target, e.relationship.as_str()));
+                }
+            }
+            let claims: &[Uuid] = match n.kind {
+                LeafNodeKind::Claim => std::slice::from_ref(&n.id),
+                LeafNodeKind::Agent => self
+                    .claims_of_filer
+                    .get(&n.id)
+                    .map_or(&[][..], Vec::as_slice),
+                LeafNodeKind::Evidence => &[],
+            };
+            for &c in claims {
+                let claim = LeafNode::claim(c);
+                if let Some(Some(filer)) = self.rows.claims.get(&c) {
+                    let agent = LeafNode::agent(*filer);
+                    if nodes.contains(&claim)
+                        && nodes.contains(&agent)
+                        && !self.authorship_pairs.contains(&(*filer, c))
+                    {
+                        out.insert((agent, claim, DERIVED_FILER_RELATIONSHIP));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Whether `n` is a row the leaf may hold at all.
@@ -616,6 +698,14 @@ impl<'r> LeafIndex<'r> {
                 counts,
             });
         }
+        // One claim cannot be split further; its document is refused by the
+        // contract and the caller reports it (module docs, "edge limit").
+        if counts.edges > ATLAS_LEAF_EDGE_CAP && counts.claims > 1 {
+            return LeafOutcome::NeedsSplit(NeedsSplit {
+                reason: SplitReason::EdgeCap,
+                counts,
+            });
+        }
         LeafOutcome::Fits(LeafNodeSet {
             nodes: nodes.into_iter().collect(),
             edges,
@@ -629,18 +719,37 @@ impl<'r> LeafIndex<'r> {
         let mut parts = Vec::new();
         let mut current: Vec<Uuid> = Vec::new();
         let mut current_nodes: BTreeSet<LeafNode> = BTreeSet::new();
+        let mut current_edges: BTreeSet<EdgeKey<'r>> = BTreeSet::new();
         for c in claims {
             let (claim_nodes, _) = self.claim_nodes(c, cap);
-            let added = claim_nodes
+            let mut added: Vec<LeafNode> = claim_nodes
                 .iter()
                 .filter(|n| !current_nodes.contains(n))
-                .count();
-            if !current.is_empty() && current_nodes.len() + added > cap {
+                .copied()
+                .collect();
+            let mut over = current_nodes.len() + added.len() > cap;
+            let mut new_edges = BTreeSet::new();
+            if !current.is_empty() && !over {
+                let mut union = current_nodes.clone();
+                union.extend(added.iter().copied());
+                new_edges = self.edge_keys_touching(&union, &added);
+                new_edges.retain(|k| !current_edges.contains(k));
+                over = current_edges.len() + new_edges.len() > ATLAS_LEAF_EDGE_CAP;
+            }
+            if !current.is_empty() && over {
                 parts.push(std::mem::take(&mut current));
                 current_nodes.clear();
+                current_edges.clear();
+                added.clone_from(&claim_nodes);
+                let alone: BTreeSet<LeafNode> = claim_nodes.iter().copied().collect();
+                new_edges = self.edge_keys_touching(&alone, &added);
+            } else if current.is_empty() {
+                let alone: BTreeSet<LeafNode> = claim_nodes.iter().copied().collect();
+                new_edges = self.edge_keys_touching(&alone, &added);
             }
             current.push(c);
             current_nodes.extend(claim_nodes);
+            current_edges.extend(new_edges);
         }
         if !current.is_empty() {
             parts.push(current);
@@ -671,9 +780,13 @@ pub fn assemble_leaf(rows: &LeafRows, part: &[Uuid], cap: usize) -> Result<LeafO
 
 /// The fallback split: the drawable claims of `part` in id order, cut into
 /// consecutive parts, each claim with its (capped) agents and evidence, a new
-/// part started when the next claim would take the current one over `cap`.
-/// Every part assembles to [`LeafOutcome::Fits`]; a node shared by claims in
-/// two parts is in both. A leaf that already fits comes back as one part.
+/// part started when the next claim would take the current one over `cap`
+/// nodes or over [`ATLAS_LEAF_EDGE_CAP`] edges (counted as
+/// [`assemble_leaf`] counts them). Every part assembles to
+/// [`LeafOutcome::Fits`]; a node shared by claims in two parts is in both. A
+/// leaf that already fits comes back as one part, and a leaf that needs a
+/// split comes back as two or more. A part of one claim may still exceed the
+/// edge limit (module docs, "edge limit").
 ///
 /// A stable partition by id, not a clustering: W4 and W5 replace it with their
 /// own and keep it only as the last resort.
@@ -972,6 +1085,121 @@ impl AtlasLeafRepository {
         check_cap(cap)?;
         let rows = Self::read_leaf_rows(conn, viewer, map, claim_ids).await?;
         assemble_leaf(&rows, claim_ids, cap)
+    }
+
+    /// The claim-to-claim edges among `claim_ids` that `map` may draw, as
+    /// `(source, target, relationship as stored)`, one per stored row, in
+    /// edge-id order: the input of the nightly's cross-group links (group
+    /// `bundles` and `targets`, leaf `outgoing`). Both ends must be in
+    /// `claim_ids` (the claims the map's run draws) AND be claims the map may
+    /// draw, under the claim rule of [`Self::read_leaf_rows`] (public, or the
+    /// team's own), whatever the caller passed: group levels are served as
+    /// stored with no per-viewer filter, so a link between claims the map
+    /// cannot draw must never reach one. The edge must be in force, and the
+    /// edge row must pass the MAP edge rule of [`Self::read_leaf_rows`]:
+    /// public, or owned by the team with no co-owner. A co-owned edge is
+    /// never returned, so a link hidden from a leaf never reappears between
+    /// leaves. Which relationships count as a link is the caller's rule
+    /// (W5's), not this read's.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn map_claim_links(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Uuid, String)>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT e.source_id, e.target_id, e.relationship::text \
+               FROM edges e \
+               JOIN claims cs ON cs.id = e.source_id \
+               JOIN claims ct ON ct.id = e.target_id \
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
+                AND e.source_id = ANY($1) AND e.target_id = ANY($1) \
+                AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                AND (e.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
+                         AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
+                AND (cs.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND cs.visibility = 'group' \
+                         AND cs.owner_group_id = $2)) \
+                AND (ct.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND ct.visibility = 'group' \
+                         AND ct.owner_group_id = $2)) \
+                /* {EDGE_VISIBILITY:e} */ \
+                /* {VISIBILITY:cs} */ \
+                /* {VISIBILITY:ct} */ \
+              ORDER BY e.id",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String)>(&sql)
+            .bind(claim_ids)
+            .bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
+    /// The raw label text of a leaf's agent and evidence nodes (Atlas W9's
+    /// real leaves): each agent's `display_name`, and each evidence row's
+    /// `raw_content`, else its `evidence_type`, for the rows `map` may draw.
+    /// An agent with no display name, and an evidence id the map may not
+    /// draw, are absent; the caller supplies a fallback label. Text is
+    /// returned as stored: clipping to the contract's label length is the
+    /// document builder's.
+    ///
+    /// `agents` carries no tenancy (077's `agents_identity` is readable by
+    /// every session); evidence carries the map predicate, as in
+    /// [`Self::read_leaf_rows`].
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a statement fails.
+    pub async fn node_labels(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        agent_ids: &[Uuid],
+        evidence_ids: &[Uuid],
+    ) -> Result<(BTreeMap<Uuid, String>, BTreeMap<Uuid, String>), DbError> {
+        let agents: BTreeMap<Uuid, String> = if agent_ids.is_empty() {
+            BTreeMap::new()
+        } else {
+            sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT a.id, a.display_name FROM agents a \
+                  WHERE a.id = ANY($1) AND a.display_name IS NOT NULL",
+            )
+            .bind(agent_ids)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect()
+        };
+        if evidence_ids.is_empty() {
+            return Ok((agents, BTreeMap::new()));
+        }
+        let sql = viewer.splice(
+            "SELECT ev.id, COALESCE(NULLIF(btrim(ev.raw_content), ''), ev.evidence_type) \
+               FROM evidence ev \
+              WHERE ev.id = ANY($1) \
+                AND (ev.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND ev.visibility = 'group' \
+                         AND ev.owner_group_id = $2)) \
+                /* {VISIBILITY:ev} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql)
+            .bind(evidence_ids)
+            .bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let evidence = q.fetch_all(&mut *conn).await?.into_iter().collect();
+        Ok((agents, evidence))
     }
 }
 
@@ -1509,5 +1737,197 @@ mod tests {
         assert!(resolve_with_fallback(&rows, &[id(88)], 100)
             .unwrap()
             .is_empty());
+    }
+
+    /// `n` claims (ids 1..=n, filer 1000) linked to each other both ways by
+    /// two relationships: `2 n (n - 1)` stored edges plus `n` derived filer
+    /// edges among `n + 1` nodes.
+    fn clique(n: u128) -> LeafRows {
+        let mut rows = rows_with(n, 0);
+        let mut eid = 1;
+        for s in 1..=n {
+            for t in 1..=n {
+                if s == t {
+                    continue;
+                }
+                for rel in ["supports", "corroborates"] {
+                    rows.edges.push(edge(
+                        eid,
+                        LeafNode::claim(id(s)),
+                        LeafNode::claim(id(t)),
+                        rel,
+                    ));
+                    eid += 1;
+                }
+            }
+        }
+        rows
+    }
+
+    fn needs_split(outcome: LeafOutcome) -> NeedsSplit {
+        match outcome {
+            LeafOutcome::NeedsSplit(n) => n,
+            other => panic!("expected NeedsSplit, got {other:?}"),
+        }
+    }
+
+    /// Each fallback part fits both caps, the parts cover the leaf, and the
+    /// split is exact: the next claim would have taken each part over.
+    fn assert_split_is_tight(rows: &LeafRows, cap: usize) {
+        let ids = all(rows);
+        let parts = fallback_split(rows, &ids, cap).unwrap();
+        assert!(parts.len() >= 2, "{} parts", parts.len());
+        let mut covered = BTreeSet::new();
+        for (i, p) in parts.iter().enumerate() {
+            let set = fits(assemble_leaf(rows, p, cap).unwrap());
+            assert!(
+                set.counts.edges <= ATLAS_LEAF_EDGE_CAP || set.counts.claims == 1,
+                "part {i}: {:?}",
+                set.counts
+            );
+            assert!(set.counts.nodes <= cap);
+            assert_attached(&set);
+            covered.extend(p.iter().copied());
+            if let Some(next) = parts.get(i + 1) {
+                let mut grown = p.clone();
+                grown.push(next[0]);
+                needs_split(assemble_leaf(rows, &grown, cap).unwrap());
+            }
+        }
+        assert_eq!(covered, ids.into_iter().collect::<BTreeSet<_>>());
+        for set in resolve_with_fallback(rows, &all(rows), cap).unwrap() {
+            assert!(set.counts.edges <= ATLAS_LEAF_EDGE_CAP || set.counts.claims == 1);
+        }
+    }
+
+    #[test]
+    fn a_leaf_over_the_edge_limit_needs_a_split_on_edges() {
+        // 30 claims + the filer = 31 nodes (well under the node cap), but
+        // 1,740 stored + 30 filer edges.
+        let rows = clique(30);
+        let n = needs_split(assemble_leaf(&rows, &all(&rows), 100).unwrap());
+        assert_eq!(n.reason, SplitReason::EdgeCap);
+        assert_eq!(n.counts.nodes, 31);
+        assert_eq!(n.counts.edges, 30 * 29 * 2 + 30);
+        assert_split_is_tight(&rows, 100);
+        // 22 claims: 924 + 22 = 946 edges, so it fits as one leaf.
+        let small = clique(22);
+        let set = fits(assemble_leaf(&small, &all(&small), 100).unwrap());
+        assert_eq!(set.counts.edges, 946);
+    }
+
+    #[test]
+    fn one_claim_over_the_edge_limit_is_one_part_and_reports_its_edges() {
+        // One claim, 40 evidence rows on it and every evidence row linked to
+        // every other: 40 + 1,560 stored + 1 filer edge among 42 nodes.
+        let mut rows = rows_with(1, 40);
+        let ev: Vec<Uuid> = rows.evidence.keys().copied().collect();
+        let mut eid = 1;
+        for s in &ev {
+            for t in &ev {
+                if s != t {
+                    rows.edges.push(edge(
+                        eid,
+                        LeafNode::evidence(*s),
+                        LeafNode::evidence(*t),
+                        "cites",
+                    ));
+                    eid += 1;
+                }
+            }
+        }
+        let set = fits(assemble_leaf(&rows, &all(&rows), 100).unwrap());
+        assert_eq!(set.counts.edges, 40 + 40 * 39 + 1);
+        assert_eq!(fallback_split(&rows, &all(&rows), 100).unwrap().len(), 1);
+        // Beside a second claim, the pair needs a split on edges, and the
+        // dense claim is cut out on its own.
+        let mut two = rows.clone();
+        two.requested.insert(id(2));
+        two.claims.insert(id(2), Some(id(1000)));
+        let n = needs_split(assemble_leaf(&two, &all(&two), 100).unwrap());
+        assert_eq!(n.reason, SplitReason::EdgeCap);
+        let parts = fallback_split(&two, &all(&two), 100).unwrap();
+        assert_eq!(parts, vec![vec![id(1)], vec![id(2)]]);
+    }
+
+    #[test]
+    fn the_edge_split_counts_exactly_what_assembly_counts() {
+        // Random dense leaves: claims, a few filers and authors, evidence on
+        // several claims, edges of every kind with repeated relationships and
+        // filers with and without a stored authorship edge.
+        for seed in 1..=12_u64 {
+            let mut r = Rng(seed);
+            let mut rows = LeafRows::default();
+            let agents: Vec<Uuid> = (0..4).map(|k| id(5_000 + k)).collect();
+            rows.agents.extend(agents.iter().copied());
+            let claims: Vec<Uuid> = (0..60).map(|_| r.uuid()).collect();
+            for &c in &claims {
+                rows.requested.insert(c);
+                rows.claims
+                    .insert(c, Some(agents[usize::try_from(r.below(4)).unwrap()]));
+            }
+            let mut evidence = Vec::new();
+            for _ in 0..30 {
+                let ev = r.uuid();
+                let c = claims[usize::try_from(r.below(60)).unwrap()];
+                rows.evidence.insert(ev, Some(c));
+                evidence.push(ev);
+                rows.edges.push(edge(
+                    u128::from(r.next()),
+                    LeafNode::evidence(ev),
+                    LeafNode::claim(c),
+                    "supports",
+                ));
+            }
+            let pick = |r: &mut Rng| -> LeafNode {
+                match r.below(10) {
+                    0 => LeafNode::agent(agents[usize::try_from(r.below(4)).unwrap()]),
+                    1 => LeafNode::evidence(evidence[usize::try_from(r.below(30)).unwrap()]),
+                    _ => LeafNode::claim(claims[usize::try_from(r.below(60)).unwrap()]),
+                }
+            };
+            for _ in 0..2_500 {
+                let (s, t) = (pick(&mut r), pick(&mut r));
+                if s.kind == LeafNodeKind::Agent && t.kind == LeafNodeKind::Agent {
+                    continue;
+                }
+                let rel = ["supports", "refutes", "authored", "cites"]
+                    [usize::try_from(r.below(4)).unwrap()];
+                rows.edges.push(edge(u128::from(r.next()), s, t, rel));
+            }
+            assert_eq!(
+                needs_split(assemble_leaf(&rows, &all(&rows), 100).unwrap()).reason,
+                SplitReason::EdgeCap,
+                "seed {seed}"
+            );
+            assert_split_is_tight(&rows, 100);
+        }
+    }
+
+    #[test]
+    fn exactly_at_the_edge_limit_fits_and_one_over_splits() {
+        // Claims 1 and 2 (one filer) joined by 1,022 relationships: 1,022
+        // stored + 2 filer edges = 1,024, the limit.
+        let mut rows = rows_with(2, 0);
+        for k in 0..1_022_u128 {
+            rows.edges.push(edge(
+                k + 1,
+                LeafNode::claim(id(1)),
+                LeafNode::claim(id(2)),
+                &format!("r{k}"),
+            ));
+        }
+        let set = fits(assemble_leaf(&rows, &all(&rows), 100).unwrap());
+        assert_eq!(set.counts.edges, ATLAS_LEAF_EDGE_CAP);
+        // A third claim adds its filer edge: 1,025, one over.
+        let mut over = rows.clone();
+        over.requested.insert(id(3));
+        over.claims.insert(id(3), Some(id(1000)));
+        let n = needs_split(assemble_leaf(&over, &all(&over), 100).unwrap());
+        assert_eq!((n.reason, n.counts.edges), (SplitReason::EdgeCap, 1_025));
+        assert_eq!(
+            fallback_split(&over, &all(&over), 100).unwrap(),
+            vec![vec![id(1), id(2)], vec![id(3)]]
+        );
     }
 }

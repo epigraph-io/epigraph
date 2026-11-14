@@ -9,8 +9,9 @@
 //! finished run whatever it holds, and every level document's `switch` names
 //! a level of the other hierarchy. A links-only run would hide the meaning
 //! levels and leave every switch pointing at a level that is not served. The
-//! nightly (W9) does the same with [`write_links_levels`], which writes into
-//! a run the caller opened next to `write_meaning_levels`.
+//! meaning levels are written with [`write_meaning_levels_switched`], so a
+//! deep meaning level's switch leads to its best links group, not the links
+//! root. The nightly (W9, `atlas_nightly`) builds both hierarchies itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -30,9 +31,7 @@ use super::files::{
 use super::graph::{
     check_mirrors, counted_links, leaf_count, linked_claims, meaning_leaf_of, switch_targets,
 };
-use crate::atlas_meaning::build::{
-    resolve_result, resolve_theme, write_meaning_levels, ResolvedTheme,
-};
+use crate::atlas_meaning::build::{resolve_result, resolve_theme, ResolvedTheme};
 use crate::atlas_meaning::docs::level_documents_with_switch;
 use crate::atlas_meaning::files::{index_attachments, prepare_export_dir, ResultDoc};
 use crate::atlas_meaning::tree::{check_tree, map_key, resolve_tree, MeaningTree, ResolveStats};
@@ -349,6 +348,48 @@ async fn links_documents(
     })
 }
 
+/// Write every meaning level document of `meaning` into the unfinished run
+/// `run_id` of `map`, each level's switch leading to the links group of the
+/// same theme with the largest Jaccard overlap of claims (W5's rule,
+/// [`switch_targets`] the other way round): the meaning root to the links
+/// root, a deeper level to its best links group rather than the links root.
+/// `links` must hold the same themes. Returns the number written.
+///
+/// # Errors
+/// A theme with no links tree, a document the contract refuses, a claim
+/// with no readable label, or a database error.
+pub async fn write_meaning_levels_switched(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    run_id: Uuid,
+    meaning: &[ResolvedTheme],
+    links: &[ResolvedLinksTheme],
+) -> anyhow::Result<usize> {
+    let by_theme: BTreeMap<Uuid, &ResolvedLinksTheme> =
+        links.iter().map(|l| (l.tree.theme_id, l)).collect();
+    let mut written = 0;
+    for m in meaning {
+        let l = by_theme
+            .get(&m.tree.theme_id)
+            .with_context(|| format!("theme {} has no links tree", m.tree.theme_id))?;
+        let switch = switch_targets(&m.tree, &l.tree)?;
+        let labels =
+            AtlasMeaningRepository::claim_labels(tx, viewer, map, &m.tree.nodes[0].claims).await?;
+        let docs = level_documents_with_switch(&m.tree, run_id, &labels, &|node| {
+            switch
+                .get(&node.id)
+                .copied()
+                .with_context(|| format!("meaning level {} has no switch target", node.id))
+        })?;
+        for doc in docs {
+            AtlasMapRepository::put_level(tx, run_id, &doc).await?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
 /// Check both results and, with `write`, store them as ONE finished run of
 /// `map` holding both hierarchies: W4's `resolve_result` (the whole-map
 /// check, the W3 re-check) for the meaning result, then
@@ -356,10 +397,34 @@ async fn links_documents(
 /// transaction. Without `write` it builds every document of both and writes
 /// nothing. On any refusal nothing is written.
 ///
+/// With `write`, the whole build holds the map's publish lock
+/// (`AtlasMapRepository::lock_map_for_build`, taken before the snapshot), so
+/// a nightly that built from an older run cannot publish over this one.
+///
 /// # Errors
 /// Any refusal of W4's `resolve_result`, [`resolve_links_result`] or the
 /// document builders, or a database error.
 pub async fn apply_hierarchies(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    meaning: &ResultDoc,
+    links: &LinksResultDoc,
+    cap: usize,
+    write: bool,
+) -> anyhow::Result<serde_json::Value> {
+    if !write {
+        return build_hierarchies(conn, viewer, map, meaning, links, cap, false).await;
+    }
+    AtlasMapRepository::lock_map_for_build(conn, map).await?;
+    let built = build_hierarchies(conn, viewer, map, meaning, links, cap, true).await;
+    let unlocked = AtlasMapRepository::unlock_map_for_build(conn, map).await;
+    let report = built?;
+    unlocked?;
+    Ok(report)
+}
+
+async fn build_hierarchies(
     conn: &mut PgConnection,
     viewer: &Viewer,
     map: AtlasMap,
@@ -441,7 +506,9 @@ pub async fn apply_hierarchies(
         },
     )
     .await?;
-    let meaning_docs = write_meaning_levels(&mut tx, viewer, map, run_id, &meaning_themes).await?;
+    let meaning_docs =
+        write_meaning_levels_switched(&mut tx, viewer, map, run_id, &meaning_themes, &links_themes)
+            .await?;
     let links_docs = write_links_levels(&mut tx, viewer, map, run_id, &links_themes).await?;
     if meaning_docs == 0 {
         bail!("the results hold no theme; nothing was written");

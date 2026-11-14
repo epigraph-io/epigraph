@@ -1,0 +1,14 @@
+# The alert for a failed Atlas night (Atlas W9): started by the nightly
+# service's OnFailure= with the failing unit's name as the instance (%i).
+#
+# A TEMPLATE: replace ExecStart with your alert command, one that sends the
+# unit name and its last journal lines (journalctl -u %i -n 50) through a
+# mail or chat path whose delivery you have verified end to end. An alert
+# nobody receives is no alert.
+
+[Unit]
+Description=Alert: %i failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/epigraph-unit-alert %i

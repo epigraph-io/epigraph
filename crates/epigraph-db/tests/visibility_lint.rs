@@ -2779,6 +2779,35 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          it touches no table. `begin_build_snapshot` then reads the epochs through `map_epochs`, \
          which splices the viewer.",
     ),
+    // Atlas W9: the nightly's housekeeping of one map.
+    (
+        "atlas_map.rs",
+        "prune_runs",
+        "WRITE. Deletes one map's old `atlas_map_runs` rows (finished runs past the newest N, \
+         unfinished runs older than the newest finished one), their levels going by the FK \
+         cascade; every statement is scoped by the map's own tenancy columns, the nightly calls \
+         it on the maintenance connection and the application role holds SELECT only on the \
+         table.",
+    ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_publish",
+        "NO ROW READ. Takes `pg_advisory_xact_lock` on a hash of the map's tenancy key so the \
+         nightly and the naming step's write serialise their publish of one map; it touches no \
+         table.",
+    ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_build",
+        "NO ROW READ. Takes the session-level `pg_advisory_lock` on the same key as \
+         lock_map_for_publish, so an operator build and the nightly's publish of one map \
+         serialise; it touches no table.",
+    ),
+    (
+        "atlas_map.rs",
+        "unlock_map_for_build",
+        "NO ROW READ. Releases lock_map_for_build's session advisory lock; it touches no table.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
