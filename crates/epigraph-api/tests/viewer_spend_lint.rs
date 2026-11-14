@@ -190,7 +190,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
-            "sqlx::query(UPDATE).execute",
         ],
     ),
     // stamped: the write transaction is stamped from the caller's viewer, and
@@ -851,6 +850,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
+    // stamped: the write runs on `write_as`, the transaction stamped from the
+    // caller's viewer; `set_source_reliability_conn` refuses a perspective the
+    // caller cannot see (404) or cannot update (403), and commits nothing.
+    (
+        "perspective.rs",
+        "set_source_reliability",
+        &["PerspectiveRepository::set_source_reliability_conn"],
+    ),
     // write on a transaction stamped with the caller's viewer; the system
     // agent and its declaration are agents reads.
     (
