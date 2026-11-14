@@ -15,7 +15,8 @@
 //!   the theme is about the query even though no single member is close.
 //!
 //! The member therefore appears on a `limit = 2` page if, and only if, the
-//! theme leg ran and was RRF-merged. Its private sibling (same theme, closer
+//! theme leg ran and was RRF-merged. Plain `recall` is the similarity route,
+//! so the theme leg is reached only through `recall_routed`. Its private sibling (same theme, closer
 //! to the query than the public member) must never appear for a viewer
 //! outside its group: the leg is viewer-scoped.
 
@@ -187,10 +188,51 @@ fn ids(results: &[epigraph_engine::RecallResult]) -> Vec<String> {
     results.iter().map(|r| r.claim_id.clone()).collect()
 }
 
-/// The pre-change behaviour, kept reachable: a pure-similarity page of 2 is the
-/// two ANN-nearest claims and never the farther theme member.
+/// The pre-change behaviour, kept reachable AND kept as plain `recall`'s: on the
+/// weak fixture, where Auto would traverse, a page of 2 is the two ANN-nearest
+/// claims and never the farther theme member. Plain `recall` must serve the
+/// same page, so existing callers (episcience synthesis seeding) are not moved
+/// onto the uncalibrated Auto thresholds; delegating `recall` to Auto fails it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn similarity_route_is_ann_only(pool: PgPool) {
+    let c = seed(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, c.outsider)
+        .await
+        .expect("viewer");
+    let routed = recall_routed(
+        &pool,
+        &scoped,
+        &viewer,
+        &embedder(),
+        "q",
+        2,
+        0.0,
+        RecallRoute::Similarity,
+    )
+    .await
+    .expect("recall");
+    let plain = recall(&pool, &scoped, &viewer, &embedder(), "q", 2, 0.0)
+        .await
+        .expect("recall");
+    for (name, page) in [("Similarity", &routed), ("plain recall", &plain)] {
+        let got = ids(page);
+        assert_eq!(got.len(), 2, "{name}: both ANN hits: {got:?}");
+        assert!(got.contains(&c.ann_a.to_string()), "{name}: {got:?}");
+        assert!(got.contains(&c.ann_b.to_string()), "{name}: {got:?}");
+        assert!(!got.contains(&c.member.to_string()), "{name}: {got:?}");
+        assert!(
+            page.iter().all(|r| !r.via_theme_traversal),
+            "{name} must not run the theme leg: {got:?}"
+        );
+    }
+}
+
+/// Route Auto: the ANN page is weak (max cosine ~0.33 < 0.4), so the theme leg
+/// runs and its top member is RRF-merged onto the page, displacing the weaker
+/// ANN hit. Fails on the pre-change code, which had no theme leg.
+#[sqlx::test(migrations = "../../migrations")]
+async fn auto_route_merges_theme_member_when_ann_is_weak(pool: PgPool) {
     let c = seed(&pool).await;
     let scoped = fixture::scoped_pool(&pool).await;
     let viewer = epigraph_db::Viewer::resolve(&pool, c.outsider)
@@ -204,30 +246,10 @@ async fn similarity_route_is_ann_only(pool: PgPool) {
         "q",
         2,
         0.0,
-        RecallRoute::Similarity,
+        RecallRoute::Auto,
     )
     .await
     .expect("recall");
-    let got = ids(&got);
-    assert_eq!(got.len(), 2, "both ANN hits: {got:?}");
-    assert!(got.contains(&c.ann_a.to_string()), "{got:?}");
-    assert!(got.contains(&c.ann_b.to_string()), "{got:?}");
-    assert!(!got.contains(&c.member.to_string()), "{got:?}");
-}
-
-/// `recall` (route Auto): the ANN page is weak (max cosine ~0.33 < 0.4), so the
-/// theme leg runs and its top member is RRF-merged onto the page, displacing
-/// the weaker ANN hit. Fails on the pre-change code, which had no theme leg.
-#[sqlx::test(migrations = "../../migrations")]
-async fn auto_route_merges_theme_member_when_ann_is_weak(pool: PgPool) {
-    let c = seed(&pool).await;
-    let scoped = fixture::scoped_pool(&pool).await;
-    let viewer = epigraph_db::Viewer::resolve(&pool, c.outsider)
-        .await
-        .expect("viewer");
-    let got = recall(&pool, &scoped, &viewer, &embedder(), "q", 2, 0.0)
-        .await
-        .expect("recall");
     let member = got
         .iter()
         .find(|r| r.claim_id == c.member.to_string())
@@ -327,7 +349,7 @@ async fn hierarchical_route_serves_only_theme_members(pool: PgPool) {
 }
 
 /// Auto does NOT traverse when the ANN page is dense and strong: with a claim
-/// at cosine 1.0 and a full page, the theme member stays off a page of 2.
+/// at cosine 1.0 and a full page of 5, the theme member stays off the page.
 #[sqlx::test(migrations = "../../migrations")]
 async fn auto_route_skips_theme_leg_when_ann_is_strong(pool: PgPool) {
     let c = seed(&pool).await;
@@ -344,9 +366,18 @@ async fn auto_route_skips_theme_leg_when_ann_is_strong(pool: PgPool) {
     let viewer = epigraph_db::Viewer::resolve(&pool, c.outsider)
         .await
         .expect("viewer");
-    let got = recall(&pool, &scoped, &viewer, &embedder(), "q", 5, 0.0)
-        .await
-        .expect("recall");
+    let got = recall_routed(
+        &pool,
+        &scoped,
+        &viewer,
+        &embedder(),
+        "q",
+        5,
+        0.0,
+        RecallRoute::Auto,
+    )
+    .await
+    .expect("recall");
     assert!(
         got.iter().all(|r| !r.via_theme_traversal),
         "a strong, full ANN page must not trigger the theme leg: {:?}",

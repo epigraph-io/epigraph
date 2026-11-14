@@ -19,7 +19,10 @@
 //! # Routes (backlog a47df8ed)
 //!
 //! [`recall_routed`] takes a [`RecallRoute`]; [`recall`] is
-//! [`RecallRoute::Auto`].
+//! [`RecallRoute::Similarity`], so its existing callers (episcience synthesis
+//! seeding) keep the page they had before the theme leg existed. Auto and
+//! Hierarchical are opt-in through [`recall_routed`]; `RecallRoute` has no
+//! `Default`, so a caller that offers a route must choose its default itself.
 //!
 //! - **Similarity** is the System-1 leg alone: ANN over `claims.embedding`.
 //! - **Hierarchical** is the System-2 leg alone: the query's nearest themes
@@ -98,12 +101,14 @@ pub struct RecallResult {
 }
 
 /// Which retrieval legs a recall runs (backlog a47df8ed). See the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Deliberately no `Default`: [`recall`] pins `Similarity`, and which route a
+/// caller-facing `route=` parameter defaults to is that surface's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecallRoute {
     /// ANN, plus the theme leg RRF-merged in when the ANN page is sparse.
-    #[default]
     Auto,
-    /// ANN only: the behaviour before the theme leg existed.
+    /// ANN only: the behaviour before the theme leg existed, and [`recall`]'s.
     Similarity,
     /// Theme traversal only.
     Hierarchical,
@@ -256,6 +261,9 @@ fn format_pgvector(vec: &[f32]) -> String {
 
 /// Semantic recall: embed the query, find similar claims, filter by truth.
 ///
+/// Runs [`RecallRoute::Similarity`], the ANN leg alone; use [`recall_routed`]
+/// for the theme-traversal routes.
+///
 /// Falls back to an ILIKE text search over current claims
 /// ([`text_search_fallback`]) when `embedder` returns an error (e.g.
 /// embeddings disabled, no API key).
@@ -302,7 +310,7 @@ pub async fn recall(
         query,
         limit,
         min_truth,
-        RecallRoute::Auto,
+        RecallRoute::Similarity,
     )
     .await
 }
@@ -310,7 +318,7 @@ pub async fn recall(
 /// [`recall`] with an explicit [`RecallRoute`] (backlog a47df8ed).
 ///
 /// Same parameters, errors and fallback as [`recall`], which is this function
-/// at [`RecallRoute::Auto`].
+/// at [`RecallRoute::Similarity`].
 #[allow(clippy::too_many_arguments)]
 pub async fn recall_routed(
     pool: &PgPool,
@@ -802,7 +810,6 @@ mod tests {
             assert_eq!(r.as_str().parse::<RecallRoute>(), Ok(r));
         }
         assert!("ann".parse::<RecallRoute>().is_err());
-        assert_eq!(RecallRoute::default(), RecallRoute::Auto);
     }
 
     /// Confirm `MockProvider` satisfies the `EmbeddingService` bound required by
