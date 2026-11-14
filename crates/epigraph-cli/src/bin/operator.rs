@@ -444,8 +444,10 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Who holds a group through its role bindings at an instant (migration
-    /// 165): each role holder and each agent registered to one. Read-only.
+    /// Who holds a group at an instant: each role-binding member (migration
+    /// 165: a role holder, or an agent registered to one) on a `MEMBER` line,
+    /// then each DIRECT member (a `group_memberships` row live at that
+    /// instant, migration 060) on a `DIRECT` line. Read-only.
     GroupRoster {
         /// The group.
         #[arg(long)]
@@ -2021,11 +2023,18 @@ async fn main_inner() -> anyhow::Result<i32> {
                     row.agent, row.role, row.holder
                 );
             }
-            println!(
-                "members={}\tgroup={group}\tat={}",
-                rows.len(),
-                at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339())
-            );
+            let at_text = at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339());
+            println!("members={}\tgroup={group}\tat={at_text}", rows.len());
+            let direct = group_role::direct_members(&mut conn, group, at).await?;
+            for d in &direct {
+                println!(
+                    "DIRECT\tagent={}\trole={}\tsource=direct\tjoined={}",
+                    d.agent,
+                    d.role,
+                    d.joined_at.to_rfc3339()
+                );
+            }
+            println!("direct={}\tgroup={group}\tat={at_text}", direct.len());
             Ok(0)
         }
         Command::GroupMember { action } => {

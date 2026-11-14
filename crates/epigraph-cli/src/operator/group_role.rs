@@ -1,6 +1,7 @@
 //! `define-group-role`, `bind-group-role`, `end-group-role-binding` and
 //! `group-roster`: a group whose membership FOLLOWS a platform role
-//! (migration 165), on the maintenance DSN.
+//! (migration 165), on the maintenance DSN. `group-roster` also lists the
+//! group's DIRECT members (`group_memberships`), on their own lines.
 //!
 //! A binding makes every registered human holding a live assignment of the
 //! role (its `grant-role` window) a `reader` or `writer` of the group, and,
@@ -250,6 +251,50 @@ pub async fn roster(
             agent,
             role,
             holder,
+        })
+        .collect())
+}
+
+/// One DIRECT member of a group: a `group_memberships` row (migration 060),
+/// added by `group-member add` or the group's own creation, not derived from
+/// a role binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectRow {
+    pub agent: Uuid,
+    /// `reader`, `writer` or `admin`.
+    pub role: String,
+    pub joined_at: DateTime<Utc>,
+}
+
+/// The direct members of `group` live at `at` (now when `None`): joined at or
+/// before it, and not revoked by then. Read-only. A role binding's derived
+/// members are [`roster`]'s; a check that a person can read or write the group
+/// needs both.
+///
+/// # Errors
+/// A statement failed.
+pub async fn direct_members(
+    conn: &mut PgConnection,
+    group: Uuid,
+    at: Option<DateTime<Utc>>,
+) -> anyhow::Result<Vec<DirectRow>> {
+    let rows: Vec<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT agent_id, role::text, joined_at FROM group_memberships \
+          WHERE group_id = $1 \
+            AND joined_at <= COALESCE($2, now()) \
+            AND (revoked_at IS NULL OR revoked_at > COALESCE($2, now())) \
+          ORDER BY joined_at, agent_id",
+    )
+    .bind(group)
+    .bind(at)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(agent, role, joined_at)| DirectRow {
+            agent,
+            role,
+            joined_at,
         })
         .collect())
 }
