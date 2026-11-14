@@ -1417,7 +1417,7 @@
       ctx.strokeStyle = colour;
       ctx.lineWidth = style.width * zoom;
       ctx.setLineDash(style.dash);
-      ctx.globalAlpha = style.flows ? 0.7 : 0.3;
+      ctx.globalAlpha = style.alpha;
       ctx.beginPath();
       ctx.moveTo(x0, y0);
       ctx.lineTo(x1, y1);
@@ -1552,7 +1552,11 @@
         const other = leaf.childById.get(otherEnd(e));
         if (!other) continue;
         const style = NESTED.edgeStyle(e);
-        const weight = style.flows ? ' · ' + (num(e.flow_weight) || 0).toFixed(2) + (style.estimate ? ' (estimate)' : '') : '';
+        const weight = style.flows
+          ? ' · ' + (num(e.flow_weight) || 0).toFixed(2) + (style.estimate ? ' (estimate)' : '')
+          : style.noMass
+            ? ' · no stored mass'
+            : '';
         const li = el('li');
         li.appendChild(button('atlas__item', e.relationship.toLowerCase() + ': ' + other.label + weight, () => select(other, true)));
         ul.appendChild(li);

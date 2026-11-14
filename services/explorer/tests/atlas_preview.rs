@@ -495,6 +495,36 @@ async fn the_preview_page_carries_the_banner_and_no_inline_script() {
     }
 }
 
+/// The leaf legend keys the massless evidence line, apart from the solid
+/// exact flow and the dashed estimate, with a style the stylesheet defines.
+#[tokio::test]
+async fn the_leaf_legend_keys_evidence_with_no_stored_mass() {
+    let router = preview_router();
+    let body = get(&router, PAGE_PATH).await.text();
+    let at = body
+        .find(r#"data-role="leaf-legend""#)
+        .expect("the leaf legend is in the page");
+    let legend = &body[at..at + body[at..].find("</div>").unwrap()];
+    let keys: Vec<&str> = legend
+        .split(r#"<span class="atlas__key">"#)
+        .skip(1)
+        .collect();
+    let nomass = keys
+        .iter()
+        .find(|k| k.contains("evidence, no stored mass"))
+        .expect("a legend entry for evidence with no stored mass");
+    assert!(nomass.contains("atlas__line--nomass"), "{nomass}");
+    for other in ["atlas__line--exact", "atlas__line--proxy"] {
+        assert!(!nomass.contains(other), "{nomass}");
+        assert!(legend.contains(other), "the {other} key stays");
+    }
+    let css = get(&router, "/static/atlas.css").await.text();
+    assert!(
+        css.contains(".atlas__line--nomass {"),
+        "styled in atlas.css"
+    );
+}
+
 /// The preview mounts no route that reaches the API: every Explorer page and
 /// BFF route is absent, so a preview on a host with a live API cannot read it.
 #[tokio::test]

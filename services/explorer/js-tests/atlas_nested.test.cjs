@@ -53,7 +53,8 @@ test('proxy edges are dashed estimates; exact and no-flow edges are solid', () =
   const none = N.edgeStyle(edge({ flow_basis: 'none', sign: 0, flow_weight: 0, relationship: 'AUTHORED' }));
   assert.deepEqual(none.dash, []);
   assert.equal(none.flows, false);
-  // The style never comes from the relationship's name or casing.
+  // A flowing edge's style never comes from its relationship's name or
+  // casing; only a none edge's tone does (see the sparse-mass tests).
   const a = N.edgeStyle(edge({ relationship: 'supports' }));
   const b = N.edgeStyle(edge({ relationship: 'SUPPORTS' }));
   const c = N.edgeStyle(edge({ relationship: 'refutes' }));
@@ -137,6 +138,133 @@ test('a signed link with weight 0 keeps its tone but carries no flow', () => {
   assert.ok(N.edgeStyle(edge({ flow_basis: 'proxy', sign: -1, flow_weight: 0 })).estimate);
   // Sign 0 (cites) stays neutral at any weight the contract allows.
   assert.equal(N.edgeStyle(edge({ sign: 0, flow_weight: 0 })).tone, 'neutral');
+});
+
+// Evidence with no readable mass is served flow_basis none, weight 0 and
+// sign 0 whatever it says about the claim, so its direction is in its
+// relationship. These read the committed contract fixture, not a hand-made
+// edge, so the basis, sign and weight are the ones a builder serves.
+const sparse = () => {
+  const leaf = fixture('team_leaf_sparse_mass');
+  const kinds = new Map(leaf.nodes.map((n) => [n.id, n.kind]));
+  const fromEvidence = leaf.edges.filter((e) => kinds.get(e.source) === 'evidence');
+  const rel = (e) => e.relationship.toLowerCase();
+  return {
+    none: (r) => fromEvidence.filter((e) => e.flow_basis === 'none' && rel(e) === r),
+    exact: fromEvidence.filter((e) => e.flow_basis === 'exact'),
+  };
+};
+
+/** A massless evidence edge: no flow at all, solid, and not an estimate. */
+function assertNoFlow(s, why) {
+  assert.equal(s.flows, false, why);
+  assert.equal(s.particles, 0, why);
+  assert.equal(s.direction, 0, why);
+  assert.deepEqual(N.particleFractions(4.2, s, 0.3), [], why);
+  assert.deepEqual(s.dash, [], why + ': solid, never the dashed estimate');
+  assert.equal(s.estimate, false, why);
+  assert.equal(s.noMass, true, why);
+}
+
+/** What a viewer sees of a drawn style: no internal flag. */
+const look = (s) => JSON.stringify([s.width, s.alpha, s.dash, s.tone, s.particles > 0]);
+
+test('a none evidence edge that refutes gets the opposing tone and no flow', () => {
+  const refutes = sparse().none('refutes');
+  assert.ok(refutes.length > 0, 'the fixture holds a none refutes evidence edge');
+  for (const e of refutes) {
+    assert.equal(e.sign, 0, 'served with sign 0: the direction is in the relationship');
+    const s = N.edgeStyle(e);
+    assert.equal(s.tone, 'oppose', JSON.stringify(e));
+    assertNoFlow(s, JSON.stringify(e));
+  }
+  // contradicts reads the same way, in either casing.
+  const c = N.edgeStyle(Object.assign({}, refutes[0], { relationship: 'CONTRADICTS' }));
+  assert.equal(c.tone, 'oppose');
+  assertNoFlow(c, 'contradicts');
+});
+
+test('a none evidence edge that supports gets the supporting tone and no flow', () => {
+  const supports = sparse().none('supports');
+  assert.ok(supports.length > 0, 'the fixture holds a none supports evidence edge');
+  const upper = supports.filter((e) => e.relationship === 'SUPPORTS');
+  assert.ok(upper.length > 0, 'and one spelled SUPPORTS');
+  for (const e of supports) {
+    assert.equal(e.sign, 0);
+    const s = N.edgeStyle(e);
+    assert.equal(s.tone, 'support', JSON.stringify(e));
+    assertNoFlow(s, JSON.stringify(e));
+  }
+});
+
+test('a massless evidence line is told apart from exact flows and dashed estimates', () => {
+  const sup = N.edgeStyle(sparse().none('supports')[0]);
+  const opp = N.edgeStyle(sparse().none('refutes')[0]);
+  const others = [
+    // exact flows, and an exact signed edge stored with weight 0
+    N.edgeStyle(edge({ flow_basis: 'exact', sign: 1, flow_weight: 0.5 })),
+    N.edgeStyle(edge({ flow_basis: 'exact', sign: -1, flow_weight: 0.5 })),
+    N.edgeStyle(edge({ flow_basis: 'exact', sign: 1, flow_weight: 0 })),
+    N.edgeStyle(edge({ flow_basis: 'exact', sign: -1, flow_weight: 0 })),
+    // dashed estimates, flowing or not
+    N.edgeStyle(edge({ flow_basis: 'proxy', sign: 1, flow_weight: 0.5 })),
+    N.edgeStyle(edge({ flow_basis: 'proxy', sign: -1, flow_weight: 0 })),
+  ];
+  for (const s of [sup, opp]) {
+    for (const o of others) assert.notEqual(look(s), look(o), look(s) + ' vs ' + look(o));
+    assert.ok(s.width < N.flowWidth(0.01), 'thinner than any flow');
+    assert.ok(s.width > N.HAIRLINE, 'and wider than a hairline, so its tone reads');
+  }
+  assert.notEqual(look(sup), look(opp));
+});
+
+test('an exact evidence edge is unchanged: its sign, not its relationship, sets its style', () => {
+  const exact = sparse().exact;
+  assert.ok(exact.length > 0, 'the fixture keeps some exact evidence beside the none edges');
+  for (const e of exact) {
+    const s = N.edgeStyle(e);
+    assert.equal(s.basis, 'exact');
+    assert.equal(s.tone, e.sign > 0 ? 'support' : 'oppose', JSON.stringify(e));
+    assert.equal(s.flows, e.flow_weight > 0, JSON.stringify(e));
+    assert.equal(s.width, e.flow_weight > 0 ? N.flowWidth(e.flow_weight) : N.HAIRLINE);
+    assert.equal(s.direction, e.flow_weight > 0 ? e.sign : 0);
+    assert.deepEqual(s.dash, []);
+    assert.ok(!s.noMass, JSON.stringify(e));
+  }
+  // An exact edge whose name disagrees with its sign follows the sign.
+  for (const [sign, rel, tone] of [
+    [1, 'refutes', 'support'],
+    [-1, 'supports', 'oppose'],
+  ]) {
+    const s = N.edgeStyle(edge({ flow_basis: 'exact', sign, flow_weight: 0.4, relationship: rel }));
+    assert.equal(s.tone, tone, rel);
+    assert.equal(s.direction, sign, rel);
+    assert.ok(s.flows && !s.noMass, rel);
+  }
+  // A none edge that is not evidence for or against (an agent's authorship)
+  // stays neutral.
+  for (const rel of ['authored', 'AUTHORED', 'asserts']) {
+    const s = N.edgeStyle(edge({ flow_basis: 'none', sign: 0, flow_weight: 0, relationship: rel }));
+    assert.equal(s.tone, 'neutral', rel);
+    assert.ok(!s.noMass, rel);
+  }
+});
+
+test('the preview has a leaf with massless evidence for and against, drawn in tone', () => {
+  let shown = 0;
+  for (const d of previewLevels()) {
+    if (d.kind !== 'leaf') continue;
+    const kinds = new Map(d.nodes.map((n) => [n.id, n.kind]));
+    const tones = new Set(
+      d.edges
+        .filter((e) => kinds.get(e.source) === 'evidence' && e.flow_basis === 'none')
+        .map((e) => N.edgeStyle(e))
+        .filter((s) => s.noMass)
+        .map((s) => s.tone),
+    );
+    if (tones.has('support') && tones.has('oppose')) shown += 1;
+  }
+  assert.ok(shown > 0, 'a preview leaf shows the sparse-mass case');
 });
 
 test('the switch leads to the other hierarchy, and nothing else', () => {

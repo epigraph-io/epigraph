@@ -6,12 +6,17 @@
  * atlas.js loads it first and reads it as the global AtlasNested.
  *
  * - Belief as flow: an edge's look comes from its flow_basis, sign and
- *   flow_weight only, never from its relationship name (stored in either
+ *   flow_weight, never from its relationship name (stored in either
  *   casing). Width grows with flow_weight; proxy (claim to claim, link
  *   strength x sign, no belief factor) is dashed and labelled an estimate;
  *   exact (evidence to claim, the stored mass) is solid; sign sets the tone
  *   (supporting or opposing) and which way particles run. A zero-weight edge
  *   (cites, an agent's authorship) is a hairline and carries no flow.
+ * - The one exception: evidence with no readable mass is served
+ *   flow_basis none, weight 0 and sign 0 whatever it says, so a none edge
+ *   takes its tone from its relationship (supports; refutes or contradicts).
+ *   It is drawn as a thin solid line with no flow ("evidence, no stored
+ *   mass"), apart from both exact flows and dashed estimates.
  * - Positions are the precomputed ones: leafPositions and placeChildren are
  *   affine maps into the parent circle, with no simulation and no settle.
  * - Colour still means truth_value, as on the region and theme levels; no
@@ -34,6 +39,14 @@
   /** A theme the picked map does not draw. */
   const NOT_ON_MAP = 'Not on this map';
   const HAIRLINE = 0.6;
+  /** A massless evidence line: thicker than a hairline, thinner than any flow. */
+  const NO_MASS_WIDTH = 0.9;
+  /** A none edge's relationship, lower-cased, and the tone it reads as. */
+  const NO_MASS_TONES = { supports: 'support', refutes: 'oppose', contradicts: 'oppose' };
+  /** Stroke opacity: a flow, a massless evidence line, any other line. */
+  const FLOW_ALPHA = 0.7;
+  const NO_MASS_ALPHA = 0.55;
+  const IDLE_ALPHA = 0.3;
   const PROXY_DASH = [6, 4];
   /** Fraction of an edge a particle travels per second. */
   const PARTICLE_SPEED = 0.35;
@@ -85,10 +98,25 @@
   }
 
   /**
+   * The tone of a none edge that is evidence for or against its claim, from
+   * its relationship (either casing), or null for any other none edge (an
+   * agent's authorship). Its sign is 0, so the name is all there is.
+   */
+  function noMassTone(relationship) {
+    if (typeof relationship !== 'string') return null;
+    const key = relationship.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(NO_MASS_TONES, key) ? NO_MASS_TONES[key] : null;
+  }
+
+  /**
    * How a leaf edge is drawn. `basis` is exact | proxy | none; anything else
-   * counts as none. Returns {width, dash, estimate, tone, direction,
-   * particles, flows}. `tone` follows the sign whatever the weight; width,
-   * direction and particles need a weight above 0 and a non-zero sign.
+   * counts as none. Returns {basis, width, alpha, dash, estimate, tone,
+   * direction, particles, flows, noMass}. For exact and proxy edges `tone` follows the
+   * sign whatever the weight; width, direction and particles need a weight
+   * above 0 and a non-zero sign. A none edge never flows; one that supports,
+   * refutes or contradicts is evidence with no stored mass (`noMass`), toned
+   * by that relationship and drawn NO_MASS_WIDTH wide at NO_MASS_ALPHA, so
+   * its colour reads where a hairline's would not.
    */
   function edgeStyle(edge) {
     const e = edge || {};
@@ -96,17 +124,22 @@
     const weight = clamp01(e.flow_weight);
     const direction = flowDirection(e.sign);
     const flows = basis !== 'none' && weight > 0 && direction !== 0;
+    const massless = basis === 'none' ? noMassTone(e.relationship) : null;
+    // Otherwise the tone comes from the sign alone: a contradicting link
+    // stored with strength 0 still reads as opposing, though it carries no
+    // flow.
+    const signTone = direction > 0 ? 'support' : direction < 0 ? 'oppose' : 'neutral';
     return {
       basis,
-      width: flows ? flowWidth(weight) : HAIRLINE,
+      width: flows ? flowWidth(weight) : massless ? NO_MASS_WIDTH : HAIRLINE,
+      alpha: flows ? FLOW_ALPHA : massless ? NO_MASS_ALPHA : IDLE_ALPHA,
       dash: basis === 'proxy' ? PROXY_DASH.slice() : [],
       estimate: basis === 'proxy',
-      // The tone comes from the sign alone: a contradicting link stored with
-      // strength 0 still reads as opposing, though it carries no flow.
-      tone: direction > 0 ? 'support' : direction < 0 ? 'oppose' : 'neutral',
+      tone: massless || signTone,
       direction: flows ? direction : 0,
       particles: flows ? particleCount(weight) : 0,
       flows,
+      noMass: massless !== null,
     };
   }
 
@@ -406,6 +439,7 @@
     PLACEHOLDER,
     NOT_ON_MAP,
     HAIRLINE,
+    NO_MASS_WIDTH,
     displayName,
     isPlaceholder,
     flowWidth,

@@ -427,6 +427,12 @@
   border-top-color: var(--atlas-critical);
 }
 
+/* Evidence with no stored mass: thin and solid, with no flow. */
+.atlas__line--nomass {
+  border-top-width: 1px;
+  opacity: 0.7;
+}
+
 .atlas__glyph {
   display: inline-block;
   width: 0.6rem;
