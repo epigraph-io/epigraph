@@ -768,7 +768,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-const HIGH_WATER: usize = 210;
+/// 210 -> 209: `supersede_claim`'s detached factor-query spawn in
+/// `routes/versioning.rs`, whose only effect was a log line, was deleted
+/// (backlog 79e1f75d); the file keeps 1 site.
+const HIGH_WATER: usize = 209;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1137,7 +1140,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (`AppState::admin_cascade_session`). What remains is `supersede_claim`'s
     // detached factor-query spawn and `mark_duplicate`'s best-effort provenance
     // append. Read off this test's failure output.
-    ("routes/versioning.rs", 2),
+    //
+    // 2 -> 1 (backlog 79e1f75d): the factor-query spawn, whose only effect
+    // was a log line, was deleted. What remains is `mark_duplicate`'s
+    // best-effort provenance append. Read off this test's failure output
+    // (`recorded 2, measured 1`).
+    ("routes/versioning.rs", 1),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is

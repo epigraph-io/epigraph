@@ -8,24 +8,19 @@
 //! claim is created that explicitly supersedes the old one. This preserves the
 //! full epistemic history: every version of a belief is recorded and traceable.
 //!
-//! # Tenancy: 1 of this file's 9 raw-pool sites is converted
+//! # Tenancy: one raw-pool site remains
 //!
-//! Conversion shard 7. `claim_history` runs
-//! `ClaimRepository::version_history` on a viewer-stamped connection from
-//! [`AppState::read_as`]; the statement already spliced the viewer, and what
-//! changed is which connection carries the session GUCs the `claims` policy
-//! reads.
+//! `claim_history` reads on a viewer-stamped connection from
+//! [`AppState::read_as`]. `supersede_claim` and `mark_duplicate` read their
+//! authority target on a stamped connection, run their act on a transaction
+//! stamped with the caller's viewer (`AppState::write_as`), and run their
+//! administrative cascade on the maintenance connection.
 //!
-//! The other 8 sites WRITE — six in `supersede_claim`, two in `mark_duplicate`.
-//! One of the six is blocked a second time at SITE level:
-//! `let pool = state.db_pool.clone()` is moved into a detached `tokio::spawn`,
-//! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
-//! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
-//!
-//! `supersede_claim`'s ownership read (`F-write-authz-reads-unfiltered`) is
-//! now viewer-filtered on a stamped connection (batch H6): a caller cannot
-//! supersede a claim it cannot read. The write itself is still on the raw
-//! pool, and it is still one of the 8 sites above.
+//! The one site left on `state.db_pool` is `mark_duplicate`'s best-effort
+//! provenance append (`crates/epigraph-db/tests/no_unscoped_pool.rs` counts
+//! it). `supersede_claim`'s detached factor-query spawn, which only logged how
+//! many factors referenced the replacement, was deleted (backlog 79e1f75d):
+//! the administrative cascade's belief re-derivation is what repairs them.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -547,47 +542,6 @@ pub async fn supersede_claim(
     let embedded = state
         .embed_committed_claim_as(&viewer, new_uuid, &request.content, "supersede_claim.embed")
         .await;
-
-    // 10. Trigger belief propagation for downstream factors (fire-and-forget).
-    //
-    // Supersession creates stale downstream beliefs: any factor that referenced
-    // the old claim via variable_ids now needs its beliefs re-propagated from
-    // the new claim. We identify affected factors here and log them so Task 6
-    // (unified BP dispatcher) can pick them up. The spawn is intentionally
-    // non-blocking — a propagation failure must never abort a supersession.
-    {
-        let pool = state.db_pool.clone();
-        tokio::spawn(async move {
-            let factor_ids: Result<Vec<(Uuid,)>, sqlx::Error> =
-                sqlx::query_as("SELECT id FROM factors WHERE $1 = ANY(variable_ids)")
-                    .bind(new_uuid)
-                    .fetch_all(&pool)
-                    .await;
-
-            match factor_ids {
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %new_uuid,
-                        error = %e,
-                        "BP trigger: failed to query factors for new claim after supersession"
-                    );
-                }
-                Ok(rows) if rows.is_empty() => {
-                    tracing::debug!(
-                        claim_id = %new_uuid,
-                        "BP trigger: no factors reference new claim, skipping propagation"
-                    );
-                }
-                Ok(rows) => {
-                    tracing::info!(
-                        claim_id = %new_uuid,
-                        factor_count = rows.len(),
-                        "BP trigger: supersession requires belief propagation across factors"
-                    );
-                }
-            }
-        });
-    }
 
     Ok((
         StatusCode::CREATED,
