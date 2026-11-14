@@ -487,11 +487,21 @@ gets forgotten.
 
 Related but not the same:
 
-- **Cross-agent backlog retire** is not allowed via
-  `resolve_backlog_item` directly — it enforces owner-equality. The
-  workaround is a free-text "Resolves <UUID>:" prefix on the
-  resolution claim and letting the daily reconciler patch the
-  label (user-memory `feedback_cross_agent_backlog_retire.md`).
+- **Who may retire an item.** `resolve_backlog_item` checks who owns
+  the original claim, and the same check runs on any `update_labels`,
+  `patch_claim` or `update_with_evidence` call that adds or removes
+  `resolved`. The owner is the claim's author. On stdio it is also an
+  agent linked to the same operator as the author (so an agent whose
+  model was bumped, and which therefore runs under a new identity, can
+  retire its predecessor's items) and an agent live-linked to the
+  author itself (its delegate). Over HTTP it is the author's operator
+  or a live delegated run token, and a `claims:admin` token also
+  passes. A stdio agent that shares no operator with the author is
+  refused, and so is a stdio server with no declared signer
+  (`--agent-key` / `--agent-model`) on any claim it did not author.
+  There is no free-text workaround: a bare "Resolves <UUID>:" claim is
+  exactly the drift the "Do **not**" list above forbids. If you are
+  refused, have an owner retire the item.
 - **EpiClaw dedup-first rule** — EpiClaw's `CLAUDE.md` requires a
   `recall()` and a restatement test *before* `submit_claim` or
   `memorize`, including before filing a backlog item. This stops

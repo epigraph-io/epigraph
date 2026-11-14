@@ -24,6 +24,34 @@ Do NOT:
 If you find yourself reaching for raw SQL or `update_labels` after a resolution,
 that's a sign you should be using `resolve_backlog_item` instead.
 
+## Who may retire an item
+
+`resolved` is the one label with retirement semantics, so it is gated on every
+transport (issue #374). `resolve_backlog_item` requires ownership of the
+original claim, and `update_labels`, `patch_claim` and `update_with_evidence`'s
+`labels` merge apply the same check whenever a call adds or removes `resolved`.
+
+An owner is:
+
+- the claim's author;
+- on stdio, an agent linked to the same operator as the author (this is what
+  lets an agent whose model was bumped retire its predecessor's items), or an
+  agent live-linked to the author itself (its delegate: one hop, and a retired
+  link grants nothing);
+- over HTTP, the author's operator, or a live delegated run token. A
+  `claims:admin` token also passes.
+
+Refused: a stdio agent that shares no operator with the author and is not its
+delegate, and a stdio server with no declared signer (`--agent-key` /
+`--agent-model`) on any claim it did not author. Over HTTP the whole label
+mutation needs that ownership, whatever the labels; on stdio every other label
+stays ungated.
+
+A refusal is not a reason to file a free-text "Resolves <UUID>" claim. Have an
+owner retire the item. The rule's implementation and its reasoning are in
+`crates/epigraph-mcp/src/tools/claims.rs` (`require_owner_or_admin`,
+`gate_retirement_label`).
+
 ## Querying open backlog
 
 ```python
