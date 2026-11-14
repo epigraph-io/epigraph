@@ -173,3 +173,86 @@ async fn a_database_without_173_at_all_still_boots(pool: PgPool) {
         "173's triggers must be required only where one of 173's functions says 173 ran"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Migration 210's tier: the Atlas map tables' root triggers and the three
+// staleness triggers
+// ---------------------------------------------------------------------------
+//
+// A dropped or disabled staleness trigger errors nowhere: a row leaves a map's
+// readable set, no epoch moves, and a stored map keeps reporting itself
+// current. 210 has three functions, and any one present means 210 ran.
+
+/// 210's staleness triggers, spelled here for the same reason as [`TRIGGER`].
+const STALE_TRIGGERS_210: &[(&str, &str)] = &[
+    ("claims", "claims_atlas_map_stale"),
+    ("edges", "edges_atlas_map_stale"),
+    ("evidence", "evidence_atlas_map_stale"),
+];
+
+/// Dropped 210 staleness triggers are refused, each one named, even with one
+/// of 210's three functions dropped alongside.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dropped_210_staleness_triggers_are_refused(pool: PgPool) {
+    for (rel, tg) in STALE_TRIGGERS_210 {
+        sqlx::query(&format!("DROP TRIGGER {tg} ON public.{rel}"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("drop 210 trigger {tg}: {e}"));
+    }
+    sqlx::query("DROP FUNCTION public.epigraph_atlas_map_stale()")
+        .execute(&pool)
+        .await
+        .expect("drop one 210 function");
+
+    let state = AppState::with_db(pool, ApiConfig::default());
+    let msg = state
+        .assert_tenancy_triggers_armed()
+        .await
+        .expect_err("a database at 210 without its staleness triggers must not serve")
+        .to_string();
+    for (rel, tg) in STALE_TRIGGERS_210 {
+        assert!(
+            msg.contains(&format!("{rel}.{tg}")),
+            "the refusal must name {rel}.{tg}; got: {msg}"
+        );
+    }
+}
+
+/// A disabled staleness trigger is refused too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_disabled_210_staleness_trigger_is_refused(pool: PgPool) {
+    sqlx::query("ALTER TABLE public.claims DISABLE TRIGGER claims_atlas_map_stale")
+        .execute(&pool)
+        .await
+        .expect("disable");
+    let state = AppState::with_db(pool, ApiConfig::default());
+    let msg = state
+        .assert_tenancy_triggers_armed()
+        .await
+        .expect_err("a disabled staleness trigger must not serve")
+        .to_string();
+    assert!(
+        msg.contains("claims.claims_atlas_map_stale"),
+        "the refusal must name the disabled trigger; got: {msg}"
+    );
+}
+
+/// The discriminator: a database with 210 undone by its documented runbook is
+/// behind, not broken, and boots.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_database_with_210_undone_still_boots(pool: PgPool) {
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/210-undo.sql"),
+    )
+    .expect("210-undo.sql");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("run 210's undo");
+    let state = AppState::with_db(pool, ApiConfig::default());
+    assert!(
+        state.assert_tenancy_triggers_armed().await.is_ok(),
+        "210's triggers must be required only where one of 210's functions says 210 ran"
+    );
+}

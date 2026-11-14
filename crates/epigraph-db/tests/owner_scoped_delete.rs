@@ -2055,9 +2055,11 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     // neighbours, which 173 gives 115's policy and guard.
     // 26 -> 27 (ruling R-74): migration 183's `workflows`, with
     // `workflows_delete_owner` and `workflows_owner_immutable`.
+    // 27 -> 30 (Atlas W2, backlog 77f4bf09): migration 210's three
+    // `atlas_map_*` tables, each with `<t>_delete_owner` and `<t>_owner_immutable`.
     assert_eq!(
         rows.len(),
-        27,
+        30,
         "the tier-A set changed size; decide its DELETE rule: {rows:?}"
     );
     let missing: Vec<&String> = rows
@@ -2094,7 +2096,8 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     .await
     .expect("delete policy quals");
     // 26 -> 27 (ruling R-74): migration 183's `workflows_delete_owner`.
-    assert_eq!(quals.len(), 27, "{quals:?}");
+    // 27 -> 30 (Atlas W2): migration 210's three `atlas_map_*_delete_owner`.
+    assert_eq!(quals.len(), 30, "{quals:?}");
     for (table, qual) in &quals {
         assert!(
             qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),
@@ -2246,7 +2249,16 @@ async fn every_unscoped_fk_cascade_into_tier_a_is_listed(pool: PgPool) {
     // `harvester_sources` also carries 115's restrictive DELETE policy, and
     // `harvester_fragments -> harvester_audit_reports` is a cascade between
     // two tables that both do, so neither pair can appear here.)
-    const ACCEPTED: &[(&str, &str)] = &[("graph_clusters", "claim_cluster_membership")];
+    //
+    // Migration 210 (Atlas W2) adds `claim_themes -> atlas_map_levels`: a level
+    // document is a materialization of one theme's groups in one nightly run,
+    // and a deleted theme leaves nothing for it to describe. The cascade only
+    // removes documents (fewer rows served, never more), and the next nightly
+    // writes a new run without them.
+    const ACCEPTED: &[(&str, &str)] = &[
+        ("claim_themes", "atlas_map_levels"),
+        ("graph_clusters", "claim_cluster_membership"),
+    ];
     let pairs: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT pc.relname::text, cc.relname::text \
            FROM pg_constraint k \
