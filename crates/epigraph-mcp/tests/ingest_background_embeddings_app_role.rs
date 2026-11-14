@@ -39,7 +39,7 @@ mod fixture;
 use std::sync::Arc;
 
 use epigraph_db::{ScopedPool, SessionGucMode};
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::background::BackgroundTasks;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::claims::submit_claim;

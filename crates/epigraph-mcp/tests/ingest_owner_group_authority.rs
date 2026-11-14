@@ -34,7 +34,7 @@ mod fixture;
 mod common;
 use common::*;
 
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
 use epigraph_mcp::types::IngestDocumentInlineParams;
 use sqlx::PgPool;

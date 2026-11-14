@@ -18,12 +18,13 @@ use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
-use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
+use epigraph_ingest::common::plan::PlannedClaim;
+use epigraph_ingest::document::builder::build_ingest_plan;
 use epigraph_ingest::document::schema::ByteSpan;
+use epigraph_ingest::document::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 use epigraph_ingest::document::structure::{
     parse_structure, slice_segmentation, SourceFormat, StructuredDoc,
 };
-use epigraph_ingest::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(

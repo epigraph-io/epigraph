@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use epigraph_crypto::AgentSigner;
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::tools::ingestion::{do_ingest_document_reporting, IngestTenancy};
 use epigraph_mcp::EpiGraphMcpFull;

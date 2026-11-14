@@ -1,13 +1,12 @@
-pub mod builder;
 pub mod common;
 pub mod document;
 pub mod errors;
-pub mod schema;
 pub mod workflow;
 
 #[cfg(test)]
 mod tests {
-    use crate::schema::{DocumentExtraction, SourceType, ThesisDerivation};
+    use crate::common::schema::ThesisDerivation;
+    use crate::document::schema::{DocumentExtraction, SourceType};
 
     #[test]
     fn test_parse_minimal_document_extraction() {
@@ -104,7 +103,8 @@ mod tests {
 
     // ── IngestPlan builder tests ─────────────────────────────────────
 
-    use super::builder::*;
+    use crate::common::paths::normalize_claim_path;
+    use crate::document::builder::build_ingest_plan;
 
     fn make_extraction(json: &str) -> DocumentExtraction {
         serde_json::from_str(json).expect("test JSON should parse")
@@ -374,8 +374,8 @@ mod tests {
             }]
         }"#;
         let ext: DocumentExtraction = serde_json::from_str(json).unwrap();
-        let plan1 = crate::builder::build_ingest_plan(&ext);
-        let plan2 = crate::builder::build_ingest_plan(&ext);
+        let plan1 = crate::document::builder::build_ingest_plan(&ext);
+        let plan2 = crate::document::builder::build_ingest_plan(&ext);
         let compounds1: Vec<_> = plan1
             .claims
             .iter()
@@ -745,7 +745,6 @@ mod tests {
 
     #[test]
     fn test_normalize_claim_path() {
-        use crate::builder::normalize_claim_path;
         // Slash format → bracket-dot format
         assert_eq!(
             normalize_claim_path("sections/0/paragraphs/1/atoms/2"),
@@ -780,7 +779,7 @@ mod tests {
             }]
         }"#;
         let extraction: DocumentExtraction = serde_json::from_str(json).unwrap();
-        let plan = crate::builder::build_ingest_plan(&extraction);
+        let plan = crate::document::builder::build_ingest_plan(&extraction);
         let cross_edges: Vec<_> = plan
             .edges
             .iter()
