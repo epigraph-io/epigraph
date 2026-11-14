@@ -195,10 +195,42 @@ show in the stored name:
 | a team map's names never draw on another team's private text | `a_team_maps_names_never_draw_on_another_teams_private_text` (+ `the_public_maps_prompts_hold_only_public_text`, `a_name_drawn_from_a_claim_that_narrowed_is_replaced`) |
 | a rerun over unchanged groups makes zero LLM calls | `a_rerun_over_unchanged_groups_makes_zero_calls` (and the pure `a_rerun_makes_no_call`) |
 
-Fail-on-old mutations (recorded below once measured): text taken from the
-documents' labels; text read without the map predicate; an inner key without
-the children's names; carry-over by id ignoring the key; validation that
-accepts a newline or a quote; the backend not removing `ANTHROPIC_API_KEY`.
+**Fail on old code** (measured on the branch: each mutation applied alone,
+the unit and DB targets run, then restored and `touch`ed):
+
+| Mutation | Tests that went red |
+|---|---|
+| member text taken from the documents' `label` fields | `a_team_maps_names_never_draw_on_another_teams_private_text`, `the_public_maps_prompts_hold_only_public_text`, `a_name_drawn_from_a_claim_that_narrowed_is_replaced` |
+| `claim_labels` without the map predicate | the same three |
+| key over the texts only (children's names left out) | `a_parent_is_renamed_when_a_child_name_changes`, `the_key_covers_the_children_names_the_members_and_the_map` |
+| carry-over by group id, ignoring the key | `a_parent_is_renamed_when_a_child_name_changes`, `a_changed_group_triggers_exactly_one_call`, `a_name_drawn_from_a_claim_that_narrowed_is_replaced` |
+| no carry-over at all | `a_rerun_makes_no_call`, `a_parent_is_renamed_when_a_child_name_changes`, `a_rerun_over_unchanged_groups_makes_zero_calls`, `a_changed_group_triggers_exactly_one_call` |
+| no sharing of one key within a run | `links_levels_are_named_and_an_identical_input_is_one_call`, `a_changed_group_triggers_exactly_one_call` |
+| validation accepts a control character (newline) | `invalid_replies_are_refused`, `invalid_replies_fall_back_and_are_retried` |
+| validation accepts a 5-word quote | `invalid_replies_are_refused`, `invalid_replies_fall_back_and_are_retried` |
+| `ANTHROPIC_API_KEY` / `CLAUDECODE` not removed | `the_cli_runs_without_an_api_key` |
+| named run records a fresh snapshot's epochs | `stored_named_documents_validate_and_agree` |
+| named run drops the source's params | `stored_named_documents_validate_and_agree` |
+| children's names not rewritten | `repeated_names_agree_with_each_group`, `stored_named_documents_validate_and_agree` |
+
+Not mutation-proved (direct properties): `a_plain_reply_is_accepted_and_trimmed`,
+`texts_are_clipped_and_flattened`, `the_sample_is_deterministic_and_order_free`,
+`the_budget_and_a_dry_run_defer_the_rest`, the stub-script error cases, and
+`the_binary_refuses_bad_arguments_before_connecting`.
+
+## Decisions to check
+
+- Carry-over by key, not by group id (above).
+- The meaning and links roots of a theme are named separately (their
+  children differ); they share a name only when their whole input is equal (a
+  theme that is one leaf).
+- No description: the contract has no field for one.
+- The binary keeps the source run's `algo` and adds `named_from_run` to the
+  params.
+- `claim_themes.label` is untouched. `label_themes_llm.py` still writes
+  team-private-sampled text into the global theme labels; the follow-up is to
+  retire it or restrict it to public text once W10 serves the per-map root
+  names.
 
 ## Needs prod measurement
 
