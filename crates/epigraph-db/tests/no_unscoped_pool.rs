@@ -771,7 +771,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 210 -> 207 when `routes/isomorphism.rs` was DELETED (backlog 54db73b5): a
 /// removal of never-compiled code, not a conversion, and its key went with it
 /// (`HIGH_WATER_FILES` falls by one).
-const HIGH_WATER: usize = 207;
+/// 207 -> 206 when `supersede_claim`'s detached factor-count spawn was deleted
+/// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
+const HIGH_WATER: usize = 206;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1144,7 +1146,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (`AppState::admin_cascade_session`). What remains is `supersede_claim`'s
     // detached factor-query spawn and `mark_duplicate`'s best-effort provenance
     // append. Read off this test's failure output.
-    ("routes/versioning.rs", 2),
+    //
+    // 2 -> 1 (backlog 79e1f75d): that detached factor-query spawn only logged a
+    // count and is DELETED, not converted. `mark_duplicate`'s provenance append
+    // is the one site left.
+    ("routes/versioning.rs", 1),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is
