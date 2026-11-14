@@ -84,13 +84,22 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("query_undecomposed_claims", "claims:read"),
     ("recall", "claims:read"),
     ("recall_with_context", "claims:read"),
+    // Proposes interval corrections from a viewer-stamped read and writes
+    // nothing (its own description says so); same tier as `sheaf_cohomology`.
+    ("reconcile_sheaf", "claims:read"),
     ("scoped_belief", "claims:read"),
     ("search_triples", "claims:read"),
     ("sheaf_cohomology", "claims:read"),
+    // Validates the submitted strings in memory; no database access at all.
+    ("stage_claims", "claims:read"),
     ("structure_source", "claims:read"),
     ("suggest_alternative_sets", "claims:read"),
     ("system_stats", "claims:read"),
     ("traverse", "claims:read"),
+    // Checks a stored signature and digest on a viewer-stamped read. At
+    // `claims:write` a read-scoped principal could read a claim but not ask
+    // whether it had been tampered with.
+    ("verify_claim", "claims:read"),
     // The caller's own elevation (elevation plan EL-11): `claims:read`
     // because neither reads nor writes a corpus row and neither is refused
     // to an elevated request; the authority is the database's (migration
@@ -136,12 +145,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("patch_edge", "claims:write"),
     ("refresh_workflow_promotion", "claims:write"),
     ("publish_event", "claims:write"),
-    ("reconcile_sheaf", "claims:write"),
     ("report_hierarchical_outcome", "claims:write"),
     ("report_workflow_outcome", "claims:write"),
     ("resolve_backlog_item", "claims:write"),
     ("set_source_reliability", "claims:write"),
-    ("stage_claims", "claims:write"),
     ("store_workflow", "claims:write"),
     ("submit_claim", "claims:write"),
     // Migration 207's write-only intake: the caller files into a group it
@@ -183,7 +190,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // Its reversal: each step through `update_labels` / `unmark_duplicate`.
     ("revert_label_dedup", "claims:write"),
     ("update_with_evidence", "claims:write"),
-    ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
     // Retirement withdraws an assertion another principal made (the matcher's,
     // never the caller's own), hence admin rather than the claims:write that
@@ -294,6 +300,19 @@ mod tests {
         // The k-means writer is retired (backlog a0ed0180): what remains is a
         // refusal, mapped at the read scope so every caller sees the reason.
         assert_eq!(required_scope("theme_cluster"), Some("claims:read"));
+    }
+
+    /// `verify_claim`, `reconcile_sheaf` and `stage_claims` write nothing: the
+    /// first two open only a viewer-stamped read (`server.read_as`) and the
+    /// third touches no database. They sat in the `claims:write` bucket
+    /// (backlog 6fb9e913), so a read-scoped principal could not verify a
+    /// claim's signature. Asserted by name because the coverage test passes
+    /// for any mapping.
+    #[test]
+    fn pure_read_tools_are_read_scoped() {
+        for tool in ["verify_claim", "reconcile_sheaf", "stage_claims"] {
+            assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
+        }
     }
 
     /// Sanity-check the known mutation tools cited in issue #122 are gated on
