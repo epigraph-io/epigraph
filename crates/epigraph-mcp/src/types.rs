@@ -2888,9 +2888,8 @@ pub struct TraverseNode {
     /// Dempster–Shafer pignistic probability when the node carries a DS cache,
     /// else `truth_value`. `None` for a non-claim node.
     ///
-    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
-    /// value of it could change which nodes are kept — so this equals
-    /// `truth_value` there.
+    /// The same value whatever `min_truth` was (backlog `1574d9b4`), and the
+    /// one `recall` reports as `belief_score` for the same claim and caller.
     pub belief_score: Option<f64>,
     pub depth: i32,
 }
