@@ -1149,8 +1149,9 @@ Current reservation:
   132)". Checked before claiming: no remote branch carries a `132`.
   **Applied to a throwaway database only, NOT to any deployed database.**
 
-- **133+**: public next (the elevation stack stays at or below 139; 140-159
-  are reserved)
+- **133+**: public (the elevation stack stays at or below 139; 140-159
+  are reserved). The entries from here on are not in numeric order, and this
+  line is not the next free number: see the allocation rule after `141`.
 
 - **140**: public `refresh_rotate_keeps_token_scopes` (backlog drain U002;
   slot from the drain block 140-159, so 123-139 stay free for the in-flight
@@ -1182,8 +1183,16 @@ Current reservation:
   that read it (they fail closed without it), and after 123-129 have been
   applied (sqlx would otherwise apply them out of order after 141).
 
-Next public migration **outside both reserved tenancy ranges** must be `133` or
-later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
+Next public migration **outside both reserved tenancy ranges** takes a number
+that no file in this directory, no entry in this list and no open branch
+carries. Read the head from the directory, not from this file:
+`ls migrations/*.sql | tail -1` (`209` when this paragraph was last revised; an
+earlier revision said "`133` or later" long after the head had passed it). An
+unused number below the head is not free by default: several are held by
+entries in this list (133-139 for the elevation stack, 155-157 by the drain
+register), and sqlx applies a file numbered below an already-applied head out
+of order (see the **Deploy order** notes on 140 and 141).
+Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
 the same commit as the file**. Picking a colliding version (checksum mismatch on
