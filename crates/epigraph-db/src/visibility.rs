@@ -109,17 +109,15 @@
 //! to enforce, because a fragment naming a column that does not exist is
 //! compile-time-clean and runtime-fatal.
 //!
-//! What remains open is *coverage*, not capability: the never-filtered `edges`
-//! traversals in `repos/graph_view.rs` (`expand_cluster_nodes`,
+//! What remained open was *coverage*, not capability: `edges` traversals that
+//! never carried a predicate at all. Backlog batch B08 added one to those in
+//! `crates/epigraph-db` that finding `F-edges-unfiltered` named — the five node
+//! projections in `repos/graph_view.rs` (`expand_cluster_nodes`,
 //! `neighborhood_*`, `compound_neighbors`), `repos/claim.rs`'s
-//! `rag_hybrid_context.edge_count` and — the strongest of them, because it
-//! projects `e.source_id`, `e.target_id` and `e.relationship` rather than a
-//! scalar — `repos/claim.rs::semantic_graph_neighbors` still join `edges` with
-//! no predicate at all. They are open finding `F-edges-unfiltered` in
-//! `docs/tenancy/progress.json`, re-scoped there rather than left as a comment
-//! nobody owns. That list is bounded to `crates/epigraph-db`; the MCP tool
-//! layer has its own unfiltered `edges` traversals (`epigraph-mcp/src/tools/
-//! recall.rs` spends its viewer on `claims` only) and is recorded separately.
+//! `rag_hybrid_context.edge_count` and `repos/claim.rs::semantic_graph_neighbors`
+//! — each with the placement reasoning `repos/graph_view.rs`'s module doc
+//! records. The MCP tool layer has its own `edges` traversals
+//! (`epigraph-mcp/src/tools/recall.rs`), recorded separately.
 //!
 //! PR-13 converted the reads that ALREADY carried a predicate and did not ADD
 //! one anywhere, because a never-filtered statement needs its own

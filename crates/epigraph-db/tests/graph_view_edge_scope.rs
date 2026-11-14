@@ -30,10 +30,12 @@
 mod viewer_fixture;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::GraphViewRepository;
+use epigraph_db::{ClaimRepository, GraphViewRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
-use viewer_fixture::{seed_agent_with_group, seed_group_claim, seed_public_claim, world_group};
+use viewer_fixture::{
+    seed_agent_with_group, seed_group_claim, seed_public_claim, set_claim_embedding, world_group,
+};
 
 // ── fixtures ──
 
@@ -214,6 +216,11 @@ async fn set_pignistic(pool: &PgPool, claim: Uuid, p: f64) {
         .execute(pool)
         .await
         .expect("set pignistic_prob");
+}
+
+fn probe_vector(x: f32) -> String {
+    let v: Vec<String> = (0..1536).map(|_| format!("{x}")).collect();
+    format!("[{}]", v.join(","))
 }
 
 // ── expand_cluster_nodes ──
@@ -555,5 +562,78 @@ async fn compound_neighbors_treat_a_centre_with_only_hidden_children_as_standalo
         ids.contains(&via_child2) && !ids.contains(&via_c2),
         "CALIBRATION: a centre with a child the viewer can see is walked through that \
          child; got {ids:?}"
+    );
+}
+
+// ── claim.rs: rag_hybrid_context / semantic_graph_neighbors ──
+
+/// `edge_count` counts only edges the viewer can read, on BOTH sides of the
+/// `source_id = c.id OR target_id = c.id` test.
+///
+/// The hidden edge has the claim as its SOURCE. A predicate appended without
+/// parentheses binds only to the `target_id` arm (`AND` before `OR`) and still
+/// counts it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rag_edge_count_counts_only_edges_the_viewer_can_read(pool: PgPool) {
+    let c = cast(&pool, "ev-rag").await;
+    let probe = probe_vector(0.1);
+    let quiet = claim(&pool, &c, "ev rag: claim with a hidden edge").await;
+    let busy = claim(&pool, &c, "ev rag: claim with my edges").await;
+    set_claim_embedding(&pool, quiet, &probe).await;
+    set_claim_embedding(&pool, busy, &probe).await;
+    let far1 = claim(&pool, &c, "ev rag: far 1").await;
+    let far2 = claim(&pool, &c, "ev rag: far 2").await;
+    let far3 = claim(&pool, &c, "ev rag: far 3").await;
+    hidden(&pool, &c, quiet, far1, "supports").await;
+    mine(&pool, &c, busy, far2, "supports").await;
+    mine(&pool, &c, far3, busy, "supports").await;
+
+    let rows = ClaimRepository::rag_hybrid_context(&pool, &c.viewer, &probe, 0.0, None, 10)
+        .await
+        .expect("rag_hybrid_context");
+    let count = |id: Uuid| rows.iter().find(|r| r.claim_id == id).map(|r| r.edge_count);
+    assert_eq!(
+        count(busy),
+        Some(2),
+        "CALIBRATION: both of the viewer's own edges count, outgoing and incoming"
+    );
+    assert_eq!(
+        count(quiet),
+        Some(0),
+        "an edge the viewer cannot read must not count toward edge_count"
+    );
+}
+
+/// The diverse-search neighbour walk follows only edges the viewer can read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_graph_neighbors_follow_only_edges_the_viewer_can_read(pool: PgPool) {
+    let c = cast(&pool, "ev-sgn").await;
+    let probe = probe_vector(0.2);
+    let selected = claim(&pool, &c, "ev sgn: selected").await;
+    let behind_hidden = claim(&pool, &c, "ev sgn: neighbour by a hidden edge").await;
+    let behind_mine = claim(&pool, &c, "ev sgn: neighbour by my edge").await;
+    for id in [selected, behind_hidden, behind_mine] {
+        set_claim_embedding(&pool, id, &probe).await;
+    }
+    hidden(&pool, &c, selected, behind_hidden, "supports").await;
+    mine(&pool, &c, behind_mine, selected, "supports").await;
+
+    let rows = ClaimRepository::semantic_graph_neighbors(
+        &pool,
+        &c.viewer,
+        "embedding",
+        &probe,
+        &[selected],
+    )
+    .await
+    .expect("semantic_graph_neighbors");
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.neighbor_id).collect();
+    assert!(
+        ids.contains(&behind_mine),
+        "CALIBRATION: the neighbour by the viewer's own edge must be served; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&behind_hidden),
+        "a neighbour reached only through a hidden edge must be ABSENT; got {ids:?}"
     );
 }
