@@ -199,23 +199,25 @@ pub async fn consolidate_claims(
     // Post-commit embedding, best-effort: warn but never fail the merge (the
     // CLAUDE.md write-path invariant). Skipped on the idempotent return, where
     // nothing new was written.
+    //
+    // Stored as the ACTING agent, the merged row's author, on a connection
+    // stamped from it (`claim_helper::embed_claim_author_stamped`), not through
+    // `McpEmbedder::embed_and_store`: that path resolves the author by reading
+    // the claim as PUBLIC, and a merge of team or private sources is neither,
+    // so it stored nothing there (backlog 46902f71). The merge's transaction
+    // carries no team-write grant, so none is needed here either.
     let embedded = if result.already_existed {
         false
     } else {
-        match server
-            .embedder
-            .embed_and_store(result.merged_id, &params.merged_content)
-            .await
-        {
-            true => true,
-            false => {
-                tracing::warn!(
-                    claim_id = %result.merged_id,
-                    "consolidate: merged claim embedding failed; claim is stored but not semantically recallable yet"
-                );
-                false
-            }
-        }
+        crate::claim_helper::embed_claim_author_stamped(
+            server,
+            acting_agent_id,
+            result.merged_id,
+            &params.merged_content,
+            None,
+            "consolidate_claims",
+        )
+        .await
     };
 
     let response = ConsolidateResponse {

@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -1779,18 +1778,13 @@ pub async fn do_ingest_document_reporting(
     // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
     // invariant (every is_current claim has an embedding) is satisfied eventually.
     let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        // Tracked (`crate::background`), so a stdio process drains the loop
-        // before exiting rather than leaving committed claims unembedded.
-        server.background_tasks().spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    spawn_created_claim_embeds(
+        server,
+        agent_id,
+        resolution.grant(),
+        embed_queue,
+        "ingest_document",
+    );
 
     let tenancy = IngestTenancy {
         visibility: resolution.label(),
@@ -1819,6 +1813,95 @@ pub async fn do_ingest_document_reporting(
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
     })?;
     Ok((result, tenancy))
+}
+
+/// Embed the claims a document walk CREATED, post-commit and best-effort, in a
+/// task on the server's tracker (`crate::background`).
+///
+/// Each vector is stored as the walk's AUTHOR, with the team-write grant the
+/// walk wrote under ([`store_created_claim_vector`]), not through
+/// `McpEmbedder::embed_and_store`. That path resolves a claim's author by
+/// reading the claim as PUBLIC, and a document ingest that names no visibility
+/// lands in the author's team or private, never public (backlog 46902f71): on
+/// such a claim it found no author and stored nothing, and only a WARN said so.
+/// The walk already knows the author and the grant, as
+/// `workflow_ingest::store_ingest_embedding` knows its author.
+///
+/// The queue holds only claims this walk created (a converged claim is skipped
+/// before it is queued), so every row in it is the author's to write.
+fn spawn_created_claim_embeds(
+    server: &EpiGraphMcpFull,
+    author: Uuid,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+    queue: Vec<(Uuid, String)>,
+    tool_name: &'static str,
+) {
+    if queue.is_empty() {
+        return;
+    }
+    // A clone shares the parent's pools and tracker; the grant is owned for
+    // the same `'static` reason.
+    let bg = server.clone();
+    let grant = grant.cloned();
+    server.background_tasks().spawn(async move {
+        for (id, content) in queue {
+            let pgvec = match bg.embedder.generate(&content).await {
+                Ok(v) => crate::embed::format_pgvector(&v),
+                Err(e) => {
+                    tracing::warn!(
+                        claim_id = %id,
+                        tool = tool_name,
+                        "background embedding failed (claim still stored): {e}"
+                    );
+                    continue;
+                }
+            };
+            match store_created_claim_vector(&bg, author, grant.as_ref(), id, &pgvec, tool_name)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    claim_id = %id,
+                    tool = tool_name,
+                    "background embedding stored nothing (claim missing, sealed, superseded, \
+                     or not writable by its author)"
+                ),
+                Err(e) => tracing::warn!(
+                    claim_id = %id,
+                    tool = tool_name,
+                    "background embedding store failed: {e}. The claim is stored but carries \
+                     no vector until the maintenance backfill reaches it"
+                ),
+            }
+        }
+    });
+}
+
+/// Store one created claim's vector as its author, with `grant`; on a server
+/// DECLARED to run on a privileged pool (the operator `ingest-document` CLI on
+/// `MaintenancePool`, mirroring [`begin_ingest_tx`]) there is no tenancy context
+/// to stamp, so the embedder's own declared privileged store is used.
+async fn store_created_claim_vector(
+    server: &EpiGraphMcpFull,
+    author: Uuid,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+    claim_id: Uuid,
+    pgvec: &str,
+    tool_name: &'static str,
+) -> Result<bool, String> {
+    if server.scoped.is_none() && server.privileged_pool.is_some() {
+        return server.embedder.store_vector(claim_id, pgvec).await;
+    }
+    crate::claim_helper::store_embedding_author_stamped_with_grant(
+        server.scoped.as_ref(),
+        &server.pool,
+        author,
+        grant,
+        claim_id,
+        pgvec,
+        tool_name,
+    )
+    .await
 }
 
 /// Convert a DOI into a slug form safe for use as a URL path segment or
@@ -2710,18 +2793,13 @@ pub async fn do_ingest_document_spine(
 
     // ── 6. Detach embeddings ──
     let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        // Tracked (`crate::background`), so a stdio process drains the loop
-        // before exiting rather than leaving committed claims unembedded.
-        server.background_tasks().spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    spawn_created_claim_embeds(
+        server,
+        agent_id,
+        resolution.grant(),
+        embed_queue,
+        "ingest_document_spine",
+    );
 
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
