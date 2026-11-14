@@ -108,13 +108,19 @@ deploy from the same commit. Several deploy orders below depend on it.
 
 ### Step 2 — Create the database and the migration login
 
-As a PostgreSQL superuser, on PostgreSQL 16 with **pgvector 0.8.0 or newer**
-installed:
+As a PostgreSQL superuser, on PostgreSQL 16 with pgvector 0.8.0 or newer installed
+(`epigraph-migrate` refuses an older one after migrating):
 
 ```sql
 CREATE ROLE <migration_login> LOGIN SUPERUSER PASSWORD '<secret>';  -- or a schema owner; see below
 CREATE DATABASE epigraph OWNER <migration_login>;
 ```
+
+pgvector must be 0.8.0 or newer because the semantic search and recall
+queries set `hnsw.iterative_scan`, which that release introduced. Once the
+extension exists,
+`SELECT extversion FROM pg_extension WHERE extname = 'vector';` shows its
+version.
 
 Migration `001` runs `CREATE EXTENSION IF NOT EXISTS` for `pg_trgm`,
 `uuid-ossp` and `vector`, all in schema `public`. Migrations 060 and 161 run
@@ -128,11 +134,10 @@ only raise a NOTICE ("Cannot CREATE ROLE ...: provision it out of band"),
 and 161 then skips the attestor grant (section 9 has the recipe). That path
 is not exercised by CI.
 
-**pgvector must be 0.8.0 or newer.** The semantic-search readers set
-`hnsw.iterative_scan`, which pgvector added in 0.8.0; on an older pgvector
-every semantic search fails with SQLSTATE 42602. Distribution packages often
-ship 0.6. `epigraph-migrate` refuses below the floor before applying anything,
-and the server refuses to start. To see what you have:
+On an older pgvector every semantic search fails with SQLSTATE 42602, and
+distribution packages often ship 0.6. `epigraph-migrate` applies the
+migrations, then refuses (exit 1, no `migrations: ok` marker); the server
+refuses to start. To see what you have:
 
 ```sql
 SELECT extversion FROM pg_extension WHERE extname = 'vector';             -- installed in this database
@@ -528,6 +533,25 @@ not to the API.
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims` | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `EPIGRAPH_AGENT_ID` | `scripts/_api_client.py` | The `agent_id` claim of tokens the Python helpers mint (section 7). |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
+
+### Optional LLM, rerank and NLI integrations
+
+A base install needs none of these. Each one, when set, sends text from the
+graph or from a request to a service outside the host, so decide on them one
+at a time.
+
+| Variable | Read by | Default | Meaning |
+|---|---|---|---|
+| `RERANK_API_KEY` | the MCP server, for `recall_with_context` called with `rerank: true` | unset | The key for a cross-encoder rerank service. Unset → the call degrades to plain ANN order with a warning. Set → the query and the candidate claims' content are sent to `RERANK_ENDPOINT`. |
+| `RERANK_ENDPOINT`, `RERANK_MODEL` | as above, only when `RERANK_API_KEY` is set | `https://api.cohere.com/v2/rerank`, `rerank-english-v3.0` | The rerank endpoint and the model it is asked for. |
+| `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` | the built-in Anthropic client (`epigraph-cli`, `enrichment::llm_client`): the CLIs that call an LLM (`decompose_claims`, `protocol_gen`, `method_search`, `embed_bridge`, `rerank_bridges`, `ingest_git --enricher llm`) and the API server in a `genai` build | unset | Credentials for the Anthropic API. The OAuth token is used when both are set. With neither, the `epigraph` auto-detect selector finds no active provider and the caller fails. |
+| `ENRICHMENT_MODEL` | the same client | `claude-sonnet-4-5-20250929` | The model that client requests. |
+| `EPIGRAPH_LLM_PROVIDER` | the API server, in a build with the `genai` feature | `anthropic` | The provider behind `POST /api/v1/analyze/unconstrained`: `anthropic`, `epigraph` (the first active registered provider), `mock`, or the name of a registered extension. The request's question is sent to it. A build without `genai` answers that route 503. |
+| `ENRICHMENT_LLM_PROVIDER` | `ingest_git --enricher llm` | `epigraph` | The provider selector for the commit enricher; same values. |
+| `ENRICHMENT_WINDOW_SIZE`, `ENRICHMENT_WINDOW_OVERLAP` | `ingest_git --enricher llm` | `20`, `5` | Commits per enrichment window, and how many of them overlap the next window. |
+| `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` | `ingest_git` | unset | The orchestrator agent's UUID when neither `--orchestrator-id` nor an `Epigraph-Orchestrator-Id` trailer in the PR body or commits names one. |
+| `API_ENDPOINT` | `embed_bridge` | `http://localhost:8080` | The API's base URL for that CLI. |
+| `NLI_SERVICE_URL` | `NliClient::from_env` (`epigraph-cli`, `enrichment::nli_client`) | unset | The URL of an NLI classification service, which is POSTed `{premise, hypothesis}`. No binary in this tree calls `from_env` at the time of writing, so setting the variable changes nothing yet. |
 
 ## 4. Database migrations
 
@@ -4481,9 +4505,8 @@ Do not improvise it against a live database without that entry's context.
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
-| `REFUSING: pgvector X is installed in this database; EpiGraph needs pgvector >= 0.8.0 ...` (from `epigraph-migrate` or the server) | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2). |
-| `REFUSING: this PostgreSQL server's pgvector is X (the version CREATE EXTENSION would install) ...` / `REFUSING: this PostgreSQL server has no pgvector extension ...` | A fresh database on a server whose pgvector is missing or older than 0.8.0. Install a current pgvector and migrate again; nothing was applied. |
-| `ERROR: REFUSING: the pgvector extension is not installed in this database ...` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
+| `ERROR: refusing to serve: pgvector <v> is installed but 0.8.0 or newer is required ...` | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2), and restart. |
+| ``ERROR: refusing to serve: the pgvector extension (`vector`) is not installed in this database ...`` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
 | `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
 | `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
@@ -4493,6 +4516,7 @@ Do not improvise it against a live database without that entry's context.
 | `operator binding is NOT ARMED on this database: ...` (WARN) | Expected until you arm (section 9). |
 | `migration 122 (operator binding) is not applied to this database; claim writes through default declarations fail closed until it is` | Run `epigraph-migrate`. |
 | `migrations: FAILED: REFUSING: the database has N applied migration version(s) this binary does not embed: ...` | A stale binary (section 4). Deploy the newer build, or `--allow-db-ahead` for a deliberate rollback. |
+| `migrations: FAILED: migrations were applied, but pgvector <v> is installed but 0.8.0 or newer is required ...` | The migrations ran; the installed pgvector is too old for semantic search (`hnsw.iterative_scan`). Install a newer pgvector on the server and run `ALTER EXTENSION vector UPDATE` in the database, then re-run `epigraph-migrate`. |
 | `migrations: FAILED: sqlx::migrate failed: ...` | Often an edited applied migration (a checksum mismatch), or a precondition `RAISE` (`55000` from the md5 preconditions, 074/075/084's pre-flights). Read the message, and the migration's header. |
 | `epigraph-migrate` exits 0 and applies nothing, but your migration is missing | A stale binary from a shared target directory (section 4). |
 | `Failed to bind the internal metrics listener; metrics will not be scrapeable. The API continues to serve.` | Another process holds `EPIGRAPH_METRICS_ADDR`. Give each instance its own. |

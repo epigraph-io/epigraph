@@ -41,7 +41,9 @@ epigraph-io stack is built on it.
 | `bootstrap_clients`, `epigraph-operator` and other CLIs | `crates/epigraph-cli` | Setup and maintenance tools. `bootstrap_clients` creates the first OAuth clients. |
 
 All of them use one PostgreSQL 16 database with the `pgvector` extension,
-version 0.8.0 or newer (`epigraph-migrate` and the server refuse an older one).
+version 0.8.0 or newer: the semantic search and recall queries set
+`hnsw.iterative_scan`, which pgvector 0.8.0 introduced. `epigraph-migrate`
+and the server refuse an older one.
 
 ## Quickstart (local trial)
 
@@ -118,6 +120,8 @@ Start here:
   verb-edges, agents and signing, Dempster-Shafer beliefs, perspectives,
   hierarchical extraction, and backlog discipline.
 - [`docs/intro/04-glossary.md`](docs/intro/04-glossary.md): vocabulary.
+  (The numbering skips `03`: the walkthroughs page planned under that number
+  was not written.)
 - [`docs/intro/05-next-steps.md`](docs/intro/05-next-steps.md): pointers for
   contributors, operators and downstream projects.
 

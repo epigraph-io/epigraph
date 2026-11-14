@@ -513,21 +513,14 @@ async fn main() {
 
         // The pgvector floor (backlog e30316ae): below 0.8.0 every semantic
         // search fails (SQLSTATE 42602 on `hnsw.iterative_scan`), so refuse to
-        // serve rather than serve a corpus that cannot be searched.
-        match epigraph_db::pgvector::read_state(&pool).await {
-            Ok(pgvector) => {
-                if let Err(refusal) = epigraph_db::pgvector::check(
-                    &pgvector,
-                    epigraph_db::pgvector::Phase::Serving,
-                    epigraph_db::pgvector::PGVECTOR_FLOOR,
-                ) {
-                    eprintln!("ERROR: {refusal}");
-                    std::process::exit(1);
-                }
-                tracing::info!(pgvector = ?pgvector, "pgvector meets the floor");
-            }
+        // serve rather than serve a corpus that cannot be searched. The same
+        // check `epigraph-migrate` runs after migrating
+        // (`migrate::check_pgvector_version`); here it also covers a server
+        // started without that deploy step, or after `EPIGRAPH_MIGRATE_ON_BOOT`.
+        match epigraph_api::migrate::check_pgvector_version(&pool).await {
+            Ok(version) => tracing::info!(pgvector = %version, "pgvector version ok"),
             Err(e) => {
-                eprintln!("ERROR: cannot read the pgvector version: {e}");
+                eprintln!("ERROR: refusing to serve: {e}");
                 std::process::exit(1);
             }
         }

@@ -54,7 +54,6 @@ pub mod bba_write_outcome;
 pub mod errors;
 pub mod label_validation;
 pub mod operator_binding;
-pub mod pgvector;
 pub mod pool;
 pub mod refusal_codes;
 pub mod repos;
