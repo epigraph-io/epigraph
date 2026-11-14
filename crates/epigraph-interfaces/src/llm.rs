@@ -15,7 +15,9 @@
 //!   does not unregister them.
 //! - [`LlmProvider::complete_json`] is the canonical inference call. Errors
 //!   are wrapped in [`LlmError`]; HTTP-like rate limits get
-//!   [`LlmError::RateLimited`] so callers can implement backoff.
+//!   [`LlmError::RateLimited`] so callers can implement backoff; a model or
+//!   safety-classifier refusal gets [`LlmError::Refusal`], which depends on
+//!   the prompt and should not be retried with the same prompt.
 //! - Names are unique. Registering a second provider with the same `name()`
 //!   replaces the existing entry (last write wins).
 //! - Insertion order matters: the most-recently-registered provider is
@@ -49,6 +51,15 @@ pub enum LlmError {
     /// The provider was selected but its credentials are missing.
     #[error("LLM API key not configured for provider: {provider}")]
     MissingApiKey { provider: String },
+
+    /// The model (or a safety classifier in front of it) declined to answer.
+    ///
+    /// A refusal depends on the prompt's content, not on transport or
+    /// parsing, so callers should treat it as terminal for that prompt:
+    /// retrying the same prompt spends budget and gets the same answer.
+    /// `message` says what stopped the request (e.g. a stop reason).
+    #[error("LLM refused the request: {message}")]
+    Refusal { message: String },
 }
 
 /// Pluggable language-model backend.
@@ -217,6 +228,47 @@ mod tests {
         async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
             Ok(serde_json::json!({ "from": self.name }))
         }
+    }
+
+    /// Test provider whose `complete_json` refuses every prompt, as a
+    /// provider does when a safety classifier stops the answer.
+    #[derive(Debug)]
+    struct RefusingProvider;
+
+    #[async_trait]
+    impl LlmProvider for RefusingProvider {
+        fn name(&self) -> &str {
+            "iface_test_refusing"
+        }
+        fn model_name(&self) -> &str {
+            "test"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Err(LlmError::Refusal {
+                message: format!("stopped on prompt {prompt:?}"),
+            })
+        }
+    }
+
+    /// A refusal reaches a caller holding `Arc<dyn LlmProvider>` as
+    /// `Refusal`, with the provider's reason, and not as one of the
+    /// retryable or transport variants, so the caller can stop retrying.
+    #[tokio::test]
+    async fn refusal_reaches_dyn_caller_as_refusal_with_reason() {
+        let p: Arc<dyn LlmProvider> = Arc::new(RefusingProvider);
+        let err = p.complete_json("q1").await.unwrap_err();
+        match &err {
+            LlmError::Refusal { message } => assert_eq!(message, "stopped on prompt \"q1\""),
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+        let shown = err.to_string();
+        assert!(
+            shown.contains("refused") && shown.contains("stopped on prompt"),
+            "Display must name the refusal and keep the reason: {shown}"
+        );
     }
 
     #[test]
