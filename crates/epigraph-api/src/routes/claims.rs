@@ -2110,6 +2110,9 @@ pub async fn list_claim_evidence(
                 }
                 EvidenceType::Consensus { .. } => ("statistical".to_string(), None),
                 EvidenceType::Figure { doi, .. } => ("figure".to_string(), Some(doi.clone())),
+                EvidenceType::Dataset { root_uri, .. } => {
+                    ("dataset".to_string(), Some(root_uri.clone()))
+                }
             };
 
             EvidenceResponse {

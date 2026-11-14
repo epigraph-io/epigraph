@@ -54,9 +54,9 @@ pub struct ListEvidenceQuery {
     pub claim_id: Option<Uuid>,
     /// Exact match on the stored `evidence_type` column. Vocabulary:
     /// `document`, `observation`, `testimony`, `computation`, `reference`,
-    /// `figure`, `conversational` (the `evidence_type_valid` CHECK
-    /// constraint). Note `Literature` is stored as `reference` and
-    /// `Consensus` as `computation`.
+    /// `figure`, `conversational`, `dataset` (the `evidence_type_valid` CHECK
+    /// constraint, `epigraph_core::STORED_EVIDENCE_TYPES`). Note `Literature`
+    /// is stored as `reference` and `Consensus` as `computation`.
     pub evidence_type: Option<String>,
     /// Case-insensitive substring match on `raw_content`. Rows with a NULL
     /// `raw_content` never match this predicate.
@@ -401,6 +401,7 @@ pub async fn create_evidence(
         EvidenceType::Literature { .. } => "literature",
         EvidenceType::Consensus { .. } => "consensus",
         EvidenceType::Figure { .. } => "figure",
+        EvidenceType::Dataset { .. } => "dataset",
     };
 
     Ok((

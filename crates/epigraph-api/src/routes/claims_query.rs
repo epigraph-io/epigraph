@@ -46,16 +46,9 @@ const VALID_METHODOLOGIES: &[&str] = &[
     "observational",
 ];
 
-/// Valid evidence type values (mirrors DB CHECK constraint on evidence + later migrations)
-const VALID_EVIDENCE_TYPES: &[&str] = &[
-    "document",
-    "observation",
-    "testimony",
-    "computation",
-    "reference",
-    "figure",
-    "conversational",
-];
+/// Valid evidence type values: the `evidence_type_valid` CHECK's vocabulary,
+/// from its one Rust copy.
+const VALID_EVIDENCE_TYPES: &[&str] = epigraph_core::STORED_EVIDENCE_TYPES;
 
 // ============================================================================
 // Request / Response DTOs
@@ -1553,6 +1546,7 @@ mod tests {
             "reference",
             "figure",
             "conversational",
+            "dataset",
         ] {
             let state = AppState::new(ApiConfig::default());
             let router = test_router(state);

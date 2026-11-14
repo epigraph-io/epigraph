@@ -96,9 +96,10 @@ pub struct EvidenceListFilter<'a> {
     ///
     /// That column — not the `properties` JSONB blob — is what
     /// [`EvidenceRepository::evidence_type_to_db_string`] writes, and its
-    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint in
-    /// migration 001: `document`, `observation`, `testimony`, `computation`,
-    /// `reference`, `figure`, `conversational`. Note that the Rust
+    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint
+    /// (`epigraph_core::STORED_EVIDENCE_TYPES`): migration 001's `document`,
+    /// `observation`, `testimony`, `computation`, `reference`, `figure`,
+    /// `conversational`, and migration 229's `dataset`. Note that the Rust
     /// `EvidenceType` variant names do **not** all match: `Literature` is
     /// stored as `reference` and `Consensus` as `computation`. Callers filter
     /// with the stored spelling.
@@ -211,15 +212,19 @@ impl EvidenceRepository {
     }
 
     /// The URL an evidence type carries that belongs in `evidence.source_url`:
-    /// a `Document`'s `source_url`, and nothing else.
+    /// a `Document`'s `source_url` or a `Dataset`'s `root_uri`, and nothing
+    /// else.
     ///
     /// A `Testimony`'s `source` is free text (a person's name, or the MCP
     /// default `"unknown"`), and `Literature`/`Figure` carry a DOI rather than
-    /// a URL, so none of those is a column value.
+    /// a URL, so none of those is a column value. A dataset's root is where
+    /// its data lives, so it is also the source identity the combine step
+    /// keys a re-observation on.
     #[must_use]
     pub fn source_url_of(evidence_type: &EvidenceType) -> Option<&str> {
         match evidence_type {
             EvidenceType::Document { source_url, .. } => source_url.as_deref(),
+            EvidenceType::Dataset { root_uri, .. } => Some(root_uri.as_str()),
             _ => None,
         }
     }
@@ -1272,14 +1277,7 @@ impl EvidenceRepository {
 
     /// Convert EvidenceType enum to database string
     fn evidence_type_to_db_string(evidence_type: &EvidenceType) -> &'static str {
-        match evidence_type {
-            EvidenceType::Document { .. } => "document",
-            EvidenceType::Observation { .. } => "observation",
-            EvidenceType::Testimony { .. } => "testimony",
-            EvidenceType::Literature { .. } => "reference",
-            EvidenceType::Consensus { .. } => "computation",
-            EvidenceType::Figure { .. } => "figure",
-        }
+        evidence_type.stored_type()
     }
 
     /// Store an embedding vector for an evidence item
