@@ -51,6 +51,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/atlas_meaning.rs",
     ),
     (
+        "atlas_naming",
+        Some(env!("CARGO_BIN_EXE_atlas_naming")),
+        "src/bin/atlas_naming.rs",
+    ),
+    (
         "backfill_dedup_identity_edges",
         Some(env!("CARGO_BIN_EXE_backfill_dedup_identity_edges")),
         "src/bin/backfill_dedup_identity_edges.rs",
