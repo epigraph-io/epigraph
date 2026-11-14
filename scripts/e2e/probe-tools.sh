@@ -127,7 +127,7 @@ q "SELECT 'evidence_on_claim='||(SELECT count(*) FROM evidence WHERE claim_id = 
 echo "--- submit_ds_evidence (on the auto-wired binary_truth frame) ---"
 FRAME=$(q "SELECT id FROM frames WHERE name = 'binary_truth' LIMIT 1")
 if [ -n "$FRAME" ]; then
-  call "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"submit_ds_evidence\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"frame_id\":\"$FRAME\",\"masses\":{\"true\":0.6,\"true,false\":0.4},\"hypothesis_index\":0,\"reliability\":0.9}}}" | tail -c 500
+  call "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"submit_ds_evidence\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"frame_id\":\"$FRAME\",\"masses\":{\"0\":0.6,\"0,1\":0.4},\"hypothesis_index\":0,\"reliability\":0.9}}}" | tail -c 500
 else
   echo "(no binary_truth frame seeded; skipped)"
 fi
