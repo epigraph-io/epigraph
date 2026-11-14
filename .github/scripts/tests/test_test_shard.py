@@ -12,6 +12,8 @@ same tests can be pointed at another revision of the script:
     git show <rev>:.github/scripts/test-shard.py > /tmp/old.py
     TEST_SHARD_SCRIPT=/tmp/old.py python3 -m unittest discover -s .github/scripts/tests
 
+and TEST_SHARD_WORKFLOW does the same for ci.yml.
+
 The selection tests use the real workspace (`cargo metadata`, `git ls-files`)
 rather than a hand-written graph: what they pin is that THIS repository's
 dependency edges and source scans produce the selection, so an edge or a
@@ -27,7 +29,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.environ.get("TEST_SHARD_SCRIPT") or os.path.join(HERE, "..", "test-shard.py")
-WORKFLOW = os.path.join(HERE, "..", "..", "workflows", "ci.yml")
+WORKFLOW = os.environ.get("TEST_SHARD_WORKFLOW") or os.path.join(HERE, "..", "..", "workflows", "ci.yml")
 
 
 def load_planner():
@@ -566,6 +568,51 @@ class Workflow(unittest.TestCase):
         self.assertEqual(steps["Test"]["if"], "matrix.shard != 'source-scans'")
         self.assertEqual(steps["Test (source scans)"]["if"], "matrix.shard == '%s'" % ts.SCANS)
         self.assertIn("scan-args", steps["Test (source scans)"]["run"])
+
+    def run_step(self, name, env):
+        """Run a test-shard step's body under bash -eo pipefail, as the local
+        gate does (it ignores `if:`), with a fake `cargo` that logs its
+        arguments and, like a test that spawns a child, reads its stdin.
+        Returns the logged invocations."""
+        import subprocess
+
+        step = [s for s in self.jobs["test-shard"]["steps"] if s.get("name") == name][0]
+        root = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "log")
+            fake = os.path.join(tmp, "cargo")
+            with open(fake, "w") as fh:
+                fh.write('#!/bin/sh\ncat > /dev/null\necho "$*" >> "%s"\n' % log)
+            os.chmod(fake, 0o755)
+            full = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], **env)
+            out = subprocess.run(
+                ["bash", "-eo", "pipefail", "-c", step["run"]],
+                cwd=root,
+                env=full,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(out.returncode, 0, out.stderr)
+            if not os.path.exists(log):
+                return []
+            with open(log) as fh:
+                return fh.read().splitlines()
+
+    def test_each_test_step_is_a_no_op_on_the_other_steps_shard(self):
+        self.assertEqual(self.run_step("Test", {"SHARD": ts.SCANS, "THREADS": "1"}), [])
+        # The literal a runner without the matrix context would pass.
+        for shard in ("db-1of2", "${{ matrix.shard }}"):
+            env = {"SHARD": shard, "TARGETS": "${{ matrix.targets }}"}
+            self.assertEqual(self.run_step("Test (source scans)", env), [], shard)
+
+    def test_source_scans_runs_every_invocation_even_if_a_test_reads_stdin(self):
+        targets = json.dumps({"epigraph-db": ["a", "b"], "epigraph-cli": ["c"]})
+        calls = self.run_step("Test (source scans)", {"SHARD": ts.SCANS, "TARGETS": targets})
+        self.assertEqual(len(calls), 2, calls)
+        self.assertTrue(calls[0].startswith("test --locked --no-fail-fast -p epigraph-cli --test c"), calls)
+        self.assertIn("-p epigraph-db --test a --test b -- --test-threads=4", calls[1])
 
 
 if __name__ == "__main__":

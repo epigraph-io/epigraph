@@ -328,7 +328,11 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           THREADS: ${{ matrix.threads }}
+        # The body repeats the `if:` because the local gate (ci-local /
+        # ci-shards) runs every step of this job verbatim and does not
+        # evaluate `if:`; each step must be a no-op on the other's shard.
         run: |
+          if [ "$SHARD" = source-scans ]; then exit 0; fi
           args="$(python3 .github/scripts/test-shard.py args "$SHARD")"
           # shellcheck disable=SC2086  # $args is a list of cargo arguments
           cargo test --locked --no-fail-fast $args -- --test-threads="$THREADS"
@@ -341,17 +345,23 @@ jobs:
         # does not otherwise touch whose sources read a changed file (the
         # cross-crate ratchets, the runbook and calibration checks). One
         # cargo invocation per package, at that package's --test-threads.
+        # cargo's stdin is /dev/null: a test that spawns a child with inherited
+        # stdin must not eat the rest of the invocation list, which would end
+        # the loop early with exit 0.
         if: matrix.shard == 'source-scans'
         env:
+          SHARD: ${{ matrix.shard }}
           TARGETS: ${{ matrix.targets }}
         run: |
-          python3 .github/scripts/test-shard.py scan-args "$TARGETS" > "$RUNNER_TEMP/scan-args"
-          cat "$RUNNER_TEMP/scan-args"
+          if [ "$SHARD" != source-scans ]; then exit 0; fi
+          invocations="$(mktemp)"
+          python3 .github/scripts/test-shard.py scan-args "$TARGETS" > "$invocations"
+          cat "$invocations"
           status=0
           while read -r threads args; do
             # shellcheck disable=SC2086  # $args is a list of cargo arguments
-            cargo test --locked --no-fail-fast $args -- --test-threads="$threads" || status=1
-          done < "$RUNNER_TEMP/scan-args"
+            cargo test --locked --no-fail-fast $args -- --test-threads="$threads" < /dev/null || status=1
+          done < "$invocations"
           exit "$status"
 
   # TESTS THAT NO PLAIN `cargo test -p` RUNS, as a gate.
