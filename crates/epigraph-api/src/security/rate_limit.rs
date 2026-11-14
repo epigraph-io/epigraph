@@ -384,13 +384,17 @@ impl AgentRateLimiter {
     /// * `Ok(())` if the request is allowed
     /// * `Err(RateLimitError)` if the rate limit is exceeded
     pub fn check(&self, agent_id: &AgentId) -> Result<(), RateLimitError> {
-        // Check global limit first
+        // Per-key limit FIRST. A request it refuses must not spend a global
+        // token, or one throttled client that keeps retrying drains the global
+        // bucket and every other client is refused with it. (A request the
+        // global limit then refuses has spent its key's token; that only
+        // under-serves a client while the whole service is over its limit.)
+        self.check_agent(agent_id)?;
+
         if self.config.enable_global_limit {
             self.check_global()?;
         }
-
-        // Check per-agent limit
-        self.check_agent(agent_id)
+        Ok(())
     }
 
     /// Check global rate limit
@@ -697,6 +701,36 @@ mod tests {
             limiter.check(&key(0)).is_err(),
             "a tracked, throttled key keeps its debt"
         );
+    }
+
+    /// A request the per-key limit refuses must not spend a global token.
+    /// Otherwise one throttled client, retrying, drains the global bucket and
+    /// every other client gets 429 too: the limiter becomes the DoS.
+    #[test]
+    fn a_throttled_key_cannot_drain_the_global_bucket() {
+        let limiter = AgentRateLimiter::new(RateLimitConfig {
+            default_rpm: 1,
+            global_rpm: 3,
+            replenish_interval_secs: 60,
+            enable_global_limit: true,
+        });
+        limiter.check(&key(1)).unwrap();
+        for _ in 0..10 {
+            assert!(matches!(
+                limiter.check(&key(1)),
+                Err(RateLimitError::AgentLimitExceeded { .. })
+            ));
+        }
+        limiter
+            .check(&key(2))
+            .expect("another client is within both limits");
+        limiter
+            .check(&key(3))
+            .expect("the global bucket still has its third token");
+        assert!(matches!(
+            limiter.check(&key(4)),
+            Err(RateLimitError::GlobalLimitExceeded { .. })
+        ));
     }
 
     #[test]
