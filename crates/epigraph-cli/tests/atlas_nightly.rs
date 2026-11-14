@@ -654,7 +654,9 @@ async fn a_new_claim_relays_and_renames_only_its_leaf_and_ancestors(pool: PgPool
     let before = levels(&pool, latest(&pool, a_map).await).await;
 
     let new = claims(&pool, None, c.fa, Some(c.a_team), 1, 0).await[0];
+    let calls = backend.calls();
     let summary = night(&pool, &viewer, &backend, &opts()).await;
+    let made = backend.calls() - calls;
     assert_eq!(summary["themes"]["assigned"], 1, "{summary:#}");
     let r = map_report(&summary, a_map);
     assert_eq!(r["status"], "written", "{r:#}");
@@ -678,6 +680,14 @@ async fn a_new_claim_relays_and_renames_only_its_leaf_and_ancestors(pool: PgPool
         !renamed.is_empty() && renamed.is_subset(&affected),
         "{renamed:?}"
     );
+    // Only the affected levels may cost a model call; every other name is
+    // copied by key.
+    assert!(
+        (1..=affected.len()).contains(&made),
+        "{made} model calls for {} affected levels",
+        affected.len()
+    );
+    assert_eq!(r["naming"]["report"]["calls"], made);
     // The other maps did not change at all.
     for m in [AtlasMap::Team(c.b_team), AtlasMap::Public] {
         assert_eq!(map_report(&summary, m)["status"], "unchanged");
