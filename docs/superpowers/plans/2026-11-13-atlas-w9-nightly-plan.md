@@ -155,8 +155,38 @@ results, or let the nightly carry the map.
 | (hand-off) standalone meaning apply cannot hide links | `a_meaning_only_apply_refuses_to_hide_a_links_run` |
 | (hand-off) deep meaning switch to the overlapping links group | `meaning_levels_switch_to_their_best_links_group` (pure) + the night's switch assertions |
 
-Every new test is shown to fail on broken code by a mutation run and
-recorded in the PR.
+## Fail on old code (measured on the branch)
+
+Each mutation applied alone on a lane, the affected target run on a fresh
+database, then restored (`.mut/`-style script, not committed):
+
+| Mutation | Tests that went red |
+|---|---|
+| a theme's error propagates (no carry/drop) | `a_theme_that_fails_is_carried_and_the_night_completes`, `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
+| carry without the re-assembly check | `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
+| naming with no previous names | `a_second_night_over_unchanged_input_writes_nothing_and_calls_no_model`, `a_new_claim_relays_and_renames_only_its_leaf_and_ancestors` (after its call bound was added: the first probe left it green) |
+| layout fill with no previous run | `a_second_night_...` |
+| skip on epochs alone | `a_night_over_two_teams_...`, `a_second_night_...`, `a_new_claim_...`, `a_theme_that_fails_...` |
+| never skip | `a_second_night_...`, `a_new_claim_...` |
+| nightly meaning switch to the links root | `a_night_over_two_teams_...` |
+| skeleton leaves (no W3/W7 fill) | `a_night_over_two_teams_...` and both drift tests |
+| no theme assignment | `a_new_claim_...` |
+| no new mirror leaves | `a_new_claim_...` |
+| prune keeps one run too many | `pruning_keeps_exactly_k_finished_runs_of_that_map_only` |
+| prune ranks runs across maps | `pruning_keeps_exactly_k_...` |
+| guard a no-op | `a_meaning_only_apply_refuses_to_hide_a_links_run` |
+| `apply_hierarchies` meaning switch to the links root | `meaning_levels_switch_to_their_best_links_group` |
+| timer `OnCalendar` misspelt | both `atlas_nightly_units` tests |
+| service `IOSchedulingClass=idlest` | `systemd_analyze_verifies_the_units` (the lane has systemd-analyze) |
+| first leaf instead of the nearest centroid | `a_new_claim_joins_the_leaf_with_the_nearest_centroid_whatever_the_leaf_order` |
+| no single-child collapse | `an_emptied_leaf_is_dropped_and_its_single_child_parent_collapses` |
+| no neighbour vote | `a_new_unlinked_claim_lands_in_its_meaning_leafs_mirror_and_a_linked_one_by_its_neighbours` |
+
+Not mutation-proved: the publish lock (a race needs two concurrent
+publishers; W8's newer-run check is still proved by its own test), the
+evidence-label map predicate in `node_labels` (W3's read already keeps
+another team's evidence out of the node set, so the label read never sees
+one), and the `superseded` path.
 
 ## Needs prod measurement
 
