@@ -1,0 +1,287 @@
+//! The guest read surface (backlog `1deb9dbf`): anonymous, read-only reads of
+//! the PUBLIC graph under `/api/v1/guest/`.
+//!
+//! A guest is a caller with no bearer: a signed-out visitor, or a link-card
+//! fetcher that unfurls a pasted claim link without any user token. Every
+//! handler here reads as [`Viewer::public_only`], a scoped viewer over no
+//! group, so it reads `visibility = 'public'` rows and nothing else. On the
+//! production pool both migration 077's row policies and the in-query `$V`
+//! predicate apply, exactly as for a signed-in principal that has joined
+//! nothing. A bearer the request happens to carry changes nothing here: a
+//! signed-in caller reads its own graph through the authenticated routes.
+//!
+//! # The routes
+//!
+//! | Route | Answer |
+//! |---|---|
+//! | `GET /api/v1/guest/claims/:id` | [`GuestClaimCard`] |
+//! | `GET /api/v1/guest/claims/:id/ego` | the authenticated ego body, read as the guest |
+//! | `GET /api/v1/guest/graph/themes/overview` | [`GuestThemesOverview`]: ids and public counts, no labels |
+//! | `GET /api/v1/guest/graph/themes/layout` | the authenticated layout body, read as the guest, with no theme or region label; the unplaced list is refused |
+//!
+//! # A non-public id is an absent one
+//!
+//! The card and the ego answer a claim the guest may not read with the same
+//! `NotFound` 404 as an id that names nothing: same status, content type and
+//! body (which echoes only the caller's own id). The card reads its row
+//! through the viewer predicate, so "private" and "absent" are one `None`.
+//!
+//! # What a guest does not get
+//!
+//! * **Who filed it.** The card carries no `agent_id`, no `trace_id`, no
+//!   tenancy or encryption field and no `authored_by` block, which names
+//!   humans and prompt snapshots. Its `sources` are the documents the claim
+//!   came from (key and title), as read under the guest viewer.
+//! * **A stored theme or region label.** The theme labeller samples members
+//!   with no visibility predicate, so a stored label may be derived from text
+//!   the guest cannot read (residual `D-PR16-theme-cluster-viewer-scope`), and
+//!   a region label is built from its themes' labels. The overview and the
+//!   layout therefore withhold both, and the layout refuses the unplaced list,
+//!   which is ordered by label and whose cursor carries the label bytes.
+//! * **A sealed claim.** A claim with a `claim_encryption` row is answered as
+//!   absent: its `content` is not its plaintext, and sealing is a group act.
+//!
+//! # The envelope
+//!
+//! The routes sit on the `public` router (`routes/mod.rs`), so they carry its
+//! layers: the anonymous body limit and the rate limiter, which charges a
+//! request without a token to its client address. Every answer is
+//! `Cache-Control: no-store`, so a claim made private stops being served at
+//! once rather than when a cache expires.
+
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, HeaderValue},
+    response::{IntoResponse, Response},
+    Json,
+};
+use chrono::{DateTime, Utc};
+use epigraph_core::ClaimId;
+use epigraph_db::visibility::Viewer;
+use epigraph_db::{AuthoredBy, AuthoredByRepository, ClaimEncryptionRepository, ClaimRepository};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
+use crate::routes::{finish_scoped_read, open_scoped_read};
+use crate::state::AppState;
+
+/// Mark a guest answer, success or error, as never stored by any cache.
+fn no_store(mut res: Response) -> Response {
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
+fn guest_answer<T: IntoResponse>(r: Result<T, ApiError>) -> Response {
+    no_store(match r {
+        Ok(body) => body.into_response(),
+        Err(e) => e.into_response(),
+    })
+}
+
+fn claim_not_found(id: Uuid) -> ApiError {
+    ApiError::NotFound {
+        entity: "Claim".to_string(),
+        id: id.to_string(),
+    }
+}
+
+// ── The claim card ──
+
+/// One document a public claim came from.
+#[derive(Debug, Serialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct GuestSource {
+    /// The document key (a DOI, or another document key).
+    pub doi: String,
+    pub title: Option<String>,
+}
+
+/// `GET /api/v1/guest/claims/:id`: a public claim's card.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct GuestClaimCard {
+    pub id: Uuid,
+    pub content: String,
+    /// The claim's stored truth value, the figure the ego's nodes carry.
+    pub truth_value: f64,
+    pub labels: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    /// The documents the claim was ingested from, creating document first.
+    pub sources: Vec<GuestSource>,
+}
+
+/// The documents an [`AuthoredBy`] names, creating document first, each once.
+fn sources_of(authored: &AuthoredBy) -> Vec<GuestSource> {
+    let mut out: Vec<GuestSource> = Vec::new();
+    let mut push = |doi: &str, title: Option<&String>| {
+        if !out.iter().any(|s| s.doi == doi) {
+            out.push(GuestSource {
+                doi: doi.to_string(),
+                title: title.cloned(),
+            });
+        }
+    };
+    if let AuthoredBy::Literature(l) = authored {
+        push(&l.paper.paper.doi, l.paper.paper.title.as_ref());
+    }
+    for p in &authored.corroboration().corroborated_by {
+        push(&p.paper.doi, p.paper.title.as_ref());
+    }
+    out
+}
+
+async fn read_claim_card(state: &AppState, id: Uuid) -> Result<Json<GuestClaimCard>, ApiError> {
+    let viewer = Viewer::public_only();
+    let mut read = open_scoped_read(state, &viewer, "guest_claim_card").await?;
+
+    let Some((claim, labels)) =
+        ClaimRepository::get_by_id_with_labels(&mut *read, &viewer, ClaimId::from_uuid(id)).await?
+    else {
+        return Err(claim_not_found(id));
+    };
+    let sealed = ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, id)
+        .await?
+        .is_some();
+    if sealed {
+        return Err(claim_not_found(id));
+    }
+    let authored = AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        id,
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
+    )
+    .await?;
+    finish_scoped_read(read, "guest_claim_card").await?;
+
+    Ok(Json(GuestClaimCard {
+        id,
+        content: claim.content,
+        truth_value: claim.truth_value.value(),
+        labels,
+        created_at: claim.created_at,
+        sources: sources_of(&authored),
+    }))
+}
+
+/// `GET /api/v1/guest/claims/:id`
+pub async fn claim_card(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    guest_answer(read_claim_card(&state, id).await)
+}
+
+// ── Ego ──
+
+/// `GET /api/v1/guest/claims/:id/ego`: [`crate::routes::ego::claim_ego`] read
+/// as the guest.
+pub async fn claim_ego(
+    state: State<AppState>,
+    id: Path<Uuid>,
+    params: Query<crate::routes::ego::EgoQuery>,
+) -> Response {
+    guest_answer(
+        crate::routes::ego::claim_ego(ViewerExtractor(Viewer::public_only()), state, id, params)
+            .await,
+    )
+}
+
+// ── The theme overview ──
+
+/// Query of `GET /api/v1/guest/graph/themes/overview`.
+#[derive(Debug, Deserialize)]
+pub struct GuestOverviewParams {
+    /// Page size, clamped to `1..=200` (the default).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The previous page's `next_cursor`, unchanged.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// One theme with a public member, without its stored label.
+#[derive(Debug, Serialize)]
+pub struct GuestThemeOut {
+    pub id: Uuid,
+    /// Current PUBLIC members of the theme.
+    pub claim_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GuestThemesOverview {
+    pub themes: Vec<GuestThemeOut>,
+    /// Themes with at least one current public member.
+    pub total: i64,
+    pub next_cursor: Option<String>,
+}
+
+async fn read_overview(
+    state: &AppState,
+    params: GuestOverviewParams,
+) -> Result<Json<GuestThemesOverview>, ApiError> {
+    use epigraph_db::repos::claim_theme::{ThemeOverviewCursor, THEME_OVERVIEW_PAGE_MAX};
+
+    let limit = params
+        .limit
+        .unwrap_or(THEME_OVERVIEW_PAGE_MAX)
+        .clamp(1, THEME_OVERVIEW_PAGE_MAX);
+    let after = match params.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(ThemeOverviewCursor::decode(token).ok_or_else(|| {
+            ApiError::BadRequest {
+                message: "malformed `after` cursor; pass back `next_cursor` of the previous \
+                          page unchanged"
+                    .to_string(),
+            }
+        })?),
+    };
+
+    let viewer = Viewer::public_only();
+    let mut read = open_scoped_read(state, &viewer, "guest_themes_overview").await?;
+    let page =
+        epigraph_db::ClaimThemeRepository::overview_page(&mut *read, &viewer, after, limit).await?;
+    finish_scoped_read(read, "guest_themes_overview").await?;
+
+    Ok(Json(GuestThemesOverview {
+        themes: page
+            .themes
+            .into_iter()
+            .map(|t| GuestThemeOut {
+                id: t.id,
+                claim_count: t.member_count,
+            })
+            .collect(),
+        total: page.total,
+        next_cursor: page.next.map(|c| c.encode()),
+    }))
+}
+
+/// `GET /api/v1/guest/graph/themes/overview`
+pub async fn themes_overview(
+    State(state): State<AppState>,
+    Query(params): Query<GuestOverviewParams>,
+) -> Response {
+    guest_answer(read_overview(&state, params).await)
+}
+
+// ── The layout ──
+
+/// `GET /api/v1/guest/graph/themes/layout`:
+/// [`crate::routes::graph_layout::themes_layout`] read as the guest, with
+/// labels withheld.
+pub async fn themes_layout(
+    State(state): State<AppState>,
+    Query(q): Query<crate::routes::graph_layout::LayoutQuery>,
+) -> Response {
+    let viewer = Viewer::public_only();
+    guest_answer(
+        crate::routes::graph_layout::themes_layout_as(
+            &viewer,
+            &state,
+            q,
+            crate::routes::graph_layout::Labels::Withheld,
+        )
+        .await,
+    )
+}
