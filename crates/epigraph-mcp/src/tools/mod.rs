@@ -1,8 +1,8 @@
 pub mod admin_write;
 pub mod agent_lookup;
 pub mod alternative_sets;
-pub mod batch;
 pub mod atomicity;
+pub mod batch;
 pub mod bba_retract;
 pub mod bug_report;
 pub mod cdst_maintenance;

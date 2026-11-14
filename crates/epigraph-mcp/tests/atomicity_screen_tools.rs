@@ -176,7 +176,7 @@ fn ids_of(doc: &Value) -> Vec<Uuid> {
         .collect()
 }
 
-fn row<'a>(doc: &'a Value, id: Uuid) -> &'a Value {
+fn row(doc: &Value, id: Uuid) -> &Value {
     doc["claims"]
         .as_array()
         .expect("claims")
