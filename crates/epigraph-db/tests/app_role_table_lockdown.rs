@@ -935,7 +935,7 @@ async fn rotation_ignores_a_public_overload_of_the_builtins_it_calls(pool: PgPoo
 }
 
 /// The rotation's expiry cap is the client type's refresh TTL, row by row: the
-/// same table as `oauth/token.rs::handle_refresh_token`'s `refresh_ttl` (agent
+/// same table as `oauth/token.rs::refresh_token_ttl` (agent
 /// 24 h, human 30 d, service 90 d). A 100-year successor must land in a
 /// two-sided band around each TTL, so a shortened cap fails as well as a
 /// lengthened one. `oauth_clients_client_type_check` admits only these three

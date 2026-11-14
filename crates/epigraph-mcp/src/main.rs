@@ -2,7 +2,8 @@
 
 //! EpiGraph Full-Framework MCP Server — exposes all workspace crates as MCP tools.
 //!
-//! Connects to the EpiGraph PostgreSQL backend and provides 58 MCP tools including
+//! Connects to the EpiGraph PostgreSQL backend and provides the kernel MCP tools
+//! (the count is derived from the router, see `server_instructions`), including
 //! full CDST support (6 combination methods), scoped beliefs, and DS-vs-Bayesian divergence.
 //!
 //! ## Usage
@@ -42,7 +43,10 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(
     name = "epigraph-mcp-full",
-    about = "EpiGraph full-framework MCP server — 58 epistemic tools"
+    // No tool count here: the number is derived from the router at runtime
+    // (`EpiGraphMcpFull::all_tools_json`, in the handshake instructions and
+    // the startup log), and a literal in this string goes stale.
+    about = "EpiGraph full-framework MCP server"
 )]
 struct Cli {
     /// PostgreSQL connection URL

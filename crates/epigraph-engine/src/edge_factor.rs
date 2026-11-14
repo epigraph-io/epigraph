@@ -578,12 +578,30 @@ pub async fn recompute_claim_belief_binary(
 /// `epigraph-cli/src/bin/recompute_claim_belief.rs`) that need to refresh
 /// the cached BetP after a direct mutation to `mass_functions.source_strength`
 /// landed on a non-binary frame (research_validity, textbook_veracity_*, ...).
-/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
-/// frame-agnostic scalars — last writer wins — so for claims with BBAs
-/// across multiple frames, the caller is responsible for ordering
-/// per-frame recomputes deterministically.
+/// Also called directly, with the frame the caller is handling, by the
+/// per-write paths (MCP `submit_ds_evidence`, the HTTP belief route) and the
+/// retraction cascades.
 ///
-/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`.
+/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are ONE
+/// cache per claim, not one per frame, and `claims.belief_frame_id` records
+/// which frame's combination they hold. This function does NOT apply the
+/// cache-owner rule: it folds the frame it is given and writes that fold to
+/// the cache with `belief_frame_id = frame_id`. Which frame should own the
+/// cache is decided by [`recompute_claim_cached_belief`] (`binary_truth`,
+/// else `claim_validity`, else the recorded frame, else the first writer),
+/// which then calls this function with that frame. A caller that passes
+/// another frame re-points the cache to it whenever its session may write the
+/// claim row, so such a caller still decides the outcome by its call order.
+///
+/// The one write the database declines is that of a session that does not
+/// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
+/// reached through `MassFunctionRepository::update_claim_belief`): it may
+/// refresh the cache on the frame already recorded, or seed an empty cache on
+/// `binary_truth`; on any other frame its write is a no-op, not an error.
+///
+/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`. `Ok(true)`
+/// means the claim has BBAs there and the fold was attempted; it does not say
+/// the cache was written.
 ///
 /// # Errors
 /// String error if the frame row can't be loaded, the frame's hypothesis
