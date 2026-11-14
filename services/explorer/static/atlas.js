@@ -889,7 +889,41 @@
     minR: Infinity,
     animate: false,
     leafShown: false,
+    /** Levels attached since the last frame, until it draws them (W12 marks). */
+    drawnPending: [],
+    /** Levels asked for and not yet drawn (W12 marks). */
+    wanted: new Set(),
   };
+
+  // The latency marks (W12): `atlas:want:<level id>` when the viewer needs a
+  // level (zoom, switch, link), `atlas:drawn:<kind>:<level id>` after the first
+  // frame that draws it, and the stage's `data-atlas-drawn-level`. A level
+  // re-attached without being asked for (a breadcrumb ancestor from the cache)
+  // gets no drawn mark. They are what scripts/e2e/atlas-latency-browser.mjs
+  // times; nothing here reads them.
+  function markWanted(id) {
+    NS.wanted.add(id);
+    try {
+      performance.mark('atlas:want:' + id);
+    } catch (e) {
+      /* no User Timing: nothing to mark */
+    }
+  }
+
+  function markDrawn() {
+    if (!NS.drawnPending.length) return;
+    const docs = NS.drawnPending;
+    NS.drawnPending = [];
+    for (const doc of docs) {
+      if (!NS.wanted.delete(doc.level_id)) continue;
+      try {
+        performance.mark('atlas:drawn:' + doc.kind + ':' + doc.level_id);
+      } catch (e) {
+        /* no User Timing: nothing to mark */
+      }
+    }
+    dom.stage.setAttribute('data-atlas-drawn-level', docs[docs.length - 1].level_id);
+  }
 
   function nestedRoot(theme) {
     if (!NS.on || !theme || theme.kind !== 'theme') return null;
@@ -940,6 +974,7 @@
 
   /** Hang a fetched level's children under `node` (a theme, group or leaf). */
   function attachLevel(node, doc) {
+    NS.drawnPending.push(doc);
     node.doc = doc;
     node.levelId = doc.level_id;
     node.next = null;
@@ -1007,6 +1042,7 @@
     }
     theme.state = 'loading';
     redraw();
+    markWanted(id);
     try {
       attachLevel(theme, await fetchLevel(id, 'group', NS.hierarchy));
     } catch (e) {
@@ -1021,6 +1057,7 @@
     if (node.state === 'loading') return;
     node.state = 'loading';
     redraw();
+    markWanted(node.levelId);
     try {
       attachLevel(node, await fetchLevel(node.levelId, node.kind, node.hierarchy));
     } catch (e) {
@@ -1091,6 +1128,7 @@
       return;
     }
     let doc;
+    markWanted(target.level_id);
     try {
       doc = await fetchLevel(target.level_id, null, hierarchy);
     } catch (e) {
@@ -1129,6 +1167,7 @@
       return;
     }
     let doc;
+    markWanted(target.level_id);
     try {
       doc = await fetchLevel(target.level_id, null, target.hierarchy);
     } catch (e) {
@@ -1882,6 +1921,7 @@
     drawRim();
     const ringItems = drawRing();
     S.drawn = drawn.concat(ringItems);
+    markDrawn();
     if (S.rim.length) {
       S.caption = (S.caption ? S.caption + ' ' : '') + 'Rim marks show links to the strongest partners only.';
     }
