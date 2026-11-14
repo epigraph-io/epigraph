@@ -55,6 +55,35 @@ documents (W9 / W10) calls the fill before `write_run`.
   bytes. No trigonometry, `exp` or `powf`.
 - **Rounded.** Positions are rounded to 1e-4, as `math.rs` does, and every
   quality bound is checked on the rounded output.
+- **Warm starts (added after review).** A level whose input changed is laid
+  out again from the previous run's stored positions for it, not from
+  scratch (`layout_leaf_from`, `layout_group_from`; the fill counts them in
+  `FillReport::warm_started`). This matters most for groups: a child's exact
+  `claim_count` sets its radius and enters its parent's hash, so one new
+  claim in a leaf changes the input of its parent, grandparent and theme
+  root, and a cold relayout of a level of 60 or more children moved nearly
+  every circle by most of the disc (review measurement: 120 of 127 beyond
+  their own radius, up to 1.44). Warm:
+  - Group: surviving children start at their previous centres, taken back
+    into the pre-fit frame by `sqrt(sum of previous r^2 / GROUP_FILL)`; new
+    children start just outside, toward their linked siblings; then 50 rounds
+    of weak gravity (0.0005) with a collision sweep each, the sweeps, the
+    centring and the fit. One more claim in one child of 30 to 128 moves no
+    other circle more than 0.014 (bounded at 0.02 by the test).
+  - Leaf: placed nodes start where they were, new ones beside their placed
+    neighbours; the start is rescaled to where the forces balance (Newton on
+    the virial cubic) and the force iterations run at a hundredth of the cold
+    temperature. A node or edge added or removed in a 40- or 99-node leaf
+    moves the others 0.02 on average, at most 0.042.
+  - Only a previous run recorded under the same `LAYOUT_ALGO` is started
+    from, so a tag bump lays every level out cold.
+  - A warm result depends on the previous positions as well as the input, so
+    it is deterministic in (seed, input, previous) but not a function of the
+    hash alone. The hash stays the skip key and does not include the previous
+    positions: with them in it, a warm-started level would miss the skip on
+    every later night, since its previous positions change each time it is
+    laid out. Bucketing the sizes was rejected: a child crossing a bucket
+    boundary would still reshuffle its parent from cold.
 
 ## The content hash and where it is stored
 
@@ -113,14 +142,22 @@ run on a remote lane on ids and edges only.
 |-----------|------|
 | Every leaf in a synthetic hierarchy has stored positions | `atlas_w6_layout_store::every_level_of_a_synthetic_hierarchy_is_stored_with_valid_positions`: per hierarchy a theme root, two groups and six leaves (one at the 100-node cap), built with placeholder (0, 0) positions, filled, written with `write_run`/`put_level`/`finish_run`, read back with `level_for_viewer`, parsed with `parse_and_validate`, and checked for the minimum distance, the disc bound and non-overlap; the layout record reads back from `params`. A leaf left unfilled turns it red. |
 | A rerun over unchanged leaves gives identical positions and skips them through the content hash | `atlas_w6_layout_store::a_rerun_lays_out_only_the_changed_leaf_and_keeps_every_other_stored_position` (through W2's storage: `computed == 1`, `reused == 17`, every other level's positions equal), `fill::tests::an_unchanged_level_reuses_the_previous_positions_and_is_not_laid_out` (sentinel positions under the right hash come back, copied by id, `computed == 0`), `fill::tests::one_changed_leaf_is_the_only_one_laid_out_again` (`computed == 1`). Disabling the hash comparison, or reuse, turns them red. |
-| The per-leaf time bound holds, so the nightly fits its window | `force::tests::a_full_leaf_lays_out_within_the_time_bound`: 100 nodes, 400 edges, best of 5 runs under 50 ms on one core in the test (debug) build; measured about 26 ms. Ten times the iterations turns it red. The nightly's share is that time times the changed leaves per night (a prod measurement). |
+| The per-leaf time bound holds, so the nightly fits its window | `force::tests::a_full_leaf_lays_out_within_the_time_bound`: 100 nodes, 400 edges, cold and warm, best of 5. The 50 ms bound is asserted in a release build (`cargo test --release`, as the nightly runs it; measured 2.6 ms); a debug build asserts 500 ms (measured 26 ms), so CI's shared runners cannot flake it. 25 times the iterations turns the debug run red. The nightly's share is that time times the changed leaves per night (a prod measurement). |
+| Levels above a changed leaf keep their arrangement (review finding) | `force::tests::a_group_relaid_from_its_previous_circles_keeps_them_where_they_were` (30, 60, 128 children), `force::tests::a_leaf_relaid_from_its_previous_positions_keeps_them_where_they_were`, `fill::tests::a_child_that_gains_a_claim_relays_its_parent_from_the_stored_circles` (40-child fixture root), `atlas_w6_layout_store::a_claim_added_to_one_leaf_relays_it_and_its_ancestors_from_their_stored_positions` (through W2's storage: computed 3, warm 3, reused 15). |
 
 Quality bounds (all on the rounded output), in `force::tests`:
 - `leaf_nodes_keep_the_minimum_distance_and_stay_inside_the_disc` (40 random graphs up to the cap, plus a 99-spoke star; the farthest node is also at least 0.9 of the disc radius, so the layout uses its disc);
 - `connected_nodes_sit_closer_than_unconnected_ones` (the linked mean is under two thirds of the unlinked mean);
 - `group_circles_do_not_overlap_and_stay_inside_the_unit_disc`, `group_radii_are_monotone_in_size`, `linked_children_sit_closer_than_unlinked_ones`, `one_child_fills_the_fit_disc`;
 - determinism: `the_same_input_gives_byte_identical_positions_whatever_the_input_order`, `group_layout_is_deterministic_and_order_free_and_hashed`, `the_leaf_hash_changes_with_every_layout_input_and_nothing_else`;
-- `small_leaves_are_placed`, `malformed_inputs_are_refused`.
+- `small_leaves_are_placed`, `malformed_inputs_are_refused`;
+- `a_group_with_nothing_in_common_with_its_previous_circles_is_laid_out_cold`;
+- `the_layout_output_is_pinned_to_the_algorithm_tag`: SHA-256 of the exact
+  output of a cold and a warm 100-node leaf and a cold and a warm 128-child
+  group, beside an assertion on `LAYOUT_ALGO`. An arithmetic change fails it
+  until the tag is bumped and the digests re-pinned, so stored positions are
+  never reused under changed code. It is also the cross-host check to run on
+  another CPU architecture (not yet done).
 
 In `fill::tests`: `filled_fixture_levels_validate_and_keep_the_layout_bounds`
 (the W10a fixture levels pass `to_stored_json` after the fill),
@@ -132,7 +169,15 @@ In `fill::tests`: `filled_fixture_levels_validate_and_keep_the_layout_bounds`
 `a_w3_node_set_and_its_leaf_document_hash_and_lay_out_alike`.
 
 Each test is shown to fail on broken code: 39 mutation probes went red and
-were reverted (22 on the layout, 13 on the fill, 4 on the stored run). One
+were reverted (22 on the layout, 13 on the fill, 4 on the stored run). After
+review, 8 more went red: either warm path forced cold, the leaf rescale
+dropped, the warm leaf at the cold temperature, the warm gravity changed
+(the pin), the fill's warm start disabled (three fill and both DB rerun tests
+red), the fill's warm start ignoring the algorithm tag, and 25 times the leaf
+iterations (the debug time bound). The movement bound in the DB test is a
+wiring check only: its synthetic groups have 2 or 3 children, where even a
+cold relayout barely moves (the review measured 0 movers at 5 and 12
+children); the movement proofs are the force and fill tests above. One
 more fill probe survived and is equivalent: it lets a previous document of
 the other kind (a group where a leaf was) be reused, but a leaf and a group
 never share an input hash (their hash headers differ), so that branch cannot
@@ -146,7 +191,8 @@ fewer group levels than leaves.
 
 ## Build gate (tier 1)
 
-- `cargo test -p epigraph-cli --lib atlas_layout` (new unit tests)
+- `cargo test -p epigraph-cli --lib atlas_layout` (new unit tests), and
+  `cargo test --release -p epigraph-cli --lib atlas_layout::force::tests::a_full_leaf_lays_out_within_the_time_bound`
 - `cargo test -p epigraph-cli --test atlas_w6_layout_store` under `--db`
 - `cargo fmt --check`, `cargo +stable clippy -p epigraph-cli --all-targets --locked -- -D warnings`
 - `cargo test -p epigraph-db --test no_unscoped_pool`, `cargo check -p epigraph-api --no-default-features --locked`
@@ -156,6 +202,12 @@ No edge writer is added or renamed, so the signing ratchet is not in scope.
 ## Left for later items
 
 - W9 reads the previous finished run's `params.layout` and its level
-  documents, and calls `fill_positions` before `write_run`.
+  documents, and calls `fill_positions` before `write_run`. W2's repository
+  has no function yet that reads a previous run's `params` and all its
+  levels (the DB test uses raw SQL for `params` and one read per level), so
+  W9 adds both to the repository layer.
+- Prod measurements: the record's size in `params` on the largest team map
+  (about 110 bytes per level per hierarchy), and the nightly window (changed
+  leaves per night times about 2.6 ms, plus re-laid group levels).
 - The off-box shipping itself (serialising inputs to a lane and positions
   back) is W9's orchestration; W6 makes the pure step text-free.
