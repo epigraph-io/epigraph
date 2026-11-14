@@ -614,9 +614,19 @@ fn serial() -> openssl::asn1::Asn1Integer {
 impl TestAttestation {
     /// A fresh root and attestation certificate (§8.2.1: version 3; subject C,
     /// O, OU = "Authenticator Attestation", CN; `CA:FALSE`), valid from
-    /// yesterday for a year: the library checks the window.
+    /// yesterday for a year: the library checks the window. The root is
+    /// valid from a year ago: a test may hold a lineage passkey's chain to its
+    /// validity at a past confirmation time, which the root must then cover.
     #[must_use]
     pub fn new(vendor: &str) -> Self {
+        Self::with_root_validity(vendor, now_unix() - ROOT_AGE, now_unix() + 365 * 86_400)
+    }
+
+    /// [`Self::new`], its ROOT valid `not_before..=not_after` (Unix seconds)
+    /// instead: a test holds a lineage passkey to its root's window as well as
+    /// its leaf's at the time it confirmed.
+    #[must_use]
+    pub fn with_root_validity(vendor: &str, not_before: i64, not_after: i64) -> Self {
         let root_key = p256();
         let mut name = X509NameBuilder::new().expect("name");
         name.append_entry_by_text("CN", &format!("{vendor} Test Attestation Root"))
@@ -628,11 +638,9 @@ impl TestAttestation {
         b.set_subject_name(&root_name).expect("subject");
         b.set_issuer_name(&root_name).expect("issuer");
         b.set_pubkey(&root_key).expect("pubkey");
-        // Valid from a year ago: a test may hold a lineage passkey's chain to
-        // its validity at a past confirmation time, which the root must cover.
-        b.set_not_before(&Asn1Time::from_unix(now_unix() - ROOT_AGE).expect("t"))
+        b.set_not_before(&Asn1Time::from_unix(not_before).expect("t"))
             .expect("nb");
-        b.set_not_after(&Asn1Time::days_from_now(365).expect("t"))
+        b.set_not_after(&Asn1Time::from_unix(not_after).expect("t"))
             .expect("na");
         b.append_extension(BasicConstraints::new().critical().ca().build().expect("bc"))
             .expect("bc");
