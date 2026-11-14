@@ -131,12 +131,18 @@ fn sources_of(authored: &AuthoredBy) -> Vec<GuestSource> {
     out
 }
 
-async fn read_claim_card(state: &AppState, id: Uuid) -> Result<Json<GuestClaimCard>, ApiError> {
-    let viewer = Viewer::public_only();
-    let mut read = open_scoped_read(state, &viewer, "guest_claim_card").await?;
+/// The card of `id` as `viewer` reads it. Every guest handler passes
+/// [`Viewer::public_only`]; the parameter is a `&Viewer` so
+/// `tests/viewer_spend_lint.rs` measures this body like any other read.
+async fn read_claim_card(
+    state: &AppState,
+    viewer: &Viewer,
+    id: Uuid,
+) -> Result<Json<GuestClaimCard>, ApiError> {
+    let mut read = open_scoped_read(state, viewer, "guest_claim_card").await?;
 
     let Some((claim, labels)) =
-        ClaimRepository::get_by_id_with_labels(&mut *read, &viewer, ClaimId::from_uuid(id)).await?
+        ClaimRepository::get_by_id_with_labels(&mut *read, viewer, ClaimId::from_uuid(id)).await?
     else {
         return Err(claim_not_found(id));
     };
@@ -148,7 +154,7 @@ async fn read_claim_card(state: &AppState, id: Uuid) -> Result<Json<GuestClaimCa
     }
     let authored = AuthoredByRepository::for_claim(
         &mut read,
-        &viewer,
+        viewer,
         id,
         claim.agent_id.as_uuid(),
         claim.created_at,
@@ -169,7 +175,7 @@ async fn read_claim_card(state: &AppState, id: Uuid) -> Result<Json<GuestClaimCa
 
 /// `GET /api/v1/guest/claims/:id`
 pub async fn claim_card(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
-    guest_answer(read_claim_card(&state, id).await)
+    guest_answer(read_claim_card(&state, &Viewer::public_only(), id).await)
 }
 
 // ── Ego ──
@@ -216,8 +222,11 @@ pub struct GuestThemesOverview {
     pub next_cursor: Option<String>,
 }
 
+/// The overview page as `viewer` reads it; a `&Viewer` for the same reason
+/// as [`read_claim_card`].
 async fn read_overview(
     state: &AppState,
+    viewer: &Viewer,
     params: GuestOverviewParams,
 ) -> Result<Json<GuestThemesOverview>, ApiError> {
     use epigraph_db::repos::claim_theme::{ThemeOverviewCursor, THEME_OVERVIEW_PAGE_MAX};
@@ -237,10 +246,9 @@ async fn read_overview(
         })?),
     };
 
-    let viewer = Viewer::public_only();
-    let mut read = open_scoped_read(state, &viewer, "guest_themes_overview").await?;
+    let mut read = open_scoped_read(state, viewer, "guest_themes_overview").await?;
     let page =
-        epigraph_db::ClaimThemeRepository::overview_page(&mut *read, &viewer, after, limit).await?;
+        epigraph_db::ClaimThemeRepository::overview_page(&mut *read, viewer, after, limit).await?;
     finish_scoped_read(read, "guest_themes_overview").await?;
 
     Ok(Json(GuestThemesOverview {
@@ -262,7 +270,7 @@ pub async fn themes_overview(
     State(state): State<AppState>,
     Query(params): Query<GuestOverviewParams>,
 ) -> Response {
-    guest_answer(read_overview(&state, params).await)
+    guest_answer(read_overview(&state, &Viewer::public_only(), params).await)
 }
 
 // ── The layout ──
@@ -274,10 +282,9 @@ pub async fn themes_layout(
     State(state): State<AppState>,
     Query(q): Query<crate::routes::graph_layout::LayoutQuery>,
 ) -> Response {
-    let viewer = Viewer::public_only();
     guest_answer(
         crate::routes::graph_layout::themes_layout_as(
-            &viewer,
+            &Viewer::public_only(),
             &state,
             q,
             crate::routes::graph_layout::Labels::Withheld,
