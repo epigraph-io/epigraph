@@ -3457,6 +3457,35 @@ mod db_tests {
         .expect("upsert oauth_client");
     }
 
+    /// `AppState` on a `ScopedPool`, for the `patch_claim` tests.
+    ///
+    /// `patch_claim` reads its write target through `AppState::read_as`, which
+    /// REFUSES (500) on a state built with `AppState::with_db`: that state has
+    /// no `ScopedPool`, and a fallback to the raw pool would be an unstamped
+    /// read. The server binary and `tests/common` build their state this way
+    /// for the same reason. The pool the tests seed with stays the plain
+    /// `try_test_pool` one; both connect to `DATABASE_URL`.
+    async fn scoped_test_state() -> AppState {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (the pool connected)");
+        let scoped = epigraph_db::ScopedPool::connect_with_options(
+            &url,
+            epigraph_db::SessionGucMode::Session,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("scoped pool connect");
+        AppState::with_scoped_pool(
+            scoped,
+            ApiConfig {
+                require_packet_signatures: false,
+                ..Default::default()
+            },
+        )
+    }
+
     /// Build a test router with patch_claim + an injected AuthContext.
     fn test_router(state: AppState, auth: AuthContext) -> Router {
         Router::new()
@@ -3511,13 +3540,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3560,13 +3583,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3604,13 +3621,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // Sending truth_value alongside a real patchable field: truth_value is silently dropped,
@@ -3671,13 +3682,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3716,13 +3721,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // Patch two fields at once
@@ -3769,13 +3768,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // Patch properties with a value that is already set → no actual change
@@ -3813,13 +3806,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3839,13 +3826,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
 
         // Router WITHOUT injected AuthContext extension
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = Router::new()
             .route("/api/v1/claims/:id", patch(patch_claim))
             .with_state(state);
@@ -3887,13 +3868,7 @@ mod db_tests {
             delegated_by: None,
         };
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth);
 
         let resp = router
@@ -3918,13 +3893,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // truth_value is an unknown field; after deserialization nothing to patch → 400
@@ -3948,13 +3917,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3987,13 +3950,25 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
+        let state = scoped_test_state().await;
+
+        // Calibration: this state serves the route's scoped read, so the 500
+        // asserted below comes from a later step. On a state with no
+        // `ScopedPool` every request dies at that read with the same 500, and
+        // this test then passes without reaching the provenance write.
+        let probe = test_router(state.clone(), auth_ctx(bad_client_id))
+            .oneshot(patch_request(
+                Uuid::new_v4(),
+                serde_json::json!({"properties": {"mutated": true}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            probe.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown claim is 404 on this state, so the scoped read works"
         );
+
         let router = test_router(state, auth_ctx(bad_client_id));
 
         let resp = router
