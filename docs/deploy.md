@@ -437,7 +437,8 @@ For the others, anything else is off.
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | As for the API. |
 | `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error. See `crates/epigraph-mcp/src/federation/`. |
 | `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. |
-| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | How often an unhealthy extension is re-dialled. |
+| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | Period of the federation health timer: an unhealthy extension is re-dialled, a healthy one has its tool list re-read (and is demoted if it no longer answers). |
+| `EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS` | `300` | Longest a proxied federated `tools/call` may take before the gateway abandons it and answers the caller with a timeout. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
 | `RUST_LOG` | `epigraph_mcp=info,tenancy=info` | Log filter, to stderr. `rmcp*` is capped at INFO regardless. |

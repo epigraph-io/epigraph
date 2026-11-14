@@ -914,10 +914,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              and likely fail; extensions will mount unhealthy"
         );
     }
+    // Bound on one proxied tools/call. Unset, zero or unparseable keeps the
+    // default: an operator who mistypes the value must not get an unbounded
+    // call, which is the behaviour this bound replaced.
+    let call_timeout = std::env::var("EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(
+            epigraph_mcp::federation::client::DEFAULT_CALL_TIMEOUT,
+            std::time::Duration::from_secs,
+        );
     let federation = epigraph_mcp::federation::SharedFederation::new(
         epigraph_mcp::federation::FederationRegistry::build(ext_configs, &discovery_token)
             .await
-            .map_err(|e| format!("federation gateway build failed: {e}"))?,
+            .map_err(|e| format!("federation gateway build failed: {e}"))?
+            .with_call_timeout(call_timeout),
     );
     let federated_tool_count = federation.list_federated_tools().len();
     if federation.is_empty() {
@@ -946,7 +958,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         tracing::info!(
             reconnect_interval_secs = reconnect_interval.as_secs(),
-            "Federation gateway: reconnect timer started for unhealthy extensions"
+            call_timeout_secs = call_timeout.as_secs(),
+            "Federation gateway: health timer started (re-dials unhealthy extensions, \
+             re-reads healthy ones' tool lists)"
         );
         federation.spawn_reconnect_loop(reconnect_interval);
     }

@@ -107,6 +107,20 @@ pub struct FederationRegistry {
     /// [`reconnect_tick`](SharedFederation::reconnect_tick) can re-dial dropped
     /// extensions without the caller threading the token back through.
     discovery_token: String,
+    /// Bound on one proxied `tools/call` round trip
+    /// ([`client::DEFAULT_CALL_TIMEOUT`] unless
+    /// [`with_call_timeout`](Self::with_call_timeout) set another).
+    call_timeout: Duration,
+}
+
+/// One extension as the health timer sees it: an owned snapshot taken under
+/// the read lock, so the tick's network I/O runs with no lock held.
+struct TickTarget {
+    index: usize,
+    config: ExtensionConfig,
+    /// The discovery session's peer handle when the extension is mounted
+    /// healthy; `None` when it is unhealthy (there is no session to probe).
+    peer: Option<rmcp::service::Peer<rmcp::RoleClient>>,
 }
 
 impl FederationRegistry {
@@ -122,7 +136,16 @@ impl FederationRegistry {
             extensions: Vec::new(),
             routes: HashMap::new(),
             discovery_token: String::new(),
+            call_timeout: client::DEFAULT_CALL_TIMEOUT,
         }
+    }
+
+    /// Bound each proxied `tools/call` by `timeout` instead of
+    /// [`client::DEFAULT_CALL_TIMEOUT`].
+    #[must_use]
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
     }
 
     /// Build a registry from parsed extension configs, connecting a discovery
@@ -217,6 +240,7 @@ impl FederationRegistry {
             extensions,
             routes,
             discovery_token: discovery_token.to_string(),
+            call_timeout: client::DEFAULT_CALL_TIMEOUT,
         })
     }
 
@@ -294,7 +318,14 @@ impl FederationRegistry {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
-        client::invoke_once(&config.addr, caller_token, downstream_name, arguments).await
+        client::invoke_once(
+            &config.addr,
+            caller_token,
+            downstream_name,
+            arguments,
+            self.call_timeout,
+        )
+        .await
     }
 
     /// Every extension currently mounted unhealthy, as `(index, config)` pairs,
@@ -314,27 +345,73 @@ impl FederationRegistry {
             .collect()
     }
 
+    /// Every mounted extension, healthy or not, for one pass of the health
+    /// timer. Sync and owning, for the reason [`Self::unhealthy_targets`] is.
+    #[must_use]
+    fn tick_targets(&self) -> Vec<TickTarget> {
+        self.extensions
+            .iter()
+            .enumerate()
+            .map(|(index, ext)| TickTarget {
+                index,
+                config: ext.config.clone(),
+                peer: if ext.healthy {
+                    ext.client.as_ref().map(|c| c.peer().clone())
+                } else {
+                    None
+                },
+            })
+            .collect()
+    }
+
     /// The token used to (re)establish discovery sessions.
     #[must_use]
     fn discovery_token(&self) -> String {
         self.discovery_token.clone()
     }
 
-    /// Promote extension `index` to healthy with `tools` routed to it, using the
-    /// freshly-established discovery `session`.
+    /// Demote extension `index` to unhealthy: drop its discovery session, its
+    /// cached tools and every route it owns, so the gateway stops advertising
+    /// tools it can no longer reach. The health timer re-dials it. Returns
+    /// `true` when it was healthy before the call.
+    fn demote(&mut self, index: usize) -> bool {
+        let Some(ext) = self.extensions.get_mut(index) else {
+            return false;
+        };
+        let was_healthy = ext.healthy;
+        ext.client = None;
+        ext.tools.clear();
+        ext.healthy = false;
+        self.routes.retain(|_, owner| *owner != index);
+        was_healthy
+    }
+
+    /// The index of the extension named `name`.
+    fn index_of(&self, name: &str) -> Option<usize> {
+        self.extensions.iter().position(|e| e.config.name == name)
+    }
+
+    /// Make `tools` the tool list of extension `index` and route them to it,
+    /// replacing whatever it routed before, and mark it healthy. `session` is a
+    /// freshly-established discovery session to adopt (a reconnect, or a
+    /// healthy extension whose old session had died); `None` keeps the session
+    /// the list was just read over (a healthy extension's periodic refresh).
     ///
-    /// The **write half** of a reconnect pass: sync, no `.await`, so it runs
-    /// entirely under the write lock. A reconnect that would introduce a
-    /// tool-name collision with an already-mounted extension is skipped (logged)
-    /// rather than errored — reconnect must never take down the running gateway;
-    /// the collision is surfaced at the next `build`. Returns `true` when the
-    /// extension was actually promoted.
-    fn apply_reconnect(
+    /// The **write half** of a health pass: sync, no `.await`, so it runs
+    /// entirely under the write lock. A list that would introduce a tool-name
+    /// collision with ANOTHER mounted extension is skipped (logged) rather than
+    /// errored — the timer must never take down the running gateway; the
+    /// collision is surfaced at the next `build`. The extension is then left
+    /// exactly as it was. Returns `true` when the list was applied.
+    fn apply_tools(
         &mut self,
         index: usize,
-        session: ExtensionClient,
+        session: Option<ExtensionClient>,
         tools: Vec<Tool>,
     ) -> bool {
+        if index >= self.extensions.len() {
+            return false;
+        }
         // Guard against stealing a route owned by a *different* extension. The
         // snapshot this reconnect was planned from may be stale: another tick
         // (or a concurrent revival) could have claimed the name in between.
@@ -345,29 +422,47 @@ impl FederationRegistry {
                     tracing::warn!(
                         extension = %self.extensions[index].config.name,
                         tool = %name,
-                        "federation: reconnect skipped — tool collides with a mounted extension"
+                        "federation: tool list not applied — a tool collides with another mounted extension"
                     );
                     return false;
                 }
             }
         }
+        let was_healthy = self.extensions[index].healthy;
+        let changed = self.extensions[index].tools != tools;
+        // Routes are REPLACED, not merged: a tool the extension no longer
+        // exports must stop being advertised and routed.
+        self.routes.retain(|_, owner| *owner != index);
         for tool in &tools {
             self.routes.insert(tool.name.to_string(), index);
         }
-        tracing::info!(
-            extension = %self.extensions[index].config.name,
-            tool_count = tools.len(),
-            "federation: reconnected extension"
-        );
+        if !was_healthy {
+            tracing::info!(
+                extension = %self.extensions[index].config.name,
+                tool_count = tools.len(),
+                "federation: reconnected extension"
+            );
+        } else if changed || session.is_some() {
+            tracing::info!(
+                extension = %self.extensions[index].config.name,
+                tool_count = tools.len(),
+                tools_changed = changed,
+                session_replaced = session.is_some(),
+                "federation: refreshed extension"
+            );
+        }
         let ext = &mut self.extensions[index];
-        ext.client = Some(session);
+        if let Some(session) = session {
+            ext.client = Some(session);
+        }
         ext.tools = tools;
         ext.healthy = true;
         true
     }
 }
 
-/// Default period between reconnect attempts for unhealthy extensions.
+/// Default period of the health timer: how often an unhealthy extension is
+/// re-dialled and a healthy one has its tool list re-read.
 pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A shareable handle to the registry. The gateway constructs one
@@ -481,43 +576,113 @@ impl SharedFederation {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
-        client::invoke_once(&config.addr, caller_token, downstream_name, arguments).await
+        let call_timeout = self.read().call_timeout;
+        let result = client::invoke_once(
+            &config.addr,
+            caller_token,
+            downstream_name,
+            arguments,
+            call_timeout,
+        )
+        .await;
+        // An extension the gateway could not even reach is demoted NOW rather
+        // than at the next tick, so it stops being advertised and the
+        // unknown-tool error can name it as down. A call that reached it and
+        // failed (its own error, a slow answer) says nothing about its health.
+        if result.as_ref().is_err_and(FederationError::is_unreachable) {
+            let mut guard = self.write();
+            if let Some(index) = guard.index_of(&config.name) {
+                if guard.demote(index) {
+                    tracing::warn!(
+                        extension = %config.name,
+                        tool = %effective_name,
+                        "federation: extension unreachable on invoke; demoted until the \
+                         health timer re-dials it"
+                    );
+                }
+            }
+        }
+        result
     }
 
-    /// One reconnect pass: re-dial every extension currently mounted unhealthy
-    /// and, on success, route its tools. Healthy extensions are untouched.
+    /// One pass of the health timer over EVERY mounted extension.
+    ///
+    /// - **Unhealthy** (down at boot, or demoted since): re-dial it and, on
+    ///   success, route its tools.
+    /// - **Healthy**: re-read its tool list over its persistent discovery
+    ///   session and make that the routed list, so a tool it added, removed or
+    ///   re-schema'd since the last pass is picked up. If the session no longer
+    ///   answers (the extension restarted or died), re-dial once in the same
+    ///   pass: a restarted extension is adopted on its new session with no gap,
+    ///   and one that is gone is demoted (no tools, no routes) until it
+    ///   returns.
+    ///
+    /// Before this pass covered healthy extensions, a mounted extension was
+    /// never looked at again: the gateway advertised its boot-time tool list
+    /// for the life of the process (backlog c19cdae0).
     ///
     /// Structured as snapshot → (unlocked) network I/O → apply, so no lock is
-    /// held across an `.await`.
+    /// held across an `.await`. Every request is bounded
+    /// ([`client::HANDSHAKE_TIMEOUT`], [`client::LIST_TIMEOUT`]), so one hung
+    /// extension delays the pass by a few seconds and cannot stop it.
     pub async fn reconnect_tick(&self) {
         let (targets, token) = {
             let guard = self.read();
-            (guard.unhealthy_targets(), guard.discovery_token())
+            (guard.tick_targets(), guard.discovery_token())
         };
-        for (index, config) in targets {
-            let session = match client::discovery_session(&config.addr, &token).await {
-                Ok(s) => s,
+        for TickTarget {
+            index,
+            config,
+            peer,
+        } in targets
+        {
+            let was_healthy = peer.is_some();
+            if let Some(peer) = peer {
+                match client::list_all_tools_on(&peer).await {
+                    Ok(raw) => {
+                        let tools = FederationRegistry::prefix_tools(&config, raw);
+                        self.write().apply_tools(index, None, tools);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!(extension = %config.name, error = %e, "federation: discovery session no longer answers; re-dialling");
+                    }
+                }
+            }
+            let redialled = match client::discovery_session(&config.addr, &token).await {
+                Ok(session) => match client::list_all_tools(&session).await {
+                    Ok(raw) => Ok((session, raw)),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            };
+            match redialled {
+                Ok((session, raw)) => {
+                    let tools = FederationRegistry::prefix_tools(&config, raw);
+                    self.write().apply_tools(index, Some(session), tools);
+                }
+                Err(e) if was_healthy => {
+                    if self.write().demote(index) {
+                        tracing::warn!(
+                            extension = %config.name,
+                            error = %e,
+                            "federation: extension stopped answering; demoted (its tools are \
+                             no longer advertised) until it can be re-dialled"
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::debug!(extension = %config.name, error = %e, "federation: reconnect still failing");
-                    continue;
                 }
-            };
-            let raw = match client::list_all_tools(&session).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::debug!(extension = %config.name, error = %e, "federation: reconnect tools/list failed");
-                    continue;
-                }
-            };
-            let tools = FederationRegistry::prefix_tools(&config, raw);
-            self.write().apply_reconnect(index, session, tools);
+            }
         }
     }
 
-    /// Spawn the background reconnect timer, returning its handle.
+    /// Spawn the background health timer, returning its handle.
     ///
     /// Without this, an extension that was down at boot stays unroutable for the
-    /// lifetime of the process — the gateway would need a restart to pick it up.
+    /// lifetime of the process — the gateway would need a restart to pick it
+    /// up — and one that changes or dies after mounting is never noticed.
     pub fn spawn_reconnect_loop(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
