@@ -585,7 +585,7 @@ pub struct ReasoningTraceResponse {
 /// The author a reasoning trace is recorded under: the authenticated caller
 /// (backlog f64cf9c6; the rule `experiment_loop.rs::caller_author` follows).
 ///
-/// The trace, its response and its key lookup took the body's `agent_id`, so
+/// The trace and its response took the body's `agent_id`, so
 /// any caller holding `claims:write` could file reasoning in another agent's
 /// name. Omitted, the author is the caller; named, it must be the caller.
 /// Checked after the scope and before anything is read or written.
@@ -612,13 +612,20 @@ fn trace_author(
 ///
 /// POST /api/v1/reasoning-traces
 ///
-/// The author is the authenticated caller ([`trace_author`]); an absent
-/// `AuthContext` is a refusal, not a pass. The author's key lookup, the trace
-/// and its `HAS_TRACE` edge are written on ONE transaction stamped with the
-/// caller's viewer (`AppState::write_as`), so the database decides the trace's
-/// owner from the caller's writable groups. A trace the database refuses is
-/// `403` with nothing written. The edge stays best-effort, as it was, under a
-/// savepoint so a refused edge does not roll the trace back.
+/// The author is the authenticated caller (backlog f64cf9c6,
+/// [`trace_author`]): an omitted `agent_id` is the caller's
+/// own, a named one that is not the caller is `403`, and an absent
+/// `AuthContext` is a refusal, not a pass. The trace and its `HAS_TRACE` edge
+/// are written on ONE transaction stamped with the caller's viewer
+/// (`AppState::write_as`), so the database decides the trace's owner from the
+/// caller's writable groups.
+///
+/// The claim is read as the caller on that transaction first: a claim the
+/// caller cannot read gets the same `404` as one that does not exist, so the
+/// route is no existence oracle (as `belief.rs::submit_evidence` step 5a). A
+/// readable claim the database refuses the trace on is `403` with nothing
+/// written. The edge stays best-effort, as it was, under a savepoint so a
+/// refused edge does not roll the trace back.
 #[cfg(feature = "db")]
 pub async fn create_reasoning_trace(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -682,17 +689,36 @@ pub async fn create_reasoning_trace(
     };
     let mut tx = state.write_as(&viewer, "create_reasoning_trace").await?;
 
-    // Resolve the author's public key
-    let public_key = epigraph_db::AgentRepository::get_by_id(&mut *tx, AgentId::from_uuid(author))
-        .await
-        .ok()
-        .flatten()
-        .map(|a| a.public_key)
-        .unwrap_or([0u8; 32]);
+    // The claim, read as the caller. Unreadable and nonexistent answer alike.
+    {
+        let sql = viewer.splice(
+            "SELECT c.id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(request.claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+            .is_none()
+        {
+            return Err(ApiError::NotFound {
+                entity: "claim".to_string(),
+                id: request.claim_id.to_string(),
+            });
+        }
+    }
 
+    // `reasoning_traces` stores neither the author nor its key
+    // (`ReasoningTraceRepository::create_with_reasoning_type`), so no key is
+    // looked up.
     let trace = ReasoningTrace::new(
         AgentId::from_uuid(author),
-        public_key,
+        [0u8; 32],
         methodology,
         inputs,
         request.confidence,

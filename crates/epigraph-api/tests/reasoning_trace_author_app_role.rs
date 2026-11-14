@@ -7,7 +7,9 @@
 //! * a body `agent_id` naming another agent is `403` with nothing written;
 //! * an omitted (or self-naming) `agent_id` is the caller, and the trace is
 //!   written on a transaction stamped with the caller's viewer, so the database
-//!   decides its owner from the caller's writable groups.
+//!   decides its owner from the caller's writable groups;
+//! * a claim the caller cannot read answers exactly as a nonexistent one
+//!   (`404`, same body), and a claim it reads but may not write is `403`.
 //!
 //! Both pools of the `AppState` are `epigraph_app` (no BYPASSRLS, FORCEd
 //! tenancy policies), as in `entity_triple_write_app_role.rs`: a write that
@@ -235,4 +237,126 @@ async fn the_callers_trace_commits_on_the_app_role_owned_by_the_callers_group(po
     assert_eq!(status.as_u16(), 201);
     assert_eq!(body.agent_id, w.caller);
     assert_eq!(traces_on(&w.pool, w.claim).await.len(), 2);
+}
+
+/// A `'group'`-visibility claim owned by `group`, readable only by its members.
+async fn group_claim_of(pool: &PgPool, agent: Uuid, group: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'group', $5)",
+    )
+    .bind(id)
+    .bind(format!("f64cf9c6 group claim {id}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed group claim");
+    id
+}
+
+/// The refusal rendered as the client sees it: status and body bytes, with the
+/// request's own claim id replaced by a fixed token (the 404 echoes the id the
+/// caller sent, which it already knows).
+async fn rendered(
+    res: Result<(axum::http::StatusCode, Json<impl Sized>), ApiError>,
+    claim: Uuid,
+) -> (u16, String) {
+    use axum::response::IntoResponse;
+    let err = match res {
+        Ok((status, _)) => panic!("expected a refusal, got {status}"),
+        Err(e) => e,
+    };
+    let response = err.into_response();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let body = String::from_utf8(bytes.to_vec())
+        .expect("utf-8 body")
+        .replace(&claim.to_string(), "<claim>");
+    (status, body)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_claim_answers_exactly_as_a_missing_one(pool: PgPool) {
+    let w = world(pool, "f64-oracle").await;
+    let (_, hidden_group) = seed_agent_with_group(&w.pool, "f64-oracle-hidden").await;
+    let hidden = group_claim_of(&w.pool, w.other, hidden_group).await;
+    let missing = Uuid::new_v4();
+
+    let unreadable = rendered(
+        create_reasoning_trace(
+            viewer(&w.pool, w.caller).await,
+            State(w.state.clone()),
+            auth(w.caller),
+            Json(request(hidden, None)),
+        )
+        .await,
+        hidden,
+    )
+    .await;
+    let absent = rendered(
+        create_reasoning_trace(
+            viewer(&w.pool, w.caller).await,
+            State(w.state.clone()),
+            auth(w.caller),
+            Json(request(missing, None)),
+        )
+        .await,
+        missing,
+    )
+    .await;
+
+    assert_eq!(
+        unreadable.0, 404,
+        "an unreadable claim is 404: {unreadable:?}"
+    );
+    assert_eq!(
+        unreadable, absent,
+        "an unreadable claim and a nonexistent one must be indistinguishable"
+    );
+    assert!(
+        traces_on(&w.pool, hidden).await.is_empty(),
+        "nothing written"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_readable_claim_the_caller_cannot_write_is_refused(pool: PgPool) {
+    let w = world(pool, "f64-reader").await;
+    let (author, read_only_group) = seed_agent_with_group(&w.pool, "f64-reader-owner").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(read_only_group)
+    .bind(w.caller)
+    .execute(&w.pool)
+    .await
+    .expect("seed reader membership");
+    let claim = group_claim_of(&w.pool, author, read_only_group).await;
+
+    let res = create_reasoning_trace(
+        viewer(&w.pool, w.caller).await,
+        State(w.state.clone()),
+        auth(w.caller),
+        Json(request(claim, None)),
+    )
+    .await;
+    match res {
+        Err(ApiError::Forbidden { .. }) => {}
+        other => panic!(
+            "a claim the caller reads but may not write must be 403, got {:?}",
+            other.map(|(s, _)| s)
+        ),
+    }
+    assert!(
+        traces_on(&w.pool, claim).await.is_empty(),
+        "nothing written"
+    );
 }
