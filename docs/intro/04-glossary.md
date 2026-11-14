@@ -18,7 +18,7 @@ A label applied via `submit_claim` (or `memorize`) with `labels=["backlog"]` to 
 
 ## BetP
 
-The pignistic probability: a scalar in `[0, 1]` derived from a Dempster-Shafer mass function by distributing the mass of each focal set uniformly over its singletons. BetP is the standard projection used to order claims by belief and is the primary belief signal EpiGraph exposes — Bayesian `truth_value` is deprecated. See the LANL Open World DST paper (LA-UR-25-23655) for the standard treatment. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
+The pignistic probability: a scalar in `[0, 1]` derived from a Dempster-Shafer mass function by distributing the mass of each focal set uniformly over its singletons. BetP is the standard projection used to order claims by belief and is the primary belief signal EpiGraph exposes. The scalar `truth_value` column is still set on every claim and is the fallback score for a claim with no Dempster-Shafer state; the Bayesian updater that used to maintain it is deprecated. See the LANL Open World DST paper (LA-UR-25-23655) for the standard treatment. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
 
 ## challenge
 
@@ -78,7 +78,7 @@ A named viewpoint — typically an agent's or a group's — under which belief a
 
 ## pignistic probability
 
-Synonym for BetP: the scalar probability obtained by distributing each focal set's mass uniformly over its singleton elements of the frame. It is the standard decision-theoretic projection from a DST mass function and replaces the deprecated `truth_value` for all belief ordering. See the LANL Open World DST paper (LA-UR-25-23655) for derivation. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
+Synonym for BetP: the scalar probability obtained by distributing each focal set's mass uniformly over its singleton elements of the frame. It is the standard decision-theoretic projection from a DST mass function and is the score to rank by; some of the kernel's own queries still order by the scalar `truth_value` (see §3). See the LANL Open World DST paper (LA-UR-25-23655) for derivation. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
 
 ## provenance
 

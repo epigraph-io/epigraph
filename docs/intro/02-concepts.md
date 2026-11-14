@@ -220,7 +220,16 @@ rules are implemented in `crates/epigraph-ds`, and the read-only
 `compare_methods` tool runs all six over a claim's stored mass
 functions so you can see how sensitive it is to the choice.
 
-Scalar propagation is no longer what belief is served from, but it has not been removed from the tree. Multiplying scalar truth values along edges collapses them toward zero independently of how strong the evidence actually is, which is why the Dempster-Shafer path is primary. What remains: the loopy belief-propagation engine (`crates/epigraph-engine/src/bp.rs`) is reachable through `POST /api/v1/bp/propagate` as a read-only diagnostic (a request to write its results is refused with 409 unless the server was started with `EPIGRAPH_BP_APPLY=on`), and a few HTTP paths still write `truth_value` through the deprecated `BayesianUpdater`: a packet submission's initial truth, the workflow outcome report, and forgetting a convention. The deprecated `truth_value` column is still present in some rows for back-compat; do not order claims by it. The `bp_messages` table that backed the scalar engine is dead and a candidate for drop (`project_bp_messages_dead.md`).
+Scalar propagation is no longer what belief is served from, but it has not been removed from the tree. Multiplying scalar truth values along edges collapses them toward zero independently of how strong the evidence actually is, which is why the Dempster-Shafer path is primary. What remains: the loopy belief-propagation engine (`crates/epigraph-engine/src/bp.rs`) is reachable through `POST /api/v1/bp/propagate` as a read-only diagnostic (a request to write its results is refused with 409 unless the server was started with `EPIGRAPH_BP_APPLY=on`), and a few HTTP paths still write `truth_value` through the deprecated `BayesianUpdater`: a packet submission's initial truth, the workflow outcome report, and forgetting a convention.
+
+`truth_value` is not a leftover column. It is set on every claim and the kernel still reads and writes it:
+
+- **What it holds.** The scalar the claim was authored with, or a copy of the cache: `submit_claim` and `update_with_evidence` store `truth_value = clamped(pignistic_prob)` when they fold evidence. A later cache recompute rewrites the cache and not `truth_value`, so such a copy can be stale; the operator binary `refresh_truth_mirrors` (`crates/epigraph-cli`) brings stale copies back in step with the cache.
+- **Where it is read.** The belief score that `recall` and `query_claims` gate on with `min_truth` is the pignistic probability when the claim has a Dempster-Shafer cache and `truth_value` when it does not. Several queries order by the column directly: `ClaimRepository::get_high_truth` / `get_low_truth`, the workflow listings in `crates/epigraph-db/src/repos/workflow.rs`, and the ranking of a recall hit's epistemic neighbors.
+
+So rank by `pignistic_prob` (or a result's `belief_score`) in your own code, and expect `truth_value` to decide the order wherever the kernel's own queries sort by it.
+
+The `bp_messages` table has not been dropped either. `FactorRepository` keeps its read and write functions for it (nothing outside the tests calls the write at the time of writing), and retiring a promoted match candidate deletes that factor's rows from it.
 
 Math kept at intro level: full DST adds operations like Yager normalisation (re-attributing conflict mass to ignorance), Dubois-Prade combination (each conflicting pair's mass goes to the union of the two sets), the cautious rule (for sources that are not independent), and discounting with `mass_on_missing` to model open-world ignorance. Those live in `crates/epigraph-ds/src/combination.rs` — for the intro, hold onto the three-bucket story: belief, plausibility, ignorance, with BetP as the scalar projection you sort by.
 
@@ -345,6 +354,7 @@ A single recall hit for an ingested paragraph, abbreviated, looks like this — 
   "paragraph_content": "DNA-origami actuators driven by ...",
   "similarity": 0.83,
   "truth_value": 0.71,
+  "belief_score": 0.78,
   "paper": {"doi": "10.1038/s41586-024-...", "title": "..."},
   "atoms":       [/* level-3 children */],
   "siblings":    [/* level-2 siblings in same section */],
@@ -353,7 +363,7 @@ A single recall hit for an ingested paragraph, abbreviated, looks like this — 
 }
 ```
 
-Each batched list also carries a `_total` and `_truncated` field (e.g., `atoms_total`, `atoms_truncated`) so the caller can tell when the structural fan-out was clipped. The `truth_value` field on `RecallHit` is a legacy scalar carried for back-compat; treat `pignistic_prob` from `get_belief` (§3) as the authoritative belief signal for ranking.
+Each batched list also carries a `_total` and `_truncated` field (e.g., `atoms_total`, `atoms_truncated`) so the caller can tell when the structural fan-out was clipped. The `truth_value` field on `RecallHit` is the claim's own `claims.truth_value`, reported unchanged; it is not what `min_truth` compares against. That is the hit's `belief_score`: the pignistic probability when the claim has a Dempster-Shafer cache, and `truth_value` when it does not (§3).
 
 **See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the whole-corpus kNN logic and the full `RecallHit` shape; user-memory `feedback_tier1_ingestion_only.md` for the single-canonical-ingest-path rule; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
 
