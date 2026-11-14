@@ -145,7 +145,8 @@ WALKERS = {
     "crates/epigraph-db/tests/locked_decisions.rs": ("*Cargo.toml",),
     "crates/epigraph-db/tests/maintenance_surface_register.rs": (),
     "crates/epigraph-db/tests/no_hybrid_bypass_spend.rs": (),
-    "crates/epigraph-db/tests/no_unmaintained_dsn.rs": (),
+    # It walks `repo_root().join("scripts")` for *.py files.
+    "crates/epigraph-db/tests/no_unmaintained_dsn.rs": ("scripts/*",),
     "crates/epigraph-db/tests/no_unscoped_pool.rs": (),
     "crates/epigraph-db/tests/owner_scoped_delete.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/personal_group_mint_ratchet.rs": ("crates/*/src/*", "migrations/*"),
@@ -423,6 +424,7 @@ def scan_reads(root, pkgs, dirs, files, read=None):
             f = f.rsplit("/", 1)[0]
             tracked_dirs.add(f)
     top = {f.split("/", 1)[0] for f in files}
+    top_dirs = {d for d in top if d in tracked_dirs} - {"crates"}
     package_roots = set(dirs.values())
     roots = test_targets(root, pkgs, dirs)
     texts = {}
@@ -488,6 +490,7 @@ def scan_reads(root, pkgs, dirs, files, read=None):
         blanked = _RAW.sub(lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', body)
         literals += [(m.group(1), m.start()) for m in _STRING.finditer(blanked)]
         climbs = bool(_PARENT_CLIMB.search(text))
+        bare = []  # (top-level directory, position) joined alone, e.g. join("scripts")
         for lit, pos in literals:
             if not lit or any(c.isspace() for c in lit) or "\\" in lit:
                 continue
@@ -505,6 +508,12 @@ def scan_reads(root, pkgs, dirs, files, read=None):
                     note(path, pos)
                 continue
             rel = "/".join(segs)
+            if len(segs) == 1 and "." not in rel and rel in top_dirs:
+                # Only as a path: `root.join("scripts")`, not a table or
+                # word that happens to share a directory's name.
+                if blanked[:pos].rstrip().endswith("join("):
+                    bare.append((rel, pos))
+                continue
             if segs[0] in top and (len(segs) >= 2 or "." in rel) and exists(rel):
                 path = rel  # relative to the repository root
             elif len(segs) >= 2 and exists("crates/" + rel):
@@ -513,11 +522,17 @@ def scan_reads(root, pkgs, dirs, files, read=None):
                 continue
             if outside(path):
                 note(path, pos)
+        if climbs and _WALK.search(text):
+            walkers.add(f)
+            # A walk from a top-level directory it names alone reads all of
+            # it. `crates` is left to WALKERS, whose globs say which part of
+            # each crate a ratchet reads; widening those to every file under
+            # crates/ would put source-scans on every crate change.
+            for path, pos in bare:
+                note(path, pos)
         for path, before in sorted(found.items()):
             r, ts = reach(name, f, before)
             reads.append((name, "prefix", path, r, ts, f))
-        if climbs and _WALK.search(text):
-            walkers.add(f)
     for f, globs in sorted(WALKERS.items()):
         name = owner(f, dirs)
         if name is None or f not in tracked:

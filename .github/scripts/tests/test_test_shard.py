@@ -170,6 +170,14 @@ class AffectedSelection(unittest.TestCase):
         self.assertEqual(args[2::2], ["--test"] * (len(args[2:]) // 2))
         self.assertTrue(args[3:])
 
+    def test_a_new_script_runs_the_dsn_lint_that_walks_scripts(self):
+        # no_unmaintained_dsn walks repo_root().join("scripts") for *.py and
+        # fails on a new psycopg2.connect( that skips the maintenance DSN; a
+        # script it does not already name must still select it.
+        for path in ("scripts/a_new_backfill.py", "scripts/lib/a_new_helper.py"):
+            d = pr_plan([path])
+            self.assertIn("no_unmaintained_dsn", d["partial"].get("epigraph-db", {}), path)
+
     def test_a_package_a_selected_shard_covers_gets_no_scan_targets(self):
         # A db source change selects workspace-rest (jobs etc. depend on db),
         # which runs epigraph-crypto in full, so crypto's ratchet is not also
@@ -256,6 +264,29 @@ class SourceScanDetection(unittest.TestCase):
         self.assertFalse(ts.check_walkers(walkers, declared={}, out=out))
         self.assertIn("FAIL crates/alpha/tests/scan.rs", out.getvalue())
         self.assertTrue(ts.check_walkers(walkers, declared={"crates/alpha/tests/scan.rs": ()}, out=out))
+
+    def test_a_walk_from_a_joined_top_level_directory_reads_all_of_it(self):
+        files = dict(self.BASE)
+        files["scripts/old.py"] = ""
+        files["crates/alpha/tests/scan.rs"] = (
+            'fn root() -> PathBuf { Path::new(env!("CARGO_MANIFEST_DIR")).join("../..") }\n'
+            'fn walk() { for e in std::fs::read_dir(root().join("scripts")).unwrap() {} }\n'
+        )
+        files["crates/beta/tests/scan.rs"] = (
+            'fn root() -> PathBuf { Path::new(env!("CARGO_MANIFEST_DIR")).join("../..") }\n'
+            'const TABLES: &[&str] = &["scripts"];\n'
+            'fn walk() { for e in std::fs::read_dir(root().join("crates")).unwrap() {} }\n'
+        )
+        root, pkgs, dirs, names = self.tree(files)
+        reads, walkers = ts.scan_reads(root, pkgs, dirs, names)
+        self.assertEqual(walkers, {"crates/alpha/tests/scan.rs", "crates/beta/tests/scan.rs"})
+        found = {(r[0], r[2], r[3], r[4]) for r in reads}
+        self.assertIn(("alpha", "scripts", ts.TARGETS, ("scan",)), found)
+        # A word that is not joined onto a path is not a read, and `crates`
+        # is left to WALKERS' globs.
+        self.assertNotIn("beta", {r[0] for r in reads})
+        whole, partial = ts.affected(["scripts/new.py"], pkgs, dirs, reads)
+        self.assertEqual((whole, set(partial)), ({}, {"alpha"}))
 
     def test_the_real_tree_declares_every_walker(self):
         self.assertEqual(reads()[1], set(ts.WALKERS))
