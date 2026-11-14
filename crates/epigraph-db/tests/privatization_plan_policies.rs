@@ -423,8 +423,7 @@ async fn every_rendering_primitive_names_only_what_the_reader_can_read_under_the
     let readable = world.seed_claim;
 
     // Select and freeze on maintenance under a bypass viewer, as the route does.
-    let (scoped, bypass) = fixture::bypass(&pool).await;
-    let _ = &scoped;
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
     let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
     let mut mconn = maint
         .acquire()
