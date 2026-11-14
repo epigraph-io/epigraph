@@ -458,6 +458,10 @@ struct VerifiedAssertion {
     timestamp: u64,
     /// The signed 16-byte nonce.
     nonce: [u8; 16],
+    /// The 32-byte Ed25519 public key the signature verified under: the key
+    /// the nonce is spent under (migration 213), whatever spelling of it the
+    /// client row's `client_id` carries.
+    public_key: [u8; 32],
 }
 
 /// Verify an Ed25519 agent assertion for the client_credentials grant.
@@ -471,7 +475,8 @@ struct VerifiedAssertion {
 ///
 /// This check is stateless. SINGLE USE is enforced by the caller,
 /// [`authenticate_confidential_client`], which records the returned nonce
-/// (migration 213) and refuses a `(client, nonce)` already recorded, so a
+/// under the returned public key (migration 213) and refuses a
+/// `(public key, nonce)` already recorded, so a
 /// captured assertion cannot be replayed inside its window. The signed message
 /// is still not bound to a domain or audience (backlog 950696a1, step 2).
 fn verify_agent_assertion(
@@ -552,11 +557,14 @@ fn verify_agent_assertion(
         nonce: assertion_bytes[8..24]
             .try_into()
             .expect("slice is exactly 16 bytes"),
+        public_key: verifying_key.to_bytes(),
     })
 }
 
-/// Record a VERIFIED assertion's nonce for `client` (an `oauth_clients.id`)
-/// and refuse a replay (migration 213). Runs only after
+/// Record a VERIFIED assertion's nonce under the public key it verified with
+/// and refuse a replay (migration 213). Keyed by the key, not by `client`'s
+/// row, so a second client row spelling the same key in another hex case
+/// cannot re-spend it. Runs only after
 /// [`verify_agent_assertion`] has passed, so an unauthenticated request never
 /// writes a row. Fails CLOSED: a database error refuses the assertion.
 #[cfg(feature = "db")]
@@ -575,7 +583,7 @@ async fn consume_assertion_nonce(
         })?;
     let first_use = epigraph_db::AssertionNonceRepository::consume(
         &state.db_pool,
-        client.id,
+        &verified.public_key,
         &verified.nonce,
         expires_at,
     )
@@ -1755,6 +1763,10 @@ mod assertion_tests {
         let verified = verify_agent_assertion(&assertion, &pk, &client_id).expect("verifies");
         assert_eq!(verified.timestamp, ts);
         assert_eq!(&verified.nonce[..], &assertion[8..24]);
+        assert_eq!(
+            verified.public_key, pk,
+            "the nonce is spent under the key the signature verified with"
+        );
     }
 
     #[test]

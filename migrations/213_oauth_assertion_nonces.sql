@@ -11,14 +11,20 @@
 -- five minutes. The only defence was transport security.
 --
 -- CHANGE
---   1. `oauth_assertion_nonces(oauth_client_id, nonce, expires_at, used_at)`:
---      one row per assertion an agent presented, keyed by the client
---      (`oauth_clients.id`) and the assertion's 16-byte nonce. It holds no
---      credential: a nonce cannot be presented without a signature over it.
---      No FK to `oauth_clients`: the row is a short-lived replay record, it
---      dies with its window, and an FK would only add a lock on the client
---      row to every token mint.
---   2. `epigraph_oauth_assertion_nonce_consume(client, nonce, expires_at)`: the
+--   1. `oauth_assertion_nonces(agent_public_key, nonce, expires_at, used_at)`:
+--      one row per assertion an agent presented, keyed by the 32-byte Ed25519
+--      public key the signature verified under and the assertion's 16-byte
+--      nonce. It holds no credential: a nonce cannot be presented without a
+--      signature over it.
+--      KEYED BY THE KEY, NOT THE CLIENT ROW. An agent's `client_id` is its
+--      hex public key, taken as registered, and hex decoding accepts either
+--      case, so `abcd..` and `ABCD..` can be two `oauth_clients` rows that
+--      verify the same signature. Keyed by the row, an assertion spent on one
+--      would mint once more on the other. What the signature binds is the
+--      key, so the key is what a nonce is spent under.
+--      No FK: the row is a short-lived replay record, it dies with its
+--      window, and an FK would only add a lock to every token mint.
+--   2. `epigraph_oauth_assertion_nonce_consume(key, nonce, expires_at)`: the
 --      ONLY write path, a SECURITY DEFINER on 172's form
 --      (`pg_catalog, pg_temp`, every name qualified), owned by
 --      `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
@@ -67,13 +73,15 @@
 SET LOCAL lock_timeout = '3s';
 
 CREATE TABLE IF NOT EXISTS public.oauth_assertion_nonces (
-    oauth_client_id uuid        NOT NULL,
-    nonce           bytea       NOT NULL
-                        CONSTRAINT oauth_assertion_nonces_nonce_len
-                        CHECK (octet_length(nonce) = 16),
-    expires_at      timestamptz NOT NULL,
-    used_at         timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (oauth_client_id, nonce)
+    agent_public_key bytea       NOT NULL
+                         CONSTRAINT oauth_assertion_nonces_key_len
+                         CHECK (octet_length(agent_public_key) = 32),
+    nonce            bytea       NOT NULL
+                         CONSTRAINT oauth_assertion_nonces_nonce_len
+                         CHECK (octet_length(nonce) = 16),
+    expires_at       timestamptz NOT NULL,
+    used_at          timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (agent_public_key, nonce)
 );
 COMMENT ON TABLE public.oauth_assertion_nonces IS
     'Migration 213: the nonces of agent client_credentials assertions already presented, '
@@ -84,12 +92,13 @@ COMMENT ON TABLE public.oauth_assertion_nonces IS
 CREATE INDEX IF NOT EXISTS idx_oauth_assertion_nonces_expires_at
     ON public.oauth_assertion_nonces (expires_at);
 
--- Record one presented assertion nonce. Returns true when this call recorded
--- it, false when the (client, nonce) pair was already recorded (a replay) or
--- when `p_expires_at` has already passed. Raises 22023 on a NULL argument, a
--- nonce that is not 16 bytes, or an expiry more than one hour ahead.
+-- Record one presented assertion nonce under the public key its signature
+-- verified with. Returns true when this call recorded it, false when the
+-- (key, nonce) pair was already recorded (a replay) or when `p_expires_at` has
+-- already passed. Raises 22023 on a NULL argument, a key that is not 32 bytes,
+-- a nonce that is not 16 bytes, or an expiry more than one hour ahead.
 CREATE OR REPLACE FUNCTION public.epigraph_oauth_assertion_nonce_consume(
-    p_client_id uuid, p_nonce bytea, p_expires_at timestamptz)
+    p_public_key bytea, p_nonce bytea, p_expires_at timestamptz)
 RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
@@ -97,8 +106,13 @@ DECLARE
     v_now timestamptz := pg_catalog.now();
     v_n   integer;
 BEGIN
-    IF p_client_id IS NULL OR p_nonce IS NULL OR p_expires_at IS NULL THEN
-        RAISE EXCEPTION 'AN01: an assertion nonce names a client, a nonce and an expiry'
+    IF p_public_key IS NULL OR p_nonce IS NULL OR p_expires_at IS NULL THEN
+        RAISE EXCEPTION 'AN01: an assertion nonce names a public key, a nonce and an expiry'
+            USING ERRCODE = '22023';
+    END IF;
+    IF pg_catalog.octet_length(p_public_key) <> 32 THEN
+        RAISE EXCEPTION 'AN04: an agent public key is 32 bytes (got %)',
+                        pg_catalog.octet_length(p_public_key)
             USING ERRCODE = '22023';
     END IF;
     IF pg_catalog.octet_length(p_nonce) <> 16 THEN
@@ -112,8 +126,8 @@ BEGIN
     END IF;
 
     DELETE FROM public.oauth_assertion_nonces d
-     WHERE (d.oauth_client_id, d.nonce) IN (
-           SELECT x.oauth_client_id, x.nonce
+     WHERE (d.agent_public_key, d.nonce) IN (
+           SELECT x.agent_public_key, x.nonce
              FROM public.oauth_assertion_nonces x
             WHERE x.expires_at <= v_now
             ORDER BY x.expires_at
@@ -124,13 +138,13 @@ BEGIN
         RETURN false;
     END IF;
 
-    INSERT INTO public.oauth_assertion_nonces (oauth_client_id, nonce, expires_at)
-    VALUES (p_client_id, p_nonce, p_expires_at)
-    ON CONFLICT (oauth_client_id, nonce) DO NOTHING;
+    INSERT INTO public.oauth_assertion_nonces (agent_public_key, nonce, expires_at)
+    VALUES (p_public_key, p_nonce, p_expires_at)
+    ON CONFLICT (agent_public_key, nonce) DO NOTHING;
     GET DIAGNOSTICS v_n = ROW_COUNT;
     RETURN v_n = 1;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_assertion_nonce_consume(uuid, bytea, timestamptz)
+REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)
     FROM PUBLIC;
 
 REVOKE ALL ON public.oauth_assertion_nonces FROM PUBLIC;
@@ -142,14 +156,14 @@ DO $$ BEGIN
         EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON public.oauth_assertion_nonces '
                 'TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_oauth_assertion_nonce_consume('
-                'uuid, bytea, timestamptz) OWNER TO epigraph_maintenance';
+                'bytea, bytea, timestamptz) OWNER TO epigraph_maintenance';
     ELSE
         RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; the 213 definer '
                      'stays owned by the migration runner.';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_oauth_assertion_nonce_consume('
-                'uuid, bytea, timestamptz) TO epigraph_app';
+                'bytea, bytea, timestamptz) TO epigraph_app';
         EXECUTE 'REVOKE ALL ON public.oauth_assertion_nonces FROM epigraph_app';
         EXECUTE 'GRANT SELECT ON public.oauth_assertion_nonces TO epigraph_app';
     END IF;

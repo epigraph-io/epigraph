@@ -2879,7 +2879,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         // agent mint (500).
         (
             "epigraph_oauth_assertion_nonce_consume",
-            "public.epigraph_oauth_assertion_nonce_consume(uuid, bytea, timestamptz)",
+            "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
             true,
         ),
         (

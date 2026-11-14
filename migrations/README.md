@@ -2647,17 +2647,22 @@ restart.
   **Applied to throwaway databases only, NOT to any deployed database.**
 - **213**: public `oauth_assertion_nonces` (backlog 950696a1, step 1). An
   agent's Ed25519 `client_credentials` assertion is now single use: the table
-  `oauth_assertion_nonces(oauth_client_id, nonce, expires_at, used_at)`
-  (primary key `(oauth_client_id, nonce)`, 16-byte nonce CHECK, no FK, no
-  tenancy columns, no row security, like 141's `revoked_access_tokens`) and
+  `oauth_assertion_nonces(agent_public_key, nonce, expires_at, used_at)`
+  (primary key `(agent_public_key, nonce)`, 32-byte key and 16-byte nonce
+  CHECKs, no FK, no tenancy columns, no row security, like 141's
+  `revoked_access_tokens`) and
   one SECURITY DEFINER on 172's form, owned by `epigraph_maintenance`,
   EXECUTE revoked from PUBLIC and granted to `epigraph_app`:
-  `epigraph_oauth_assertion_nonce_consume(uuid, bytea, timestamptz)` returns
+  `epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)` returns
   true when it records the pair, false for a replay (one
-  `INSERT .. ON CONFLICT DO NOTHING`), raises 22023 on a malformed nonce or an
-  expiry more than an hour ahead, and lazily prunes up to 1000 rows past
-  their expiry (`FOR UPDATE SKIP LOCKED`). The application role keeps SELECT
-  only. `oauth/token.rs` calls it after the assertion's signature and
+  `INSERT .. ON CONFLICT DO NOTHING`), raises 22023 on a malformed key or
+  nonce or an expiry more than an hour ahead, and lazily prunes up to 1000
+  rows past their expiry (`FOR UPDATE SKIP LOCKED`). The application role
+  keeps SELECT only. The record is keyed by the public key the signature
+  verified under, not by the `oauth_clients` row: an agent's `client_id` is
+  its hex key as registered, and hex decoding accepts either case, so two
+  rows spelling one key differently would otherwise each grant a captured
+  assertion one more use. `oauth/token.rs` calls it after the assertion's signature and
   freshness verify, on both the `client_credentials` and the refresh grant,
   keeping each nonce until the signed timestamp + 360 s (the 300 s window
   plus a 60 s skew margin). Registered in `tenancy_backfill.rs`

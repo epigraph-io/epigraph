@@ -578,7 +578,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          one `oauth_clients` row's status before anything is minted, the same \
          pre-authentication reason. The twentieth is migration 213's single-use check of an \
          agent's assertion (`AssertionNonceRepository::consume`), an app-callable definer keyed \
-         by the client and the assertion's signed nonce, run after the signature and freshness \
+         by the verified public key and the assertion's signed nonce, run after the signature and freshness \
          verify and before anything is minted: the same pre-authentication reason.",
     ),
     (

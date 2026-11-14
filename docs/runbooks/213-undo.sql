@@ -18,7 +18,7 @@
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 
-DROP FUNCTION IF EXISTS public.epigraph_oauth_assertion_nonce_consume(uuid, bytea, timestamptz);
+DROP FUNCTION IF EXISTS public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz);
 DROP TABLE IF EXISTS public.oauth_assertion_nonces;
 
 COMMIT;

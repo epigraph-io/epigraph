@@ -1161,10 +1161,9 @@ async fn an_agent_assertion_is_single_use_on_the_app_role(pool: PgPool) {
         "a fresh assertion mints on the application role: {body}"
     );
     let recorded: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM oauth_assertion_nonces n JOIN oauth_clients c \
-             ON c.id = n.oauth_client_id WHERE c.client_id = $1",
+        "SELECT count(*) FROM oauth_assertion_nonces WHERE agent_public_key = $1",
     )
-    .bind(&client_id)
+    .bind(public_key.to_vec())
     .fetch_one(&pool)
     .await
     .expect("count nonces");

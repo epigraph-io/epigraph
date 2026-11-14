@@ -247,3 +247,48 @@ async fn a_replayed_assertion_is_refused_on_the_refresh_grant(pool: PgPool) {
         "r1 still refreshes with a fresh assertion: {body}"
     );
 }
+
+/// Catches: the single-use record keyed by the `oauth_clients` ROW instead of
+/// the signing key. `/oauth/register` takes an agent's `client_id` as given and
+/// `hex::decode` accepts either case, so the lowercase and uppercase spellings
+/// of one public key can be two client rows that verify the same signature. An
+/// assertion spent on one must not mint again on the other.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_assertion_spent_on_one_spelling_of_a_key_is_refused_on_another(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let lower = active_agent_client(&pool, &key).await;
+    let upper = lower.to_uppercase();
+    assert_ne!(lower, upper, "the hex key has letters to case-fold");
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         SELECT $2, 'assertion-replay-test-upper', 'agent', allowed_scopes, granted_scopes, \
+                'active', agent_id, owner_id \
+           FROM oauth_clients WHERE client_id = $1",
+    )
+    .bind(&lower)
+    .bind(&upper)
+    .execute(&pool)
+    .await
+    .expect("the uppercase spelling of the same key as a second active client");
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    // Calibration: the uppercase row authenticates on its own.
+    let (status, body) = post_token(&app, credentials_grant(&upper, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the uppercase spelling mints with a fresh assertion: {body}"
+    );
+
+    let captured = fresh_assertion(&key);
+    let (status, body) = post_token(&app, credentials_grant(&lower, &captured)).await;
+    assert_eq!(status, StatusCode::OK, "first presentation: {body}");
+    let (status, body) = post_token(&app, credentials_grant(&upper, &captured)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the same signed assertion replayed under the other spelling of the key: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+}
