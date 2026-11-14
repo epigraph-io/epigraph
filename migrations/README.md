@@ -2645,6 +2645,32 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **214**: public `compromised_revoke_read_committed` (backlog c77931a7,
+  2deb56fa). Re-states 200's `epigraph_revoke_passkey_compromised(uuid,
+  text)` (same signature, result columns, walk, UPDATE and audit mode) with
+  two changes. (a) It refuses, before any lock or read, a call outside READ
+  COMMITTED (`25000`, nothing revoked): under REPEATABLE READ or
+  SERIALIZABLE its walk read the snapshot taken before its lock wait and
+  missed a passkey enrolled during the wait, which then stayed live. (b) It
+  repeats the person-wide `FOR NO KEY UPDATE` and the walk until every
+  walked passkey is locked: a passkey enrolled during the wait was walked
+  but not locked, so a completion under it could commit between the walk
+  and the UPDATE and stay live (attested). After 32 passes it refuses
+  `40001`, nothing revoked. A precondition checks the md5 of 200's
+  body (`0dfedeb8a0dc722a743fe2299baae704`) and RAISEs `55000` (changing
+  nothing) over any other. `CREATE OR REPLACE` keeps 200's owner and
+  grants; it stays registered at 200 in `tenancy_backfill.rs`. Pinned by
+  `epigraph-db/tests/pending_admin_acts.rs`
+  (`the_compromised_revoke_runs_only_under_read_committed`,
+  `a_passkey_enrolled_during_the_lock_wait_is_locked_before_the_walk_ends`,
+  `the_214_undo_restores_200s_compromised_revoke`). Undo:
+  `docs/runbooks/214-undo.sql` (tested: run twice, it returns the `public`
+  catalog to 213's; it refuses `55000` over any body but 214's or 200's);
+  run it BEFORE `200-undo.sql`. Checked before claiming: no migration on
+  main or an origin branch carries a `214`. **Deploy order:** no binary
+  depends on it; apply whenever. If the maintenance DSN's isolation is not
+  READ COMMITTED, `revoke-passkey --compromised` is refused from then on.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
