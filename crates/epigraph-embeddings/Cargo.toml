@@ -39,7 +39,10 @@ wiremock = "0.6"  # HTTP fixture for the OpenAI provider tests
 proptest = { workspace = true }
 
 [features]
-default = []
+# `openai` by default: every consumer already gets it through the workspace dep,
+# and CI's bare `cargo test -p epigraph-embeddings` must compile
+# tests/openai_provider_http.rs, which is `cfg(feature = "openai")`.
+default = ["openai"]
 openai = ["reqwest", "tiktoken-rs"]  # Enable OpenAI API support
 jina = ["reqwest"]  # Enable Jina multimodal embedding API support
 
