@@ -272,6 +272,125 @@ impl TokenBucket {
     }
 }
 
+/// `on` (default) or `off`: whether the server installs a rate limiter.
+pub const RATE_LIMIT_ENV: &str = "EPIGRAPH_RATE_LIMIT";
+/// Requests per minute per bucket (principal or client address).
+pub const RATE_LIMIT_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_RPM";
+/// Requests per minute across all buckets; unset or `off` disables the
+/// global limit.
+pub const RATE_LIMIT_GLOBAL_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM";
+/// The reverse proxies whose `X-Forwarded-For` is believed ([`TrustedProxies`]).
+pub const TRUSTED_PROXIES_ENV: &str = "EPIGRAPH_TRUSTED_PROXIES";
+/// [`RATE_LIMIT_RPM_ENV`]'s default: 10 requests a second sustained, with a
+/// burst of a full minute's worth.
+pub const DEFAULT_RATE_LIMIT_RPM: u32 = 600;
+
+/// A blank value is treated as unset.
+fn blank_is_unset(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// The server's rate-limit configuration, read once at boot from the
+/// `EPIGRAPH_RATE_LIMIT*` and `EPIGRAPH_TRUSTED_PROXIES` variables.
+///
+/// [`Self::parse`] takes the raw values so it is testable without touching
+/// process environment; [`Self::from_env`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitSettings {
+    /// Whether a limiter is installed at all.
+    pub enabled: bool,
+    /// True when [`RATE_LIMIT_ENV`] held a value that is neither `on` nor
+    /// `off` (the limiter stays ON; the caller should warn).
+    pub unrecognised_switch: bool,
+    /// Requests per minute per bucket.
+    pub per_key_rpm: u32,
+    /// Requests per minute across all buckets, if limited.
+    pub global_rpm: Option<u32>,
+    /// Whose `X-Forwarded-For` is believed. Unset means loopback only (a
+    /// reverse proxy on this host); `none` trusts no proxy.
+    pub trusted_proxies: TrustedProxies,
+}
+
+impl RateLimitSettings {
+    /// Parse the raw variable values (`None` = unset; blank = unset).
+    ///
+    /// A number or proxy list that does not parse is an error rather than a
+    /// default: a typo in a limit or a proxy list should refuse to boot, not
+    /// silently serve a different limit or collapse every client behind the
+    /// proxy into one bucket.
+    pub fn parse(
+        switch: Option<&str>,
+        per_key_rpm: Option<&str>,
+        global_rpm: Option<&str>,
+        trusted_proxies: Option<&str>,
+    ) -> Result<Self, String> {
+        let (enabled, unrecognised_switch) = match blank_is_unset(switch) {
+            None => (true, false),
+            Some(v) if v.eq_ignore_ascii_case("on") => (true, false),
+            Some(v) if v.eq_ignore_ascii_case("off") => (false, false),
+            Some(_) => (true, true),
+        };
+
+        let rpm = |name: &str, raw: &str| {
+            raw.parse::<u32>()
+                .ok()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| format!("{name}={raw:?} is not a positive whole number"))
+        };
+        let per_key_rpm = match blank_is_unset(per_key_rpm) {
+            None => DEFAULT_RATE_LIMIT_RPM,
+            Some(v) => rpm(RATE_LIMIT_RPM_ENV, v)?,
+        };
+        let global_rpm = match blank_is_unset(global_rpm) {
+            None => None,
+            Some(v) if v.eq_ignore_ascii_case("off") => None,
+            Some(v) => Some(rpm(RATE_LIMIT_GLOBAL_RPM_ENV, v)?),
+        };
+        let trusted_proxies = match blank_is_unset(trusted_proxies) {
+            None => TrustedProxies::loopback(),
+            Some(v) => {
+                TrustedProxies::parse(v).map_err(|e| format!("{TRUSTED_PROXIES_ENV}: {e}"))?
+            }
+        };
+
+        Ok(Self {
+            enabled,
+            unrecognised_switch,
+            per_key_rpm,
+            global_rpm,
+            trusted_proxies,
+        })
+    }
+
+    /// Read and parse the variables from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        let var = |name: &str| std::env::var(name).ok();
+        Self::parse(
+            var(RATE_LIMIT_ENV).as_deref(),
+            var(RATE_LIMIT_RPM_ENV).as_deref(),
+            var(RATE_LIMIT_GLOBAL_RPM_ENV).as_deref(),
+            var(TRUSTED_PROXIES_ENV).as_deref(),
+        )
+    }
+
+    /// The limiter these settings describe, or `None` when disabled.
+    #[must_use]
+    pub fn build(&self) -> Option<AgentRateLimiter> {
+        if !self.enabled {
+            return None;
+        }
+        Some(
+            AgentRateLimiter::new(RateLimitConfig {
+                default_rpm: self.per_key_rpm,
+                global_rpm: self.global_rpm.unwrap_or(u32::MAX),
+                replenish_interval_secs: 1,
+                enable_global_limit: self.global_rpm.is_some(),
+            })
+            .with_trusted_proxies(self.trusted_proxies.clone()),
+        )
+    }
+}
+
 /// Seconds between two recorded refusals of one bucket
 /// ([`AgentRateLimiter::should_record_rejection`]).
 pub const REJECTION_RECORD_INTERVAL_SECS: i64 = 60;
@@ -819,6 +938,68 @@ mod tests {
         };
         assert!(limiter.should_record_rejection(&g));
         assert!(!limiter.should_record_rejection(&g));
+    }
+
+    #[test]
+    fn settings_default_to_on_with_loopback_proxies_and_no_global_limit() {
+        let s = RateLimitSettings::parse(None, None, None, None).unwrap();
+        assert!(s.enabled && !s.unrecognised_switch);
+        assert_eq!(s.per_key_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert_eq!(s.global_rpm, None);
+        assert_eq!(s.trusted_proxies, TrustedProxies::loopback());
+        let limiter = s.build().expect("on by default");
+        assert_eq!(limiter.config().default_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert!(!limiter.config().enable_global_limit);
+        // Blank is unset.
+        assert_eq!(
+            RateLimitSettings::parse(Some(" "), Some(""), Some(""), Some("")).unwrap(),
+            s
+        );
+    }
+
+    #[test]
+    fn settings_parse_every_variable() {
+        let s =
+            RateLimitSettings::parse(Some("ON"), Some("30"), Some("5000"), Some("192.0.2.0/24"))
+                .unwrap();
+        let limiter = s.build().unwrap();
+        assert_eq!(limiter.config().default_rpm, 30);
+        assert_eq!(limiter.config().global_rpm, 5000);
+        assert!(limiter.config().enable_global_limit);
+        assert!(limiter
+            .trusted_proxies()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(!limiter
+            .trusted_proxies()
+            .contains("127.0.0.1".parse().unwrap()));
+
+        let off = RateLimitSettings::parse(Some("off"), None, None, None).unwrap();
+        assert!(!off.enabled);
+        assert!(off.build().is_none());
+
+        // An unrecognised switch stays ON (fail safe) and says so.
+        let odd = RateLimitSettings::parse(Some("disabled"), None, None, None).unwrap();
+        assert!(odd.enabled && odd.unrecognised_switch);
+
+        let none = RateLimitSettings::parse(None, None, Some("off"), Some("none")).unwrap();
+        assert_eq!(none.global_rpm, None);
+        assert!(none.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn settings_refuse_malformed_values() {
+        for (rpm, global, proxies) in [
+            (Some("0"), None, None),
+            (Some("fast"), None, None),
+            (None, Some("-1"), None),
+            (None, None, Some("192.0.2.1,")),
+            (None, None, Some("proxy.internal")),
+        ] {
+            assert!(
+                RateLimitSettings::parse(None, rpm, global, proxies).is_err(),
+                "{rpm:?} {global:?} {proxies:?} must refuse"
+            );
+        }
     }
 
     #[test]

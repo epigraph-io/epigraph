@@ -154,6 +154,44 @@ async fn main() {
         }
     }
 
+    // Rate limiting (backlog 966164c8), read once. Until this block the
+    // limiter the router layers (`middleware::rate_limit`) was never built in
+    // this binary, so every request, including the anonymous `/oauth/token`,
+    // `/oauth/register` and `/elevate/*`, was unlimited. ON by default; a
+    // malformed limit or proxy list refuses to start, because the silent
+    // alternative (a different limit, or every client behind the proxy in one
+    // bucket) is worse than a refusal. Built here, before any connection, so
+    // the boot log says whether it is on even when the database is down.
+    let rate_limit = match epigraph_api::RateLimitSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: rate limiting is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    if rate_limit.unrecognised_switch {
+        tracing::warn!(
+            "EPIGRAPH_RATE_LIMIT is set to a value that is neither `on` nor `off`: rate \
+             limiting stays ON (only `off` disables it)"
+        );
+    }
+    let rate_limiter = rate_limit.build();
+    if rate_limiter.is_some() {
+        tracing::info!(
+            per_key_rpm = rate_limit.per_key_rpm,
+            global_rpm = ?rate_limit.global_rpm,
+            trusted_proxies = %rate_limit.trusted_proxies,
+            "rate limiter ON: authenticated requests are charged to their principal, \
+             anonymous ones to their client address (X-Forwarded-For believed only from \
+             trusted_proxies)"
+        );
+    } else {
+        tracing::warn!(
+            "rate limiter OFF (EPIGRAPH_RATE_LIMIT=off): no request is rate limited, \
+             including the anonymous OAuth and elevation endpoints"
+        );
+    }
+
     // The passkey relying party (elevation plan EL-3), read once. Unset is
     // "off" (the enrollment endpoints answer 503); a partial or malformed
     // configuration refuses to start rather than silently serving 503s.
@@ -548,6 +586,12 @@ async fn main() {
         state.with_providers(providers)
     };
 
+    // Install the limiter built at the top of `main` (or none when it is off).
+    let state = match rate_limiter {
+        Some(limiter) => state.with_rate_limiter(limiter),
+        None => state,
+    };
+
     // Hydrate the in-process webhook store from `webhook_subscriptions`
     // (migration 085, PR-10). Before this table existed the store was empty on
     // every boot, so every deploy silently unsubscribed everyone and the
@@ -762,8 +806,10 @@ async fn main() {
             .await
             .expect("Failed to load TLS certificate/key");
 
+        // With connect info: the rate limiter keys an anonymous request on
+        // its TCP peer, and without it every such request shares one bucket.
         axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("TLS server error");
         return;
@@ -785,7 +831,14 @@ async fn main() {
 
     tracing::info!("Server listening on {}", addr);
 
-    axum::serve(listener, app).await.expect("Server error");
+    // With connect info: the rate limiter keys an anonymous request on its
+    // TCP peer, and without it every such request shares one bucket.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("Server error");
 }
 
 /// `EPIGRAPH_BP_APPLY`, read once at boot: whether `POST /api/v1/bp/propagate`
