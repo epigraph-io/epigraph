@@ -786,6 +786,13 @@ impl ClaimThemeRepository {
     /// combination, backlog a2991ea6); the window must not become the second
     /// instance of it.
     ///
+    /// Current claims only, by its own `is_current` predicate, as are
+    /// [`Self::claims_in_theme_exact_at_dim`] and
+    /// [`Self::nearest_theme_coverage_since`]: like the flat seed query
+    /// (`ClaimRepository::search_by_embedding_since_conn`, backlog 7720cb7a),
+    /// the diverse reads no longer rely on `chk_deprecated_no_embedding`
+    /// alone to keep a retired claim out of recall.
+    ///
     /// Runs with an iterative HNSW scan (backlog a507966d): see
     /// [`begin_iterative_hnsw`]. Takes a connection rather than an executor
     /// because the scan settings need a (rolled-back) transaction.
@@ -816,6 +823,7 @@ impl ClaimThemeRepository {
              FROM claims c \
              WHERE c.theme_id = ANY($1) \
                AND c.{claim_col} IS NOT NULL \
+               AND c.is_current \
                AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz)\
                {level_clause} \
                /* {{VISIBILITY:c}} */ \
@@ -888,6 +896,7 @@ impl ClaimThemeRepository {
                  FROM claims c \
                  WHERE c.theme_id = $1 \
                    AND c.{claim_col} IS NOT NULL \
+                   AND c.is_current \
                    AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz) \
                    /* {{VISIBILITY:c}} */ \
              ), \
@@ -1001,6 +1010,7 @@ impl ClaimThemeRepository {
                  SELECT (c.theme_id = ANY($4::uuid[]) AND c.{reach_col} IS NOT NULL) AS reachable \
                  FROM claims c \
                  WHERE c.{nn_col} IS NOT NULL \
+                   AND c.is_current \
                    AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)\
                    {level_clause} \
                    /* {{VISIBILITY:c}} */ \
