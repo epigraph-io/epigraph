@@ -1903,6 +1903,20 @@ pub struct BatchedContext {
 /// filter on: an id is a disclosure, and the neighbour ids feed
 /// `all_paragraph_ids`, which the last two statements then hydrate into content.
 ///
+/// # The `edges` rows are filtered too (backlog batch B08)
+///
+/// The claims predicate alone left every `edges` row walked here unfiltered,
+/// so an edge private to another group between two readable claims still
+/// shaped the result: a section, an atom, a sibling, a neighbour id, a paper
+/// attribution, and the window totals (`F-edges-unfiltered`, the MCP residual).
+/// Every `edges` alias now also carries the static form of
+/// `Viewer::edge_predicate_fragment`, spelled as statement 7b already spells
+/// it, on the same two binds. In statements 4, 7 and 7b the predicate sits
+/// BEFORE the window functions, so `total` never counts a hidden edge. The
+/// paper-attribution `LEFT JOIN edges asserts_e` in statement 7 carries it in
+/// the `ON`: a hidden attribution leaves `paper_doi` empty rather than dropping
+/// the readable neighbour.
+///
 /// # A deliberate deviation, recorded
 ///
 /// The SQL stays in `crates/epigraph-mcp/src/tools/` rather than moving to
@@ -1986,6 +2000,10 @@ pub async fn fetch_batched_context(
               AND (c.properties->>'level')::int = 1
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             "#,
             paragraph_ids,
             v_bypass,
@@ -2025,6 +2043,10 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 3
                   AND ($3::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($4::uuid[]))
+                  AND ($3::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($4::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($4::uuid[]))))
             )
             SELECT
                 paragraph_id AS "paragraph_id!",
@@ -2077,6 +2099,10 @@ pub async fn fetch_batched_context(
                   AND e.relationship = 'decomposes_to'
                   AND ($2::bool OR cp.visibility = 'public'
                        OR cp.owner_group_id = ANY($3::uuid[]))
+                  AND ($2::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($3::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($3::uuid[]))))
                 "#,
                 &atom_ids,
                 v_bypass,
@@ -2123,6 +2149,10 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 2
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
+                  AND ($2::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($3::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($3::uuid[]))))
                 "#,
                 &section_ids,
                 v_bypass,
@@ -2173,11 +2203,19 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND ($3::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($4::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($4::uuid[]))))
                 UNION ALL
                 SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND ($3::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($4::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($4::uuid[]))))
             ),
             joined AS (
                 SELECT
@@ -2193,6 +2231,10 @@ pub async fn fetch_batched_context(
                   ON asserts_e.target_id = c.id
                   AND asserts_e.relationship = 'asserts'
                   AND asserts_e.source_type = 'paper'
+                  AND ($3::bool OR asserts_e.visibility = 'public'
+                       OR (asserts_e.owner_group_id = ANY($4::uuid[])
+                           AND (asserts_e.co_owner_group_id IS NULL
+                                OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
                 LEFT JOIN papers p ON p.id = asserts_e.source_id
             ),
             ranked AS (
@@ -2357,6 +2399,10 @@ pub async fn fetch_batched_context(
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             UNION ALL
             SELECT e.target_id AS "paragraph_id!", e.source_id AS "neighbor_id!"
             FROM edges e
@@ -2364,6 +2410,10 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             "#,
             paragraph_ids,
             v_bypass,
@@ -2401,6 +2451,10 @@ pub async fn fetch_batched_context(
                       AND (cb.properties->>'level')::int = 3
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
+                      AND ($2::bool OR e.visibility = 'public'
+                           OR (e.owner_group_id = ANY($3::uuid[])
+                               AND (e.co_owner_group_id IS NULL
+                                    OR e.co_owner_group_id = ANY($3::uuid[]))))
                 ),
                 backward AS (
                     SELECT e.target_id AS atom_a, e.source_id AS atom_b, e.relationship
@@ -2413,6 +2467,10 @@ pub async fn fetch_batched_context(
                       AND (cb.properties->>'level')::int = 3
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
+                      AND ($2::bool OR e.visibility = 'public'
+                           OR (e.owner_group_id = ANY($3::uuid[])
+                               AND (e.co_owner_group_id IS NULL
+                                    OR e.co_owner_group_id = ANY($3::uuid[]))))
                 )
                 SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
                 FROM forward
@@ -2453,6 +2511,10 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 2
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
+                  AND ($2::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($3::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($3::uuid[]))))
                 "#,
                 &atom_b_ids,
                 v_bypass,
@@ -2536,6 +2598,10 @@ pub async fn fetch_batched_context(
               AND e.source_type = 'paper'
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             "#,
             &all_paragraph_ids,
             v_bypass,

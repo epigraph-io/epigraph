@@ -116,8 +116,9 @@
 //! `neighborhood_*`, `compound_neighbors`), `repos/claim.rs`'s
 //! `rag_hybrid_context.edge_count` and `repos/claim.rs::semantic_graph_neighbors`
 //! — each with the placement reasoning `repos/graph_view.rs`'s module doc
-//! records. The MCP tool layer has its own `edges` traversals
-//! (`epigraph-mcp/src/tools/recall.rs`), recorded separately.
+//! records. The MCP tool layer's batched recall context
+//! (`epigraph-mcp/src/tools/recall.rs::fetch_batched_context`) gained the static
+//! three-bind form of the same edge predicate in that batch.
 //!
 //! PR-13 converted the reads that ALREADY carried a predicate and did not ADD
 //! one anywhere, because a never-filtered statement needs its own
