@@ -1213,13 +1213,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `epigraph_mcp::stdio_transport`.
         let (stdin, stdout) = rmcp::transport::stdio();
         let transport = epigraph_mcp::stdio_transport::stdio_server_transport(stdin, stdout);
+        // Taken before `serve`, which consumes the server: the tracker every
+        // detached ingest walk and embedding loop is spawned on.
+        let background = server.background_tasks();
         let service = server.serve(transport).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e
         })?;
 
         tracing::info!("EpiGraph MCP full-framework server running on stdio ({mode})");
-        service.waiting().await?;
+        // The client closing the transport ends `waiting`, and returning from
+        // `main` then drops every task still running: a walk the client was
+        // told is `queued`, or an embedding loop over committed claims. Drain
+        // them first, bounded, and whether or not `waiting` failed.
+        let served = service.waiting().await;
+        background
+            .drain(epigraph_mcp::background::EXIT_DRAIN_LIMIT)
+            .await;
+        served?;
     }
 
     Ok(())

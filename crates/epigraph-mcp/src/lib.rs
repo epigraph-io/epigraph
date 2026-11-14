@@ -1,6 +1,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod auth;
+pub mod background;
 pub mod claim_helper;
 pub mod elevated_access;
 pub mod embed;

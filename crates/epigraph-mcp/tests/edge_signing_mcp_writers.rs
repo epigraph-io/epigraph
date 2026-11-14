@@ -307,7 +307,7 @@ async fn the_link_tools_attest_their_edges_and_not_a_dedup_hit(pool: PgPool) {
     );
 }
 
-fn extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
+fn extraction(tag: &str) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {
             "title": format!("dae795f8 {tag}: Signed Edges"),

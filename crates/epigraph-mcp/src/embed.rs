@@ -272,6 +272,12 @@ impl McpEmbedder {
     /// the store is REFUSED with a named cause rather than attempted with a viewer
     /// that cannot satisfy the check.
     ///
+    /// So this path is for a PUBLIC claim of unknown author. A caller that knows
+    /// the author of a team or private claim stores through
+    /// `claim_helper::store_embedding_author_stamped` (or its `_with_grant`
+    /// form) instead: `submit_claim`, `memorize`, workflow ingest, both document
+    /// walks and `consolidate_claims` do.
+    ///
     /// # Errors
     /// `Err` when no vector could be stored and the cause is not "the row did not
     /// match": an undeclared store path, an unresolvable author, a failed stamp,

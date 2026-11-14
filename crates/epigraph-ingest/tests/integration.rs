@@ -1,5 +1,5 @@
-use epigraph_ingest::builder::build_ingest_plan;
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::builder::build_ingest_plan;
+use epigraph_ingest::document::schema::DocumentExtraction;
 
 /// Paragraph `evidence_type` is normalised to a canonical key and inherited by
 /// its atoms; an unrecognised value is dropped to `None` so it never reaches

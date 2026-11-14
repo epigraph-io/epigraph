@@ -7,7 +7,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
@@ -555,7 +555,7 @@ async fn ingest_document_handles_compound_equals_atom(pool: sqlx::PgPool) {
         }],
         "relationships": []
     });
-    let extraction: epigraph_ingest::schema::DocumentExtraction =
+    let extraction: epigraph_ingest::document::schema::DocumentExtraction =
         serde_json::from_value(extraction_json).expect("fixture parses");
 
     // Must not panic and must not return Err with a CHECK violation.
@@ -618,7 +618,7 @@ async fn ingest_tags_bbas_with_normalized_evidence_type(pool: sqlx::PgPool) {
         }],
         "relationships": []
     });
-    let extraction: epigraph_ingest::schema::DocumentExtraction =
+    let extraction: epigraph_ingest::document::schema::DocumentExtraction =
         serde_json::from_value(extraction_json).expect("fixture parses");
 
     do_ingest_document(

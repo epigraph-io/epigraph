@@ -14,7 +14,7 @@ mod fixture;
 mod common;
 use common::*;
 
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::tools;
 use epigraph_mcp::types::StoreWorkflowParams;
 use sqlx::PgPool;

@@ -40,14 +40,14 @@ where
 // tool uncallable.
 fn deserialize_document_source<'de, D>(
     d: D,
-) -> Result<epigraph_ingest::schema::DocumentSource, D::Error>
+) -> Result<epigraph_ingest::document::schema::DocumentSource, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Either {
-        Object(epigraph_ingest::schema::DocumentSource),
+        Object(epigraph_ingest::document::schema::DocumentSource),
         Str(String),
     }
 
@@ -59,14 +59,14 @@ where
 
 fn deserialize_document_extraction<'de, D>(
     d: D,
-) -> Result<epigraph_ingest::schema::DocumentExtraction, D::Error>
+) -> Result<epigraph_ingest::document::schema::DocumentExtraction, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Either {
-        Object(Box<epigraph_ingest::schema::DocumentExtraction>),
+        Object(Box<epigraph_ingest::document::schema::DocumentExtraction>),
         Str(String),
     }
 
@@ -2184,7 +2184,7 @@ pub struct IngestDocumentInlineParams {
         description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, an optional top-level source_text, and an optional top-level `labels` array of caller labels (e.g. a stage tag) applied to every claim the ingest writes or resolves to, in addition to the writer's own `doi:<document key>` label (a claim another agent authored that the ingest converges onto gets the doi: label only). When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting an abstract then the full paper is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
-    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
     /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
     #[schemars(
         description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
@@ -2215,7 +2215,7 @@ pub struct IngestDocumentSpineParams {
         description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph (structural nodes are scoped to this document, not shared with other papers that share a heading); atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms. An optional top-level `labels` array of caller labels (e.g. a stage tag) is applied to every node this call writes, in addition to the writer's own `doi:<document key>` label; a node another agent authored gets the doi: label only."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
-    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
 
     #[schemars(
         description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It scopes the new claims only: the paper's own record (title, DOI, journal), its author agents, its processed_by stamp (what check_already_ingested reports) and its asserts edges onto already-public claims it converges onto stay readable by every agent whatever you pass, so do not ingest a confidential document. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
@@ -2249,6 +2249,13 @@ pub struct IngestDocumentSpineResponse {
     pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
+    /// How many of the nodes this call created had their embedding QUEUED, to
+    /// be stored after this response, best-effort: 0 when this server has no
+    /// embedding provider. Not a count of stored vectors, which this response
+    /// cannot know (backlog fdacc14f).
+    pub paragraphs_embedding_queued: usize,
+    /// DEPRECATED alias of `paragraphs_embedding_queued`, kept for existing
+    /// readers. Despite its name it was never a count of stored vectors.
     pub paragraphs_embedded: usize,
     /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
     /// as new in this ingest. Atomize exactly these paragraphs, then call
@@ -2282,7 +2289,7 @@ pub struct StructureSourceParams {
         description = "Document source metadata (title, doi/uri, source_type, authors, year, …) — same shape as DocumentExtraction.source."
     )]
     #[serde(deserialize_with = "deserialize_document_source")]
-    pub source: epigraph_ingest::schema::DocumentSource,
+    pub source: epigraph_ingest::document::schema::DocumentSource,
     #[schemars(
         description = "Format of `text`: \"markdown\" or \"plaintext\". Determines the deterministic parser."
     )]
@@ -2581,6 +2588,13 @@ pub struct IngestDocumentResponse {
     /// `authors[].pending_ingested_by`).
     pub ingested_by: String,
     pub claims_ingested: usize,
+    /// How many of the claims this call created had their embedding QUEUED, to
+    /// be stored after this response, best-effort: 0 when this server has no
+    /// embedding provider. Not a count of stored vectors, which this response
+    /// cannot know (backlog fdacc14f).
+    pub claims_embedding_queued: usize,
+    /// DEPRECATED alias of `claims_embedding_queued`, kept for existing
+    /// readers. Despite its name it was never a count of stored vectors.
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
     pub relationships_created: usize,
