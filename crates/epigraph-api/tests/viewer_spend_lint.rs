@@ -851,6 +851,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
+    // gated (`PerspectiveRepository::get_by_id`) then write, on a transaction
+    // stamped with the caller's viewer: `perspectives`' owner-scoped UPDATE
+    // (migration 117) decides write authority, and the repo answers
+    // `WriteRefused` for a row it will not update (backlog 0f2f9ddb).
+    (
+        "perspective.rs",
+        "set_source_reliability",
+        &["PerspectiveRepository::set_source_reliability_conn"],
+    ),
     // write on a transaction stamped with the caller's viewer; the system
     // agent and its declaration are agents reads.
     (

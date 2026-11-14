@@ -209,6 +209,15 @@ pub async fn set_source_reliability(
     validate_reliability(&request.source_reliability)?;
 
     let mut tx = state.write_as(&viewer, "set_source_reliability").await?;
+    // Read the target through the VIEWER first, as MCP `set_source_reliability`
+    // does: a perspective the caller cannot read is 404 by the viewer's own
+    // predicate, whatever role the connection has.
+    epigraph_db::PerspectiveRepository::get_by_id(&mut *tx, &viewer, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "Perspective".to_string(),
+            id: id.to_string(),
+        })?;
     // `NotFound` (404) and `WriteRefused` (403) come back as errors; a count of
     // zero cannot, but it is refused rather than answered 204 if it ever does.
     let changed = epigraph_db::PerspectiveRepository::set_source_reliability_conn(
