@@ -752,28 +752,53 @@ fn sqlx_call_offsets(src: &str) -> Vec<usize> {
     while let Some(rel) = src[from..].find("sqlx::query") {
         let at = from + rel;
         from = at + "sqlx::query".len();
-
-        // Skip the `_as` / `_scalar` suffix, then any turbofish, then require `(`.
-        let mut tail = &src[from..];
-        for suffix in ["_as", "_scalar"] {
-            if let Some(rest) = tail.strip_prefix(suffix) {
-                tail = rest;
-                break;
-            }
-        }
-        let tail = tail.trim_start();
-        let opens_call = if let Some(rest) = tail.strip_prefix("::<") {
-            // Turbofish: find its close, then require `(`.
-            rest.find('>')
-                .is_some_and(|gt| rest[gt + 1..].trim_start().starts_with('('))
-        } else {
-            tail.starts_with('(')
-        };
-        if opens_call {
+        if call_open_paren(src, at).is_some() {
             out.push(at);
         }
     }
     out
+}
+
+/// The byte offset of the `(` that opens the `sqlx::query*` call at `at`, or
+/// `None` when the text there is not a call.
+///
+/// Skips the `_as` / `_scalar` suffix, then any turbofish, then requires `(`.
+/// The turbofish's close is found by BALANCING angle brackets, not by taking
+/// the first `>`: in `::<_, (i64, Option<f64>)>(` the first `>` closes
+/// `Option<f64>`. Both [`sqlx_call_offsets`] and [`arg_region`] go through
+/// here, so the two cannot disagree on where a call opens. Before this, a
+/// nested turbofish was not counted as a call at all, and a tuple turbofish
+/// (`::<_, (Uuid, String)>(`) had its TYPE TUPLE scanned as the argument
+/// region in place of the SQL. See `a_nested_generic_turbofish_is_counted`.
+fn call_open_paren(src: &str, at: usize) -> Option<usize> {
+    let mut pos = at + "sqlx::query".len();
+    for suffix in ["_as", "_scalar"] {
+        if src[pos..].starts_with(suffix) {
+            pos += suffix.len();
+            break;
+        }
+    }
+    pos += src[pos..].len() - src[pos..].trim_start().len();
+    if src[pos..].starts_with("::<") {
+        pos += "::<".len();
+        let mut depth = 1usize;
+        let close = src[pos..].char_indices().find_map(|(i, c)| {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })?;
+        pos += close + 1;
+        pos += src[pos..].len() - src[pos..].trim_start().len();
+    }
+    src[pos..].starts_with('(').then_some(pos)
 }
 
 /// The balanced-paren argument region of the `sqlx::query*` call at `at`.
@@ -784,7 +809,15 @@ fn sqlx_call_offsets(src: &str) -> Vec<usize> {
 /// that parentheses inside the SQL text cannot unbalance the depth count.
 fn arg_region(src: &str, at: usize) -> &str {
     let b = src.as_bytes();
-    let Some(open) = src[at..].find('(').map(|i| at + i) else {
+    // At a `sqlx::query*` call the region opens AFTER any turbofish, which may
+    // itself hold a `(` (a tuple row type). Anywhere else (the `auth_ctx`
+    // shape classifier passes a `Some(` site) it is the first `(`.
+    let open = if src[at..].starts_with("sqlx::query") {
+        call_open_paren(src, at)
+    } else {
+        src[at..].find('(').map(|i| at + i)
+    };
+    let Some(open) = open else {
         return &src[at..];
     };
     let n = src.len();
@@ -1413,6 +1446,60 @@ fn a_format_built_statement_is_counted() {
     let offsets = sqlx_call_offsets(raw);
     assert_eq!(offsets.len(), 1);
     assert!(reads_claim_content(&resolved_region(raw, offsets[0])));
+}
+
+/// A turbofish whose type arguments are themselves generic is still a call.
+///
+/// `sqlx_call_offsets` used to take the FIRST `>` after `::<` as the
+/// turbofish's close. In `query_as::<_, (i64, Option<f64>)>(` that `>` closes
+/// `Option<f64>`, the text after it is `)>(` rather than `(`, and the call was
+/// silently not counted. That is how `embeddings.rs::neighborhood_density`'s
+/// count / mean / median aggregate over `claims.embedding` stayed out of
+/// [`UNCOMPENSATED_INLINE_READS`] while its sibling was in it (backlog
+/// 67c905a3). [`arg_region`] had the matching hole: it opened the region at
+/// the first `(` after the call, which for a tuple row type
+/// (`::<_, (Uuid, String)>(`) is the TYPE, so the SQL was never scanned. Both
+/// now go through [`call_open_paren`]. Measured when the scan was fixed, after
+/// that handler's conversion: every exact-set register in this file kept its
+/// value, so the fix moved no register.
+#[test]
+fn a_nested_generic_turbofish_is_counted() {
+    let nested = r#"
+        let row = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(
+            "SELECT COUNT(*), AVG(1 - (embedding <=> $1::vector)), NULL FROM claims",
+        )
+        .fetch_one(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(nested);
+    assert_eq!(
+        offsets.len(),
+        1,
+        "a turbofish with nested generics must still be recognised as a call"
+    );
+    assert!(
+        reads_claim_content(&resolved_region(nested, offsets[0])),
+        "and its statement must be scanned like any other"
+    );
+
+    // A TUPLE row type opens a `(` inside the turbofish. The argument region
+    // must start after the turbofish, at the SQL, not at the type tuple.
+    let tuple = r#"
+        let rows = sqlx::query_as::<_, (Uuid, String)>("SELECT c.id, c.content FROM claims c")
+            .fetch_all(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(tuple);
+    assert_eq!(offsets.len(), 1, "a tuple turbofish is one call");
+    assert!(
+        reads_claim_content(&resolved_region(tuple, offsets[0])),
+        "the region of a tuple-turbofish call must be its SQL, not its row type"
+    );
+
+    // A turbofish that never opens a call is still not one.
+    let bare = "// see sqlx::query_as::<_, Option<f64>> for the row shape";
+    assert!(
+        sqlx_call_offsets(bare).is_empty(),
+        "a bare mention of a nested turbofish is prose, not a call"
+    );
 }
 
 #[test]
