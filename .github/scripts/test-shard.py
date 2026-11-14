@@ -181,15 +181,30 @@ HOSTED_RUNNER = "ubuntu-latest"
 UNLIMITED_PARALLEL = 256
 
 
-# The workspace this script belongs to (it lives in .github/scripts/), so a
-# run from another directory plans this tree and not the cwd's.
-MANIFEST = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Cargo.toml"))
+def manifest_of(script):
+    """The workspace manifest to plan, or None for the cwd's workspace.
+
+    In place (`<workspace>/.github/scripts/test-shard.py`) the script plans the
+    tree it belongs to, so a run from another directory does not pair another
+    checkout's packages with this tree's files. A COPY elsewhere (the local
+    gate runs one from its cache, and one from each mirror's `.ci-shards/`)
+    plans the workspace of the directory it is run from, as `cargo metadata`
+    does by default."""
+    here = os.path.dirname(os.path.abspath(script))
+    if os.path.basename(here) != "scripts" or os.path.basename(os.path.dirname(here)) != ".github":
+        return None
+    manifest = os.path.join(os.path.dirname(os.path.dirname(here)), "Cargo.toml")
+    return manifest if os.path.isfile(manifest) else None
+
+
+MANIFEST = manifest_of(__file__)
 
 
 def load():
     """(repository root, {package name: cargo metadata package})."""
+    where = ["--manifest-path", MANIFEST] if MANIFEST else []
     out = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", MANIFEST],
+        ["cargo", "metadata", "--no-deps", "--format-version", "1"] + where,
         check=True,
         capture_output=True,
         text=True,

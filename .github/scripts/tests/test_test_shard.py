@@ -261,6 +261,36 @@ class SourceScanDetection(unittest.TestCase):
         self.assertEqual(reads()[1], set(ts.WALKERS))
 
 
+class ScriptLocation(unittest.TestCase):
+    """Which workspace the planner plans, in place and as a copy."""
+
+    def test_in_place_it_plans_its_own_workspace(self):
+        root, _pkgs, _shards = workspace()
+        here = os.path.join(root, ".github", "scripts", "test-shard.py")
+        self.assertEqual(ts.manifest_of(here), os.path.join(root, "Cargo.toml"))
+
+    def test_a_copy_plans_the_workspace_it_is_run_from(self):
+        # The local gate (ci-shards) runs copies from its cache directory and
+        # from each mirror's .ci-shards/. A copy must not climb two levels
+        # from wherever it was put and plan, or fail on, that directory.
+        import shutil
+        import subprocess
+        import sys
+
+        root, _pkgs, shards = workspace()
+        with tempfile.TemporaryDirectory() as tmp:
+            for sub in ("cache", os.path.join("mirror", ".ci-shards"), os.path.join("x", "scripts")):
+                copy = os.path.join(tmp, sub, "test-shard.py")
+                os.makedirs(os.path.dirname(copy))
+                shutil.copy(SCRIPT, copy)
+                out = subprocess.run(
+                    [sys.executable, copy, "matrix"], cwd=root, capture_output=True, text=True
+                )
+                self.assertEqual(out.returncode, 0, f"{sub}: {out.stderr[-400:]}")
+                ids = [e["shard"] for e in json.loads(out.stdout)["include"]]
+                self.assertEqual(ids, list(shards), sub)
+
+
 class EventPolicy(unittest.TestCase):
     def test_non_pull_request_events_run_the_full_set(self):
         for event in ("push", "merge_group", "workflow_dispatch", "schedule", "something_new"):
