@@ -210,6 +210,9 @@ async fn query_claims_hides_only_unauthorized_rows(pool: PgPool) {
             // `a85ee585`'s current-only default.
             is_current: None,
             exclude_spine: None,
+            created_after: None,
+            created_before: None,
+            offset: None,
         },
     )
     .await

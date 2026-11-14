@@ -157,7 +157,7 @@ pub struct SubmitClaimParams {
     pub group_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct QueryClaimsParams {
     #[schemars(
         description = "Minimum belief score (0.0-1.0, default 0.0). The score is the claim's \
@@ -198,6 +198,33 @@ pub struct QueryClaimsParams {
                        kept. Default false (no level filter)."
     )]
     pub exclude_spine: Option<bool>,
+
+    #[schemars(
+        description = "Keep only claims created at or after this instant (RFC 3339, e.g. \
+                       2026-11-01T00:00:00Z; inclusive). Applied in SQL before limit/offset, so \
+                       with created_before and offset this is a COMPLETE listing of what was \
+                       created in a window, page by page, unlike recall's semantic `since` \
+                       (a capped top-k). Omit for no lower bound."
+    )]
+    #[serde(default)]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Keep only claims created at or before this instant (RFC 3339; \
+                       inclusive). A created_before earlier than created_after is refused as \
+                       invalid params. Omit for no upper bound."
+    )]
+    #[serde(default)]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Rows to skip before the page starts (default 0, never negative). The \
+                       order is created_at newest first with ties broken by id, so stepping \
+                       offset by limit visits every matching row exactly once; a page shorter \
+                       than limit is the last."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

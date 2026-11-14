@@ -987,6 +987,25 @@ pub async fn query_claims(
     // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
     // most of the page (backlog 31e7b727). Off unless the caller asks.
     let exclude_spine = params.exclude_spine.unwrap_or(false);
+
+    // The created_at window and offset (backlog 24caecaa): bound in SQL before
+    // LIMIT, inside the same viewer-filtered statement, so paging by offset
+    // lists every readable claim created in the window. Both refusals run
+    // before any statement, so they cannot depend on what the caller may see.
+    let window = epigraph_db::CreatedWindow {
+        after: params.created_after,
+        before: params.created_before,
+    };
+    if window.is_inverted() {
+        return Err(invalid_params(
+            "created_after is later than created_before; no claim can be created in that window",
+        ));
+    }
+    let offset = params.offset.unwrap_or(0);
+    if offset < 0 {
+        return Err(invalid_params("offset must not be negative"));
+    }
+
     let mut read = server.read_as(viewer, "query_claims").await?;
     let claims = ClaimRepository::list_by_belief_range(
         &mut *read,
@@ -995,8 +1014,9 @@ pub async fn query_claims(
         max,
         is_current,
         limit,
-        0,
+        offset,
         exclude_spine,
+        window,
     )
     .await
     .map_err(internal_error)?;

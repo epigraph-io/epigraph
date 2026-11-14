@@ -265,6 +265,9 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
             // about `a85ee585`'s current-only default.
             is_current: None,
             exclude_spine: None,
+            created_after: None,
+            created_before: None,
+            offset: None,
         },
     )
     .await

@@ -124,6 +124,37 @@ pub enum ClaimSortOrder {
 /// the struct: a `total` produced by a different predicate set than the rows
 /// it describes is the defect this type exists to prevent (backlog
 /// `2265a67b`).
+/// A `created_at` window for [`ClaimRepository::list_by_belief_range`]: both
+/// bounds INCLUSIVE, either open. The inclusive spelling is the REST
+/// `GET /api/v1/claims` filter's (`created_after` / `created_before`), so the
+/// two surfaces agree about a row created exactly on a bound.
+///
+/// A struct rather than two more positional `Option<DateTime>` arguments
+/// beside each other, which a call site could swap silently.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedWindow {
+    /// Keep rows with `created_at >= after`.
+    pub after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep rows with `created_at <= before`.
+    pub before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl CreatedWindow {
+    /// No bound: every `created_at` passes.
+    pub const ANY: Self = Self {
+        after: None,
+        before: None,
+    };
+
+    /// `true` when both bounds are set and `after` is later than `before`, a
+    /// window no row can fall in. Callers refuse it rather than answer an
+    /// empty page that reads as "nothing was created then".
+    #[must_use]
+    pub fn is_inverted(&self) -> bool {
+        matches!((self.after, self.before), (Some(a), Some(b)) if a > b)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ClaimListFilter<'a> {
     /// Case-insensitive `content ILIKE '%search%'`.
@@ -5555,13 +5586,21 @@ impl ClaimRepository {
     /// text value, never a cast, so an absent or odd `level` cannot raise.
     /// `false` folds the predicate away and leaves the page unchanged.
     ///
+    /// # `window` (backlog `24caecaa`)
+    ///
+    /// [`CreatedWindow`] bounds `created_at` in SQL, inclusive at both ends,
+    /// before `LIMIT`, so `limit` + `offset` page through EVERY claim the
+    /// viewer may read that was created in the window. `recall`'s `since` is
+    /// a semantic top-k narrowed by time, never a complete listing; this is
+    /// the complete one. [`CreatedWindow::ANY`] folds both predicates away.
+    ///
     /// # Bind layout
     ///
-    /// `is_current` occupies `$3` and `exclude_spine` `$6`, so the viewer's
-    /// group bind is `$7`. The group bind is conditional (a `Bypass` or
-    /// elevated viewer binds nothing), so it must stay LAST: were it `$6`, a
-    /// bind-less viewer would leave the statement one value short of the
-    /// `$7` it references.
+    /// `is_current` occupies `$3`, `exclude_spine` `$6` and the window `$7`
+    /// and `$8`, so the viewer's group bind is `$9`. The group bind is
+    /// conditional (a `Bypass` or elevated viewer binds nothing), so it must
+    /// stay LAST: were it `$8`, a bind-less viewer would leave the statement
+    /// one value short of the `$9` it references.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -5572,6 +5611,7 @@ impl ClaimRepository {
         limit: i64,
         offset: i64,
         exclude_spine: bool,
+        window: CreatedWindow,
     ) -> Result<Vec<(Claim, f64)>, DbError> {
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
@@ -5605,6 +5645,8 @@ impl ClaimRepository {
                 FROM claims
                 WHERE ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
                   AND (NOT $6::bool OR COALESCE(properties->>'level', '') NOT IN ('0', '1', '2'))
+                  AND ($7::timestamptz IS NULL OR created_at >= $7)
+                  AND ($8::timestamptz IS NULL OR created_at <= $8)
                   /* {VISIBILITY:claims} */
             ) scored
             WHERE belief_score >= $1 AND belief_score <= $2
@@ -5613,7 +5655,7 @@ impl ClaimRepository {
             "#,
             ]
             .concat(),
-            7,
+            9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(min_belief)
@@ -5621,7 +5663,9 @@ impl ClaimRepository {
             .bind(is_current)
             .bind(limit)
             .bind(offset)
-            .bind(exclude_spine);
+            .bind(exclude_spine)
+            .bind(window.after)
+            .bind(window.before);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

@@ -51,6 +51,9 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
             limit: Some(50),
             is_current: None,
             exclude_spine: None,
+            created_after: None,
+            created_before: None,
+            offset: None,
         },
     )
     .await
@@ -75,6 +78,9 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
             limit: Some(50),
             is_current: Some(false),
             exclude_spine: None,
+            created_after: None,
+            created_before: None,
+            offset: None,
         },
     )
     .await
