@@ -15,6 +15,18 @@ pub struct SourceKey {
     /// hidden behind an arbitrary single pick. Empty = non-paper claim.
     pub paper_dois: Vec<String>,
     pub agent_id: Uuid,
+    /// Root of the claim's `derived_from` chain (`None` when it has no
+    /// `derived_from` parent). SCOPE: this is claim-to-claim derivation
+    /// lineage only. It does NOT model the intra-source closure that
+    /// migration 041's `same_source_papers()` walks (`same_source`,
+    /// `section_follows`, `continues_argument`, `decomposes_to`, in either
+    /// direction): paper siblings are caught by `paper_dois` (asserting
+    /// papers over the `decomposes_to` ancestry), and a claim reachable from
+    /// a paper only through `section_follows` / `continues_argument` /
+    /// `same_source` edges, with no `asserts` edge on it or an ancestor, is
+    /// NOT seen as same-source here. The matcher derives one key per
+    /// candidate endpoint, so the undirected closure walk is deliberately
+    /// not repeated per claim.
     pub derivation_root: Option<Uuid>,
 }
 
@@ -129,9 +141,13 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
         }
         // Also deliberately unfiltered: `derived_from` is lineage, not evidence.
         // Retracting an evidential edge must not sever a decomposition chain.
+        // `ORDER BY target_id` makes the walk deterministic for a claim with
+        // several `derived_from` parents; without it `LIMIT 1` could pick a
+        // different parent (and so a different root) on each run.
         let parent: Option<(Uuid,)> = sqlx::query_as(
             "SELECT target_id FROM edges
              WHERE source_id = $1 AND relationship = 'derived_from'
+             ORDER BY target_id
              LIMIT 1",
         )
         .bind(current)
