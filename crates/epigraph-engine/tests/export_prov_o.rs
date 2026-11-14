@@ -112,7 +112,8 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
     // target = superseded claim.
     let supersedes_edge_id = insert_edge(&pool, child_claim, prior_claim, "supersedes").await;
 
-    let document = export_provenance_prov_o(&pool, &viewer, child_claim, Some(5))
+    let mut conn = pool.acquire().await.expect("acquire");
+    let document = export_provenance_prov_o(&mut conn, &viewer, child_claim, Some(5))
         .await
         .expect("export should succeed");
 

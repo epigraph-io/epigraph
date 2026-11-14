@@ -235,12 +235,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         ENGINE_POOL_PARAM,
     ),
     (
-        "epigraph-engine/src/export/prov.rs",
-        "export_provenance_prov_o",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
         "epigraph-engine/src/matching/policy.rs",
         "write_edge",
         1,
@@ -603,7 +597,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 84;
+const HIGH_WATER: usize = 83;
 
 // ===========================================================================
 // The scanner.

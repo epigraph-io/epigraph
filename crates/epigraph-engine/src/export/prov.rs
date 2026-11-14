@@ -113,10 +113,28 @@ fn prov_relation_endpoints(
 /// `evidence.evidence_type = 'computation'`) are simply one shape of input;
 /// the exporter does not special-case them.
 ///
+/// # The caller's connection
+///
+/// Every statement runs on `conn`, which the caller stamps for `viewer`
+/// (`ScopedPool::read_as` in a request handler, the maintenance connection in
+/// the CLI). It took a raw pool until it was exposed over MCP: under FORCEd
+/// row security a raw application-login pool admits public rows only, so a
+/// member's own group-private ancestors would have silently dropped out of
+/// the export while the in-query viewer predicate admitted them.
+///
+/// # A claim the viewer cannot read is absent everywhere
+///
+/// A claim id is emitted only once [`ClaimRepository::get_by_id`] has
+/// returned it for `viewer`: as an entity, an attribution, or an endpoint of
+/// a relation. A `supersedes` edge the viewer can see may still point at a
+/// claim it cannot (an edge is visible on its own row, not its endpoints'),
+/// so relation endpoints are checked against the READABLE set, never against
+/// the candidate set, which would print a hidden claim's id in a relation.
+///
 /// # Errors
 /// Returns [`epigraph_db::DbError`] if any underlying repository call fails.
 pub async fn export_provenance_prov_o(
-    pool: &epigraph_db::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     root_claim_id: uuid::Uuid,
     max_depth: Option<i32>,
@@ -134,7 +152,7 @@ pub async fn export_provenance_prov_o(
     // relative to what the CTE looks for. So we add supersedes targets
     // explicitly, one hop per claim already in the set.
     let ancestor_ids =
-        LineageRepository::get_ancestor_ids(pool, viewer, root_claim_id, max_depth).await?;
+        LineageRepository::get_ancestor_ids(&mut *conn, viewer, root_claim_id, max_depth).await?;
     let mut claim_ids = ancestor_ids;
     if !claim_ids.contains(&root_claim_id) {
         claim_ids.push(root_claim_id);
@@ -142,7 +160,7 @@ pub async fn export_provenance_prov_o(
 
     let mut supersedes_targets = Vec::new();
     for &claim_id in &claim_ids {
-        let outgoing = EdgeRepository::get_by_source(pool, viewer, claim_id, "claim").await?;
+        let outgoing = EdgeRepository::get_by_source(&mut *conn, viewer, claim_id, "claim").await?;
         for edge in outgoing {
             if edge.target_type == "claim"
                 && edge.relationship == "supersedes"
@@ -160,19 +178,27 @@ pub async fn export_provenance_prov_o(
 
     // --- Pass 2: emit entities, agents, and relations -------------------
 
+    // Pass 2a: keep only the candidates this viewer can READ. A candidate
+    // reached through a visible edge to a hidden claim (a supersedes target)
+    // is dropped here, before any of its ids can be printed.
+    let mut readable = Vec::with_capacity(claim_ids.len());
+    for &claim_id in &claim_ids {
+        if let Some(claim) =
+            ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(claim_id)).await?
+        {
+            readable.push((claim_id, claim));
+        }
+    }
+    let readable_ids: std::collections::HashSet<uuid::Uuid> =
+        readable.iter().map(|(id, _)| *id).collect();
+
     let mut entities = Vec::new();
     let mut agents_seen = std::collections::HashSet::new();
     let mut agent_entities = Vec::new();
     let mut relations = Vec::new();
     let mut edges_seen = std::collections::HashSet::new();
 
-    for &claim_id in &claim_ids {
-        let Some(claim) =
-            ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(claim_id)).await?
-        else {
-            continue;
-        };
-
+    for (claim_id, claim) in readable {
         entities.push(serde_json::json!({
             "@id": format!("claim:{claim_id}"),
             "@type": "prov:Entity",
@@ -183,7 +209,7 @@ pub async fn export_provenance_prov_o(
         let agent_uuid: uuid::Uuid = claim.agent_id.into();
         if agents_seen.insert(agent_uuid) {
             if let Some(agent) =
-                AgentRepository::get_by_id(pool, AgentId::from_uuid(agent_uuid)).await?
+                AgentRepository::get_by_id(&mut *conn, AgentId::from_uuid(agent_uuid)).await?
             {
                 agent_entities.push(serde_json::json!({
                     "@id": format!("agent:{agent_uuid}"),
@@ -208,8 +234,9 @@ pub async fn export_provenance_prov_o(
         // (e.g. the root is both a target of its ancestor's edge and a
         // source of its own supersedes edge).
         let mut claim_edges =
-            EdgeRepository::get_by_target(pool, viewer, claim_id, "claim").await?;
-        claim_edges.extend(EdgeRepository::get_by_source(pool, viewer, claim_id, "claim").await?);
+            EdgeRepository::get_by_target(&mut *conn, viewer, claim_id, "claim").await?;
+        claim_edges
+            .extend(EdgeRepository::get_by_source(&mut *conn, viewer, claim_id, "claim").await?);
 
         for edge in claim_edges {
             if !edges_seen.insert(edge.id) {
@@ -217,8 +244,8 @@ pub async fn export_provenance_prov_o(
             }
             if edge.source_type != "claim"
                 || edge.target_type != "claim"
-                || !claim_ids.contains(&edge.source_id)
-                || !claim_ids.contains(&edge.target_id)
+                || !readable_ids.contains(&edge.source_id)
+                || !readable_ids.contains(&edge.target_id)
             {
                 continue;
             }

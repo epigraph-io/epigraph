@@ -90,8 +90,9 @@ async fn run(
         .into());
     }
 
+    let mut conn = pool.acquire().await?;
     let document = epigraph_engine::export::prov::export_provenance_prov_o(
-        &pool,
+        &mut conn,
         viewer,
         cli.claim_id,
         cli.max_depth,
