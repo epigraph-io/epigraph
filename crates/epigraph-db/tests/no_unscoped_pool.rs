@@ -768,7 +768,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-const HIGH_WATER: usize = 210;
+///
+/// 210 -> 209 (backlog 0f2f9ddb): `set_source_reliability` holds a `Viewer`
+/// and writes on the caller's stamped transaction
+/// (`set_source_reliability_conn`); `routes/perspective.rs` 2 -> 1. No file
+/// reached zero.
+const HIGH_WATER: usize = 209;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1068,12 +1073,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // and not convertible.
     ("routes/papers.rs", 8),
     // 5 before conversion shard 5, which moved `list_perspectives`,
-    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`. The
-    // two that remain both WRITE -- `create_perspective` (which also creates a
-    // PERSPECTIVE_OF edge) and `set_source_reliability` (an `UPDATE`) -- and
-    // neither `PerspectiveRepository::create` nor `::set_source_reliability`
-    // takes a `Viewer`. Same owner as `context.rs`'s residue.
-    ("routes/perspective.rs", 2),
+    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`; 2
+    // before backlog 0f2f9ddb moved `set_source_reliability` onto
+    // `AppState::write_as` and `set_source_reliability_conn`. The one that
+    // remains WRITES -- `create_perspective` (which also creates a
+    // PERSPECTIVE_OF edge) -- and `PerspectiveRepository::create` takes no
+    // `Viewer`. Same owner as `context.rs`'s residue.
+    ("routes/perspective.rs", 1),
     // 9 before the operator-binding delta review, which moved
     // `create_challenge`'s transaction onto `AppState::begin_claim_write`.
     ("routes/policies.rs", 8),

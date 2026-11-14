@@ -159,6 +159,10 @@ fn claims_write_routes() -> Vec<(Method, String)> {
         (Method::PUT, format!("/api/v1/activities/{a}/complete")),
         (Method::POST, "/api/v1/contexts".into()),
         (Method::POST, "/api/v1/perspectives".into()),
+        (
+            Method::PUT,
+            format!("/api/v1/perspectives/{a}/source-reliability"),
+        ),
         (Method::POST, format!("/api/v1/claims/{a}/assess")),
         (Method::POST, "/api/v1/skills/share".into()),
         (Method::POST, "/api/v1/hypothesis".into()),
