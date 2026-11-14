@@ -59,6 +59,7 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -114,6 +115,7 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -202,6 +204,7 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     labels: vec!["backlog".into()],
                     visibility: Some("public".to_string()),
                     group_id: None,
+                    dataset: None,
                 },
                 epigraph_mcp::types::BatchClaimEntry {
                     content: bad.into(),
@@ -215,6 +218,7 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     labels: vec![BAD_LABEL.into()],
                     visibility: Some("public".to_string()),
                     group_id: None,
+                    dataset: None,
                 },
             ],
         },

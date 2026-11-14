@@ -36,6 +36,7 @@ fn rfp_submission(content: &str, evidence_type: &str, url: Option<&str>) -> Subm
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

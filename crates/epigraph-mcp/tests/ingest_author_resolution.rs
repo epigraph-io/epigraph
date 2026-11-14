@@ -1717,6 +1717,7 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

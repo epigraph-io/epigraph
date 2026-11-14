@@ -37,6 +37,7 @@ fn params(content: &str, methodology: &str) -> SubmitClaimParams {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

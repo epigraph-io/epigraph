@@ -155,6 +155,89 @@ pub struct SubmitClaimParams {
     )]
     #[serde(default)]
     pub group_id: Option<String>,
+    #[schemars(
+        description = "Structured dataset evidence (optional): the evidence commits to a multi-file dataset by its manifest's digest, so a reader can resolve and verify the data without parsing evidence_data. When given, the evidence row is stored as type \"dataset\" with these fields (returned by get_claim's datasets and get_provenance); evidence_type still sets the evidence weight as usual, and evidence_data is still required (a one-line description of the run is enough). Evidence on one claim is de-duplicated on evidence_data, so two datasets on the same claim need different evidence_data. An invalid dataset refuses the call and writes nothing."
+    )]
+    #[serde(default)]
+    pub dataset: Option<DatasetEvidenceParams>,
+}
+
+/// A dataset evidence input (backlog c8beb101): `submit_claim`'s and
+/// `batch_submit_claims`'s `dataset`, turned into
+/// `epigraph_core::EvidenceType::Dataset` by `EvidenceType::dataset`, which
+/// normalises and validates it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DatasetEvidenceParams {
+    #[schemars(
+        description = "Where the dataset lives: a URI or path naming its root directory (e.g. s3://bucket/campaign/run-0042/). Also stored as the evidence's source_url."
+    )]
+    pub root_uri: String,
+
+    #[schemars(
+        description = "Where the manifest can be fetched, if not at a known name under root_uri (optional)."
+    )]
+    #[serde(default)]
+    pub manifest_uri: Option<String>,
+
+    #[schemars(
+        description = "The blob store id of the manifest, if it was uploaded as a blob (optional)."
+    )]
+    #[serde(default)]
+    pub manifest_blob_id: Option<String>,
+
+    #[schemars(
+        description = "The manifest's digest as <algorithm>:<hex>, e.g. blake3:af13... or sha256:e3b0... (bare hex is accepted when hash_algorithm is given). Algorithms: blake3, sha256, sha512. Stored lower-case with its prefix."
+    )]
+    pub manifest_hash: String,
+
+    #[schemars(
+        description = "The digest's algorithm (blake3, sha256 or sha512). Optional when manifest_hash carries the prefix; must agree with it when both are given."
+    )]
+    #[serde(default)]
+    pub hash_algorithm: Option<String>,
+
+    #[schemars(description = "How many files the manifest lists.")]
+    pub file_count: u64,
+
+    #[schemars(description = "The summed size in bytes of the files the manifest lists.")]
+    pub total_bytes: u64,
+
+    #[schemars(description = "An episcience sample id the dataset belongs to (optional).")]
+    #[serde(default)]
+    pub sample_id: Option<String>,
+
+    #[schemars(
+        description = "Blob store ids of dataset files that were uploaded (optional, at most 64)."
+    )]
+    #[serde(default)]
+    pub blob_ids: Vec<String>,
+}
+
+impl From<DatasetEvidenceParams> for epigraph_core::DatasetManifestInput {
+    fn from(p: DatasetEvidenceParams) -> Self {
+        let DatasetEvidenceParams {
+            root_uri,
+            manifest_uri,
+            manifest_blob_id,
+            manifest_hash,
+            hash_algorithm,
+            file_count,
+            total_bytes,
+            sample_id,
+            blob_ids,
+        } = p;
+        Self {
+            root_uri,
+            manifest_uri,
+            manifest_blob_id,
+            manifest_hash,
+            hash_algorithm,
+            file_count,
+            total_bytes,
+            sample_id,
+            blob_ids,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3434,6 +3517,12 @@ pub struct BatchClaimEntry {
     )]
     #[serde(default)]
     pub group_id: Option<String>,
+
+    #[schemars(
+        description = "Structured dataset evidence for this entry, exactly as submit_claim's dataset. An invalid dataset refuses THIS entry only and writes nothing for it."
+    )]
+    #[serde(default)]
+    pub dataset: Option<DatasetEvidenceParams>,
 }
 
 /// The methodology a batch entry gets when it names none — the value every
@@ -3461,6 +3550,7 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             novelty_threshold,
             visibility,
             group_id,
+            dataset,
         } = entry;
         Self {
             content,
@@ -3474,6 +3564,7 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             novelty_threshold,
             visibility,
             group_id,
+            dataset,
         }
     }
 }

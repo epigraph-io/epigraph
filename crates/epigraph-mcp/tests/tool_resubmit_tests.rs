@@ -58,6 +58,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     };
     let params2 = SubmitClaimParams {
         content: content.clone(),
@@ -71,6 +72,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     };
 
     tools::claims::submit_claim(&server, &viewer, params1, None)

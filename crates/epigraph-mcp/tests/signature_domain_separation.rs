@@ -221,6 +221,7 @@ async fn submit_claim_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
             novelty_threshold: Some(0.0),
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
