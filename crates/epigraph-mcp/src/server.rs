@@ -834,7 +834,9 @@ impl EpiGraphMcpFull {
     /// - The downstream ANSWERED with an MCP error
     ///   ([`FederationError::Downstream`]): returned as-is (code, message,
     ///   data). It is the extension's reply to this caller's own request,
-    ///   made under this caller's own token.
+    ///   made under this caller's own token. Except an internal error
+    ///   (`-32603`), whose message is redacted as this server redacts its own:
+    ///   a downstream's internal error is where its driver text lands.
     /// - The gateway could not open a session, or found no route
     ///   ([`FederationError::Connect`], [`FederationError::Timeout`],
     ///   [`FederationError::NoRoute`]): "extension `<name>` unavailable".
@@ -853,6 +855,22 @@ impl EpiGraphMcpFull {
     ) -> McpError {
         use crate::federation::client::FederationError;
         match err {
+            // An internal error is the one answer NOT passed through: a
+            // downstream's `-32603` is where its own driver and provider text
+            // ends up (episcience's `internal_error` puts `format!("…: {e}")`
+            // in the message), which `errors.rs` keeps from every caller of
+            // this server. Its message goes to the server log instead.
+            FederationError::Downstream(answer)
+                if answer.code == rmcp::model::ErrorCode::INTERNAL_ERROR =>
+            {
+                crate::errors::internal_error_logged(
+                    format!(
+                        "Federated tool '{tool}' failed with an internal error in extension \
+                         '{extension}'; the detail is in the server log."
+                    ),
+                    answer.message,
+                )
+            }
             FederationError::Downstream(answer) => answer,
             FederationError::Connect { .. }
             | FederationError::Timeout(..)

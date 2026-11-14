@@ -215,7 +215,9 @@ either clash with a `prefix=`.
   client response cache, which would otherwise answer the check from memory.
 - Downstream errors mid-call → the downstream's own MCP error reaches the caller
   **unchanged** (code, message, data); `EpiGraphMcpFull::federated_call_error` (backlog
-  7ea4bd74). A downstream the gateway cannot open a session with is answered "extension
+  7ea4bd74). The exception is an internal error (`-32603`): its message is where a
+  downstream's driver text lands, so the gateway redacts it as it redacts its own and names
+  the extension instead. A downstream the gateway cannot open a session with is answered "extension
   `<name>` unavailable", naming the extension and never its address.
 - A downstream that accepts a call and never answers → cut off at the extension's
   `call_timeout_secs=` (default 300 s), and the caller is told it gave no answer and that

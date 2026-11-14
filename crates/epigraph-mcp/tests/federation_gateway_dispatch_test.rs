@@ -387,3 +387,40 @@ async fn a_call_that_never_answers_is_answered_at_the_extensions_bound() {
         "and that the call may have run anyway: {error}"
     );
 }
+
+/// A downstream's INTERNAL error is the exception to pass-through: its message
+/// is where a downstream that does not redact puts its driver text, and this
+/// server keeps that text from callers (`errors.rs`). The caller is told which
+/// extension failed, not what its database said.
+///
+/// Mutation: drop the `INTERNAL_ERROR` arm in `federated_call_error` -> the
+/// stub's "stub_private_table" reaches the caller, and this fails.
+#[tokio::test]
+async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
+    let (addr, _control) = stub::spawn_controlled_stub(&[stub::INTERNAL_FAIL_TOOL]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let error = call_for_error(
+        &url,
+        stub::INTERNAL_FAIL_TOOL,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("stub_private_table") && !message.contains("database"),
+        "a downstream's internal error text must not reach the caller: {error}"
+    );
+    assert!(
+        message.contains("internal error in extension 'ext'"),
+        "the caller is told which extension failed: {error}"
+    );
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32603),
+        "still an internal error: {error}"
+    );
+}

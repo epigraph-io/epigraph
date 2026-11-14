@@ -19,7 +19,8 @@
 //! - a request whose bearer is [`REJECTED_BEARER`] gets `401`.
 //!
 //! Tool behaviour is keyed by name: [`HANG_TOOL`] never answers,
-//! [`FAIL_TOOL`] answers with [`fail_error`], and any other name echoes
+//! [`FAIL_TOOL`] answers with [`fail_error`], [`INTERNAL_FAIL_TOOL`] with
+//! [`internal_fail_error`], and any other name echoes
 //! `stub handled `<name>``.
 #![allow(dead_code)]
 
@@ -41,6 +42,8 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 pub const HANG_TOOL: &str = "hang_forever";
 /// A tool whose `tools/call` answers with [`fail_error`].
 pub const FAIL_TOOL: &str = "always_fails";
+/// A tool whose `tools/call` answers with [`internal_fail_error`].
+pub const INTERNAL_FAIL_TOOL: &str = "fails_internally";
 /// A bearer the stub answers with `401`, at `initialize` as on every request.
 pub const REJECTED_BEARER: &str = "a-token-this-downstream-refuses";
 
@@ -52,6 +55,18 @@ pub fn fail_error() -> ErrorData {
     ErrorData::invalid_params(
         "stub refused: widget 42 is out of range (max 7)",
         Some(serde_json::json!({ "widget": 42, "max": 7 })),
+    )
+}
+
+/// The `-32603` answer [`INTERNAL_FAIL_TOOL`] gives, its message carrying
+/// driver text the way a downstream that does not redact its own internal
+/// errors would (`internal_error(format!("lookup: {e}"))`).
+#[must_use]
+pub fn internal_fail_error() -> ErrorData {
+    ErrorData::internal_error(
+        "sample lookup: error returned from database: relation \"stub_private_table\" \
+         does not exist",
+        None,
     )
 }
 
@@ -116,6 +131,7 @@ impl ServerHandler for ControlledStub {
                 unreachable!()
             }
             FAIL_TOOL => Err(fail_error()),
+            INTERNAL_FAIL_TOOL => Err(internal_fail_error()),
             other => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "stub handled `{other}`"
             ))])
