@@ -114,8 +114,13 @@ bytes per named level; measure on prod.
 **Reply validation** (`validate_reply`): the JSON object (a code fence and
 surrounding prose are tolerated), a string `name`, trimmed of quotes and a
 final period; refused when empty, over 80 characters or 8 words, holding a
-control character (a newline included), or sharing a run of 5 consecutive
-words with any sampled text (it quotes a claim instead of naming the group).
+control character (a newline included) or any whitespace but the ASCII space
+(checked before the trim, so an edge separator is refused, not trimmed away),
+holding any character outside the name rule (a letter or digit of any script,
+the ASCII space, `- – ' ’ , . : & / ( ) +`: so no line or paragraph
+separator, bidirectional override, zero-width character, private-use
+character or markup), or sharing a run of 5 consecutive words with any
+sampled text (it quotes a claim instead of naming the group).
 A refused or failed reply leaves `name` null and `needs_naming` true, with
 no key recorded.
 
@@ -124,14 +129,37 @@ no key recorded.
 `trait NameBackend { fn complete(&self, prompt: &str) -> Result<String, BackendError>; }`
 
 - `ClaudeCliBackend` spawns `claude -p --output-format json --max-turns 1
-  --model <model>` (the model `label_themes_llm.py` uses by default), the
-  prompt on stdin, `ANTHROPIC_API_KEY` and `CLAUDECODE` removed from its
+  --model <model>` (the model `label_themes_llm.py` uses by default) plus
+  the lockdown flags `--safe-mode --restricted --tools "" --strict-mcp-config
+  --setting-sources "" --disable-slash-commands --no-session-persistence`,
+  the prompt on stdin, `ANTHROPIC_API_KEY` and `CLAUDECODE` removed from its
   environment (the `scripts/lib/claude_cli.py` pattern: the CLI's own OAuth,
-  never an API key, never the SDK), in an empty owner-only working
-  directory, killed (only that child) at a timeout. A non-zero exit,
-  `is_error`, an empty `result` or a timeout is a failed reply, never an
-  abort of the run. The program path is injectable, so a test runs a stub
-  script in its place.
+  never an API key, never the SDK). A non-zero exit, `is_error`, an empty
+  `result` or a timeout is a failed reply, never an abort of the run. The
+  program path is injectable, so a test runs a stub script in its place.
+- **Prompt-injection guards** (security review). The prompt carries claim
+  text, which is untrusted, and the CLI looks for instruction files in the
+  working directory's ancestors.
+  - Working directory: a fresh 0700 directory in `$XDG_RUNTIME_DIR/atlas-naming`,
+    else `$HOME/.cache/epigraph/atlas-naming`, never the system temp dir. The
+    base is created 0700 and refused unless owned by the effective uid with
+    no group or other bits, and unless no ancestor is writable by anyone but
+    this user or root.
+  - Flags: `--safe-mode` turns off CLAUDE.md and memory discovery, skills,
+    plugins, hooks and MCP while keeping the CLI's own sign-in; the rest turn
+    off tools, settings sources, MCP servers, skills and session files.
+    `--bare` is not used: it never reads the sign-in and would need an API
+    key. A CLI without one of these flags fails the call, so the group keeps
+    its placeholder; it never runs with fewer guards.
+  - Probed on the deployment host (Claude Code 2.1.280) with the argv copied
+    byte for byte: a CLAUDE.md planted in an ancestor of the working
+    directory took over the old argv's answer and is ignored under the new
+    one; the user-level CLAUDE.md is no longer loaded; the init event lists
+    no tools, MCP servers or skills.
+  - The call is bounded as a whole: the CLI leads its own process group, the
+    output is read against the same deadline, and every timeout path kills
+    the group (a pid this call started), so a process left holding stdout
+    cannot hang the run.
 - `RecordingBackend` (tests): a scripted reply function, a call counter and
   every prompt it received.
 
@@ -163,7 +191,14 @@ no key recorded.
 - `ClaudeCliBackend` against stub scripts: the stub refuses unless
   `ANTHROPIC_API_KEY` and `CLAUDECODE` are absent and `-p` is passed; an
   `is_error` envelope, an empty result and a hang (killed at the timeout)
-  are errors.
+  are errors; the argv (count and each argument) and the working directory
+  match a literal list; a grandchild holding stdout open is killed at the
+  timeout;
+- the working-directory base comes from `XDG_RUNTIME_DIR`, else `HOME`; a
+  base with group or other bits, or under a directory another user may
+  write, is refused;
+- a name holding a separator, format, private-use, control or markup
+  character is refused, mid-name and at the end.
 
 **DB** (`crates/epigraph-cli/tests/atlas_naming.rs`), meaning levels from
 W4's apply plus synthetic links levels in the same run; a backend that copies
@@ -215,10 +250,22 @@ the unit and DB targets run, then restored and `touch`ed):
 | (review) write without the newer-run check | `a_run_published_during_naming_is_not_hidden` |
 | `max_calls` ignored | `the_budget_and_a_dry_run_defer_the_rest` |
 | the binary accepts `--max-calls 0` | `the_binary_refuses_bad_arguments_before_connecting` |
+| (review) the old argv, without the lockdown flags | `the_cli_is_called_with_every_guard` |
+| (review) the CLI run in the system temp dir | `the_cli_is_called_with_every_guard` |
+| (review) the base taken from the system temp dir | `the_workdir_base_is_the_users_own` |
+| (review) the base's mode check dropped | `a_shared_base_or_ancestor_is_refused` |
+| (review) the ancestor check dropped | `a_shared_base_or_ancestor_is_refused` |
+| (review) the name allow-list dropped | `a_name_outside_the_character_rule_is_refused` |
+| (review) the raw check cut back to control characters | `a_name_outside_the_character_rule_is_refused` |
+| (review) the output read with no deadline | `a_process_left_holding_the_output_is_killed_at_the_timeout` |
+| (review) the group kill dropped from the output timeout | `a_process_left_holding_the_output_is_killed_at_the_timeout` |
+| (review) quotation marks not trimmed | `a_plain_reply_is_accepted_and_trimmed` |
+| (review) whitespace not collapsed in a sampled text | `texts_are_clipped_and_flattened` |
+| (review) the sample taken in node order, not by hash rank | `the_sample_is_deterministic_and_order_free` |
+| (review) an `is_error` envelope accepted | `an_error_envelope_an_empty_result_and_a_bad_exit_are_errors` |
 
-Not mutation-proved (direct properties): `a_plain_reply_is_accepted_and_trimmed`,
-`texts_are_clipped_and_flattened`, `the_sample_is_deterministic_and_order_free`
-and the stub-script error cases.
+In each review row only the named test went red; the other unit tests stayed
+green.
 
 ## Decisions to check
 
@@ -232,7 +279,9 @@ and the stub-script error cases.
   model ran (a named copy of the older run would otherwise be served in its
   place); rerun to name the newer one. The check and the write are one
   transaction but not a lock, so a build finishing in the same instant can
-  still race it.
+  still race it. A per-map `pg_advisory_xact_lock` closes it only if every
+  publisher takes it before its own newer-run check, which means the shared
+  run writer; that is left to W9, whose nightly is the other publisher.
 - Every write of the binary copies all of the run's levels (storage churn per
   naming run; W9 avoids it by naming before its own write).
 - `claim_themes.label` is untouched. `label_themes_llm.py` still writes
