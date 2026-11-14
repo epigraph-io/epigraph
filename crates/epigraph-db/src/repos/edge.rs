@@ -2243,6 +2243,14 @@ impl EdgeRepository {
     /// count toward a cycle (a cycle closed only through another group's
     /// private edge is not refused).
     ///
+    /// It first takes a transaction-scoped advisory lock keyed on the walked
+    /// relationship set, held until the caller's transaction ends. Two
+    /// concurrent writers of `a -rel-> b` and `b -rel-> a` then check and
+    /// insert one after the other: the second's walk runs on a fresh READ
+    /// COMMITTED snapshot that sees the first's committed edge, so the pair
+    /// cannot both pass and commit a 2-cycle. Call it on the transaction that
+    /// then writes the edge.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(conn))]
@@ -2253,6 +2261,12 @@ impl EdgeRepository {
         relationships: &[&str],
     ) -> Result<bool, DbError> {
         let rels: Vec<String> = relationships.iter().map(|r| (*r).to_string()).collect();
+        let mut key: Vec<&str> = relationships.to_vec();
+        key.sort_unstable();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("edges.reaches:{}", key.join(",")))
+            .execute(&mut *conn)
+            .await?;
         let reached: bool = sqlx::query_scalar(&format!(
             "WITH RECURSIVE reach(node) AS ( \
                  SELECT $1::uuid \
