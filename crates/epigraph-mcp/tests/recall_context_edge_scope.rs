@@ -156,6 +156,10 @@ async fn recall_context_walks_only_edges_the_viewer_can_read(pool: PgPool) {
     edge(&pool, cl(p), cor_h, "corroborates", c.theirs).await;
     edge(&pool, cl(cor_m), p, "corroborates", c.mine).await;
     edge(&pool, cl(cor_m2), p, "corroborates", c.mine).await;
+    // Each direction of the UNION carries its own predicate, so each gets a
+    // hidden edge: p -> cor_h exercises the source arm, cor_h2 -> p the target.
+    let cor_h2 = leveled(&pool, &c, "rce: hidden incoming corroborator", 2).await;
+    edge(&pool, cl(cor_h2), p, "corroborates", c.theirs).await;
     let paper_h = paper(&pool, "10.9999/rce-hidden").await;
     let paper_m = paper(&pool, "10.9999/rce-mine").await;
     edge(&pool, (paper_h, "paper"), cor_m, "asserts", c.theirs).await;
@@ -172,12 +176,16 @@ async fn recall_context_walks_only_edges_the_viewer_can_read(pool: PgPool) {
     let ca_m = leveled(&pool, &c, "rce: my continuation", 2).await;
     edge(&pool, cl(p), ca_h, "continues_argument", c.theirs).await;
     edge(&pool, cl(ca_m), p, "continues_argument", c.mine).await;
+    let ca_h2 = leveled(&pool, &c, "rce: hidden incoming continuation", 2).await;
+    edge(&pool, cl(ca_h2), p, "continues_argument", c.theirs).await;
 
     // 9. atom-atom links of atom_m, and 10. the far atom's parents.
     let aa_h = leveled(&pool, &c, "rce: hidden linked atom", 3).await;
     let aa_m = leveled(&pool, &c, "rce: my linked atom", 3).await;
     edge(&pool, cl(atom_m), aa_h, "supports", c.theirs).await;
     edge(&pool, cl(aa_m), atom_m, "supports", c.mine).await;
+    let aa_h2 = leveled(&pool, &c, "rce: hidden incoming linked atom", 3).await;
+    edge(&pool, cl(aa_h2), atom_m, "supports", c.theirs).await;
     let par_h = leveled(&pool, &c, "rce: hidden far parent", 2).await;
     let par_m = leveled(&pool, &c, "rce: my far parent", 2).await;
     edge(&pool, cl(par_h), aa_m, "decomposes_to", c.theirs).await;
@@ -253,7 +261,9 @@ async fn recall_context_walks_only_edges_the_viewer_can_read(pool: PgPool) {
         "CALIBRATION: corroborators by my edges; got {cor_ids:?}"
     );
     check(
-        !cor_ids.contains(&cor_h) && ctx.corroborates_total_by_paragraph.get(&p) == Some(&2),
+        !cor_ids.contains(&cor_h)
+            && !cor_ids.contains(&cor_h2)
+            && ctx.corroborates_total_by_paragraph.get(&p) == Some(&2),
         "7 corroborates neighbour / total",
     );
     let doi = |id: Uuid| {
