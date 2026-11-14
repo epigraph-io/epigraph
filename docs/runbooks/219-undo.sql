@@ -11,16 +11,16 @@
 -- added.
 --
 -- WHAT IT DOES:
---   * re-states 070's `epigraph_node_tenancy(uuid, text)` and 168's
+--   * re-states 070's `epigraph_node_tenancy(uuid, text)` and 218's
 --     `epigraph_propagate_tenancy()` byte for byte (`CREATE OR REPLACE` keeps
 --     their owner and ACL; never DROP them: a DROP resets the ACL and breaks
 --     every trigger and policy that names them);
 --   * drops `epigraph_step_lineage_executors(uuid)` (nothing in SQL names
 --     it);
 --   * REFUSES, changing nothing, unless both functions hold 219's bodies (or
---     already hold 070's and 168's, a second run). A later migration that
+--     already hold 070's and 218's, a second run). A later migration that
 --     re-stated either one (a merged body) would otherwise be reverted to
---     168's, losing that migration's change: undo that migration first.
+--     218's, losing that migration's change: undo that migration first.
 --
 -- WHAT IT LEAVES:
 --   * every edge 219's section 4 narrowed, and every edge written or re-met
@@ -37,7 +37,7 @@
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 
--- The guard: md5(prosrc) of 219's bodies, or of 070's and 168's (already
+-- The guard: md5(prosrc) of 219's bodies, or of 070's and 218's (already
 -- undone). Anything else was re-stated after 219.
 DO $$
 DECLARE v_node text; v_prop text;
@@ -47,12 +47,12 @@ BEGIN
     SELECT md5(p.prosrc) INTO v_prop FROM pg_catalog.pg_proc p
      WHERE p.oid = 'public.epigraph_propagate_tenancy()'::regprocedure;
     IF (v_node, v_prop) IS DISTINCT FROM ('d08bf867256ced915ba54f65cf620de7',
-                                          '574ca9041faaae85cece692bfb0a79fb')
+                                          'd48f242f2756ae9679d97d111dfda925')
        AND (v_node, v_prop) IS DISTINCT FROM ('8e97895802b7dbb334f92b3c5a4d884a',
-                                              '763b53778fcd779f1f968d38af58b3d7') THEN
+                                              '982ea8801a69cae7baff37e19c08f37f') THEN
         RAISE EXCEPTION '219-undo: epigraph_node_tenancy (prosrc md5 %) or '
                         'epigraph_propagate_tenancy (prosrc md5 %) is neither 219''s body nor '
-                        '070''s / 168''s: a later migration re-stated it. Undo that migration '
+                        '070''s / 218''s: a later migration re-stated it. Undo that migration '
                         'first; nothing was changed', v_node, v_prop
               USING ERRCODE = '55000';
     END IF;
@@ -76,7 +76,7 @@ BEGIN
     END IF;
 END $$;
 
--- 168's body.
+-- 218's body (218 re-stated 168's before 219).
 CREATE OR REPLACE FUNCTION public.epigraph_propagate_tenancy() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
@@ -192,12 +192,35 @@ BEGIN
         END IF;
     END LOOP;
     -- Harvester fragments hang off provenance, not off claim_id.
+    -- 218: a fragment of a changed claim takes the MOST RESTRICTIVE of the
+    -- CHANGED claims that cite it (group before public, a real owner before a
+    -- sentinel, then the lowest owner id); it never moves to a claim this
+    -- statement did not change. When that winner is public, a group fragment
+    -- that another group-private claim still cites is left as it is (owner
+    -- and visibility): publicizing one citer no longer makes the fragment
+    -- public, and does not hand it to the other citer's group either.
     UPDATE public.harvester_fragments f
-       SET owner_group_id = ch.owner_group_id, visibility = ch.visibility
-      FROM public.harvester_claim_provenance p JOIN changed ch ON ch.id = p.claim_id
-     WHERE f.id = p.fragment_id
+       SET owner_group_id = w.owner_group_id, visibility = w.visibility
+      FROM (SELECT DISTINCT ON (p.fragment_id)
+                   p.fragment_id, ch.owner_group_id, ch.visibility
+              FROM public.harvester_claim_provenance p
+              JOIN changed ch ON ch.id = p.claim_id
+             ORDER BY p.fragment_id,
+                      (ch.visibility = 'group') DESC,
+                      (ch.owner_group_id IN (
+                         '00000000-0000-0000-0000-000000000000'::uuid,
+                         '00000000-0000-0000-0000-00000000dead'::uuid)) ASC,
+                      ch.owner_group_id ASC) w
+     WHERE f.id = w.fragment_id
+       AND NOT (w.visibility = 'public'
+                AND f.visibility = 'group'
+                AND EXISTS (SELECT 1
+                              FROM public.harvester_claim_provenance p2
+                              JOIN public.claims c2 ON c2.id = p2.claim_id
+                             WHERE p2.fragment_id = f.id
+                               AND c2.visibility = 'group'))
        AND (f.owner_group_id, f.visibility)
-           IS DISTINCT FROM (ch.owner_group_id, ch.visibility);
+           IS DISTINCT FROM (w.owner_group_id, w.visibility);
     -- Edges are the MEET of their (possibly changed) endpoints, recomputed from
     -- BOTH endpoints (072's header). 122 (OB6): the edges touching the batch
     -- are found by two equi-joins (source side, target side) instead of one OR
