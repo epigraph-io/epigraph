@@ -110,6 +110,18 @@ pub trait LlmProvider: Send + Sync + 'static {
     /// with the same prompt, so existing implementors need no change.
     /// Because a provider may ignore the schema, callers must still validate
     /// every field of the answer.
+    ///
+    /// A forwarding wrapper (an implementor that delegates to an inner
+    /// provider, such as an `Arc` newtype or a recording decorator) must
+    /// override this method and forward it to the inner provider's
+    /// `complete_json_schema`. Without that override the wrapper gets this
+    /// default, and the schema is dropped with no error even when the inner
+    /// provider enforces it.
+    ///
+    /// A downstream subtrait of `LlmProvider` that declares its own method
+    /// named `complete_json_schema` makes method-call syntax ambiguous
+    /// (E0034) wherever both traits are in scope; such a subtrait should be
+    /// removed in favour of this method.
     async fn complete_json_schema(
         &self,
         prompt: &str,
