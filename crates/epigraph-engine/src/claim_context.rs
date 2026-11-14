@@ -408,7 +408,7 @@ async fn primary_parent(
         return Ok(None);
     }
     let expected = expected_parent_level(level);
-    Ok(ClaimContextRepository::first_parent(conn, viewer, root.id, expected.as_deref()).await?)
+    ClaimContextRepository::first_parent(conn, viewer, root.id, expected.as_deref()).await
 }
 
 /// Walk up from `primary` to the level-1 ancestor, filtering every hop by

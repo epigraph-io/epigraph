@@ -118,18 +118,17 @@ pub fn cited_id_tokens(text: &str) -> Vec<String> {
     let bytes_ok = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     for raw in text.split(|c: char| !bytes_ok(c)) {
         let tok = raw.trim_matches('-');
-        let cited = if is_uuid(tok) {
-            Some(tok.to_ascii_lowercase())
-        } else if tok.len() == 8 && tok.chars().all(|c| c.is_ascii_hexdigit()) {
-            Some(tok.to_ascii_lowercase())
-        } else {
-            // A hyphenated run that starts with an 8-hex segment followed by
-            // a non-uuid tail (`30d8b667-fixed`) still cites the prefix.
-            tok.split_once('-').and_then(|(head, _)| {
-                (head.len() == 8 && head.chars().all(|c| c.is_ascii_hexdigit()))
-                    .then(|| head.to_ascii_lowercase())
-            })
-        };
+        let cited =
+            if is_uuid(tok) || (tok.len() == 8 && tok.chars().all(|c| c.is_ascii_hexdigit())) {
+                Some(tok.to_ascii_lowercase())
+            } else {
+                // A hyphenated run that starts with an 8-hex segment followed by
+                // a non-uuid tail (`30d8b667-fixed`) still cites the prefix.
+                tok.split_once('-').and_then(|(head, _)| {
+                    (head.len() == 8 && head.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| head.to_ascii_lowercase())
+                })
+            };
         if let Some(t) = cited {
             if seen.insert(t.clone()) {
                 out.push(t);
