@@ -807,6 +807,51 @@ async fn a_theme_that_fails_is_carried_and_the_night_completes(pool: PgPool) {
     assert_eq!(params["themes"]["carried"], serde_json::json!([c.t1]));
 }
 
+/// The first night after an operator build carries a failing theme too: the
+/// previous run holds skeleton leaves (claims only), and every node of them
+/// is still drawable, so `t1` keeps its levels (both hierarchies, the same
+/// claims in the same leaves) instead of vanishing from the map.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_theme_that_fails_on_the_first_night_keeps_its_skeleton_levels(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let before = levels(&pool, latest(&pool, a_map).await).await;
+    break_t1_and_grow_t2(&pool, &c).await;
+
+    let backend = namer();
+    let summary = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    let carried = r["themes"]["carried"].as_array().unwrap();
+    assert_eq!(carried.len(), 1, "{r:#}");
+    assert_eq!(carried[0]["theme_id"], serde_json::json!(c.t1));
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    let claims_of = |p: &Value| -> BTreeSet<String> {
+        p["nodes"]
+            .as_array()
+            .map(|n| {
+                n.iter()
+                    .filter(|x| x["kind"] == "claim")
+                    .map(|x| x["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut t1_levels = 0;
+    for (k, (theme, payload)) in &before {
+        if *theme != c.t1 {
+            continue;
+        }
+        let (_, now) = after.get(k).expect("a carried level is in the new run");
+        assert_eq!(claims_of(now), claims_of(payload), "{k:?}");
+        parse(now);
+        t1_levels += 1;
+    }
+    assert!(t1_levels >= 8);
+}
+
 /// The carry is a leak control: when theme `t1` fails AND one of its claims
 /// has left team A's map, `t1` is dropped from the run, not carried, and no
 /// stored level of the map names that claim.

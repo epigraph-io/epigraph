@@ -91,10 +91,11 @@ A theme whose update fails (a SQL error inside its savepoint, a tree the
 checks refuse, a leaf document the contract refuses, e.g. a leaf with more
 than 1,024 edges) does not fail the night:
 - **carried**: the previous run's documents of that theme, BOTH hierarchies
-  (so switches resolve), `run_id` rewritten and re-validated, IF every
-  carried leaf re-assembled from the current rows gives the same nodes and
-  edges (a leak control: a claim, agent, evidence row or edge that left the
-  map's audience is never carried);
+  (so switches resolve), `run_id` rewritten and re-validated, IF every node
+  and edge of every carried leaf is still in that leaf re-assembled from the
+  current rows (a subset check, a leak control: a claim, agent, evidence row
+  or edge that left the map's audience is never carried; a skeleton leaf of
+  an operator build carries on the first night);
 - otherwise **dropped** from the run.
 Both are listed per map in the summary with the error text.
 
@@ -151,7 +152,7 @@ results, or let the nightly carry the map.
 | a run over a synthetic multi-team corpus completes; every stored level validates; both hierarchies; switches resolve; leaves carry real nodes, weights, positions and names (fake backend) | `a_night_over_two_teams_stores_real_validated_levels_in_both_hierarchies` |
 | two consecutive runs over unchanged input change nothing (variant: the second night writes NO run, makes 0 model calls, and its built documents equal the stored ones) | `a_second_night_over_unchanged_input_writes_nothing_and_calls_no_model` |
 | a run with new claims touches only the affected groups | `a_new_claim_relays_and_renames_only_its_leaf_and_ancestors` |
-| a drifted theme does not fail the night | `a_theme_that_fails_is_carried_and_the_night_completes`, `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
+| a drifted theme does not fail the night | `a_theme_that_fails_is_carried_and_the_night_completes`, `a_theme_that_fails_on_the_first_night_keeps_its_skeleton_levels`, `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
 | pruning keeps exactly K finished runs | `pruning_keeps_exactly_k_finished_runs_of_that_map_only` |
 | the units pass `systemd-analyze verify` / a syntax test | `atlas_nightly_units::*` |
 | (hand-off) standalone meaning apply cannot hide links | `a_meaning_only_apply_refuses_to_hide_a_links_run` |
@@ -166,6 +167,7 @@ database, then restored (`.mut/`-style script, not committed):
 |---|---|
 | a theme's error propagates (no carry/drop) | `a_theme_that_fails_is_carried_and_the_night_completes`, `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
 | carry without the re-assembly check | `a_failed_theme_with_a_narrowed_claim_is_dropped_not_carried` |
+| carry requires equality, not a subset (the first version) | `a_theme_that_fails_on_the_first_night_keeps_its_skeleton_levels` |
 | naming with no previous names | `a_second_night_over_unchanged_input_writes_nothing_and_calls_no_model`, `a_new_claim_relays_and_renames_only_its_leaf_and_ancestors` (after its call bound was added: the first probe left it green) |
 | layout fill with no previous run | `a_second_night_...` |
 | skip on epochs alone | `a_night_over_two_teams_...`, `a_second_night_...`, `a_new_claim_...`, `a_theme_that_fails_...` |

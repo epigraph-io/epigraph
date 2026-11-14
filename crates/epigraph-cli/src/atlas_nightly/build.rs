@@ -298,10 +298,13 @@ async fn build_theme(
 
 /// The previous run's documents of one theme, carried into this run when
 /// the theme's update failed: both hierarchies (so every switch resolves),
-/// and only if every carried leaf, re-assembled from the rows the map may
-/// draw NOW, has the same nodes and the same edges. That is the leak
-/// control: a claim, agent, evidence row or edge that left the map's
-/// audience is never carried.
+/// and only if every node and every `(source, target, relationship)` of
+/// every carried leaf is still in that leaf re-assembled from the rows the
+/// map may draw NOW. That is the leak control: a claim, agent, evidence row
+/// or edge that left the map's audience is never carried. It is a subset
+/// check, not equality, so the skeleton leaves of an operator build (claims
+/// only, no edges) carry on the first night too; what arrived since is
+/// simply not in the carried levels.
 async fn carry_theme(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -344,8 +347,8 @@ async fn carry_theme(
             .collect();
         let (nodes, edges) = leaf_shape(l);
         ensure!(
-            nodes == fresh_nodes && edges == fresh_edges,
-            "leaf {} changed since the previous run",
+            nodes.is_subset(&fresh_nodes) && edges.is_subset(&fresh_edges),
+            "leaf {} holds a node or an edge the map may no longer draw",
             l.level_id
         );
     }

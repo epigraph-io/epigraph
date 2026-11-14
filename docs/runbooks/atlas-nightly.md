@@ -46,8 +46,9 @@ newer run was published while the night ran; nothing was written) or
 A theme whose update FAILS (for example a leaf past the contract's 1,024
 edges) does not fail the night. It is:
 - **carried**: the previous run's levels of that theme are kept, both
-  hierarchies, when every carried leaf still assembles to the same nodes and
-  edges from what the map may draw now; or
+  hierarchies, when every node and edge of every carried leaf is still in
+  that leaf assembled from what the map may draw now (claims that arrived
+  since are simply missing from it); or
 - **dropped** from the run otherwise (a claim, agent, evidence row or edge
   of it left the map's audience: carrying it would leak it).
 
@@ -71,6 +72,11 @@ atlas_links export --map team:<group> --meaning-from meaning.json --out <dir2>
 python3 scripts/atlas_links_core.py compute --from <dir2> --out links.json
 atlas_links apply --map team:<group> --meaning-from meaning.json --from links.json --apply
 ```
+
+An operator build stores skeleton levels (claim nodes only, placeholder
+positions, no names), and it is served as soon as it is applied: run
+`atlas_nightly --apply --map <map>` right after it, so the map gets real
+leaves, positions and names before anyone browses it.
 
 Rebuild a map the same way whenever its summary keeps listing `unbuilt`,
 `dropped` or `carried` themes, or many `resplit_leaves`: the nightly's
