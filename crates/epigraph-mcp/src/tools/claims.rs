@@ -1708,6 +1708,43 @@ pub async fn update_with_evidence(
     // MIGRATION 114: on a public claim the caller does not own, neither update
     // runs (labels were refused above) and `truth_after` reports the unchanged
     // value. The recombined DS belief is still returned below.
+    // The claim's Beta-Bernoulli track and its DS-vs-Bayesian divergence row
+    // (backlog f50344c0), kept as `POST /frames/:id/evidence` keeps them, by
+    // the same functions: the evidence BBA's mass on TRUE (index 0 of the
+    // binary frame) goes to alpha, the rest of its non-conflict mass to beta,
+    // and the row records this call's BetP against that posterior on the
+    // cache's frame, for `get_divergence`. Every call here stores a new BBA
+    // (an identical `evidence_data` is refused above), so it is always
+    // counted. Both are best-effort, each under its own savepoint: the row is
+    // claim-derived, and a non-owner of a public claim is refused it (and the
+    // Beta write) without losing the evidence.
+    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+        &mut tx,
+        claim_id,
+        Some(epigraph_engine::ds_divergence::beta_increments(
+            &ds.evidence_bba,
+            Some(0),
+        )),
+        "update_with_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+    let frame_version = epigraph_db::FrameRepository::get_by_id(&mut *tx, viewer, ds.frame_id)
+        .await
+        .map_err(internal_error)?
+        .map(|f| f.version);
+    epigraph_engine::ds_divergence::record_divergence(
+        &mut tx,
+        claim_id,
+        ds.frame_id,
+        ds.pignistic_prob,
+        bayesian_posterior,
+        frame_version,
+        "update_with_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+
     let after_truth = if foreign_claim {
         claim.truth_value
     } else {
