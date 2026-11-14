@@ -9,7 +9,7 @@ use crate::common::edges::{decomposes_edge, thesis_derivation_str};
 use crate::common::ids::{atom_id, compound_claim_id, compound_content_hash, content_hash};
 use crate::common::paths::normalize_claim_path;
 use crate::common::plan::{IngestPlan, PlannedClaim, PlannedEdge};
-use crate::document::schema::{DocumentExtraction, Paragraph, SourceType};
+use crate::document::schema::{ByteSpan, DocumentExtraction, Paragraph, SourceType};
 use crate::workflow::builder::{CONTENT_HASH_SCOPE_CANONICAL_NAME, CONTENT_HASH_SCOPE_KEY};
 
 const fn source_type_str(st: &SourceType) -> &'static str {
@@ -175,6 +175,20 @@ fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
     })
 }
 
+/// The [`PlannedClaim::supporting_locator`] of a section or paragraph node:
+/// its extraction path, the section title a reader can find in the source,
+/// and the byte span into `source_text` when the extractor supplied one.
+/// Only a Tier-1 extraction has that span; a Tier-2 locator indexes the
+/// extractor's output, not the source document.
+#[must_use]
+pub fn passage_locator(path: &str, section_title: &str, span: Option<&ByteSpan>) -> String {
+    let mut locator = format!("{path} ({section_title:?})");
+    if let Some(span) = span {
+        locator.push_str(&format!(", bytes {}..{}", span.start, span.end));
+    }
+    locator
+}
+
 /// Tier stamp (§2). Tier 1 (`verbatim_v2`) when the extraction carries
 /// `source_text` (so section/paragraph nodes are byte-exact verbatim spans);
 /// else Tier 2 (`extracted_v2`, e.g. the Python HTML/CNXML emitters).
@@ -225,6 +239,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             evidence_type: None,
             axis: None,
             supporting_text: None,
+            supporting_locator: Some("thesis".to_string()),
             enrichment: serde_json::json!({}),
         });
         Some(id)
@@ -261,6 +276,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             // axis on them would have nothing to place.
             axis: None,
             supporting_text: None,
+            supporting_locator: Some(passage_locator(&section_path, &section.title, None)),
             enrichment: serde_json::json!({}),
         });
 
@@ -272,6 +288,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
 
         for (pi, paragraph) in section.paragraphs.iter().enumerate() {
             let para_path = format!("{section_path}.paragraphs[{pi}]");
+            let para_locator = passage_locator(&para_path, &section.title, paragraph.span.as_ref());
             let para_hash = content_hash(&paragraph.text);
             let para_seed = format!("{doc_title}\u{1f}{para_path}");
             let para_id = compound_claim_id(&para_hash, &para_seed);
@@ -323,6 +340,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                 evidence_type: para_evidence_type.clone(),
                 axis: para_axis,
                 supporting_text: Some(paragraph.text.clone()),
+                supporting_locator: Some(para_locator.clone()),
                 enrichment: enrichment.clone(),
             });
 
@@ -358,6 +376,7 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
                     // that actually reaches a mass function.
                     axis: atom_axes.get(ai).cloned().flatten(),
                     supporting_text: Some(paragraph.text.clone()),
+                    supporting_locator: Some(para_locator.clone()),
                     enrichment: enrichment.clone(),
                 });
 

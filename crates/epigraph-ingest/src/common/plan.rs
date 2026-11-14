@@ -37,6 +37,15 @@ pub struct PlannedClaim {
     /// Declared labeled axis this claim sits on, or `None` for `binary_truth`.
     pub axis: Option<PlannedAxis>,
     pub supporting_text: Option<String>,
+    /// Where this claim's supporting passage sits in the source, e.g.
+    /// `sections[0].paragraphs[2] ("Intro"), bytes 120..340`. The evidence
+    /// writer stores this locator plus a BLAKE3 hash of the passage instead of
+    /// the passage itself unless the source's licence permits retention
+    /// (backlog 8709d128). With a Tier-1 byte span, a reader who holds the
+    /// source can re-derive the quote from it; a Tier-2 locator has no span
+    /// and indexes the extractor's output. `None` for plans with no source
+    /// document (workflows).
+    pub supporting_locator: Option<String>,
     pub enrichment: serde_json::Value,
 }
 

@@ -118,6 +118,28 @@ impl PaperRepository {
         }))
     }
 
+    /// The source licence recorded for a paper (migration 226), or `None`
+    /// when none is recorded or no paper has this id. `None` means "unknown",
+    /// which every caller must treat as all rights reserved. Ingest only READS
+    /// this; it is set by an operator, never from an extraction, so a caller
+    /// cannot declare its own source open-licensed (backlog 8709d128).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor))]
+    pub async fn licence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        paper_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        // Runtime-checked, not `query!`: see `get_or_create`.
+        let licence: Option<Option<String>> =
+            sqlx::query_scalar("SELECT licence FROM papers WHERE id = $1")
+                .bind(paper_id)
+                .fetch_optional(executor)
+                .await?;
+        Ok(licence.flatten())
+    }
+
     /// Returns true if the paper has any outgoing `processed_by` edge whose
     /// `properties.pipeline` matches `pipeline_version`. Used as the
     /// re-ingestion version gate by hierarchical ingestion.
