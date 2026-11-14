@@ -571,7 +571,10 @@ class Workflow(unittest.TestCase):
     def test_shards_run_on_the_planner_runner_only(self):
         self.assertEqual(self.jobs["test-shard"]["runs-on"], "${{ fromJSON(needs.plan.outputs.runs_on) }}")
         # The variable reaches the planner and nothing else: an expression that
-        # read it directly would bypass the fork guard.
+        # read it directly would bypass the fork guard. This pins THIS
+        # workflow only; a fork's PR runs its own edited copy, so the guard is
+        # defence in depth, not the boundary (see ci.yml SELF-HOSTED SHARD
+        # RUNNERS).
         self.assertEqual(self.text.count("vars.SHARD_RUNS_ON"), 1)
         step = [s for s in self.jobs["plan"]["steps"] if s.get("id") == "plan"][0]
         self.assertEqual(step["env"]["SHARD_RUNS_ON"], "${{ vars.SHARD_RUNS_ON }}")
