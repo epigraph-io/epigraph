@@ -1716,6 +1716,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the UPDATE moves; a foreign row would move 0 rows, which the body
     // refuses (VIS06) rather than auditing a change that did not happen.
     ("epigraph_set_agent_default_group", 209),
+    // 212 (backlog f78526ad), the sealed-row vector guards on `claims` and
+    // `evidence`. Both fail OPEN and QUIETLY under a non-member owner: their
+    // only read is of the FORCEd `claim_encryption` / `evidence_encryption`,
+    // which 077's policy then filters exactly as the writing session's own
+    // read would, so a sealed row whose group the owner cannot see reads as
+    // unsealed and its vector is admitted with no error. The owner is the
+    // control here.
+    ("epigraph_refuse_sealed_claim_vector", 212),
+    ("epigraph_refuse_sealed_evidence_vector", 212),
     // 207, the bug-report intake. The write fails LOUD under a non-member
     // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
     // `evidence` are refused by their WITH CHECK (the owner no longer passes
