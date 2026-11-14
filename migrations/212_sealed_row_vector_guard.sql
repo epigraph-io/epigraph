@@ -83,6 +83,13 @@
 --
 -- Idempotent: CREATE OR REPLACE FUNCTION, DROP TRIGGER IF EXISTS before each
 -- CREATE TRIGGER. Undo: docs/runbooks/212-undo.sql.
+--
+-- Lock: CREATE TRIGGER takes SHARE ROW EXCLUSIVE on `claims` and `evidence`.
+-- Behind a long open write transaction on either table it would queue, and
+-- every later write to that table would queue behind it. The timeout makes it
+-- fail fast instead (as 197 does); re-run the migration when the table is
+-- quiet.
+SET LOCAL lock_timeout = '3s';
 
 CREATE OR REPLACE FUNCTION public.epigraph_refuse_sealed_claim_vector()
 RETURNS trigger

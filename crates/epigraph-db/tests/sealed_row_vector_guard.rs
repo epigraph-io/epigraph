@@ -258,3 +258,33 @@ async fn the_212_undo_removes_both_guards_and_is_idempotent(pool: PgPool) {
         "after the undo the bare write lands again"
     );
 }
+
+/// 212 takes SHARE ROW EXCLUSIVE on `claims` and `evidence` (CREATE TRIGGER).
+/// Behind a long open write transaction it must fail fast rather than queue
+/// every later write to those tables behind it, so the file sets a
+/// transaction-local `lock_timeout` (197's form) before its first CREATE
+/// TRIGGER. Static: the migration text, comments stripped.
+#[test]
+fn the_212_migration_sets_a_lock_timeout_before_it_creates_a_trigger() {
+    let raw = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../migrations/212_sealed_row_vector_guard.sql"),
+    )
+    .expect("read migration 212");
+    let sql: String = raw
+        .lines()
+        .map(|l| l.split("--").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    let timeout = sql
+        .find("set local lock_timeout")
+        .expect("212 sets no transaction-local lock_timeout");
+    let trigger = sql
+        .find("create trigger")
+        .expect("CALIBRATION: 212 creates a trigger");
+    assert!(
+        timeout < trigger,
+        "212's lock_timeout must be set before its first CREATE TRIGGER"
+    );
+}
