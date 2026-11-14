@@ -426,7 +426,10 @@ async fn every_rendering_primitive_names_only_what_the_reader_can_read_under_the
     let (scoped, bypass) = fixture::bypass(&pool).await;
     let _ = &scoped;
     let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
-    let mut mconn = maint.acquire().await.expect("acquire maintenance connection");
+    let mut mconn = maint
+        .acquire()
+        .await
+        .expect("acquire maintenance connection");
     let seeds = vec![readable, unreadable];
     let edge_types = vec!["derived_from".to_string()];
     let selection = PrivatizationRepository::select(

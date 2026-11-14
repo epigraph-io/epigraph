@@ -506,7 +506,10 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
             .await
             .unwrap_or_else(|e| panic!("{who}: the item page must be served: {e:?}"));
             let page_wire = wire(&page);
-            assert_names_none(&format!("{who}: GET /plans/:id/items page {pages}"), &page_wire);
+            assert_names_none(
+                &format!("{who}: GET /plans/:id/items page {pages}"),
+                &page_wire,
+            );
             named_readable |= page.items.iter().any(|i| i.id == readable);
             counted += page.not_visible_to_actor;
             match page.next_cursor {
@@ -532,7 +535,10 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
         )
         .await
         .unwrap_or_else(|e| panic!("{who}: GET /plans/:id must be served: {e:?}"));
-        assert_eq!(summary.item_count, 2, "{who}: the summary COUNTS both items");
+        assert_eq!(
+            summary.item_count, 2,
+            "{who}: the summary COUNTS both items"
+        );
         assert_names_none(&format!("{who}: GET /plans/:id"), &wire(&summary));
 
         let Json(listed) = list_plans(

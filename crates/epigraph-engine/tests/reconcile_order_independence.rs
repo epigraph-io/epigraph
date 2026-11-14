@@ -129,7 +129,11 @@ fn input() -> impl Strategy<Value = Input> {
                 above.extend(below);
                 Input {
                     obstructions: above,
-                    intervals: ivs.into_iter().enumerate().map(|(i, iv)| (node(i), iv)).collect(),
+                    intervals: ivs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, iv)| (node(i), iv))
+                        .collect(),
                     factors,
                 }
             })
