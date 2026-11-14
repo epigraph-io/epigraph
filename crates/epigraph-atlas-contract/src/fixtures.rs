@@ -556,6 +556,40 @@ pub fn public_leaf() -> LevelDocument {
     LevelDocument::Leaf(leaf_level(&mut rng, f, (45, 5, 10), 3, 10, ClaimValues::AS_DRAWN).0)
 }
 
+/// A team leaf in which most evidence carries no mass the map's audience can
+/// read, the common case: every evidence-to-claim edge is served `none`
+/// (weight 0, sign 0, its relationship kept) except those of every fourth
+/// evidence node, which keep their exact stored mass. So the leaf has
+/// evidence attached to its claims only through `none` edges, `none` edges
+/// that `supports` and that `refutes` (sign 0 for both: the direction is in
+/// the relationship), and some `exact` evidence beside them.
+///
+/// Built from the same generator as the other leaves, then rewritten, so
+/// the other fixtures and their draws are untouched.
+pub fn team_leaf_sparse_mass() -> LevelDocument {
+    let mut rng = Rng::new(0xA71A_5006);
+    let f = frame(&mut rng, MapScope::Team, Hierarchy::Meaning, 4);
+    let (mut leaf, _) = leaf_level(&mut rng, f, (40, 6, 16), 3, 8, ClaimValues::AS_DRAWN);
+    let evidence: Vec<Uuid> = leaf
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Evidence(e) => Some(e.id),
+            _ => None,
+        })
+        .collect();
+    for e in &mut leaf.edges {
+        if let Some(i) = evidence.iter().position(|id| *id == e.source) {
+            if i % 4 != 0 {
+                e.sign = 0;
+                e.flow_weight = 0.0;
+                e.flow_basis = FlowBasis::None;
+            }
+        }
+    }
+    LevelDocument::Leaf(leaf)
+}
+
 /// A leaf built the way the committed leaf fixtures are, from any seed, with
 /// `vary` applied to every claim's drawn values, and each claim's belief (in
 /// claim order), which the leaf does not carry. For the contract's own tests
@@ -601,6 +635,7 @@ pub fn level_fixtures() -> Vec<(&'static str, LevelDocument)> {
         ("team_group_deep", team_group_deep()),
         ("team_leaf_dense", team_leaf_dense()),
         ("public_leaf", public_leaf()),
+        ("team_leaf_sparse_mass", team_leaf_sparse_mass()),
     ]
 }
 

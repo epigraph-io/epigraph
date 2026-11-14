@@ -133,12 +133,29 @@ pub enum ChildKind {
     Leaf,
 }
 
-/// Where an edge's `flow_weight` comes from. The endpoint kinds fix it, so a
-/// producer cannot leave out a belief flow by marking the edge `none`.
+/// Where an edge's `flow_weight` comes from. The endpoint kinds limit it:
+/// claim to claim is always `proxy`, evidence to claim is `exact` or `none`,
+/// and every other pair is `none` ([`FlowBasis::allows`]). So a producer
+/// cannot leave out a claim-to-claim flow by marking the edge `none`.
+///
+/// An evidence-to-claim edge is `none` when it carries no mass the map's
+/// audience can read: either that audience can read no mass row keyed by
+/// that evidence on that claim (most stored evidence edges have none, so
+/// this is the common case, not an error), or its relationship carries no
+/// belief direction (anything but `supports` or `refutes`, compared
+/// lower-cased). The contract cannot tell such an edge from one whose
+/// builder dropped a readable mass; the builder (backlog W7) carries that
+/// invariant and its known-mass test.
+///
+/// A `none` edge has sign 0 whatever its relationship, so a `refutes` edge
+/// with no readable mass is served with sign 0, like a `supports` one. A
+/// reader that wants the direction of such evidence takes it from
+/// [`Edge::relationship`], not from [`Edge::sign`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
-    /// Evidence to claim, always: the stored mass.
+    /// Evidence to claim with a mass row the map's audience can read: the
+    /// stored mass.
     Exact,
     /// Claim to claim, always: the link's strength times its sign, and
     /// nothing else, which the view labels an estimate. With the sign in
@@ -156,19 +173,35 @@ pub enum FlowBasis {
     /// sign 0 and so weight 0; validation rejects a proxy edge with sign 0
     /// and any other weight.
     Proxy,
-    /// Every other pair of kinds (an agent's authorship, for example): no
-    /// belief flow, so weight 0 and sign 0.
+    /// No belief flow, so weight 0 and sign 0 whatever the relationship:
+    /// every pair of kinds other than claim to claim and evidence to claim
+    /// (an agent's authorship, for example), and an evidence-to-claim edge
+    /// with no readable mass or with a relationship that carries no belief
+    /// direction. Such an evidence node still counts as attached to the
+    /// claim. A `refutes` evidence edge served `none` keeps its direction
+    /// only in its relationship name.
     None,
 }
 
 impl FlowBasis {
-    /// The basis an edge between these node kinds must carry.
+    /// The basis an edge between these node kinds carries when belief flows
+    /// along it: `exact` from evidence to a claim, `proxy` between claims,
+    /// `none` otherwise. An evidence-to-claim edge with no readable mass is
+    /// `none` instead; [`FlowBasis::allows`] is the rule a document must meet.
     pub fn for_kinds(source: NodeKind, target: NodeKind) -> Self {
         match (source, target) {
             (NodeKind::Evidence, NodeKind::Claim) => FlowBasis::Exact,
             (NodeKind::Claim, NodeKind::Claim) => FlowBasis::Proxy,
             _ => FlowBasis::None,
         }
+    }
+
+    /// Whether an edge between these node kinds may carry this basis: the
+    /// one [`FlowBasis::for_kinds`] gives, or `none` from evidence to a claim.
+    pub fn allows(self, source: NodeKind, target: NodeKind) -> bool {
+        self == FlowBasis::for_kinds(source, target)
+            || (self == FlowBasis::None
+                && (source, target) == (NodeKind::Evidence, NodeKind::Claim))
     }
 }
 
@@ -306,18 +339,21 @@ impl Node {
 
 /// A link between two nodes of a leaf, pointing the way belief flows.
 ///
-/// **Only edge rows the map's audience can read** (backlog W8): an edge row
-/// has its own visibility and owner and co-owner groups, apart from its
-/// endpoints. The public map draws public rows only. A team map draws public
-/// rows and the rows that team owns or co-owns, so a row co-owned by two
-/// teams is drawn on both teams' maps. Two readable endpoints do not make a
-/// row readable, and a served edge carries no row id or visibility, so
+/// **Only edge rows the map's whole audience can read** (backlog W8): an
+/// edge row has its own visibility and owner and co-owner groups, apart from
+/// its endpoints. The public map draws public rows only. A team map draws
+/// public rows and the rows that team owns with no co-owner. A co-owned row
+/// is readable only by members of both groups, so it is never drawn on a
+/// single team's map (a joint view for such viewers is later work). Two
+/// readable endpoints do not make a row readable, and a served edge carries no row id or visibility, so
 /// [`LevelDocument::for_viewer`] cannot check this: the builder must.
 ///
 /// The `edges` table keeps one row per submission (migration 018 dropped
 /// its triple-uniqueness), so one (source, target, relationship) can have
-/// several rows. After the audience filter above, the builder collapses
-/// them into one edge with the largest `flow_weight` among them: a
+/// several rows, and the table spells one relationship in both casings
+/// (`SUPPORTS` and `supports`). After the audience filter above, the builder
+/// collapses the rows that share a source, a target and a lower-cased
+/// relationship into one edge with the largest `flow_weight` among them: a
 /// resubmission is not more support. Filtering first matters: otherwise an
 /// unreadable row's larger weight would win the collapse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -325,10 +361,17 @@ impl Node {
 pub struct Edge {
     pub source: Uuid,
     pub target: Uuid,
-    /// The stored relationship name, unnormalised: both `AUTHORED` and
-    /// `authored` are in use, so the view compares names case-insensitively.
+    /// The relationship name, lower-cased by the builder: the `edges` table
+    /// spells names in both casings (`AUTHORED` and `authored`), and the
+    /// builder serves the lower-cased stored name. The name pattern still
+    /// admits upper case (some fixtures keep it on purpose), so a reader
+    /// compares names case-insensitively.
     pub relationship: String,
-    /// 1 supporting, -1 opposing, 0 no belief direction.
+    /// The direction of the belief that flows along the edge: 1 supporting,
+    /// -1 opposing, 0 none. An edge whose `flow_basis` is `none` carries no
+    /// flow and so has sign 0 whatever its relationship: evidence that
+    /// `refutes` a claim but has no readable mass is served with sign 0, and
+    /// a reader takes its direction from `relationship`.
     pub sign: i8,
     /// In [0, 1].
     pub flow_weight: f64,
@@ -439,7 +482,8 @@ pub fn gzip_len(bytes: &[u8]) -> usize {
 
 /// Whether `s` is a relationship name the contract accepts: an ASCII letter,
 /// then letters, digits or `_`, at most [`MAX_RELATIONSHIP_CHARS`] long.
-/// Both casings are in use (`AUTHORED`, `authored`).
+/// Either casing passes: builders serve names lower-cased, and the pattern
+/// still admits the stored upper-case spellings (`AUTHORED`).
 pub fn is_relationship_name(s: &str) -> bool {
     s.len() <= MAX_RELATIONSHIP_CHARS
         && s.starts_with(|c: char| c.is_ascii_alphabetic())
@@ -824,13 +868,20 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
         check_sign(&format!("{p}/sign"), e.sign, v);
         check_unit(&format!("{p}/flow_weight"), e.flow_weight, v);
         if let (Some(s), Some(t)) = (src, dst) {
-            let want = FlowBasis::for_kinds(s, t);
-            if e.flow_basis != want {
+            if !e.flow_basis.allows(s, t) {
+                let want = FlowBasis::for_kinds(s, t);
+                let or_none = if want != FlowBasis::None && FlowBasis::None.allows(s, t) {
+                    " or None"
+                } else {
+                    ""
+                };
                 v.push(format!(
-                    "{p}/flow_basis: an edge from {s:?} to {t:?} has basis {want:?}, not {:?}",
+                    "{p}/flow_basis: an edge from {s:?} to {t:?} has basis {want:?}{or_none}, not {:?}",
                     e.flow_basis
                 ));
             }
+            // Any edge to a claim attaches its other end, whatever its
+            // basis: evidence with no readable mass (`none`) included.
             if s == NodeKind::Claim || t == NodeKind::Claim {
                 anchored.insert(e.source);
                 anchored.insert(e.target);
