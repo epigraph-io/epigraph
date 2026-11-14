@@ -26,6 +26,12 @@
 //! * another submitter (or a value that is not one): HELD, unless
 //!   `--force-reassign`, which REASSIGNS it.
 //!
+//! Each line also prints whether the row is its lineage's head
+//! (`WorkflowRepository::head_by_canonical`), its owner group and its
+//! visibility. Authority over a lineage follows the HEAD's submitter, so a
+//! run that writes a lineage's rows but not its head prints a `WARN` line
+//! naming the head: that write does not change who may act on the lineage.
+//!
 //! # The run
 //!
 //! A dry run by default: it prints the classification and writes nothing.
@@ -166,6 +172,12 @@ struct Row {
     canonical_name: String,
     generation: i32,
     metadata: Value,
+    owner_group: Option<Uuid>,
+    visibility: Option<String>,
+    /// The lineage's head as `WorkflowRepository::head_by_canonical` picks
+    /// it (latest generation): the row whose submitter decides authority
+    /// over the lineage.
+    head_id: Uuid,
 }
 
 impl Row {
@@ -209,24 +221,31 @@ fn prior_json(row: &Row) -> Value {
     }
 }
 
+type RowTuple = (Uuid, String, i32, Value, Option<Uuid>, Option<String>, Uuid);
+
 async fn lock_rows(conn: &mut PgConnection, sel: &Selection) -> anyhow::Result<Vec<Row>> {
-    let base = "SELECT id, canonical_name, generation, metadata FROM workflows WHERE ";
-    let order = " ORDER BY canonical_name, generation, id FOR UPDATE";
-    let rows: Vec<(Uuid, String, i32, Value)> = match sel {
-        Selection::Ids(ids) => sqlx::query_as(&format!("{base}id = ANY($1){order}"))
+    // `head_id` mirrors `WorkflowRepository::head_by_canonical`.
+    let base = "SELECT w.id, w.canonical_name, w.generation, w.metadata, w.owner_group_id, \
+                       w.visibility, \
+                       (SELECT h.id FROM workflows h WHERE h.canonical_name = w.canonical_name \
+                         ORDER BY h.generation DESC LIMIT 1) AS head_id \
+                  FROM workflows w WHERE ";
+    let order = " ORDER BY w.canonical_name, w.generation, w.id FOR UPDATE OF w";
+    let rows: Vec<RowTuple> = match sel {
+        Selection::Ids(ids) => sqlx::query_as(&format!("{base}w.id = ANY($1){order}"))
             .bind(ids)
             .fetch_all(&mut *conn)
             .await
             .context("locking the listed workflows")?,
         Selection::CanonicalNames(names) => {
-            sqlx::query_as(&format!("{base}canonical_name = ANY($1){order}"))
+            sqlx::query_as(&format!("{base}w.canonical_name = ANY($1){order}"))
                 .bind(names)
                 .fetch_all(&mut *conn)
                 .await
                 .context("locking the listed lineages")?
         }
         Selection::WithoutSubmitter => sqlx::query_as(&format!(
-            "{base}NOT (jsonb_typeof(metadata) = 'object' AND metadata ? $1){order}"
+            "{base}NOT (jsonb_typeof(w.metadata) = 'object' AND w.metadata ? $1){order}"
         ))
         .bind(WorkflowRepository::SUBMITTER_KEY)
         .fetch_all(&mut *conn)
@@ -235,12 +254,17 @@ async fn lock_rows(conn: &mut PgConnection, sel: &Selection) -> anyhow::Result<V
     };
     Ok(rows
         .into_iter()
-        .map(|(id, canonical_name, generation, metadata)| Row {
-            id,
-            canonical_name,
-            generation,
-            metadata,
-        })
+        .map(
+            |(id, canonical_name, generation, metadata, owner_group, visibility, head_id)| Row {
+                id,
+                canonical_name,
+                generation,
+                metadata,
+                owner_group,
+                visibility,
+                head_id,
+            },
+        )
         .collect())
 }
 
@@ -383,10 +407,15 @@ pub async fn run(
         };
         writeln!(
             out,
-            "{tag}\tworkflow={}\tcanonical_name={}\tgeneration={}\tsubmitter={prior}{}",
+            "{tag}\tworkflow={}\tcanonical_name={}\tgeneration={}\tsubmitter={prior}\t\
+             head={}\towner_group={}\tvisibility={}{}",
             r.id,
             r.canonical_name,
             r.generation,
+            if r.id == r.head_id { "yes" } else { "no" },
+            r.owner_group
+                .map_or_else(|| "none".to_string(), |g| g.to_string()),
+            r.visibility.as_deref().unwrap_or("none"),
             if class == Class::Held {
                 "\t(another submitter is recorded; --force-reassign replaces it)"
             } else {
@@ -404,6 +433,21 @@ pub async fn run(
         }
     }
     report.eligible = to_write.len();
+    // Authority over a lineage follows its HEAD's submitter, so a write that
+    // leaves the head alone does not change who may act on the lineage.
+    let written_ids: BTreeSet<Uuid> = to_write.iter().map(|r| r.id).collect();
+    let mut warned = BTreeSet::new();
+    for r in &to_write {
+        if !written_ids.contains(&r.head_id) && warned.insert(r.canonical_name.as_str()) {
+            writeln!(
+                out,
+                "WARN\tcanonical_name={}\thead={}\t(the lineage head is not written by this \
+                 run; authority over the lineage follows the head's submitter, which this run \
+                 leaves as it is)",
+                r.canonical_name, r.head_id
+            )?;
+        }
+    }
     writeln!(
         out,
         "ELIGIBLE-WORKFLOW-ROWS\t{}\nREASSIGN-COUNT\t{}\nALREADY-COUNT\t{}\nHELD-COUNT\t{}\n\
@@ -766,6 +810,9 @@ mod tests {
             canonical_name: "c".into(),
             generation: 0,
             metadata: md,
+            owner_group: None,
+            visibility: None,
+            head_id: Uuid::nil(),
         }
     }
 

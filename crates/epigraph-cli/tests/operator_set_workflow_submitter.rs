@@ -522,3 +522,63 @@ fn both_verbs_keep_their_own_help_description() {
         "set-workflow-submitter's help opens with {first:?}"
     );
 }
+
+/// Authority over a lineage follows its head's submitter: selecting a
+/// non-head generation alone says so per row (`head=no`, its owner group and
+/// visibility) and WARNs naming the head; selecting the head too does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_head_row_selected_alone_warns_naming_the_head(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (login, dsn) = maintenance_login(&pool).await;
+    let dir = scratch_dir();
+    let (s, op) = (fx.submitter.to_string(), fx.operator.to_string());
+    // alpha: gen 0 = w_empty (group-private), gen 1 = w_null (the head).
+    let gen0 = lines_file(&dir, "gen0.txt", &[fx.w_empty.to_string()]);
+    let alone = run_with(
+        &set_args(&["--ids-file", gen0.to_str().unwrap()], &s, &op, &[]),
+        &dsn,
+    );
+    assert_eq!(alone.code, 0, "{}", alone.show());
+    let line = alone
+        .stdout
+        .lines()
+        .find(|l| l.starts_with(&format!("WRITE\tworkflow={}", fx.w_empty)))
+        .unwrap_or_else(|| panic!("no WRITE line: {}", alone.show()));
+    assert!(
+        line.contains("\thead=no\t") && line.contains("\tvisibility=group"),
+        "{line}"
+    );
+    assert!(
+        alone
+            .stdout
+            .contains(&format!("WARN\tcanonical_name=alpha\thead={}", fx.w_null)),
+        "{}",
+        alone.show()
+    );
+    let both = lines_file(
+        &dir,
+        "both.txt",
+        &[fx.w_empty.to_string(), fx.w_null.to_string()],
+    );
+    let with_head = run_with(
+        &set_args(&["--ids-file", both.to_str().unwrap()], &s, &op, &[]),
+        &dsn,
+    );
+    assert_eq!(with_head.code, 0, "{}", with_head.show());
+    assert!(
+        with_head
+            .stdout
+            .contains(&format!("WRITE\tworkflow={}", fx.w_null))
+            && !with_head.stdout.contains("WARN\t"),
+        "{}",
+        with_head.show()
+    );
+    assert!(
+        with_head.stdout.lines().any(|l| l
+            .starts_with(&format!("WRITE\tworkflow={}", fx.w_null))
+            && l.contains("\thead=yes\t")),
+        "{}",
+        with_head.show()
+    );
+    drop_login(&pool, &login).await;
+}
