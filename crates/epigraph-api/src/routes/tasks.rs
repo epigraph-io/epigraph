@@ -106,9 +106,12 @@ pub async fn create_task(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     let now = Utc::now();
     let row = TaskRow {
@@ -276,9 +279,12 @@ pub async fn assign_task(
     Path(id): Path<Uuid>,
     Json(request): Json<AssignTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     // Verify task exists
     let _ = TaskRepository::get_by_id(&state.db_pool, id)
@@ -325,9 +331,12 @@ pub async fn complete_task(
     Path(id): Path<Uuid>,
     Json(request): Json<CompleteTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     // Verify task exists
     let _ = TaskRepository::get_by_id(&state.db_pool, id)
@@ -374,9 +383,12 @@ pub async fn fail_task(
     Path(id): Path<Uuid>,
     Json(request): Json<FailTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     // Verify task exists
     let _ = TaskRepository::get_by_id(&state.db_pool, id)

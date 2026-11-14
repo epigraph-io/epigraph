@@ -184,10 +184,13 @@ pub async fn create_agent(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateAgentRequest>,
 ) -> Result<Json<AgentResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = &auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-    }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = &auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
 
     let public_key = parse_public_key(&request.public_key)?;
     // Migration 148: the legacy public-constant key of a system role names a
@@ -783,15 +786,18 @@ pub async fn update_agent(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateAgentRequest>,
 ) -> Result<Json<AgentResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        // Caller must be the target agent OR have claims:admin
-        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
-            return Err(ApiError::Forbidden {
-                reason: "can only mutate your own agent record".into(),
-            });
-        }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+    // Caller must be the target agent OR have claims:admin
+    if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
+        return Err(ApiError::Forbidden {
+            reason: "can only mutate your own agent record".into(),
+        });
     }
 
     let agent_id = AgentId::from_uuid(id);
