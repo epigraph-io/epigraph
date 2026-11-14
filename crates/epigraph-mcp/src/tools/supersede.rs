@@ -100,12 +100,32 @@ pub async fn supersede_claim(
         }
         (None, status) => (status, CascadeReport::default()),
     };
+    // The maintenance connection goes back to its pool BEFORE the provider
+    // round trip below: an embedding call must not hold a pooled connection.
+    drop(session);
+
+    // The replacement is a new CURRENT claim, so it is embedded post-commit,
+    // best-effort (CLAUDE.md's write-path rule; backlog 7628ab2c): without a
+    // vector it is invisible to recall. Stored on a connection stamped as
+    // `actor`, the principal whose transaction just INSERTed the row (and so
+    // provably writes its owner group), not the inherited author, who may no
+    // longer write the group the claim lives in.
+    let embedded = crate::claim_helper::embed_claim_author_stamped(
+        server,
+        actor,
+        new_id,
+        &params.content,
+        None,
+        "supersede_claim",
+    )
+    .await;
 
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
             "reason": params.reason,
+            "embedded": embedded,
             "cascade": cascade,
             "belief_cascade": belief_cascade,
         }))

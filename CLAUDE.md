@@ -215,10 +215,13 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
 - **MCP `improve_workflow_hierarchy`** — embeds executor output (claims) AND calls `set_goal_embedding` for the new `workflows` row; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
+- **MCP `supersede_claim`** — embeds the replacement post-commit, on the stamp of the principal that wrote it (`actor`), not the inherited author, who may not write the claim's group; `crates/epigraph-mcp/src/tools/supersede.rs::supersede_claim` (backlog 7628ab2c)
+- **MCP `evolve_step`** — embeds the new step (`supersedes` and `revises` alike) post-commit, through its author; `crates/epigraph-mcp/src/tools/evolve_step.rs::evolve_step`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
+- **HTTP `POST /api/v1/claims/:id/supersede`** and **`POST /api/v1/workflows/steps/:id/evolve`** — embed the replacement / new step post-commit on the caller's stamp through `AppState::embed_committed_claim_as`; `routes/versioning.rs::supersede_claim`, `routes/workflows.rs::evolve_step`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format `[v,v,...]`, bind as `$N::vector`)

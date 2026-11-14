@@ -139,6 +139,11 @@ pub struct SupersessionResponse {
     pub version: u32,
     /// When the new claim was created
     pub created_at: DateTime<Utc>,
+    /// Whether the replacement got its embedding (best-effort; the
+    /// maintenance backfill reaches it otherwise). `#[serde(default)]` so
+    /// older payloads still deserialize.
+    #[serde(default)]
+    pub embedded: bool,
     /// The administrative cascade that follows the supersession (migration
     /// 117): `status` is `applied`, `deferred` (no maintenance connection; the
     /// supersession itself committed) or `failed`, with its `security_events`
@@ -531,6 +536,17 @@ pub async fn supersede_claim(
         }
         (None, status) => (status, Default::default()),
     };
+    // The maintenance connection goes back to its pool BEFORE the provider
+    // round trip below.
+    drop(session);
+
+    // 9c. The replacement is a new CURRENT claim, so it is embedded
+    // post-commit, best-effort (CLAUDE.md's write-path rule; backlog
+    // 7628ab2c): without a vector it is invisible to recall. On the caller's
+    // stamp, the one that just INSERTed the row.
+    let embedded = state
+        .embed_committed_claim_as(&viewer, new_uuid, &request.content, "supersede_claim.embed")
+        .await;
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
     //
@@ -581,6 +597,7 @@ pub async fn supersede_claim(
             new_truth_value: request.truth_value,
             version: 0, // version counting now handled by DB chain walk
             created_at: now,
+            embedded,
             cascade,
             belief_cascade,
         }),
