@@ -2249,6 +2249,13 @@ pub struct IngestDocumentSpineResponse {
     pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
+    /// How many of the nodes this call created had their embedding QUEUED, to
+    /// be stored after this response, best-effort: 0 when this server has no
+    /// embedding provider. Not a count of stored vectors, which this response
+    /// cannot know (backlog fdacc14f).
+    pub paragraphs_embedding_queued: usize,
+    /// DEPRECATED alias of `paragraphs_embedding_queued`, kept for existing
+    /// readers. Despite its name it was never a count of stored vectors.
     pub paragraphs_embedded: usize,
     /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
     /// as new in this ingest. Atomize exactly these paragraphs, then call
@@ -2581,6 +2588,13 @@ pub struct IngestDocumentResponse {
     /// `authors[].pending_ingested_by`).
     pub ingested_by: String,
     pub claims_ingested: usize,
+    /// How many of the claims this call created had their embedding QUEUED, to
+    /// be stored after this response, best-effort: 0 when this server has no
+    /// embedding provider. Not a count of stored vectors, which this response
+    /// cannot know (backlog fdacc14f).
+    pub claims_embedding_queued: usize,
+    /// DEPRECATED alias of `claims_embedding_queued`, kept for existing
+    /// readers. Despite its name it was never a count of stored vectors.
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
     pub relationships_created: usize,

@@ -1775,10 +1775,10 @@ pub async fn do_ingest_document_reporting(
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
-    // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
-    // invariant (every is_current claim has an embedding) is satisfied eventually.
-    let queued = embed_queue.len();
-    spawn_created_claim_embeds(
+    // by N × ~0.8 s OpenAI calls. The response reports the number QUEUED (0 when
+    // this server has no embedding provider), never a number stored: nothing has
+    // been stored when it is built. The task logs stored against queued.
+    let queued = spawn_created_claim_embeds(
         server,
         agent_id,
         resolution.grant(),
@@ -1803,6 +1803,7 @@ pub async fn do_ingest_document_reporting(
         authors: author_responses,
         ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
+        claims_embedding_queued: queued,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
         relationships_created,
@@ -1829,21 +1830,38 @@ pub async fn do_ingest_document_reporting(
 ///
 /// The queue holds only claims this walk created (a converged claim is skipped
 /// before it is queued), so every row in it is the author's to write.
+///
+/// Returns how many embeddings were QUEUED (backlog fdacc14f): 0 when the queue
+/// is empty or this server has no embedding provider
+/// (`McpEmbedder::embeddings_disabled`), in which case no task is spawned,
+/// because every provider call would fail. The task logs how many it stored
+/// against how many were queued when it finishes.
 fn spawn_created_claim_embeds(
     server: &EpiGraphMcpFull,
     author: Uuid,
     grant: Option<&epigraph_db::TeamWriteGrant>,
     queue: Vec<(Uuid, String)>,
     tool_name: &'static str,
-) {
+) -> usize {
     if queue.is_empty() {
-        return;
+        return 0;
     }
+    if server.embedder.embeddings_disabled() {
+        tracing::warn!(
+            tool = tool_name,
+            claims = queue.len(),
+            "embeddings are disabled on this server (no provider key), so the claims this \
+             ingest created carry no vector until the maintenance backfill reaches them"
+        );
+        return 0;
+    }
+    let queued = queue.len();
     // A clone shares the parent's pools and tracker; the grant is owned for
     // the same `'static` reason.
     let bg = server.clone();
     let grant = grant.cloned();
     server.background_tasks().spawn(async move {
+        let mut stored = 0usize;
         for (id, content) in queue {
             let pgvec = match bg.embedder.generate(&content).await {
                 Ok(v) => crate::embed::format_pgvector(&v),
@@ -1859,7 +1877,7 @@ fn spawn_created_claim_embeds(
             match store_created_claim_vector(&bg, author, grant.as_ref(), id, &pgvec, tool_name)
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => stored += 1,
                 Ok(false) => tracing::warn!(
                     claim_id = %id,
                     tool = tool_name,
@@ -1874,7 +1892,24 @@ fn spawn_created_claim_embeds(
                 ),
             }
         }
+        if stored == queued {
+            tracing::info!(
+                tool = tool_name,
+                stored,
+                queued,
+                "background embedding done"
+            );
+        } else {
+            tracing::warn!(
+                tool = tool_name,
+                stored,
+                queued,
+                "background embedding stored fewer vectors than it queued; the rest carry no \
+                 vector until the maintenance backfill reaches them"
+            );
+        }
     });
+    queued
 }
 
 /// Store one created claim's vector as its author, with `grant`; on a server
@@ -2791,9 +2826,9 @@ pub async fn do_ingest_document_spine(
         crate::errors::internal_error_logged("ingest_document_spine: could not commit", e)
     })?;
 
-    // ── 6. Detach embeddings ──
-    let queued = embed_queue.len();
-    spawn_created_claim_embeds(
+    // ── 6. Detach embeddings (the response reports the number queued; see step 8
+    // of `do_ingest_document_reporting`) ──
+    let queued = spawn_created_claim_embeds(
         server,
         agent_id,
         resolution.grant(),
@@ -2810,6 +2845,7 @@ pub async fn do_ingest_document_spine(
         ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
+        paragraphs_embedding_queued: queued,
         paragraphs_embedded: queued,
         new_paragraph_paths,
         converged_claims_unlabelled: converged_unlabelled,

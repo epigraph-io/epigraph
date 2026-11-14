@@ -55,6 +55,12 @@ use uuid::Uuid;
 
 /// An app-role stdio server whose embedder stores a fixed vector for any text.
 async fn app_role_server(pool: &PgPool, seed: u8) -> EpiGraphMcpFull {
+    app_role_server_with(pool, seed, true).await
+}
+
+/// [`app_role_server`], or with no embedding provider at all (`provider:
+/// false`: no key and no generator, so `embeddings_disabled()` is true).
+async fn app_role_server_with(pool: &PgPool, seed: u8, provider: bool) -> EpiGraphMcpFull {
     let url = fixture::database_url_for(pool).await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
@@ -62,9 +68,13 @@ async fn app_role_server(pool: &PgPool, seed: u8) -> EpiGraphMcpFull {
             .expect("app-role ScopedPool");
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
     let signer = epigraph_crypto::AgentSigner::from_bytes(&[seed; 32]).expect("signer");
-    let embedder = epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None)
-        .with_scoped_pool(scoped.clone())
-        .with_generator(Arc::new(|_text: &str| Ok(vec![0.01_f32; 1536])));
+    let embedder =
+        epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
+    let embedder = if provider {
+        embedder.with_generator(Arc::new(|_text: &str| Ok(vec![0.01_f32; 1536])))
+    } else {
+        embedder
+    };
     EpiGraphMcpFull::new(plain, signer, embedder, /* read_only */ false).with_scoped_pool(scoped)
 }
 
@@ -168,7 +178,13 @@ async fn a_waited_ingest_leaves_its_embedding_loop_tracked(pool: PgPool) {
     let server = app_role_server(&pool, 0xB2).await;
     let doi = "10.0/b928-waited";
     let body = ingest(&server, params(doi, true, Some("public"), None)).await;
-    assert!(body["claims_ingested"].as_u64().unwrap_or(0) > 0, "{body}");
+    let created = body["claims_ingested"].as_u64().unwrap_or(0);
+    assert!(created > 0, "{body}");
+    assert_eq!(
+        body["claims_embedding_queued"].as_u64(),
+        Some(created),
+        "every created claim is queued: {body}"
+    );
 
     let tasks = server.background_tasks();
     assert_eq!(
@@ -401,4 +417,56 @@ async fn a_consolidated_team_claim_is_embedded(pool: PgPool) {
         body["embedded"], true,
         "and the response must say so: {body}"
     );
+}
+
+// ── What the response says was embedded (backlog fdacc14f) ─────────────────
+
+/// With no embedding provider, nothing is queued and the response says 0, in
+/// both the new field and its deprecated alias; no task is left behind.
+/// Verified to fail: with the `embeddings_disabled` check removed from the
+/// queueing helper (the old behaviour, `claims_embedded: queue.len()`), the
+/// document walk reports all 5 created claims as queued.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_server_with_no_embedding_provider_reports_nothing_queued(pool: PgPool) {
+    let server = app_role_server_with(&pool, 0xB8, false).await;
+    let body = ingest(&server, params("10.0/fdac-doc", true, Some("public"), None)).await;
+    assert!(body["claims_ingested"].as_u64().unwrap_or(0) > 0, "{body}");
+    assert_eq!(body["claims_embedding_queued"], 0, "{body}");
+    assert_eq!(
+        body["claims_embedded"], 0,
+        "the deprecated alias too: {body}"
+    );
+    assert_eq!(server.background_tasks().running(), 0, "no embedding task");
+
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("the stdio viewer");
+    let mut extraction = doc("10.0/fdac-spine");
+    for section in &mut extraction.sections {
+        for paragraph in &mut section.paragraphs {
+            paragraph.atoms.clear();
+            paragraph.generality.clear();
+        }
+    }
+    let out = ingest_document_spine(
+        &server,
+        &viewer,
+        IngestDocumentSpineParams {
+            extraction,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        None,
+    )
+    .await
+    .expect("the spine ingest");
+    let text = out.content[0].as_text().expect("text").text.clone();
+    let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert!(body["paragraphs_new"].as_u64().unwrap_or(0) > 0, "{body}");
+    assert_eq!(body["paragraphs_embedding_queued"], 0, "{body}");
+    assert_eq!(
+        body["paragraphs_embedded"], 0,
+        "the deprecated alias too: {body}"
+    );
+    assert_eq!(server.background_tasks().running(), 0, "no embedding task");
 }
