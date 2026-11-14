@@ -189,7 +189,7 @@ impl FederationRegistry {
     ///
     /// # Errors
     /// As [`build`](Self::build).
-    pub async fn build_reserving(
+    async fn build_reserving(
         configs: Vec<ExtensionConfig>,
         discovery_token: &str,
         reserved: HashSet<String>,
