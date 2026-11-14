@@ -381,8 +381,12 @@ async fn viewer_scoped_cache_headers(
 ///
 /// # Rate limiting
 ///
-/// All routes (except health endpoints) are subject to rate limiting when a
-/// rate limiter is configured in `AppState`.
+/// When `AppState` carries a rate limiter, every routed request except the
+/// health endpoints is rate limited. Each of the three routers installs the
+/// limiter itself, inside its bearer layer, so an authenticated request is
+/// charged to its principal and an anonymous one to its client address
+/// (`middleware::rate_limit`). A request to a protected route without a valid
+/// token is refused 401 by the bearer layer before it reaches the limiter.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -1193,10 +1197,19 @@ pub fn create_router_with_extensions(
     // Embedder extensions (`extensions::mount_all`) are nested HERE, before
     // either layer: `route_layer` and `layer` wrap only routes that already
     // exist, so a mount below them would be unauthenticated.
+    //
+    // THE RATE LIMITER (backlog bd5c0f40) sits between the two: inside the
+    // bearer layer, so it charges each request to its verified principal
+    // rather than to an address many principals may share; outside the
+    // recorder, so a refused request is never served and never recorded.
     let protected = extensions::mount_all(protected, extensions, &state)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::elevated_access::record_elevated_access,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1284,10 +1297,18 @@ pub fn create_router_with_extensions(
     // premise is gone: those handlers are no longer reachable without a
     // credential at all. The remaining work — deriving a `Viewer` on every read
     // path rather than an `Option<AuthContext>` — is PR-07.
-    let public = public.layer(middleware::from_fn_with_state(
-        state.clone(),
-        optional_bearer_auth_middleware,
-    ));
+    //
+    // The rate limiter sits inside it: a caller that presents a token is
+    // charged to its principal, an anonymous one to its address.
+    let public = public
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            optional_bearer_auth_middleware,
+        ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
@@ -1317,19 +1338,23 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        // Anonymous by construction, so charged to the client address
+        // (`/oauth/token` and `/oauth/register` are the brute-force targets).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // Apply rate limiting and body limit as outermost layers
-    // Rate limiting bypasses health endpoints internally
+    // The body limit is the outermost layer. Rate limiting is NOT layered
+    // here: each of the three routers above installs it where it can see the
+    // principal (inside the bearer layers), so a merged-router layer could
+    // only ever key on the address. Health endpoints bypass it internally.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
         .with_state(state)
 }
 
@@ -1355,8 +1380,12 @@ pub fn create_router_with_extensions(
 ///
 /// # Rate limiting
 ///
-/// All routes (except health endpoints) are subject to rate limiting when a
-/// rate limiter is configured in `AppState`.
+/// When `AppState` carries a rate limiter, every routed request except the
+/// health endpoints is rate limited. Each of the three routers installs the
+/// limiter itself, inside its bearer layer, so an authenticated request is
+/// charged to its principal and an anonymous one to its client address
+/// (`middleware::rate_limit`). A request to a protected route without a valid
+/// token is refused 401 by the bearer layer before it reaches the limiter.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -1756,9 +1785,17 @@ pub fn create_router_with_extensions(
     // Embedder extensions (`extensions::mount_all`) are nested HERE, before
     // the bearer layer: `layer` wraps only routes that already exist, so a
     // mount below it would be unauthenticated.
-    let protected = extensions::mount_all(protected, extensions, &state).layer(
-        middleware::from_fn_with_state(state.clone(), bearer_auth_middleware),
-    );
+    // The rate limiter sits inside the bearer layer, so it charges each
+    // request to its verified principal (backlog bd5c0f40).
+    let protected = extensions::mount_all(protected, extensions, &state)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ));
 
     // The anonymous allowlist. Adding a route here is a security decision;
     // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
@@ -1788,10 +1825,18 @@ pub fn create_router_with_extensions(
     // header passes through, a request with a present-but-invalid token still
     // 401s. Retained rather than dropped so an allowlisted handler can still
     // see who is calling when a token happens to be supplied.
-    let public = public.layer(middleware::from_fn_with_state(
-        state.clone(),
-        optional_bearer_auth_middleware,
-    ));
+    //
+    // The rate limiter sits inside it: a caller that presents a token is
+    // charged to its principal, an anonymous one to its address.
+    let public = public
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            optional_bearer_auth_middleware,
+        ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
@@ -1816,19 +1861,23 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        // Anonymous by construction, so charged to the client address
+        // (`/oauth/token` and `/oauth/register` are the brute-force targets).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // Apply rate limiting and body limit as outermost layers
-    // Rate limiting bypasses health endpoints internally
+    // The body limit is the outermost layer. Rate limiting is NOT layered
+    // here: each of the three routers above installs it where it can see the
+    // principal (inside the bearer layers), so a merged-router layer could
+    // only ever key on the address. Health endpoints bypass it internally.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
         .with_state(state)
 }
 

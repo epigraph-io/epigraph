@@ -15,8 +15,9 @@
 //! - **Health endpoints**: Exempt from rate limiting
 
 // UNSCOPED-POOL-EXEMPT: One `db_pool.clone()` handed to a detached task that records security
-// events. It runs after the rate-limit decision and outside any request's viewer scope, and rate
-// limiting precedes authentication, so the request may have no principal to scope to at all.
+// events. It runs after the rate-limit decision and outside any request's viewer scope, and on the
+// anonymous routers (the allowlist without a token, OAuth) the request has no principal to scope
+// to at all.
 
 use axum::{
     body::Body,
@@ -89,12 +90,11 @@ impl IntoResponse for RateLimitResponse {
                 .parse()
                 .expect("Numeric retry_after is valid header"),
         );
-        // Never cached. This middleware wraps the whole merged router, so a 429
-        // never passes through the inner routers' layers; on /oauth/* and
-        // /.well-known/* that includes `routes::oauth_response_headers`, whose
-        // no-store / no-cache RFC 6749 section 5.1 requires there. Set here, on
-        // every route's 429: a refusal that a cache replayed would refuse a
-        // client after its window has reopened.
+        // Never cached, on every route's 429: a refusal that a cache replayed
+        // would refuse a client after its window has reopened. (On /oauth/*
+        // and /.well-known/* `routes::oauth_response_headers` wraps this layer
+        // and sets the same RFC 6749 section 5.1 headers; elsewhere nothing
+        // else would.)
         response.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),

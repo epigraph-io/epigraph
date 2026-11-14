@@ -15,7 +15,9 @@
 //! client to spend it locked out every other un-proxied client.
 //!
 //! The anonymous tests need no database: the pool is lazy and the routes they
-//! drive (`/.well-known/oauth-authorization-server`) never touch it.
+//! drive (`/.well-known/oauth-authorization-server`) never touch it. The
+//! principal tests need `DATABASE_URL`, because both bearer layers consult the
+//! revocation table before the limiter sees the request.
 //!
 //! Addresses are documentation ranges only (RFC 5737, RFC 3849).
 
@@ -32,6 +34,7 @@ use axum::{
 use epigraph_api::TrustedProxies;
 use epigraph_api::{create_router, AgentRateLimiter, ApiConfig, AppState, RateLimitConfig};
 use tower::ServiceExt;
+use uuid::Uuid;
 
 /// Requests per key before a 429. Small, and the refill (LIMIT per minute)
 /// is far slower than a test, so no request in a burst is refunded.
@@ -165,4 +168,90 @@ async fn ipv6_clients_are_keyed_by_their_slash_64() {
         StatusCode::OK,
         "a different /64 is a different client"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Principal keying (needs DATABASE_URL: bearer auth reads the revocation table)
+// ---------------------------------------------------------------------------
+
+fn db_router(limiter: AgentRateLimiter) -> (Router, AppState) {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_lazy(&url)
+        .expect("lazy pool");
+    let state = AppState::with_db(pool, ApiConfig::default()).with_rate_limiter(limiter);
+    (create_router(state.clone()), state)
+}
+
+fn token_for(state: &AppState, agent: Uuid) -> String {
+    state
+        .jwt_config
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".into()],
+            "agent",
+            None,
+            Some(agent),
+            chrono::Duration::minutes(10),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("token")
+        .0
+}
+
+async fn authed(router: &Router, method: &str, uri: &str, token: &str) -> StatusCode {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    // Every request comes from the SAME peer: only the principal tells them apart.
+    req.extensions_mut().insert(ConnectInfo(
+        "203.0.113.30:6000".parse::<SocketAddr>().unwrap(),
+    ));
+    router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Two principals behind one address (one NAT, one proxy, one agent host)
+/// have separate buckets, on the anonymous allowlist router and on the
+/// protected router alike. With the limiter outside the bearer layers it could
+/// only key on the address, so the second principal's first request was
+/// refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_requests_are_charged_to_their_principal() {
+    for (method, uri) in [
+        ("GET", "/api/v1/openapi.json"),
+        // Protected: the empty body fails the handler's extractor, which is
+        // fine; only whether the LIMITER refused (429) is asserted.
+        ("POST", "/api/v1/claims"),
+    ] {
+        let (router, state) = db_router(limiter());
+        let a = token_for(&state, Uuid::new_v4());
+        let b = token_for(&state, Uuid::new_v4());
+        for i in 0..LIMIT {
+            let status = authed(&router, method, uri, &a).await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{method} {uri}: request {i} of principal A is within the limit"
+            );
+            assert_ne!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}: the token must authenticate"
+            );
+        }
+        assert_eq!(
+            authed(&router, method, uri, &a).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{method} {uri}: principal A has spent its bucket"
+        );
+        assert_ne!(
+            authed(&router, method, uri, &b).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{method} {uri}: principal B from the same address has its own bucket"
+        );
+    }
 }
