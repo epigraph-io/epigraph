@@ -3,7 +3,9 @@
 //! This module contains various embedding provider backends:
 //! - `MockProvider`: For testing
 //! - `OpenAiProvider`: `OpenAI` API (requires `openai` feature)
-//! - `LocalProvider`: Local model inference (requires `local` feature)
+//! - `LocalProvider`: a deterministic hash stub, NOT model inference. It is
+//!   compiled unconditionally (no feature gates it) and its vectors carry no
+//!   semantic meaning, so nothing should store them in the `embedding` column.
 
 mod jina;
 mod local;

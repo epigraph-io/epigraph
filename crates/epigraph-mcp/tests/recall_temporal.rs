@@ -30,9 +30,9 @@
 //! Each asserts the disjunction the criterion allows: EITHER every top-level
 //! hit satisfies `created_at >= since`, OR the call was rejected with an error
 //! naming `since` and the incompatible option. What neither branch permits is
-//! a successful call that silently ignores the window — the failure mode the
-//! existing `paper_doi_filter`-on-diverse `TODO(diverse-recall)` already
-//! exhibits, which this feature must not repeat.
+//! a successful call that silently ignores the window — the failure mode
+//! `paper_doi_filter`-on-diverse exhibited until that combination was refused
+//! (backlog a2991ea6), which this feature must not repeat.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

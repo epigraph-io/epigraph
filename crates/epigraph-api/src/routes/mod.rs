@@ -100,8 +100,6 @@ pub mod health;
 pub mod hypothesis;
 pub mod independence;
 pub mod ingest;
-#[cfg(all(feature = "db", feature = "episcience"))]
-pub mod isomorphism;
 #[cfg(feature = "db")]
 pub mod lineage;
 #[cfg(feature = "db")]
@@ -352,13 +350,21 @@ async fn viewer_scoped_cache_headers(
 /// token, with 401 and an RFC 6750 `WWW-Authenticate: Bearer …,
 /// error="invalid_token"` challenge.
 ///
-/// ## `public` — the anonymous ALLOWLIST, two routes
+/// ## `public` — the anonymous ALLOWLIST, fourteen routes
 ///
 /// - `GET /health` — static, stateless
 /// - `GET /api/v1/openapi.json` — static schema document
+/// - twelve `/elevate/*` ceremony routes, anonymous by design (the ceremony's
+///   id and the passkey are its credentials): passkey enrollment
+///   (`/elevate/enroll/:id` with its `challenge` and `finish`), the elevation
+///   ticket (`/elevate/:ticket` with its `challenge` and `assert`), the
+///   admin-act confirmation (`/elevate/act/:id` with its `challenge` and
+///   `assert`), and three static assets under `/elevate/assets/`. Six of the
+///   twelve are `POST`.
 ///
 /// Enforced by `crates/epigraph-api/tests/public_router_allowlist.rs`, which
-/// fails if a third route appears here.
+/// fails if a route appears here that its `PUBLIC_ALLOWLIST_DB` does not name;
+/// that constant's doc records why each ceremony is anonymous.
 ///
 /// ## `oauth` — anonymous by construction
 ///
@@ -371,7 +377,9 @@ async fn viewer_scoped_cache_headers(
 /// `GET /claims`, `GET /claims/:id`, `GET /agents`, `GET /lineage/:claim_id`,
 /// `POST /api/v1/search/semantic` and `GET /api/v1/query/rag`, all reachable
 /// with no credential. 105 of them moved to `protected`, `/metrics` moved to a
-/// separate internal listener, and the remaining two are the allowlist above.
+/// separate internal listener, and the remaining two (`/health` and the
+/// OpenAPI document) were the whole allowlist; the `/elevate/*` ceremony
+/// routes joined it later.
 /// **The RAG and evidence-search public-access guarantees are revoked.**
 ///
 /// The `require_signature` (Ed25519 request-signing) middleware was deleted
@@ -701,7 +709,6 @@ pub fn create_router_with_extensions(
         // interface table say. The `/rotate-key` spelling this comment used to
         // carry was never served by anything.
         .route("/api/v1/groups/:id/rotate", post(groups::rotate_key))
-        // Isomorphism pattern detection (episcience feature)
         // Admin OAuth client management
         .route(
             "/api/v1/admin/clients/:id/approve",
@@ -852,7 +859,8 @@ pub fn create_router_with_extensions(
     // port.
     //
     // The rule is not "audit N handlers" — it is invert the split. `public` is
-    // now an ALLOWLIST of two routes (built below); every other registration is
+    // now an ALLOWLIST (built below: two routes when PR-03 landed, fourteen
+    // with the `/elevate/*` ceremonies); every other registration is
     // appended to `protected` and inherits `bearer_auth_middleware`.
     //
     // Axum permits repeated `.route()` calls on the same path with different
@@ -1164,7 +1172,6 @@ pub fn create_router_with_extensions(
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
         )
-        // /api/v1/isomorphism/patterns — episcience feature
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/:id", get(tasks::get_task))
@@ -1335,15 +1342,16 @@ pub fn create_router_with_extensions(
 
 /// Create a router without database-dependent routes.
 ///
-/// # Status: not built in any supported configuration
+/// # Status: check-only
 ///
-/// `epigraph-api`'s default feature set is `["db"]` and every CI job builds
-/// with defaults. `cargo check -p epigraph-api --no-default-features` has been
-/// failing for some time (28 pre-existing errors: missing `sqlx`, `db_pool`,
-/// `ClaimId`, …), so **no compiler checks this function**. It is kept in sync
-/// with the `db` variant by hand and by
-/// `crates/epigraph-api/tests/public_router_allowlist.rs`, which is a
-/// source-text lint precisely so that it covers the block nothing else does.
+/// `epigraph-api`'s default feature set is `["db"]`, and the `server` binary
+/// declares `required-features = ["db"]` (operator ruling R-39), so this
+/// function is never reachable from a request. It IS compiled: CI runs
+/// `cargo check -p epigraph-api --no-default-features --locked`
+/// (`.github/workflows/ci.yml`), which type-checks it. Nothing runs it, so it
+/// is kept in step with the `db` variant by hand and by
+/// `crates/epigraph-api/tests/public_router_allowlist.rs`, a source-text lint
+/// that reads both variants' route tables.
 ///
 /// # Route structure
 ///

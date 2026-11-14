@@ -1,8 +1,17 @@
 //! OpenAPI specification for the EpiGraph API
 //!
-//! Generates a complete OpenAPI 3.1 specification for the EpiGraph REST API.
-//! The spec is available at `GET /api/v1/openapi.json` and describes all
-//! endpoints, request/response schemas, and security requirements.
+//! Generates an OpenAPI 3.1 document for the EpiGraph REST API, served at
+//! `GET /api/v1/openapi.json`.
+//!
+//! **The document is PARTIAL.** It describes the 19 operations listed in
+//! `ApiDoc`'s `paths(...)` below (health, packet submit, RAG query, admin
+//! stats, challenges, supersede / dedup / undedup, claim get / patch / labels,
+//! agent search, five workflow routes and the hierarchical edge create), with
+//! their schemas and the bearer security scheme. The router in
+//! `routes/mod.rs` registers well over two hundred routes; the rest are not
+//! described here, and no test ties this list to the route table. Each entry
+//! is a stub function in this file carrying `#[utoipa::path]`, so a described
+//! operation is not checked against its real handler either.
 
 // Path stub functions are consumed by #[utoipa::path] for spec generation only
 #![allow(dead_code)]
@@ -68,8 +77,9 @@ use workflow_schema_stubs::{
 
 /// EpiGraph API OpenAPI specification
 ///
-/// Defines all endpoints, schemas, and security requirements for the
-/// epistemic knowledge graph REST API.
+/// Defines the documented subset of endpoints (see the module doc: the list
+/// is partial), their schemas, and the security requirements of the epistemic
+/// knowledge graph REST API.
 #[derive(OpenApi)]
 #[openapi(
     info(
