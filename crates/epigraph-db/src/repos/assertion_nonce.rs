@@ -17,36 +17,58 @@ use crate::errors::DbError;
 
 pub struct AssertionNonceRepository;
 
+/// What migration 213's definer did with one presented nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceConsumption {
+    /// This call recorded the nonce: the assertion's first presentation.
+    Recorded,
+    /// The `(public key, nonce)` pair was already recorded: a replay.
+    Replay,
+    /// The expiry the caller computed has already passed on the DATABASE
+    /// clock, so nothing was recorded. The caller accepted the assertion as
+    /// fresh on its own clock, so this means the two clocks disagree by more
+    /// than the retention margin. It is a refusal, but not a replay.
+    Expired,
+}
+
 impl AssertionNonceRepository {
     /// Record that the agent holding `public_key` (the 32-byte Ed25519 key its
     /// assertion's signature verified under) presented an assertion carrying
     /// `nonce`, kept until `expires_at`, through migration 213's
-    /// definer: the application role holds no write on the table. Returns
-    /// `true` when this call recorded it (the first presentation) and `false`
-    /// when the pair was already recorded (a replay) or `expires_at` has
-    /// already passed on the database clock. The decision is one
-    /// `INSERT .. ON CONFLICT DO NOTHING`, so of two concurrent presentations
-    /// exactly one gets `true`.
+    /// definer: the application role holds no write on the table. The
+    /// decision is one `INSERT .. ON CONFLICT DO NOTHING`, so of two
+    /// concurrent presentations exactly one gets
+    /// [`NonceConsumption::Recorded`]. Only `Recorded` admits the assertion.
     ///
     /// The caller must pass a nonce read from an assertion whose SIGNATURE AND
     /// FRESHNESS it has already verified: the token endpoint is anonymous, and
     /// an unverified nonce would let anyone fill the table.
     ///
-    /// An `Err` means the answer is UNKNOWN; the token endpoint must refuse
-    /// the assertion, never admit it.
+    /// An `Err` means the answer is UNKNOWN (including an answer this build
+    /// does not recognise); the token endpoint must refuse the assertion,
+    /// never admit it.
     #[instrument(skip(pool, public_key, nonce))]
     pub async fn consume(
         pool: &PgPool,
         public_key: &[u8],
         nonce: &[u8],
         expires_at: DateTime<Utc>,
-    ) -> Result<bool, DbError> {
-        sqlx::query_scalar("SELECT public.epigraph_oauth_assertion_nonce_consume($1, $2, $3)")
-            .bind(public_key)
-            .bind(nonce)
-            .bind(expires_at)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| DbError::QueryFailed { source: e })
+    ) -> Result<NonceConsumption, DbError> {
+        let answer: String =
+            sqlx::query_scalar("SELECT public.epigraph_oauth_assertion_nonce_consume($1, $2, $3)")
+                .bind(public_key)
+                .bind(nonce)
+                .bind(expires_at)
+                .fetch_one(pool)
+                .await
+                .map_err(|e| DbError::QueryFailed { source: e })?;
+        match answer.as_str() {
+            "recorded" => Ok(NonceConsumption::Recorded),
+            "replay" => Ok(NonceConsumption::Replay),
+            "expired" => Ok(NonceConsumption::Expired),
+            other => Err(DbError::InvalidData {
+                reason: format!("unrecognised assertion nonce answer {other:?}"),
+            }),
+        }
     }
 }

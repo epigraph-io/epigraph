@@ -257,7 +257,7 @@ pub use workflow::{
 };
 
 // Privacy / encryption repositories
-pub use assertion_nonce::AssertionNonceRepository;
+pub use assertion_nonce::{AssertionNonceRepository, NonceConsumption};
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};

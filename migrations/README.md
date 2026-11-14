@@ -2653,9 +2653,12 @@ restart.
   `revoked_access_tokens`) and
   one SECURITY DEFINER on 172's form, owned by `epigraph_maintenance`,
   EXECUTE revoked from PUBLIC and granted to `epigraph_app`:
-  `epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)` returns
-  true when it records the pair, false for a replay (one
-  `INSERT .. ON CONFLICT DO NOTHING`), raises 22023 on a malformed key or
+  `epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)` answers
+  `'recorded'` when it records the pair, `'replay'` when it is already
+  recorded (one `INSERT .. ON CONFLICT DO NOTHING`), and `'expired'`,
+  recording nothing, when the caller's expiry has already passed on the
+  database clock (API host and database clocks skewed by more than the 60 s
+  margin; refused 401 and logged as skew, not as a replay), raises 22023 on a malformed key or
   nonce or an expiry more than an hour ahead, and lazily prunes up to 1000
   rows past their expiry (`FOR UPDATE SKIP LOCKED`). The application role
   keeps SELECT only. The record is keyed by the public key the signature

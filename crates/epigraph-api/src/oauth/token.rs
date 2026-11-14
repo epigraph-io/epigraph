@@ -581,7 +581,7 @@ async fn consume_assertion_nonce(
             .ok_or(ApiError::BadRequest {
             message: "client_assertion timestamp out of range".to_string(),
         })?;
-    let first_use = epigraph_db::AssertionNonceRepository::consume(
+    let outcome = epigraph_db::AssertionNonceRepository::consume(
         &state.db_pool,
         &verified.public_key,
         &verified.nonce,
@@ -591,16 +591,34 @@ async fn consume_assertion_nonce(
     .map_err(|e| ApiError::InternalError {
         message: format!("recording the assertion nonce failed: {e}"),
     })?;
-    if !first_use {
-        tracing::warn!(
-            client_id = %client.client_id,
-            "Agent assertion rejected: nonce already used (replay)"
-        );
-        return Err(ApiError::Unauthorized {
-            reason: "client_assertion has already been used".to_string(),
-        });
+    match outcome {
+        epigraph_db::NonceConsumption::Recorded => Ok(()),
+        epigraph_db::NonceConsumption::Replay => {
+            tracing::warn!(
+                client_id = %client.client_id,
+                "Agent assertion rejected: nonce already used (replay)"
+            );
+            Err(ApiError::Unauthorized {
+                reason: "client_assertion has already been used".to_string(),
+            })
+        }
+        // Fresh on this host's clock, but its retention has already passed
+        // on the database clock: the clocks disagree by more than the
+        // retention margin. Refused (the nonce could not be recorded), and
+        // reported as skew so an operator is not sent hunting a replay.
+        epigraph_db::NonceConsumption::Expired => {
+            tracing::error!(
+                client_id = %client.client_id,
+                assertion_ts = verified.timestamp,
+                "Agent assertion rejected: its nonce retention has already passed on the \
+                 database clock; the API host and database clocks are skewed by more than \
+                 the retention margin"
+            );
+            Err(ApiError::Unauthorized {
+                reason: "client_assertion expired (server clock skew)".to_string(),
+            })
+        }
     }
-    Ok(())
 }
 
 /// Whether `client_type` is a CONFIDENTIAL client: one that holds a credential

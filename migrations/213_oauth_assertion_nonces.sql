@@ -28,8 +28,12 @@
 --      ONLY write path, a SECURITY DEFINER on 172's form
 --      (`pg_catalog, pg_temp`, every name qualified), owned by
 --      `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
---      `epigraph_app`. It returns true when it recorded the nonce (the first
---      presentation) and false when the pair is already recorded (a replay).
+--      `epigraph_app`. It answers 'recorded' when it recorded the nonce (the
+--      first presentation), 'replay' when the pair is already recorded, and
+--      'expired' when the caller's expiry has already passed on the database
+--      clock (see RETENTION). The last two are both refusals; they are told
+--      apart so that clock skew between the API host and the database is
+--      logged as skew, not reported to a legitimate agent as a replay.
 --      The INSERT ... ON CONFLICT DO NOTHING is the whole decision, so two
 --      concurrent presentations of one assertion record exactly one row: the
 --      second waits on the first's unique-index entry and then sees the
@@ -47,7 +51,7 @@
 --      two may have before a pruned nonce could be presented again inside
 --      the window. The definer refuses an `expires_at` more than one hour
 --      ahead (22023), so a caller bug cannot pin rows indefinitely, and
---      answers false, recording nothing, for one already past.
+--      answers 'expired', recording nothing, for one already past.
 --   3. The application role keeps SELECT only (`rls_enforcement.rs` requires
 --      every public table to be readable by `epigraph_app`; nothing here is
 --      secret). 077's default privileges granted it INSERT, UPDATE, DELETE and
@@ -93,13 +97,13 @@ CREATE INDEX IF NOT EXISTS idx_oauth_assertion_nonces_expires_at
     ON public.oauth_assertion_nonces (expires_at);
 
 -- Record one presented assertion nonce under the public key its signature
--- verified with. Returns true when this call recorded it, false when the
--- (key, nonce) pair was already recorded (a replay) or when `p_expires_at` has
--- already passed. Raises 22023 on a NULL argument, a key that is not 32 bytes,
+-- verified with. Answers 'recorded' when this call recorded it, 'replay' when
+-- the (key, nonce) pair was already recorded, and 'expired' (recording
+-- nothing) when `p_expires_at` has already passed. Raises 22023 on a NULL argument, a key that is not 32 bytes,
 -- a nonce that is not 16 bytes, or an expiry more than one hour ahead.
 CREATE OR REPLACE FUNCTION public.epigraph_oauth_assertion_nonce_consume(
     p_public_key bytea, p_nonce bytea, p_expires_at timestamptz)
-RETURNS boolean
+RETURNS text
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
@@ -135,14 +139,17 @@ BEGIN
               FOR UPDATE SKIP LOCKED);
 
     IF p_expires_at <= v_now THEN
-        RETURN false;
+        RETURN 'expired';
     END IF;
 
     INSERT INTO public.oauth_assertion_nonces (agent_public_key, nonce, expires_at)
     VALUES (p_public_key, p_nonce, p_expires_at)
     ON CONFLICT (agent_public_key, nonce) DO NOTHING;
     GET DIAGNOSTICS v_n = ROW_COUNT;
-    RETURN v_n = 1;
+    IF v_n = 1 THEN
+        RETURN 'recorded';
+    END IF;
+    RETURN 'replay';
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)
     FROM PUBLIC;
