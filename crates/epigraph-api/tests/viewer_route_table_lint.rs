@@ -257,8 +257,11 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     ("clusters.rs", 2),
     // `conflicts.rs` was 1 and is now 0, so it is gone from the register
     // (backlog 67c905a3). The site was `scan_conflicts`'s
-    // `mass_functions ⨝ claims` scan, which returned `c.content` for every
-    // high-conflict claim to any bearer. It is now
+    // `mass_functions ⨝ claims` scan, run on the raw pool with no viewer and
+    // projecting `c.content`. Under a login subject to row security that
+    // session sees public rows only, so it hid a member's own private
+    // high-conflict claims; only under a login that bypasses row security
+    // would it have returned every claim's content to any bearer. It is now
     // `ConflictDensityRepository::high_conflict_claims(.., &viewer, ..)`, which
     // marks both `mf` and `c`, on the caller's `read_as` connection. Pinned by
     // `tier_a_inline_reads_scoped.rs`.
@@ -295,9 +298,12 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
-    // `list_network_policies` and `get_challenge`. Not converted with the rest
-    // of backlog 67c905a3, because another open change rewrites this file's
-    // policy-claim handling; converting them in parallel would conflict.
+    // `list_network_policies` and `get_challenge`. Deferred, not blocked: they
+    // were left out of backlog 67c905a3's change only to keep it to the files
+    // it had proving tests for. Nothing else is converting them, and both are
+    // single unjoined `claims` reads that the ordinary conversion (a repo
+    // method marking `claims`, run on the caller's `read_as` connection)
+    // retires; that also gives both routes a `ViewerExtractor`.
     ("policies.rs", 2),
     // `political.rs` was 1 and is now 0, so it is gone from the register
     // (backlog 67c905a3). The site was `inflation_leaderboard`'s
