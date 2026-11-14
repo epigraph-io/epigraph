@@ -20,7 +20,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-use axum::http::Request;
+use axum::http::{Request, Response, StatusCode};
 use axum::Router;
 use tower::ServiceBuilder;
 use tower_http::request_id::{
@@ -160,6 +160,11 @@ impl ServeSettings {
 /// response, and the handler runs under the timeout. So a 408 from the timeout
 /// is traced and carries the id too.
 ///
+/// Every response is logged once at INFO (status and latency) by
+/// [`log_response`], and a 408 at WARN: tower-http's default response event is
+/// DEBUG, which the default filter drops, and a timeout that fired after a
+/// handler committed must not be invisible to the operator.
+///
 /// The span records the method, the path (through [`loggable_path`]) and the
 /// request id, and nothing else. Not the query string (`/oauth/authorize` and
 /// `/oauth/callback` carry authorization codes and state there), no headers
@@ -173,7 +178,11 @@ pub fn apply_layers(router: Router, settings: &ServeSettings) -> Router {
         ServiceBuilder::new()
             .map_request(drop_unacceptable_request_id::<axum::body::Body>)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-            .layer(TraceLayer::new_for_http().make_span_with(request_span))
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(request_span)
+                    .on_response(log_response),
+            )
             .layer(PropagateRequestIdLayer::x_request_id()),
     )
 }
@@ -208,6 +217,22 @@ fn drop_unacceptable_request_id<B>(mut request: Request<B>) -> Request<B> {
         headers.remove(REQUEST_ID_HEADER);
     }
     request
+}
+
+/// The per-request log line, inside the request span (method, path, id).
+fn log_response<B>(response: &Response<B>, latency: Duration, _span: &tracing::Span) {
+    let status = response.status();
+    let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
+    if status == StatusCode::REQUEST_TIMEOUT {
+        tracing::warn!(
+            status = status.as_u16(),
+            latency_ms,
+            "request timed out and was answered 408; a write its handler had already \
+             committed stands"
+        );
+    } else {
+        tracing::info!(status = status.as_u16(), latency_ms, "request finished");
+    }
 }
 
 /// The trace span for one request: method, path and request id only.
@@ -527,5 +552,33 @@ mod tests {
             let response = call(apply_layers(slow_router(), &settings), "/fast", Some(ok)).await;
             assert_eq!(response.headers().get(REQUEST_ID_HEADER).unwrap(), ok);
         }
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_timed_out_request_is_logged_at_warn_and_a_finished_one_at_info() {
+        let settings = ServeSettings {
+            request_timeout: Some(Duration::from_millis(100)),
+            ..ServeSettings::default()
+        };
+        let slow = call(apply_layers(slow_router(), &settings), "/slow", None).await;
+        assert_eq!(slow.status(), StatusCode::REQUEST_TIMEOUT);
+        let fast = call(apply_layers(slow_router(), &settings), "/fast", None).await;
+        assert_eq!(fast.status(), StatusCode::OK);
+        logs_assert(|lines: &[&str]| {
+            let timed_out = lines.iter().any(|l| {
+                l.contains(" WARN ") && l.contains("request timed out") && l.contains("408")
+            });
+            let finished = lines.iter().any(|l| {
+                l.contains(" INFO ") && l.contains("request finished") && l.contains("200")
+            });
+            match (timed_out, finished) {
+                (true, true) => Ok(()),
+                _ => Err(format!(
+                    "timed_out={timed_out} finished={finished}:\n{}",
+                    lines.join("\n")
+                )),
+            }
+        });
     }
 }
