@@ -36,5 +36,6 @@
 //! links root is known from the theme alone, which is what the meaning
 //! root's switch points at.
 
+pub mod build;
 pub mod files;
 pub mod graph;
