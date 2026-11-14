@@ -47,6 +47,25 @@ impl EventRepository {
         actor_id: Option<Uuid>,
         payload: &serde_json::Value,
     ) -> Result<Uuid, sqlx::Error> {
+        Self::insert_on(pool, event_type, actor_id, payload).await
+    }
+
+    /// [`Self::insert`] on any executor, typically the caller's open
+    /// transaction, so the event commits or rolls back with the write it
+    /// records.
+    ///
+    /// Unlike [`Self::publish_or_log_conn`], a failure is the caller's error,
+    /// not a log line. Use it where the event IS the durable record of the
+    /// write (the assess route's writer record): there a swallowed failure
+    /// would leave the write with no trace, which is the defect the event
+    /// exists to close. Inside a transaction a failure aborts it, so the
+    /// caller must propagate the error rather than carry on.
+    pub async fn insert_on<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        event_type: &str,
+        actor_id: Option<Uuid>,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, sqlx::Error> {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO events (id, event_type, actor_id, payload, graph_version, created_at) \
@@ -56,7 +75,7 @@ impl EventRepository {
         .bind(event_type)
         .bind(actor_id)
         .bind(payload)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(id)
     }
