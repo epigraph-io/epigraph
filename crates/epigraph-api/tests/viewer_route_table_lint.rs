@@ -343,14 +343,25 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 ///
 /// Asserted exactly for the same monotonicity reason as above.
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
-    ("agent_keys.rs", 3),
+    // BACKLOG 3b560cfe converted the MUTATING sites of this register, eleven
+    // of them, to the prescribed
+    // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
+    // shape, so their scope (and self-or-admin) checks run unconditionally:
+    // `agent_keys.rs` rotate/revoke (3 -> 1), `agents.rs` create/update (2 ->
+    // row removed), `crud.rs` create_evidence/create_analysis (6 -> 4),
+    // `papers.rs` create_paper (1 -> row removed) and `tasks.rs`
+    // create/assign/complete/fail (6 -> 2). Rows that reached zero are REMOVED,
+    // not zeroed, for the reason the PR-10 note below gives. What remains is
+    // READ handlers only, plus `crud.rs::create_reasoning_trace`, which another
+    // branch converts. `tests/mutating_handlers_refuse_without_auth_context.rs`
+    // drives the eleven with no `AuthContext` and requires 401.
+    ("agent_keys.rs", 1),
     // 1 → 2 when the needle set widened from one spelling to four. NOT a new
     // site and NOT a regression: `create_agent`'s `agents:write` check is
     // written `if let Some(axum::Extension(ref auth)) = &auth_ctx` — the same
     // idiom with a trailing `&` on the scrutinee — and the single-spelling
     // needle could not see it. The block was always here; the register could
-    // not count it.
-    ("agents.rs", 2),
+    // not count it. (`("agents.rs", 2)` stood here until backlog 3b560cfe.)
     // `("audit.rs", 1)` REMOVED by PR-18a, on the PR-10 precedent recorded
     // below: `query_security_events` now takes the prescribed
     // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
@@ -383,7 +394,7 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // shape on the way. Its `record_provenance` block is a SEPARATE `if let`
     // and is deliberately untouched — it is still counted, in the other
     // register, where the count stays 4.
-    ("crud.rs", 6),
+    ("crud.rs", 4),
     // `("edges.rs", 5)` REMOVED by batch W12b, on the PR-10 precedent above:
     // the five write handlers (`create_edge`, `create_hierarchical_edge`,
     // `patch_edge`, `delete_edge`, `relate_claims`) took `ViewerExtractor`,
@@ -392,8 +403,7 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // `None`. They now take the prescribed `let Some(..) = auth_ctx else {
     // return Err(ApiError::Unauthorized ..) }` shape and check `edges:write`
     // unconditionally.
-    ("papers.rs", 1),
-    ("tasks.rs", 6),
+    ("tasks.rs", 2),
     // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
     // `delete_webhook` to the prescribed
     // `auth_ctx.ok_or(ApiError::Unauthorized { .. })?` shape and made the scope
