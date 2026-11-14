@@ -212,10 +212,14 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
 ///
-/// Twelve handler sites across seven files read `tier_a` claim content inline
-/// (thirteen across eight until `tenancy/fix-security-track` retired
-/// `hypothesis.rs`'s — see the comment on that removal below)
-/// in the route layer with no `Viewer` spliced into the statement. Before PR-14
+/// Seven handler sites across four files read `tier_a` claim content inline
+/// in the route layer with no `Viewer` spliced into the statement:
+/// `clusters.rs` (2), `policies.rs` (2), `search.rs` (1) and `workflows.rs`
+/// (2). It was ten across seven before backlog 67c905a3 retired
+/// `conflicts.rs`, `embeddings.rs` and `political.rs` (see the comment on each
+/// removal below); this paragraph said "twelve" from before `workflows.rs` went
+/// 4 -> 2. It was thirteen across eight before `tenancy/fix-security-track`
+/// retired `hypothesis.rs`'s. Before PR-14
 /// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
 /// become live disclosure the moment ownership is transcribed into the tenancy
 /// columns, with nothing behind them."* That prediction is not stale — it has
@@ -243,8 +247,21 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// handler. Do not add to it — move the statement into
 /// `crates/epigraph-db/src/repos/`, mark it, and splice a `Viewer`.
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
+    // `build_from_bridges`' two `edges ⨝ claims` reads (the bridge edges and
+    // the paragraph nodes). Not converted with the rest of backlog 67c905a3:
+    // this handler WRITES the shared `graph_cluster_runs` / `graph_clusters` /
+    // `claim_cluster_membership` rows from what it reads, on the raw pool, so
+    // stamping only the reads would hand an unstamped writer membership rows
+    // for claims its own session cannot see. The reads and the writes have to
+    // move onto one stamped transaction together.
     ("clusters.rs", 2),
-    ("conflicts.rs", 1),
+    // `conflicts.rs` was 1 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The site was `scan_conflicts`'s
+    // `mass_functions ⨝ claims` scan, which returned `c.content` for every
+    // high-conflict claim to any bearer. It is now
+    // `ConflictDensityRepository::high_conflict_claims(.., &viewer, ..)`, which
+    // marks both `mf` and `c`, on the caller's `read_as` connection. Pinned by
+    // `tier_a_inline_reads_scoped.rs`.
     // `cross_source.rs` was 1 until PR-09 and is now 0, so it is gone from the
     // register entirely. The site was `SELECT id, content FROM claims WHERE id
     // = ANY($1)` in `list_candidates`, hydrating excerpts for the candidate
@@ -256,7 +273,14 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `MatchCandidateRepo::corroborates_edges_for_claim`. Both were byte-for-byte
     // duplicates of SQL in `epigraph-mcp/src/tools/matching.rs`; there is now
     // one copy, in the repo layer, filtered.
-    ("embeddings.rs", 1),
+    // `embeddings.rs` was 1 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The counted site was `neighborhood_density`'s
+    // level / source-type sample. Its sibling, the count / mean / median
+    // aggregate over the same radius, was never counted: `sqlx_call_offsets`
+    // stops at the first `>` of a turbofish, and that call's was
+    // `query_as::<_, (i64, Option<f64>, Option<f64>)>`. Both are now
+    // `ClaimRepository::{neighborhood_density_stats, neighborhood_density_breakdown}`,
+    // each marking `c`, on the caller's `read_as` connection.
     // `hypothesis.rs` was 1 until `tenancy/fix-security-track` and is now 0, so
     // it is gone from the register entirely. The site was
     // `create_hypothesis`'s VOI neighborhood scan — `SELECT c.id, c.belief,
@@ -270,8 +294,16 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
+    // `list_network_policies` and `get_challenge`. Not converted with the rest
+    // of backlog 67c905a3, because another open change rewrites this file's
+    // policy-claim handling; converting them in parallel would conflict.
     ("policies.rs", 2),
-    ("political.rs", 1),
+    // `political.rs` was 1 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The site was `inflation_leaderboard`'s
+    // `claims ⨝ agents` aggregate; it is now
+    // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, marking
+    // `c` in the `WHERE` so the mean and the `HAVING` threshold both see only
+    // visible claims, on the caller's `read_as` connection.
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
     // forward-only scan could not see. Its in-code comment argues it is not a
     // live leak — the ids come from the viewer-filtered

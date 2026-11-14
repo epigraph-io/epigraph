@@ -7,12 +7,18 @@
 //! /api/v1/conflicts/silence-check`, and the `19c` silence-alarm step of
 //! `POST /api/v1/frames/:id/evidence`.
 //!
-//! No `Viewer`: this is an aggregate over counts, with no row content, read on
-//! whatever executor the caller passes (today the handlers' raw pool).
+//! The density reads take no `Viewer`: they are aggregates over counts, with no
+//! row content, read on whatever executor the caller passes. Row security on a
+//! stamped connection is what scopes them.
+//!
+//! [`ConflictDensityRepository::high_conflict_claims`] is different: it
+//! projects `claims.content`, so it splices the caller's `Viewer` onto both
+//! tenanted relations it reads.
 
 use uuid::Uuid;
 
 use crate::errors::DbError;
+use crate::visibility::Viewer;
 
 /// One frame's conflict density.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
@@ -100,6 +106,19 @@ LEFT JOIN fc_counts fcc ON fcc.frame_id = t.id \
 LEFT JOIN pair_counts pc ON pc.frame_id = t.id \
 ORDER BY t.id";
 
+/// One claim's live BBA conflict in one frame, as `GET /api/v1/conflicts/scan`
+/// reports it under `high_conflict`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct HighConflictClaim {
+    pub claim_id: Uuid,
+    pub frame_id: Uuid,
+    /// The largest `conflict_k` among the claim's visible live BBAs in the frame.
+    pub max_k: Option<f64>,
+    /// How many visible live BBAs in the frame reached `min_k`.
+    pub bba_count: i64,
+    pub content: String,
+}
+
 /// Read-only conflict-density queries.
 pub struct ConflictDensityRepository;
 
@@ -118,6 +137,51 @@ impl ConflictDensityRepository {
             .fetch_all(executor)
             .await?;
         Ok(rows)
+    }
+
+    /// The `limit` claim/frame pairs with the highest live BBA conflict at or
+    /// above `min_k`, among the BBAs and claims `viewer` may read.
+    ///
+    /// This was an inline statement in `epigraph-api`'s
+    /// `routes/conflicts.rs::scan_conflicts`, run on the raw pool with no
+    /// viewer, which returned `claims.content` for every matching claim.
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the query fails.
+    pub async fn high_conflict_claims<'e, E>(
+        executor: E,
+        viewer: &Viewer,
+        min_k: f64,
+        limit: i64,
+    ) -> Result<Vec<HighConflictClaim>, DbError>
+    where
+        E: sqlx::PgExecutor<'e>,
+    {
+        // Both markers sit in the `WHERE`, so they filter rows BEFORE the
+        // `GROUP BY` and the `LIMIT`: `max_k` and `bba_count` aggregate only
+        // BBAs the viewer may read, and a claim the viewer cannot read neither
+        // appears nor takes a slot in the limit. The `mf` marker is defense in
+        // depth (a BBA inherits its claim's tenancy under migration 070); the
+        // `c` marker is what keeps the projected `content` readable.
+        let sql = viewer.splice(
+            "SELECT mf.claim_id, mf.frame_id, MAX(mf.conflict_k) AS max_k, \
+                    COUNT(*) AS bba_count, c.content \
+             FROM mass_functions mf \
+             JOIN claims c ON c.id = mf.claim_id \
+             WHERE mf.conflict_k >= $1 AND mf.retracted_at IS NULL \
+               /* {VISIBILITY:mf} */ /* {VISIBILITY:c} */ \
+             GROUP BY mf.claim_id, mf.frame_id, c.content \
+             ORDER BY max_k DESC \
+             LIMIT $2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, HighConflictClaim>(&sql)
+            .bind(min_k)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Densities for exactly the given frames (unknown ids are absent).

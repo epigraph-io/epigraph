@@ -777,7 +777,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 209 -> 207 (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding` and
 /// `PUT /api/v1/evidence/:id/embedding` were deleted with their handlers;
 /// `routes/rag.rs` 2 -> 0, key DELETED (`HIGH_WATER_FILES` 38 -> 37).
-const HIGH_WATER: usize = 207;
+///
+/// 207 -> 205 (backlog 67c905a3): `scan_conflicts` reads on the caller's
+/// stamped connection; `routes/conflicts.rs` 10 -> 8. No file reached zero.
+///
+/// 205 -> 203 (backlog 67c905a3): `neighborhood_density` reads on the caller's
+/// stamped connection; `routes/embeddings.rs` 2 -> 0, key DELETED
+/// (`HIGH_WATER_FILES` 37 -> 36).
+///
+/// 203 -> 202 (backlog 67c905a3): `inflation_leaderboard` reads on the caller's
+/// stamped connection; `routes/political.rs` 5 -> 4.
+const HIGH_WATER: usize = 202;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -846,7 +856,8 @@ const HIGH_WATER: usize = 207;
 /// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
 /// caller's stamped transaction; merged with the line above on staging).
 /// 38 -> 37 when `routes/rag.rs` reached zero (backlog 9bef22f3).
-const HIGH_WATER_FILES: usize = 37;
+/// 37 -> 36 when `routes/embeddings.rs` reached zero (backlog 67c905a3).
+const HIGH_WATER_FILES: usize = 36;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -927,7 +938,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/computation.rs", 5),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
-    ("routes/conflicts.rs", 10),
+    // 10 -> 8 (backlog 67c905a3): `scan_conflicts` holds a `Viewer` and runs
+    // both of its reads (the high-conflict claims and the frame densities) on
+    // one `AppState::read_as` connection.
+    ("routes/conflicts.rs", 8),
     // 5 before conversion shard 5, which moved `list_contexts`, `get_context`,
     // `list_active_contexts` and `frame_contexts` onto `AppState::read_as`. The
     // one that remains is `create_context`, which WRITES through its alias:
@@ -993,7 +1007,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // DELETED the factor INSERT (it fed only BP; SPEC §4.1 W10): removed, not
     // converted.
     ("routes/edges.rs", 4),
-    ("routes/embeddings.rs", 2),
+    // `routes/embeddings.rs` was 2 and is GONE, not zeroed (backlog 67c905a3):
+    // `neighborhood_density` holds a `Viewer` and runs both of its reads on one
+    // `AppState::read_as` connection.
     // `routes/entities.rs` was 8 and is GONE, not zeroed. Conversion shard 7
     // took 5 (`entity_neighborhood` 2, category A; `query_triples` 3, filed C by
     // PR #460 on the handler's verb but measured as a read). Backlog 850dcc61
@@ -1091,14 +1107,16 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 12 before conversion shard 5, which moved all seven read-only
     // viewer-holding handlers onto `AppState::read_as`: `epistemic_profile`,
     // `compare_agents`, `position_timeline`, `claim_genealogy`,
-    // `originated_claims`, `inflation_index` and `claim_techniques`. The five
-    // that remain hold NO `Viewer` at all -- `inflation_leaderboard`
-    // (which is also the site
-    // `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` records as
-    // `("political.rs", 1)`, so it must not be relocated to lower that
-    // register), `list_techniques`, `list_coalitions`, and the two `create_*`
-    // handlers, which write. This file's module doc carries the reasoning.
-    ("routes/political.rs", 5),
+    // `originated_claims`, `inflation_index` and `claim_techniques`.
+    // 5 -> 4 (backlog 67c905a3): `inflation_leaderboard` took a
+    // `ViewerExtractor` and reads through the viewer-spliced
+    // `PoliticalRepository::get_inflation_leaderboard` on `AppState::read_as`,
+    // retiring `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`'s
+    // `("political.rs", 1)` in the same change. The four that remain hold NO
+    // `Viewer` at all -- `list_techniques`, `list_coalitions`, and the two
+    // `create_*` handlers, which write. This file's module doc carries the
+    // reasoning.
+    ("routes/political.rs", 4),
     // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
     // its two writers, `generate_claim_embedding` and
     // `generate_evidence_embedding` (the `PUT …/embedding` routes).

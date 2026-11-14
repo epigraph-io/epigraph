@@ -407,6 +407,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "bp_seed_rows",
         &["derivation_scope::retain_for_cache"],
     ),
+    // stamped: the frame-density aggregate behind `silence_alarms` takes no
+    // viewer (counts only, no row content) and runs on the caller's `read_as`
+    // connection, so row security scopes its counts; the content read beside
+    // it receives the viewer (`high_conflict_claims`).
+    (
+        "conflicts.rs",
+        "scan_conflicts",
+        &["ConflictDensityRepository::scan"],
+    ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
     // The signed REFUTES edge write runs on a transaction stamped with the
     // caller's viewer (`if let Ok(mut tx) = state.write_as(&viewer, ..)`,

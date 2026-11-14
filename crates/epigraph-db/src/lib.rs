@@ -131,18 +131,18 @@ pub use repos::{
     MarkedDuplicateRow, MarkedDuplicates, MassFunctionRepository, MatchCandidateRepo,
     MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
     MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
-    MethodSourcePaper, MethodUsageExample, MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage,
-    NewHierarchicalOutcomeReport, NewRecallEvent, OAuthClientRepository, OAuthClientRow,
-    OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
-    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
-    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
-    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
-    RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate,
-    TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
+    MethodSourcePaper, MethodUsageExample, MovedBba, NearestClaimHit, NeighborhoodDensityStats,
+    NeighbourhoodThemeCoverage, NewHierarchicalOutcomeReport, NewRecallEvent,
+    OAuthClientRepository, OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository,
+    PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
+    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReasoningTraceRepository,
+    RecallEventRepository, RecallEventRow, RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome,
+    RevokedAccessTokenRepository, RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository,
+    ScoredHierarchicalWorkflowRow, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
+    SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
     TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
     WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
@@ -203,7 +203,9 @@ pub use sqlx::PgPool;
 // Re-export row types for users of repositories
 pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
-pub use repos::conflict_density::{ConflictDensityRepository, FrameConflictDensity};
+pub use repos::conflict_density::{
+    ConflictDensityRepository, FrameConflictDensity, HighConflictClaim,
+};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{

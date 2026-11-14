@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
 #[cfg(feature = "db")]
+use crate::middleware::bearer::ViewerExtractor;
+#[cfg(feature = "db")]
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
@@ -43,8 +45,12 @@ pub struct NeighborhoodDensityResponse {
 }
 
 /// POST /api/v1/embeddings/neighborhood-density
+///
+/// Read as the caller: counts, similarities and the level / source-type
+/// breakdown cover only claims the caller may read.
 #[cfg(feature = "db")]
 pub async fn neighborhood_density(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<NeighborhoodDensityRequest>,
 ) -> Result<Json<NeighborhoodDensityResponse>, ApiError> {
@@ -70,46 +76,49 @@ pub async fn neighborhood_density(
             .join(",")
     );
 
+    // Both reads run as the caller, on one viewer-stamped connection: every
+    // number in the response is an aggregate over claims the caller may read.
+    // The vector is embedded BEFORE the connection is checked out, so the
+    // external call does not hold it.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "neighborhood_density",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Aggregate stats in one round trip. Uses the existing HNSW index on
     // claims.embedding via the `<=>` cosine-distance operator. Cosine
     // similarity = 1 - cosine_distance. Filter is `similarity >= 1 - radius`
     // in distance space because pgvector indexes operate on distance.
-    let row = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(
-        "SELECT COUNT(*)::bigint AS n, \
-                AVG(1 - (embedding <=> $1::vector))::float8 AS mean_sim, \
-                percentile_cont(0.5) WITHIN GROUP \
-                    (ORDER BY 1 - (embedding <=> $1::vector))::float8 AS median_sim \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND is_current = true \
-           AND (embedding <=> $1::vector) <= $2",
+    let stats = epigraph_db::ClaimRepository::neighborhood_density_stats(
+        &mut *read,
+        &viewer,
+        &embedding_str,
+        radius,
     )
-    .bind(&embedding_str)
-    .bind(radius)
-    .fetch_one(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("density aggregate failed: {e}"),
     })?;
-    let n_claims = row.0;
-    let mean_similarity = row.1.unwrap_or(0.0);
-    let median_similarity = row.2.unwrap_or(0.0);
+    let n_claims = stats.n_claims;
+    let mean_similarity = stats.mean_similarity.unwrap_or(0.0);
+    let median_similarity = stats.median_similarity.unwrap_or(0.0);
 
     // Sample for level + source_type breakdown. Use max_sample to bound
     // worst-case scan even when n_claims is huge.
-    let breakdown_rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT properties->>'level' AS lvl, properties->>'source_type' AS src \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND is_current = true \
-           AND (embedding <=> $1::vector) <= $2 \
-         ORDER BY embedding <=> $1::vector \
-         LIMIT $3",
+    let breakdown_rows = epigraph_db::ClaimRepository::neighborhood_density_breakdown(
+        &mut *read,
+        &viewer,
+        &embedding_str,
+        radius,
+        max_sample,
     )
-    .bind(&embedding_str)
-    .bind(radius)
-    .bind(max_sample)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("density breakdown failed: {e}"),
