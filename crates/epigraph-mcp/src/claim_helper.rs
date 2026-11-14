@@ -597,6 +597,32 @@ pub async fn embed_claim_author_stamped(
     pending_embedding: Option<String>,
     tool_name: &'static str,
 ) -> bool {
+    embed_claim_author_stamped_with_grant(
+        server,
+        author_agent_id,
+        None,
+        claim_id,
+        text,
+        pending_embedding,
+        tool_name,
+    )
+    .await
+}
+
+/// [`embed_claim_author_stamped`] for a claim written under a team-write
+/// `grant` (an operated agent writing its human's team, D-V3): the store is
+/// stamped with the same grant the write was, so the `UPDATE` can match the
+/// row. See [`store_embedding_author_stamped_with_grant`]. The document walks'
+/// post-commit embedding loops call this with the grant they wrote under.
+pub async fn embed_claim_author_stamped_with_grant(
+    server: &EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+    claim_id: uuid::Uuid,
+    text: &str,
+    pending_embedding: Option<String>,
+    tool_name: &'static str,
+) -> bool {
     // Reuse the novelty gate's already-generated vector when there is one; only
     // the gate's embedder-failure path and the repair arm (where an exact
     // resubmit means the gate never ran) pay a second provider call.
@@ -615,10 +641,11 @@ pub async fn embed_claim_author_stamped(
         },
     };
 
-    match store_embedding_author_stamped(
+    match store_embedding_author_stamped_with_grant(
         server.scoped.as_ref(),
         &server.pool,
         author_agent_id,
+        grant,
         claim_id,
         &pgvec,
         tool_name,

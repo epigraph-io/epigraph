@@ -292,7 +292,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/claim_helper.rs",
-        "embed_claim_author_stamped",
+        "embed_claim_author_stamped_with_grant",
         1,
         DELEGATES_THE_STAMP,
     ),
@@ -317,7 +317,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          the claim's author on the plain pool as the PUBLIC viewer and stores on that author's \
          stamp. The public-only author read is a known limit (CLAUDE.md's declared-tenancy \
          note: a group-private claim's author is not resolvable here, and \
-         workflow_ingest::store_ingest_embedding stores through the known author instead).",
+         workflow_ingest::store_ingest_embedding and the document walks' embedding loops \
+         (claim_helper::embed_claim_author_stamped_with_grant) store through the known author \
+         instead).",
     ),
     (
         "epigraph-mcp/src/operator.rs",

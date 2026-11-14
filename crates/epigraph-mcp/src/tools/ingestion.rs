@@ -1821,9 +1821,9 @@ pub async fn do_ingest_document_reporting(
 /// task on the server's tracker (`crate::background`).
 ///
 /// Each vector is stored as the walk's AUTHOR, with the team-write grant the
-/// walk wrote under ([`store_created_claim_vector`]), not through
-/// `McpEmbedder::embed_and_store`. That path resolves a claim's author by
-/// reading the claim as PUBLIC, and a document ingest that names no visibility
+/// walk wrote under (`claim_helper::embed_claim_author_stamped_with_grant`),
+/// not through `McpEmbedder::embed_and_store`. That path resolves a claim's
+/// author by reading the claim as PUBLIC, and a document ingest that names no visibility
 /// lands in the author's team or private, never public (backlog 46902f71): on
 /// such a claim it found no author and stored nothing, and only a WARN said so.
 /// The walk already knows the author and the grant, as
@@ -1864,33 +1864,26 @@ fn spawn_created_claim_embeds(
     server.background_tasks().spawn(async move {
         let mut stored = 0usize;
         for (id, content) in queue {
-            let pgvec = match bg.embedder.generate(&content).await {
-                Ok(v) => crate::embed::format_pgvector(&v),
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %id,
-                        tool = tool_name,
-                        "background embedding failed (claim still stored): {e}"
-                    );
-                    continue;
-                }
-            };
-            match store_created_claim_vector(&bg, author, grant.as_ref(), id, &pgvec, tool_name)
+            // A server DECLARED to run on a privileged pool (the operator
+            // `ingest-document` CLI on `MaintenancePool`, mirroring
+            // `begin_ingest_tx`) has no tenancy context to stamp: the
+            // embedder's own declared privileged store applies there.
+            let one = if bg.scoped.is_none() && bg.privileged_pool.is_some() {
+                bg.embedder.embed_and_store(id, &content).await
+            } else {
+                crate::claim_helper::embed_claim_author_stamped_with_grant(
+                    &bg,
+                    author,
+                    grant.as_ref(),
+                    id,
+                    &content,
+                    None,
+                    tool_name,
+                )
                 .await
-            {
-                Ok(true) => stored += 1,
-                Ok(false) => tracing::warn!(
-                    claim_id = %id,
-                    tool = tool_name,
-                    "background embedding stored nothing (claim missing, sealed, superseded, \
-                     or not writable by its author)"
-                ),
-                Err(e) => tracing::warn!(
-                    claim_id = %id,
-                    tool = tool_name,
-                    "background embedding store failed: {e}. The claim is stored but carries \
-                     no vector until the maintenance backfill reaches it"
-                ),
+            };
+            if one {
+                stored += 1;
             }
         }
         if stored == queued {
@@ -1911,33 +1904,6 @@ fn spawn_created_claim_embeds(
         }
     });
     queued
-}
-
-/// Store one created claim's vector as its author, with `grant`; on a server
-/// DECLARED to run on a privileged pool (the operator `ingest-document` CLI on
-/// `MaintenancePool`, mirroring [`begin_ingest_tx`]) there is no tenancy context
-/// to stamp, so the embedder's own declared privileged store is used.
-async fn store_created_claim_vector(
-    server: &EpiGraphMcpFull,
-    author: Uuid,
-    grant: Option<&epigraph_db::TeamWriteGrant>,
-    claim_id: Uuid,
-    pgvec: &str,
-    tool_name: &'static str,
-) -> Result<bool, String> {
-    if server.scoped.is_none() && server.privileged_pool.is_some() {
-        return server.embedder.store_vector(claim_id, pgvec).await;
-    }
-    crate::claim_helper::store_embedding_author_stamped_with_grant(
-        server.scoped.as_ref(),
-        &server.pool,
-        author,
-        grant,
-        claim_id,
-        pgvec,
-        tool_name,
-    )
-    .await
 }
 
 /// URN prefix for a synthesized (non-DOI) document identity key.
