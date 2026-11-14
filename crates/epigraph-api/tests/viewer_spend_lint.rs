@@ -465,6 +465,21 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "provenance::record_provenance",
         ],
     ),
+    // stamped / write (backlog f64cf9c6): the author is the caller; its key
+    // read (`agents`, untenanted), the trace and its best-effort edge run on
+    // ONE `AppState::write_as` transaction, so the database decides the
+    // trace's owner (`reasoning_traces_attach_writer`) and refuses what the
+    // caller may not write. Provenance is the audit-trail append.
+    (
+        "crud.rs",
+        "create_reasoning_trace",
+        &[
+            "AgentRepository::get_by_id",
+            "ReasoningTraceRepository::create",
+            "belief::create_edge_under_savepoint",
+            "provenance::record_provenance",
+        ],
+    ),
     // untenanted: claim_themes; the centroid is computed from viewer-filtered
     // claims (`set_centroid_from_claims`).
     (

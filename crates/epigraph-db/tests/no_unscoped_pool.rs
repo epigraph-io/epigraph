@@ -768,7 +768,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-const HIGH_WATER: usize = 210;
+///
+/// 210 -> 207 (backlog f64cf9c6): `create_reasoning_trace` moved its three
+/// pool sites onto the caller's `AppState::write_as` transaction
+/// (`routes/crud.rs` 30 -> 27, keeping sites).
+const HIGH_WATER: usize = 207;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -971,7 +975,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 31 -> 30: `build_themes_from_corpus` (the k-means bootstrap, a corpus-wide
     // write on `state.db_pool`) was deleted with the prototype, backlog
     // a0ed0180. A removal, not a conversion.
-    ("routes/crud.rs", 30),
+    // 30 -> 27 (backlog f64cf9c6): `create_reasoning_trace` writes its author
+    // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
+    // transaction. Its provenance append stays on the pool, as every
+    // `record_provenance` call does.
+    ("routes/crud.rs", 27),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
