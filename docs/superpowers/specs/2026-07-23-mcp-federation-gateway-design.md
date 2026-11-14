@@ -166,8 +166,12 @@ signed token** (the downstream re-validates it), so the middleware also inserts
 `RawBearerToken(pub String)` into the request extensions alongside `AuthContext`.
 `call_tool` pulls it from `context.extensions.get::<http::request::Parts>()` →
 `parts.extensions.get::<RawBearerToken>()`. Present only on the HTTP path: **stdio has no
-bearer**, so a federated `tools/call` over stdio has no token to forward and is rejected
-(federated tools list over stdio, but cannot be invoked).
+bearer**, so a federated `tools/call` over stdio has no token to forward and is rejected,
+with a `denied:<ext>:<tool>` audit event like every other federated refusal. Federated
+tools are therefore listed only to a caller that presented a bearer over HTTP
+(`EpiGraphMcpFull::lists_federated_tools`): not over stdio, and not on the
+unauthenticated listener, whose principal-less context carries no token (backlog
+b6559e75).
 
 ### Scope gate (federated tools only)
 
@@ -176,10 +180,11 @@ compile-time `SCOPE_MAP`, so federated tools must **not** be added to `SCOPE_MAP
 coverage is a static test invariant). Instead a **separate** `enforce_federated_scope`
 checks the caller holds the extension's configured `scope=…`. `call_tool` branches to
 federation **only after** the static `tool_router` misses the name, so the static gate
-never runs for a federated tool and never runs the federated gate for a kernel tool. A
-kernel tool always wins a name clash (build-time collision detection only guards clashes
-*between extensions*; an extension-vs-kernel clash is the operator's `prefix=`
-responsibility).
+never runs for a federated tool and never runs the federated gate for a kernel tool.
+The two never share a name: `FederationRegistry::build` reserves every kernel tool name
+(`EpiGraphMcpFull::kernel_tool_names`) and refuses an extension that exports one, exactly as
+it refuses two extensions exporting the same name (backlog 351d3def). The operator resolves
+either clash with a `prefix=`.
 
 ## Data flow (federated call)
 
@@ -201,8 +206,28 @@ responsibility).
 
 - Downstream socket down at startup → its tools are **absent** from `tools/list`
   (logged); gateway serves everything else. Reconnect on a timer; tools reappear.
-- Downstream errors mid-call → surfaced as a normal MCP tool error.
-- Collision at startup (two servers, same tool name, no prefix) → **refuse to start**.
+- A mounted downstream is **re-listed** on every tick of the same timer (backlog
+  c19cdae0): a failed `tools/list` demotes it (its tools stop being listed and routed, and
+  the same tick re-dials it), and a changed list swaps its routes in one write. A per-call
+  session that cannot be opened triggers the same check at once, through the gateway's own
+  discovery session, so one caller's refused token never demotes it for everyone. Every
+  discovery `tools/list` is bounded (`LIST_TOOLS_TIMEOUT`, 10 s) and bypasses rmcp's
+  client response cache, which would otherwise answer the check from memory.
+- Downstream errors mid-call → the downstream's own MCP error reaches the caller
+  **unchanged** (code, message, data); `EpiGraphMcpFull::federated_call_error` (backlog
+  7ea4bd74). The exception is an internal error (`-32603`): its message is where a
+  downstream's driver text lands, so the gateway redacts it as it redacts its own and names
+  the extension instead. A downstream the gateway cannot open a session with is answered "extension
+  `<name>` unavailable", naming the extension and never its address.
+- A downstream that accepts a call and never answers → cut off at the extension's
+  `call_timeout_secs=` (default 300 s), and the caller is told it gave no answer and that
+  the call may still complete there.
+- Collision at startup (two extensions, or an extension and the kernel, exporting the same
+  effective tool name) → **refuse to start**.
+- Collision at runtime (an extension that reconnects, or re-lists, with a name the kernel
+  or another mounted extension already routes) → that one name is **not routed** to it, with
+  a warning; the rest of its tools are. The running gateway is never taken down, and the
+  clash is refused at the next start.
 
 ## Testing
 
