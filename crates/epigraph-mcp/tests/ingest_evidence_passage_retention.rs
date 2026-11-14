@@ -282,6 +282,9 @@ fn retention_allowlist_admits_only_open_redistributable_licences() {
         "CC0-1.0",
         "CC0",
         "public-domain",
+        "CC-BY-3.0-IGO",
+        "CC-BY-SA-3.0",
+        "CC-BY-SA",
     ] {
         assert!(ok(Some(open)), "{open} should permit retention");
     }
@@ -293,6 +296,16 @@ fn retention_allowlist_admits_only_open_redistributable_licences() {
         "Elsevier user license",
         "CC-BYX",
         "",
+        // Free-text spellings of restrictive licences (review of B60): each
+        // normalises to a string that starts with `CC-BY-` yet is NC/ND or
+        // not a licence id at all, so a prefix test would admit it.
+        "CC-BY-NonCommercial-4.0",
+        "CC BY 4.0 (non-commercial)",
+        "CC-BY-NoDerivatives-4.0",
+        "CC-BY-PROPRIETARY",
+        "CC-BY-4.0-NC",
+        "CC-BY-SA-4.0-ND",
+        "CC0-1.0-NC",
     ] {
         assert!(!ok(Some(closed)), "{closed} must not permit retention");
     }
