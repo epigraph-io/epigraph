@@ -337,7 +337,7 @@ jobs:
           cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
           --test cluster_graph_test
           -- --test-threads=1
-      - name: OAuth authorization-code tests marked #[ignore]
+      - name: "OAuth authorization-code tests marked #[ignore]"
         # 13 tests in tests/oauth_authorization_code.rs are
         # `#[ignore = "requires DATABASE_URL test DB"]`: the code-redeem,
         # consent and dynamic-client-registration paths (backlog d0c23a32).
@@ -347,7 +347,7 @@ jobs:
           cargo test -p epigraph-api --locked --no-fail-fast
           --test oauth_authorization_code
           -- --ignored --test-threads=1
-      - name: engine-integration suite including #[ignore]d tests
+      - name: "engine-integration suite including #[ignore]d tests"
         # Every DB-backed test in tests/engine-integration is #[ignore]d, so
         # the `workspace-rest` shard compiles the suite and runs none of it.
         # Its tests read back only the rows they wrote themselves and delete
