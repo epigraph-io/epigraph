@@ -70,6 +70,7 @@ pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;
 pub mod unified_bp;
+pub mod visibility_act;
 pub mod voi;
 pub mod workflow_promotion;
 

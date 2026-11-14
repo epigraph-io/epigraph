@@ -14,6 +14,12 @@
 //! * backlog 3b505b5c (2): a `harvester_sources` row whose fragments all moved
 //!   follows them (team / public); one whose fragments still disagree stays
 //!   and is counted as held.
+//! * backlog 31285392: the moved claim's cached belief is refolded for its new
+//!   audience. A claim whose cache folded a BBA citing evidence that stays
+//!   behind (pinned) serves, after the act, exactly the value of a control
+//!   claim that never had that BBA.
+//! * the refold fails closed: an operated agent whose session does not itself
+//!   write the target team is refused, and nothing moves.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -23,7 +29,8 @@ use common::*;
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ScopedPool, SessionGucMode};
+use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
+use epigraph_engine::edge_factor::recompute_claim_cached_belief;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::claims::submit_claim;
 use epigraph_mcp::tools::visibility::{publicize_claims, share_claims_with_team};
@@ -491,4 +498,201 @@ async fn publicize_carries_a_source_whose_fragments_all_went_public(pool: PgPool
     let events = audit(&pool, "claim.publicized").await;
     assert_eq!(events[0]["harvester_sources_moved"], 1, "{events:?}");
     assert_eq!(events[0]["harvester_sources_held"], 0, "{events:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31285392: the moved claim's cached belief
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `(pignistic_prob, belief, plausibility)` as stored on the claim.
+type Cache = (Option<f64>, Option<f64>, Option<f64>);
+
+async fn cache(pool: &PgPool, claim: Uuid) -> Cache {
+    sqlx::query_as("SELECT pignistic_prob, belief, plausibility FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("cache")
+}
+
+/// The cache as `agent` is served it, on its stamped app-role connection.
+async fn served_cache(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) -> Cache {
+    let v = viewer(pool, agent).await;
+    let mut conn = s.scoped.acquire_as(&v).await.expect("stamped connection");
+    sqlx::query_as("SELECT pignistic_prob, belief, plausibility FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("{agent} reads the claim's cache: {e}"))
+}
+
+fn same(a: &Cache, b: &Cache) -> bool {
+    let eq = |x: Option<f64>, y: Option<f64>| match (x, y) {
+        (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+        (None, None) => true,
+        _ => false,
+    };
+    eq(a.0, b.0) && eq(a.1, b.1) && eq(a.2, b.2)
+}
+
+/// The frame the submit's own BBA sits on, and its hypothesis count.
+async fn submit_frame(pool: &PgPool, claim: Uuid) -> (Uuid, i32) {
+    sqlx::query_as(
+        "SELECT mf.frame_id, array_length(f.hypotheses, 1) \
+           FROM mass_functions mf JOIN frames f ON f.id = mf.frame_id \
+          WHERE mf.claim_id = $1 ORDER BY mf.created_at LIMIT 1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("PREMISE: the submit wrote a BBA")
+}
+
+/// A strongly refuting BBA on `claim`, by `agent`, citing `evidence`, on the
+/// frame of the claim's submit BBA (so it folds into the same cache).
+async fn refuting_bba(pool: &PgPool, claim: Uuid, agent: Uuid, evidence: Uuid) {
+    let (frame, n) = submit_frame(pool, claim).await;
+    let all = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let mut masses = serde_json::Map::new();
+    masses.insert("1".to_string(), serde_json::json!(0.9));
+    masses.insert(all, serde_json::json!(0.1));
+    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
+        .await
+        .expect("evidence perspective");
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        Some(evidence),
+        &serde_json::Value::Object(masses),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        Some(evidence),
+    )
+    .await
+    .expect("store the refuting BBA");
+}
+
+/// The claim's cached belief refolded on an app-role transaction stamped as
+/// `agent` (the author), committed.
+async fn refold(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) {
+    let v = viewer(pool, agent).await;
+    let mut tx = s.scoped.begin_as(&v).await.expect("stamped tx");
+    recompute_claim_cached_belief(&mut tx, &v, claim)
+        .await
+        .expect("refold");
+    tx.commit().await.expect("commit");
+}
+
+/// Publicize: the claim's cache had folded a refuting BBA citing evidence
+/// that stays group-only (pinned). After the act every reader is served the
+/// value of a control claim that never had that BBA, not the old fold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_refolds_the_belief_without_the_bba_on_evidence_left_behind(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "casc-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "casc-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "a team finding", "team", Some(t)).await;
+    let control = write(&pool, &s, eve, "the same finding, public", "public", None).await;
+    let hidden = fixture::seed_evidence(&pool, c, "reference").await;
+    pin(&pool, hidden, eve).await;
+    refuting_bba(&pool, c, eve, hidden).await;
+    refold(&pool, &s, eve, c).await;
+    refold(&pool, &s, eve, control).await;
+    let stale = cache(&pool, c).await;
+    let expected = cache(&pool, control).await;
+    assert!(
+        expected.0.is_some() && !same(&stale, &expected),
+        "PREMISE: the team's fold took in the pinned BBA ({stale:?} vs control {expected:?})"
+    );
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    let served = served_cache(&pool, &s, carol, c).await;
+    assert!(
+        same(&served, &expected),
+        "a stranger is served the fold of what it may read ({served:?}), not the team's \
+         fold ({stale:?}); control {expected:?}"
+    );
+}
+
+/// Share: the private claim's cache had folded a refuting BBA citing evidence
+/// pinned in the home group. After the act the teammate is served the value
+/// of a control team claim that never had that BBA.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "casc-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "casc-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(&pool, &s, alice, "a private finding", "private", None).await;
+    let control = write(&pool, &s, alice, "the same finding, team", "team", Some(t)).await;
+    let hidden = fixture::seed_evidence(&pool, c, "reference").await;
+    pin(&pool, hidden, alice).await;
+    refuting_bba(&pool, c, alice, hidden).await;
+    refold(&pool, &s, alice, c).await;
+    refold(&pool, &s, alice, control).await;
+    let stale = cache(&pool, c).await;
+    let expected = cache(&pool, control).await;
+    assert!(
+        expected.0.is_some() && !same(&stale, &expected),
+        "PREMISE: the home fold took in the pinned BBA ({stale:?} vs control {expected:?})"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "evidence", hidden).await,
+        group(home),
+        "pinned"
+    );
+    let served = served_cache(&pool, &s, bob, c).await;
+    assert!(
+        same(&served, &expected),
+        "the teammate is served the fold of what the team may read ({served:?}), not the \
+         home fold ({stale:?}); control {expected:?}"
+    );
+}
+
+/// The refold fails closed. An agent its human operates writes a private
+/// claim (into the human's personal group, the agent's home) and shares it
+/// into a team the HUMAN writes: 206 admits the target through the operator
+/// arm, but the agent's own stamp does not write the team, so the refold
+/// could not reach the moved claim. The act is refused and nothing moves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_act_whose_session_cannot_refold_the_moved_claim_is_refused(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "human's team").await;
+    let (human, human_home) = fixture::seed_human_operator(&pool, "casc-human").await;
+    let (crew, _) = fixture::seed_agent_with_group(&pool, "casc-crew").await;
+    add_member(&pool, t, human, "writer").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
+            .await
+            .expect("live link");
+    }
+    let c = write(&pool, &s, crew, "crew draft", "private", None).await;
+    assert_eq!(tenancy(&pool, "claims", c).await, group(human_home));
+
+    let err = share(&pool, &s, crew, &[c], t)
+        .await
+        .expect_err("the crew agent's session does not write the team");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+    assert!(err.message.contains("does not itself write"), "{err:?}");
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(human_home),
+        "nothing moved"
+    );
+    assert!(audit(&pool, "claim.shared_with_team").await.is_empty());
 }

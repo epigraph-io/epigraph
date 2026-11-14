@@ -1927,6 +1927,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          the principal's home group and its writable teams, all or nothing, audited.",
     ),
     (
+        "claim_visibility.rs",
+        "claims_not_writable_on_session",
+        "READ, on the widening act's own caller-STAMPED transaction, of which of the ids the act \
+         just moved the SESSION cannot write: row security on the stamped connection is the \
+         read filter and `epigraph_writable_groups()` the write test, so the question is what \
+         the stamp may do, not what a viewer may see. Returns only ids the caller passed; its \
+         one caller (`epigraph_engine::visibility_act`) refuses the act on any id it returns.",
+    ),
+    (
         "security_event.rs",
         "workflow_caller_write",
         "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \
