@@ -320,6 +320,23 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE and TRUNCATE for every role, a superuser included, short of disabling \
          triggers.",
     ),
+    // ---- Migration 221: hierarchical outcome reports. ----------------------
+    (
+        "workflow_outcome_reports",
+        "UPDATE",
+        "An outcome report (221) is the record of what one report said and the result a \
+         retry with its key is answered with; nothing edits it. Under FORCE the absent \
+         UPDATE policy default-denies every non-superuser role, and 221 grants the \
+         application SELECT and INSERT only.",
+    ),
+    (
+        "workflow_outcome_reports",
+        "DELETE",
+        "An outcome report (221) is never deleted by the application; it goes with its \
+         workflow row (ON DELETE CASCADE). Under FORCE the absent DELETE policy \
+         default-denies every non-superuser role, and 221 grants the application SELECT \
+         and INSERT only.",
+    ),
     (
         "workflows",
         "DELETE",
@@ -414,6 +431,7 @@ const PROTECTED: &[&str] = &[
     "harvester_sources",
     "harvester_audit_reports",
     "workflows",
+    "workflow_outcome_reports",
 ];
 
 // ===========================================================================
@@ -1586,6 +1604,22 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              needs one of the two session arms beside it (`epigraph_bypass()` / \
              `epigraph_definer_bypass()`), i.e. the maintenance session or the \
              `epigraph_countersign_authorship` definer.",
+        ),
+        (
+            "workflow_outcome_reports_read",
+            "workflow_outcome_reports.workflow_id",
+            "221's read policy: its arm `EXISTS (SELECT 1 FROM workflows w WHERE w.id = \
+             workflow_outcome_reports.workflow_id)` names no session helper itself, but the \
+             subquery reads `workflows` with the reader's own rights, so it is \
+             `workflows_read` (183's session arms) that answers it: session-derived through \
+             the subquery, as `challenges_claim_readable` is through `claims`.",
+        ),
+        (
+            "workflow_outcome_reports_insert",
+            "workflow_outcome_reports.workflow_id",
+            "221's insert policy: the same `EXISTS` over `workflows` as its read policy, \
+             answered by `workflows_read` with the writer's own rights, so a report is \
+             written only on a workflow the session reads.",
         ),
         (
             "challenges_claim_readable",

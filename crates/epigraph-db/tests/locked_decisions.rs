@@ -2330,6 +2330,10 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     // Workflow rows (183, ruling R-74): tier-A since that migration, which
     // FORCEs the table itself; reached through `tier_a` in the test below.
     "workflows",
+    // Hierarchical outcome reports (221): FORCEd by the migration that creates
+    // them; their tenancy is inherited from the workflow row, so they carry no
+    // tenancy columns and are reached through WORKFLOW_REPORT_TABLES below.
+    "workflow_outcome_reports",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2435,6 +2439,10 @@ const GROUP_ROLE_TABLES: &[&str] = &["group_role_bindings"];
 /// `owner_group_id` columns, so it does not join `tier_a`.
 const ROLE_AGENT_TABLES: &[&str] = &["role_agents"];
 
+/// The hierarchical outcome reports (221), FORCEd by the migration that
+/// creates them; row security inherited from `workflows`.
+const WORKFLOW_REPORT_TABLES: &[&str] = &["workflow_outcome_reports"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2498,6 +2506,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(AGENT_IDENTITY_TABLES.iter().map(|s| (*s).to_string()))
         .chain(GROUP_ROLE_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ROLE_AGENT_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(WORKFLOW_REPORT_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()
