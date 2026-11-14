@@ -54,7 +54,7 @@ The frame of discernment — the finite set of mutually-exclusive hypotheses ove
 
 ## hierarchical extraction
 
-The canonical ingest pipeline that decomposes a source into thesis (level 0) → section (level 1) → paragraph (level 2) → atom (level 3), with `decomposes_to` edges linking each level to its children; the source itself is a `papers` row that `asserts` each of those claims. Tier 1 hierarchical extraction (`extract-claims` → `ingest_document`) is the only supported ingest path; legacy flat extraction and Jina embeddings break primary-column search and are not used. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+The canonical ingest pipeline that decomposes a source into thesis (level 0) → section (level 1) → paragraph (level 2) → atom (level 3), with `decomposes_to` edges linking each level to its children; the source itself is a `papers` row that `asserts` each of those claims. The `extract-claims` skill produces it with `structure_source` (verbatim sections and paragraphs) → LLM atoms → `ingest_document_inline`; `ingest_document` and the two-phase `ingest_document_spine` write the same tree. Flat extraction (the `ingest_literature` CLI) gives recall no tree to draw context from, and Jina embeddings must not go in the primary embedding column. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## MCP
 

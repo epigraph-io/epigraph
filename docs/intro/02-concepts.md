@@ -359,13 +359,34 @@ papers row ──asserts──▶ each claim above
 
 **Every embedded claim is a search candidate; the hierarchy is context.** The `recall_with_context` MCP tool runs vector kNN over every claim that carries an embedding — paragraphs, atoms, sections, workflow steps, and claims written on their own with `submit_claim` or `memorize` — then *batches in* the structural context for each hit: its parent paper and section, its atoms (level 3), its sibling paragraphs in the same section (level 2), its corroborating and epistemic edges, and its neighbor paragraphs. Parentage is an enrichment attribute, not an eligibility filter: a hit with no paper attribution comes back without a `paper` key and with `section: null`, rather than being dropped. The hierarchy lists (atoms, siblings, neighbor paragraphs) are filled only for paragraph hits; corroborating and epistemic edges come from the hit's own edges whatever its level (backlog `a1d89aab`, drain U082). Paragraphs are still the unit of meaning the hierarchy is built around — an atom on its own strips away its surrounding context, and a 50-page document averages out into a single embedding that does not retrieve well — which is why the tree's context travels with every hit that has one. Earlier versions searched level-2 paragraphs only; an exactly matching standalone claim then lost to weaker paragraphs because it was never a candidate.
 
-This shape exists only because ingestion *creates* it that way. The
-single canonical ingest path is **Tier 1 hierarchical extraction**:
-the `extract-claims` LLM extractor consumes a paper, emits
-paragraph- and atom-level claims as a tree, and the
-`ingest_document` writer lands them with the parent edges already
-in place. There is no supported flat-extraction path. Two
-historical failure modes are worth knowing about:
+This shape exists only because ingestion *creates* it that way.
+Hierarchical extraction is the canonical shape, and more than one
+writer produces it. The MCP server registers four document tools:
+
+- `structure_source` — read-only and deterministic. It splits raw
+  markdown or plain text into a `DocumentExtraction` whose sections
+  and paragraphs are byte-exact slices of the source, with the atoms
+  left empty. No LLM rewrites the spine text.
+- `ingest_document_inline` — the writer. It takes a complete
+  `DocumentExtraction` in the call and lands the thesis, sections,
+  paragraphs and atoms with their edges; when the extraction carries
+  `source_text` it re-verifies the spans against it. For an authored
+  record with no external source to quote (a lab-notebook entry, a run
+  summary), omit `source_text` and this one call is the whole path.
+- `ingest_document` — the same writer, reading the extraction from a
+  JSON file inside the server's working directory.
+- `ingest_document_spine` — phase 1 of a two-phase flow: it writes the
+  thesis, sections and paragraphs, ignores atoms, and returns the paths
+  of the paragraphs that are new, so only those are atomized before
+  `ingest_document_inline` adds the atoms.
+
+The `extract-claims` skill drives the first route for extracted
+sources: `structure_source`, then the LLM fills in atoms only, then
+`ingest_document_inline`. Outside MCP, the operator `ingest_document`
+CLI runs the document writer on the maintenance connection, and the
+`ingest_literature` CLI is a flat path: it submits each extracted
+claim as its own packet, with no tree. Two historical failure modes
+are worth knowing about:
 
 - **Jina embeddings in the primary column.** Earlier attempts at
   populating the primary embedding column with Jina vectors broke
@@ -411,7 +432,7 @@ A single recall hit for an ingested paragraph, abbreviated, looks like this — 
 
 Each batched list also carries a `_total` and `_truncated` field (e.g., `atoms_total`, `atoms_truncated`) so the caller can tell when the structural fan-out was clipped. The `truth_value` field on `RecallHit` is the claim's own `claims.truth_value`, reported unchanged; it is not what `min_truth` compares against. That is the hit's `belief_score`: the pignistic probability when the claim has a Dempster-Shafer cache, and `truth_value` when it does not (§3).
 
-**See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the whole-corpus kNN logic and the full `RecallHit` shape; user-memory `feedback_tier1_ingestion_only.md` for the single-canonical-ingest-path rule; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
+**See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the whole-corpus kNN logic and the full `RecallHit` shape; `docs/superpowers/specs/2026-06-18-deterministic-spine-ingest-design.md` for the verbatim-spine design; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
 
 ---
 
