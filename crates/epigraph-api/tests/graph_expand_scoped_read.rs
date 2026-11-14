@@ -555,12 +555,11 @@ async fn neighborhoods_expand_omits_a_stranger_claim_in_both_modes(pool: PgPool)
 /// `dense_routes_scoped_read.rs:61` names as executed by NO test in the
 /// workspace, and the one our branch's `035ceca1` swept with redaction.
 ///
-/// The `supports` edges are forced PUBLIC. That is load-bearing here in a way
-/// it is not elsewhere: `GraphViewRepository::compound_neighbors` carries NO
-/// marker on its `edges` traversal — only `/* {VISIBILITY:c} */` on the final
-/// `JOIN claims c` — so the claims predicate is the sole filter, and a
-/// trigger-stamped edge would have let this arm pass for a reason the handler
-/// does not actually implement.
+/// The `supports` edges are forced PUBLIC so that only the claims predicate
+/// (`/* {VISIBILITY:c} */` on the final `JOIN claims c`) can withhold a
+/// neighbour here. `compound_neighbors` now also filters its `edges` reads
+/// (backlog batch B08); a trigger-stamped edge would let this arm pass through
+/// the edge predicate alone, so it would no longer test the claims predicate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn compound_neighborhood_omits_a_neighbour_the_viewer_cannot_read(pool: PgPool) {
     let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "gx-cn-mine").await;
