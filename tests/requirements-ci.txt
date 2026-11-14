@@ -9,3 +9,5 @@ numpy==1.26.4
 scikit-learn==1.8.0
 umap-learn==0.5.11
 numba==0.64.0
+# tests/theme (scripts/atlas_links_core.py: Louvain communities, BSD-3)
+networkx==3.6.1
