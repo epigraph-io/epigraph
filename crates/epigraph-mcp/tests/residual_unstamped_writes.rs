@@ -331,10 +331,12 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
     // `raw_pool_register.rs` registers reads by their tenancy instead.
     (
     "claim_helper.rs",
-    "store_embedding_author_stamped",
+    "store_embedding_author_stamped_for",
     "The `&server.pool` here is the helper's READ pool: it resolves the author's viewer through \
      `epigraph_live_memberships` (SECURITY DEFINER) before the stamp exists. The WRITE inside that \
-     helper runs on `ScopedPool::begin_as`, which is the whole point of it.",
+     helper runs on `ScopedPool::begin_as`, which is the whole point of it. (The call moved from \
+     `store_embedding_author_stamped` to its grant-taking form with backlog 46902f71; the plain \
+     form now delegates to it and touches no pool itself.)",
 ),
     (
         "embed.rs",

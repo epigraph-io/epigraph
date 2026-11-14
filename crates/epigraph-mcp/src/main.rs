@@ -1213,16 +1213,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `epigraph_mcp::stdio_transport`.
         let (stdin, stdout) = rmcp::transport::stdio();
         let transport = epigraph_mcp::stdio_transport::stdio_server_transport(stdin, stdout);
+        // Taken before `serve` consumes the server: the detached tasks its
+        // tools spawn (a queued document walk, post-commit embedding) are
+        // waited for below.
+        let background = server.background_tasks();
         let service = server.serve(transport).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e
         })?;
 
         tracing::info!("EpiGraph MCP full-framework server running on stdio ({mode})");
-        service.waiting().await?;
+        let served = service.waiting().await;
+
+        // The client has disconnected. Returning now drops the runtime, which
+        // CANCELS whatever is still running on it: a walk the client was told
+        // was `queued` (nothing written), or the embedding of claims that have
+        // already committed (backlog b928ccc1). Wait for them, with a bound so
+        // a stuck provider call cannot hold the process open forever.
+        let pending = background.active();
+        if pending > 0 {
+            let drain = stdio_drain_timeout();
+            tracing::info!(
+                pending,
+                timeout_secs = drain.as_secs(),
+                "stdio client disconnected; waiting for background work to finish"
+            );
+            if !background.wait_idle(drain).await {
+                tracing::warn!(
+                    unfinished = background.active(),
+                    timeout_secs = drain.as_secs(),
+                    "exiting with background work unfinished: a queued ingest may have written \
+                     nothing, and committed claims may have no embedding until a backfill"
+                );
+            }
+        }
+        served?;
     }
 
     Ok(())
+}
+
+/// How long the stdio entry point waits, after its client disconnects, for
+/// detached work to finish: `EPIGRAPH_MCP_STDIO_DRAIN_SECS`, default 120. An
+/// unparseable value keeps the default; `0` waits not at all (the behaviour
+/// before the wait existed).
+fn stdio_drain_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        std::env::var("EPIGRAPH_MCP_STDIO_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120),
+    )
 }
 
 #[cfg(test)]

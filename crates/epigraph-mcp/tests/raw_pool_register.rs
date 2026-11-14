@@ -292,7 +292,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/claim_helper.rs",
-        "embed_claim_author_stamped",
+        "embed_claim_author_stamped_for",
         1,
         DELEGATES_THE_STAMP,
     ),
