@@ -43,8 +43,9 @@ atlas_nightly [--map M ...] [--apply] [--max-calls N] [--keep-runs K]
         `resolve_tree` (a leaf over the 100-node cap is split on the box by
         W3's fallback split, counted in `resplit_leaves`);
       - **links tree, incrementally, against the RESOLVED meaning tree**:
-        each previous leaf keeps its role (a mirror if most of its surviving
-        claims are unlinked now). An unlinked claim goes to the mirror of its
+        each previous leaf keeps its role (a mirror when the previous run's
+        `params.mirrors` record lists it; for a run with no record, when at
+        least half its surviving claims are unlinked now). An unlinked claim goes to the mirror of its
         meaning leaf, which holds exactly the unlinked claims of that leaf
         (W5b; an existing mirror leaf keyed to that meaning leaf is reused in
         place, a new one goes under the root). A new or newly linked claim
@@ -60,14 +61,15 @@ atlas_nightly [--map M ...] [--apply] [--max-calls N] [--keep-runs K]
         (claim text through W4's map-scoped read; agent display names and
         evidence text through a new map-scoped read, never empty, clipped to
         160 characters), W7's `build_leaf_flow_edges` weights;
-      - W6's `fill_positions`, warm-started from the previous run.
+      - the naming inputs: `plan_samples`, `read_member_texts` (the
+        map-scoped text read), `read_previous`.
    2. The snapshot transaction ROLLS BACK (it wrote nothing).
-   3. **Naming** with NO transaction open (W8's design): `plan_samples`,
-      `read_member_texts` (its own short read), `read_previous`,
-      `name_levels` under `--max-calls`.
+   3. W6's `fill_positions`, warm-started from the previous run, then
+      **naming** (`name_levels` under `--max-calls`), both with NO
+      transaction open (W8's design).
    4. **Unchanged night:** if every level equals the previous run's
-      (compared as JSON values per (hierarchy, group id), the `run_id` field
-      normalised, and the same level set) AND the snapshot epochs equal the
+      (compared as parsed contract documents per (hierarchy, group id), the
+      `run_id` field set to the previous run's, and the same level set) AND the snapshot epochs equal the
       previous run's, nothing is written (`"unchanged": true`). Documents
       equal but epochs moved: the run IS written, so the map is `current`
       again. (Epochs alone cannot gate the skip: a claim INSERT and a theme
@@ -127,7 +129,7 @@ results, or let the nightly carry the map.
 |---|---|
 | `crates/epigraph-db/src/repos/atlas_map.rs` | `prune_runs`, `lock_map_for_publish`, `maps_with_finished_runs`, `run_hierarchies` |
 | `crates/epigraph-db/src/repos/atlas_leaf.rs` | `node_labels` (agents, evidence under the map predicate) |
-| `crates/epigraph-db/src/repos/claim_theme.rs` | `count_unthemed_embedded`, `themes_over_member_cap` |
+| `crates/epigraph-db/src/repos/atlas_meaning.rs` | `unthemed_embedded_count`, `themes_over_member_cap` (viewer-spliced, no new exemption) |
 | `crates/epigraph-db/src/repos/maintenance_lock.rs` | `ATLAS_NIGHTLY_LOCK_KEY` |
 | `crates/epigraph-cli/src/atlas_nightly/previous.rs` | pure: the previous run's trees from its stored rows |
 | `crates/epigraph-cli/src/atlas_nightly/incremental.rs` | pure: the meaning and links updates, collapse, re-mint |
