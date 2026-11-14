@@ -534,7 +534,8 @@ fn extraction_atomicity(extraction: &DocumentExtraction) -> Option<serde_json::V
             "compound_atoms": compound,
             "examples": examples,
             "note": "These atoms appear to assert several independent things (conjunct_count \
-                     >= 2). They were ingested as submitted; nothing was refused. Split them \
+                     >= 2). The ingest proceeds exactly as it would without this warning; \
+                     nothing is refused. Split them \
                      in the extraction, or later with decompose_claims --redecompose, so a \
                      dispute can target the one assertion it disputes.",
         })

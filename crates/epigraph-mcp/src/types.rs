@@ -506,9 +506,9 @@ pub struct QueryCompoundClaimsParams {
     pub limit: Option<u32>,
 
     #[schemars(
-        description = "Most claims to read and screen in this call (default 2000, at most \
-                       10000). The walk stops at the first of limit hits or max_scan reads; \
-                       next_cursor resumes it."
+        description = "Most claims of the population to screen in this call (default 2000, \
+                       at most 10000). The walk stops at the first of limit hits or max_scan \
+                       screened; next_cursor resumes it."
     )]
     #[serde(default)]
     pub max_scan: Option<u32>,
@@ -1607,9 +1607,10 @@ pub struct AtomicityWarning {
 
 /// The [`AtomicityWarning::note`] every warning carries.
 pub const ATOMICITY_WARNING_NOTE: &str =
-    "This text appears to assert several independent things (conjunct_count >= 2). It was \
-     written as submitted; nothing was refused. Consider submitting each assertion as its own \
-     claim, so a later dispute can target the one it disputes.";
+    "This text appears to assert several independent things (conjunct_count >= 2). The call \
+     was handled exactly as it would be without this warning; nothing was refused. Consider \
+     submitting each assertion as its own claim, so a later dispute can target the one it \
+     disputes.";
 
 impl AtomicityWarning {
     /// The warning for `content`, or `None` when it does not screen compound.
