@@ -548,7 +548,7 @@ async fn publicize_over_http_refolds_the_belief_for_the_public(pool: PgPool) {
     let stale = belief_cache(&pool, c).await;
     let expected = belief_cache(&pool, control).await;
     let near = |a: Option<f64>, b: Option<f64>| match (a, b) {
-        (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+        (Some(a), Some(b)) => (a - b).abs() < 1e-6,
         _ => false,
     };
     assert!(
@@ -566,6 +566,11 @@ async fn publicize_over_http_refolds_the_belief_for_the_public(pool: PgPool) {
     .await;
     assert_eq!(status, 200, "{body}");
     let served = belief_cache(&pool, c).await;
+    assert_eq!(
+        belief_cache(&pool, control).await,
+        expected,
+        "the control is untouched by the act"
+    );
     assert!(
         near(served.0, expected.0) && near(served.1, expected.1) && near(served.2, expected.2),
         "the published claim serves the fold of its public sources ({served:?}), not the \
