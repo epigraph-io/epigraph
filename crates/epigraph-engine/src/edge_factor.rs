@@ -1173,6 +1173,38 @@ pub fn is_known_evidence_type_key_in(key: &str, profile: &BeliefProfile) -> bool
         || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
 }
 
+/// The `mass_functions.locality_tag` values a caller may send (backlog
+/// 86ee2d30), sorted.
+///
+/// The fold distinguishes only two classes, read off
+/// `global_source_strength`'s `compose_with_locality`: a tag that begins
+/// with `intra` composes the intra-locality factor, and every other tag the
+/// cross factor. So `intra_self_cite` (what `finish_edge_bba` writes) and
+/// the bare `intra` shorthand both discount, `cross` and `unknown` do not.
+/// The global test is case-sensitive, so the claim's cached belief does NOT
+/// discount `Intra_self_cite`; a perspective-scoped read
+/// ([`effective_source_strength_profiled`]) lowercases the tag first and
+/// does. Every known tag is lowercase, so a known tag folds the same way in
+/// both.
+///
+/// `intra_methodological_overlap` is left out on purpose: no write path emits
+/// it yet, and it is 28 characters against the column's `varchar(20)`
+/// (migration 045, see [`LOCALITY_TAG_MAX_CHARS`]), so storing it fails.
+pub const KNOWN_LOCALITY_TAGS: &[&str] = &["cross", "intra", "intra_self_cite", "unknown"];
+
+/// The longest `mass_functions.locality_tag` the column stores, in
+/// characters: it is `varchar(20)` (migration 045). A longer tag is a
+/// database error at write time, so write paths refuse it up front.
+pub const LOCALITY_TAG_MAX_CHARS: usize = 20;
+
+/// Whether `tag` is in [`KNOWN_LOCALITY_TAGS`]. A tag outside it is stored
+/// as given and never refused: a misspelt intra tag (`self-cite`) just
+/// silently gets no discount, which is why callers report it.
+#[must_use]
+pub fn is_known_locality_tag(tag: &str) -> bool {
+    KNOWN_LOCALITY_TAGS.contains(&tag)
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
 /// keys that aren't in the known vocabulary of the profile the combine folds
 /// under.

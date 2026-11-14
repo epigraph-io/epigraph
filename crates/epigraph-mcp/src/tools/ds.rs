@@ -223,6 +223,12 @@ pub async fn submit_ds_evidence(
     } else {
         "unknown"
     };
+    // A tag that is STORED must fit the column (`varchar(20)`, migration 045).
+    // A longer one used to reach the INSERT and come back as a redacted
+    // internal error with nothing written, so this refusal changes no call
+    // that succeeds today; a tag sent without `evidence_type` is dropped, not
+    // stored, and is never refused.
+    check_stored_locality_tag_len(stored_locality_tag)?;
     if calibrated_evidence_type.is_none() {
         let reliability = params.reliability.unwrap_or(1.0).clamp(0.0, 1.0);
         if reliability < 1.0 {
@@ -398,6 +404,23 @@ pub async fn submit_ds_evidence(
         }
         _ => Vec::new(),
     };
+    // The same silent-failure class for `locality_tag` (backlog 86ee2d30):
+    // a tag outside the vocabulary is stored and folded as cross (no
+    // discount), and a tag sent without `evidence_type` is dropped.
+    warnings.extend(locality_tag_warning(
+        calibrated_evidence_type.is_some(),
+        params.locality_tag.as_deref(),
+    ));
+    // The machine-readable twin of that warning, like `unknown_keys` is for
+    // `evidence_type`: set only for a STORED tag outside the vocabulary.
+    let unknown_locality_tag = params
+        .locality_tag
+        .as_deref()
+        .filter(|tag| {
+            calibrated_evidence_type.is_some()
+                && !epigraph_engine::edge_factor::is_known_locality_tag(tag)
+        })
+        .map(str::to_string);
 
     // Migration 114: on a public claim this caller does not own, the BBA is the
     // caller's own row, but the claim's frame assignment and its cached belief
@@ -671,6 +694,7 @@ pub async fn submit_ds_evidence(
         deduplicated: write_outcome.deduplicated(),
         warnings,
         unknown_keys,
+        unknown_locality_tag,
     })
 }
 
@@ -743,6 +767,67 @@ async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, 
         .ok()
         .flatten()
         .is_some_and(|m| m.contains_key(&et.to_lowercase()))
+}
+
+/// The warning a `submit_ds_evidence` call earns for its `locality_tag`, if
+/// any (backlog 86ee2d30). Never a refusal, like the `evidence_type` warning.
+///
+/// - Sent without `evidence_type`: the tag is dropped and the BBA stored with
+///   `"unknown"` (see the reliability fork in [`submit_ds_evidence`]). Sending
+///   `"unknown"` itself changes nothing, so it earns no warning.
+/// - Sent with `evidence_type` but outside
+///   [`epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS`]: stored as given,
+///   and the fold discounts it only if it begins with `intra`.
+fn locality_tag_warning(
+    evidence_type_supplied: bool,
+    locality_tag: Option<&str>,
+) -> Option<String> {
+    let tag = locality_tag?;
+    if !evidence_type_supplied {
+        return (tag != "unknown").then(|| {
+            format!(
+                "locality_tag={tag:?} was ignored: it is only consulted together with \
+                 evidence_type, so this BBA was stored with locality_tag \"unknown\" and no \
+                 locality discount."
+            )
+        });
+    }
+    if epigraph_engine::edge_factor::is_known_locality_tag(tag) {
+        return None;
+    }
+    // The claim's cached belief folds with the case-sensitive
+    // `starts_with("intra")`; a perspective-scoped read lowercases first
+    // (`effective_source_strength_profiled`), so a capitalised intra tag is
+    // the one case where the two disagree.
+    let effect = if tag.starts_with("intra") {
+        "it begins with \"intra\", so the intra-locality discount still applies"
+    } else if tag.to_lowercase().starts_with("intra") {
+        "the claim's cached belief combines it as cross-source evidence, with NO locality \
+         discount (that check is case-sensitive), while a perspective-scoped read lowercases \
+         it and DOES apply the intra discount; send it lowercase"
+    } else {
+        "it is combined as cross-source evidence, with NO locality discount"
+    };
+    Some(format!(
+        "locality_tag={tag:?} is not in the locality vocabulary; it was stored as given, and \
+         {effect}. Known tags: {}.",
+        epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS.join(", ")
+    ))
+}
+
+/// Refuse a `locality_tag` that would be stored but cannot fit the column
+/// ([`epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS`], counted in
+/// characters as `varchar` does).
+fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
+    let max = epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS;
+    let len = stored.chars().count();
+    if len > max {
+        return Err(invalid_params(format!(
+            "locality_tag is {len} characters; at most {max} are stored. Known tags: {}.",
+            epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// The `warnings` a `submit_ds_evidence` call earns by sending a deprecated
@@ -1172,6 +1257,58 @@ mod tests {
             .expect_err(&format!("{masses} must be refused"));
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{masses}");
         err.message.into_owned()
+    }
+
+    /// Backlog 86ee2d30: a `locality_tag` outside the vocabulary, or one sent
+    /// without `evidence_type`, used to change the belief (or not) with no
+    /// signal. Each case names what the fold does with it.
+    #[test]
+    fn locality_tag_warning_names_what_the_fold_does() {
+        for tag in ["cross", "intra", "intra_self_cite", "unknown"] {
+            assert_eq!(locality_tag_warning(true, Some(tag)), None, "{tag}");
+        }
+        assert_eq!(locality_tag_warning(true, None), None);
+        assert_eq!(locality_tag_warning(false, None), None);
+        assert_eq!(locality_tag_warning(false, Some("unknown")), None);
+
+        let w = locality_tag_warning(true, Some("self-cite")).expect("misspelt intra tag");
+        assert!(
+            w.contains("\"self-cite\"")
+                && w.contains("NO locality discount")
+                && w.contains("intra_self_cite"),
+            "{w}"
+        );
+        // The cached belief's check is case-sensitive, a perspective-scoped
+        // read's is not: the warning must say both, not just "no discount".
+        let w = locality_tag_warning(true, Some("Intra_self_cite")).expect("capitalised");
+        assert!(
+            w.contains("cached belief")
+                && w.contains("NO locality discount")
+                && w.contains("perspective-scoped read")
+                && w.contains("DOES apply the intra discount"),
+            "{w}"
+        );
+        let w = locality_tag_warning(true, Some("self-cite")).expect("misspelt");
+        assert!(!w.contains("perspective-scoped"), "{w}");
+        let w = locality_tag_warning(true, Some("intra_other")).expect("unlisted intra tag");
+        assert!(w.contains("discount still applies"), "{w}");
+
+        let w = locality_tag_warning(false, Some("intra_self_cite")).expect("dropped tag");
+        assert!(w.contains("ignored") && w.contains("evidence_type"), "{w}");
+    }
+
+    /// A stored tag longer than the `varchar(20)` column is refused as a
+    /// parameter error naming the limit; 20 characters (or 20 multi-byte
+    /// characters, which is more than 20 bytes) still pass.
+    #[test]
+    fn an_over_long_stored_locality_tag_is_refused_by_characters() {
+        assert!(check_stored_locality_tag_len("unknown").is_ok());
+        assert!(check_stored_locality_tag_len(&"a".repeat(20)).is_ok());
+        assert!(check_stored_locality_tag_len(&"é".repeat(20)).is_ok());
+        let err = check_stored_locality_tag_len("intra_methodological_overlap")
+            .expect_err("28 characters");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("28 characters") && err.message.contains("20"));
     }
 
     /// Backlog 2fe81d61: on the write path an unparseable focal key became the
