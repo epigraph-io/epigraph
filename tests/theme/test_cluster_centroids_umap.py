@@ -66,3 +66,35 @@ def test_load_refuses_a_run_222_could_not_backfill(db, capsys):
     with pytest.raises(SystemExit):
         C.load_centroids_from_db(db, OTHER_RUN)
     assert "no umap_centroid for cluster(s) [1]" in capsys.readouterr().err
+
+
+def test_reseeding_a_pre_222_row_clears_its_stale_padded_centroid(db):
+    """A run stored before 222 holds the padded `centroid` (plus the
+    umap_centroid 222 backfilled from it). Re-seeding it must clear the padded
+    copy: docs/runbooks/222-undo.sql re-pads only rows whose `centroid` IS
+    NULL, so a stale padded value left in place would be what a rolled-back
+    script reads after an undo, not the current centroid."""
+    old = _centroids(k=1, seed=3)[0]
+    padded = np.zeros(1536, dtype=np.float32)
+    padded[: C.UMAP_DIM] = old
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO cluster_centroids "
+            "(cluster_run_id, cluster_id, centroid, umap_centroid, claim_count) "
+            "VALUES (%s, 0, %s::vector, %s::vector, 0)",
+            (RUN, "[" + ",".join(map(str, padded.tolist())) + "]",
+             "[" + ",".join(map(str, old.tolist())) + "]"),
+        )
+    db.commit()
+
+    new = _centroids(k=1, seed=4)
+    C.store_centroids(db, RUN, new)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT centroid IS NULL FROM cluster_centroids "
+            "WHERE cluster_run_id = %s AND cluster_id = 0",
+            (RUN,),
+        )
+        assert cur.fetchone() == (True,)
+    got, _ = C.load_centroids_from_db(db, RUN)
+    np.testing.assert_allclose(got, new, rtol=1e-6)

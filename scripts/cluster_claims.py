@@ -195,7 +195,9 @@ def seed_phase(conn, sample_size, k, run_id, all_claims=False):
 def store_centroids(conn, run_id, centroids):
     """Store the (k, UMAP_DIM) k-means centroids of `run_id` in
     cluster_centroids.umap_centroid (vector(32), migration 222), one row per
-    cluster id. The legacy zero-padded `centroid` column is not written."""
+    cluster id. The legacy zero-padded `centroid` column is cleared, so a
+    pre-222 row re-seeded under the same run keeps no stale padded copy for
+    docs/runbooks/222-undo.sql (which re-pads only NULL rows) to resurrect."""
     centroids = np.asarray(centroids, dtype=np.float32)
     if centroids.ndim != 2 or centroids.shape[1] != UMAP_DIM:
         raise ValueError(f"expected (k, {UMAP_DIM}) centroids, got {centroids.shape}")
@@ -206,7 +208,8 @@ def store_centroids(conn, run_id, centroids):
                     (cluster_run_id, cluster_id, umap_centroid, claim_count)
                 VALUES (%s, %s, %s::vector, 0)
                 ON CONFLICT (cluster_run_id, cluster_id) DO UPDATE SET
-                    umap_centroid = EXCLUDED.umap_centroid
+                    umap_centroid = EXCLUDED.umap_centroid,
+                    centroid = NULL
             """, (run_id, cluster_id, json.dumps(centroid.tolist())))
     conn.commit()
 
