@@ -278,8 +278,9 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // level / source-type sample. Its sibling, the count / mean / median
     // aggregate over the same radius, was never counted: `sqlx_call_offsets`
     // stops at the first `>` of a turbofish, and that call's was
-    // `query_as::<_, (i64, Option<f64>, Option<f64>)>`. Both are now
-    // `ClaimRepository::{neighborhood_density_stats, neighborhood_density_breakdown}`,
+    // `query_as::<_, (i64, Option<f64>, Option<f64>)>`. Both now call the
+    // repo methods the MCP `embedding_neighborhood_density` tool already used,
+    // `ClaimRepository::{embedding_radius_density, embedding_radius_breakdown}`,
     // each marking `c`, on the caller's `read_as` connection.
     // `hypothesis.rs` was 1 until `tenancy/fix-security-track` and is now 0, so
     // it is gone from the register entirely. The site was

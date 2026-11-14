@@ -96,7 +96,9 @@ pub async fn neighborhood_density(
     // claims.embedding via the `<=>` cosine-distance operator. Cosine
     // similarity = 1 - cosine_distance. Filter is `similarity >= 1 - radius`
     // in distance space because pgvector indexes operate on distance.
-    let stats = epigraph_db::ClaimRepository::neighborhood_density_stats(
+    // The same two viewer-spliced reads the MCP `embedding_neighborhood_density`
+    // tool runs, so the transports share one copy of the SQL.
+    let (n_claims, mean_opt, median_opt) = epigraph_db::ClaimRepository::embedding_radius_density(
         &mut *read,
         &viewer,
         &embedding_str,
@@ -106,13 +108,12 @@ pub async fn neighborhood_density(
     .map_err(|e| ApiError::InternalError {
         message: format!("density aggregate failed: {e}"),
     })?;
-    let n_claims = stats.n_claims;
-    let mean_similarity = stats.mean_similarity.unwrap_or(0.0);
-    let median_similarity = stats.median_similarity.unwrap_or(0.0);
+    let mean_similarity = mean_opt.unwrap_or(0.0);
+    let median_similarity = median_opt.unwrap_or(0.0);
 
     // Sample for level + source_type breakdown. Use max_sample to bound
     // worst-case scan even when n_claims is huge.
-    let breakdown_rows = epigraph_db::ClaimRepository::neighborhood_density_breakdown(
+    let breakdown_rows = epigraph_db::ClaimRepository::embedding_radius_breakdown(
         &mut *read,
         &viewer,
         &embedding_str,

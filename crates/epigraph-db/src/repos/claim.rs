@@ -2166,88 +2166,6 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
-    /// Count, mean and median cosine similarity of the current, embedded claims
-    /// within `radius` (cosine DISTANCE) of `query_vector`, over the claims
-    /// `viewer` may read.
-    ///
-    /// The aggregate half of `epigraph-api`'s
-    /// `POST /api/v1/embeddings/neighborhood-density`. It was an inline
-    /// statement in `routes/embeddings.rs` on the raw pool with no viewer, so
-    /// every number it returned was a function of claims the caller may not
-    /// read. `viewer_route_table_lint.rs` never counted it: its scanner stops
-    /// at the first `>` of a turbofish, and this statement's was
-    /// `query_as::<_, (i64, Option<f64>, Option<f64>)>`. Its sibling
-    /// [`Self::neighborhood_density_breakdown`] was counted.
-    ///
-    /// `query_vector` is pgvector literal text (`"[0.1,0.2,...]"`), matched
-    /// against the 1536-d `embedding` column.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    pub async fn neighborhood_density_stats<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        query_vector: &str,
-        radius: f64,
-    ) -> Result<NeighborhoodDensityStats, DbError> {
-        let sql = viewer.splice(
-            "SELECT COUNT(*)::bigint AS n_claims, \
-                    AVG(1 - (c.embedding <=> $1::vector))::float8 AS mean_similarity, \
-                    percentile_cont(0.5) WITHIN GROUP \
-                        (ORDER BY 1 - (c.embedding <=> $1::vector))::float8 AS median_similarity \
-             FROM claims c \
-             WHERE c.embedding IS NOT NULL \
-               AND c.is_current = true \
-               AND (c.embedding <=> $1::vector) <= $2 \
-               /* {VISIBILITY:c} */",
-            3,
-        );
-        let mut q = sqlx::query_as::<_, NeighborhoodDensityStats>(&sql)
-            .bind(query_vector)
-            .bind(radius);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        Ok(q.fetch_one(executor).await?)
-    }
-
-    /// `(properties->>'level', properties->>'source_type')` of the at most
-    /// `max_sample` nearest current, embedded claims within `radius` of
-    /// `query_vector`, over the claims `viewer` may read, nearest first.
-    ///
-    /// The breakdown half of `POST /api/v1/embeddings/neighborhood-density`;
-    /// see [`Self::neighborhood_density_stats`].
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    pub async fn neighborhood_density_breakdown<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        query_vector: &str,
-        radius: f64,
-        max_sample: i64,
-    ) -> Result<Vec<(Option<String>, Option<String>)>, DbError> {
-        let sql = viewer.splice(
-            "SELECT c.properties->>'level' AS lvl, c.properties->>'source_type' AS src \
-             FROM claims c \
-             WHERE c.embedding IS NOT NULL \
-               AND c.is_current = true \
-               AND (c.embedding <=> $1::vector) <= $2 \
-               /* {VISIBILITY:c} */ \
-             ORDER BY c.embedding <=> $1::vector \
-             LIMIT $3",
-            4,
-        );
-        let mut q = sqlx::query_as::<_, (Option<String>, Option<String>)>(&sql)
-            .bind(query_vector)
-            .bind(radius)
-            .bind(max_sample);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        Ok(q.fetch_all(executor).await?)
-    }
-
     /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
     ///
     /// **Legacy behavior:** dedups on `content_hash` alone (NOT on
@@ -12411,17 +12329,6 @@ async fn migrate_consolidated_edges(
 /// `belief`, `plausibility` and `similarity` are `Option` because the columns
 /// are nullable and the caller supplies its own defaults — the shape the route
 /// layer already had, preserved so the move changes no arithmetic.
-/// The aggregate [`ClaimRepository::neighborhood_density_stats`] returns.
-#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-pub struct NeighborhoodDensityStats {
-    /// Visible current claims within the radius.
-    pub n_claims: i64,
-    /// Mean cosine similarity over them; `None` when there are none.
-    pub mean_similarity: Option<f64>,
-    /// Median cosine similarity over them; `None` when there are none.
-    pub median_similarity: Option<f64>,
-}
-
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct GroundedNeighbor {
     /// `claims.id`.

@@ -6,7 +6,7 @@
 //! | route | repo read |
 //! |---|---|
 //! | `GET /api/v1/conflicts/scan` (`high_conflict`) | `ConflictDensityRepository::high_conflict_claims` |
-//! | `POST /api/v1/embeddings/neighborhood-density` | `ClaimRepository::{neighborhood_density_stats, neighborhood_density_breakdown}` |
+//! | `POST /api/v1/embeddings/neighborhood-density` | `ClaimRepository::{embedding_radius_density, embedding_radius_breakdown}` |
 //! | `GET /api/v1/inflation-index/leaderboard` | `PoliticalRepository::get_inflation_leaderboard` |
 //!
 //! # The instrument, and the two proofs each route gets
