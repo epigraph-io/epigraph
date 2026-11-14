@@ -6,38 +6,24 @@
 //! - `POST /api/v1/papers` — Create or upsert a paper by DOI
 //! - `GET  /api/v1/papers` — List papers with optional `?doi=` filter
 //!
-//! # Tenancy: shard 4 measured this file and converted NOTHING
+//! # Tenancy: the listing reads as the caller; the writer does not
 //!
-//! That is the result of the measurement, not an omission from it.
+//! `GET /api/v1/papers` returns, beside each `papers` row, the paper's
+//! authors and its claim count, and both depend on who asks: an assertion or
+//! a claim the caller cannot read is neither counted nor listed. So `list_papers` takes a
+//! [`ViewerExtractor`](crate::middleware::bearer::ViewerExtractor) and runs
+//! every statement, the `papers` page included, on ONE viewer-stamped
+//! connection ([`AppState::read_as`]); the enrichment reads live in the repo
+//! layer (`PaperRepository::{count_readable_claims_of_papers,
+//! first_ingest_principals, list_authors_bounded}`), where the visibility
+//! markers apply. `ViewerExtractor` refuses a token with no agent id (401);
+//! every token the server issues carries one (`oauth::token::principal_agent_id`).
 //!
-//! `epigraph-db/tests/no_unscoped_pool.rs` records 8 sites here, and the recon
-//! that sized conversion shard 4 classified all 8 as reads. Re-measured against
-//! the tree and the schema, neither half of that holds, and the register keeps
-//! its row at 8:
-//!
-//! * **Two of the eight are writes** (`create_paper`'s `UPDATE papers` and its
-//!   `INSERT ... RETURNING`, the latter issued as a `fetch_one` so a needle
-//!   looking for `execute` misses it). `read_as` is read-only by construction;
-//!   see `routes/belief.rs`'s module doc for why routing a write through it is a
-//!   silent rollback rather than a compile error.
-//! * **Neither handler holds a `Viewer`**, so all eight sites would need an
-//!   extractor added to BOTH `#[cfg]` arms before any of them could be
-//!   converted. Both routes already sit on the authenticated router, so that is
-//!   not an anonymous-access change — but `ViewerExtractor` additionally refuses
-//!   a token that carries no agent id, which IS a callable behaviour change and
-//!   needs its own evidence.
-//! * **Converting the remaining six would have moved `HIGH_WATER` by 6 and
-//!   changed no row this endpoint returns.** That is the operational
-//!   conclusion of a schema measurement taken at migration head 092; the
-//!   measurement itself is registered as `F-SHARD4-A3` and is not restated
-//!   here. The ratchet counts these sites because its needle is textual.
-//!
-//! So converting this file would have cost a real behaviour change and bought
-//! a counter movement — the exact trade the ratchet's own module doc warns a
-//! shard against ("check the CONTROL before the counter").
-//!
-//! `F-SHARD4-A3` needs an operator decision and this batch is not positioned to
-//! make it. Analysis held outside this repository.
+//! `create_paper` is unchanged and still runs on the raw pool: its two writes
+//! (`UPDATE papers`, `INSERT ... RETURNING`) cannot run on `read_as`, which is
+//! read-only by construction (`routes/belief.rs`'s module doc says why a write
+//! routed through it is a silent rollback), and `papers` carries no row
+//! security. `epigraph-db/tests/no_unscoped_pool.rs` counts its 4 sites.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -95,10 +81,48 @@ fn default_limit() -> i64 {
     20
 }
 
+/// One author of a listed paper, from its `authored` edge.
+#[derive(Serialize, Debug, Clone)]
+pub struct PaperAuthorItem {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    /// The extraction's author index, when recorded.
+    pub position: Option<i64>,
+    /// `"author"` unless the edge records another role.
+    pub role: String,
+    pub affiliations: Vec<String>,
+    /// On a pending author only: the ingester that named them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub named_by: Option<Uuid>,
+}
+
+/// One paper of `GET /api/v1/papers`: the row, and what the caller may read
+/// of its provenance.
+#[derive(Serialize, Debug)]
+pub struct PaperListItem {
+    #[serde(flatten)]
+    pub paper: PaperResponse,
+    /// ONE ingest's authors (the paper's first ingest readable by the
+    /// caller, `authors_ingested_by`), in position order: one ingest's
+    /// author list is never mixed with another's. At most 50, with
+    /// `authors_truncated`.
+    pub authors: Vec<PaperAuthorItem>,
+    /// Authors that ingest named without speaking for them, awaiting their
+    /// countersignature. Never listed under `authors`.
+    pub pending_authors: Vec<PaperAuthorItem>,
+    pub authors_truncated: bool,
+    /// Whose ingest the author lists are; `null` when no ingest of the paper
+    /// is readable.
+    pub authors_ingested_by: Option<Uuid>,
+    /// The claims any ingest of the paper asserts, each once, whose
+    /// assertion is in force and readable and which the caller can read.
+    pub claim_count: i64,
+}
+
 /// Paginated paper response
 #[derive(Serialize, Debug)]
 pub struct PaginatedPaperResponse {
-    pub items: Vec<PaperResponse>,
+    pub items: Vec<PaperListItem>,
     pub total: i64,
     pub limit: i64,
     pub offset: i64,
@@ -239,8 +263,13 @@ pub async fn create_paper(
 /// List papers with optional DOI filter
 ///
 /// GET /api/v1/papers?doi=10.1234/example&limit=20&offset=0
+///
+/// Each item carries the paper's authors and claim count as the caller's
+/// viewer sees them ([`PaperListItem`]). Every statement runs on one
+/// viewer-stamped connection (module doc).
 #[cfg(feature = "db")]
 pub async fn list_papers(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<PaperListParams>,
 ) -> Result<Json<PaginatedPaperResponse>, ApiError> {
@@ -249,86 +278,152 @@ pub async fn list_papers(
 
     use sqlx::Row;
 
-    if let Some(ref doi) = params.doi {
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_papers",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let (rows, total): (Vec<sqlx::postgres::PgRow>, i64) = if let Some(ref doi) = params.doi {
         // DOI lookup under every spelling of the document key (the same
         // normalizer the writer and the MCP tools use), canonical first.
         let spellings = epigraph_db::repos::paper::document_key_spellings(doi);
-        let rows: Vec<_> = sqlx::query(
+        let rows = sqlx::query(
             "SELECT id, doi, title, journal, created_at FROM papers \
              WHERE doi = ANY($1) ORDER BY array_position($1, doi) LIMIT $2 OFFSET $3",
         )
         .bind(&spellings)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db_pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query papers: {e}"),
         })?;
-
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = ANY($1)")
             .bind(&spellings)
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *read)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to count papers: {e}"),
             })?;
-
-        let items = rows
-            .iter()
-            .map(|r| PaperResponse {
-                id: r.get("id"),
-                doi: r.get("doi"),
-                title: r.get("title"),
-                journal: r.get("journal"),
-                created_at: r.get("created_at"),
-            })
-            .collect();
-
-        Ok(Json(PaginatedPaperResponse {
-            items,
-            total,
-            limit,
-            offset,
-        }))
+        (rows, total)
     } else {
-        // Full list
-        let rows: Vec<_> = sqlx::query(
-            "SELECT id, doi, title, journal, created_at FROM papers ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        let rows = sqlx::query(
+            "SELECT id, doi, title, journal, created_at FROM papers \
+             ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db_pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query papers: {e}"),
         })?;
-
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *read)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to count papers: {e}"),
             })?;
+        (rows, total)
+    };
 
-        let items = rows
-            .iter()
-            .map(|r| PaperResponse {
-                id: r.get("id"),
-                doi: r.get("doi"),
-                title: r.get("title"),
-                journal: r.get("journal"),
-                created_at: r.get("created_at"),
-            })
-            .collect();
+    let papers: Vec<PaperResponse> = rows
+        .iter()
+        .map(|r| PaperResponse {
+            id: r.get("id"),
+            doi: r.get("doi"),
+            title: r.get("title"),
+            journal: r.get("journal"),
+            created_at: r.get("created_at"),
+        })
+        .collect();
+    let ids: Vec<Uuid> = papers.iter().map(|p| p.id).collect();
 
-        Ok(Json(PaginatedPaperResponse {
-            items,
-            total,
-            limit,
-            offset,
-        }))
-    }
+    let enrich = |e: epigraph_db::DbError| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_papers",
+            "paper provenance read failed"
+        );
+        ApiError::InternalError {
+            message: "Failed to read paper provenance".to_string(),
+        }
+    };
+    let counts =
+        epigraph_db::PaperRepository::count_readable_claims_of_papers(&mut *read, &viewer, &ids)
+            .await
+            .map_err(enrich)?;
+    let firsts = epigraph_db::PaperRepository::first_ingest_principals(&mut *read, &viewer, &ids)
+        .await
+        .map_err(enrich)?;
+    let writers: Vec<(Uuid, Uuid, i32)> = firsts
+        .iter()
+        .map(|(paper, p)| (*paper, p.ingested_by, 0))
+        .collect();
+    let mut authors = epigraph_db::PaperRepository::list_authors_bounded(
+        &mut *read,
+        &viewer,
+        &ids,
+        i64::try_from(epigraph_db::authored_by::MAX_PAPER_AUTHORS).unwrap_or(i64::MAX),
+        &writers,
+        &[],
+    )
+    .await
+    .map_err(enrich)?;
+    crate::routes::finish_scoped_read(read, "list_papers").await?;
+
+    let items = papers
+        .into_iter()
+        .map(|paper| {
+            let id = paper.id;
+            let (listed, authors_truncated) = authors.remove(&id).unwrap_or_default();
+            let mut plain = Vec::new();
+            let mut pending = Vec::new();
+            for (a, _) in listed {
+                let item = PaperAuthorItem {
+                    id: a.agent_id,
+                    display_name: a.display_name,
+                    position: a.position,
+                    role: a.role,
+                    affiliations: a.affiliations,
+                    named_by: if a.pending_countersign {
+                        a.written_by
+                    } else {
+                        None
+                    },
+                };
+                if a.pending_countersign {
+                    pending.push(item);
+                } else {
+                    plain.push(item);
+                }
+            }
+            PaperListItem {
+                paper,
+                authors: plain,
+                pending_authors: pending,
+                authors_truncated,
+                authors_ingested_by: firsts.get(&id).map(|p| p.ingested_by),
+                claim_count: counts.get(&id).copied().unwrap_or(0),
+            }
+        })
+        .collect();
+
+    Ok(Json(PaginatedPaperResponse {
+        items,
+        total,
+        limit,
+        offset,
+    }))
 }
 
 /// List papers (placeholder - no database)

@@ -768,7 +768,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-const HIGH_WATER: usize = 210;
+/// 210 -> 206: `list_papers` moved its four reads onto `AppState::read_as`
+/// (backlog fe75ef36); `routes/papers.rs` keeps `create_paper`'s four.
+const HIGH_WATER: usize = 206;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1057,16 +1059,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // deleted — see `routes/search.rs` and `routes/voids.rs` below — which is
     // what makes it the first multi-file shard in the series.
     //
-    // `routes/papers.rs` is UNCHANGED at 8, deliberately. Shard 4 was sized to
-    // include this file and then measured it: two of the eight sites write,
-    // neither handler holds a `Viewer`, and adding one to both `#[cfg]` arms is
-    // a callable behaviour change. A schema measurement taken in the same pass
-    // is registered as `F-SHARD4-A3` and is not restated here; its operational
-    // conclusion is that converting the remaining six would move this counter
-    // and change no row the endpoint returns. That file's module doc carries
-    // the reasoning. This row is the series' example of a file that is COUNTED
-    // and not convertible.
-    ("routes/papers.rs", 8),
+    // `routes/papers.rs` was 8. Shard 4 measured it and converted nothing:
+    // two of the eight sites write, and neither handler held a `Viewer`.
+    // Backlog fe75ef36 / b7354adc then gave `GET /api/v1/papers` per-viewer
+    // fields (authors, claim count, ingestions), so `list_papers` took a
+    // `ViewerExtractor` and moved its four reads onto `AppState::read_as`.
+    // The four that remain are `create_paper`'s, two of them writes.
+    ("routes/papers.rs", 4),
     // 5 before conversion shard 5, which moved `list_perspectives`,
     // `get_perspective` and `agent_perspectives` onto `AppState::read_as`. The
     // two that remain both WRITE -- `create_perspective` (which also creates a

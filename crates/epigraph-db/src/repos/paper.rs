@@ -674,13 +674,7 @@ impl PaperRepository {
             "SELECT k.by::uuid, k.first_at \
                FROM (SELECT {by} AS by, min(e.created_at) AS first_at \
                        FROM edges e \
-                      WHERE ((e.source_id = $1 AND e.source_type = 'paper' \
-                              AND e.target_type = 'claim' AND e.relationship = 'asserts') \
-                          OR (e.target_id = $1 AND e.target_type = 'paper' \
-                              AND e.source_type = 'agent' AND e.relationship = 'authored')) \
-                        AND {in_force} \
-                        AND {marked} \
-                        AND {by} ~ '^[0-9a-fA-F]{{8}}-([0-9a-fA-F]{{4}}-){{3}}[0-9a-fA-F]{{12}}$' \
+                      WHERE {edge} \
                         AND ($2::bool OR e.visibility = 'public' \
                              OR (e.owner_group_id = ANY($3::uuid[]) \
                                  AND (e.co_owner_group_id IS NULL \
@@ -689,8 +683,7 @@ impl PaperRepository {
               ORDER BY k.first_at, k.by \
               LIMIT $4",
             by = crate::repos::ingest_written::ingest_written_by_sql("e"),
-            in_force = crate::repos::edge::EDGE_IN_FORCE,
-            marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+            edge = ingest_principal_edge_sql("$1"),
         );
         let rows: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(&sql)
             .bind(paper_id)
@@ -704,6 +697,107 @@ impl PaperRepository {
             .map(|(ingested_by, first_written_at)| PaperIngestPrincipal {
                 ingested_by,
                 first_written_at,
+            })
+            .collect())
+    }
+
+    /// The claim count of each of `paper_ids` as `viewer` sees it, for a
+    /// listing of papers: per paper, the claims any ingest of it asserts
+    /// (its ingest-written `paper -asserts-> claim` edges), each claim once,
+    /// counted only while the assertion is in force and both the assertion
+    /// AND the claim are readable by `viewer`. Retirement state is not
+    /// filtered (as [`Self::list_asserted_claims`]). A paper with no such
+    /// claim maps to 0. One statement for the whole page.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, paper_ids))]
+    pub async fn count_readable_claims_of_papers<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, i64>, DbError> {
+        if paper_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            &format!(
+                "SELECT p.id, \
+                        (SELECT COUNT(DISTINCT e.target_id) \
+                           FROM edges e \
+                           JOIN claims c ON c.id = e.target_id \
+                          WHERE e.source_id = p.id \
+                            AND e.source_type = 'paper' \
+                            AND e.target_type = 'claim' \
+                            AND e.relationship = 'asserts' \
+                            AND {in_force} \
+                            AND {marked} \
+                            /* {{EDGE_VISIBILITY:e}} */ \
+                            /* {{VISIBILITY:c}} */) \
+                   FROM unnest($1::uuid[]) AS p(id)",
+                in_force = crate::repos::edge::EDGE_IN_FORCE,
+                marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, i64)>(&sql).bind(paper_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
+    /// Each of `paper_ids`' FIRST readable ingest principal, as
+    /// [`Self::ingest_principals`] orders them (oldest readable in-force
+    /// ingest-written edge, then `by`): whose author list a listing of papers
+    /// shows ([`Self::list_authors_bounded`] with that one writer), the rule
+    /// `query_paper` applies when no `ingested_by` is named. A paper no
+    /// ingest of which `viewer` can read is absent. One statement.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, paper_ids))]
+    pub async fn first_ingest_principals<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, PaperIngestPrincipal>, DbError> {
+        if paper_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            &format!(
+                "SELECT p.id, k.by::uuid, k.first_at \
+                   FROM unnest($1::uuid[]) AS p(id) \
+                  CROSS JOIN LATERAL ( \
+                        SELECT {by} AS by, min(e.created_at) AS first_at \
+                          FROM edges e \
+                         WHERE {edge} \
+                           /* {{EDGE_VISIBILITY:e}} */ \
+                         GROUP BY 1 \
+                         ORDER BY 2, 1 \
+                         LIMIT 1) k",
+                by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+                edge = ingest_principal_edge_sql("p.id"),
+            ),
+            2,
+        );
+        let mut q =
+            sqlx::query_as::<_, (Uuid, Uuid, chrono::DateTime<chrono::Utc>)>(&sql).bind(paper_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(paper, ingested_by, first_written_at)| {
+                (
+                    paper,
+                    PaperIngestPrincipal {
+                        ingested_by,
+                        first_written_at,
+                    },
+                )
             })
             .collect())
     }
@@ -1156,6 +1250,27 @@ pub struct PaperAuthorEdge {
 /// whether more exist.
 pub type BoundedAuthorListings =
     std::collections::HashMap<Uuid, (Vec<(PaperAuthorListing, bool)>, bool)>;
+
+/// The provenance predicate over `e` that makes it one of paper `key`'s
+/// ingest-principal edges ([`PaperRepository::ingest_principals`],
+/// [`PaperRepository::first_ingest_principals`]): an in-force,
+/// ingest-written `paper -asserts-> claim` from the paper or `agent
+/// -authored-> paper` onto it, whose marker names a well-formed principal.
+/// Visibility is each caller's own (one spells it statically, one splices it).
+fn ingest_principal_edge_sql(key: &str) -> String {
+    format!(
+        "((e.source_id = {key} AND e.source_type = 'paper' \
+           AND e.target_type = 'claim' AND e.relationship = 'asserts') \
+       OR (e.target_id = {key} AND e.target_type = 'paper' \
+           AND e.source_type = 'agent' AND e.relationship = 'authored')) \
+         AND {in_force} \
+         AND {marked} \
+         AND {by} ~ '^[0-9a-fA-F]{{8}}-([0-9a-fA-F]{{4}}-){{3}}[0-9a-fA-F]{{12}}$'",
+        in_force = crate::repos::edge::EDGE_IN_FORCE,
+        marked = crate::repos::ingest_written::ingest_written_edge_sql("e"),
+        by = crate::repos::ingest_written::ingest_written_by_sql("e"),
+    )
+}
 
 /// The columns [`PaperRepository::list_authors`] and
 /// [`PaperRepository::list_authors_bounded`] read for one `authored` edge
