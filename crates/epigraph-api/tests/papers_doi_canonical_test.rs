@@ -179,8 +179,68 @@ async fn a_legacy_url_keyed_paper_is_found_by_the_bare_doi_and_not_twinned() {
     );
     assert_eq!(body["id"], legacy_id.to_string(), "{body}");
     assert_eq!(
-        body["title"], "canonical doi test",
-        "the upsert must have updated the row it found: {body}"
+        body["title"], "legacy",
+        "a POST that finds an existing row fills only NULL fields; it must not \
+         overwrite the title the row already carries (backlog 62ce37ca): {body}"
+    );
+}
+
+/// Backlog 62ce37ca on the REST writer: `papers` is one global row per
+/// document with no row security, so a second `POST /api/v1/papers` naming an
+/// existing DOI must not rewrite the first writer's title. It may fill a field
+/// that is still NULL; both halves are asserted, so a writer that ignored the
+/// second POST entirely would fail too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_post_fills_only_null_fields_of_an_existing_paper() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+    let doi = format!("10.5555/e2fill-only.{}", Uuid::new_v4());
+
+    let post = |title: &'static str, journal: Option<&'static str>| {
+        let doi = doi.clone();
+        let token = token.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/papers"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "doi": doi, "title": title, "journal": journal }))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            (status, body)
+        }
+    };
+
+    let (status, first) = post("first writer's title", None).await;
+    assert_eq!(status, 200, "{first}");
+    let (status, second) = post("second writer's title", Some("second writer's journal")).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second["id"], first["id"], "{second}");
+    assert_eq!(
+        second["title"], "first writer's title",
+        "a second POST must not overwrite an existing title: {second}"
+    );
+    assert_eq!(
+        second["journal"], "second writer's journal",
+        "a second POST still fills a NULL journal: {second}"
+    );
+
+    let stored: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT title, journal FROM papers WHERE doi = $1")
+            .bind(&doi)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        (
+            Some("first writer's title".to_string()),
+            Some("second writer's journal".to_string())
+        )
     );
 }
 

@@ -114,8 +114,9 @@ pub struct PaginatedPaperResponse {
 ///
 /// Inserts a new paper under the canonical document key
 /// (`epigraph_db::repos::paper::canonical_document_key`), or returns the
-/// existing one found under any spelling of that key, updating title/journal
-/// when provided.
+/// existing one found under any spelling of that key, filling title/journal
+/// only where the stored value is NULL (an existing value is never
+/// overwritten; backlog 62ce37ca).
 #[cfg(feature = "db")]
 pub async fn create_paper(
     State(state): State<AppState>,
@@ -158,14 +159,19 @@ pub async fn create_paper(
     })?;
 
     let row = if let Some(existing_row) = existing {
-        // Paper exists — update title/journal if new values provided, then
-        // re-fetch. By id: the row found may be keyed on a legacy spelling.
+        // Paper exists — fill title/journal only where the stored value is
+        // NULL, then re-fetch. By id: the row found may be keyed on a legacy
+        // spelling. Fill-only, not overwrite (backlog 62ce37ca): `papers` is
+        // one global row per document with no row security, so overwriting
+        // let any `claims:write` caller naming an existing DOI rewrite that
+        // paper's title for every reader. Same rule as
+        // `PaperRepository::get_or_create`.
         let existing_id: Uuid = existing_row.get("id");
         if request.title.is_some() || request.journal.is_some() {
             sqlx::query(
                 r#"UPDATE papers
-                   SET title   = COALESCE($2, title),
-                       journal = COALESCE($3, journal)
+                   SET title   = COALESCE(title, $2),
+                       journal = COALESCE(journal, $3)
                    WHERE id = $1"#,
             )
             .bind(existing_id)
@@ -196,8 +202,8 @@ pub async fn create_paper(
             r#"INSERT INTO papers (doi, title, journal)
                VALUES ($1, $2, $3)
                ON CONFLICT (doi) DO UPDATE SET
-                   title   = COALESCE(EXCLUDED.title, papers.title),
-                   journal = COALESCE(EXCLUDED.journal, papers.journal)
+                   title   = COALESCE(papers.title, EXCLUDED.title),
+                   journal = COALESCE(papers.journal, EXCLUDED.journal)
                RETURNING id, doi, title, journal, created_at"#,
         )
         .bind(&doi)
