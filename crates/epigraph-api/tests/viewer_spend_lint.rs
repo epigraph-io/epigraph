@@ -1113,15 +1113,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "db_pool.begin",
         ],
     ),
-    // gated (`write_target_of`) then write; the factors SELECT feeds the
-    // write's re-pointing.
+    // gated (`write_target_of`) then write. (The detached factors SELECT that
+    // only logged a count was deleted, backlog 79e1f75d.)
     (
         "versioning.rs",
         "supersede_claim",
         &[
             "ClaimRepository::supersede_act_conn",
             "ClaimVersionRepository::create",
-            "sqlx::query_as(SELECT).fetch_all",
             "supersede_session_or_deferral",
         ],
     ),

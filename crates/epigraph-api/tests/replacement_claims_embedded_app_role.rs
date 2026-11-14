@@ -128,7 +128,10 @@ async fn http_supersede_embeds_the_replacement_on_the_app_role(pool: PgPool) {
     .await
     .into_response();
     let (status, body) = json_of(resp).await;
-    assert!(status.is_success(), "the author supersedes: {status} {body}");
+    assert!(
+        status.is_success(),
+        "the author supersedes: {status} {body}"
+    );
     let new_id = uuid_field(&body, "new_claim_id");
 
     assert_eq!(
