@@ -65,8 +65,8 @@ A nested node loads its own document when it fills a third of the view, as regio
 and themes already do (design §6). The zoom ceiling follows the smallest attached
 nested node, so a deep leaf can be framed.
 
-**Encoding** (`atlas_nested.js`, from `sign`, `flow_basis` and `flow_weight` only,
-never from the relationship name):
+**Encoding** (`atlas_nested.js`, from `sign`, `flow_basis` and `flow_weight`,
+never from the relationship name, except a `none` evidence edge's tone: see §5):
 - width grows with `flow_weight`;
 - `proxy` is dashed and listed in the legend as an estimate, while `exact` is solid;
 - the sign sets the colour (support accent, opposing critical) and the particle
@@ -159,3 +159,40 @@ never from the relationship name):
 | Proxy marked estimate, opposing style, exact solid | JS style tests and the legend |
 | Colour still means belief; regions and themes unchanged | Existing `tests/atlas.rs` pass unchanged; the real page has no `data-atlas-maps` |
 | Preview impossible to enable by accident | Preview Rust tests (off by default, loopback only, banner) |
+
+## 5. Operator rulings 2026-11-13
+
+The level contract changed under this item, and the change was merged into this branch:
+
+- Evidence with no readable mass is served on its evidence-to-claim edge as `flow_basis`
+  `none`, with weight 0 and sign 0, whatever it says about the claim. That is the common case.
+- Because its sign is 0, a reader takes such an edge's direction from its `relationship`.
+- The contract adds a committed fixture, `team_leaf_sparse_mass`. Most of its evidence
+  edges are `none`, among them 7 that refute and 31 that support.
+
+What this item does about it:
+
+- **Edge style.** For every exact or proxy edge, `flow_basis`, `sign` and `flow_weight`
+  still drive the style. A `none` edge that `supports` takes the supporting tone, and one
+  that `refutes` or `contradicts` (either casing) takes the opposing tone. It is drawn as a
+  thin solid line with no particles and no arrow (`NO_MASS_WIDTH`, wider than a hairline so
+  the colour reads, thinner than any flow), set apart from exact flows and dashed estimates.
+  Any other `none` edge (an agent's authorship) stays a neutral hairline. `edgeStyle`
+  carries the stroke alpha as well, so what a viewer sees is decided, and tested, in one place.
+- **Legend.** The leaf legend gains "evidence, no stored mass". The side panel lists such an
+  edge with "no stored mass" where a flow shows its weight.
+- **Tests.** The node tests read the `none` edges from the committed `team_leaf_sparse_mass`
+  fixture:
+  - a refuting edge gets the opposing tone and no flow;
+  - a supporting edge (including one spelled `SUPPORTS`) gets the supporting tone and no flow;
+  - the massless line differs from exact flows (including an exact edge stored with weight 0)
+    and from dashed estimates;
+  - an exact edge is unchanged, and still follows its sign when its name disagrees.
+  A Rust page test checks the legend entry and its stylesheet class.
+- **Preview.** No preview leaf had a `none` evidence edge, so the generator now serves one
+  team leaf (the second theme, the root's second leaf, and its twin in the other hierarchy)
+  with the fixture's rule. Every evidence edge there is `none` except those of every fourth
+  evidence node. The rule draws nothing from the seeded generator, so the other 76 preview
+  levels and the v1 contract fixtures stay byte-identical. A contract test asserts that
+  the preview holds such a leaf in each hierarchy, with supporting and refuting `none`
+  edges among them. The existing tests still validate every preview payload.
