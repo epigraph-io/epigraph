@@ -431,6 +431,7 @@ async fn report_workflow_outcome_signs_its_evidence_under_v1(pool: PgPool) {
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow.to_string(),
             success: true,
             execution_log: vec![StepExecution {

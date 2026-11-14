@@ -78,7 +78,7 @@ use std::path::{Path, PathBuf};
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
 /// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
-///   `workflow_hierarchical.rs` 14).** Fixture assertions inside
+///   `workflow_hierarchical.rs` 17).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
 const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("ds.rs", 1, 0),
@@ -112,7 +112,9 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // read from the error message no longer reaches the caller. Fixture SQL.
     // 2 -> 0 production (backlog c34a0643): the counter lock read and UPDATE
     // moved to `WorkflowRepository::record_hierarchical_outcome`.
-    ("workflow_hierarchical.rs", 0, 14),
+    // Test sites 14 -> 17 (backlog 9928b61f): the report-row read-back, and
+    // the idempotency race test's holder lock and lock-wait poll. Fixture SQL.
+    ("workflow_hierarchical.rs", 0, 17),
     ("workflow_ingest.rs", 0, 10),
     // 2 -> 1 (ruling R-74, migration 183): `report_workflow_outcome`'s
     // routing probe moved to the repo layer

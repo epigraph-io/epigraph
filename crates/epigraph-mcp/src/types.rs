@@ -952,9 +952,15 @@ pub struct ReportWorkflowOutcomeParams {
     pub execution_log: Vec<StepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim; not stored for a workflows-table id."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim, and on the report's row for a workflows-table id (at most 65536 bytes)."
     )]
     pub outcome_details: String,
+
+    #[schemars(
+        description = "Optional idempotency key, for a workflows-table id only (1-200 characters, e.g. a UUID you generate once per run): a retry with the same key, from you, on the same workflow, writes nothing and returns the first report's result with idempotent_replay=true. Refused for a legacy flat workflow claim."
+    )]
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 
     #[schemars(
         description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)"
@@ -1086,9 +1092,15 @@ pub struct ReportHierarchicalOutcomeParams {
     pub step_executions: Vec<HierarchicalStepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Currently accepted but not stored."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Stored on the report's row (at most 65536 bytes), readable by whoever reads the workflow."
     )]
     pub outcome_details: String,
+
+    #[schemars(
+        description = "Optional idempotency key for this report (1-200 characters, e.g. a UUID you generate once per run). A retry with the same key, from you, on the same workflow, writes nothing and returns the FIRST report's result with idempotent_replay=true, so a timed-out report can be retried without counting the run twice. Without a key every call is a new report."
+    )]
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 
     #[schemars(
         description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)."

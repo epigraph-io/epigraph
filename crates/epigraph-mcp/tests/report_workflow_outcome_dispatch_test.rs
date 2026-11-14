@@ -73,6 +73,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             execution_log: vec![
@@ -153,6 +154,31 @@ async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool
         "legacy seed must not collide with workflows table"
     );
 
+    // A flat claim has no report row to key a retry on, so an idempotency key
+    // is refused (backlog 9928b61f) before anything is written, rather than
+    // accepted while the retry is still counted.
+    let refused = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        ReportWorkflowOutcomeParams {
+            idempotency_key: Some("flat-key".to_string()),
+            workflow_id: claim_id.to_string(),
+            success: true,
+            execution_log: vec![],
+            outcome_details: "keyed flat report".to_string(),
+            quality: Some(0.8),
+            goal_text: None,
+        },
+        None,
+    )
+    .await
+    .expect_err("a key on a flat workflow claim must be refused");
+    assert_eq!(
+        refused.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "{refused:?}"
+    );
+
     // Must succeed via the legacy claims-table path. Pre-fix this also worked;
     // the test exists to catch a regression where the new dispatch
     // accidentally drops the fallback.
@@ -160,6 +186,7 @@ async fn report_outcome_still_handles_legacy_flat_workflow_claim_id(pool: PgPool
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: claim_id.to_string(),
             success: true,
             execution_log: vec![StepExecution {
@@ -213,6 +240,7 @@ async fn report_outcome_404s_for_truly_unknown_id(pool: PgPool) {
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: bogus.to_string(),
             success: true,
             execution_log: vec![],

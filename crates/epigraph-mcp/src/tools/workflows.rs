@@ -1075,8 +1075,22 @@ pub async fn report_workflow_outcome(
             params.quality,
             params.goal_text.as_deref(),
             None,
+            crate::tools::workflow_hierarchical::OutcomeReportMeta {
+                outcome_details: &params.outcome_details,
+                idempotency_key: params.idempotency_key.as_deref(),
+            },
         )
         .await;
+    }
+
+    // A legacy flat workflow claim has no report row to key a retry on. Refuse
+    // a key rather than accept it and still count the retry (backlog 9928b61f).
+    // Worded for an unknown id too: this runs before the claim lookup.
+    if params.idempotency_key.is_some() {
+        return Err(invalid_params(format!(
+            "workflow {workflow_id} is not a workflows-table id you can read; \
+             `idempotency_key` is supported for workflows-table ids only"
+        )));
     }
 
     // Author = the request's principal (batch H-b, D1); signer = this server.

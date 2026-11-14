@@ -248,6 +248,7 @@ async fn an_inserted_step_is_at_its_position_for_every_plan_order_reader(pool: P
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             execution_log,

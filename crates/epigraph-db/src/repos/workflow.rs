@@ -215,6 +215,83 @@ pub fn hierarchical_outcome_variance(deviated: impl IntoIterator<Item = bool>) -
     }
 }
 
+/// Longest `idempotency_key` a hierarchical outcome report accepts, in
+/// characters (migration 221's CHECK counts the same way).
+pub const OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS: usize = 200;
+
+/// Longest `outcome_details` a hierarchical outcome report stores, in bytes
+/// (migration 221's CHECK).
+pub const OUTCOME_DETAILS_MAX_BYTES: usize = 65_536;
+
+/// Refuse an `idempotency_key` migration 221 would refuse: blank (empty or
+/// only whitespace) or longer than [`OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS`]. The
+/// message names the rule, for both transports to hand back as a 400 /
+/// invalid-params error before anything is written.
+///
+/// # Errors
+/// The reason the key is refused.
+pub fn validate_outcome_idempotency_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("`idempotency_key` must not be blank".to_string());
+    }
+    let n = key.chars().count();
+    if n > OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS {
+        return Err(format!(
+            "`idempotency_key` is {n} characters; the limit is {OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS}"
+        ));
+    }
+    Ok(())
+}
+
+/// What one hierarchical outcome report produced, transport-neutral: the
+/// counters after it, its own variance, and what happened to its step rows.
+/// Stored on the report's `workflow_outcome_reports` row (migration 221) so a
+/// retry with the same idempotency key is answered with exactly this, on
+/// either transport.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HierarchicalOutcomeResult {
+    #[serde(flatten)]
+    pub counters: HierarchicalOutcomeCounters,
+    /// The fraction of this report's step rows marked `deviated`.
+    pub variance: f64,
+    /// Step rows this report wrote (all of them: the report is all or nothing).
+    pub step_executions_written: usize,
+    /// The `step_index` values written with a NULL `step_claim_id`, in
+    /// request order.
+    pub unresolved_step_indices: Vec<usize>,
+}
+
+/// What [`WorkflowRepository::record_hierarchical_outcome`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HierarchicalOutcomeRecord {
+    /// No readable workflow row with this id, or the viewer reads none of the
+    /// plan's steps. Nothing was written; answer as an unknown id.
+    NotFound,
+    /// This reporter already reported on this workflow under this
+    /// idempotency key. Nothing was written; answer with the stored result.
+    Replayed {
+        report_id: Uuid,
+        result: HierarchicalOutcomeResult,
+    },
+    /// The counters moved. The caller writes the step rows and then the
+    /// report row ([`WorkflowRepository::insert_hierarchical_outcome_report`])
+    /// on the same transaction.
+    Recorded(HierarchicalOutcomeCounters),
+}
+
+/// One `workflow_outcome_reports` row to write; see
+/// [`WorkflowRepository::insert_hierarchical_outcome_report`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewHierarchicalOutcomeReport<'a> {
+    pub workflow_id: Uuid,
+    pub idempotency_key: Option<&'a str>,
+    pub success: bool,
+    pub quality: Option<f64>,
+    pub run_label: Option<&'a str>,
+    pub outcome_details: &'a str,
+    pub result: &'a HierarchicalOutcomeResult,
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -1238,10 +1315,10 @@ impl WorkflowRepository {
     }
 
     /// Record one hierarchical outcome report's COUNTERS on `workflows.metadata`:
-    /// lock the row, check that `viewer` reads the plan, recompute the rolling
-    /// counters and write them back. `Ok(None)` (and nothing written) when no
-    /// row with this id is readable or the viewer reads none of the plan's
-    /// steps; both transports answer that exactly like an unknown id.
+    /// lock the row, check that `viewer` reads the plan, answer a repeated
+    /// idempotency key with the stored result, else recompute the rolling
+    /// counters and write them back. See [`HierarchicalOutcomeRecord`] for the
+    /// three answers; only `Recorded` wrote anything.
     ///
     /// The one implementation of the counter half of `report_hierarchical_outcome`,
     /// shared by the MCP tool and the HTTP route (backlog c34a0643), which each
@@ -1256,23 +1333,36 @@ impl WorkflowRepository {
     /// writes the run's step rows on the same transaction keeps the report all
     /// or nothing.
     ///
+    /// # Idempotency (backlog 9928b61f)
+    ///
+    /// With `idempotency_key`, the key lookup runs AFTER the lock, on a fresh
+    /// statement: a retry that raced the original waits for it and then finds
+    /// its committed report row, so it is answered `Replayed` and moves no
+    /// counter. The key is scoped to (workflow, reporting principal); it runs
+    /// after the plan check too, so a caller that cannot read the plan learns
+    /// nothing about which keys exist. A key names ONE report: a reuse is
+    /// answered with the first report's result whatever else it says.
+    ///
     /// # Visibility
     ///
     /// Run it on the caller's STAMPED transaction. The lock read carries the
     /// row predicate (`{VISIBILITY:w}`), which agrees with `workflows`' own row
     /// security (migration 183); [`Self::viewer_reads_plan_structure`] then
     /// requires a readable STEP. The `UPDATE` is by primary key on the row the
-    /// predicate just admitted.
+    /// predicate just admitted, and the report rows are admitted by migration
+    /// 221's policies only through that same row.
     ///
     /// # Errors
-    /// Returns `DbError` if a query fails.
+    /// Returns `DbError` if a query fails, and `DbError::InvalidData` for a
+    /// stored result that does not decode.
     pub async fn record_hierarchical_outcome(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
         success: bool,
         variance: f64,
-    ) -> Result<Option<HierarchicalOutcomeCounters>, DbError> {
+        idempotency_key: Option<&str>,
+    ) -> Result<HierarchicalOutcomeRecord, DbError> {
         let sql = viewer.splice(
             "SELECT w.metadata FROM workflows w \
              WHERE w.id = $1 /* {VISIBILITY:w} */ \
@@ -1284,10 +1374,39 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         let Some(mut metadata) = q.fetch_optional(&mut *conn).await? else {
-            return Ok(None);
+            return Ok(HierarchicalOutcomeRecord::NotFound);
         };
         if !Self::viewer_reads_plan_structure(conn, viewer, workflow_id).await? {
-            return Ok(None);
+            return Ok(HierarchicalOutcomeRecord::NotFound);
+        }
+
+        if let Some(key) = idempotency_key {
+            let sql = viewer.splice(
+                "SELECT r.id, r.result FROM workflow_outcome_reports r \
+                 JOIN workflows w ON w.id = r.workflow_id \
+                 WHERE r.workflow_id = $1 \
+                   AND r.reporter_id IS NOT DISTINCT FROM $2 \
+                   AND r.idempotency_key = $3 \
+                   /* {VISIBILITY:w} */",
+                4,
+            );
+            let mut q = sqlx::query_as::<_, (Uuid, serde_json::Value)>(&sql)
+                .bind(workflow_id)
+                .bind(viewer.principal())
+                .bind(key);
+            if let Some(g) = viewer.group_bind() {
+                q = q.bind(g);
+            }
+            if let Some((report_id, stored)) = q.fetch_optional(&mut *conn).await? {
+                let result: HierarchicalOutcomeResult =
+                    serde_json::from_value(stored).map_err(|e| DbError::InvalidData {
+                        reason: format!(
+                            "workflow_outcome_reports {report_id}: stored result does not \
+                             decode: {e}"
+                        ),
+                    })?;
+                return Ok(HierarchicalOutcomeRecord::Replayed { report_id, result });
+            }
         }
 
         let counters = HierarchicalOutcomeCounters::after_report(&metadata, success, variance);
@@ -1297,7 +1416,63 @@ impl WorkflowRepository {
             .bind(workflow_id)
             .execute(&mut *conn)
             .await?;
-        Ok(Some(counters))
+        Ok(HierarchicalOutcomeRecord::Recorded(counters))
+    }
+
+    /// Write the `workflow_outcome_reports` row (migration 221) of a report
+    /// [`Self::record_hierarchical_outcome`] answered `Recorded`, on the SAME
+    /// transaction, after its step rows: what the report said (`success`,
+    /// `quality`, `run_label`, `outcome_details`, its idempotency key) and its
+    /// [`HierarchicalOutcomeResult`]. The reporter is `viewer`'s principal, the
+    /// same one the key lookup matched on. Returns the row id.
+    ///
+    /// The row is admitted by migration 221's policies only while the session
+    /// reads the workflow row; the caller has just locked that row through the
+    /// same viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the insert fails, including a duplicate key (which
+    /// the row lock rules out for callers that hold it).
+    pub async fn insert_hierarchical_outcome_report(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        report: NewHierarchicalOutcomeReport<'_>,
+    ) -> Result<Uuid, DbError> {
+        let result = serde_json::to_value(report.result).map_err(|e| DbError::InvalidData {
+            reason: format!("hierarchical outcome result does not encode: {e}"),
+        })?;
+        // The insert names the workflow by id; the row's own policy (migration
+        // 221) requires the session to read it, and the in-query predicate
+        // states the same rule so a reader of this function need not know it.
+        let sql = viewer.splice(
+            "INSERT INTO workflow_outcome_reports \
+                 (workflow_id, reporter_id, idempotency_key, success, quality, run_label, \
+                  outcome_details, result) \
+             SELECT w.id, $2, $3, $4, $5, $6, $7, $8 FROM workflows w \
+             WHERE w.id = $1 /* {VISIBILITY:w} */ \
+             RETURNING id",
+            9,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(report.workflow_id)
+            .bind(viewer.principal())
+            .bind(report.idempotency_key)
+            .bind(report.success)
+            .bind(report.quality)
+            .bind(report.run_label)
+            .bind(report.outcome_details)
+            .bind(result);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| DbError::InvalidData {
+                reason: format!(
+                    "workflow {} is not readable on this transaction; no outcome report written",
+                    report.workflow_id
+                ),
+            })
     }
 
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the

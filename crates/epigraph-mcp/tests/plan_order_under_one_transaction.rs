@@ -139,6 +139,7 @@ async fn report_outcome_attributes_each_step_index_to_its_planned_step(pool: PgP
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             execution_log,

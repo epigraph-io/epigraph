@@ -542,6 +542,7 @@ async fn report_workflow_outcome_on_a_world_workflow_claim_leaves_its_truth_alon
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: wf.to_string(),
             success: true,
             execution_log: vec![StepExecution {
@@ -578,6 +579,7 @@ async fn report_workflow_outcome_on_a_world_workflow_claim_leaves_its_truth_alon
 /// A clean successful outcome report, as the two seed cases below send it.
 fn clean_outcome(wf: Uuid) -> ReportWorkflowOutcomeParams {
     ReportWorkflowOutcomeParams {
+        idempotency_key: None,
         workflow_id: wf.to_string(),
         success: true,
         execution_log: vec![StepExecution {
