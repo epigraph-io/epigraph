@@ -180,22 +180,22 @@ pub fn switch_targets(
         for (g, inter) in overlap {
             let (b, depth) = info[&g];
             let union = a + b - inter;
-            let better = match best {
-                None => true,
-                Some((bg, bi, bu, bd)) => {
-                    // inter/union against bi/bu, exactly.
-                    let lhs = inter * bu;
-                    let rhs = bi * union;
-                    lhs > rhs || (lhs == rhs && (depth > bd || (depth == bd && g < bg)))
-                }
-            };
-            if better {
-                best = Some((g, inter, union, depth));
+            let cand = (g, inter, union, depth);
+            if best.is_none_or(|b| beats(cand, b)) {
+                best = Some(cand);
             }
         }
         out.insert(node.id, best.context("a links level with no claim")?.0);
     }
     Ok(out)
+}
+
+/// Whether switch candidate `a` beats `b`, each `(group, intersection,
+/// union, depth)`: the larger Jaccard `intersection / union` (compared
+/// exactly, by cross-multiplying), then the deeper group, then the smaller id.
+fn beats(a: (Uuid, usize, usize, u8), b: (Uuid, usize, usize, u8)) -> bool {
+    let (lhs, rhs) = (a.1 * b.2, b.1 * a.2);
+    lhs > rhs || (lhs == rhs && (a.3 > b.3 || (a.3 == b.3 && a.0 < b.0)))
 }
 
 /// The number of leaves of `tree`.
@@ -416,6 +416,27 @@ mod tests {
         let tree = check_tree(MAP, L, THEME, &[leaf(root, None, 0, &all)], &set(&all)).unwrap();
         let m: BTreeMap<Uuid, Uuid> = all.iter().map(|x| (*x, Uuid::from_u128(5))).collect();
         assert_eq!(check_mirrors(&tree, &set(&[c(1), c(2)]), &m).unwrap(), 0);
+    }
+
+    /// Jaccard first (exactly: 2/4 equals 3/6), then depth even against a
+    /// smaller id, then the smaller id.
+    #[test]
+    fn a_switch_tie_goes_to_the_deeper_group_then_the_smaller_id() {
+        let (small, large) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert!(
+            beats((large, 3, 4, 1), (small, 2, 4, 5)),
+            "higher Jaccard wins"
+        );
+        assert!(
+            beats((large, 2, 4, 2), (small, 3, 6, 1)),
+            "equal Jaccard: deeper wins"
+        );
+        assert!(!beats((small, 3, 6, 1), (large, 2, 4, 2)));
+        assert!(
+            beats((small, 2, 4, 2), (large, 2, 4, 2)),
+            "then the smaller id"
+        );
+        assert!(!beats((large, 2, 4, 2), (small, 2, 4, 2)));
     }
 
     #[test]
