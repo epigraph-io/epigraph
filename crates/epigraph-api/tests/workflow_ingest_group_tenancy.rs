@@ -1786,9 +1786,11 @@ async fn outcome_written(pool: &PgPool, workflow_id: Uuid) -> (Option<i64>, i64)
 
 /// A public generation 0 (`W1`) and a generation 1 (`W2`) declared into the
 /// operator group `og`, where W2 keeps W1's step 0 text and adds a step of its
-/// own: W2's plan has a public step (the one it shares with W1, through a
-/// public `executes` edge) and a group-private one. The fixture-shape
-/// assertions pin that mixed plan.
+/// own: W2's plan has a public step (the one it shares with W1) and a
+/// group-private one. W2's `executes` edge onto the shared public step is
+/// W2's group's (migration 219: the workflow endpoint contributes its row's
+/// tenancy to the meet; it used to be public). The fixture-shape assertions
+/// pin that mixed plan.
 async fn reused_step_generations(w: &World, pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     reused_step_generations_into(w, pool, name, w.og).await
 }
@@ -1835,8 +1837,9 @@ async fn reused_step_generations_into(
     );
     assert_eq!(
         (shared_steps[0].1.as_str(), shared_steps[0].2.as_str()),
-        ("public", "public"),
-        "fixture shape: the shared step and W2's executes edge to it are public: {shared_steps:?}"
+        ("public", "group"),
+        "fixture shape: the shared step is public and W2's executes edge to it is W2's \
+         group's: {shared_steps:?}"
     );
     let own_private: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges e JOIN claims c ON c.id = e.target_id \
@@ -3732,4 +3735,158 @@ async fn a_caller_that_does_not_write_the_inherited_group_cannot_add_a_generatio
             .await
             .expect("the declared generation's row");
     assert_eq!(row, ("group".to_string(), w.og), "the declaration wins");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A private generation's EDGES (backlog 630af617 (3), migration 219)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `(source, relationship)` of every edge into `target`, as `token` lists
+/// them over `GET /api/v1/edges`.
+async fn listed_into(w: &World, target: Uuid, relationship: &str, token: &str) -> BTreeSet<Uuid> {
+    let (status, out) = w
+        .api
+        .get(
+            &format!("/api/v1/edges?target_id={target}&relationship={relationship}"),
+            token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    out.as_array()
+        .unwrap_or_else(|| panic!("an edge array: {out}"))
+        .iter()
+        .map(|e| uuid_of(&e["source_id"]))
+        .collect()
+}
+
+/// The variant_of edges `child -> parent` (harness superuser).
+async fn variant_of_count(pool: &PgPool, child: Uuid, parent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'variant_of'",
+    )
+    .bind(child)
+    .bind(parent)
+    .fetch_one(pool)
+    .await
+    .expect("variant_of count")
+}
+
+/// Over HTTP, on the application role: a non-member listing the edges into
+/// the PUBLIC generation W1, or into the public step W1 and the private W2
+/// share, does not see W2. W2's parent link (`variant_of`) and its `executes`
+/// edge onto the shared step take W2's group from W2's row. Before 219 both
+/// were public, so a non-member who cannot read W2 learned that it exists,
+/// what it descends from and which public steps it runs. The member lists
+/// both; and a non-member reads none of W2's own edges.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_generations_edges_are_hidden_from_a_non_member(pool: PgPool) {
+    let w = world(&pool).await;
+    let (w1, w2) = reused_step_generations(&w, &pool, "acme-hidden-edges").await;
+    let step = shared_step(&pool, w1, w2).await;
+    assert_eq!(
+        variant_of_count(&pool, w2, w1).await,
+        1,
+        "CALIBRATION: W2 descends from W1"
+    );
+    let stranger = token(w.h2, READ_SCOPES);
+    let member = token(w.h, READ_SCOPES);
+
+    assert_eq!(
+        listed_into(&w, w1, "variant_of", &stranger).await,
+        BTreeSet::new(),
+        "a non-member does not see the private generation descending from the public one"
+    );
+    assert_eq!(
+        listed_into(&w, w1, "variant_of", &member).await,
+        BTreeSet::from([w2]),
+        "the member does"
+    );
+    assert_eq!(
+        listed_into(&w, step, "executes", &stranger).await,
+        BTreeSet::from([w1]),
+        "a non-member sees only the public plan running the shared public step"
+    );
+    assert_eq!(
+        listed_into(&w, step, "executes", &member).await,
+        BTreeSet::from([w1, w2]),
+        "the member sees both plans"
+    );
+
+    let (status, out) = w
+        .api
+        .get(&format!("/api/v1/edges?source_id={w2}"), &stranger)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out, json!([]), "a non-member reads none of W2's edges");
+    let (status, out) = w
+        .api
+        .get(&format!("/api/v1/edges?source_id={w2}"), &member)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert!(
+        out.as_array().is_some_and(|a| !a.is_empty()),
+        "CALIBRATION: the member reads W2's edges: {out}"
+    );
+}
+
+/// MCP `get_neighborhood` as `agent`: the source ids of the `relationship`
+/// edges into `node`.
+async fn mcp_sources_into(
+    w: &World,
+    pool: &PgPool,
+    agent: Uuid,
+    node: Uuid,
+    relationship: &str,
+) -> BTreeSet<Uuid> {
+    let viewer = epigraph_db::Viewer::resolve(pool, agent)
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::GetNeighborhoodParams = serde_json::from_value(json!({
+        "node_id": node.to_string(),
+        "relationship": relationship,
+        "direction": "incoming",
+        "limit": 200,
+    }))
+    .expect("the tool's parameters");
+    let out = epigraph_mcp::tools::graph::get_neighborhood(&w.c_server, &viewer, params)
+        .await
+        .unwrap_or_else(|e| panic!("get_neighborhood runs: {}", e.message));
+    tool_json(&out)["edges"]
+        .as_array()
+        .unwrap_or_else(|| panic!("an edges array"))
+        .iter()
+        .map(|e| uuid_of(&e["source_id"]))
+        .collect()
+}
+
+/// The MCP twin of [`a_private_generations_edges_are_hidden_from_a_non_member`]
+/// on the app-role server: `get_neighborhood` into W1 (`variant_of`) and into
+/// the shared step (`executes`) shows W2 to the member only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn over_mcp_a_private_generations_edges_are_hidden_from_a_non_member(pool: PgPool) {
+    let w = world(&pool).await;
+    let (w1, w2) = reused_step_generations(&w, &pool, "acme-hidden-edges-mcp").await;
+    let step = shared_step(&pool, w1, w2).await;
+
+    assert_eq!(
+        mcp_sources_into(&w, &pool, w.h2, w1, "variant_of").await,
+        BTreeSet::new(),
+        "a non-member does not see the private generation's parent link"
+    );
+    assert_eq!(
+        mcp_sources_into(&w, &pool, w.h, w1, "variant_of").await,
+        BTreeSet::from([w2]),
+        "the member does"
+    );
+    assert_eq!(
+        mcp_sources_into(&w, &pool, w.h2, step, "executes").await,
+        BTreeSet::from([w1]),
+        "a non-member sees only the public plan running the shared step"
+    );
+    assert_eq!(
+        mcp_sources_into(&w, &pool, w.h, step, "executes").await,
+        BTreeSet::from([w1, w2]),
+        "the member sees both plans"
+    );
 }

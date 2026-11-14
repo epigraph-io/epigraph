@@ -1465,6 +1465,8 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// only to name the migration in the NOTE an operator reads.
 const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_claims_require_tenancy",
+    // Last redefined by migration 219 (the `workflow` arm; CREATE OR REPLACE
+    // keeps the owner, and 219 re-sets it regardless).
     "epigraph_node_tenancy",
     // Last redefined by migration 120 (writer-owned edges: CREATE OR REPLACE,
     // re-owned in its section 9). Kept HERE, unconditional, rather than moved
@@ -1473,9 +1475,9 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
-    // Last redefined by migration 122 (120's body with the edges meet made
-    // set-based: two equi-joins and inlined endpoint reads, OB6); see the note
-    // above.
+    // Last redefined by migration 219 (168's body, itself 122's set-based
+    // edges meet plus one IF, with a `workflows` join per endpoint); see the
+    // note above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
@@ -1749,6 +1751,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // update policy (42501): nothing is ever confirmed or declined that the
     // owner could not see.
     ("epigraph_countersign_authorship", 208),
+    // 219, the `evolve_step` gate's unfiltered read of every workflow that
+    // executes a step's lineage. Fails OPEN and SILENT under a non-member
+    // owner: its reads of the FORCEd `edges` and `claims` are then filtered to
+    // what the calling session reads, so a group plan's `executes` edge a
+    // non-member cannot see is not returned, its authority is never checked,
+    // and the gate admits an evolve of a step a hidden plan runs. That is the
+    // stake this entry reports.
+    ("epigraph_step_lineage_executors", 219),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3106,6 +3116,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_countersign_authorship",
             "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
+            true,
+        ),
+        // 219: the `evolve_step` gate calls it on the request DSN (REST and
+        // MCP); without the grant every evolve of an executed step is 42501.
+        (
+            "epigraph_step_lineage_executors",
+            "public.epigraph_step_lineage_executors(uuid)",
             true,
         ),
     ];

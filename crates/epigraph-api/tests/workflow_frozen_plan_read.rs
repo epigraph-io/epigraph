@@ -245,7 +245,8 @@ async fn team_group(pool: &PgPool, writer: Uuid, label: &str) -> Uuid {
     id
 }
 
-/// Move `claims` to `('group', g)` and check the `executes` edges followed.
+/// Move `claims` to `('group', g)` and check the `executes` edges followed
+/// (into G, and still requiring the plan row's group when that is another).
 async fn restrict(pool: &PgPool, workflow_id: Uuid, claims: &[Uuid], g: Uuid) {
     let mut conn = pool.acquire().await.expect("acquire");
     let moved = PrivatizationRepository::restrict_claims_conn(&mut conn, claims, g)
@@ -258,9 +259,16 @@ async fn restrict(pool: &PgPool, workflow_id: Uuid, claims: &[Uuid], g: Uuid) {
     PrivatizationRepository::restrict_plan_workflows_conn(&mut conn, &moved, g)
         .await
         .expect("restrict the plan's row");
+    // Migration 219: an `executes` edge is the meet of its claim AND its plan's
+    // row, so once the row is private to another group the edge is co-owned
+    // by both (readable only by a member of both).
     let off: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'executes' \
-            AND target_id = ANY($2) AND NOT (visibility = 'group' AND owner_group_id = $3)",
+        "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' AND e.target_id = ANY($2) \
+            AND NOT (e.visibility = 'group' \
+                     AND $3 IN (e.owner_group_id, e.co_owner_group_id) \
+                     AND (w.visibility = 'public' \
+                          OR w.owner_group_id IN (e.owner_group_id, e.co_owner_group_id)))",
     )
     .bind(workflow_id)
     .bind(claims)
@@ -270,7 +278,7 @@ async fn restrict(pool: &PgPool, workflow_id: Uuid, claims: &[Uuid], g: Uuid) {
     .expect("edge tenancy");
     assert_eq!(
         off, 0,
-        "the executes edges follow their claims into ('group', G)"
+        "the executes edges follow their claims into G, and keep the plan row's group"
     );
 }
 
@@ -569,8 +577,9 @@ async fn a_hidden_tail_is_detectable_only_against_the_pinned_digest(pool: PgPool
 
 /// An `executes` edge the caller CAN see whose target it cannot read is a
 /// hidden item: counted, never named. The shape is written by the harness
-/// (the tenancy trigger keeps an edge with its target, so no API path makes
-/// it); it is what a policy or trigger regression would produce.
+/// (the tenancy trigger keeps an edge with its target, and since migration 219
+/// with its plan too, co-owned, so no API path makes it); it is what a policy
+/// or trigger regression would produce.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_visible_edge_to_an_unreadable_claim_is_counted_and_never_named(pool: PgPool) {
     let w = private_workflow(&pool).await;
@@ -585,7 +594,7 @@ async fn a_visible_edge_to_an_unreadable_claim_is_counted_and_never_named(pool: 
         .await
         .expect("harness: skip triggers");
     let n = sqlx::query(
-        "UPDATE edges SET owner_group_id = $3 \
+        "UPDATE edges SET owner_group_id = $3, co_owner_group_id = NULL \
           WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
     )
     .bind(w.workflow_id)

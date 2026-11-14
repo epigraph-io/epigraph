@@ -1994,9 +1994,20 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          spliced viewer predicate could only DROP workflows from that set, which makes the gate \
          fail open, never safer. Both callers run it on the caller's own stamped write \
          transaction (MCP `begin_author_stamped_tx`, REST `begin_claim_write`), before the act \
-         it gates, so row security on that connection still applies; the residual it leaves \
-         (lineage members split across tenancies out of band) is stated on the function. \
-         Returns workflow ids only, never content.",
+         it gates, so row security on that connection still applies. What it cannot see (since \
+         migration 219 a group plan's `executes` edge onto a public step) the gates read through \
+         `step_lineage_executors`. Returns workflow ids only, never content.",
+    ),
+    (
+        "workflow.rs",
+        "step_lineage_executors",
+        "AUTHORITY READ through migration 219's definer \
+         `epigraph_step_lineage_executors(claim)`: every workflow that executes the claim's step \
+         lineage, read UNFILTERED (the edges and lineage members, no join to `workflows`), for \
+         the `evolve_step` gates, which must hold workflow authority over each one. A spliced \
+         viewer predicate could only DROP workflows from the set, which makes the gate fail \
+         open. The ids stay in the server: a gate answers every refusal over an id the caller's \
+         own read did not return as a missing parent. Returns workflow ids only, never content.",
     ),
     (
         "agent_lookup.rs",

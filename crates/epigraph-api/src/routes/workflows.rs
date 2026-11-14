@@ -3367,19 +3367,22 @@ async fn require_api_workflow_authority(
 /// transaction, before the act. Returns each workflow with its grant, for
 /// [`record_api_lineage_writes`].
 ///
-/// # Accepted residual: the lineage split (operator ruling R-21)
+/// # A workflow the caller cannot see
 ///
 /// The workflow set is read on the caller's RLS-bound transaction, so it holds
 /// only the workflows whose `executes` edge (and lineage member) the caller
-/// can see. A group-private workflow outside the caller's groups that executes
-/// the same lineage is therefore not in the set and is not authority-checked.
-/// Every claim of a lineage takes its parent's tenancy at `evolve_step` and an
-/// `executes` edge takes its step's, so this needs a lineage whose members were
-/// split across tenancies; the ruling ACCEPTS that residual rather than moving
-/// the read into a privileged (definer) frame. Stated on
-/// `WorkflowRepository::workflows_executing_step_lineage` and in the MCP
-/// `evolve_step` tool description, whose twin
-/// (`tools/evolve_step.rs::require_lineage_authority`) shares it.
+/// can see. Since migration 219 an `executes` edge also takes its PLAN's
+/// tenancy, so a group plan reusing a public step is invisible to a
+/// non-member, edge and all; a lineage whose members were split across
+/// tenancies hid a plan the same way before. The gate therefore also reads
+/// `WorkflowRepository::step_lineage_executors` (219's definer: the same set,
+/// read unfiltered, for the server only) and runs [`workflow_authority`] on
+/// every workflow the caller's own read did not find, exactly as on the rest:
+/// its arms are unchanged (a row the caller cannot read yields no submitter
+/// on the caller's stamp, so only the audited admin arm can admit there, as
+/// before 219). Any refusal over such a workflow is the missing-parent answer,
+/// even over a row the caller can read, so no answer names it. The MCP twin
+/// (`tools/evolve_step.rs::require_lineage_authority`) does the same.
 #[cfg(feature = "db")]
 async fn require_api_lineage_authority(
     conn: &mut sqlx::PgConnection,
@@ -3403,7 +3406,21 @@ async fn require_api_lineage_authority(
         entity: "Claim".into(),
         id: parent.to_string(),
     };
-    let mut grants = Vec::with_capacity(workflows.len());
+    // Since migration 219 such a workflow's `executes` edge is hidden from the
+    // caller too, so `workflows` above does not hold it: the definer returns
+    // the whole set, unfiltered, to the server.
+    let every = epigraph_db::WorkflowRepository::step_lineage_executors(&mut *conn, parent)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!(
+                "evolve_step: could not read every workflow executing the step's lineage: {e}"
+            ),
+        })?;
+    let hidden: Vec<Uuid> = every
+        .into_iter()
+        .filter(|w| !workflows.contains(w))
+        .collect();
+    let mut grants = Vec::with_capacity(workflows.len() + hidden.len());
     for workflow in workflows {
         let grant = workflow_authority(
             &mut *conn,
@@ -3414,6 +3431,26 @@ async fn require_api_lineage_authority(
             &not_found,
         )
         .await?;
+        grants.push((workflow, grant));
+    }
+    // A workflow the caller did not find: the same arms, but EVERY refusal is
+    // the missing-parent answer, even over a row the caller can read (a
+    // public plan whose edge onto a hidden lineage member is hidden), so the
+    // answer never names it.
+    for workflow in hidden {
+        let grant = workflow_authority(
+            &mut *conn,
+            Some(auth),
+            viewer,
+            Some(caller),
+            workflow,
+            &not_found,
+        )
+        .await
+        .map_err(|e| match e {
+            e @ ApiError::InternalError { .. } => e,
+            _ => not_found(),
+        })?;
         grants.push((workflow, grant));
     }
     Ok(grants)

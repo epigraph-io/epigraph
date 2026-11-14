@@ -1443,7 +1443,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "workflows.rs",
         "require_api_lineage_authority",
-        &["WorkflowRepository::workflows_executing_step_lineage"],
+        // Both are AUTHORITY reads of the workflows executing a step's
+        // lineage (the set the caller must hold authority over), so a viewer
+        // predicate could only drop workflows and make the gate fail open.
+        // `step_lineage_executors` (migration 219's definer) is the same set
+        // read unfiltered; its ids stay in the server, and every refusal over
+        // one the caller's own read did not return is the missing-parent
+        // answer.
+        &[
+            "WorkflowRepository::step_lineage_executors",
+            "WorkflowRepository::workflows_executing_step_lineage",
+        ],
     ),
     (
         "workflows.rs",

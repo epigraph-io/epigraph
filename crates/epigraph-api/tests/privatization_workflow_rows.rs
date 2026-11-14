@@ -365,3 +365,95 @@ async fn a_row_that_changed_between_plan_and_apply_is_not_moved(pool: PgPool) {
         "only the moved row is recorded: {audit:?}"
     );
 }
+
+/// Every edge touching `workflow`, as `(edge, visibility, owner, co-owner)`.
+async fn workflow_edges(pool: &PgPool, workflow: Uuid) -> Vec<(Uuid, String, Uuid, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT id, visibility::text, owner_group_id, co_owner_group_id FROM edges \
+          WHERE source_id = $1 OR target_id = $1 ORDER BY id",
+    )
+    .bind(workflow)
+    .fetch_all(pool)
+    .await
+    .expect("read the workflow's edges")
+}
+
+/// (5) Backlog 630af617 (3), migration 219: the edges of a plan privatized as a
+/// unit follow its row. A workflow endpoint now contributes its row's tenancy
+/// to an edge's meet, so once the row is `('group', target)` EVERY edge on it
+/// is the target's: the `executes` edges onto its moved claims, the one onto
+/// the level-3 atom that stays public, and its `variant_of` link to a public
+/// parent generation (before, the last two stayed public and named the now
+/// private plan). The revert puts every one of them back on its pre-apply
+/// tuple exactly; the row goes back last, so the revert re-meets the row's
+/// edges once it is public again (before, the `executes` edges onto the
+/// restored claims stayed in the target group, met with the still-private
+/// row). Run on the `epigraph_maintenance` role the job connection is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_privatized_plans_edges_follow_its_row_and_a_revert_restores_them(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    let maintenance = viewer_fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = Arc::new(
+        viewer_fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(maintenance),
+    );
+    let (_, owner) = viewer_fixture::seed_agent_with_group(&pool, "wf-edges-owner").await;
+    let thesis = structural_claim(&pool, &world, "edges plan thesis", 0).await;
+    let a = structural_claim(&pool, &world, "edges plan step a", 2).await;
+    let atom = structural_claim(&pool, &world, "edges plan shared atom", 3).await;
+    let parent = workflow_row(&pool, "edges-plan", "public", owner).await;
+    let wf = workflow_row(&pool, "edges-plan-next", "public", owner).await;
+    for (claim, level) in [(thesis, 0), (a, 2), (atom, 3)] {
+        executes(&pool, wf, claim, level).await;
+    }
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'workflow', $2, 'workflow', 'variant_of')",
+    )
+    .bind(wf)
+    .bind(parent)
+    .execute(&pool)
+    .await
+    .expect("seed the variant_of edge");
+    let before = workflow_edges(&pool, wf).await;
+    assert_eq!(before.len(), 4, "CALIBRATION: {before:?}");
+    assert!(
+        before
+            .iter()
+            .all(|e| (e.1.as_str(), e.2, e.3) == ("public", Uuid::nil(), None)),
+        "CALIBRATION: a public plan's edges are structural, ('public', world): {before:?}"
+    );
+
+    let plan = apply(&pool, &world, &scoped, &[thesis, a]).await;
+    assert_eq!(
+        row(&pool, wf).await,
+        ("group".to_string(), world.target_group),
+        "CALIBRATION: the row moved with its plan"
+    );
+    assert_eq!(fx::tenancy(&pool, atom).await.0, "public", "CALIBRATION");
+    let applied = workflow_edges(&pool, wf).await;
+    assert!(
+        applied
+            .iter()
+            .all(|e| (e.1.as_str(), e.2, e.3) == ("group", world.target_group, None)),
+        "every edge on a privatized plan's row is the target group's, the atom's and the \
+         parent link included: {applied:?}"
+    );
+
+    let correlation = fx::dispatch(&pool, &world, plan, "reverting").await;
+    fx::run_revert(&scoped, &fx::revert_job(plan, world.actor, &correlation), 1)
+        .await
+        .expect("revert");
+    assert_eq!(fx::plan_state(&pool, plan).await, "reverted");
+    assert_eq!(
+        row(&pool, wf).await,
+        ("public".to_string(), owner),
+        "CALIBRATION: the row is back"
+    );
+    assert_eq!(
+        workflow_edges(&pool, wf).await,
+        before,
+        "the revert restores every edge on the row to its pre-apply tuple"
+    );
+}
