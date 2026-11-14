@@ -27,17 +27,19 @@
 //!   Every level below that ancestor on `s`'s side lists the link towards
 //!   `pt[k]`, the child of the common ancestor that holds `t`: the shallowest
 //!   group holding `t` that is outside the level, so the stub flies as far
-//!   up as the viewer can navigate and no further. The same on `t`'s side,
-//!   towards `ps[k]`.
+//!   up as the viewer can navigate and no further.
 //! * **Another theme.** Every level on `s`'s path, the theme root included,
 //!   lists the link towards the other theme's root in the same hierarchy
-//!   (depth 0); the same on `t`'s side.
+//!   (depth 0).
 //!
-//! A level lists an outside link from the inside end, whichever way the edge
-//! row points, so a leaf whose claims are only cited still shows its stubs.
-//! In a group level that is a bundle from the child holding the inside end
-//! to a `targets` entry; in a leaf an `outgoing` entry with the inside claim
-//! among its `sources`.
+//! A link is listed from its SOURCE end only, as the contract defines a
+//! bundle ("all links from one child") and an `outgoing` entry ("all links
+//! leaving the leaf", its `sources` the nodes they leave from): in a group
+//! level a bundle from the child holding `s` to a sibling or a `targets`
+//! entry, in a leaf an `outgoing` entry with `s` among its `sources`. The
+//! levels on `t`'s side list nothing for it, so a stub always reads as "this
+//! claim links to that group", never the other way round. A leaf whose claims
+//! are only linked TO shows no stub for those links.
 //!
 //! # Count and sign
 //!
@@ -126,8 +128,8 @@ struct Tallies {
 
 impl Tallies {
     /// List a link at every level of `path` from index `from` down, towards
-    /// `target`, anchored on the inside claim `inside`.
-    fn anchor(&mut self, path: &[Uuid], from: usize, target: Uuid, inside: Uuid, sign: i8) {
+    /// `target`, from the link's source claim `source`.
+    fn anchor(&mut self, path: &[Uuid], from: usize, target: Uuid, source: Uuid, sign: i8) {
         for i in from..path.len() {
             if let Some(child) = path.get(i + 1) {
                 self.groups
@@ -144,7 +146,7 @@ impl Tallies {
                     .entry(target)
                     .or_default();
                 t.add(sign);
-                sources.insert(inside);
+                sources.insert(source);
             }
         }
     }
@@ -261,10 +263,8 @@ fn fill_hierarchy(
                 .or_default()
                 .add(sign);
             tallies.anchor(ps, k, pt[k], *s, sign);
-            tallies.anchor(pt, k, ps[k], *t, sign);
         } else {
             tallies.anchor(ps, 0, pt[0], *s, sign);
-            tallies.anchor(pt, 0, ps[0], *t, sign);
         }
     }
 
@@ -579,40 +579,29 @@ mod tests {
             ]
         );
         assert_eq!(targets(&docs, id(R)), vec![(id(T), t2, 0)]);
-        // G: B -> C a sibling bundle; A is outside G, listed once.
+        // G: B -> C a sibling bundle; C -> A leaves G towards A, listed
+        // once. A -> B arrives in G and is listed only from A's side.
         assert_eq!(
             bundles(&docs, id(G)),
-            vec![
-                (id(B), id(A), 2, 0),
-                (id(B), id(C), 1, -1),
-                (id(C), id(A), 1, 1),
-            ]
+            vec![(id(B), id(C), 1, -1), (id(C), id(A), 1, 1)]
         );
         assert_eq!(targets(&docs, id(G)), vec![(id(A), t1, 1)]);
-        // Leaf A: B and C are reached through G (the shallowest group
-        // outside A that holds them), the other theme through its root.
+        // Leaf A: B is reached through G (the shallowest group outside A
+        // that holds it), the other theme through its root. C -> A arrives
+        // in A, so it is no stub of A's.
         assert_eq!(
             outgoing(&docs, id(A)),
             vec![
-                (id(G), 3, 1, vec![id(0xa1), id(0xa2)]),
+                (id(G), 2, 0, vec![id(0xa1), id(0xa2)]),
                 (id(T), 1, 0, vec![id(0xa3)]),
             ]
         );
-        assert_eq!(
-            outgoing(&docs, id(B)),
-            vec![
-                (id(A), 2, 0, vec![id(0xb1), id(0xb2)]),
-                (id(C), 1, -1, vec![id(0xb1)]),
-            ]
-        );
-        assert_eq!(
-            outgoing(&docs, id(C)),
-            vec![
-                (id(A), 1, 1, vec![id(0xc1)]),
-                (id(B), 1, -1, vec![id(0xc1)])
-            ]
-        );
-        assert_eq!(outgoing(&docs, id(T)), vec![(id(R), 1, 0, vec![id(0xd1)])]);
+        // Each link is a stub of its source leaf only: B's claims are
+        // linked to from A, and C's from B, and neither shows those.
+        assert_eq!(outgoing(&docs, id(B)), vec![(id(C), 1, -1, vec![id(0xb1)])]);
+        assert_eq!(outgoing(&docs, id(C)), vec![(id(A), 1, 1, vec![id(0xc1)])]);
+        // T's claim is only cited, so T has no stub.
+        assert_eq!(outgoing(&docs, id(T)), vec![]);
         // Seven distinct counted links were read; the one to a claim no leaf
         // holds and the one inside leaf A show nowhere.
         assert_eq!(report.links, 7, "{report:?}");

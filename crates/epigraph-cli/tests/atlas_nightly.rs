@@ -1519,60 +1519,39 @@ async fn links_across_groups_leaves_and_themes_fill_bundles_targets_and_outgoing
             h.as_str()
         );
         assert_eq!(targets_of(&docs, i.root), [(i.rt, l.x2, 0)].into());
+        // G lists only the links leaving its children: B -> C, and C -> A
+        // towards A. The links INTO B (from A and from D) are listed on
+        // their source's side only.
         assert_eq!(
             bundles_of(&docs, i.g),
-            [
-                (i.b, i.a, 2, 0),
-                (i.b, i.c, 1, -1),
-                (i.c, i.a, 1, 1),
-                (i.b, i.d, 1, 1),
-            ]
-            .into(),
+            [(i.b, i.c, 1, -1), (i.c, i.a, 1, 1)].into(),
             "{} G",
             h.as_str()
         );
-        assert_eq!(
-            targets_of(&docs, i.g),
-            [(i.a, l.x1, 1), (i.d, l.x1, 1)].into()
-        );
+        assert_eq!(targets_of(&docs, i.g), [(i.a, l.x1, 1)].into());
         let sorted = |v: &[Uuid]| {
             let mut v = v.to_vec();
             v.sort();
             v
         };
         let (a, b, c, d) = (&l.a, &l.b, &l.c, &l.d);
+        // Every stub is a link LEAVING its leaf, with the claims it leaves
+        // from: c5 -> a5 and d9 -> a9 arrive in A and are not A's stubs;
+        // b4 -> c4 is B's, never C's (c4 is the claim contradicted).
         assert_eq!(
             outgoing_of(&docs, i.a),
-            [
-                (i.g, 3, 1, sorted(&[a[1], a[2], a[5]])),
-                (i.rt, 1, 0, vec![a[3]]),
-                (i.d, 1, 0, vec![a[9]]),
-            ]
-            .into(),
+            [(i.g, 2, 0, sorted(&[a[1], a[2]])), (i.rt, 1, 0, vec![a[3]]),].into(),
             "{} A",
             h.as_str()
         );
-        assert_eq!(
-            outgoing_of(&docs, i.b),
-            [
-                (i.a, 2, 0, sorted(&[b[1], b[2]])),
-                (i.c, 1, -1, vec![b[4]]),
-                (i.d, 1, 1, vec![b[6]]),
-            ]
-            .into()
-        );
-        assert_eq!(
-            outgoing_of(&docs, i.c),
-            [(i.b, 1, -1, vec![c[4]]), (i.a, 1, 1, vec![c[5]])].into()
-        );
+        assert_eq!(outgoing_of(&docs, i.b), [(i.c, 1, -1, vec![b[4]])].into());
+        assert_eq!(outgoing_of(&docs, i.c), [(i.a, 1, 1, vec![c[5]])].into());
         assert_eq!(
             outgoing_of(&docs, i.d),
             [(i.a, 1, 0, vec![d[9]]), (i.g, 1, 1, vec![d[6]])].into()
         );
-        assert_eq!(
-            outgoing_of(&docs, i.rt),
-            [(i.root, 1, 0, vec![l.t[0]])].into()
-        );
+        // The other theme's claim is only cited: no stub.
+        assert_eq!(outgoing_of(&docs, i.rt), BTreeSet::new());
         // Every link target is named as its own level is.
         for doc in docs.values() {
             let named: Vec<&epigraph_atlas_contract::LinkTarget> = match doc {
@@ -1617,8 +1596,9 @@ async fn a_co_owned_or_other_teams_edge_never_makes_a_link_but_a_public_one_does
                 h.as_str()
             );
         }
-        // The public edge d6 -> b6 counts.
-        assert!(sources.contains(&l.d[6]) && sources.contains(&l.b[6]));
+        // The public edge d6 -> b6 counts, listed from its source d6 only.
+        assert!(sources.contains(&l.d[6]));
+        assert!(!sources.contains(&l.b[6]), "b6 is only linked to");
         let root = bundles_of(&docs, i.root);
         assert!(
             root.contains(&(i.a, i.g, 2, 0)),
@@ -1639,9 +1619,9 @@ async fn a_co_owned_or_other_teams_edge_never_makes_a_link_but_a_public_one_does
 
 /// Done when: a second night over unchanged input, links included, is still
 /// unchanged (no run written, so every stored byte stays) with zero model
-/// calls; and one new link changes only the levels it passes through, every
-/// other level byte-identical, with no model call and only its group
-/// re-laid.
+/// calls; and one new link changes only the levels that list it (the common
+/// ancestor's bundle and the source side's stub), every other level
+/// byte-identical, with no model call and only its group re-laid.
 #[sqlx::test(migrations = "../../migrations")]
 async fn links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_passes(
     pool: PgPool,
@@ -1661,7 +1641,8 @@ async fn links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_p
     assert_eq!(backend.calls(), calls, "the second night called the model");
     assert_eq!(latest(&pool, l.map()).await, first);
 
-    // One more link inside G: B -> C.
+    // One more link inside G: B -> C. It changes G (the bundle, re-laid)
+    // and B (its stub), never C, which it only arrives in.
     link(&pool, l.b[10], "claim", l.c[10], "supports").await;
     let third = night(&pool, &viewer, &backend, &opts()).await;
     let r = map_report(&third, l.map());
@@ -1682,7 +1663,7 @@ async fn links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_p
     let mut relay = BTreeSet::new();
     for h in [M, L] {
         let i = l.ids(h);
-        for id in [i.g, i.b, i.c] {
+        for id in [i.g, i.b] {
             want.insert(format!("{}/{id}", h.as_str()));
         }
         relay.insert(format!("{}/{}", h.as_str(), i.g));
