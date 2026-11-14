@@ -788,22 +788,16 @@ async fn main() {
     axum::serve(listener, app).await.expect("Server error");
 }
 
-/// `EPIGRAPH_BP_APPLY`, read once at boot: whether `POST /api/v1/bp/propagate`
-/// may write its results (`epigraph_api::state::BpApply`). BP apply is retired
-/// and OFF by default; logged when ON, so a journal shows which processes were
+/// `EPIGRAPH_BP_APPLY`, as the belief modes read it at boot: whether
+/// `POST /api/v1/bp/propagate` may write its results
+/// (`epigraph_api::state::BpApply`). BP apply is retired and OFF by default; a
+/// value that is neither `on` nor `off` is reported with the other belief-mode
+/// typos at boot, and ON is logged, so a journal shows which processes were
 /// armed.
 #[cfg(feature = "db")]
 fn bp_apply_from_env() -> epigraph_api::state::BpApply {
-    use epigraph_api::state::{BpApply, BP_APPLY_ENV};
-    let raw = std::env::var(BP_APPLY_ENV).ok();
-    if BpApply::is_unrecognised(raw.as_deref()) {
-        tracing::warn!(
-            value = raw.as_deref().unwrap_or_default(),
-            "EPIGRAPH_BP_APPLY is set to a value that is neither `on` nor `off`: BP apply stays \
-             OFF on this process (only `on` enables it)"
-        );
-    }
-    let switch = BpApply::parse(raw.as_deref());
+    use epigraph_api::state::BpApply;
+    let switch = epigraph_engine::belief_modes::current().bp_apply;
     if switch == BpApply::On {
         tracing::warn!(
             "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \

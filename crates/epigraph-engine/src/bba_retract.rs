@@ -146,7 +146,7 @@ pub async fn refresh_cache_after_retract(
         &mut *conn,
         viewer,
         claim_id,
-        crate::atom_items::CompoundSourceEdges::current(),
+        crate::atom_items::modes().compound_source_edges,
     )
     .await?;
     let vacated = matches!(

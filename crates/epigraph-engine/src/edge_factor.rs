@@ -1807,13 +1807,13 @@ pub struct AtomCacheSettings {
 }
 
 impl AtomCacheSettings {
-    /// This process's settings: the two flags as read at startup, and O24 as
-    /// ruled.
+    /// This process's settings: the two flags as read at startup
+    /// ([`crate::atom_items::modes`]), and O24 as ruled.
     #[must_use]
     pub fn current() -> Self {
         Self {
-            fold: crate::atom_items::AtomFoldMode::current(),
-            compound_source_edges: crate::atom_items::CompoundSourceEdges::current(),
+            fold: crate::atom_items::modes().atom_fold,
+            compound_source_edges: crate::atom_items::modes().compound_source_edges,
             vacate_on_evidence_removal: true,
         }
     }
