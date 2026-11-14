@@ -1,5 +1,6 @@
 -- 218: a harvester fragment cited by several claims takes the MOST RESTRICTIVE
--- of them. (backlog 73ea4d4d, 0bf301fd)
+-- of them; the application role loses UPDATE on harvester_claim_provenance.
+-- (backlog 73ea4d4d, 77fbf3f9, 0bf301fd)
 --
 -- ===================================================================
 -- 0. WHY THIS FILE EXISTS
@@ -100,7 +101,28 @@
 -- MORE readable. docs/tenancy.md states the same.
 --
 -- ===================================================================
--- 3. WHAT IT DOES NOT DO
+-- 3. NO UPDATE ON harvester_claim_provenance FOR epigraph_app (77fbf3f9)
+-- ===================================================================
+--
+-- 089's stamp is AFTER INSERT only, so an UPDATE that re-points an existing
+-- provenance row's `fragment_id` or `claim_id` stamps nothing (finding
+-- F-089-E), and `epigraph_app` held UPDATE on the table (077's grant on all
+-- tables; 118's revocations do not name it). No writer in this tree updates
+-- this table: its only Rust references are reads, and arm (d) re-stamps the
+-- rows' own tenancy as a maintenance-owned definer, under
+-- `epigraph_maintenance`'s own UPDATE (070). The external harvester that
+-- writes it is outside this tree; the README's deploy note asks the operator
+-- to confirm it only INSERTs on an application DSN.
+-- So the application role loses UPDATE outright, which closes the path
+-- without a second trigger and moves none of the four pinned trigger counts.
+-- A table-level REVOKE also removes any column-level UPDATE grant. INSERT,
+-- SELECT and DELETE are kept (the harvest path and 115's owner-scoped DELETE
+-- use them). `epigraph_maintenance` keeps UPDATE; it is not a writer that
+-- re-points a link either, and the operator tools that run on it only
+-- re-stamp the rows' tenancy.
+--
+-- ===================================================================
+-- 4. WHAT IT DOES NOT DO
 -- ===================================================================
 --
 -- It moves no existing row. Fragments the backfill or the old trigger already
@@ -111,10 +133,10 @@
 -- operator work.
 --
 -- `CREATE OR REPLACE` of both bodies (same signatures) keeps their owner and
--- ACL; part C below re-asserts the owner anyway, as 089, 114, 122 and 168 do.
+-- ACL; part D below re-asserts the owner anyway, as 089, 114, 122 and 168 do.
 -- Undo: docs/runbooks/218-undo.sql (restores 115's and 168's bodies byte for
--- byte; it RE-OPENS the defect). Idempotent: a re-run of this file changes
--- nothing.
+-- byte and re-grants UPDATE to `epigraph_app`; it RE-OPENS both defects).
+-- Idempotent: a re-run of this file changes nothing.
 -- ===================================================================
 SET LOCAL lock_timeout = '3s';
 
@@ -361,7 +383,16 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_propagate_tenancy() FROM PUBLIC;
 
 -- ===================================================================
--- C. OWNERSHIP (CREATE OR REPLACE keeps it; re-set regardless, guarded on
+-- C. NO UPDATE ON harvester_claim_provenance FOR THE APPLICATION ROLE
+-- ===================================================================
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE UPDATE ON public.harvester_claim_provenance FROM epigraph_app';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- D. OWNERSHIP (CREATE OR REPLACE keeps it; re-set regardless, guarded on
 --    the role as 089 and 168 guard it)
 -- ===================================================================
 DO $$ BEGIN

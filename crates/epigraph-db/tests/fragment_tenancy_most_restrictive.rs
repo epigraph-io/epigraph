@@ -1,5 +1,6 @@
-//! Migration 218 (backlog 73ea4d4d): a harvester fragment cited by several
-//! claims takes the MOST RESTRICTIVE of them.
+//! Migration 218 (backlog 73ea4d4d, 77fbf3f9): a harvester fragment cited by
+//! several claims takes the MOST RESTRICTIVE of them, and the application role
+//! may not UPDATE `harvester_claim_provenance`.
 //!
 //! # The defect
 //!
@@ -332,6 +333,71 @@ async fn moving_one_group_citer_to_another_group_still_carries_the_fragment(pool
     );
 }
 
+/// 77fbf3f9: the application role holds no UPDATE on the provenance table,
+/// table-level or on any column, and an UPDATE that re-points a row is
+/// refused with 42501. INSERT, SELECT and DELETE stay (calibration).
+///
+/// Never calls `fixture::grant_app_privileges`, which grants UPDATE on every
+/// table and would re-grant exactly what 218 revokes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_update_provenance(pool: PgPool) {
+    let (update, any_column, insert, select, delete): (bool, bool, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT has_table_privilege('epigraph_app', 'public.harvester_claim_provenance', \
+                                        'UPDATE'), \
+                    has_any_column_privilege('epigraph_app', \
+                                             'public.harvester_claim_provenance', 'UPDATE'), \
+                    has_table_privilege('epigraph_app', 'public.harvester_claim_provenance', \
+                                        'INSERT'), \
+                    has_table_privilege('epigraph_app', 'public.harvester_claim_provenance', \
+                                        'SELECT'), \
+                    has_table_privilege('epigraph_app', 'public.harvester_claim_provenance', \
+                                        'DELETE')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the app role's privileges");
+    assert!(
+        insert && select && delete,
+        "CALIBRATION: the harvest path's INSERT, the reads and 115's owner-scoped DELETE keep \
+         their grants (insert={insert}, select={select}, delete={delete})"
+    );
+    assert!(
+        !update && !any_column,
+        "epigraph_app must hold no UPDATE on harvester_claim_provenance (table={update}, any \
+         column={any_column}): a re-pointed fragment_id or claim_id runs no stamping trigger"
+    );
+
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "frag-upd").await;
+    let c = claim(&pool, agent, "group", group).await;
+    let f = fragment(&pool, "group", group).await;
+    let other = fragment(&pool, "group", group).await;
+    link_in_one_statement(&pool, &[(c, f)]).await;
+
+    let code = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query(
+            "UPDATE harvester_claim_provenance SET fragment_id = $1 \
+              WHERE claim_id = $2 AND fragment_id = $3",
+        )
+        .bind(other)
+        .bind(c)
+        .bind(f)
+        .execute(&mut *conn)
+        .await;
+        let code = r.err().and_then(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+        });
+        (conn, code)
+    })
+    .await;
+    assert_eq!(
+        code.as_deref(),
+        Some("42501"),
+        "the app role's UPDATE of a provenance row must be refused for want of the privilege"
+    );
+}
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// The embedded migrations with `version <= max`.
@@ -363,7 +429,7 @@ async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
 }
 
 /// Every function in `public` (whole definition, owner, ACL) plus the
-/// provenance table's ACL.
+/// provenance table's ACL: what 218 changes.
 async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
     let mut rows: Vec<String> = sqlx::query_scalar(
         "SELECT p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ') ' \
@@ -388,9 +454,9 @@ async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
     rows.into_iter().collect()
 }
 
-/// `docs/runbooks/218-undo.sql` returns the functions to their state below 218
-/// (so it restates 115's and 168's bodies byte for byte), and a second run
-/// changes nothing.
+/// `docs/runbooks/218-undo.sql` returns the functions and the provenance
+/// table's ACL to their state below 218 (so it restates 115's and 168's
+/// bodies byte for byte), and a second run changes nothing.
 #[sqlx::test(migrations = false)]
 async fn the_218_undo_returns_the_catalog_below_218(pool: PgPool) {
     migrate(&pool, &up_to(217)).await;
@@ -406,11 +472,13 @@ async fn the_218_undo_returns_the_catalog_below_218(pool: PgPool) {
         [
             "epigraph_inherit_fragment_tenancy_stmt",
             "epigraph_propagate_tenancy",
+            "harvester_claim_provenance",
         ]
         .into_iter()
         .map(String::from)
         .collect(),
-        "CALIBRATION: 218 re-states the two fragment-stamping bodies, nothing else"
+        "CALIBRATION: 218 re-states the two fragment-stamping bodies and revokes one table \
+         privilege, nothing else"
     );
 
     let undo = std::fs::read_to_string(

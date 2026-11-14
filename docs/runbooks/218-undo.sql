@@ -1,20 +1,27 @@
 -- ===================================================================
--- 218-undo.sql: take migration 218 (most-restrictive fragment tenancy) back
+-- 218-undo.sql: take migration 218 (most-restrictive fragment tenancy, and
+-- no UPDATE on harvester_claim_provenance for the application role) back
 -- out, in ONE transaction, on the migration (superuser) DSN.
 --
--- READ FIRST: THIS RE-OPENS BACKLOG 73ea4d4d. After it a fragment cited by
--- several claims takes an ARBITRARY one of them in the provenance trigger
--- (089/115's `UPDATE ... FROM`), and arm (d) copies the changed claim's tuple
--- onto every fragment it cites, so publicizing one citer makes a fragment
--- public while another citer is group-private.
+-- READ FIRST: THIS RE-OPENS BACKLOG 73ea4d4d AND 77fbf3f9. After it:
+--   * a fragment cited by several claims takes an ARBITRARY one of them in
+--     the provenance trigger (089/115's `UPDATE ... FROM`), and arm (d)
+--     copies the changed claim's tuple onto every fragment it cites, so
+--     publicizing one citer makes a fragment public while another citer is
+--     group-private;
+--   * `epigraph_app` may again UPDATE `harvester_claim_provenance`, and a
+--     re-pointed `fragment_id` / `claim_id` runs no stamping trigger.
 --
--- No binary needs rolling back first or after: no binary reads a 218 object.
+-- No binary needs rolling back first or after: the backfill binary's
+-- fragment arm reads no 218 object (it applies the same order in its own
+-- SQL), and no application writer updates the provenance table.
 --
 -- WHAT IT DOES:
 --   * re-states 115's `epigraph_inherit_fragment_tenancy_stmt()` and 168's
 --     `epigraph_propagate_tenancy()` byte for byte; `CREATE OR REPLACE` keeps
 --     their owner and ACL (CREATE OR REPLACE, never DROP: a DROP resets the
---     ACL to PUBLIC-executable).
+--     ACL to PUBLIC-executable);
+--   * re-grants UPDATE on `harvester_claim_provenance` to `epigraph_app`.
 --
 -- WHAT IT LEAVES:
 --   * every row as it stands (a fragment 218's rule stamped keeps its tuple);
@@ -228,5 +235,11 @@ BEGIN
     RETURN NULL;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_propagate_tenancy() FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT UPDATE ON public.harvester_claim_provenance TO epigraph_app';
+    END IF;
+END $$;
 
 COMMIT;
