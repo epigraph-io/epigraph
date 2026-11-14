@@ -28,8 +28,10 @@ mod viewer_fixture;
 
 use axum::extract::{Path, State};
 use axum::Json;
+use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::assess::{assess_claim, AssessClaimRequest, AssessClaimResponse};
+use epigraph_api::routes::events::{create_event, CreateEventRequest};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
 use sqlx::PgPool;
@@ -184,6 +186,67 @@ async fn each_assessment_records_its_writer_and_any_contest_durably(pool: PgPool
         .find(|(_, p)| uuid_at(p, "mass_function_id") == Some(slot))
         .map(|(actor, _)| *actor);
     assert_eq!(prior, Some(Some(one)), "the contested assessment's writer");
+}
+
+/// `claim.assessed` is the server's own record, so neither caller-typed
+/// publish path may file one. The scenario the review measured: an agent
+/// files a `claim.assessed` naming a real slot row, which the prior-writer
+/// rule would then read as the slot's latest record, crediting the next real
+/// overwrite as replacing the forger's masses. Padded and re-cased spellings
+/// are refused too, and an ordinary type still publishes, so the refusal is
+/// about the type and not a broken path.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rest_publish_path_refuses_a_forged_assessment_record(pool: PgPool) {
+    let (author, _) = seed_agent_with_group(&pool, "assess-writer-forge-author").await;
+    let (writer, _) = seed_agent_with_group(&pool, "assess-writer-forge-writer").await;
+    let (forger, _) = seed_agent_with_group(&pool, "assess-writer-forge-forger").await;
+    let claim = seed_public_claim(&pool, author, "assess writer record: forgery").await;
+    let real = assess(&pool, writer, claim, request(true, 0.9)).await;
+
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let post = |event_type: &str| {
+        let body: CreateEventRequest = serde_json::from_value(serde_json::json!({
+            "event_type": event_type,
+            "actor_id": forger,
+            "payload": {
+                "claim_id": claim,
+                "frame_id": real.frame_id,
+                "mass_function_id": real.mass_function_id,
+                "owner_agent_id": real.owner_agent_id,
+                "assessed_by": forger,
+                "replaced": true,
+                "contested": true,
+            },
+        }))
+        .expect("CreateEventRequest deserializes");
+        create_event(write_scope(), State(state.clone()), Json(body))
+    };
+
+    for spelling in ["claim.assessed", "  claim.assessed\t", "Claim.Assessed"] {
+        let refused = post(spelling).await;
+        assert!(
+            matches!(refused, Err(ApiError::ValidationError { ref field, .. }) if field == "event_type"),
+            "a caller must not file {spelling:?}: {refused:?}"
+        );
+    }
+    let filed: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT actor_id FROM events \
+          WHERE lower(btrim(event_type, E' \\t\\n\\r')) = 'claim.assessed' \
+          ORDER BY graph_version",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read assessment records");
+    assert_eq!(
+        filed,
+        vec![Some(writer)],
+        "only the route's own record exists; nothing a caller posted was written"
+    );
+
+    let Json(ordinary) = post("review.note")
+        .await
+        .expect("an ordinary event type still publishes");
+    assert_eq!(ordinary.event_type, "review.note");
 }
 
 /// The record is part of the slot write, not a best-effort side effect: when

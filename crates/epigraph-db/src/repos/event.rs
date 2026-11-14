@@ -40,6 +40,32 @@ pub struct EventCursor {
 pub struct EventRepository;
 
 impl EventRepository {
+    /// The assess route's durable writer record (backlog 4a7f90f8): one per
+    /// `POST /api/v1/claims/:id/assess`, written inside that call's slot
+    /// transaction. See `epigraph_api::routes::assess::ASSESSMENT_EVENT_TYPE`.
+    pub const ASSESSMENT_EVENT_TYPE: &'static str = "claim.assessed";
+
+    /// Event types that only a server write path may record. The caller-typed
+    /// publish surfaces (`POST /api/v1/events`, the MCP `publish_event` tool)
+    /// refuse them, because a reader trusts a record of one of these types as
+    /// the server's own account of a write: a caller-filed `claim.assessed`
+    /// would otherwise become "the previous record" of a slot and re-attribute
+    /// the next overwrite to whoever filed it.
+    pub const RESERVED_EVENT_TYPES: &'static [&'static str] = &[Self::ASSESSMENT_EVENT_TYPE];
+
+    /// Whether a caller-supplied `event_type` names a reserved type.
+    ///
+    /// Compared trimmed and ASCII-case-insensitively, so a padded or
+    /// re-cased spelling is refused too: the MCP tool stores the type as
+    /// given, and no caller has a reason to file a near-miss of a reserved
+    /// name.
+    pub fn is_reserved_type(event_type: &str) -> bool {
+        let t = event_type.trim();
+        Self::RESERVED_EVENT_TYPES
+            .iter()
+            .any(|r| t.eq_ignore_ascii_case(r))
+    }
+
     /// Insert a new event, auto-incrementing graph_version.
     pub async fn insert(
         pool: &PgPool,

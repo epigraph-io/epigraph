@@ -33,10 +33,18 @@ use uuid::Uuid;
 ///
 /// The payload carries ids and booleans only, never masses or BetP. Its
 /// `claim_id` is what lets the event list hide the record from a viewer who
-/// cannot read the claim. `POST /api/v1/events` accepts a caller-chosen type
-/// and `actor_id`, so a record of this type is an audit trail to cross-check
-/// against the slot row, not proof of authorship on its own.
-pub const ASSESSMENT_EVENT_TYPE: &str = "claim.assessed";
+/// cannot read the claim.
+///
+/// The type is reserved (`EventRepository::RESERVED_EVENT_TYPES`): both
+/// caller-typed publish paths, `POST /api/v1/events` and the MCP
+/// `publish_event` tool, refuse it, so through the API only this route's
+/// slot transaction writes it. That holds at the API, not in the database:
+/// a direct database login with INSERT on `events` can still write a row of
+/// this type, so the record is the server's account of a write, not a
+/// cryptographic proof of authorship. Before the reservation the REST path
+/// accepted this type, so a row of it older than the reservation may have
+/// been filed by a caller rather than by this route.
+pub const ASSESSMENT_EVENT_TYPE: &str = epigraph_db::EventRepository::ASSESSMENT_EVENT_TYPE;
 
 // =============================================================================
 // REQUEST / RESPONSE TYPES
