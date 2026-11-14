@@ -159,3 +159,34 @@ async fn a_registered_handler_still_runs_and_a_transient_failure_is_retried() {
         "a transient failure was never put back for a retry: {mine:?}"
     );
 }
+
+/// A permanent error (`JobError::should_retry` false) fails the job on its
+/// first occurrence: it is never put back to `pending` and never re-run, however
+/// much of its retry budget is left (backlog 09109b93).
+#[tokio::test]
+async fn a_permanent_failure_is_terminal_on_the_first_attempt() {
+    let queue = Arc::new(RecordingQueue::default());
+    let job = Job::new("permanent", json!({})).with_max_retries(3);
+    let id = job.id;
+    queue.enqueue(job).await.unwrap();
+
+    run_loop(
+        &queue,
+        vec![Arc::new(AlwaysFails {
+            job_type: "permanent",
+            error: JobError::PayloadError {
+                message: "not an object".into(),
+            },
+        })],
+    )
+    .await;
+
+    let mine: Vec<Job> = queue.updates().into_iter().filter(|j| j.id == id).collect();
+    assert_eq!(
+        mine.iter()
+            .map(|j| (j.state, j.retry_count))
+            .collect::<Vec<_>>(),
+        vec![(JobState::Failed, 1)],
+        "a permanent failure was retried: {mine:?}"
+    );
+}

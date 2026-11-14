@@ -496,33 +496,67 @@ async fn an_unregistered_job_type_at_the_head_of_the_queue_does_not_wedge_the_dr
     );
 }
 
-/// A job whose handler fails is put back to `pending` with the retry counted,
-/// and not retried in the same run (the next run is the backoff); when its
-/// retries are used up it is `failed`. Every run in which it failed exits 1,
-/// the retryable ones included (brief: "1 a job failed").
+/// A drain-test handler whose every attempt fails with `error`.
+struct FailsWith {
+    job_type: &'static str,
+    error: epigraph_jobs::JobError,
+}
+
+#[epigraph_jobs::async_trait]
+impl epigraph_jobs::JobHandler for FailsWith {
+    async fn handle(
+        &self,
+        _job: &epigraph_jobs::Job,
+    ) -> Result<epigraph_jobs::JobResult, epigraph_jobs::JobError> {
+        Err(self.error.clone())
+    }
+
+    fn job_type(&self) -> &str {
+        self.job_type
+    }
+}
+
+/// A runner with only `handler` registered, on the maintenance login's queue.
+fn runner_with(
+    scoped: &Arc<ScopedPool>,
+    handler: FailsWith,
+) -> (epigraph_jobs::JobRunner, PostgresJobQueue) {
+    let queue = PostgresJobQueue::new(scoped.inner().clone());
+    let mut runner = epigraph_jobs::JobRunner::new(1, Arc::new(queue.clone()));
+    runner.register_handler(Arc::new(handler));
+    (runner, queue)
+}
+
+/// Seed a job of `job_type` with an attempt budget of `max_retries`.
+async fn enqueue_typed(pool: &PgPool, job_type: &str, max_retries: u32) -> Uuid {
+    let job = epigraph_jobs::Job::new(job_type, serde_json::json!({})).with_max_retries(max_retries);
+    let id: Uuid = job.id.into();
+    PostgresJobQueue::new(pool.clone())
+        .enqueue(job)
+        .await
+        .expect("seed the job as the superuser");
+    id
+}
+
+/// A job whose handler fails TRANSIENTLY (`JobError::should_retry` true) is
+/// put back to `pending` with the retry counted, and not retried in the same
+/// run (the next run is the backoff); when its retries are used up it is
+/// `failed`. Every run in which it failed exits 1, the retryable ones included
+/// (brief: "1 a job failed").
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_failing_job_is_retried_next_run_then_fails_terminally(pool: PgPool) {
-    // A privatization apply for a plan that does not exist: the handler
-    // refuses it. Privatization jobs are enqueued with one retry; this one is
-    // given three, so the run sees retryable failures before the terminal one
-    // (the default for every other job type).
-    let id = {
-        let job = fx::apply_job(Uuid::new_v4(), Uuid::new_v4(), "no-such-dispatch");
-        let id: Uuid = job.id.into();
-        PostgresJobQueue::new(pool.clone())
-            .enqueue(job)
-            .await
-            .expect("seed");
-        id
-    };
-    sqlx::query("UPDATE jobs SET max_retries = 3 WHERE id = $1")
-        .bind(id)
-        .execute(&pool)
-        .await
-        .expect("give the job three retries");
+    let id = enqueue_typed(&pool, "drain_test_transient", 3).await;
 
     let scoped = maintenance_scoped(&pool).await;
-    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+    let (runner, queue) = runner_with(
+        &scoped,
+        FailsWith {
+            job_type: "drain_test_transient",
+            error: epigraph_jobs::JobError::ProcessingFailed {
+                message: "provider answered 503".to_string(),
+            },
+        },
+    );
     for attempt in 1..=2 {
         let run = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
             .await
@@ -565,6 +599,52 @@ async fn a_failing_job_is_retried_next_run_then_fails_terminally(pool: PgPool) {
         "a failed job was picked up again: {after:?}"
     );
     assert_eq!(after.exit_code(), 0);
+}
+
+/// A job whose handler fails PERMANENTLY (`JobError::should_retry` false: here
+/// a payload that will never parse) is `failed` after its first run, with its
+/// retry budget unspent, and never handed out again (backlog 09109b93). Before
+/// the fix the drain consulted only `retry_count >= max_retries`, so a refusal
+/// or a malformed payload was re-run on every timer cycle until the budget ran
+/// out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_permanent_failure_is_terminal_on_its_first_run(pool: PgPool) {
+    let id = enqueue_typed(&pool, "drain_test_permanent", 3).await;
+
+    let scoped = maintenance_scoped(&pool).await;
+    let (runner, queue) = runner_with(
+        &scoped,
+        FailsWith {
+            job_type: "drain_test_permanent",
+            error: epigraph_jobs::JobError::PayloadError {
+                message: "missing field `claim_id`".to_string(),
+            },
+        },
+    );
+    let run = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        run.failures.len() == 1 && run.failures[0].terminal,
+        "a permanent failure was reported retryable: {run:?}"
+    );
+    let (state, err) = job_state(&pool, id).await;
+    assert_eq!(
+        state, "failed",
+        "a permanent failure went back to pending with 2 of its 3 attempts left"
+    );
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("missing field")),
+        "{err:?}"
+    );
+    assert_eq!(run.exit_code(), 1);
+    let again = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        again.failures.is_empty() && again.completed == 0,
+        "a permanently failed job was run again: {again:?}"
+    );
 }
 
 /// The exit code's order: a failure (retryable or terminal) is 1 even when

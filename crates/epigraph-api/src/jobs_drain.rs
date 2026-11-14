@@ -139,8 +139,9 @@ pub struct DrainFailure {
     pub job_type: String,
     /// The handler's error.
     pub error: String,
-    /// `true`: it used its last retry and is now `failed`. `false`: it is back
-    /// to `pending` and the next run retries it.
+    /// `true`: it is now `failed`, because the error was permanent
+    /// ([`JobError::should_retry`] false) or it used its last retry. `false`:
+    /// it is back to `pending` and the next run retries it.
     pub terminal: bool,
 }
 
@@ -193,9 +194,10 @@ impl DrainReport {
 /// type, one at a time, until none is left or `max_runtime` has elapsed.
 ///
 /// Each job's final state is written back with `JobQueue::update`:
-/// `completed`; or, on a handler error, `pending` again with the retry counted
-/// (not retried in this run: the next run is the backoff), or `failed` once
-/// its retries are used up.
+/// `completed`; or, on a transient handler error
+/// ([`JobError::should_retry`]), `pending` again with the retry counted (not
+/// retried in this run: the next run is the backoff), or `failed` once its
+/// retries are used up; or, on a permanent handler error, `failed` at once.
 ///
 /// # Errors
 /// A database error reading or claiming from the queue (the run stops; the
@@ -251,7 +253,10 @@ pub async fn drain(
                 report.completed += 1;
             }
             Err(e) => {
-                let terminal = job.retry_count >= job.max_retries;
+                // A permanent error (`JobError::should_retry` false: a refusal,
+                // a payload that will never parse, an SSRF block) is terminal on
+                // its first occurrence; only a transient one spends the budget.
+                let terminal = !e.should_retry() || job.retry_count >= job.max_retries;
                 job.error_message = Some(e.to_string());
                 job.updated_at = chrono::Utc::now();
                 if terminal {

@@ -606,7 +606,9 @@ impl JobRunner {
                             job.retry_count += 1;
                             job.error_message = Some(e.to_string());
 
-                            if job.retry_count >= job.max_retries {
+                            // A permanent error is terminal at once; only a
+                            // transient one spends the retry budget.
+                            if !e.should_retry() || job.retry_count >= job.max_retries {
                                 job.state = JobState::Failed;
                                 job.updated_at = Utc::now();
                                 job.completed_at = Some(Utc::now());
