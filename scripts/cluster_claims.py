@@ -215,11 +215,11 @@ def label_clusters(conn, ids, reduced, labels, centroids, k, run_id):
             nearest_idx = cluster_indices[np.argsort(cluster_dists)[:5]]
             nearest_ids = [ids[i] for i in nearest_idx]
 
-            # Never a bug report's text: the label is shown outside the intake
-            # group (theme_lib.not_intake_owned).
+            # Public members' text only: the label is shown to every viewer
+            # of any member (theme_lib.public_label_source).
             cur.execute(
                 "SELECT substring(c.content for 100) FROM claims c "
-                "WHERE c.id = ANY(%s::uuid[]) AND " + theme_lib.not_intake_owned("c"),
+                "WHERE c.id = ANY(%s::uuid[]) AND " + theme_lib.public_label_source("c"),
                 (nearest_ids,))
             texts = [r[0] for r in cur.fetchall()]
             label = "; ".join(texts)
