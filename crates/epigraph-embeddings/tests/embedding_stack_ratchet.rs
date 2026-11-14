@@ -17,14 +17,15 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root")
 }
 
-/// Every `.rs` file under `crates/*/src`, as (workspace-relative path, text).
-/// Integration tests (`crates/*/tests`) are excluded: they may talk about the
-/// endpoint, they never ship.
+/// Every `.rs` file under `crates/*/src` and `services/*/src`, as
+/// (workspace-relative path, text). Integration tests (`*/tests`) are
+/// excluded: they may talk about the endpoint, they never ship.
 fn production_sources() -> Vec<(String, String)> {
     let root = workspace_root();
     let mut out = Vec::new();
-    let mut stack: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("read crates/")
+    let mut stack: Vec<PathBuf> = ["crates", "services"]
+        .into_iter()
+        .flat_map(|top| std::fs::read_dir(root.join(top)).expect("read crates/ and services/"))
         .filter_map(Result::ok)
         .map(|e| e.path().join("src"))
         .filter(|p| p.is_dir())
@@ -49,6 +50,10 @@ fn production_sources() -> Vec<(String, String)> {
         out.len() > 100,
         "CALIBRATION: the walk found only {} source files; it is not reading the workspace",
         out.len()
+    );
+    assert!(
+        out.iter().any(|(p, _)| p.starts_with("services/")),
+        "CALIBRATION: the walk read no services/*/src file"
     );
     out
 }
@@ -229,15 +234,8 @@ fn pgvector_literals_come_from_one_helper() {
                 offenders.push(format!("{path}: {n}"));
             }
         }
-        let mut from = 0;
-        while let Some(i) = body[from..].find("\"[{}]\"") {
-            let at = from + i;
-            let window: String = body[at..].chars().take(400).collect();
-            if window.contains(".join(\",\")") {
-                let line = body[..at].matches('\n').count() + 1;
-                offenders.push(format!("{path}:{line}: inline `[{{}}]` + join(\",\")"));
-            }
-            from = at + 1;
+        for (line, form) in inline_bracket_joins(body) {
+            offenders.push(format!("{path}:{line}: inline `{form}` + join(\",\")"));
         }
     }
     assert!(
@@ -245,4 +243,58 @@ fn pgvector_literals_come_from_one_helper() {
         "hand-rolled pgvector literals; use epigraph_db::pgvector_literal:\n{}",
         offenders.join("\n")
     );
+}
+
+/// Every bracket format string, positional `"[{}]"` or named `"[{body}]"`,
+/// with a `.join(",")` within 400 bytes on either side, as (line, the string).
+///
+/// Both sides, because the named form joins FIRST and formats after: the
+/// deleted `embedding_restore.rs::format_pgvector` was
+/// `let body = v.iter()...join(","); format!("[{body}]")`.
+fn inline_bracket_joins(body: &str) -> Vec<(usize, String)> {
+    const WINDOW: usize = 400;
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = body[from..].find("\"[{") {
+        let at = from + i;
+        from = at + 1;
+        let rest = &body[at + 3..];
+        let ident_len = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if !rest[ident_len..].starts_with("}]\"") {
+            continue;
+        }
+        let mut lo = at.saturating_sub(WINDOW);
+        while !body.is_char_boundary(lo) {
+            lo -= 1;
+        }
+        let mut hi = (at + WINDOW).min(body.len());
+        while !body.is_char_boundary(hi) {
+            hi += 1;
+        }
+        if body[lo..hi].contains(".join(\",\")") {
+            let line = body[..at].matches('\n').count() + 1;
+            out.push((line, body[at..at + 3 + ident_len + 3].to_string()));
+        }
+    }
+    out
+}
+
+/// The matcher finds both shapes a hand-rolled literal has taken, and not a
+/// bracket format with no join near it.
+#[test]
+fn the_literal_matcher_sees_both_forms() {
+    let positional = "fn a(v: &[f32]) -> String {\n    format!(\"[{}]\", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(\",\"))\n}\n";
+    let named = "fn b(v: &[f32]) -> String {\n    let body = v\n        .iter()\n        .map(std::string::ToString::to_string)\n        .collect::<Vec<_>>()\n        .join(\",\");\n    format!(\"[{body}]\")\n}\n";
+    let unrelated = "fn c(n: usize) -> String {\n    format!(\"[{n}]\")\n}\n";
+    assert_eq!(
+        inline_bracket_joins(positional),
+        vec![(2, "\"[{}]\"".to_string())]
+    );
+    assert_eq!(
+        inline_bracket_joins(named),
+        vec![(7, "\"[{body}]\"".to_string())]
+    );
+    assert!(inline_bracket_joins(unrelated).is_empty());
 }
