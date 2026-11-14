@@ -91,7 +91,11 @@ const REGISTER: &[(&str, usize)] = &[
     // does not see (module doc): lowered because the `let _ =` write is gone,
     // not because the error now propagates.
     ("conventions.rs", 4),
-    ("crud.rs", 2),
+    // 2 before `create_reasoning_trace` moved its trace and HAS_TRACE edge
+    // onto the caller-stamped `write_as` transaction (the edge stays
+    // best-effort through a savepoint, a form this register does not see):
+    // lowered because the `let _ =` write is gone.
+    ("crud.rs", 1),
     ("gaps.rs", 1),
     ("perspective.rs", 1),
     ("reasoning.rs", 3),
