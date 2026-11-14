@@ -878,6 +878,12 @@ pub struct StoreWorkflowParams {
     )]
     #[serde(default)]
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Mint a new generation-0 lineage even when an existing hierarchical workflow you can read has a near-identical goal (default false). Without it, a goal whose embedding is at least 0.90 cosine-similar to a live workflow's goal under a DIFFERENT canonical_name stores nothing and returns that workflow with matched_existing=true, its similarity and a hint to evolve it with improve_workflow_hierarchy instead. An identical goal (same canonical_name) is a no-op as before (already_ingested)."
+    )]
+    #[serde(default)]
+    pub force_new: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2770,6 +2776,17 @@ pub struct StoreWorkflowResponse {
     /// `true` if a workflow with this `(canonical_name, generation)` was
     /// already present and the call short-circuited.
     pub already_ingested: bool,
+    /// `true` when nothing was stored because an existing hierarchical
+    /// workflow under ANOTHER canonical_name has a near-identical goal (backlog
+    /// 5e54282f); `workflow_id`, `canonical_name`, `goal` and `generation` then
+    /// describe that workflow. Pass `force_new: true` to mint anyway.
+    pub matched_existing: bool,
+    /// The matched workflow's goal similarity (cosine), with `matched_existing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
+    /// What to do instead, with `matched_existing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

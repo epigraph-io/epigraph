@@ -376,6 +376,48 @@ pub async fn store_workflow(
     use epigraph_ingest::workflow::WorkflowExtraction;
 
     let canonical_name = slugify_workflow_goal(&params.goal);
+
+    // Embed the goal ONCE, best-effort: it decides whether this goal is a
+    // rewording of a workflow the caller already reads (backlog 5e54282f), and
+    // the same vector is stored as the new row's goal embedding below. An
+    // embedder failure keeps today's behaviour (no matching, no goal vector).
+    let goal_vec = match server.embedder.generate(&params.goal).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = ?e, "store_workflow goal embedding failed; not matching");
+            None
+        }
+    };
+    if !params.force_new.unwrap_or(false) {
+        if let Some(qvec) = goal_vec.as_deref() {
+            if let Some(hit) = matching_workflow(server, viewer, &canonical_name, qvec).await? {
+                return success_json(&StoreWorkflowResponse {
+                    workflow_id: hit.id.to_string(),
+                    hint: Some(format!(
+                        "A workflow you can read already has a near-identical goal ({:.3} \
+                         similar): '{}' (canonical_name '{}', generation {}). Nothing was \
+                         stored. To change its steps, call improve_workflow_hierarchy with \
+                         parent_canonical_name='{}'; to mint a separate lineage anyway, call \
+                         store_workflow again with force_new=true.",
+                        hit.similarity,
+                        hit.goal,
+                        hit.canonical_name,
+                        hit.generation,
+                        hit.canonical_name
+                    )),
+                    canonical_name: hit.canonical_name,
+                    goal: hit.goal,
+                    generation: hit.generation,
+                    step_count: 0,
+                    claims_ingested: 0,
+                    already_ingested: false,
+                    matched_existing: true,
+                    similarity: Some(hit.similarity),
+                });
+            }
+        }
+    }
+
     let prereqs = params.prerequisites.unwrap_or_default();
     let tags = params.tags.unwrap_or_default();
     let confidence = resolve_workflow_confidence(params.confidence);
@@ -443,20 +485,15 @@ pub async fn store_workflow(
     crate::tools::workflow_ingest::embed_created_workflow_claims(server, caller, &inserted).await;
 
     // Also embed the workflow goal into workflows.goal_embedding for
-    // embedding-first find_workflow_hierarchical. Omitted from the original
-    // store_workflow; do_ingest_workflow embeds it correctly.
-    if let Some(wf_id) = crate::tools::workflow_ingest::goal_embedding_target(&response) {
-        match server.embedder.generate(&params.goal).await {
-            Ok(qvec) => {
-                crate::tools::workflow_ingest::store_workflow_goal_embedding(
-                    server, caller, wf_id, &qvec,
-                )
-                .await;
-            }
-            Err(e) => {
-                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
-            }
-        }
+    // embedding-first find_workflow_hierarchical (and the matching above).
+    // The vector computed before the ingest is reused; an embedder failure
+    // there was already logged.
+    if let (Some(wf_id), Some(qvec)) = (
+        crate::tools::workflow_ingest::goal_embedding_target(&response),
+        goal_vec.as_deref(),
+    ) {
+        crate::tools::workflow_ingest::store_workflow_goal_embedding(server, caller, wf_id, qvec)
+            .await;
     }
 
     success_json(&StoreWorkflowResponse {
@@ -467,7 +504,47 @@ pub async fn store_workflow(
         step_count: params.steps.len(),
         claims_ingested: response.claims_ingested,
         already_ingested: response.already_ingested,
+        matched_existing: false,
+        similarity: None,
+        hint: None,
     })
+}
+
+/// Cosine similarity at or above which `store_workflow` treats a new goal as a
+/// rewording of an existing hierarchical workflow's goal (backlog 5e54282f).
+/// Well above `find_workflow_hierarchical`'s 0.5 search floor: that one finds
+/// candidates, this one refuses to mint a lineage.
+pub const STORE_WORKFLOW_MATCH_THRESHOLD: f64 = 0.90;
+
+/// The live (`truth_value >= 0.3`) hierarchical workflow `viewer` reads whose
+/// goal is the most similar to `qvec`, when it clears
+/// [`STORE_WORKFLOW_MATCH_THRESHOLD`] under a canonical_name other than
+/// `canonical_name`. `None` when there is none, and ALSO when a readable row
+/// already carries `canonical_name` itself: an identical goal is the ingest's
+/// own idempotent no-op (`already_ingested`), not a match.
+async fn matching_workflow(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    canonical_name: &str,
+    qvec: &[f32],
+) -> Result<Option<epigraph_db::ScoredHierarchicalWorkflowRow>, McpError> {
+    let mut read = server.read_as(viewer, "store_workflow").await?;
+    let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
+        &mut *read,
+        viewer,
+        &format_pgvector(qvec),
+        0.3,
+        10,
+    )
+    .await
+    .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
+    if hits.iter().any(|h| h.canonical_name == canonical_name) {
+        return Ok(None);
+    }
+    Ok(hits
+        .into_iter()
+        .find(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD))
 }
 
 pub async fn find_workflow(

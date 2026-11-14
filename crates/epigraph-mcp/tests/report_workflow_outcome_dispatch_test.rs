@@ -38,6 +38,7 @@ async fn report_outcome_dispatches_to_hierarchical_when_id_is_a_workflows_row(po
         &server,
         &viewer,
         StoreWorkflowParams {
+            force_new: None,
             tenancy: Some(common::stdio_public_tenancy(&server).await),
             goal: goal.clone(),
             steps: vec!["alpha step".to_string(), "beta step".to_string()],
