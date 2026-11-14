@@ -341,3 +341,100 @@ async fn kind_narrows_and_a_bad_kind_or_cursor_is_refused(pool: PgPool) {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
 }
+
+async fn show_statement_timeout(conn: &mut sqlx::PgConnection) -> String {
+    sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(conn)
+        .await
+        .expect("SHOW statement_timeout")
+}
+
+/// The unthemed overview aggregates every readable current claim per request,
+/// so it runs under its own `statement_timeout`. Pinned deterministically by
+/// a lock wait (a `statement_timeout` covers time spent waiting on a lock):
+/// while another session holds `evidence` exclusively, the overview gives up
+/// at its bound with `57014` instead of waiting, and the connection's own
+/// `statement_timeout` is put back afterwards, on the error path.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_overview_gives_up_at_its_time_bound_and_restores_the_connection(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let k = corpus(&pool).await;
+    // Resolved on the superuser pool (an unstamped downgraded session would
+    // resolve an empty group set).
+    let viewer = epigraph_db::Viewer::resolve(&pool, k.stranger)
+        .await
+        .expect("resolve the stranger");
+    let query = epigraph_db::SourcesQuery {
+        theme_id: Some(k.t),
+        kinds: None,
+        after: None,
+        limit: 50,
+    };
+
+    let mut read = state.read_as(&viewer).await.expect("stamped read");
+    let before = show_statement_timeout(&mut read).await;
+
+    let mut locker = pool.begin().await.expect("locker tx");
+    sqlx::query("LOCK TABLE evidence IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *locker)
+        .await
+        .expect("hold evidence");
+
+    let bounded = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        epigraph_db::SourcesRepository::overview(
+            &mut read,
+            &viewer,
+            &query,
+            std::time::Duration::from_millis(300),
+        ),
+    )
+    .await
+    .expect("the overview waited on the lock past its bound: no statement_timeout applied");
+    let err = bounded.expect_err("the overview cannot read evidence while it is locked");
+    let code = match &err {
+        epigraph_db::DbError::QueryFailed { source } => source
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(|c| c.to_string()),
+        _ => None,
+    };
+    assert_eq!(code.as_deref(), Some("57014"), "{err:?}");
+    assert!(
+        matches!(
+            epigraph_api::routes::sources::overview_read_failed(&err),
+            epigraph_api::errors::ApiError::ServiceUnavailable { .. }
+        ),
+        "a timed-out overview answers 503"
+    );
+    assert_eq!(
+        show_statement_timeout(&mut read).await,
+        before,
+        "the connection's own statement_timeout is restored after a timeout"
+    );
+
+    locker.rollback().await.expect("release evidence");
+    let (rows, _) = epigraph_db::SourcesRepository::overview(
+        &mut read,
+        &viewer,
+        &query,
+        epigraph_db::SOURCES_OVERVIEW_STATEMENT_TIMEOUT,
+    )
+    .await
+    .expect("unlocked, the same connection reads the overview");
+    assert!(!rows.is_empty(), "the theme has sources");
+    assert_eq!(show_statement_timeout(&mut read).await, before);
+    read.commit().await.expect("finish the read");
+}
+
+/// Any other read failure stays an opaque 500.
+#[test]
+fn a_failed_overview_read_that_did_not_time_out_is_a_500() {
+    let err = epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::RowNotFound,
+    };
+    assert!(matches!(
+        epigraph_api::routes::sources::overview_read_failed(&err),
+        epigraph_api::errors::ApiError::InternalError { .. }
+    ));
+}

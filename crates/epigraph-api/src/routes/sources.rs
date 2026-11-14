@@ -103,8 +103,43 @@ pub struct SourcesOverviewResponse {
 /// The sources of the caller's readable current claims, grouped by kind,
 /// with the caller's counts (module doc).
 ///
+/// The answer to a failed overview read: a 503 when the statement ran past
+/// [`epigraph_db::SOURCES_OVERVIEW_STATEMENT_TIMEOUT`] (`57014
+/// query_canceled`), telling the caller to narrow by `theme_id`, else an
+/// opaque 500. Either way the driver's error is logged, never answered.
+#[must_use]
+pub fn overview_read_failed(e: &epigraph_db::DbError) -> ApiError {
+    tracing::error!(
+        target: "tenancy.scoped_read",
+        error = %e,
+        handler = "sources_overview",
+        "sources overview read failed"
+    );
+    let canceled = matches!(
+        e,
+        epigraph_db::DbError::QueryFailed { source }
+            if source
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref()
+                == Some("57014")
+    );
+    if canceled {
+        ApiError::ServiceUnavailable {
+            service: "sources overview (the read ran past its time bound; narrow it with \
+                      theme_id)"
+                .to_string(),
+        }
+    } else {
+        ApiError::InternalError {
+            message: "Failed to read the sources overview".to_string(),
+        }
+    }
+}
+
 /// # Errors
-/// 400 for an unknown `kind` or a malformed `after`; 500 when a read fails.
+/// 400 for an unknown `kind` or a malformed `after`; 503 when the grouping
+/// ran past its time bound; 500 when a read fails.
 pub async fn sources_overview(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
@@ -144,20 +179,10 @@ pub async fn sources_overview(
         .unwrap_or(DEFAULT_SOURCES_LIMIT)
         .clamp(1, epigraph_db::MAX_SOURCES_PAGE);
 
-    let failed = |e: epigraph_db::DbError| {
-        tracing::error!(
-            target: "tenancy.scoped_read",
-            error = %e,
-            handler = "sources_overview",
-            "sources overview read failed"
-        );
-        ApiError::InternalError {
-            message: "Failed to read the sources overview".to_string(),
-        }
-    };
+    let failed = |e: epigraph_db::DbError| overview_read_failed(&e);
     let mut read = state.read_as(&viewer).await.map_err(failed)?;
     let (rows, more) = epigraph_db::SourcesRepository::overview(
-        &mut *read,
+        &mut read,
         &viewer,
         &epigraph_db::SourcesQuery {
             theme_id: params.theme_id,
@@ -165,6 +190,7 @@ pub async fn sources_overview(
             after,
             limit,
         },
+        epigraph_db::SOURCES_OVERVIEW_STATEMENT_TIMEOUT,
     )
     .await
     .map_err(failed)?;

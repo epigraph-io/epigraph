@@ -24,7 +24,17 @@
 //! within its kind), and paged by keyset ([`SourcesCursor`]). Counts are
 //! computed per request, so a source whose count changes between two pages may
 //! move across the boundary; the cursor never repeats a position it passed.
+//!
+//! Without a `theme_id` the overview aggregates EVERY readable current claim
+//! on each page request (the grouping cannot be cut off before the `LIMIT`),
+//! so [`SourcesRepository::overview`] runs under its own `statement_timeout`
+//! ([`SOURCES_OVERVIEW_STATEMENT_TIMEOUT`] from the route) and puts the
+//! connection's previous value back on every exit. An overrun is a `57014
+//! query_canceled` the route answers with a 503.
 
+use std::time::Duration;
+
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::errors::DbError;
@@ -37,6 +47,12 @@ pub const SOURCE_KINDS: &[&str] = &["agent", "paper", "web"];
 
 /// Most sources one page returns.
 pub const MAX_SOURCES_PAGE: i64 = 200;
+
+/// The bound on one overview statement. A placeholder until the unthemed
+/// overview has been measured at production scale: the API's scoped pool
+/// sets no pool-wide `statement_timeout`, so without this an unthemed request
+/// in a loop is an unbounded aggregation of the corpus per call.
+pub const SOURCES_OVERVIEW_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A keyset position in the overview's `(claim_count DESC, kind, key)`
 /// order: the last row of the previous page.
@@ -122,10 +138,42 @@ impl SourcesRepository {
     /// title, an agent row its display name (`papers` and `agents` carry no
     /// row security; only the sources this page lists are joined).
     ///
+    /// The statement runs under `statement_timeout` (at least 1 ms: a zero
+    /// would DISABLE the bound), and the connection's previous
+    /// `statement_timeout` is restored on every exit, the error ones
+    /// included, before the result is returned. On a transaction-mode
+    /// connection a timed-out statement aborts the transaction, the restore
+    /// then fails too, and the original error is the one returned (the
+    /// rollback on drop undoes the `SET` with everything else).
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    pub async fn overview<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns `DbError::QueryFailed` if the database query fails, including
+    /// `57014 query_canceled` when `statement_timeout` is exceeded.
+    pub async fn overview(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        query: &SourcesQuery<'_>,
+        statement_timeout: Duration,
+    ) -> Result<(Vec<SourceRow>, bool), DbError> {
+        let previous = crate::pool::read_statement_timeout(conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        crate::pool::apply_statement_timeout(conn, statement_timeout.max(Duration::from_millis(1)))
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        let page = Self::overview_page(&mut *conn, viewer, query).await;
+        // Restored BEFORE the `?` on `page`, so a timeout leaves the
+        // connection as it was found.
+        let restored = crate::pool::restore_statement_timeout(conn, &previous).await;
+        let page = page?;
+        restored.map_err(|source| DbError::QueryFailed { source })?;
+        Ok(page)
+    }
+
+    /// The overview's one statement, unbounded: [`Self::overview`] is its
+    /// only caller.
+    async fn overview_page(
+        conn: &mut PgConnection,
         viewer: &Viewer,
         query: &SourcesQuery<'_>,
     ) -> Result<(Vec<SourceRow>, bool), DbError> {
@@ -202,7 +250,7 @@ impl SourcesRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let mut rows = q.fetch_all(executor).await?;
+        let mut rows = q.fetch_all(conn).await?;
         let more = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
         rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         Ok((rows, more))

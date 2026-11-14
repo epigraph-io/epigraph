@@ -185,7 +185,8 @@ pub use repos::{
 };
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use repos::{
-    SourceRow, SourcesCursor, SourcesQuery, SourcesRepository, MAX_SOURCES_PAGE, SOURCE_KINDS,
+    SourceRow, SourcesCursor, SourcesQuery, SourcesRepository, MAX_SOURCES_PAGE,
+    SOURCES_OVERVIEW_STATEMENT_TIMEOUT, SOURCE_KINDS,
 };
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};

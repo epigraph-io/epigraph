@@ -248,7 +248,8 @@ pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use sources::{
-    SourceRow, SourcesCursor, SourcesQuery, SourcesRepository, MAX_SOURCES_PAGE, SOURCE_KINDS,
+    SourceRow, SourcesCursor, SourcesQuery, SourcesRepository, MAX_SOURCES_PAGE,
+    SOURCES_OVERVIEW_STATEMENT_TIMEOUT, SOURCE_KINDS,
 };
 pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
