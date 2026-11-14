@@ -1770,7 +1770,8 @@ pub async fn do_ingest_document_reporting(
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
-    // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
+    // by N × ~0.8 s OpenAI calls. The response's `claims_embedded` is the number
+    // QUEUED here, not the number embedded (the field keeps its wire name); the
     // invariant (every is_current claim has an embedding) is satisfied eventually.
     let queued = embed_queue.len();
     if !embed_queue.is_empty() {

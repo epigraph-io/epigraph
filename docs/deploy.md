@@ -108,7 +108,8 @@ deploy from the same commit. Several deploy orders below depend on it.
 
 ### Step 2 — Create the database and the migration login
 
-As a PostgreSQL superuser, on PostgreSQL 16 with pgvector installed:
+As a PostgreSQL superuser, on PostgreSQL 16 with pgvector 0.8.0 or newer installed
+(`epigraph-migrate` refuses an older one after migrating):
 
 ```sql
 CREATE ROLE <migration_login> LOGIN SUPERUSER PASSWORD '<secret>';  -- or a schema owner; see below
@@ -4439,6 +4440,7 @@ Do not improvise it against a live database without that entry's context.
 | `operator binding is NOT ARMED on this database: ...` (WARN) | Expected until you arm (section 9). |
 | `migration 122 (operator binding) is not applied to this database; claim writes through default declarations fail closed until it is` | Run `epigraph-migrate`. |
 | `migrations: FAILED: REFUSING: the database has N applied migration version(s) this binary does not embed: ...` | A stale binary (section 4). Deploy the newer build, or `--allow-db-ahead` for a deliberate rollback. |
+| `migrations: FAILED: migrations were applied, but pgvector <v> is installed but 0.8.0 or newer is required ...` | The migrations ran; the installed pgvector is too old for semantic search (`hnsw.iterative_scan`). Install a newer pgvector on the server and run `ALTER EXTENSION vector UPDATE` in the database, then re-run `epigraph-migrate`. |
 | `migrations: FAILED: sqlx::migrate failed: ...` | Often an edited applied migration (a checksum mismatch), or a precondition `RAISE` (`55000` from the md5 preconditions, 074/075/084's pre-flights). Read the message, and the migration's header. |
 | `epigraph-migrate` exits 0 and applies nothing, but your migration is missing | A stale binary from a shared target directory (section 4). |
 | `Failed to bind the internal metrics listener; metrics will not be scrapeable. The API continues to serve.` | Another process holds `EPIGRAPH_METRICS_ADDR`. Give each instance its own. |
