@@ -524,6 +524,35 @@ fn verify_agent_assertion(
     Ok(())
 }
 
+/// Access-token lifetime by client type: agent 15 min, human 1 h, service 1 h;
+/// an unknown type gets the shortest. The ONE table, used by the
+/// `client_credentials`, `refresh_token` and `authorization_code` grants, which
+/// each used to carry their own copy.
+#[cfg(feature = "db")]
+fn access_token_ttl(client_type: &str) -> Duration {
+    match client_type {
+        "agent" => Duration::minutes(15),
+        "human" => Duration::hours(1),
+        "service" => Duration::hours(1),
+        _ => Duration::minutes(15),
+    }
+}
+
+/// Refresh-token lifetime by client type: agent 24 h, human 30 d, service
+/// 90 d; an unknown type gets the shortest. Shared by the same three grants as
+/// [`access_token_ttl`]. The refresh rotation's database-side expiry cap
+/// mirrors this table (`rotation_caps_each_client_types_successor_at_its_refresh_ttl`
+/// in `epigraph-db/tests/app_role_table_lockdown.rs`); change both together.
+#[cfg(feature = "db")]
+fn refresh_token_ttl(client_type: &str) -> Duration {
+    match client_type {
+        "agent" => Duration::hours(24),
+        "human" => Duration::days(30),
+        "service" => Duration::days(90),
+        _ => Duration::hours(24),
+    }
+}
+
 /// Whether `client_type` is a CONFIDENTIAL client: one that holds a credential
 /// of its own (an agent's Ed25519 key, a service's secret) and so must present
 /// it on the `client_credentials` grant and on the refresh grant (RFC 6749
@@ -646,12 +675,7 @@ async fn handle_client_credentials(
     }
     authenticate_confidential_client(&client, req)?;
 
-    let ttl = match client.client_type.as_str() {
-        "agent" => Duration::minutes(15),
-        "human" => Duration::hours(1),
-        "service" => Duration::hours(1),
-        _ => Duration::minutes(15),
-    };
+    let ttl = access_token_ttl(&client.client_type);
 
     // Effective scopes = intersection of requested and granted, through the
     // mint chokepoint (never the elevation scope; the admin-only scopes per
@@ -709,12 +733,7 @@ async fn handle_client_credentials(
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
         let hash = blake3::hash(&raw);
-        let refresh_ttl = match client.client_type.as_str() {
-            "agent" => Duration::hours(24),
-            "human" => Duration::days(30),
-            "service" => Duration::days(90),
-            _ => Duration::hours(24),
-        };
+        let refresh_ttl = refresh_token_ttl(&client.client_type);
         epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
             &state.db_pool,
             hash.as_bytes(),
@@ -916,12 +935,7 @@ async fn handle_refresh_token(
         });
     }
 
-    let ttl = match client.client_type.as_str() {
-        "agent" => Duration::minutes(15),
-        "human" => Duration::hours(1),
-        "service" => Duration::hours(1),
-        _ => Duration::minutes(15),
-    };
+    let ttl = access_token_ttl(&client.client_type);
 
     // RFC 6749 section 6: a refreshed token "MUST NOT include any scope not
     // originally granted by the resource owner". The ceiling is the presented
@@ -1026,12 +1040,7 @@ async fn handle_refresh_token(
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
         let new_hash = blake3::hash(&raw);
-        let refresh_ttl = match client.client_type.as_str() {
-            "agent" => Duration::hours(24),
-            "human" => Duration::days(30),
-            "service" => Duration::days(90),
-            _ => Duration::hours(24),
-        };
+        let refresh_ttl = refresh_token_ttl(&client.client_type);
         match RefreshTokenRepository::rotate(
             &state.db_pool,
             hash.as_bytes(),
@@ -1280,15 +1289,10 @@ async fn handle_authorization_code(
         });
     }
 
-    // TTLs by client type, matching the sibling grant handlers' tables. Per-user
+    // TTLs by client type, from the one table every grant handler uses. Per-user
     // clients are always client_type="human" (1h access / 30d refresh); keying off
     // client_type keeps the values coupled to type rather than hardcoded.
-    let ttl = match client.client_type.as_str() {
-        "agent" => Duration::minutes(15),
-        "human" => Duration::hours(1),
-        "service" => Duration::hours(1),
-        _ => Duration::minutes(15),
-    };
+    let ttl = access_token_ttl(&client.client_type);
     // The code's consented scopes, through the mint chokepoint (never the
     // elevation scope; the admin-only scopes per migration 128's switch). The
     // refresh chain stores the consent itself; see
@@ -1316,12 +1320,7 @@ async fn handle_authorization_code(
         let raw: [u8; 32] = rand::thread_rng().gen();
         let token_str = hex::encode(raw);
         let hash = blake3::hash(&raw);
-        let refresh_ttl = match client.client_type.as_str() {
-            "agent" => Duration::hours(24),
-            "human" => Duration::days(30),
-            "service" => Duration::days(90),
-            _ => Duration::hours(24),
-        };
+        let refresh_ttl = refresh_token_ttl(&client.client_type);
         let refresh_id =
             epigraph_db::repos::refresh_token::RefreshTokenRepository::create_issued_to(
                 &state.db_pool,
@@ -2028,5 +2027,25 @@ mod refresh_scope_tests {
             Some(v(&["claims:write", "claims:read"])),
             "any whitespace separates requested scopes"
         );
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod token_ttl_tests {
+    use super::*;
+
+    /// The lifetimes the three grant handlers each carried a copy of, pinned on
+    /// the one table they now share.
+    #[test]
+    fn the_ttl_table_is_unchanged_by_client_type() {
+        for (client_type, access, refresh) in [
+            ("agent", Duration::minutes(15), Duration::hours(24)),
+            ("human", Duration::hours(1), Duration::days(30)),
+            ("service", Duration::hours(1), Duration::days(90)),
+            ("unknown", Duration::minutes(15), Duration::hours(24)),
+        ] {
+            assert_eq!(access_token_ttl(client_type), access, "{client_type}");
+            assert_eq!(refresh_token_ttl(client_type), refresh, "{client_type}");
+        }
     }
 }
