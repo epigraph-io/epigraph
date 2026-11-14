@@ -363,6 +363,19 @@ name = "atlas_meaning"
 path = "tests/atlas_meaning.rs"
 required-features = ["db"]
 
+# Atlas W8: LLM names for every group of a map, through the Claude CLI
+# (maintenance DSN). Dry run unless --apply.
+[[bin]]
+name = "atlas_naming"
+path = "src/bin/atlas_naming.rs"
+required-features = ["db"]
+
+# Atlas W8: the naming step on a fresh database, with a recording backend.
+[[test]]
+name = "atlas_naming"
+path = "tests/atlas_naming.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
@@ -464,6 +477,11 @@ dotenvy = "0.15"
 base64 = "0.22"
 blake3 = { workspace = true }
 sha2 = { workspace = true }
+# Atlas naming (`atlas_naming::backend`): the effective uid its private
+# working directory is checked against, and the kill of the Claude CLI's
+# process group at the timeout, both without `unsafe` (forbidden in this
+# workspace). Already in the lockfile, at this version.
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 rand = { workspace = true }
 linfa = { workspace = true }
 linfa-clustering = { workspace = true }
