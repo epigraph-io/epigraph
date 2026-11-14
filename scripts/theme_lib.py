@@ -74,6 +74,12 @@ def not_intake_owned(alias="c"):
       * project_to_themes copies cluster_labels (filtered above);
         split_theme, maintain_themes.auto_split_theme and the
         create-with-centroid route write placeholder or derived labels;
+      * theme_cap_split reads no member content at all: its parts are
+        labelled from the parent theme's label plus a part number, and its
+        plan, export, result and manifest files hold ids, sizes and
+        embeddings only (tests/theme/test_theme_cap_split.py::
+        test_no_claim_text_reaches_any_output). Intake-owned members move
+        with their part, as membership is outside this rule;
       * split_theme --dry-run and subcluster_outliers are read-only reports
         that print member text to the maintenance operator running them and
         store nothing. A theme an operator later creates from what they read
