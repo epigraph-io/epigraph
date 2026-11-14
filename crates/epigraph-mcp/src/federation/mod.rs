@@ -904,3 +904,167 @@ mod candidate_tests {
         );
     }
 }
+
+/// The `generation` guard on [`FederationRegistry::apply_relist`] and
+/// [`FederationRegistry::apply_reconnect`].
+///
+/// A reconnect pass snapshots a mount's generation, drops the lock for its
+/// network I/O, and applies its result later. Between the two, another pass
+/// (or a failed call's [`SharedFederation::recheck`]) may have demoted and
+/// re-promoted the same mount. These tests stage exactly that: the mount is
+/// already in the state the stale result's health check would accept, so only
+/// the generation comparison can refuse the stale write. Each has a control
+/// at the current generation, so a test cannot pass because the write is a
+/// no-op for some other reason.
+#[cfg(test)]
+mod generation_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use rmcp::model::Tool;
+    use rmcp::{ServerHandler, ServiceExt};
+
+    use super::{FederationRegistry, MountedExtension};
+    use crate::federation::client::{ExtensionClient, FederationError};
+    use crate::federation::config::{ExtensionConfig, DEFAULT_CALL_TIMEOUT};
+
+    fn tool(name: &str) -> Tool {
+        Tool::new(
+            name.to_string(),
+            "test tool",
+            Arc::new(serde_json::Map::new()),
+        )
+    }
+
+    fn config() -> ExtensionConfig {
+        ExtensionConfig {
+            name: "ext".to_string(),
+            addr: "127.0.0.1:1".to_string(),
+            scope: "ext:tools".to_string(),
+            prefix: None,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+
+    /// One mount at `generation`, routing `tools` when `healthy`.
+    ///
+    /// `client` is `None` even when `healthy` is true, a state the gateway
+    /// never builds. That is sound only for `apply_relist`, which never reads
+    /// the session; the reconnect tests pass a real one.
+    fn registry(healthy: bool, generation: u64, tools: &[&str]) -> FederationRegistry {
+        let tools: Vec<Tool> = if healthy {
+            tools.iter().map(|n| tool(n)).collect()
+        } else {
+            Vec::new()
+        };
+        let routes: HashMap<String, usize> =
+            tools.iter().map(|t| (t.name.to_string(), 0)).collect();
+        FederationRegistry {
+            extensions: vec![MountedExtension {
+                config: config(),
+                client: None,
+                tools,
+                healthy,
+                generation,
+            }],
+            routes,
+            discovery_token: String::new(),
+            reserved: HashSet::new(),
+        }
+    }
+
+    fn routed(registry: &FederationRegistry) -> Vec<String> {
+        let mut names: Vec<String> = registry.routes.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn list_failed() -> Result<Vec<Tool>, FederationError> {
+        Err(FederationError::ListTimeout(Duration::from_secs(10)))
+    }
+
+    /// A downstream with no tools, served over an in-memory pipe, so a test
+    /// holds a real discovery session without a socket.
+    struct Downstream;
+    impl ServerHandler for Downstream {}
+
+    async fn session() -> ExtensionClient {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = Downstream.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        match ().serve(client_io).await {
+            Ok(client) => client,
+            Err(e) => panic!("in-memory MCP handshake failed: {e}"),
+        }
+    }
+
+    /// A re-list that failed, planned before the mount was demoted and
+    /// reconnected, must not demote the freshly reconnected mount.
+    #[test]
+    fn a_stale_failed_relist_does_not_demote_a_reconnected_mount() {
+        let mut stale = registry(true, 2, &["a"]);
+        stale.apply_relist(0, 0, list_failed());
+        assert!(
+            stale.extensions[0].healthy,
+            "a stale failure demoted the mount"
+        );
+        assert_eq!(routed(&stale), vec!["a".to_string()]);
+
+        let mut current = registry(true, 2, &["a"]);
+        current.apply_relist(0, 2, list_failed());
+        assert!(
+            !current.extensions[0].healthy,
+            "control: a failure at the current generation must demote"
+        );
+        assert!(routed(&current).is_empty());
+    }
+
+    /// A re-list that answered, planned before a newer change, must not swap
+    /// in its older tool list.
+    #[test]
+    fn a_stale_changed_relist_does_not_swap_routes() {
+        let mut stale = registry(true, 2, &["a"]);
+        stale.apply_relist(0, 0, Ok(vec![tool("old")]));
+        assert_eq!(
+            routed(&stale),
+            vec!["a".to_string()],
+            "a stale tool list replaced the current one"
+        );
+        assert_eq!(stale.extensions[0].generation, 2);
+
+        let mut current = registry(true, 2, &["a"]);
+        current.apply_relist(0, 2, Ok(vec![tool("new")]));
+        assert_eq!(
+            routed(&current),
+            vec!["new".to_string()],
+            "control: a changed list at the current generation must be swapped in"
+        );
+        assert_eq!(current.extensions[0].generation, 3);
+    }
+
+    /// A reconnect planned before the mount was promoted and demoted again
+    /// must not promote it with its stale session and tool list.
+    #[tokio::test]
+    async fn a_stale_reconnect_does_not_promote_a_demoted_mount() {
+        let mut stale = registry(false, 2, &[]);
+        stale.apply_reconnect(0, 0, session().await, vec![tool("old")]);
+        assert!(
+            !stale.extensions[0].healthy,
+            "a stale reconnect promoted the mount"
+        );
+        assert!(stale.extensions[0].client.is_none());
+        assert!(routed(&stale).is_empty());
+
+        let mut current = registry(false, 2, &[]);
+        current.apply_reconnect(0, 2, session().await, vec![tool("new")]);
+        assert!(
+            current.extensions[0].healthy,
+            "control: a reconnect at the current generation must promote"
+        );
+        assert_eq!(routed(&current), vec!["new".to_string()]);
+    }
+}
