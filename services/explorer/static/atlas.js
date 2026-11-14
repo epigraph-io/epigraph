@@ -889,7 +889,58 @@
     minR: Infinity,
     animate: false,
     leafShown: false,
+    /** Levels attached since the last frame, until it draws them (W12 marks). */
+    drawnPending: [],
+    /** Levels asked for and not yet drawn (W12 marks). */
+    wanted: new Set(),
   };
+
+  // The latency marks (W12): `atlas:want:<level id>` when the viewer needs a
+  // level (zoom, switch, link), `atlas:drawn:<kind>:<level id>` after the first
+  // frame that draws it, and the stage's `data-atlas-drawn-level`. A level
+  // re-attached without being asked for (a breadcrumb ancestor from the cache)
+  // gets no drawn mark. They are what scripts/e2e/atlas-latency-browser.mjs
+  // times; nothing here reads them. OFF unless the page was opened with
+  // `window.__ATLAS_TIMING__ === true` set before this script runs (the
+  // browser script sets it with an init script): User Timing marks are never
+  // evicted, so a real /atlas session must not accumulate one per level.
+  const TIMING = (() => {
+    try {
+      return window.__ATLAS_TIMING__ === true;
+    } catch (e) {
+      return false;
+    }
+  })();
+
+  function markWanted(id) {
+    if (!TIMING) return;
+    NS.wanted.add(id);
+    try {
+      performance.mark('atlas:want:' + id);
+    } catch (e) {
+      /* no User Timing: nothing to mark */
+    }
+  }
+
+  /** A wanted level whose fetch failed is no longer wanted. */
+  function unmarkWanted(id) {
+    NS.wanted.delete(id);
+  }
+
+  function markDrawn() {
+    if (!NS.drawnPending.length) return;
+    const docs = NS.drawnPending;
+    NS.drawnPending = [];
+    for (const doc of docs) {
+      if (!NS.wanted.delete(doc.level_id)) continue;
+      try {
+        performance.mark('atlas:drawn:' + doc.kind + ':' + doc.level_id);
+      } catch (e) {
+        /* no User Timing: nothing to mark */
+      }
+    }
+    dom.stage.setAttribute('data-atlas-drawn-level', docs[docs.length - 1].level_id);
+  }
 
   function nestedRoot(theme) {
     if (!NS.on || !theme || theme.kind !== 'theme') return null;
@@ -940,6 +991,7 @@
 
   /** Hang a fetched level's children under `node` (a theme, group or leaf). */
   function attachLevel(node, doc) {
+    if (TIMING) NS.drawnPending.push(doc);
     node.doc = doc;
     node.levelId = doc.level_id;
     node.next = null;
@@ -1007,9 +1059,11 @@
     }
     theme.state = 'loading';
     redraw();
+    markWanted(id);
     try {
       attachLevel(theme, await fetchLevel(id, 'group', NS.hierarchy));
     } catch (e) {
+      unmarkWanted(id);
       theme.state = isAbort(e) ? 'idle' : 'error';
       theme.error = e.message;
     }
@@ -1021,9 +1075,11 @@
     if (node.state === 'loading') return;
     node.state = 'loading';
     redraw();
+    markWanted(node.levelId);
     try {
       attachLevel(node, await fetchLevel(node.levelId, node.kind, node.hierarchy));
     } catch (e) {
+      unmarkWanted(node.levelId);
       node.state = isAbort(e) ? 'idle' : 'error';
       node.error = e.message;
     }
@@ -1091,9 +1147,11 @@
       return;
     }
     let doc;
+    markWanted(target.level_id);
     try {
       doc = await fetchLevel(target.level_id, null, hierarchy);
     } catch (e) {
+      unmarkWanted(target.level_id);
       if (!isAbort(e)) setNotice(e.message);
       return;
     }
@@ -1129,9 +1187,11 @@
       return;
     }
     let doc;
+    markWanted(target.level_id);
     try {
       doc = await fetchLevel(target.level_id, null, target.hierarchy);
     } catch (e) {
+      unmarkWanted(target.level_id);
       if (!isAbort(e)) setNotice(e.message);
       return;
     }
@@ -1882,6 +1942,7 @@
     drawRim();
     const ringItems = drawRing();
     S.drawn = drawn.concat(ringItems);
+    markDrawn();
     if (S.rim.length) {
       S.caption = (S.caption ? S.caption + ' ' : '') + 'Rim marks show links to the strongest partners only.';
     }
