@@ -3120,14 +3120,17 @@ impl ServerHandler for EpiGraphMcpFull {
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
                 // (d) proxy to the downstream on a fresh caller-token session.
-                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
-                // handler's error type directly (no further conversion).
+                // A failure is answered as what it is (backlog 7ea4bd74): the
+                // downstream's own JSON-RPC error unchanged, and a designed
+                // message for an extension that is down or did not answer.
+                // Every one of these used to reach the caller as the same
+                // redacted "internal error".
                 return self
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map(rmcp::model::CallToolResponse::from)
-                    .map_err(crate::errors::internal_error);
+                    .map_err(|e| crate::errors::federated_call_error(&ext_name, &request.name, e));
             }
 
             // Neither a kernel tool nor a federated route: a ROUTING failure.
