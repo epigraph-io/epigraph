@@ -344,6 +344,112 @@ async fn a_private_item_persists_without_an_embedding_while_a_public_one_is_embe
     }
 }
 
+/// Backlog 55c12085: one author's SECOND `fully_private` claim.
+///
+/// `create_claim_core` stores the constant `[private]` as a `fully_private`
+/// claim's content, so every such claim by one author carries the same
+/// `(content_hash, agent_id)`. The strict-create duplicate check keyed on that
+/// pair therefore answered 409 to every private claim after an author's first,
+/// and `if_not_exists` is refused for the tier. Two items in one batch and a
+/// third in a later request must all persist, each with its own ciphertext row.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_author_can_write_more_than_one_fully_private_claim() {
+    let db = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db)
+        .await
+        .unwrap();
+    let agent = common::seed_system_agent(&pool).await;
+    epigraph_db::ClaimRepository::personal_group_of_pool(&pool, agent)
+        .await
+        .expect("provision the agent's personal group");
+    let (addr, _shutdown) = common::spawn_app(&db).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client_for_agent(
+        &pool,
+        &["claims:write", "groups:write"],
+        agent,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let group: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/groups"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": uniq("grp"),
+            "group_public_key": hex::encode(blake3::hash(uniq("key").as_bytes()).as_bytes())
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = group["group_id"]
+        .as_str()
+        .expect("group created (epoch 0 active)")
+        .to_string();
+    let private_item = |ciphertext: &str| {
+        serde_json::json!({
+            "content": uniq("private"), "privacy_tier": "fully_private", "group_id": group_id,
+            "encrypted_content": ciphertext, "encryption_epoch": 0
+        })
+    };
+
+    let first: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/claims/batch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"claims": [
+            private_item("Zmlyc3Q="),
+            private_item("c2Vjb25k"),
+        ]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        first["created"], 2,
+        "both private items must persist; a 409 on the second is the placeholder \
+         hash collision: {first}"
+    );
+
+    let later: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/claims/batch"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"claims": [private_item("dGhpcmQ=")]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        later["created"], 1,
+        "a private claim in a LATER request, after the author's earlier ones \
+         committed, must persist too: {later}"
+    );
+
+    let mut ids: Vec<Uuid> = vec![
+        id_at(&first, 0).expect("id").parse().unwrap(),
+        id_at(&first, 1).expect("id").parse().unwrap(),
+        id_at(&later, 0).expect("id").parse().unwrap(),
+    ];
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "three distinct claims: {first} {later}");
+    let sealed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claim_encryption WHERE claim_id = ANY($1) \
+            AND privacy_tier = 'fully_private'",
+    )
+    .bind(&ids)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sealed, 3, "each private claim has its own ciphertext row");
+}
+
 /// Final review, Important item 2 (deferred #6): the encrypted path's
 /// group-membership refusal. `create_claim_core` checks
 /// `GroupMembershipRepository::is_member` against the AUTHENTICATED identity
