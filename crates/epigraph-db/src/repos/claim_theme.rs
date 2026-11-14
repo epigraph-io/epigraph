@@ -75,13 +75,12 @@ pub const THEME_OVERVIEW_PAGE_MAX: i64 = 200;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeOverviewRow {
     pub id: Uuid,
-    /// Stored label. NOT viewer-derived: for a theme with members the viewer
-    /// cannot read it may summarise their text (the theme scripts that name
-    /// themes and clusters sample members with no visibility predicate,
-    /// except claims the bug-report intake group owns, which none of them
-    /// samples: `scripts/theme_lib.py::not_intake_owned` lists every such
-    /// path; the label residual on `D-PR16-theme-cluster-viewer-scope`). Cut
-    /// to 200 characters.
+    /// Stored label. NOT viewer-derived. The theme scripts that name themes
+    /// and clusters sample public, non-intake members only
+    /// (`scripts/theme_lib.py::public_label_source` lists every such path),
+    /// but a label stored before that rule, until an operator relabels, may
+    /// summarise text the viewer cannot read (the label residual on
+    /// `D-PR16-theme-cluster-viewer-scope`). Cut to 200 characters.
     pub label: String,
     /// Current claims assigned to this theme that the viewer can read. `>= 1`.
     pub member_count: i64,
@@ -1254,9 +1253,10 @@ impl ClaimThemeRepository {
     /// a zero row would publish the id and label of an all-private theme. The
     /// stale `claim_themes.claim_count` column is not read, under any name.
     /// `claim_themes` is not a tenancy table; only the counts, and through them
-    /// which theme rows appear, narrow. The LABEL is not narrowed and may be
-    /// derived from members the viewer cannot read (the label residual on
-    /// `D-PR16-theme-cluster-viewer-scope`).
+    /// which theme rows appear, narrow. The LABEL is not narrowed; the theme
+    /// scripts build it from public members only, but one stored before that
+    /// rule may be derived from members the viewer cannot read (the label
+    /// residual on `D-PR16-theme-cluster-viewer-scope`).
     ///
     /// `limit` is clamped to `1..=THEME_OVERVIEW_PAGE_MAX`. `after` is a pure
     /// keyset position: one naming a count or id that no longer exists returns
