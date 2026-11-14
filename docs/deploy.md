@@ -108,12 +108,19 @@ deploy from the same commit. Several deploy orders below depend on it.
 
 ### Step 2 — Create the database and the migration login
 
-As a PostgreSQL superuser, on PostgreSQL 16 with pgvector installed:
+As a PostgreSQL superuser, on PostgreSQL 16 with pgvector 0.8.0 or newer
+installed:
 
 ```sql
 CREATE ROLE <migration_login> LOGIN SUPERUSER PASSWORD '<secret>';  -- or a schema owner; see below
 CREATE DATABASE epigraph OWNER <migration_login>;
 ```
+
+pgvector must be 0.8.0 or newer because the semantic search and recall
+queries set `hnsw.iterative_scan`, which that release introduced. Once the
+extension exists,
+`SELECT extversion FROM pg_extension WHERE extname = 'vector';` shows its
+version.
 
 Migration `001` runs `CREATE EXTENSION IF NOT EXISTS` for `pg_trgm`,
 `uuid-ossp` and `vector`, all in schema `public`. Migrations 060 and 161 run
