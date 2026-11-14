@@ -243,6 +243,17 @@ fn symmetric_edge_row(r: SymmetricRow) -> EdgeRow {
 /// Repository for Edge operations
 pub struct EdgeRepository;
 
+/// One claim-to-claim link of [`EdgeRepository::links_among_claims`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimLinkRow {
+    /// The edge's id.
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    /// Lower-cased relationship name.
+    pub relationship: String,
+}
+
 impl EdgeRepository {
     /// Create a new edge relationship
     ///
@@ -2390,6 +2401,68 @@ impl EdgeRepository {
                 properties: row.properties,
                 valid_from: row.valid_from,
                 valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
+    /// The in-force epistemic edges whose two endpoints are BOTH claims in
+    /// `claim_ids`, as `viewer` may read them: the links among a page of
+    /// claims, for a view that draws the page with its connections (a
+    /// timeline; backlog ea26d7aa).
+    ///
+    /// * relationships: [`crate::CONTEXT_EPISTEMIC_RELATIONSHIPS`], matched
+    ///   case-insensitively (the relationship text is stored in both cases);
+    /// * retracted edges are excluded (`valid_to` set and past);
+    /// * an edge the viewer may not read is absent even when it may read both
+    ///   endpoints (the edge predicate, co-ownership included);
+    /// * oldest first, at most `limit` rows. Ask for one more than the cap to
+    ///   learn whether more exist.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids), fields(id_count = claim_ids.len()))]
+    pub async fn links_among_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<ClaimLinkRow>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let relationships: Vec<String> = crate::CONTEXT_EPISTEMIC_RELATIONSHIPS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.source_id, e.target_id, lower(e.relationship) AS relationship
+            FROM edges e
+            WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+              AND e.source_id = ANY($1) AND e.target_id = ANY($1)
+              AND lower(e.relationship) = ANY($2)
+              AND (e.valid_to IS NULL OR e.valid_to > now())
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at, e.id
+            LIMIT $3
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String)>(&sql)
+            .bind(claim_ids)
+            .bind(&relationships)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, source_id, target_id, relationship)| ClaimLinkRow {
+                id,
+                source_id,
+                target_id,
+                relationship,
             })
             .collect())
     }
