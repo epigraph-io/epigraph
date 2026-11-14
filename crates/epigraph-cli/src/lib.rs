@@ -1,5 +1,7 @@
 pub mod atlas_layout;
 #[cfg(feature = "db")]
+pub mod atomicity_sweep;
+#[cfg(feature = "db")]
 pub mod backfill_factors;
 #[cfg(feature = "db")]
 pub mod belief_cache;

@@ -185,4 +185,64 @@ impl AtomicityScreenRepository {
         }
         Ok(q.fetch_all(executor).await?)
     }
+
+    /// Up to `limit` current claims carrying `label`, after the keyset
+    /// `after` (`created_at ASC, id ASC`), with the same columns as
+    /// [`Self::page`]. The compound-atom sweep reads its own label back with
+    /// this, to take it off claims that no longer qualify.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn labelled_page<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        label: &str,
+        after: Option<(DateTime<Utc>, Uuid)>,
+        limit: i64,
+    ) -> Result<Vec<ScreenRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, true AS is_current, c.labels, c.created_at,
+                   (SELECT count(DISTINCT d.target_id) FROM edges d
+                      JOIN claims k ON k.id = d.target_id
+                     WHERE d.source_id = c.id
+                       AND d.relationship = 'decomposes_to'
+                       AND d.target_type = 'claim'
+                       AND (d.valid_to IS NULL OR d.valid_to > now())
+                       AND COALESCE(k.is_current, true) = true
+                       /* {EDGE_VISIBILITY:d} */
+                       /* {VISIBILITY:k} */) AS children,
+                   (SELECT count(DISTINCT u.source_id) FROM edges u
+                      JOIN claims p ON p.id = u.source_id
+                     WHERE u.target_id = c.id
+                       AND u.relationship = 'decomposes_to'
+                       AND u.source_type = 'claim'
+                       AND (u.valid_to IS NULL OR u.valid_to > now())
+                       AND COALESCE(p.is_current, true) = true
+                       /* {EDGE_VISIBILITY:u} */
+                       /* {VISIBILITY:p} */) AS parents
+            FROM claims c
+            WHERE COALESCE(c.is_current, true) = true
+              AND $2 = ANY(c.labels)
+              AND ($3::timestamptz IS NULL OR (c.created_at, c.id) > ($3::timestamptz, $4::uuid))
+              /* {VISIBILITY:c} */
+            ORDER BY c.created_at ASC, c.id ASC
+            LIMIT $1
+            "#,
+            5,
+        );
+        let (after_at, after_id) = match after {
+            Some((at, id)) => (Some(at), Some(id)),
+            None => (None, None),
+        };
+        let mut q = sqlx::query_as::<_, ScreenRow>(&sql)
+            .bind(limit.clamp(1, 1000))
+            .bind(label)
+            .bind(after_at)
+            .bind(after_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
 }
