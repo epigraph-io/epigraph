@@ -1818,6 +1818,8 @@ async fn persist_packet(
 /// - 401 Unauthorized: Invalid signature (when signatures required)
 /// - 201 Created: Success
 pub async fn submit_packet(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     payload: Result<Json<EpistemicPacket>, JsonRejection>,

@@ -851,9 +851,15 @@ fn claims_informed_by_less_readable(
 /// the number of claims written, `skipped_not_visible` the number skipped as
 /// not visible and `skipped_compounds` the number skipped as compounds (D4);
 /// `updated_beliefs` lists what BP computed, which is not the same list.
+///
+/// A read-only run needs no scope beyond the bearer. `apply_updates: true`
+/// writes beliefs, so it needs `claims:write` (403 otherwise, before the
+/// BP-apply switch is consulted), like every other HTTP write route
+/// (backlog f00d75ab).
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    axum::Extension(auth): axum::Extension<crate::middleware::bearer::AuthContext>,
     State(state): State<AppState>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -863,6 +869,9 @@ pub async fn propagate_beliefs(
         damping: request.damping.unwrap_or(0.5),
     };
     let apply = request.apply_updates.unwrap_or(false);
+    if apply {
+        crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+    }
 
     // BP apply is retired (SPEC §6.2, hazard H4): refused before anything is
     // loaded or computed, so no path below (the empty-factor early return, the

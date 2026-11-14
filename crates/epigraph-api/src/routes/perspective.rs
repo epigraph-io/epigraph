@@ -5,17 +5,17 @@
 //! - `GET /api/v1/perspectives/:id` — get perspective detail
 //! - `GET /api/v1/agents/:id/perspectives` — list perspectives for an agent
 //!
-//! # Tenancy: 3 of this file's 5 raw-pool sites are converted
+//! # Tenancy: 4 of this file's 5 raw-pool sites are converted
 //!
 //! Conversion shard 5. `list_perspectives`, `get_perspective` and
 //! `agent_perspectives` each read through one viewer-stamped connection from
 //! [`AppState::read_as`].
 //!
-//! The two that remain both WRITE and neither repo method takes a `Viewer`:
-//! `create_perspective` (which also materializes a PERSPECTIVE_OF edge) and
-//! `set_source_reliability` (an `UPDATE`). Same owner as `context.rs`'s
-//! residue, and the same note applies about where this shard's behavioural
-//! assertion lives.
+//! `set_source_reliability` writes on the caller's stamped transaction
+//! (backlog 0f2f9ddb). The one that remains is `create_perspective`, which
+//! WRITES and whose repo method takes no `Viewer` (it also materializes a
+//! PERSPECTIVE_OF edge). Same owner as `context.rs`'s residue, and the same
+//! note applies about where this shard's behavioural assertion lives.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 //!
@@ -125,6 +125,8 @@ fn default_limit() -> i64 {
 /// `POST /api/v1/perspectives`
 #[cfg(feature = "db")]
 pub async fn create_perspective(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<CreatePerspectiveRequest>,
 ) -> Result<(StatusCode, Json<PerspectiveResponse>), ApiError> {
@@ -179,19 +181,47 @@ pub async fn create_perspective(
 /// `properties.source_reliability`; an empty map clears the override.
 ///
 /// `PUT /api/v1/perspectives/:id/source-reliability`
+///
+/// # Scope, stamp and outcome (backlog 0f2f9ddb)
+///
+/// `claims:write`, as the MCP twin requires. The UPDATE runs on the caller's
+/// stamped transaction ([`AppState::write_as`]), so `perspectives`' row
+/// security (migration 117's owner-scoped UPDATE) decides with the caller's
+/// write authority. It used to run on the unstamped pool and answer `204`
+/// whatever happened, including for a foreign group's perspective and for an
+/// id that does not exist.
+///
+/// [`epigraph_db::PerspectiveRepository::set_source_reliability_conn`] counts
+/// what it changed and tells the two refusals apart: a perspective the caller
+/// cannot see, or that does not exist, is `404`; one it can see but not update
+/// is `403`. Neither commits anything.
 #[cfg(feature = "db")]
 pub async fn set_source_reliability(
+    _scope: crate::middleware::bearer::RequireScopeWrite,
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(request): Json<SetSourceReliabilityRequest>,
 ) -> Result<StatusCode, ApiError> {
     validate_reliability(&request.source_reliability)?;
-    epigraph_db::PerspectiveRepository::set_source_reliability(
-        &state.db_pool,
+    let mut tx = state.write_as(&viewer, "set_source_reliability").await?;
+    let changed = epigraph_db::PerspectiveRepository::set_source_reliability_conn(
+        &mut tx,
         id,
         &request.source_reliability,
     )
     .await?;
+    if changed == 0 {
+        // `set_source_reliability_conn` refuses a no-op itself (NotFound or
+        // WriteRefused); this keeps a 0 from ever reading as done.
+        return Err(ApiError::NotFound {
+            entity: "Perspective".to_string(),
+            id: id.to_string(),
+        });
+    }
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("commit source reliability: {e}"),
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

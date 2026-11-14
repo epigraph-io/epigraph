@@ -471,6 +471,8 @@ pub async fn list_skills(
 ///
 /// `POST /api/v1/skills/share`
 pub async fn share_skill(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ShareSkillRequest>,
