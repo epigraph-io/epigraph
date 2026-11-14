@@ -653,6 +653,9 @@ pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
 /// both claims' group. On the supersede path the act runs first in the same
 /// transaction, so only the authority arm is reachable there, and that is what
 /// [`epigraph_auth::claim_act::supersede_not_recorded_message`] says.
+///
+/// The predicate is [`epigraph_auth::claim_act::is_cascade_deferral_refusal`],
+/// shared with the MCP tool's twin, so CX03 is recognised by one rule.
 #[cfg(feature = "db")]
 fn cx03_denial(claim_id: Uuid, e: &epigraph_db::DbError) -> Option<ApiError> {
     let epigraph_db::DbError::QueryFailed {
@@ -661,11 +664,7 @@ fn cx03_denial(claim_id: Uuid, e: &epigraph_db::DbError) -> Option<ApiError> {
     else {
         return None;
     };
-    let cx03 = format!(
-        "{}:",
-        epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
-    );
-    if d.code().as_deref() != Some("42501") || !d.message().starts_with(&cx03) {
+    if !epigraph_auth::claim_act::is_cascade_deferral_refusal(d.code().as_deref(), d.message()) {
         return None;
     }
     tracing::warn!(
@@ -711,17 +710,22 @@ pub async fn supersede_session_or_deferral<'s>(
     ApiError,
 > {
     let claim_id = trigger.subject_id;
-    session_or_deferral(state, tx, trigger, |e| {
-        supersede_deferral_refusal(claim_id, e)
-    })
+    epigraph_engine::admin_cascade::session_or_record_deferral(
+        state.admin_cascade_session().await,
+        tx,
+        trigger,
+    )
     .await
+    .map_err(|e| supersede_deferral_refusal(claim_id, e))
 }
 
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
 /// commits. When there is none -- not configured, or not usable -- record the
 /// deferral inside the act's own transaction `tx` (stamped with the caller's
 /// viewer, so `security_events_append` admits the row) and return that status:
-/// the act and its audit row then commit together.
+/// the act and its audit row then commit together. The core is
+/// `epigraph_engine::admin_cascade::session_or_record_deferral`, shared with
+/// the MCP tools; this answers its error as a database error.
 ///
 /// # Errors
 /// The deferral INSERT's error, as a database error: nothing commits.
@@ -737,7 +741,13 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     ),
     ApiError,
 > {
-    session_or_deferral(state, tx, trigger, deferral_failed).await
+    epigraph_engine::admin_cascade::session_or_record_deferral(
+        state.admin_cascade_session().await,
+        tx,
+        trigger,
+    )
+    .await
+    .map_err(deferral_failed)
 }
 
 /// The generic answer to a failed deferral INSERT: a database error.
@@ -745,33 +755,6 @@ pub(crate) async fn admin_session_or_deferral<'s>(
 fn deferral_failed(e: epigraph_db::DbError) -> ApiError {
     ApiError::DatabaseError {
         message: format!("Failed to record the deferred cascade: {e}"),
-    }
-}
-
-/// [`admin_session_or_deferral`] with the deferral's error answered by
-/// `refusal`.
-#[cfg(feature = "db")]
-async fn session_or_deferral<'s>(
-    state: &'s AppState,
-    tx: &mut sqlx::PgConnection,
-    trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
-    refusal: impl FnOnce(epigraph_db::DbError) -> ApiError,
-) -> Result<
-    (
-        Option<epigraph_db::MaintenanceSession<'s>>,
-        epigraph_engine::admin_cascade::CascadeStatus,
-    ),
-    ApiError,
-> {
-    match state.admin_cascade_session().await {
-        Ok(session) => Ok((Some(session), Default::default())),
-        Err(reason) => {
-            let status =
-                epigraph_engine::admin_cascade::record_deferral(&mut *tx, trigger, &reason)
-                    .await
-                    .map_err(refusal)?;
-            Ok((None, status))
-        }
     }
 }
 

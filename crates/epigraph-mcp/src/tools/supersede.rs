@@ -189,20 +189,24 @@ fn database_42501(e: &epigraph_db::DbError) -> Option<String> {
 /// both claims' group. On the supersede path the act runs first in the same
 /// transaction, so only the authority arm is reachable there, and that is what
 /// [`epigraph_auth::claim_act::supersede_not_recorded_message`] says.
+///
+/// The predicate is [`epigraph_auth::claim_act::is_cascade_deferral_refusal`],
+/// shared with the HTTP route's twin, so CX03 is recognised by one rule.
 fn cx03_denial(claim: uuid::Uuid, e: &epigraph_db::DbError) -> Option<McpError> {
-    let message = database_42501(e)?;
-    let cx03 = format!(
-        "{}:",
-        epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
-    );
-    if !message.starts_with(&cx03) {
+    let epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::Database(d),
+    } = e
+    else {
+        return None;
+    };
+    if !epigraph_auth::claim_act::is_cascade_deferral_refusal(d.code().as_deref(), d.message()) {
         return None;
     }
     tracing::warn!(
         target: "tenancy.scoped_write",
         tool = "supersede_claim",
         claim = %claim,
-        detail = %message,
+        detail = %d.message(),
         "the cascade deferral refused the supersession"
     );
     Some(caller_denial(
@@ -264,16 +268,21 @@ pub async fn supersede_session_or_deferral<'s>(
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
     let claim = trigger.subject_id;
-    session_or_deferral(server, tx, trigger, |e| {
-        supersede_deferral_refusal(claim, e)
-    })
+    admin_cascade::session_or_record_deferral(
+        crate::maintenance::admin_cascade_session(server).await,
+        tx,
+        trigger,
+    )
     .await
+    .map_err(|e| supersede_deferral_refusal(claim, e))
 }
 
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
 /// commits. When there is none -- not configured, or not usable -- record the
 /// deferral inside the act's own transaction `tx`, so the act and its audit row
-/// commit together, and return that status.
+/// commit together, and return that status. The core is
+/// [`admin_cascade::session_or_record_deferral`], shared with the HTTP routes;
+/// this answers its error as a fault.
 ///
 /// # Errors
 /// The deferral INSERT's error: the caller propagates it and nothing commits.
@@ -282,26 +291,13 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     tx: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
-    session_or_deferral(server, tx, trigger, internal_error).await
-}
-
-/// [`admin_session_or_deferral`] with the deferral's error answered by
-/// `refusal`.
-async fn session_or_deferral<'s>(
-    server: &'s EpiGraphMcpFull,
-    tx: &mut sqlx::PgConnection,
-    trigger: &CascadeTrigger,
-    refusal: impl FnOnce(epigraph_db::DbError) -> McpError,
-) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
-    match crate::maintenance::admin_cascade_session(server).await {
-        Ok(session) => Ok((Some(session), CascadeStatus::default())),
-        Err(reason) => {
-            let status = admin_cascade::record_deferral(&mut *tx, trigger, &reason)
-                .await
-                .map_err(refusal)?;
-            Ok((None, status))
-        }
-    }
+    admin_cascade::session_or_record_deferral(
+        crate::maintenance::admin_cascade_session(server).await,
+        tx,
+        trigger,
+    )
+    .await
+    .map_err(internal_error)
 }
 
 /// The gate read, the authority decision and the stamped transaction a claim
