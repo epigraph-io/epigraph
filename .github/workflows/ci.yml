@@ -42,34 +42,134 @@ jobs:
   # in `workspace-rest`, which is selected by exclusion.
   #
   # `test` (below) is the single required check. It fails unless every shard
-  # and every feature-gated check succeeded, so branch protection keeps one
-  # stable name however the shards are re-cut.
+  # and every feature-gated check the plan asked for succeeded, so branch
+  # protection keeps one stable name however the shards are re-cut.
+  #
+  # ON A PULL REQUEST ONLY THE AFFECTED SHARDS RUN. The org's GitHub-hosted
+  # runners are capped at 20 concurrent jobs for every PR together, and the
+  # full plan is 13 shards plus the other jobs, so one PR running everything
+  # holds nearly the whole cap. `plan` diffs the PR against its base and keeps
+  # the shards of the packages the change can affect: packages with changed
+  # files, everything that depends on them, and the test targets whose source
+  # scans read a changed file (run together in one `source-scans` shard). A
+  # change no Rust source reads (most docs, Python outside scripts/) runs no
+  # shard at all. test-shard.py's docstring has the rules; its
+  # `affected --base <ref>` mode prints the selection locally.
+  #
+  # The FULL plan still runs on every push to main, on the staging and
+  # integration PRs (head branch integration/**, staging/**, backlog/base-*,
+  # atlas/*-base), on any PR labelled `ci:full` (add the label, then "Re-run
+  # all jobs": the label is read live, not from the event), and on any change
+  # to migrations/, Cargo.lock, the root Cargo.toml, .github/, rust-toolchain*,
+  # .sqlx/ or .cargo/. The coverage check below always runs on the full plan.
+  #
+  # SELF-HOSTED SHARD RUNNERS (off unless the operator turns them on). Self-
+  # hosted runners do not count against the 20-job cap. Set the repository
+  # variable SHARD_RUNS_ON to a JSON `runs-on` value, e.g.
+  #   gh variable set SHARD_RUNS_ON -R epigraph-io/epigraph \
+  #     --body '["self-hosted", "linux", "x64", "epigraph-shard"]'
+  # and only the shards move; unset it (`gh variable delete SHARD_RUNS_ON`) to
+  # move them back. A pull request from a FORK always gets ubuntu-latest
+  # whatever the variable says (test-shard.py `shard_runner`): self-hosted
+  # runners must never run a stranger's code on a public repository.
+  #
+  # THAT GUARD IS NOT THE SECURITY BOUNDARY. On a `pull_request` event GitHub
+  # runs the workflow and scripts from the PR's own merge ref, so a fork can
+  # edit `runs-on` (or `shard_runner`, or its test) in its PR and target the
+  # self-hosted labels directly. The guard only keeps the UNMODIFIED workflow
+  # from sending a fork's code there. Before setting SHARD_RUNS_ON, put a
+  # control in place that stops fork PR runs reaching these runners whatever
+  # their workflow says, and verify it with a test fork PR. Two controls that
+  # a PR cannot edit: the repository setting requiring approval to run
+  # workflows for every outside contributor (approving a fork's run means
+  # trusting its code), and a root-owned job-started hook on each runner
+  # (ACTIONS_RUNNER_HOOK_JOB_STARTED) that fails any job whose event payload
+  # names a fork head before a step runs. GitHub's own guidance warns against
+  # self-hosted runners on public repositories. Each
+  # runner must be Linux with Docker (the Postgres service container),
+  # `mold` and Python 3 installed, and one runner per machine or VM (the
+  # service binds host port 5432); ephemeral (`--ephemeral`) runners are the
+  # safe default. An org runner group does not serve public repositories
+  # until its "Allow public repositories" setting is on.
+  #
+  # PER-PR CAP. The repository variable SHARD_MAX_PARALLEL (a positive
+  # integer) caps how many shards of ONE run execute at once, so a single PR
+  # cannot take every runner; unset means no cap.
   plan:
     name: Plan test shards
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # The labels are read live (a re-run reuses the original event's).
+      issues: read
+      pull-requests: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      run: ${{ steps.plan.outputs.run }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # On a pull request HEAD is the test merge commit; its first parent
+          # is the base it merged into, so HEAD^1...HEAD is exactly the PR's
+          # change. Depth 2 fetches both.
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
+      - name: Unit-test the shard planner
+        # The affected-set rules, the fork guard and the job graph below are
+        # tested here, where a failure blocks the run (the `python` job is
+        # advisory). PyYAML is in the runner image; install it if not.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update -y && sudo apt-get install -y python3-yaml; }
+          python3 -m unittest discover -s .github/scripts/tests -v
       - name: Check that the shards cover every test target exactly once
         # Fails the run before any shard starts if a test target is in no
         # shard or in two, or if a package's unit tests are in none. It also
         # prints the targets a plain `cargo test -p` would skip for a missing
         # feature, so a new feature-gated test is visible here rather than
-        # silently never run.
+        # silently never run, and fails on a whole-tree source scan that is
+        # not declared in test-shard.py's WALKERS. Always the full plan.
         run: python3 .github/scripts/test-shard.py check
-      - name: Emit the shard matrix
+      - name: Plan the shards for this event
         id: plan
-        run: echo "matrix=$(python3 .github/scripts/test-shard.py matrix)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SHARD_RUNS_ON: ${{ vars.SHARD_RUNS_ON }}
+          SHARD_MAX_PARALLEL: ${{ vars.SHARD_MAX_PARALLEL }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            export DIFF_BASE=HEAD^1
+            if ! PR_LABELS="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" --jq '[.[].name]')"; then
+              echo "::warning::could not read the PR's labels; using the event's"
+              PR_LABELS="$EVENT_LABELS"
+            fi
+            export PR_LABELS
+          fi
+          python3 .github/scripts/test-shard.py ci-plan >> "$GITHUB_OUTPUT"
 
   test-shard:
     name: test (${{ matrix.shard }})
     needs: plan
-    runs-on: ubuntu-latest
+    # An affected plan can hold no shard at all (a docs-only change). The job
+    # is then skipped rather than started with an empty matrix, which GitHub
+    # rejects, and the `test` gate accepts the skip because the plan said so.
+    if: ${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}
+    # ubuntu-latest unless the operator set SHARD_RUNS_ON; never a self-hosted
+    # runner for a fork's PR from THIS workflow (a fork can edit its copy: see
+    # SELF-HOSTED SHARD RUNNERS above). Computed and validated by the planner:
+    # do not read the variable here, or this workflow bypasses the guard. The
+    # fork test is repeated here from the event itself, so a planner bug alone
+    # cannot route a fork's PR to a self-hosted runner (still defence in depth:
+    # a fork can edit this line too).
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || fromJSON(needs.plan.outputs.runs_on) }}
     # A shard takes 25-40 minutes (setup and build ~10, tests 10-25). 90 bounds
     # a hang with a named cause and leaves room for a slow runner; if a shard
     # approaches it, add a shard in test-shard.py instead of raising this.
@@ -78,6 +178,8 @@ jobs:
       # Every shard reports. One red shard must not hide a second failure in
       # another, or fixing CI takes one three-hour round trip per failure.
       fail-fast: false
+      # SHARD_MAX_PARALLEL, or 256 (GitHub's matrix limit: no cap).
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
@@ -153,10 +255,13 @@ jobs:
         # Replaces rust-lld for the workspace. mold uses dramatically less
         # RAM than lld on multi-binary workspaces — the other half of the
         # linker-OOM fix above. apt's mold on ubuntu-24.04 runners is
-        # sufficient (>= 2.x).
+        # sufficient (>= 2.x). A self-hosted runner must have mold installed:
+        # it is never apt-installed there.
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y mold
+          if ! command -v mold >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y mold
+          fi
           mkdir -p .cargo
           {
             echo ""
@@ -182,6 +287,10 @@ jobs:
         # NOTE: an earlier attempt set CARGO_TARGET_DIR=/mnt — inert, because the
         # mount table shows no separate /mnt disk (/mnt is a dir on /dev/root).
         # The df -ih / df -h lines record the headroom actually reclaimed.
+        #
+        # GitHub-hosted only: on a self-hosted runner these directories are
+        # the machine's own, and deleting them is not this job's call.
+        if: runner.environment == 'github-hosted'
         run: |
           df -ih / ; df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -216,6 +325,7 @@ jobs:
         # external sqlx-cli is needed — just run the already-built binary.
         run: ./target/debug/epigraph-migrate
       - name: Test
+        if: matrix.shard != 'source-scans'
         # --no-fail-fast: run every test binary of the shard even after one
         # fails, so one run reports every failure in it.
         #
@@ -236,7 +346,11 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           THREADS: ${{ matrix.threads }}
+        # The body repeats the `if:` because the local gate (ci-local /
+        # ci-shards) runs every step of this job verbatim and does not
+        # evaluate `if:`; each step must be a no-op on the other's shard.
         run: |
+          if [ "$SHARD" = source-scans ]; then exit 0; fi
           args="$(python3 .github/scripts/test-shard.py args "$SHARD")"
           # shellcheck disable=SC2086  # $args is a list of cargo arguments
           cargo test --locked --no-fail-fast $args -- --test-threads="$THREADS"
@@ -244,6 +358,29 @@ jobs:
           if [ -n "$doc_package" ]; then
             cargo test --locked -p "$doc_package" --doc
           fi
+      - name: Test (source scans)
+        # Only in an affected plan: the test targets of packages the change
+        # does not otherwise touch whose sources read a changed file (the
+        # cross-crate ratchets, the runbook and calibration checks). One
+        # cargo invocation per package, at that package's --test-threads.
+        # cargo's stdin is /dev/null: a test that spawns a child with inherited
+        # stdin must not eat the rest of the invocation list, which would end
+        # the loop early with exit 0.
+        if: matrix.shard == 'source-scans'
+        env:
+          SHARD: ${{ matrix.shard }}
+          TARGETS: ${{ matrix.targets }}
+        run: |
+          if [ "$SHARD" != source-scans ]; then exit 0; fi
+          invocations="$(mktemp)"
+          python3 .github/scripts/test-shard.py scan-args "$TARGETS" > "$invocations"
+          cat "$invocations"
+          status=0
+          while read -r threads args; do
+            # shellcheck disable=SC2086  # $args is a list of cargo arguments
+            cargo test --locked --no-fail-fast $args -- --test-threads="$threads" < /dev/null || status=1
+          done < "$invocations"
+          exit "$status"
 
   # TESTS THAT NO PLAIN `cargo test -p` RUNS, as a gate.
   #
@@ -254,6 +391,10 @@ jobs:
   # `test-unqualified` below, each with one test that broke unnoticed.
   test-extra:
     name: test (feature-gated and ignored suites)
+    # Runs only when epigraph-api or epigraph-jobs is affected
+    # (test-shard.py EXTRA_JOBS), and always on a full plan.
+    needs: plan
+    if: ${{ fromJSON(needs.plan.outputs.run)['test-extra'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     services:
@@ -351,6 +492,10 @@ jobs:
   # add `--skip` for the failing test: a skipped test is a never-run test.
   test-unqualified:
     name: Never-run suites (advisory)
+    # Runs only when epigraph-jobs or engine-integration-tests is affected
+    # (test-shard.py EXTRA_JOBS), and always on a full plan.
+    needs: plan
+    if: ${{ fromJSON(needs.plan.outputs.run)['test-unqualified'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     continue-on-error: true
@@ -433,6 +578,11 @@ jobs:
   # `!cancelled()`, not `always()`: when a new push supersedes this run the
   # `concurrency` rule above cancels it, and with `always()` this job then ran
   # anyway and posted a red `test` on the superseded commit.
+  #
+  # A job the plan skipped (no affected shard, or no affected package for a
+  # feature-gated check) must be `skipped`, and passes; a job the plan asked
+  # for must be `success`; nothing passes unless `plan` succeeded. The rule is
+  # test-shard.py `gate`, unit-tested in `plan`.
   test:
     name: test
     if: ${{ !cancelled() }}
@@ -440,19 +590,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Every shard and feature check succeeded
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Every shard and feature check the plan asked for succeeded
         env:
           NEEDS: ${{ toJSON(needs) }}
-        run: |
-          python3 - <<'PY'
-          import json, os, sys
-          needs = json.loads(os.environ["NEEDS"])
-          bad = {name: job["result"] for name, job in needs.items() if job["result"] != "success"}
-          for name, job in sorted(needs.items()):
-              print(f"{job['result']:10s} {name}")
-          if bad:
-              sys.exit(f"not successful: {bad}")
-          PY
+        run: python3 .github/scripts/test-shard.py gate
 
   # Clippy, Format check and the no-db build check run in their OWN job, on
   # their own runner, in parallel with `test`. On a staging-sized tree the test
@@ -595,6 +737,10 @@ jobs:
   # build products: each compiles a different feature set.
   lint-features:
     name: Lint (genai and tls features)
+    # Runs only when epigraph-api or epigraph-cli is affected
+    # (test-shard.py EXTRA_JOBS), and always on a full plan.
+    needs: plan
+    if: ${{ fromJSON(needs.plan.outputs.run)['lint-features'] }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
