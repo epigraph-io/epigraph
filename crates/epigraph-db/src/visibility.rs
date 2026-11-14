@@ -7,13 +7,20 @@
 //!
 //! # Invariants, enforced by construction
 //!
-//! * **There is no anonymous shape.** A caller without an `agents.id` cannot
-//!   build a `Viewer` at all; the 401 happens in the extractor
+//! * **There is no anonymous shape.** A caller without an `agents.id` gets no
+//!   viewer of its own: the 401 happens in the extractor
 //!   (`epigraph_api::middleware::bearer::ViewerExtractor`). A third
 //!   "matches nothing" shape was considered and rejected: it is invisible to a
 //!   test strategy written as *"assert a stranger CANNOT read"*, so an
 //!   over-restricting viewer would pass every adversarial test while producing
 //!   silent, permanent empty result sets.
+//!
+//!   The guest read surface (backlog `1deb9dbf`) is not a shape either.
+//!   [`Viewer::public_only`] is an ordinary `Scoped` viewer over the nil
+//!   principal with EMPTY read and write sets: exactly what [`Viewer::resolve`]
+//!   answers for a signed-in principal that has joined nothing, so it reads the
+//!   `visibility = 'public'` rows and nothing else, and it writes nothing. It
+//!   carries no authority any signed-in stranger does not already hold.
 //! * **No `Default`, no `From<Option<Uuid>>`, no `From<&AuthContext>`, no
 //!   zero-argument `unrestricted()`.** Every one of those is a way to
 //!   materialise read authority out of nothing at a call site that looks
@@ -455,6 +462,42 @@ impl Viewer {
                 writable,
             },
         })
+    }
+
+    /// The public-only viewer that the guest read surface uses (backlog
+    /// `1deb9dbf`): a `Scoped` viewer over the nil principal with no groups and
+    /// no writable groups.
+    ///
+    /// It is the narrowest viewer that can read anything. Its read fragment
+    /// admits `visibility = 'public'` rows only (an empty `$V` matches no
+    /// `owner_group_id`), and the pool stamps empty `epigraph.group_ids` and
+    /// `epigraph.writable_group_ids` for it, so the row policies of migration
+    /// 077 admit the same public rows. Its write fragment matches nothing. It
+    /// is exactly what [`Self::resolve`] answers for a principal with no live
+    /// membership, minus the round trip, so a test fixture's
+    /// `resolve(pool, Uuid::nil())` and this constructor describe one viewer.
+    ///
+    /// The nil principal names no agent: no `agents` row has that id, and the
+    /// nil uuid elsewhere is a GROUP id (the world group), never a principal.
+    /// So a policy or ownership check keyed on `epigraph.agent_id` matches no
+    /// row for this viewer.
+    ///
+    /// This is not the banned anonymous shape. That shape "matched nothing",
+    /// which no adversarial test can tell from a correct answer. This one
+    /// matches the public corpus, which the guest tests check in both
+    /// directions: a public row is served, and a group-private row is absent.
+    ///
+    /// Call sites are pinned: `epigraph-api`'s `tests/guest_public_reads.rs`
+    /// fails when this constructor is called outside the guest route module.
+    #[must_use]
+    pub fn public_only() -> Self {
+        Viewer {
+            shape: ViewerShape::Scoped {
+                principal: Uuid::nil(),
+                group_ids: Vec::new(),
+                writable: Vec::new(),
+            },
+        }
     }
 
     /// Resolve `principal`'s viewer, ELEVATED when the database says so.
@@ -1303,6 +1346,29 @@ mod tests {
         assert_eq!(bind.len(), 2, "duplicates are collapsed");
         assert!(bind.windows(2).all(|w| w[0] < w[1]), "bind is sorted");
         assert_eq!(v.writable_groups().len(), 2);
+    }
+
+    #[test]
+    fn public_only_viewer_reads_public_rows_and_writes_nothing() {
+        let v = Viewer::public_only();
+
+        assert_eq!(v.principal(), Some(Uuid::nil()));
+        assert!(!v.is_bypass());
+        assert!(!v.is_elevated());
+        assert_eq!(v.group_bind(), Some(&[][..]), "binds an empty group set");
+        assert_eq!(v.writable_bind(), Some(&[][..]), "writes to no group");
+        assert!(v.writable_groups().is_empty());
+
+        // The read fragment is the scoped one: public, or a member group.
+        let read = v.render_predicate("c", 1);
+        assert!(read.contains("c.visibility = 'public'"), "{read}");
+        assert!(read.contains("c.owner_group_id = ANY($1"), "{read}");
+        assert_ne!(read.trim(), "true", "never the always-true fragment");
+
+        // A detached copy is the same public-only viewer.
+        let d = v.detach_scoped().expect("a scoped viewer detaches");
+        assert_eq!(d.principal(), Some(Uuid::nil()));
+        assert_eq!(d.group_bind(), Some(&[][..]));
     }
 
     #[test]
