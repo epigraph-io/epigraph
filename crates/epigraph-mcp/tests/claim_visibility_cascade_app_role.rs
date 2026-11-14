@@ -11,6 +11,9 @@
 //! * backlog 3b505b5c (1): an edge whose endpoint is a moved claim's EVIDENCE
 //!   is re-met. After a share the team reads it; after a publicize a stranger
 //!   does. An edge on a PINNED evidence row stays with the pin owner.
+//! * backlog 3b505b5c (2): a `harvester_sources` row whose fragments all moved
+//!   follows them (team / public); one whose fragments still disagree stays
+//!   and is counted as held.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -352,4 +355,140 @@ async fn publicize_re_meets_the_edges_on_the_moved_claims_evidence(pool: PgPool)
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["evidence_edges_rewritten"], 1, "{events:?}");
     assert_eq!(events[0]["evidence_kept_private"], 1, "{events:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3b505b5c (2): harvester_sources follow their fragments
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A harvester source with one fragment cited by `claim`, both stamped with
+/// the claim's current tenancy. `(source, fragment)`.
+async fn harvested(pool: &PgPool, claim: Uuid) -> (Uuid, Uuid) {
+    let (v, g) = tenancy(pool, "claims", claim).await;
+    let source: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality, status, visibility, \
+                                        owner_group_id) \
+         VALUES ($1, 'text', 'completed', $2, $3) RETURNING id",
+    )
+    .bind(Uuid::new_v4().as_bytes().to_vec())
+    .bind(&v)
+    .bind(g)
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester source");
+    let fragment = fragment_of(pool, source, claim).await;
+    (source, fragment)
+}
+
+/// A fragment of `source` cited by `claim`, stamped with the claim's tenancy.
+async fn fragment_of(pool: &PgPool, source: Uuid, claim: Uuid) -> Uuid {
+    let fragment: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
+                                          context_window, status, visibility, owner_group_id) \
+         SELECT $1, $2, 'fragment text', 'fragment text', 'completed', c.visibility, \
+                c.owner_group_id \
+           FROM claims c WHERE c.id = $3 RETURNING id",
+    )
+    .bind(source)
+    .bind(Uuid::new_v4().as_bytes().to_vec())
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester fragment");
+    sqlx::query(
+        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id, visibility, \
+                                                 owner_group_id) \
+         SELECT $1, $2, c.visibility, c.owner_group_id FROM claims c WHERE c.id = $1",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .execute(pool)
+    .await
+    .expect("seed harvester provenance");
+    fragment
+}
+
+/// Share: a source whose only fragment moved goes to the team (a teammate
+/// reads it); a source with a second fragment cited by a claim that stays
+/// private keeps its owner and is reported held.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_carries_a_source_whose_fragments_all_moved_and_holds_a_mixed_one(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "casc-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "casc-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(&pool, &s, alice, "harvested finding", "private", None).await;
+    let stays = write(
+        &pool,
+        &s,
+        alice,
+        "harvested note that stays",
+        "private",
+        None,
+    )
+    .await;
+    let (source, fragment) = harvested(&pool, c).await;
+    let (mixed, _) = harvested(&pool, c).await;
+    let other = fragment_of(&pool, mixed, stays).await;
+    assert!(
+        !reads_row(&pool, &s, bob, "harvester_sources", source).await,
+        "PREMISE: the teammate cannot read the home group's source"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fragment).await,
+        group(t)
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await,
+        group(t),
+        "every fragment of it is the team's now"
+    );
+    assert!(reads_row(&pool, &s, bob, "harvester_sources", source).await);
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", other).await,
+        group(home)
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", mixed).await,
+        group(home),
+        "a source whose fragments disagree is left where it is"
+    );
+    let events = audit(&pool, "claim.shared_with_team").await;
+    assert_eq!(events[0]["harvester_sources_moved"], 1, "{events:?}");
+    assert_eq!(events[0]["harvester_sources_held"], 1, "{events:?}");
+}
+
+/// Publicize: a source whose only fragment went public goes public, and a
+/// stranger reads it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_carries_a_source_whose_fragments_all_went_public(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "casc-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "casc-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
+    let (source, fragment) = harvested(&pool, c).await;
+    assert!(!reads_row(&pool, &s, carol, "harvester_sources", source).await);
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fragment).await.0,
+        "public"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await,
+        ("public".to_string(), t),
+        "the source takes its fragments' pair (owner kept, as the claim's)"
+    );
+    assert!(reads_row(&pool, &s, carol, "harvester_sources", source).await);
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["harvester_sources_moved"], 1, "{events:?}");
+    assert_eq!(events[0]["harvester_sources_held"], 0, "{events:?}");
 }

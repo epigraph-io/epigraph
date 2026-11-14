@@ -18,7 +18,7 @@
 -- from PUBLIC and granted to `epigraph_app`; the write window (`public,
 -- pg_temp` around the write statements only); no session state; locked
 -- before classified; membership read live. `CREATE OR REPLACE` keeps the
--- owner and the grants, and section 4 re-states them anyway.
+-- owner and the grants, and section 5 re-states them anyway.
 --
 -- ===================================================================
 -- 1. EDGES ON A MOVED CLAIM'S EVIDENCE
@@ -65,12 +65,36 @@
 -- undeclared edge, which is every edge whose tuple is its meet. They differ
 -- only on a declared edge, and there the gate leaves the declaration alone in
 -- both directions. A share is an app act, so it takes the app act's rule.
+--
+-- ===================================================================
+-- 2. HARVESTER SOURCES FOLLOW THEIR FRAGMENTS
+-- ===================================================================
+--
+-- THE GAP. A harvested claim's fragments hang off
+-- `harvester_claim_provenance`, and arm (d) re-stamps them when the claim
+-- moves. Their `harvester_sources` row is a ROOT (173: declared at INSERT by
+-- `epigraph_root_require_tenancy`), and nothing moves it afterwards. So after a
+-- share the source document stays `('group', home)` while every fragment of it
+-- is the team's, and after a publicize it stays group-only while every
+-- fragment is public.
+--
+-- THE FIX. After the claims UPDATE (so arm (d) has moved the fragments), each
+-- source with a fragment cited by a moved claim takes its fragments' pair when
+-- they all AGREE, by 173's own derivation rule (section 2 of 173:
+-- `count(DISTINCT owner_group_id || '/' || visibility) = 1`). A source whose
+-- fragments still disagree (one feeds a claim that did not move) is left where
+-- it is and counted in the audit row as `harvester_sources_held`. Whether such
+-- a mixed source should instead hold the whole act is the share-with-team
+-- spec's open question 10; this file takes the non-blocking reading (move the
+-- claims, leave the source, report it) and the act's outcome is unchanged.
+-- `harvester_sources` has no widening guard (074's `claims_block_widening` is
+-- on `claims` only); its 115 owner guard admits the maintenance owner.
 SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================
--- 2. epigraph_publicize_claims(ids, reason): group -> public
+-- 3. epigraph_publicize_claims(ids, reason): group -> public
 -- ===================================================================
--- 206 section 4, with section 1's evidence-endpoint edges.
+-- 206 section 4, with section 1's evidence-endpoint edges and section 2's sources.
 CREATE OR REPLACE FUNCTION public.epigraph_publicize_claims(p_claim_ids uuid[], p_reason text)
 RETURNS TABLE (claim_id uuid, outcome text)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -88,6 +112,8 @@ DECLARE
     v_bad boolean;
     v_edges bigint := 0;
     v_ev_edges bigint := 0;
+    v_sources_moved bigint := 0;
+    v_sources_held bigint := 0;
     v_pinned bigint := 0;
     v_owners uuid[];
     v_moved bigint := 0;
@@ -246,6 +272,32 @@ BEGIN
           FROM upd;
     END IF;
 
+
+    -- Section 2: a source whose fragments now agree takes their pair.
+    WITH touched AS (
+        SELECT DISTINCT f.source_id
+          FROM public.harvester_claim_provenance p
+          JOIN public.harvester_fragments f ON f.id = p.fragment_id
+         WHERE p.claim_id = ANY(v_todo)
+    ), agree AS (
+        SELECT f.source_id,
+               (array_agg(f.owner_group_id))[1] AS g,
+               (array_agg(f.visibility))[1]     AS v,
+               count(DISTINCT f.owner_group_id::text || '/' || f.visibility) AS n
+          FROM public.harvester_fragments f
+         WHERE f.source_id IN (SELECT t.source_id FROM touched t)
+         GROUP BY f.source_id
+    ), moved AS (
+        UPDATE public.harvester_sources hs
+           SET owner_group_id = a.g, visibility = a.v
+          FROM agree a
+         WHERE a.source_id = hs.id AND a.n = 1
+           AND (hs.owner_group_id, hs.visibility) IS DISTINCT FROM (a.g, a.v)
+        RETURNING hs.id
+    )
+    SELECT (SELECT count(*) FROM moved), (SELECT count(*) FROM agree a WHERE a.n > 1)
+      INTO v_sources_moved, v_sources_held;
+
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.publicized', v_principal, true,
             jsonb_build_object('claim_ids', to_jsonb(v_todo),
@@ -253,6 +305,8 @@ BEGIN
                                'reason', p_reason,
                                'edges_widened', v_edges,
                                'evidence_edges_rewritten', v_ev_edges,
+                               'harvester_sources_moved', v_sources_moved,
+                               'harvester_sources_held', v_sources_held,
                                'evidence_kept_private', v_pinned,
                                'migration', 215,
                                'session_user', session_user::text));
@@ -265,9 +319,9 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_publicize_claims(uuid[], text) FROM PUBLIC;
 
 -- ===================================================================
--- 3. epigraph_share_claims_with_team(ids, group, reason): private -> team
+-- 4. epigraph_share_claims_with_team(ids, group, reason): private -> team
 -- ===================================================================
--- 206 section 5, with section 1's evidence-endpoint edges.
+-- 206 section 5, with section 1's evidence-endpoint edges and section 2's sources.
 CREATE OR REPLACE FUNCTION public.epigraph_share_claims_with_team(
     p_claim_ids uuid[], p_group_id uuid, p_reason text)
 RETURNS TABLE (claim_id uuid, outcome text)
@@ -287,6 +341,8 @@ DECLARE
     v_evidence uuid[];
     v_meet_edges uuid[];
     v_ev_edges bigint := 0;
+    v_sources_moved bigint := 0;
+    v_sources_held bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'VIS01: sharing with a team needs an authenticated principal; '
@@ -413,11 +469,39 @@ BEGIN
         GET DIAGNOSTICS v_ev_edges = ROW_COUNT;
     END IF;
 
+
+    -- Section 2: a source whose fragments now agree takes their pair.
+    WITH touched AS (
+        SELECT DISTINCT f.source_id
+          FROM public.harvester_claim_provenance p
+          JOIN public.harvester_fragments f ON f.id = p.fragment_id
+         WHERE p.claim_id = ANY(v_cls_ids)
+    ), agree AS (
+        SELECT f.source_id,
+               (array_agg(f.owner_group_id))[1] AS g,
+               (array_agg(f.visibility))[1]     AS v,
+               count(DISTINCT f.owner_group_id::text || '/' || f.visibility) AS n
+          FROM public.harvester_fragments f
+         WHERE f.source_id IN (SELECT t.source_id FROM touched t)
+         GROUP BY f.source_id
+    ), moved AS (
+        UPDATE public.harvester_sources hs
+           SET owner_group_id = a.g, visibility = a.v
+          FROM agree a
+         WHERE a.source_id = hs.id AND a.n = 1
+           AND (hs.owner_group_id, hs.visibility) IS DISTINCT FROM (a.g, a.v)
+        RETURNING hs.id
+    )
+    SELECT (SELECT count(*) FROM moved), (SELECT count(*) FROM agree a WHERE a.n > 1)
+      INTO v_sources_moved, v_sources_held;
+
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.shared_with_team', v_principal, true,
             jsonb_build_object('claim_ids', to_jsonb(v_cls_ids), 'from_group_id', v_home,
                                'to_group_id', p_group_id, 'reason', p_reason,
                                'evidence_edges_rewritten', v_ev_edges,
+                               'harvester_sources_moved', v_sources_moved,
+                               'harvester_sources_held', v_sources_held,
                                'migration', 215, 'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
 
@@ -426,7 +510,7 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_share_claims_with_team(uuid[], uuid, text) FROM PUBLIC;
 
 -- ===================================================================
--- 4. OWNERSHIP AND GRANTS (206 section 6, for the two bodies re-stated)
+-- 5. OWNERSHIP AND GRANTS (206 section 6, for the two bodies re-stated)
 -- ===================================================================
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
