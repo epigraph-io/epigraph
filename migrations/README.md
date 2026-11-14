@@ -2656,11 +2656,13 @@ restart.
   only, never widening) and RAISEs a NOTICE with the counts by relationship
   and transition. So a group plan's `variant_of`, `AUTHORED` and `executes`
   edges (onto a public step or atom too) are the plan's group's, and an edge
-  from a group plan onto another group's claim is co-owned. Adds the boolean
-  SECURITY DEFINER `epigraph_step_lineage_has_hidden_executor(uuid)` on 172's
-  form (owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and
-  granted to `epigraph_app`) for the `evolve_step` authority gates, which
-  could no longer see a hidden plan's `executes` edge.
+  from a group plan onto another group's claim is co-owned. Adds the
+  SECURITY DEFINER `epigraph_step_lineage_executors(uuid)` on 172's form
+  (owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted
+  to `epigraph_app`): every workflow executing a step's lineage, read
+  unfiltered, for the `evolve_step` authority gates, which could no longer
+  see a hidden plan's `executes` edge; they check every workflow it returns
+  and answer a refusal over one the caller did not find as a missing parent.
   A GUARD refuses to apply 219 unless `epigraph_node_tenancy` and
   `epigraph_propagate_tenancy` still hold 070's and 168's bodies (md5 of
   `prosrc`), so 219 never silently reverts another re-statement; the undo

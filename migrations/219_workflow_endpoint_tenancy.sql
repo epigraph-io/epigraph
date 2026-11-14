@@ -51,13 +51,15 @@
 --      when its (owner, visibility, co-owner) triple differs. Counts by
 --      relationship and transition are RAISEd as a NOTICE: they are the
 --      measurement of what this changed.
---   4. `epigraph_step_lineage_has_hidden_executor(uuid)`, a boolean definer
---      for the `evolve_step` authority gates (section 5). They found the
---      workflows executing a step's lineage through `executes` edges read
---      under the caller's row security; after item 1 a group plan's edge onto
---      a public step is hidden from a non-member, who would then be admitted
---      to supersede a step that plan runs. The gates refuse when this answers
---      true.
+--   4. `epigraph_step_lineage_executors(uuid)`, a definer for the
+--      `evolve_step` authority gates (section 5). They found the workflows
+--      executing a step's lineage through `executes` edges and lineage
+--      members read under the caller's row security; after item 1 a group
+--      plan's edge onto a public step is hidden from a non-member, who would
+--      then be admitted to supersede a step that plan runs. The definer
+--      returns every workflow executing the lineage, read unfiltered, to the
+--      SERVER, which runs its workflow-authority check on each one and answers
+--      any refusal over a workflow the caller did not find as a missing parent.
 --
 -- A group workflow whose other endpoint is private to ANOTHER group now gets
 -- a CO-OWNED edge (072's intersection: readable only by a member of both).
@@ -437,8 +439,7 @@ BEGIN
 END $$;
 
 -- ===================================================================
--- 5. THE EVOLVE_STEP GATE: does a workflow the session cannot read execute
---    this step's lineage?
+-- 5. THE EVOLVE_STEP GATE: every workflow that executes this step's lineage
 -- ===================================================================
 -- `evolve_step` (REST and MCP) requires workflow authority over EVERY
 -- workflow that executes the parent's step lineage, and found them through
@@ -447,51 +448,48 @@ END $$;
 -- was public, so a caller outside the plan's group still found the plan, and
 -- its authority check refused (answered as a missing parent). After section 1
 -- that edge is the plan's group's, the caller no longer finds it, and would
--- be admitted to supersede a step a private plan runs.
+-- be admitted to supersede a step a private plan runs. The same read also
+-- missed a plan whose edge, or whose lineage member, row security hid for any
+-- other reason (a lineage whose members were split across tenancies).
 --
--- So the gate also asks this definer, which reads the edges and the lineage
--- members unfiltered and answers ONE BOOLEAN: true when some workflow
--- executing the lineage (retracted `executes` edges included, as the
--- repository read counts them) is a row the session cannot read: not
--- public, and not owned by a group in `epigraph_session_groups()`, or no row
--- at all. It never returns an id, so it names no hidden plan; the gate then
--- refuses exactly as it refuses a missing parent. A privileged session
--- (`epigraph_bypass()`) reads every row, so it is never true there. NOT
--- 183's `workflows_read` USING clause verbatim: its `epigraph_definer_bypass()`
--- arm is always true inside this maintenance-owned body.
+-- So the gates also ask this definer, which reads the `executes` edges and
+-- the lineage members UNFILTERED and returns the workflow ids, the same set
+-- the repository read would return to a session that reads everything
+-- (retracted edges included, no join to `workflows`). The ids go to the
+-- SERVER only: each one the caller's own read did not find is put through the
+-- same workflow-authority check, and any refusal over it is answered exactly
+-- as a missing parent, so no hidden id reaches the caller. The admin arm (a
+-- live `claims:admin` grant, audited per workflow) and every other arm keep
+-- running as before 219, when the edge was public and the plan was found.
 --
 -- 172's form: `pg_catalog, pg_temp`, every public name qualified. Owned by
 -- `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
--- `epigraph_app` (the gate runs on the request DSN).
-CREATE OR REPLACE FUNCTION public.epigraph_step_lineage_has_hidden_executor(p_claim uuid)
-RETURNS boolean
+-- `epigraph_app` (the gate runs on the request DSN). It returns workflow ids
+-- only, never content, to the server's own role.
+CREATE OR REPLACE FUNCTION public.epigraph_step_lineage_executors(p_claim uuid)
+RETURNS SETOF uuid
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
-    SELECT NOT public.epigraph_bypass()
-       AND EXISTS (
-           SELECT 1
-             FROM public.edges e
-             LEFT JOIN public.workflows w ON w.id = e.source_id
-            WHERE e.relationship = 'executes'
-              AND e.source_type = 'workflow' AND e.target_type = 'claim'
-              AND (e.target_id = p_claim
-                   OR e.target_id IN (
-                       SELECT m.id FROM public.claims m
-                         JOIN public.claims p ON p.step_lineage_id = m.step_lineage_id
-                        WHERE p.id = p_claim))
-              AND (w.id IS NULL
-                   OR NOT (w.visibility = 'public'
-                           OR w.owner_group_id = ANY (public.epigraph_session_groups()))))
+    SELECT DISTINCT e.source_id
+      FROM public.edges e
+     WHERE e.relationship = 'executes'
+       AND e.source_type = 'workflow' AND e.target_type = 'claim'
+       AND (e.target_id = p_claim
+            OR e.target_id IN (
+                SELECT m.id FROM public.claims m
+                  JOIN public.claims p ON p.step_lineage_id = m.step_lineage_id
+                 WHERE p.id = p_claim))
+     ORDER BY e.source_id
 $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_step_lineage_has_hidden_executor(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_step_lineage_executors(uuid) FROM PUBLIC;
 
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
-        EXECUTE 'ALTER FUNCTION public.epigraph_step_lineage_has_hidden_executor(uuid) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_step_lineage_executors(uuid) '
                 'OWNER TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_step_lineage_has_hidden_executor(uuid) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_step_lineage_executors(uuid) '
                 'TO epigraph_app';
     END IF;
 END $$;

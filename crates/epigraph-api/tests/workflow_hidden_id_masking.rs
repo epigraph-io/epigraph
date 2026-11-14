@@ -925,3 +925,290 @@ async fn delete_step_over_a_hidden_workflow_is_masked_and_admits_only_writers_of
         "the member is no admin write"
     );
 }
+
+/// [`mcp_evolve`] on an explicit `auth` (an admin token, say).
+async fn mcp_evolve_as(
+    w: &World,
+    auth: &epigraph_auth::AuthContext,
+    parent: Uuid,
+    content: &str,
+) -> ToolAnswer {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(auth))
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::tools::evolve_step::EvolveStepParams =
+        serde_json::from_value(json!({
+            "parent_id": parent.to_string(), "content": content,
+            "edge_type": "revises", "level": 2
+        }))
+        .expect("params");
+    tool_answer(
+        epigraph_mcp::tools::evolve_step::evolve_step(&w.server, &viewer, params, Some(auth)).await,
+    )
+}
+
+/// A current claim seeded on the harness superuser, in `lineage` when given.
+async fn seed_step(
+    pool: &PgPool,
+    author: Uuid,
+    visibility: &str,
+    owner: Uuid,
+    lineage: Option<Uuid>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, step_lineage_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(format!("a {visibility} step {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(author)
+    .bind(visibility)
+    .bind(owner)
+    .bind(lineage)
+    .execute(pool)
+    .await
+    .expect("seed the step");
+    id
+}
+
+/// An undeclared `executes` edge (the trigger derives its tenancy); its
+/// stored visibility.
+async fn executes(pool: &PgPool, workflow: Uuid, step: Uuid) -> String {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'workflow', $2, 'claim', 'executes') RETURNING visibility::text",
+    )
+    .bind(workflow)
+    .bind(step)
+    .fetch_one(pool)
+    .await
+    .expect("the executes edge")
+}
+
+/// `(agent_id, details)` of every `workflows.admin_write` row for `evolve_step`.
+async fn evolve_admin_rows(pool: &PgPool) -> Vec<(Option<Uuid>, Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'workflows.admin_write' AND details->>'action' = 'evolve_step' \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("admin rows")
+}
+
+/// A lineage split across tenancies: S1 is public and the caller's own, S2
+/// (the same `step_lineage_id`) was restricted into the team group out of
+/// band, and a PUBLIC plan submitted by the member executes S2, so that
+/// `executes` edge is the team group's. The caller reads the plan's row but
+/// neither S2 nor the edge, so the gate's own read finds no workflow. The
+/// gate still checks the plan (219's definer returns the whole set to the
+/// server), the caller holds no authority over it, and the evolve of S1 is
+/// answered exactly as a missing parent on REST and MCP, naming neither the
+/// plan nor its submitter, with nothing written. Calibration: with the edge
+/// gone the same caller evolves S1.
+///
+/// Verified to fail with the gate's unfiltered read replaced by the boolean
+/// "is a workflow ROW hidden" check (the plan's row is public, so it answered
+/// false and the gate admitted the evolve: 200 on REST and MCP).
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_of_a_lineage_split_across_tenancies_checks_the_plan_it_hides(pool: PgPool) {
+    let w = world(&pool).await;
+    let team: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM workflows WHERE id = $1")
+        .bind(w.workflow)
+        .fetch_one(&pool)
+        .await
+        .expect("the team group");
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "split-stranger").await;
+    let lineage = Uuid::new_v4();
+    // Both public, S2 first: the lineage's MOST RECENT row decides a new
+    // member's tenancy (migration 074 arm 2), and S1, the stranger's own
+    // public step, must be that row for the stranger's evolve to be writable
+    // at all. Then S2 is restricted into the team out of band (a
+    // privatization or regroup act narrows a claim in place).
+    let s2 = seed_step(&pool, stranger, "public", stranger_group, Some(lineage)).await;
+    let s1 = seed_step(&pool, stranger, "public", stranger_group, Some(lineage)).await;
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(s2)
+        .bind(team)
+        .execute(&pool)
+        .await
+        .expect("restrict S2 into the team");
+    let plan = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal, generation, metadata, visibility, \
+                                owner_group_id) \
+         VALUES ($1, $2, 'a public plan', 0, jsonb_build_object($3::text, $4::text), \
+                 'public', $5)",
+    )
+    .bind(plan)
+    .bind(format!("split-plan-{plan}"))
+    .bind(epigraph_db::WorkflowRepository::SUBMITTER_KEY)
+    .bind(w.member.to_string())
+    .bind(w.member_group)
+    .execute(&pool)
+    .await
+    .expect("the public plan");
+    assert_eq!(
+        executes(&pool, plan, s2).await,
+        "group",
+        "CALIBRATION: the edge onto the team's lineage member is the team's, hidden from the \
+         stranger"
+    );
+    let missing = Uuid::new_v4();
+    let evolve =
+        |p: Uuid| json!({"parent_id": p, "content": "a split revision", "edge_type": "revises"});
+    let names_nothing = |what: &str, answer: &str| {
+        for (id, label) in [(plan, "the plan"), (w.member, "its submitter"), (s2, "S2")] {
+            assert!(
+                !answer.contains(&id.to_string()),
+                "{what}: the answer names {label}: {answer}"
+            );
+        }
+    };
+
+    // REST.
+    let (s_split, b_split) = w
+        .api
+        .post(
+            &format!("/api/v1/workflows/steps/{s1}/evolve"),
+            &token(stranger),
+            &evolve(s1),
+        )
+        .await;
+    let (s_missing, b_missing) = w
+        .api
+        .post(
+            &format!("/api/v1/workflows/steps/{missing}/evolve"),
+            &token(stranger),
+            &evolve(missing),
+        )
+        .await;
+    names_nothing("REST evolve", &b_split.to_string());
+    assert_eq!(s_missing, StatusCode::NOT_FOUND, "{b_missing}");
+    assert_eq!(
+        (
+            s_split,
+            b_split.to_string().replace(&s1.to_string(), "<id>")
+        ),
+        (
+            s_missing,
+            b_missing.to_string().replace(&missing.to_string(), "<id>")
+        ),
+        "REST evolve of the split lineage answers as for a missing parent"
+    );
+
+    // MCP (authenticated).
+    let m_split = mcp_evolve(&w, stranger, s1, "a split revision").await;
+    let m_missing = mcp_evolve(&w, stranger, missing, "a split revision").await;
+    names_nothing("MCP evolve", &text_of(&m_split));
+    assert!(m_missing.is_err(), "{m_missing:?}");
+    assert_eq!(
+        text_of(&m_split).replace(&s1.to_string(), "<id>"),
+        text_of(&m_missing).replace(&missing.to_string(), "<id>"),
+        "MCP evolve of the split lineage answers as for a missing parent"
+    );
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = 'a split revision'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(written, 0, "the stranger wrote nothing");
+
+    // Calibration: with the plan's edge gone, nothing executes the lineage.
+    sqlx::query("DELETE FROM edges WHERE source_id = $1 AND relationship = 'executes'")
+        .bind(plan)
+        .execute(&pool)
+        .await
+        .expect("drop the plan's edge");
+    let (s, out) = w
+        .api
+        .post(
+            &format!("/api/v1/workflows/steps/{s1}/evolve"),
+            &token(stranger),
+            &evolve(s1),
+        )
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "CALIBRATION: unexecuted, the stranger evolves its own step: {out}"
+    );
+}
+
+/// The audited `claims:admin` path still reaches a plan whose `executes` edge
+/// is hidden. The team's group plan executes a public step in the admin's own
+/// group; since migration 219 that edge is the team's, so the admin (outside
+/// the team) finds no workflow through its own read. A `claims:admin` token
+/// whose client record grants nothing is refused as a missing parent, naming
+/// nothing hidden. With a live grant the admin is admitted on REST and MCP, as
+/// before 219 (when the edge was public and the plan was found), with one
+/// `workflows.admin_write` row per evolve naming the plan; the answers to the
+/// admin still name neither the plan nor its submitter.
+///
+/// Verified to fail with the gate's unfiltered read replaced by the boolean
+/// "is a workflow ROW hidden" check (it refused before any authority arm ran:
+/// 404 for the live grant too, and no admin_write row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_audited_admin_path_reaches_a_plan_whose_executes_edge_is_hidden(pool: PgPool) {
+    let w = world(&pool).await;
+    let (admin, admin_group) = fixture::seed_agent_with_group(&pool, "hidden-plan-admin").await;
+    let step = seed_step(&pool, admin, "public", admin_group, None).await;
+    assert_eq!(
+        executes(&pool, w.workflow, step).await,
+        "group",
+        "CALIBRATION: the group plan's edge is the plan's (migration 219), hidden from the admin"
+    );
+    let evolve = |c: &str| json!({"parent_id": step, "content": c, "edge_type": "revises"});
+    let uri = format!("/api/v1/workflows/steps/{step}/evolve");
+
+    // A grantless claims:admin token: the missing-parent answer.
+    let (s, out) = w
+        .api
+        .post(
+            &uri,
+            &token_for_client(Uuid::new_v4(), admin, ADMIN_SCOPES),
+            &evolve("a grantless admin revision"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a grantless admin: {out}");
+    assert_names_nothing_hidden(&w, "grantless REST evolve", &out.to_string());
+
+    // A live grant: the audited admin path.
+    let client = Uuid::new_v4();
+    grant_admin(&pool, client, admin).await;
+    let (s, out) = w
+        .api
+        .post(
+            &uri,
+            &token_for_client(client, admin, ADMIN_SCOPES),
+            &evolve("an admin revision"),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "the audited admin path over REST: {out}");
+    assert_names_nothing_hidden(&w, "admitted REST evolve", &out.to_string());
+    let rows = evolve_admin_rows(&pool).await;
+    assert_eq!(rows.len(), 1, "one admin_write row: {rows:?}");
+    assert_eq!(rows[0].0, Some(admin), "attributed to the admin: {rows:?}");
+    assert_eq!(
+        rows[0].1["workflow_id"],
+        w.workflow.to_string(),
+        "it names the plan it was admitted over: {rows:?}"
+    );
+
+    let m = mcp_evolve_as(
+        &w,
+        &admin_auth(client, admin),
+        step,
+        "an admin MCP revision",
+    )
+    .await;
+    assert!(m.is_ok(), "the audited admin path over MCP: {m:?}");
+    assert_names_nothing_hidden(&w, "admitted MCP evolve", &text_of(&m));
+    let rows = evolve_admin_rows(&pool).await;
+    assert_eq!(rows.len(), 2, "a second admin_write row: {rows:?}");
+    assert_eq!(rows[1].1["workflow_id"], w.workflow.to_string(), "{rows:?}");
+}

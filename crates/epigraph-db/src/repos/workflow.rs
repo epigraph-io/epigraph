@@ -519,9 +519,9 @@ impl WorkflowRepository {
     /// held to: a lineage member or `executes` edge that row security hides
     /// from the caller is not in the set. Since migration 219 an `executes`
     /// edge takes its PLAN's tenancy too, so a group plan's edge onto a public
-    /// step is hidden from a non-member. The gates therefore also ask
-    /// [`Self::step_lineage_has_hidden_executor`], which sees what this read
-    /// cannot, and refuse when it is true.
+    /// step is hidden from a non-member. The gates therefore also read
+    /// [`Self::step_lineage_executors`], the same set read unfiltered, and
+    /// check every workflow in it that this read did not return.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -552,31 +552,30 @@ impl WorkflowRepository {
         .await
     }
 
-    /// Whether a workflow the SESSION cannot read executes the step lineage
-    /// of `claim_id` (the same lineage and edges as
-    /// [`Self::workflows_executing_step_lineage`], retracted edges included):
-    /// migration 219's definer `epigraph_step_lineage_has_hidden_executor`,
-    /// which reads the edges and lineage members unfiltered and answers one
-    /// boolean, never an id. A workflow row that is neither public nor owned
-    /// by a group in the session's read set, or an `executes` edge with no
-    /// row, counts. Run it on the caller's stamped transaction, as the gate's
-    /// other read: the answer is about that session's read set.
+    /// Every workflow that executes the step lineage of `claim_id`, read
+    /// UNFILTERED: the set [`Self::workflows_executing_step_lineage`] returns
+    /// to a session that reads every row (same lineage, same edges, retracted
+    /// ones included, no join to `workflows`), through migration 219's
+    /// definer `epigraph_step_lineage_executors`.
     ///
     /// Exists for the `evolve_step` authority gates (REST
     /// `routes/workflows.rs::require_api_lineage_authority`, MCP
-    /// `tools/evolve_step.rs::require_lineage_authority`): a step a hidden
-    /// plan runs needs authority over that plan, which a caller who cannot
-    /// read it does not hold, so they refuse as for a missing parent.
+    /// `tools/evolve_step.rs::require_lineage_authority`), which need
+    /// authority over every such workflow, including one whose `executes`
+    /// edge, lineage member or row the caller cannot see. The ids are the
+    /// SERVER's: a gate must answer any refusal over an id the caller's own
+    /// read did not return exactly as a missing parent, and never hand the id
+    /// to the caller.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
-    pub async fn step_lineage_has_hidden_executor(
+    pub async fn step_lineage_executors(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
-    ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar("SELECT public.epigraph_step_lineage_has_hidden_executor($1)")
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("SELECT w FROM public.epigraph_step_lineage_executors($1) AS w")
             .bind(claim_id)
-            .fetch_one(&mut *conn)
+            .fetch_all(&mut *conn)
             .await
     }
 

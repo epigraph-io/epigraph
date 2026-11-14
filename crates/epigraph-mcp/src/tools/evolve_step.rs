@@ -294,11 +294,16 @@ pub async fn evolve_step(
 ///
 /// The set is read under the caller's row security, and since migration 219
 /// an `executes` edge takes its plan's tenancy, so a group plan reusing a
-/// public step is invisible to a non-member, edge and all. The gate therefore
-/// first asks `WorkflowRepository::step_lineage_has_hidden_executor` (219's
-/// definer: one boolean, never an id) and refuses as for a missing parent when
-/// a workflow the caller cannot read executes the lineage. See the REST twin,
-/// `routes/workflows.rs::require_api_lineage_authority`.
+/// public step is invisible to a non-member, edge and all (as is any plan
+/// whose edge or lineage member row security hides, a lineage split across
+/// tenancies). The gate therefore also reads
+/// `WorkflowRepository::step_lineage_executors` (219's definer: the same set,
+/// read unfiltered, for the server only) and runs the same authority check
+/// on every workflow the caller's own read did not find, answering any
+/// refusal over one exactly as a missing parent, so its id is never handed
+/// over. Its arms run as for any other workflow (the stdio arms, which refuse
+/// a row the agent cannot read; the audited admin arm over HTTP). See the
+/// REST twin, `routes/workflows.rs::require_api_lineage_authority`.
 async fn require_lineage_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
@@ -320,20 +325,21 @@ async fn require_lineage_authority(
     // its id (backlog c831df4a).
     let not_found = || parent_not_found(parent);
     // Since migration 219 such a workflow's `executes` edge is hidden from the
-    // caller too, so `workflows` above does not hold it: ask the definer.
-    let hidden =
-        epigraph_db::WorkflowRepository::step_lineage_has_hidden_executor(&mut *conn, parent)
-            .await
-            .map_err(|e| {
-                crate::errors::internal_error_logged(
-                    "evolve_step: could not check the workflows executing the step's lineage",
-                    e,
-                )
-            })?;
-    if hidden {
-        return Err(not_found());
-    }
-    let mut grants = Vec::with_capacity(workflows.len());
+    // caller too, so `workflows` above does not hold it: the definer returns
+    // the whole set, unfiltered, to the server.
+    let every = epigraph_db::WorkflowRepository::step_lineage_executors(&mut *conn, parent)
+        .await
+        .map_err(|e| {
+            crate::errors::internal_error_logged(
+                "evolve_step: could not read every workflow executing the step's lineage",
+                e,
+            )
+        })?;
+    let hidden: Vec<Uuid> = every
+        .into_iter()
+        .filter(|w| !workflows.contains(w))
+        .collect();
+    let mut grants = Vec::with_capacity(workflows.len() + hidden.len());
     for workflow in workflows {
         let grant = require_workflow_authority(
             server,
@@ -345,6 +351,30 @@ async fn require_lineage_authority(
             &not_found,
         )
         .await?;
+        grants.push((workflow, grant));
+    }
+    // A workflow the caller did not find: the same arms, but EVERY refusal is
+    // the missing-parent answer, even over a row the caller can read (a
+    // public plan whose edge onto a hidden lineage member is hidden), so the
+    // answer never names it. Internal errors stay internal (logged, opaque).
+    for workflow in hidden {
+        let grant = require_workflow_authority(
+            server,
+            &mut *conn,
+            auth,
+            caller,
+            workflow,
+            "evolve_step",
+            &not_found,
+        )
+        .await
+        .map_err(|e| {
+            if e.code == rmcp::model::ErrorCode::INTERNAL_ERROR {
+                e
+            } else {
+                not_found()
+            }
+        })?;
         grants.push((workflow, grant));
     }
     Ok(grants)

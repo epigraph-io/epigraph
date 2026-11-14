@@ -1,6 +1,6 @@
 //! `docs/runbooks/219-undo.sql`, the rollback of migration 219 (a workflow
 //! endpoint contributes its own tenancy to an edge's meet; the `evolve_step`
-//! hidden-executor check).
+//! lineage-executor read).
 //!
 //! [`the_219_undo_returns_the_catalog_below_219`]: on a database migrated
 //! through 219, the undo leaves the `public` catalog (relations, columns,
@@ -119,7 +119,7 @@ async fn the_219_undo_returns_the_catalog_below_219(pool: PgPool) {
     for name in [
         "fn epigraph_node_tenancy(",
         "fn epigraph_propagate_tenancy(",
-        "fn epigraph_step_lineage_has_hidden_executor(",
+        "fn epigraph_step_lineage_executors(",
     ] {
         assert!(
             added.iter().any(|e| e.starts_with(name)),
@@ -201,7 +201,7 @@ async fn migration_219_refuses_over_a_restated_propagation_body(pool: PgPool) {
         "the earlier re-statement survives"
     );
     let applied: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'epigraph_step_lineage_has_hidden_executor')",
+        "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'epigraph_step_lineage_executors')",
     )
     .fetch_one(&pool)
     .await

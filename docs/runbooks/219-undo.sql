@@ -1,10 +1,10 @@
 -- ===================================================================
 -- 219-undo.sql: take migration 219 (a workflow endpoint contributes its own
--- tenancy to an edge's meet; the evolve_step hidden-executor check) back out,
+-- tenancy to an edge's meet; the evolve_step lineage-executor read) back out,
 -- in ONE transaction, on the migration (superuser) DSN.
 --
 -- READ FIRST: ROLL THE BINARIES BACK BEFORE THIS RUNS. A 219 binary calls
--- `epigraph_step_lineage_has_hidden_executor` in the `evolve_step` authority
+-- `epigraph_step_lineage_executors` in the `evolve_step` authority
 -- gates (REST `POST /api/v1/workflows/steps/:id/evolve`, MCP `evolve_step`);
 -- a unit left serving after this undo answers every evolve of a step some
 -- workflow executes with an error (42883). An older binary calls nothing 219
@@ -15,8 +15,8 @@
 --     `epigraph_propagate_tenancy()` byte for byte (`CREATE OR REPLACE` keeps
 --     their owner and ACL; never DROP them: a DROP resets the ACL and breaks
 --     every trigger and policy that names them);
---   * drops `epigraph_step_lineage_has_hidden_executor(uuid)` (nothing in SQL
---     names it);
+--   * drops `epigraph_step_lineage_executors(uuid)` (nothing in SQL names
+--     it);
 --   * REFUSES, changing nothing, unless both functions hold 219's bodies (or
 --     already hold 070's and 168's, a second run). A later migration that
 --     re-stated either one (a merged body) would otherwise be reverted to
@@ -251,6 +251,6 @@ BEGIN
     RETURN NULL;
 END $$;
 
-DROP FUNCTION IF EXISTS public.epigraph_step_lineage_has_hidden_executor(uuid);
+DROP FUNCTION IF EXISTS public.epigraph_step_lineage_executors(uuid);
 
 COMMIT;

@@ -1751,13 +1751,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // update policy (42501): nothing is ever confirmed or declined that the
     // owner could not see.
     ("epigraph_countersign_authorship", 208),
-    // 219, the `evolve_step` gate's hidden-executor check. Fails OPEN and
-    // SILENT under a non-member owner: its reads of the FORCEd `edges`,
-    // `claims` and `workflows` are then filtered to what the calling session
-    // reads, so a group plan's `executes` edge a non-member cannot see is not
-    // found, the answer is false, and the gate admits an evolve of a step a
-    // hidden plan runs. That is the stake this entry reports.
-    ("epigraph_step_lineage_has_hidden_executor", 219),
+    // 219, the `evolve_step` gate's unfiltered read of every workflow that
+    // executes a step's lineage. Fails OPEN and SILENT under a non-member
+    // owner: its reads of the FORCEd `edges` and `claims` are then filtered to
+    // what the calling session reads, so a group plan's `executes` edge a
+    // non-member cannot see is not returned, its authority is never checked,
+    // and the gate admits an evolve of a step a hidden plan runs. That is the
+    // stake this entry reports.
+    ("epigraph_step_lineage_executors", 219),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3120,8 +3121,8 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         // 219: the `evolve_step` gate calls it on the request DSN (REST and
         // MCP); without the grant every evolve of an executed step is 42501.
         (
-            "epigraph_step_lineage_has_hidden_executor",
-            "public.epigraph_step_lineage_has_hidden_executor(uuid)",
+            "epigraph_step_lineage_executors",
+            "public.epigraph_step_lineage_executors(uuid)",
             true,
         ),
     ];
