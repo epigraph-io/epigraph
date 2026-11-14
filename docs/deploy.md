@@ -66,7 +66,15 @@ The four logins:
 | **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). |
 
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
-hatch of migration 074. Nothing connects as it in production.
+hatch of migration 074. Nothing connects as it in production, and no
+production login may be GRANTed it: since migration 216 the hatch is taken only
+on an explicit grant (a superuser no longer counts by implication), so a
+granted service login would have its undeclared writes stamped onto the
+memberless seed group instead of refused. Never set
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF` (the test harness's opt-in to that grant)
+on a deployed `epigraph-migrate`. Audit: `SELECT r.rolname FROM pg_auth_members
+m JOIN pg_roles r ON r.oid = m.member WHERE m.roleid = 'epigraph_seed'::regrole`
+must return no rows.
 
 Six `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
 switches the session to the application role: `reown-claims`,
