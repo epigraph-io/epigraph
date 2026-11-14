@@ -326,12 +326,13 @@ impl Node {
 
 /// A link between two nodes of a leaf, pointing the way belief flows.
 ///
-/// **Only edge rows the map's audience can read** (backlog W8): an edge row
-/// has its own visibility and owner and co-owner groups, apart from its
-/// endpoints. The public map draws public rows only. A team map draws public
-/// rows and the rows that team owns or co-owns, so a row co-owned by two
-/// teams is drawn on both teams' maps. Two readable endpoints do not make a
-/// row readable, and a served edge carries no row id or visibility, so
+/// **Only edge rows the map's whole audience can read** (backlog W8): an
+/// edge row has its own visibility and owner and co-owner groups, apart from
+/// its endpoints. The public map draws public rows only. A team map draws
+/// public rows and the rows that team owns with no co-owner. A co-owned row
+/// is readable only by members of both groups, so it is never drawn on a
+/// single team's map (a joint view for such viewers is later work). Two
+/// readable endpoints do not make a row readable, and a served edge carries no row id or visibility, so
 /// [`LevelDocument::for_viewer`] cannot check this: the builder must.
 ///
 /// The `edges` table keeps one row per submission (migration 018 dropped

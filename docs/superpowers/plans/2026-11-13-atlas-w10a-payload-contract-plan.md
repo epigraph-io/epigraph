@@ -106,10 +106,12 @@ positions and weights.
   `supports`); builders serve the stored name lower-cased and collapse repeated rows
   on the lower-cased name. The pattern still admits upper case (some fixtures keep it
   on purpose), so the view compares names case-insensitively.
-- The builder draws only edge rows the map's audience can read. An edge row has its
-  own visibility and owner and co-owner groups, apart from its endpoints. The public
-  map draws public rows only; a team map draws public rows and the rows that team owns
-  or co-owns, so a row co-owned by two teams is drawn on both teams' maps. Two readable
+- The builder draws only edge rows the map's whole audience can read. An edge row has
+  its own visibility and owner and co-owner groups, apart from its endpoints. The
+  public map draws public rows only; a team map draws public rows and the rows that
+  team owns with no co-owner. A co-owned row is readable only by members of both
+  groups, so it is never drawn on a single team's map (a joint view for such viewers
+  is later work). Two readable
   endpoints do not make a row readable, and a served edge carries no row id or
   visibility, so `for_viewer` cannot check this: it is a builder (W8) invariant, and
   no test in this crate can prove it.
