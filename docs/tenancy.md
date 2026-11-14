@@ -89,7 +89,7 @@ back. Migration 062 forbids that pairing outright with
 | A new claim from an authenticated principal | the principal's declared write target |
 | A claim-derived row (`evidence`, `triples`, …) | inherited from the parent claim by 070 arm (c), at insert |
 | A visibility change on a claim | propagated to 17 derived tables, `harvester_fragments` and `edges` by 070 arm (d), in the same transaction |
-| A `harvester_fragments` row whose provenance row arrives later | stamped from the cited claim by **089**, when the `harvester_claim_provenance` row linking them is inserted — but only if the fragment is still unstamped. See the note below the table. |
+| A `harvester_fragments` row whose provenance row arrives later | stamped from the cited claim by **089**, when the `harvester_claim_provenance` row linking them is inserted — but only if the fragment is still unstamped. With several citing claims the most restrictive wins (**218**). See the note below the table. |
 | An edge | the **meet** of its two endpoints, 070 arm (b); since **120** (operator decision D8) an edge between two public claims (or evidence, or from a `synthesis` source) is owned by its **writer's group** and stays public, and every other public-meet edge (an agent, paper, workflow, trace ... endpoint) stays `('public', world)`. See "Edges between public claims are their writer's (120)" below. |
 | A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. `harvester_fragments` is in this set too, with one qualification — see below. |
 
@@ -132,6 +132,63 @@ That is intended and fail-closed — it is the same stance
 `seal_side_channels.rs::a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it`
 already takes for the seal — and it is a second reason to declare a fragment's
 tenancy yourself rather than let a later link decide it.
+
+**Several citing claims: the most restrictive wins (migration 218).** When more
+than one claim is a candidate for a fragment's tenancy, the winner is `group`
+before `public`, then a real owner before the seed sentinel, then the lowest
+`owner_group_id`, so the result does not depend on row order. Before 218 an
+`UPDATE … FROM` applied whichever joined row the plan produced. Only a claim the
+firing act names is a candidate:
+
+* the provenance stamp ranks the citing claims of the rows its own `INSERT`
+  statement wrote, not every provenance row of the fragment, so a link an
+  earlier, unstamped session wrote never decides the fragment;
+* arm (d) ranks the claims its `UPDATE` changed that cite the fragment, as 168
+  did, and never moves the fragment to a claim it did not change. One guard is
+  added: when every changed citer ends `public`, a `group` fragment that another
+  group-private claim still cites is left exactly as it is. Publicizing one
+  citer therefore no longer makes a fragment public while another citer is
+  group-private, and it does not hand the fragment to that other citer's group
+  either. A share, re-own or regroup to a group still carries the fragment with
+  the claim exactly as before;
+* `epigraph-tenancy-backfill`'s fragment arm ranks every non-world citer of a
+  sentinel-owned fragment (it is operator-run and has no statement to scope to).
+
+What 218 does **not** do: a fragment already owned by a real group and `public`
+is not narrowed by the stamp or the backfill when a group-private claim later
+cites it. The operator tools' node rule (`restrict-claims` / `regroup-claims`
+keep a shared fragment on its tuple unless every claim citing it ends in the
+target) governs that shape today; which rule should win there is an open
+operator question (`F-089-A`, `F-089-C` in `docs/tenancy/progress.json`).
+
+**The harvester ingest path is trusted to name any citing claim (operator
+decision 2026-09-22, finding `F-089-F`).** The stamp copies tenancy from the
+claim the provenance row's writer names, and nothing constrains which claims it
+may name. Since 115 only a privileged session (`epigraph_bypass()`) reaches the
+INSERT-time stamp, and since 218 it reads only that statement's rows, so the
+writer that can name a claim to it is a privileged one: the harvester on a
+maintenance or superuser DSN. The exposure is to **integrity and availability**,
+not **disclosure**: a wrong citation can make a fragment private to the wrong
+group, or hide it from a public claim's readers, but a stamp only moves a
+sentinel-owned (hence public) fragment to public or group, never to something
+more readable. A harvester deployment must therefore be operated as a trusted
+writer: its DSN is a maintenance credential, not an application one.
+
+**What the trust model does not yet cover (finding `F-218-A`).** `epigraph_app`
+still holds INSERT on `harvester_claim_provenance`: 115 skips the stamp for an
+application session's link but keeps the row. Arm (d) re-stamps a fragment from
+whichever of its linked claims a later tenancy change names, without asking who
+wrote the link, so a link written on an application connection can still
+influence a fragment's tenancy through arm (d). This predates 218 (168 behaves
+the same) and 218 does not widen it. The candidate repair, revoking that INSERT
+from the application role, waits on the operator confirming which role the
+external harvester connects as.
+
+**`epigraph_app` holds no UPDATE on `harvester_claim_provenance` (migration
+218).** The stamp is AFTER INSERT only, so an UPDATE that re-pointed a row's
+`fragment_id` or `claim_id` would stamp nothing (finding `F-089-E`). No
+application writer updates that table. A link that must be re-pointed is the
+harvester's or an operator's job, on the maintenance DSN.
 
 ## Declaring visibility on write
 
