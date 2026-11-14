@@ -31,6 +31,17 @@ Usage:
     # Pin Claude CLI's cwd (defaults to the repo containing this script)
     python3 scripts/label_themes_llm.py --cli-cwd /path/to/workdir
 
+    # Name the graph neighbourhoods of the latest clustering run instead
+    # (graph_neighborhoods.label, served by GET /api/v1/graph/themes/:id/expand)
+    python3 scripts/label_themes_llm.py --neighborhoods [--run-id <uuid>]
+
+Neighbourhoods: the clustering job (epigraph-jobs cluster_graph) writes a fresh
+set of `graph_neighborhoods` rows on every run, each labelled `neighborhood-N`,
+and the expand route serves only the latest run. Run `--neighborhoods` after
+each clustering run; until then that run's neighbourhoods show their
+placeholders. Samples are public members only (theme_lib.public_label_source),
+as for themes.
+
 Environment:
     DATABASE_URL  - Postgres connection string. epigraph_admin is required
                     for the UPDATE; epigraph_ro is sufficient for --dry-run.
@@ -42,6 +53,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 
 import psycopg2
 import psycopg2.extras
@@ -108,16 +120,19 @@ def load_themes_with_samples(conn, limit=None):
     return themes
 
 
-def build_prompt(theme):
-    """Build the LLM prompt for theme labeling."""
+def build_prompt(theme, kind="theme"):
+    """Build the LLM prompt for theme (or, with kind="neighborhood", graph
+    neighbourhood) labeling. The kind also prefixes the result file, so a
+    theme and a neighbourhood never share one."""
     samples_text = "\n".join(
         f"  {i+1}. [{s['agent']}] {s['content']}"
         for i, s in enumerate(theme["samples"])
     )
 
-    result_path = os.path.join(RESULT_DIR, f"theme_{theme['id'][:8]}.json")
+    result_path = os.path.join(RESULT_DIR, f"{kind}_{theme['id'][:8]}.json")
+    what = "topic cluster" if kind == "theme" else "sub-topic neighbourhood of a topic"
 
-    prompt = f"""You are labeling a topic cluster in an epistemic knowledge graph.
+    prompt = f"""You are labeling a {what} in an epistemic knowledge graph.
 
 This cluster contains {theme['claim_count']} claims. Here are the 10 most representative:
 
@@ -210,6 +225,131 @@ def is_placeholder_label(label):
     )
 
 
+def _is_uuid(text):
+    try:
+        uuid.UUID(text)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def is_neighborhood_placeholder_label(label):
+    """True when a graph neighbourhood's label is not a real name.
+
+    Every theme placeholder (is_placeholder_label), plus the clustering job's
+    `neighborhood-N` and a bare UUID (the dominant frame id an older job
+    stored as the label).
+    """
+    return (
+        is_placeholder_label(label)
+        or label.startswith("neighborhood-")
+        or _is_uuid(label)
+    )
+
+
+def latest_cluster_run(conn):
+    """The clustering run the expand route serves (ClusterRunRepository::latest:
+    newest completed_at), or None."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT run_id::text FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def load_neighborhoods_with_samples(conn, run_id, limit=None):
+    """Load run `run_id`'s graph neighbourhoods (largest first) and up to 10 of
+    each one's current PUBLIC members (theme_lib.public_label_source), highest
+    pignistic probability first. `claim_count` is the number of such members,
+    so nothing about private members reaches the prompt. A neighbourhood with
+    no public member comes back with no samples."""
+    out = []
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        sql = """
+            SELECT id, label FROM graph_neighborhoods
+            WHERE run_id = %s
+            ORDER BY size DESC, id
+        """
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        cur.execute(sql, (run_id,))
+        for nbr in cur.fetchall():
+            cur.execute(
+                f"""
+                SELECT substring(c.content for 200) AS content,
+                       COALESCE(a.display_name, 'unknown') AS agent,
+                       COUNT(*) OVER () AS public_members
+                FROM claim_neighborhood_membership m
+                JOIN claims c ON c.id = m.claim_id
+                LEFT JOIN agents a ON c.agent_id = a.id
+                WHERE m.run_id = %s AND m.neighborhood_id = %s
+                  AND c.is_current
+                  AND {theme_lib.public_label_source("c")}
+                ORDER BY c.pignistic_prob DESC NULLS LAST, c.id
+                LIMIT 10
+                """,
+                (run_id, nbr["id"]),
+            )
+            samples = cur.fetchall()
+            out.append({
+                "id": str(nbr["id"]),
+                "current_label": nbr["label"] or "",
+                "claim_count": samples[0]["public_members"] if samples else 0,
+                "samples": [{"content": s["content"], "agent": s["agent"]} for s in samples],
+            })
+    return out
+
+
+def update_neighborhood(conn, neighborhood_id, label):
+    """Store a neighbourhood's label (admin-role UPDATE)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE graph_neighborhoods SET label = %s WHERE id = %s",
+            (label, neighborhood_id),
+        )
+    conn.commit()
+
+
+def label_neighborhoods(conn, run_id, limit=None, relabel_all=False, dry_run=False,
+                        cli_cwd=DEFAULT_CLI_CWD):
+    """Name run `run_id`'s neighbourhoods from public members only. Returns
+    (labeled, placeholders, skipped, failed)."""
+    nbrs = load_neighborhoods_with_samples(conn, run_id, limit=limit)
+    print(f"  {len(nbrs)} neighbourhoods in run {run_id}", file=sys.stderr)
+    labeled = placeholders = skipped = failed = 0
+    for i, nbr in enumerate(nbrs):
+        current = nbr["current_label"]
+        if not relabel_all and not is_neighborhood_placeholder_label(current):
+            skipped += 1
+            continue
+        print(f"\nNeighbourhood {i+1}/{len(nbrs)} (current: {current[:50] or '<none>'})",
+              file=sys.stderr)
+        if not nbr["samples"]:
+            if dry_run:
+                print(f"  [DRY RUN] Would store {NO_PUBLIC_MEMBER_LABEL}", file=sys.stderr)
+                continue
+            update_neighborhood(conn, nbr["id"], NO_PUBLIC_MEMBER_LABEL)
+            placeholders += 1
+            continue
+        prompt, result_path = build_prompt(nbr, kind="neighborhood")
+        if dry_run:
+            print(f"  [DRY RUN] Would call Claude CLI ({len(nbr['samples'])} samples)",
+                  file=sys.stderr)
+            continue
+        if os.path.exists(result_path):
+            os.remove(result_path)
+        result = call_claude_cli(prompt, result_path, cwd=cli_cwd)
+        if result and result.get("label"):
+            update_neighborhood(conn, nbr["id"], result["label"])
+            print(f"  -> {result['label']}", file=sys.stderr)
+            labeled += 1
+        else:
+            print("  FAILED — no valid JSON result", file=sys.stderr)
+            failed += 1
+    return labeled, placeholders, skipped, failed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
@@ -232,10 +372,38 @@ def main():
         help="Re-label every theme; default skips themes whose current label "
              "looks like an LLM-generated short string already.",
     )
+    parser.add_argument(
+        "--neighborhoods", action="store_true",
+        help="Label the graph neighbourhoods of one clustering run "
+             "(graph_neighborhoods.label) instead of themes",
+    )
+    parser.add_argument(
+        "--run-id", default=None,
+        help="With --neighborhoods: the graph_cluster_runs run to label "
+             "(default: the latest, the one the expand route serves)",
+    )
     args = parser.parse_args()
 
     conn = psycopg2.connect(args.database_url)
     os.makedirs(RESULT_DIR, exist_ok=True)
+
+    if args.neighborhoods:
+        run_id = args.run_id or latest_cluster_run(conn)
+        if run_id is None:
+            print("No clustering run: nothing to label", file=sys.stderr)
+            conn.close()
+            return
+        labeled, placeholders, skipped, failed = label_neighborhoods(
+            conn, run_id, limit=args.limit, relabel_all=args.relabel_all,
+            dry_run=args.dry_run, cli_cwd=args.cli_cwd,
+        )
+        print(
+            f"\nDone: {labeled} labeled, {placeholders} without a public member, "
+            f"{skipped} skipped, {failed} failed",
+            file=sys.stderr,
+        )
+        conn.close()
+        return
 
     print("Loading themes with sample claims...", file=sys.stderr)
     themes = load_themes_with_samples(conn, limit=args.limit)
