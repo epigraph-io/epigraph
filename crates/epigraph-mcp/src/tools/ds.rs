@@ -458,6 +458,29 @@ pub async fn submit_ds_evidence(
             .map_err(internal_error)?
             .len();
 
+    // The claim's Beta-Bernoulli track (backlog f50344c0), kept as
+    // `POST /frames/:id/evidence` keeps it, by the same function: the stored
+    // BBA's mass on the claim's assigned hypothesis goes to alpha, the rest of
+    // its non-conflict mass to beta. An identical resubmission was counted
+    // when it was first stored and is not counted again. Best-effort, under
+    // its own savepoint: a refused statement (a non-owner of a public claim
+    // does not write its row) never aborts this submission.
+    let assigned_index =
+        FrameRepository::get_claim_assignment(&mut *tx, viewer, claim_id, frame_id)
+            .await
+            .map_err(internal_error)?
+            .and_then(|a| a.hypothesis_index);
+    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+        &mut tx,
+        viewer,
+        claim_id,
+        (write_outcome != BbaWriteOutcome::Unchanged)
+            .then(|| epigraph_engine::ds_divergence::beta_increments(&mass_fn, assigned_index)),
+        "submit_ds_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+
     // Combine + persist the claim's cached belief via the SAME code path
     // `recompute_beliefs` uses (`recompute_claim_belief_on_frame` ->
     // `recompute_combined_belief`), instead of re-deriving it here with a
@@ -604,6 +627,27 @@ pub async fn submit_ds_evidence(
             )
         }
     };
+
+    // The DS-vs-Bayesian divergence row `get_divergence` reads (backlog
+    // f50344c0): this call's BetP against the Beta posterior above, on the
+    // frame the BBA was filed on. Only the REST twin used to write it, so
+    // `get_divergence` had no data for a claim whose evidence came in here.
+    // Best-effort, under its own savepoint: the row is claim-derived, and a
+    // writer that does not write the claim's group is refused it without
+    // losing the submission.
+    if let Some(p) = pignistic_prob {
+        epigraph_engine::ds_divergence::record_divergence(
+            &mut tx,
+            claim_id,
+            frame_id,
+            p,
+            bayesian_posterior,
+            Some(frame_row.version),
+            "submit_ds_evidence",
+        )
+        .await
+        .map_err(internal_error)?;
+    }
 
     tx.commit().await.map_err(internal_error)?;
 
