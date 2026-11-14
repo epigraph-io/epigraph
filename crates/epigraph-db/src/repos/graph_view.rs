@@ -334,6 +334,13 @@ impl GraphViewRepository {
     /// look filtered in review and leak through the other — which is why the
     /// marker is written per-`FROM`, not per-statement.
     ///
+    /// The `atoms` CTE joins `claims` and carries `{VISIBILITY:ac}` as well as
+    /// the membership marker, so `atom_count` counts only atoms the viewer can
+    /// read (`F-atom-count-cardinality`). The membership row normally inherits
+    /// its claim's tenancy, but the count must not depend on that: a bare count
+    /// of unreadable atoms is a cardinality oracle, the shape
+    /// `MassFunctionRepository::count_for_claim` documents.
+    ///
     /// Every `edges` read carries `{EDGE_VISIBILITY:e}`, including the two
     /// `NOT EXISTS` probes in `standalone_nodes`: an atom whose only
     /// `decomposes_to` edge is hidden is served as standalone, exactly as if
@@ -354,7 +361,8 @@ impl GraphViewRepository {
             WITH atoms AS (
                 SELECT m.claim_id
                 FROM claim_neighborhood_membership m
-                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */
+                JOIN claims ac ON ac.id = m.claim_id
+                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */ /* {VISIBILITY:ac} */
             ),
             compound_to_atoms AS (
                 SELECT e.source_id AS compound_id, e.target_id AS atom_id

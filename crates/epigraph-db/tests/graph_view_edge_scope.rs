@@ -1,5 +1,6 @@
 //! The `edges` rows a graph projection walks are filtered by the viewer, and
-//! not only the `claims` rows it returns (`F-edges-unfiltered`).
+//! not only the `claims` rows it returns (`F-edges-unfiltered`,
+//! `F-atom-count-cardinality`).
 //!
 //! # The instrument
 //!
@@ -32,7 +33,7 @@ use epigraph_db::visibility::Viewer;
 use epigraph_db::GraphViewRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
-use viewer_fixture::{seed_agent_with_group, seed_public_claim, world_group};
+use viewer_fixture::{seed_agent_with_group, seed_group_claim, seed_public_claim, world_group};
 
 // ── fixtures ──
 
@@ -40,12 +41,13 @@ struct Cast {
     viewer: Viewer,
     viewer_agent: Uuid,
     viewer_group: Uuid,
+    stranger: Uuid,
     stranger_group: Uuid,
 }
 
 async fn cast(pool: &PgPool, label: &str) -> Cast {
     let (viewer_agent, viewer_group) = seed_agent_with_group(pool, &format!("{label}-mine")).await;
-    let (_stranger, stranger_group) = seed_agent_with_group(pool, &format!("{label}-theirs")).await;
+    let (stranger, stranger_group) = seed_agent_with_group(pool, &format!("{label}-theirs")).await;
     let viewer = Viewer::resolve(pool, viewer_agent).await.expect("resolve");
     assert!(
         viewer
@@ -58,6 +60,7 @@ async fn cast(pool: &PgPool, label: &str) -> Cast {
         viewer,
         viewer_agent,
         viewer_group,
+        stranger,
         stranger_group,
     }
 }
@@ -342,6 +345,71 @@ async fn neighborhood_compound_nodes_follow_only_edges_the_viewer_can_read(pool:
         Some(("standalone".to_string(), 0)),
         "a member whose only child edge is hidden must be served as standalone; \
          got {rows:?}"
+    );
+}
+
+/// `atom_count` counts only atoms whose `claims` row the viewer can read.
+///
+/// The stranger's atom has its MEMBERSHIP row forced public and its edge
+/// forced public, so neither the membership predicate nor the edge predicate
+/// can drop it. Only a claims predicate on the atoms can.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_atom_count_excludes_an_atom_the_viewer_cannot_read(pool: PgPool) {
+    let c = cast(&pool, "ev-acount").await;
+    let world = world_group(&pool).await;
+    let compound = claim(&pool, &c, "ev acount: the compound").await;
+    let open_atom = claim(&pool, &c, "ev acount: public atom").await;
+    let my_atom = seed_group_claim(
+        &pool,
+        c.viewer_agent,
+        c.viewer_group,
+        "ev acount: my private atom",
+    )
+    .await;
+    let their_atom = seed_group_claim(
+        &pool,
+        c.stranger,
+        c.stranger_group,
+        "ev acount: their private atom",
+    )
+    .await;
+    let run = seed_run(&pool).await;
+    for atom in [open_atom, my_atom, their_atom] {
+        public_edge(&pool, compound, atom, "decomposes_to").await;
+        join_neighborhood(&pool, &run, atom).await;
+    }
+    sqlx::query(
+        "UPDATE claim_neighborhood_membership SET visibility = 'public', owner_group_id = $2 \
+         WHERE claim_id = $1",
+    )
+    .bind(their_atom)
+    .bind(world)
+    .execute(&pool)
+    .await
+    .expect("force the stranger atom's membership public");
+    let m: String = sqlx::query_scalar(
+        "SELECT visibility::text FROM claim_neighborhood_membership WHERE claim_id = $1",
+    )
+    .bind(their_atom)
+    .fetch_one(&pool)
+    .await
+    .expect("read back membership");
+    assert_eq!(m, "public", "CALIBRATION: the forced membership must stick");
+
+    let rows =
+        GraphViewRepository::neighborhood_compound_nodes(&pool, &c.viewer, run.neighborhood_id)
+            .await
+            .expect("neighborhood_compound_nodes");
+    let count = rows.iter().find(|r| r.id == compound).map(|r| r.atom_count);
+    assert_eq!(
+        count,
+        Some(2),
+        "atom_count must be 2 (the public atom and the viewer's own private one); a 3 \
+         counts an atom the viewer cannot read and a 1 drops the viewer's own; got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.id == their_atom),
+        "the unreadable atom must not appear as a node either; got {rows:?}"
     );
 }
 
