@@ -1939,45 +1939,6 @@ async fn store_created_claim_vector(
     .await
 }
 
-/// Convert a DOI into a slug form safe for use as a URL path segment or
-/// canonical name: every `/` becomes `-`. Casing is left untouched.
-///
-/// # Why this has no caller, and must NOT be wired into the label write
-///
-/// It looks like the missing half of backlog 00ad6fee ("Step 14's
-/// `recompute_beliefs(labels=[doi_slug])` is a no-op — ingest writes
-/// `doi:<doi>`, not the slug"), and the obvious repair is to emit
-/// `doi_to_slug(doi)` alongside `doi:{doi}` at both ingest sites. **Do not.**
-/// That backlog was resolved on the WORKFLOW side and this spelling is now the
-/// one the canonical workflow explicitly warns against.
-///
-/// MEASURED against prod on 2026-09-22: workflow
-/// `48c58117-4c96-5e72-805a-cb1ce7193012`
-/// (`ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction`),
-/// step_index 14, lineage `b5bb0b73-…`. The step claim the backlog quotes —
-/// `1ad33d15-e517-5e73-b3dd-c6ff00a0e2d3`, "`recompute_beliefs(labels=[doi_slug]`
-/// … DOI with slashes replaced by hyphens" — is `is_current: false`. Its head
-/// is `d079cc79-1ba2-4aa2-8705-05a072764c77` (2026-09-02):
-///
-/// > The label is the literal prefix 'doi:' joined to the DOI with slashes
-/// > INTACT … VERIFIED 2026-09-02 across 24 papers … The hyphen-slug form
-/// > previously documented here … and the bare DOI without the 'doi:' prefix
-/// > BOTH match zero claims.
-///
-/// So `doi:{doi}` (what `do_ingest_document` and the spine path already write,
-/// pinned by `ingest_document_smoke::ingested_claims_carry_doi_label_for_recompute`)
-/// is the canonical spelling on both sides. Adding a second, hyphenated label
-/// to every ingested claim would re-legitimise a form the workflow head calls a
-/// silent no-op, and `check_already_ingested` is keyed on the `doi:<key>`
-/// spelling besides.
-///
-/// Kept, not deleted: the doc comment above describes a URL/path-segment use
-/// that is unrelated to labels, and the unit tests below pin the transform.
-#[allow(dead_code)] // deliberately uncalled — see the doc comment above, not a gap
-fn doi_to_slug(doi: &str) -> String {
-    doi.replace('/', "-")
-}
-
 /// URN prefix for a synthesized (non-DOI) document identity key.
 const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
 
@@ -2975,19 +2936,6 @@ mod tests {
         .await
         .expect("gate query");
         assert_eq!(hit, Some(paper_id));
-    }
-
-    #[test]
-    fn doi_to_slug_replaces_slash() {
-        assert_eq!(
-            doi_to_slug("10.48550/arXiv.2606.04990"),
-            "10.48550-arXiv.2606.04990"
-        );
-    }
-
-    #[test]
-    fn doi_to_slug_replaces_all_slashes() {
-        assert_eq!(doi_to_slug("10.1000/xyz/123/abc"), "10.1000-xyz-123-abc");
     }
 
     // ── Document identity keying (issue #356) ──────────────────────────────
