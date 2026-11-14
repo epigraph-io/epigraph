@@ -2757,6 +2757,36 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
          column to name (the shape of claim_theme.rs `delete_all_conn`).",
     ),
+    // Backlog b7354adc: the three reads `AuthoredByRepository::for_claim` ran inline, split
+    // out unchanged so `for_paper_ingests` (which takes the viewer and spends it on
+    // `PaperRepository::ingest_principals`) shares them instead of copying them.
+    (
+        "authored_by.rs",
+        "bound_at",
+        "READ through migration 199's `epigraph_operator_bound_at` SECURITY DEFINER function: the \
+         human an agent was bound to at an instant, from `operator_links` and \
+         `author_binding_clients`, neither of which has `visibility` / `owner_group_id`. The \
+         binding is shown to every reader of a claim (the ruled audience). Private; its callers \
+         `for_claim` and `for_paper_ingests` take the viewer and pass only agents of rows the \
+         viewer already read.",
+    ),
+    (
+        "authored_by.rs",
+        "snapshot_at",
+        "READ through migration 199's PRINCIPAL-BOUND `epigraph_agent_prompt_snapshot_at` \
+         SECURITY DEFINER function, the one spelling of the prompt-snapshot gate: it reads the \
+         stamped session's principal and returns a row of `agent_prompt_snapshots` (no \
+         `visibility` / `owner_group_id`) only to the agent's linked human and to admins. The \
+         viewer is spent on the stamp; an in-query predicate has nothing to name.",
+    ),
+    (
+        "authored_by.rs",
+        "display_names",
+        "READ of `id, display_name` from the untenanted `agents` table (077's `agents_identity` \
+         policy shows every session every row; no `visibility` / `owner_group_id`), the two \
+         fields `GET /api/v1/agents/:id` answers for any id. Private; called only with ids its \
+         viewer-taking callers already resolved.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
