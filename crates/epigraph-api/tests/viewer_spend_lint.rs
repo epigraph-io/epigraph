@@ -1113,8 +1113,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "db_pool.begin",
         ],
     ),
-    // gated (`write_target_of`) then write. (The detached factors SELECT that
-    // only logged a count was deleted, backlog 79e1f75d.)
+    // gated (`write_target_of`) then write. The detached factors SELECT that
+    // was registered here only logged a count and is deleted (backlog 79e1f75d).
     (
         "versioning.rs",
         "supersede_claim",

@@ -347,11 +347,12 @@ pub struct AppState {
     /// §5 tells operators their dashboards for those two event types will read
     /// empty.
     ///
-    /// Not deleted here because removing it means touching `AppState`'s two
-    /// non-db constructors, and the `not(feature = "db")` configuration does
-    /// not compile today (28 pre-existing errors), so the change could not be
-    /// verified. It is dead weight, not a hazard: nothing reads it on a request
-    /// path.
+    /// Not deleted in PR-03 because removing it means touching `AppState`'s
+    /// two non-db constructors, and the `not(feature = "db")` configuration
+    /// did not compile then, so the change could not be verified. That reason
+    /// has lapsed: CI now runs
+    /// `cargo check -p epigraph-api --no-default-features --locked`. The field
+    /// is still dead weight, not a hazard: nothing reads it on a request path.
     pub signature_state: SignatureVerificationState,
     /// Thread-safe propagation orchestrator for truth propagation
     ///
@@ -432,8 +433,12 @@ pub struct AppState {
     /// principal owns the resource or holds `admin`/`writer` in its owning
     /// group. `with_policy_gate` replaces it.
     ///
-    /// Unlike the pre-PR-11 field, this one is **consulted**: see
-    /// `routes/ownership.rs::assign_ownership` / `::update_partition`.
+    /// **No handler consults it at present.** Its only callers were the
+    /// ownership routes (`assign_ownership` / `update_partition`), which PR-14
+    /// deleted together with their route file. The field is assigned in every
+    /// constructor and by `with_policy_gate`, and read only by this file's
+    /// `extension_wiring_tests`; write authorization on the request path is
+    /// row security plus each handler's own checks.
     pub policy_gate: SharedPolicyGate,
 
     /// External identity provider registry. Built once at startup from `providers.toml`.

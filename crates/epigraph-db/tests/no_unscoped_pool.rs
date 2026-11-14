@@ -768,10 +768,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-/// 210 -> 209: `supersede_claim`'s detached factor-query spawn in
-/// `routes/versioning.rs`, whose only effect was a log line, was deleted
-/// (backlog 79e1f75d); the file keeps 1 site.
-const HIGH_WATER: usize = 209;
+/// 210 -> 207 when `routes/isomorphism.rs` was DELETED (backlog 54db73b5): a
+/// removal of never-compiled code, not a conversion, and its key went with it
+/// (`HIGH_WATER_FILES` falls by one).
+/// 207 -> 206 when `supersede_claim`'s detached factor-count spawn was deleted
+/// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
+const HIGH_WATER: usize = 206;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -839,7 +841,8 @@ const HIGH_WATER: usize = 209;
 /// 40 -> 39 when `routes/graph_query.rs` reached zero (HTTP public-only reads).
 /// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
 /// caller's stamped transaction; merged with the line above on staging).
-const HIGH_WATER_FILES: usize = 38;
+/// 38 -> 37 when `routes/isomorphism.rs` was deleted (see [`HIGH_WATER`]).
+const HIGH_WATER_FILES: usize = 37;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1050,7 +1053,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 6 since its VOI cache moved onto that same stamped transaction (round 4
     // COR-R4-3).
     ("routes/hypothesis.rs", 6),
-    ("routes/isomorphism.rs", 3),
+    // `routes/isomorphism.rs` was 3 and is GONE, not converted: the file was
+    // DELETED with the `episcience` cargo feature that gated it (backlog
+    // 54db73b5). It imported a crate that is not a dependency, so it was never
+    // compiled and its three sites never ran.
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`
     // only ever emits non-zero entries, so a `0` row could never be satisfied.
@@ -1141,10 +1147,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // detached factor-query spawn and `mark_duplicate`'s best-effort provenance
     // append. Read off this test's failure output.
     //
-    // 2 -> 1 (backlog 79e1f75d): the factor-query spawn, whose only effect
-    // was a log line, was deleted. What remains is `mark_duplicate`'s
-    // best-effort provenance append. Read off this test's failure output
-    // (`recorded 2, measured 1`).
+    // 2 -> 1 (backlog 79e1f75d): that detached factor-query spawn only logged a
+    // count and is DELETED, not converted. `mark_duplicate`'s provenance append
+    // is the one site left.
     ("routes/versioning.rs", 1),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.

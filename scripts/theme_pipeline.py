@@ -12,6 +12,7 @@ materialises Model A; label names it. --dry-run reports the plan without writing
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -119,6 +120,46 @@ def current_k(conn, run_id):
         return cur.fetchone()[0]
 
 
+# Resolved against this file, not the working directory: the pipeline is run
+# from cron and from other checkouts, and a cwd-relative path made the label
+# step fail to start there.
+LABEL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "label_themes_llm.py")
+
+
+def label_command(database_url):
+    """argv for the label step, on the SAME database the pipeline wrote to.
+
+    label_themes_llm.py resolves its own DSN when none is passed
+    (MAINTENANCE_DATABASE_URL, DATABASE_URL, else a hard-coded default), so
+    without --database-url a `grow --database-url <scratch>` run clustered and
+    projected the scratch database and then relabelled every theme of another.
+    """
+    if not database_url:
+        raise ValueError("label step needs the pipeline's database URL")
+    return [sys.executable, LABEL_SCRIPT, "--relabel-all",
+            "--database-url", database_url]
+
+
+def run_label_step(database_url):
+    """Run the label step; return its exit code (non-zero = it did not finish)."""
+    try:
+        return subprocess.run(label_command(database_url), check=False).returncode
+    except OSError as e:
+        print(f"  label step could not start: {e}", file=sys.stderr)
+        return 127
+
+
+def grow_result(run_id, k, label_returncode):
+    """The grow summary. A failed label step is reported, not folded into
+    "grown": clustering and projection are committed by then, but the themes
+    still carry their `auto-NN` / `cluster-NN` placeholder labels."""
+    if label_returncode != 0:
+        return {"status": "label_failed", "run_id": run_id, "k": k,
+                "label_returncode": label_returncode}
+    return {"status": "grown", "run_id": run_id, "k": k}
+
+
 def grow(conn, args):
     # --from-run-id resumes the split/project/label phases on an existing base
     # run (skips the ~40-min base assign); otherwise start a fresh consolidated run.
@@ -157,8 +198,8 @@ def grow(conn, args):
         return {"status": "dry-run", "run_id": run_id, "k": current_k(conn, run_id)}
 
     project_to_themes.project_run(conn, run_id)
-    subprocess.run([sys.executable, "scripts/label_themes_llm.py", "--relabel-all"], check=False)
-    return {"status": "grown", "run_id": run_id, "k": current_k(conn, run_id)}
+    label_returncode = run_label_step(args.database_url)
+    return grow_result(run_id, current_k(conn, run_id), label_returncode)
 
 
 def main():
@@ -183,11 +224,18 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
+    # Resolved once, so the label subprocess is handed the URL this connection
+    # uses instead of resolving its own.
+    args.database_url = args.database_url or theme_lib.maintenance_dsn()
     conn = theme_lib.connect(args.database_url)
     theme_lib.set_statement_timeout(conn, ms=900000)
 
+    exit_code = 0
     if args.command == "grow":
-        print(json.dumps(grow(conn, args)))
+        result = grow(conn, args)
+        print(json.dumps(result))
+        if result["status"] == "label_failed":
+            exit_code = 1
     elif args.command == "discover":
         run_id = args.run_id or project_to_themes.latest_run_id(conn)
         stats = cluster_stats(conn, run_id)
@@ -203,8 +251,11 @@ def main():
         print(json.dumps({"status": "projected", "run_id": run_id,
                           "themes": project_to_themes.project_run(conn, run_id)}))
     elif args.command == "label":
-        subprocess.run([sys.executable, "scripts/label_themes_llm.py", "--relabel-all"], check=False)
+        exit_code = run_label_step(args.database_url)
+        if exit_code != 0:
+            print(f"label step failed (exit {exit_code})", file=sys.stderr)
     conn.close()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

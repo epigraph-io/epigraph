@@ -1149,8 +1149,9 @@ Current reservation:
   132)". Checked before claiming: no remote branch carries a `132`.
   **Applied to a throwaway database only, NOT to any deployed database.**
 
-- **133+**: public next (the elevation stack stays at or below 139; 140-159
-  are reserved)
+- **133+**: public (the elevation stack stays at or below 139; 140-159
+  are reserved). The entries from here on are not in numeric order, and this
+  line is not the next free number: see the allocation rule after `141`.
 
 - **140**: public `refresh_rotate_keeps_token_scopes` (backlog drain U002;
   slot from the drain block 140-159, so 123-139 stay free for the in-flight
@@ -1182,8 +1183,16 @@ Current reservation:
   that read it (they fail closed without it), and after 123-129 have been
   applied (sqlx would otherwise apply them out of order after 141).
 
-Next public migration **outside both reserved tenancy ranges** must be `133` or
-later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
+Next public migration **outside both reserved tenancy ranges** takes a number
+that no file in this directory, no entry in this list and no open branch
+carries. Read the head from the directory, not from this file:
+`ls migrations/*.sql | tail -1` (`209` when this paragraph was last revised; an
+earlier revision said "`133` or later" long after the head had passed it). An
+unused number below the head is not free by default: several are held by
+entries in this list (133-139 for the elevation stack, 155-157 by the drain
+register), and sqlx applies a file numbered below an already-applied head out
+of order (see the **Deploy order** notes on 140 and 141).
+Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
 the same commit as the file**. Picking a colliding version (checksum mismatch on
@@ -2856,15 +2865,20 @@ provenance or dealt with by the opt-in. Consequences, all deliberate:
 
 ## Migration Order
 
-Migrations must be applied in numerical order:
+The migrator applies the files in version order, from an empty database to
+this directory's head.
 
-1. **001_create_extensions.sql** - Enable pgvector and uuid-ossp extensions
-2. **002_create_agents.sql** - Create agents table (cryptographic identities)
-3. **003_create_claims.sql** - Create claims table (epistemic assertions)
-4. **004_create_evidence.sql** - Create evidence table (supporting materials)
-5. **005_create_reasoning_traces.sql** - Create reasoning traces and DAG structure
-6. **006_create_relationships.sql** - Add circular FKs and LPG edges table
-7. **007_create_indexes.sql** - Create performance indexes (HNSW, composite, partial)
+- **`001_initial_schema.sql`** is one file collapsed from the pre-split
+  repository's migrations 001–097 (kernel subset, per its header): agents,
+  claims, evidence, reasoning traces, edges and their indexes among its 60
+  `CREATE TABLE` statements. The seven per-table files an earlier revision
+  of this section listed (`001_create_extensions.sql` through
+  `007_create_indexes.sql`) do not exist. `001` itself runs
+  `CREATE EXTENSION IF NOT EXISTS` for `pg_trgm`, `uuid-ossp` and `vector`.
+- **`002` onward** are incremental; each is described in "Version range
+  coordination with epigraph-internal" above. The version space has gaps and
+  that list is not in numeric order, so read the head from the directory
+  (`ls migrations/*.sql | tail -1`).
 
 ## Schema Overview
 
@@ -2914,7 +2928,7 @@ All core tables include:
 - Enables lineage queries via recursive CTEs
 
 #### 6. Circular FK Resolution
-- `claims.trace_id` FK added in migration 006 (after both tables exist)
+- `claims.trace_id` FK (`claims_trace_id_fkey`) is added after both tables exist, at the end of `001_initial_schema.sql`
 - Allows claims and traces to reference each other
 - Uses `ON DELETE SET NULL` to prevent cascade issues
 
@@ -2947,27 +2961,30 @@ All core tables include:
 
 ## Running Migrations
 
-### Using sqlx (Rust)
+Use the `epigraph-migrate` binary. It applies every migration embedded in the
+build, records each in `_sqlx_migrations`, and verifies the schema head before
+and after (`crates/epigraph-api/src/migrate.rs`):
 
 ```bash
-# Set DATABASE_URL in .env
-export DATABASE_URL="postgres://user:pass@localhost:5432/epigraph"
-
-# Run migrations
-sqlx migrate run
-
-# Revert last migration
-sqlx migrate revert
+# The migration login needs DDL privilege; see docs/deploy.md.
+MIGRATION_DATABASE_URL="postgres://user:pass@localhost:5432/epigraph" \
+  cargo run -p epigraph-api --bin epigraph-migrate
 ```
 
-### Using psql
+For a test database, create a fresh one whose name ends in `_test` and migrate
+it from empty (the repository's `CLAUDE.md`, "Test database").
 
-```bash
-# Apply all migrations in order
-for file in migrations/*.sql; do
-  psql $DATABASE_URL -f $file
-done
-```
+Two things an earlier revision of this section recommended do not apply:
+
+- **`sqlx migrate revert`** has nothing to run: this directory holds no
+  `.down.sql` files. A migration that can be reversed says how in its own
+  header or ships a script in `docs/runbooks/` (`NNN-undo.sql`).
+- **A `psql -f` loop over `migrations/*.sql`** writes no `_sqlx_migrations`
+  rows, so the checksum ledger the top of this file describes is bypassed and
+  a database prepared that way then fails every `sqlx::migrate!` run. The one
+  script that does apply files with `psql`,
+  `scripts/prepare-engine-integration-db.sh`, is described under
+  "`-- no-transaction` migrations" above.
 
 ## Schema Validation
 
@@ -3021,7 +3038,7 @@ ORDER BY pg_total_relation_size('public.'||tablename) DESC;
 
 -- Vector index performance (claims)
 EXPLAIN ANALYZE
-SELECT id, statement, truth_value
+SELECT id, content, truth_value
 FROM claims
 WHERE embedding IS NOT NULL
 ORDER BY embedding <=> '[0.1, 0.2, ...]'::vector
@@ -3051,5 +3068,4 @@ For high availability:
 - [pgvector Documentation](https://github.com/pgvector/pgvector)
 - [HNSW Algorithm](https://arxiv.org/abs/1603.09320)
 - [PostgreSQL GIN Indexes](https://www.postgresql.org/docs/current/gin.html)
-- [EpiGraph Implementation Plan](/home/user/EpiGraphV2/IMPLEMENTATION_PLAN.md)
-- [TruthValue Type](/home/user/EpiGraphV2/crates/epigraph-core/src/truth.rs)
+- [TruthValue Type](../crates/epigraph-core/src/truth.rs)
