@@ -8332,7 +8332,7 @@ impl ClaimRepository {
     /// Store an embedding vector on a claim that is not sealed.
     ///
     /// The embedding string must be a valid pgvector literal (e.g., "[0.1,0.2,...]").
-    /// Follows the same pattern as `EvidenceRepository::store_embedding`.
+    /// The evidence twin is `EvidenceRepository::store_embedding_as`.
     ///
     /// # Why the seal predicate is in THIS statement
     ///

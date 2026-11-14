@@ -185,7 +185,7 @@ async fn create_test_router(pool: PgPool) -> Router {
 ///
 /// Uses raw SQL rather than ClaimRepository::create() because:
 /// 1. ClaimRepository::create() does not support the `embedding` column (pgvector),
-///    which is managed separately via EvidenceRepository::store_embedding()
+///    which is managed separately via EvidenceRepository::store_embedding_as()
 /// 2. ClaimRepository::create() does not support the `labels` column directly
 /// 3. These tests need to set up specific embedding vectors for similarity assertions,
 ///    which requires inserting the embedding in the same INSERT statement

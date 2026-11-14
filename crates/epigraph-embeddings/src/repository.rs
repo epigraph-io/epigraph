@@ -36,16 +36,25 @@ impl EmbeddingRepository {
         Self { pool, dimension }
     }
 
-    /// Store an embedding for a claim
+    /// Store an embedding for a claim that is not sealed
+    ///
+    /// The `NOT EXISTS (… claim_encryption …)` predicate is the one every
+    /// other writer of `claims.embedding` carries (`ClaimRepository::
+    /// store_embedding` and `store_embedding_if_unsealed`): a sealed claim's
+    /// content is ciphertext, and a vector computed from its plaintext must not
+    /// survive on it (backlog f78526ad). Keyed on `claim_encryption`, never on
+    /// `visibility`: a group-private claim is ordinary plaintext and is still
+    /// embedded.
     ///
     /// # Arguments
     /// * `claim_id` - The claim's UUID
     /// * `embedding` - The embedding vector
     ///
     /// # Returns
-    /// * `Ok(())` - Successfully stored
+    /// * `Ok(true)` - Stored
+    /// * `Ok(false)` - No row matched: no such claim, or the claim is sealed
     /// * `Err(EmbeddingError::DimensionMismatch)` - If dimension is wrong
-    pub async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
+    pub async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<bool, EmbeddingError> {
         if embedding.len() != self.dimension {
             return Err(EmbeddingError::DimensionMismatch {
                 expected: self.dimension,
@@ -55,10 +64,13 @@ impl EmbeddingRepository {
 
         let vector_str = format_pgvector(embedding);
 
-        sqlx::query(
+        let result = sqlx::query(
             r"
             UPDATE claims SET embedding = $2::vector, updated_at = NOW()
             WHERE id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id
+              )
             ",
         )
         .bind(claim_id)
@@ -66,7 +78,7 @@ impl EmbeddingRepository {
         .execute(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Retrieve an embedding for a claim
