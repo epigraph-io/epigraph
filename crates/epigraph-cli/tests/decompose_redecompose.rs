@@ -12,8 +12,8 @@
 mod fixture;
 
 use epigraph_cli::decompose::{
-    persist_decomposition, select_candidates, select_redecompose_candidates, verify_plan,
-    verify_plan_for, Decomposition, EligibilityFilters, Ineligible, PlanDrift,
+    persist_decomposition, persist_planned, select_candidates, select_redecompose_candidates,
+    verify_plan, verify_plan_for, Decomposition, EligibilityFilters, Ineligible, PlanDrift,
     PlannedDecomposition, Population, Priority,
 };
 use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
@@ -250,26 +250,64 @@ async fn an_atom_that_would_close_a_cycle_is_refused(pool: PgPool) {
         atoms: vec![PARAGRAPH.into(), "The pump failed.".into()],
         generality: vec![0, 0],
     };
-    let err = persist(&pool, &viewer, w.compound_atom, w.agent, &ancestor)
+    let out = persist(&pool, &viewer, w.compound_atom, w.agent, &ancestor)
         .await
-        .err()
-        .expect("refused");
-    assert!(err.contains("cycle"), "{err}");
+        .unwrap();
+    assert_eq!(out.refused_cycle, Some(w.paragraph));
+    assert_eq!(out.edges_created, 0);
     // ...or the atom's own text: a self-loop.
     let itself = Decomposition {
         atoms: vec![COMPOUND_ATOM.into(), "The pump failed.".into()],
         generality: vec![0, 0],
     };
-    let err = persist(&pool, &viewer, w.compound_atom, w.agent, &itself)
+    let out = persist(&pool, &viewer, w.compound_atom, w.agent, &itself)
         .await
-        .err()
-        .expect("refused");
-    assert!(err.contains("cycle"), "{err}");
+        .unwrap();
+    assert_eq!(out.refused_cycle, Some(w.compound_atom));
     assert_eq!(
         decomposes_count(&pool, w.compound_atom).await,
         0,
         "no edge was written for the refused parent"
     );
+
+    // Through persist_planned, the path a scheduled run and --apply-plan
+    // take: a cycle is reported per parent, NOT as a failure (a failure
+    // aborts a normal run), and the next line is still applied.
+    let line = |claim_id: Uuid, content: &str, atoms: Vec<String>| PlannedDecomposition {
+        kind: PlannedDecomposition::KIND.into(),
+        claim_id,
+        agent_id: w.agent,
+        content: content.into(),
+        atoms,
+        generality: vec![0, 0],
+        model: "fixture".into(),
+    };
+    let p = pool.clone();
+    let agent = w.agent;
+    let submit = move |text: String, _g: i64, _parent: epigraph_cli::decompose::AtomParent| {
+        let p = p.clone();
+        async move { Ok::<_, Box<dyn std::error::Error>>(claim_if_not_exists(&p, agent, &text).await) }
+    };
+    let totals = persist_planned(
+        &pool,
+        &viewer,
+        &[
+            line(w.compound_atom, COMPOUND_ATOM, ancestor.atoms.clone()),
+            line(
+                w.disputer,
+                "The backup never took over.",
+                vec!["The backup stalled.".into(), "It never restarted.".into()],
+            ),
+        ],
+        None,
+        None,
+        &submit,
+    )
+    .await
+    .unwrap();
+    assert!(totals.failed.is_empty(), "{:?}", totals.failed);
+    assert_eq!(totals.cycles, vec![(w.compound_atom, w.paragraph)]);
+    assert_eq!(totals.edges, 2, "the next line was applied");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -1091,6 +1091,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (id, why) in &totals.failed {
                 eprintln!("FAILED {id}: {why}");
             }
+            report_cycles(&totals.cycles);
             eprintln!(
                 "apply-plan complete: {} applied, {} failed (still undecomposed; re-run this \
                  plan to retry them), {} refused, {} atoms, {} decomposes_to edges",
@@ -1260,6 +1261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
             report_unplanned(&totals.gaps, &totals.singletons);
+            report_cycles(&totals.cycles);
             eprintln!(
                 "decompose complete: {} atoms, {} decomposes_to edges",
                 totals.atoms, totals.edges
@@ -1304,6 +1306,18 @@ fn report_unplanned(gaps: &PlanGaps, singletons: &[uuid::Uuid]) {
     }
     for id in singletons {
         eprintln!("SINGLETON {id}: the model returned one atom (already atomic); not decomposed");
+    }
+}
+
+/// Name every parent left unwired because an atom would close a
+/// `decomposes_to` cycle. A re-run of the same answer refuses again.
+fn report_cycles(cycles: &[(uuid::Uuid, uuid::Uuid)]) {
+    for (parent, atom) in cycles {
+        eprintln!(
+            "CYCLE {parent}: atom {atom} is the parent itself or one of its decomposes_to \
+             ancestors; no edge was written for this parent (re-running the same answer \
+             refuses again)"
+        );
     }
 }
 

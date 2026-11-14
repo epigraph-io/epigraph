@@ -840,6 +840,12 @@ mod db_writes {
         pub atom_claim_ids: Vec<Uuid>,
         pub edges_created: usize,
         pub skipped_singletons: usize,
+        /// Set when an atom id is the parent itself or one of its
+        /// `decomposes_to` ancestors: wiring it would close a cycle, so NO
+        /// edge was written for this parent (`atom_claim_ids` is then empty;
+        /// the atoms POSTed stay unwired and change nothing). A deterministic
+        /// refusal, not a failure: re-running the same answer refuses again.
+        pub refused_cycle: Option<Uuid>,
     }
 
     /// Persist one compound claim's atoms as child claims and wire
@@ -880,6 +886,7 @@ mod db_writes {
                 atom_claim_ids: vec![],
                 edges_created: 0,
                 skipped_singletons: 1,
+                refused_cycle: None,
             });
         }
         // Guard: parent must still be current (never wire onto a retired claim).
@@ -924,19 +931,23 @@ mod db_writes {
         // ancestors would close a cycle. `if_not_exists` on the atom POST can
         // hand back such an id when the model returns a text identical to the
         // parent's or an ancestor's (likeliest under `--redecompose`, where
-        // the parent is itself an atom). Refused before any edge is written.
+        // the parent is itself an atom). Refused before any edge is written,
+        // and reported as `refused_cycle` rather than as an error, so one such
+        // answer does not abort a scheduled run. The ancestor walk sees only
+        // edges the viewer can see: on the `--as-agent` path a cycle through
+        // an edge hidden from the agent is not caught.
         {
             use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
             let mut above =
                 R::decomposes_to_ancestors(&mut *db.read(viewer).await?, viewer, parent_id).await?;
             above.push(parent_id);
-            if let Some(bad) = atom_ids.iter().find(|a| above.contains(a)) {
-                return Err(format!(
-                    "atom {bad} for parent {parent_id} is the parent itself or one of its \
-                     decomposes_to ancestors; wiring it would close a cycle. No \
-                     decomposes_to edge was written for this parent"
-                )
-                .into());
+            if let Some(&bad) = atom_ids.iter().find(|a| above.contains(a)) {
+                return Ok(PersistOutcome {
+                    atom_claim_ids: vec![],
+                    edges_created: 0,
+                    skipped_singletons: 0,
+                    refused_cycle: Some(bad),
+                });
             }
         }
         // Phase 2: every edge in ONE transaction, so the parent goes from
@@ -967,6 +978,7 @@ mod db_writes {
             atom_claim_ids: atom_ids,
             edges_created: edges,
             skipped_singletons: 0,
+            refused_cycle: None,
         })
     }
 
@@ -992,6 +1004,10 @@ mod db_writes {
         /// Parents the model answered with one atom (already atomic), so
         /// nothing was written for them.
         pub singletons: Vec<Uuid>,
+        /// `(parent, atom)`: parents left unwired because the atom is the
+        /// parent or one of its `decomposes_to` ancestors (see
+        /// [`PersistOutcome::refused_cycle`]). Not a failure: the run goes on.
+        pub cycles: Vec<(Uuid, Uuid)>,
         /// Claims sent to the LLM that got no plan line (normal runs only;
         /// `--apply-plan` makes no LLM call and leaves this empty).
         pub gaps: PlanGaps,
@@ -1047,6 +1063,7 @@ mod db_writes {
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
             totals.singletons.extend(chunk_totals.singletons);
+            totals.cycles.extend(chunk_totals.cycles);
             // A normal run still ABORTS on a persist failure (after finishing
             // the chunk): the next chunk would spend another LLM call on an
             // API that is probably down. `--apply-plan` makes no LLM call and
@@ -1230,6 +1247,11 @@ mod db_writes {
             )
             .await
             {
+                Ok(outcome) if outcome.refused_cycle.is_some() => {
+                    if let Some(atom) = outcome.refused_cycle {
+                        totals.cycles.push((plan.claim_id, atom));
+                    }
+                }
                 Ok(outcome) => {
                     totals.atoms += outcome.atom_claim_ids.len();
                     totals.edges += outcome.edges_created;
