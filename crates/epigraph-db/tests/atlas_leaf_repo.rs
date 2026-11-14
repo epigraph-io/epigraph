@@ -1076,3 +1076,70 @@ async fn the_node_set_is_identical_across_runs(pool: PgPool) {
     assert!(split_a.len() >= 2);
     assert_eq!(split_a, split_b);
 }
+
+/// Atlas W9's leaf labels (review finding: the tenancy filter was untested).
+/// `node_labels` serves an evidence row's raw text, so it must label only
+/// the evidence the map may draw, whatever ids the caller passes: team T's
+/// map labels T's and public evidence, never team U's; the public map labels
+/// public evidence only. Agents carry no tenancy (077) and are labelled by
+/// display name on every map.
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_labels_label_only_the_evidence_the_map_may_draw(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let u = team(&pool, "team-u").await;
+    let world = fixture::world_group(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let filer = agent(&pool).await;
+    sqlx::query("UPDATE agents SET display_name = 'The Filer' WHERE id = $1")
+        .bind(filer)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tc = claims(&pool, filer, "group", t, 1).await[0];
+    let uc = claims(&pool, filer, "group", u, 1).await[0];
+    let pc = claims(&pool, filer, "public", world, 1).await[0];
+    let ev_t = evidence(&pool, tc, 1).await[0];
+    let ev_u = evidence(&pool, uc, 1).await[0];
+    let ev_p = evidence(&pool, pc, 1).await[0];
+    for (ev, text) in [
+        (ev_t, "text of t"),
+        (ev_u, "text of u"),
+        (ev_p, "public text"),
+    ] {
+        sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
+            .bind(ev)
+            .bind(text)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let all = [ev_t, ev_u, ev_p];
+    let mut conn = pool.acquire().await.unwrap();
+    let (agents, ev) =
+        AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Team(t), &[filer], &all)
+            .await
+            .expect("node_labels");
+    assert_eq!(agents.get(&filer).map(String::as_str), Some("The Filer"));
+    assert_eq!(
+        ev.into_iter().collect::<Vec<_>>(),
+        {
+            let mut want = vec![
+                (ev_t, "text of t".to_string()),
+                (ev_p, "public text".to_string()),
+            ];
+            want.sort();
+            want
+        },
+        "team T's map labels T's and public evidence only"
+    );
+    let (agents, ev) =
+        AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Public, &[filer], &all)
+            .await
+            .expect("node_labels");
+    assert_eq!(agents.get(&filer).map(String::as_str), Some("The Filer"));
+    assert_eq!(
+        ev.into_iter().collect::<Vec<_>>(),
+        vec![(ev_p, "public text".to_string())],
+        "the public map labels public evidence only"
+    );
+}
