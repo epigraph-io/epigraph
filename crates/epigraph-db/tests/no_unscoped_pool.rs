@@ -773,7 +773,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// and writes on the caller's stamped transaction
 /// (`set_source_reliability_conn`); `routes/perspective.rs` 2 -> 1. No file
 /// reached zero.
-const HIGH_WATER: usize = 209;
+///
+/// 209 -> 207 (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding` and
+/// `PUT /api/v1/evidence/:id/embedding` were deleted with their handlers;
+/// `routes/rag.rs` 2 -> 0, key DELETED (`HIGH_WATER_FILES` 38 -> 37).
+const HIGH_WATER: usize = 207;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -841,7 +845,8 @@ const HIGH_WATER: usize = 209;
 /// 40 -> 39 when `routes/graph_query.rs` reached zero (HTTP public-only reads).
 /// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
 /// caller's stamped transaction; merged with the line above on staging).
-const HIGH_WATER_FILES: usize = 38;
+/// 38 -> 37 when `routes/rag.rs` reached zero (backlog 9bef22f3).
+const HIGH_WATER_FILES: usize = 37;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1094,7 +1099,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
     ("routes/political.rs", 5),
-    ("routes/rag.rs", 2),
+    // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
+    // its two writers, `generate_claim_embedding` and
+    // `generate_evidence_embedding` (the `PUT …/embedding` routes).
     // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
     // loader moved onto `AppState::read_as` and
     // `EdgeRepository::claim_edges_for_reasoning` ({EDGE_VISIBILITY:e}), and the

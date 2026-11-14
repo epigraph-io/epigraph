@@ -541,7 +541,9 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("conventions.rs", 2),
     ("hypothesis.rs", 2),
     ("policies.rs", 4),
-    ("rag.rs", 2),
+    // 2 -> 0, key removed (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding`
+    // and `PUT /api/v1/evidence/:id/embedding` (`generate_claim_embedding`,
+    // `generate_evidence_embedding`) were deleted.
     ("reasoning.rs", 2),
     ("revoke_signature.rs", 1),
     // The `sqlx::query!` macro write is not counted — see the note above.

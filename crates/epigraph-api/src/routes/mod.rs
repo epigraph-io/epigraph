@@ -507,14 +507,6 @@ pub fn create_router_with_extensions(
             "/api/v1/claims/:id/provenance",
             post(provenance::set_provenance),
         )
-        .route(
-            "/api/v1/claims/:id/embedding",
-            put(rag::generate_claim_embedding),
-        )
-        .route(
-            "/api/v1/evidence/:id/embedding",
-            put(rag::generate_evidence_embedding),
-        )
         .route("/api/v1/staging/ingest/json", post(staging::ingest_json))
         .route("/api/v1/staging/ingest/git", post(staging::ingest_git))
         .route("/api/v1/staging/merge", post(staging::merge_staging))
@@ -1459,14 +1451,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/analyze/unconstrained",
             post(analyze::unconstrained_analysis),
-        )
-        .route(
-            "/api/v1/claims/:id/embedding",
-            put(rag::generate_claim_embedding),
-        )
-        .route(
-            "/api/v1/evidence/:id/embedding",
-            put(rag::generate_evidence_embedding),
         )
         .route("/api/v1/staging/ingest/json", post(staging::ingest_json))
         .route("/api/v1/staging/ingest/git", post(staging::ingest_git))
