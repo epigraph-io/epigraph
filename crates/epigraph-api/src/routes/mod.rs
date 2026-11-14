@@ -337,6 +337,19 @@ async fn viewer_scoped_cache_headers(
     res
 }
 
+/// The body limit on the two anonymous routers (`public` and `oauth`): 64 KiB.
+///
+/// The global limit (`ApiConfig::max_request_size`, 10 MiB by default) exists
+/// for authenticated evidence uploads that carry base64 figures. Nothing an
+/// anonymous caller sends needs that: an OAuth token, registration,
+/// revocation or introspection request, a consent form, and a passkey
+/// ceremony's attestation or assertion (a few KiB, a certificate chain
+/// included) all fit in 64 KiB with room to spare. Without this, every
+/// anonymous endpoint, the brute-force targets included, read up to 10 MiB
+/// per request before authenticating anyone. Over the limit the extractor
+/// answers 413.
+pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
+
 /// Create the main application router with all routes.
 ///
 /// # Route structure — authenticated by default
@@ -1300,7 +1313,11 @@ pub fn create_router_with_extensions(
     //
     // The rate limiter sits inside it: a caller that presents a token is
     // charged to its principal, an anonymous one to its address.
+    //
+    // The anonymous body limit (`ANONYMOUS_BODY_LIMIT`) is innermost, so it
+    // overrides the global limit the merged router sets below.
     let public = public
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
@@ -1338,6 +1355,9 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
+        // global limit the merged router sets below.
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
         // Anonymous by construction, so charged to the client address
         // (`/oauth/token` and `/oauth/register` are the brute-force targets).
         .layer(middleware::from_fn_with_state(
@@ -1828,7 +1848,11 @@ pub fn create_router_with_extensions(
     //
     // The rate limiter sits inside it: a caller that presents a token is
     // charged to its principal, an anonymous one to its address.
+    //
+    // The anonymous body limit (`ANONYMOUS_BODY_LIMIT`) is innermost, so it
+    // overrides the global limit the merged router sets below.
     let public = public
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
@@ -1861,6 +1885,9 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
+        // global limit the merged router sets below.
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
         // Anonymous by construction, so charged to the client address
         // (`/oauth/token` and `/oauth/register` are the brute-force targets).
         .layer(middleware::from_fn_with_state(

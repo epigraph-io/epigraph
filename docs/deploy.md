@@ -411,7 +411,11 @@ For the others, anything else is off.
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `EPIGRAPH_REDIRECT_URI` | — | Read only because `providers.toml.example`'s Google provider names them (`client_id_env`, `client_secret_env`, `audience_env`, `redirect_uri_env`). Missing while the provider is configured → startup refusal (`env var ... not set`). |
 | `EPIGRAPH_PUBLIC_BASE_URL` | `http://localhost:8080` | The public origin, with no trailing slash. |
 | `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
-| `EPIGRAPH_PORT` | `8080` | The application port. The bind address is `0.0.0.0`. |
+| `EPIGRAPH_PORT` | `8080` | The application port. |
+| `EPIGRAPH_BIND_ADDR` | `0.0.0.0` | The IP address the application listener binds (for example `127.0.0.1` behind a reverse proxy on the same host, or `::`). An IP address only; the port is `EPIGRAPH_PORT`. Not an IP address → exit 1. |
+| `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
+| `EPIGRAPH_SHUTDOWN_GRACE_SECS` | `30` | After SIGTERM or SIGINT the server stops accepting connections and lets in-flight requests finish for at most this long, then exits 0. Keep it below the unit's `TimeoutStopSec` (systemd's default is 90 s). Not a whole number → exit 1. |
+| `EPIGRAPH_MAX_REQUEST_BYTES` | `10485760` (10 MiB) | The request-body limit on authenticated routes; over it the request is answered 413. The anonymous routes (`/oauth/*`, `/.well-known/*`, `/health`, `/api/v1/openapi.json`, `/elevate/*`) are held to 64 KiB whatever this says. Not a positive whole number → exit 1. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
 | `EPIGRAPH_RATE_LIMIT` | `on` | `off` installs no rate limiter (logged as a warning at boot). Any other value stays on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | `600` | Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
@@ -4459,6 +4463,7 @@ Do not improvise it against a live database without that entry's context.
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
+| `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
 | `refusing to serve: RLS posture assertion failed` | The API connects as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |
 | `operator binding NOT ENFORCED for the writer on this privileged DSN: ...`, then `ERROR: refusing to start: ...` | A request unit on a privileged DSN against an armed database. Point it at the `epigraph_app` login. |

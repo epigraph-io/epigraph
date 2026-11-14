@@ -176,6 +176,30 @@ async fn main() {
         );
     }
     let rate_limiter = rate_limit.build();
+
+    // Serving settings (backlog ebd7952c), read once and here for the same
+    // reason as the rate limit: a malformed bind address or limit refuses to
+    // start before any connection, and the log says what is in force.
+    let serve = match epigraph_api::serving::ServeSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: serving is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        bind_ip = %serve.bind_ip,
+        request_timeout_secs = ?serve.request_timeout.map(|t| t.as_secs()),
+        shutdown_grace_secs = serve.shutdown_grace.as_secs(),
+        max_request_bytes = serve.max_request_bytes,
+        "serving settings"
+    );
+    if serve.request_timeout.is_none() {
+        tracing::warn!(
+            "EPIGRAPH_REQUEST_TIMEOUT_SECS=0: the request timeout is OFF; a stuck handler \
+             holds its connection indefinitely"
+        );
+    }
     if rate_limiter.is_some() {
         tracing::info!(
             per_key_rpm = rate_limit.per_key_rpm,
@@ -300,7 +324,9 @@ async fn main() {
         std::env::var("EPIGRAPH_ALLOW_ALL_IDENTITIES").as_deref() == Ok("true");
     let config = ApiConfig {
         require_packet_signatures,
-        max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
+        // EPIGRAPH_MAX_REQUEST_BYTES; 10 MiB by default (figure evidence
+        // carries base64 images).
+        max_request_size: serve.max_request_bytes,
         public_base_url,
         allow_all_identities,
     };
@@ -726,7 +752,12 @@ async fn main() {
         );
     }
 
-    let app = create_router(state).layer(axum::Extension(metrics.clone()));
+    // The request-id, trace and timeout layers wrap the whole router
+    // (`epigraph_api::serving::apply_layers`).
+    let app = epigraph_api::serving::apply_layers(
+        create_router(state).layer(axum::Extension(metrics.clone())),
+        &serve,
+    );
 
     // ---------------------------------------------------------------------
     // Internal metrics listener (PR-03, §10.3 Q1 option (a)).
@@ -774,12 +805,13 @@ async fn main() {
         }
     }
 
-    // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs.
+    // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs;
+    // EPIGRAPH_BIND_ADDR picks the interface (default 0.0.0.0, as before).
     let port: u16 = std::env::var("EPIGRAPH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = std::net::SocketAddr::new(serve.bind_ip, port);
 
     // Check for TLS configuration via environment variables.
     // EPIGRAPH_TLS_CERT and EPIGRAPH_TLS_KEY must both be set to enable TLS.
@@ -806,12 +838,26 @@ async fn main() {
             .await
             .expect("Failed to load TLS certificate/key");
 
+        // SIGTERM or SIGINT stops accepting and drains in-flight requests
+        // for at most the shutdown grace, as on the plain listener below.
+        let handle = axum_server::Handle::new();
+        {
+            let handle = handle.clone();
+            let grace = serve.shutdown_grace;
+            tokio::spawn(async move {
+                epigraph_api::serving::shutdown_signal().await;
+                handle.graceful_shutdown(Some(grace));
+            });
+        }
+
         // With connect info: the rate limiter keys an anonymous request on
         // its TCP peer, and without it every such request shares one bucket.
         axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("TLS server error");
+        tracing::info!("server stopped");
         return;
     }
 
@@ -834,14 +880,13 @@ async fn main() {
     let bound = listener.local_addr().unwrap_or(addr);
     tracing::info!("Server listening on {}", bound);
 
-    // With connect info: the rate limiter keys an anonymous request on its
-    // TCP peer, and without it every such request shares one bucket.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .expect("Server error");
+    // Serves with connect info (the rate limiter keys an anonymous request on
+    // its TCP peer) until SIGTERM or SIGINT, then drains in-flight requests
+    // for at most EPIGRAPH_SHUTDOWN_GRACE_SECS and returns, so `main` exits 0
+    // instead of dying mid-response on the signal.
+    epigraph_api::serving::serve_until_signal(listener, app, serve.shutdown_grace)
+        .await
+        .expect("Server error");
 }
 
 /// `EPIGRAPH_BP_APPLY`, read once at boot: whether `POST /api/v1/bp/propagate`

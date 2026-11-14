@@ -73,7 +73,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }  #
 rustls = { version = "0.23.46", optional = true }  # `tls`: ServerConfig on an explicit provider (src/tls.rs); floor = RUSTSEC-2026-0346..0349 fix
 tokio = { workspace = true }  # Async runtime
 tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstraction
-tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
+tower-http = { version = "0.5", features = ["trace", "cors", "timeout", "request-id"] }  # HTTP middleware
 serde = { workspace = true }  # Serialization
 serde_json = { workspace = true }  # JSON support
 serde_urlencoded = "0.7"  # OAuth token endpoint body (application/x-www-form-urlencoded, RFC 6749)
