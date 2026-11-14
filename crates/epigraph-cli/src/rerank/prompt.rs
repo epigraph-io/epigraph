@@ -221,6 +221,29 @@ mod tests {
         }
     }
 
+    /// ba25c292: the adjudication protocol pins the exact verifier prompt it
+    /// evaluates. If the live prompt drifts, the protocol no longer describes
+    /// the verifier being measured, and a precision figure would be
+    /// attributed to a prompt nobody pre-registered. A failure here means
+    /// "write `prompts_v2.md`", not "edit v1 to match".
+    #[test]
+    fn adjudication_protocol_pins_the_live_prompt() {
+        const PROTOCOL: &str = include_str!("../../../../tests/cross_source/prompts_v1.md");
+        let live = build_validation_prompt(&[]);
+        // With no pairs, `{pairs_text}` renders empty. Split the live prompt
+        // at that slot and require both halves verbatim in the protocol's
+        // pinned block, around a literal `{pairs_text}` placeholder line.
+        let marker = "## Candidate Pairs\n\n";
+        let cut = live.find(marker).expect("live prompt has a pairs section") + marker.len();
+        let (head, tail) = live.split_at(cut);
+        let pinned = format!("{head}{{pairs_text}}{tail}");
+        assert!(
+            PROTOCOL.contains(&pinned),
+            "tests/cross_source/prompts_v1.md no longer pins the live verifier \
+             prompt; the prompt changed, so write a new protocol version"
+        );
+    }
+
     #[test]
     fn test_build_prompt_contains_pairs() {
         let pairs = vec![
