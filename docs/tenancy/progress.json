@@ -2371,10 +2371,10 @@
       "where": "crates/epigraph-db/src/repos/privatization.rs and crates/epigraph-api/src/routes/privatization.rs",
       "what": "Response-assembly question raised and answered during PR-18's second slice; analysis held outside this repository.",
       "detail": "Registered as an id, a location and an owner only, deliberately. NO LONGER LATENT: PR-18's third slice ships crates/epigraph-api/src/routes/privatization.rs, which is the trigger its assignment names. The analysis remains held outside this repository and is deliberately not restated here or anywhere else in this diff. THE LAND PHASE COULD NOT DISCHARGE IT: the analysis is not reachable from this tree, so no one working from the diff can close it, and it needs the operator out of band. Landing PR-18 and closing this finding are different things; this is the second.",
-      "status": "open",
+      "status": "DECIDED by the operator out of band (2026-09-22); the decided discharge SHIPPED 2026-11-14 in fix/backlog-b50 (backlog 8ea110d4) as two tests: crates/epigraph-api/tests/privatization_routes.rs::every_plan_response_field_names_only_what_the_reader_can_read (route level, every serialized field of the preview, the item pages, GET /plans/:id and GET /plans, for the plan's author and for a co-admin) and crates/epigraph-db/tests/privatization_plan_policies.rs::every_rendering_primitive_names_only_what_the_reader_can_read_under_the_policy (the rendering primitives, on a fully stamped epigraph_app connection). Kept OPEN for one follow-up question the operator recorded with the decision, held out of band like the analysis.",
       "assigned": "the operator, out of band -- the review that its previous assignment named could not reach the analysis, and re-assigning it from inside the diff would be a guess",
       "disposition": "OPERATOR-DECISION",
-      "disposition_note": "Assigned to the operator out of band and re-confirmed there. Re-assigning it from inside a diff would be a guess, which is why it was moved out of band in the first place.",
+      "disposition_note": "Assigned to the operator out of band and re-confirmed there; decided there on 2026-09-22. The decided test shipped 2026-11-14 (see status); the remaining follow-up is the operator's, out of band.",
       "disposition_date": "2026-09-12",
       "decision_group": "standalone"
     },

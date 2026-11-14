@@ -394,6 +394,165 @@ async fn the_boundary_edge_sample_filters_under_the_policy_as_well_as_the_predic
     );
 }
 
+/// The same property for every rendering primitive a plan response is built
+/// from, on a fully stamped `epigraph_app` connection where the policies AND
+/// the predicates are in play: an entity the reader cannot read is COUNTED by
+/// the unfiltered side and named by none of the rendered ones.
+///
+/// The primitives, and the response field each one feeds in
+/// `routes/privatization.rs`:
+///
+/// * `UnfilteredSelection::item_count` / `visible_count` — `counts.total` and
+///   `counts.not_visible_to_actor`;
+/// * `UnfilteredSelection::render_previews` — the preview's `sample`;
+/// * `load_plan_items_conn` + `visible_previews` — the item page's `items`.
+///
+/// The response ASSEMBLY (every field of every body, including `next_cursor`)
+/// is asserted at the route level by
+/// `epigraph-api/tests/privatization_routes.rs::every_plan_response_field_names_only_what_the_reader_can_read`;
+/// this arm pins the primitives under the policy, which that suite does not
+/// isolate. Each absence is calibrated by the readable claim's presence on the
+/// same connection.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_rendering_primitive_names_only_what_the_reader_can_read_under_the_policy(
+    pool: PgPool,
+) {
+    let world = World::seed(&pool).await;
+    let (outsider, elsewhere) = fixture::seed_agent_with_group(&pool, "pp-elsewhere").await;
+    let unreadable = fixture::seed_group_claim(&pool, outsider, elsewhere, "not for you").await;
+    let readable = world.seed_claim;
+
+    // Select and freeze on maintenance under a bypass viewer, as the route does.
+    let (scoped, bypass) = fixture::bypass(&pool).await;
+    let _ = &scoped;
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let mut mconn = maint.acquire().await.expect("acquire maintenance connection");
+    let seeds = vec![readable, unreadable];
+    let edge_types = vec!["derived_from".to_string()];
+    let selection = PrivatizationRepository::select(
+        &mut mconn,
+        &bypass,
+        ClosureRequest {
+            seeds: &seeds,
+            edge_types: &edge_types,
+            direction: ClosureDirection::Both,
+            max_depth: 3,
+            node_cap: 1000,
+        },
+        NO_TIMEOUT_CONCERN,
+    )
+    .await
+    .expect("select");
+    let total = selection.item_count();
+    assert_eq!(
+        total, 3,
+        "the selection is UNFILTERED: both seeds and the readable seed's successor are in it"
+    );
+    let digest = selection.digest();
+    let selector = serde_json::json!({ "seeds": { "ids": { "claims": seeds } } });
+    let (plan_id, _) = PrivatizationRepository::create_previewed_plan(
+        &mut mconn,
+        NewPlan {
+            mode: "restrict",
+            target_group_id: world.target_group,
+            selector: &selector,
+            on_conflict: "abort",
+            pad_to: 256,
+            created_by: world.actor,
+            plan_digest: &digest,
+            item_count: i32::try_from(total).expect("small"),
+            authors_losing_count: 1,
+        },
+    )
+    .await
+    .expect("create_previewed_plan");
+    selection
+        .freeze_into(&mut mconn, plan_id)
+        .await
+        .expect("freeze_into");
+    drop(mconn);
+
+    let viewer = Viewer::resolve(&pool, world.actor)
+        .await
+        .expect("resolve the actor");
+    let mut conn = fully_stamped_app_conn(&pool, world.actor).await;
+
+    // counts: the unfiltered total includes the unreadable claim; the visible
+    // count does not.
+    let visible = selection
+        .visible_count(&mut conn, &viewer)
+        .await
+        .expect("visible_count");
+    assert_eq!(
+        i64::try_from(total).expect("small") - visible,
+        1,
+        "exactly the unreadable claim is counted as not visible (visible = {visible})"
+    );
+
+    // sample
+    let sample: Vec<Uuid> = selection
+        .render_previews(&mut conn, &viewer, 10)
+        .await
+        .expect("render_previews")
+        .into_iter()
+        .map(|p| p.claim_id)
+        .collect();
+    assert!(
+        sample.contains(&readable),
+        "CALIBRATION: the sample must name the readable claim: {sample:?}"
+    );
+    assert!(
+        !sample.contains(&unreadable),
+        "the sample must not name the unreadable claim: {sample:?}"
+    );
+
+    // items, one row at a time over the whole frozen set: the policy admits
+    // every row of this plan to its target group's admin, and the rendering
+    // pass is what narrows the names.
+    let mut rows_seen = Vec::new();
+    let mut named = Vec::new();
+    for offset in 0..8 {
+        let page = PrivatizationRepository::load_plan_items_conn(&mut conn, plan_id, offset, 1)
+            .await
+            .expect("load_plan_items_conn under the policy");
+        if page.is_empty() {
+            break;
+        }
+        let ids: Vec<Uuid> = page.iter().map(|r| r.entity_id).collect();
+        rows_seen.extend(ids.iter().copied());
+        named.extend(
+            PrivatizationRepository::visible_previews(&mut conn, &viewer, &ids)
+                .await
+                .expect("visible_previews")
+                .into_iter()
+                .map(|p| p.claim_id),
+        );
+    }
+    assert_eq!(
+        rows_seen.len(),
+        total,
+        "CALIBRATION: the policy must admit every frozen row to the target group's admin, or the \
+         absence below is about rows never read: {rows_seen:?}"
+    );
+    assert!(
+        rows_seen.contains(&unreadable),
+        "CALIBRATION: the unreadable claim is in the frozen set the page walk read"
+    );
+    assert!(
+        named.contains(&readable),
+        "CALIBRATION: the walk must name the readable claim: {named:?}"
+    );
+    assert!(
+        !named.contains(&unreadable),
+        "no page may name the unreadable claim: {named:?}"
+    );
+    assert_eq!(
+        named.len(),
+        total - 1,
+        "every readable row is named and nothing else"
+    );
+}
+
 // ===========================================================================
 // FINAL-PLAN §3.1's two request ceilings.
 // ===========================================================================
