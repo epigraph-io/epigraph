@@ -156,9 +156,10 @@ impl ServeSettings {
 /// id, the id is copied onto the response, and the handler runs under the
 /// timeout. So a 408 from the timeout is traced and carries the id too.
 ///
-/// The span records the method, the PATH and the request id, and nothing
-/// else. Not the query string (`/oauth/authorize` and `/oauth/callback` carry
-/// authorization codes and state there) and no headers (bearer tokens).
+/// The span records the method, the path (through [`loggable_path`]) and the
+/// request id, and nothing else. Not the query string (`/oauth/authorize` and
+/// `/oauth/callback` carry authorization codes and state there), no headers
+/// (bearer tokens), and not the passkey ceremonies' path credentials.
 pub fn apply_layers(router: Router, settings: &ServeSettings) -> Router {
     let router = match settings.request_timeout {
         Some(timeout) => router.layer(TimeoutLayer::new(timeout)),
@@ -182,9 +183,47 @@ fn request_span<B>(request: &Request<B>) -> tracing::Span {
     tracing::info_span!(
         "request",
         method = %request.method(),
-        path = %request.uri().path(),
+        path = %loggable_path(request.uri().path()),
         request_id = %request_id,
     )
+}
+
+/// The path as the request span records it: as received, except that the
+/// passkey ceremonies' path segments are replaced by their route parameter.
+///
+/// `/elevate/enroll/:id`, `/elevate/:ticket` and `/elevate/act/:id` carry the
+/// ceremony's own credential in the path (an enrollment id, a ticket id, an
+/// act id: random, short-lived, single-use; `routes/mod.rs` documents them as
+/// the ceremony's credentials together with the authenticator). The span is
+/// attached to every event a request emits, so recording them would copy a
+/// live credential into each of those log lines. The static assets under
+/// `/elevate/assets/` are kept as they are.
+pub fn loggable_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let Some(rest) = path.strip_prefix("/elevate/") else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    let mut segments = rest.split('/');
+    let (head, credential) = match segments.next() {
+        Some("assets") => return std::borrow::Cow::Borrowed(path),
+        Some(kind @ ("enroll" | "act")) => (Some(kind), segments.next()),
+        first => (None, first),
+    };
+    if matches!(credential, None | Some("")) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::from("/elevate/");
+    match head {
+        Some(kind) => {
+            out.push_str(kind);
+            out.push_str("/:id");
+        }
+        None => out.push_str(":ticket"),
+    }
+    for tail in segments {
+        out.push('/');
+        out.push_str(tail);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Resolves when the process receives SIGTERM (systemd's stop) or SIGINT
@@ -273,6 +312,32 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::get;
     use tower::ServiceExt;
+
+    #[test]
+    fn the_ceremony_credentials_never_reach_the_span() {
+        for (raw, logged) in [
+            (
+                "/elevate/enroll/4f1c2a/finish",
+                "/elevate/enroll/:id/finish",
+            ),
+            ("/elevate/enroll/4f1c2a", "/elevate/enroll/:id"),
+            ("/elevate/act/9b7e/assert", "/elevate/act/:id/assert"),
+            ("/elevate/act/9b7e", "/elevate/act/:id"),
+            ("/elevate/t1ck3t/challenge", "/elevate/:ticket/challenge"),
+            ("/elevate/t1ck3t", "/elevate/:ticket"),
+        ] {
+            assert_eq!(loggable_path(raw), logged, "{raw}");
+        }
+        for kept in [
+            "/elevate/assets/elevate.js",
+            "/elevate/",
+            "/oauth/token",
+            "/api/v1/claims/0b6f",
+            "/health",
+        ] {
+            assert_eq!(loggable_path(kept), kept);
+        }
+    }
 
     #[test]
     fn unset_and_blank_are_the_pre_existing_behaviour() {
