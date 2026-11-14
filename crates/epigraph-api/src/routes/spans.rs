@@ -129,6 +129,8 @@ fn random_span_id() -> String {
 /// `POST /api/v1/spans`
 #[cfg(feature = "db")]
 pub async fn create_span(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(req): Json<CreateSpanRequest>,
 ) -> Result<(StatusCode, Json<CreateSpanResponse>), ApiError> {
@@ -187,6 +189,8 @@ pub async fn create_span(
 /// `PUT /api/v1/spans/:id/close`
 #[cfg(feature = "db")]
 pub async fn close_span(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(req): Json<CloseSpanRequest>,

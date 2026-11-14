@@ -173,6 +173,7 @@ async fn post_packet(
     content: &str,
 ) -> (StatusCode, String) {
     let resp = submit_packet(
+        write_scope(),
         ViewerExtractor(viewer),
         State(state.clone()),
         Ok(Json(packet(author, content))),
@@ -396,6 +397,7 @@ async fn create_hypothesis_binds_the_authenticated_caller(pool: PgPool) {
                 }))
                 .expect("request");
             let resp = epigraph_api::routes::hypothesis::create_hypothesis(
+                write_scope(),
                 ViewerExtractor(viewer),
                 State(state),
                 Json(req),
@@ -488,6 +490,7 @@ async fn create_hypothesis_persists_voi_without_the_orphan_policy(pool: PgPool) 
         serde_json::from_value(serde_json::json!({ "statement": statement, "agent_id": a }))
             .expect("request");
     let resp = epigraph_api::routes::hypothesis::create_hypothesis(
+        write_scope(),
         ViewerExtractor(viewer),
         State(state),
         Json(req),
@@ -820,4 +823,26 @@ async fn batch_dedup_hit_on_another_humans_claim_writes_no_edges_or_provenance(p
         1,
         "control: A's new claim gets one 'create' provenance row"
     );
+}
+
+/// The `claims:write` scope the write handlers now take as their first
+/// extractor (backlog f00d75ab). A direct handler call stands in for the
+/// bearer middleware, so it supplies the scope the route checks.
+fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
+    let principal = uuid::Uuid::new_v4();
+    epigraph_api::middleware::bearer::RequireScopeWrite(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: epigraph_api::middleware::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    )
 }

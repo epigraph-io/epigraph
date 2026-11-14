@@ -401,6 +401,8 @@ pub async fn silence_check(
 /// POST /api/v1/conflicts/:a/:b/counterfactuals - Store counterfactual scenarios.
 #[cfg(feature = "db")]
 pub async fn store_counterfactuals(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Path((claim_a_id, claim_b_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<GenerateCounterfactualsRequest>,

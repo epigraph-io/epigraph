@@ -519,6 +519,7 @@ async fn bp_seeds_the_members_own_private_claim(pool: PgPool) {
     .expect("request");
     let Json(body) = propagate_beliefs(
         ViewerExtractor(viewer_for(&pool, p.member).await),
+        bearer(p.member, &["claims:read"]),
         State(state),
         Json(request),
     )
@@ -546,4 +547,25 @@ async fn bp_seeds_the_members_own_private_claim(pool: PgPool) {
          same shape, so it must get the same BP value ({private_value} vs \
          {public_value}); a gap means its BBA was not seeded"
     );
+}
+
+/// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
+/// f00d75ab: `apply_updates: true` needs `claims:write`).
+fn bearer(
+    agent: Uuid,
+    scopes: &[&str],
+) -> axum::Extension<epigraph_api::middleware::bearer::AuthContext> {
+    axum::Extension(epigraph_api::middleware::bearer::AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Service,
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    })
 }

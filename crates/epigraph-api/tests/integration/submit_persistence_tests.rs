@@ -276,7 +276,7 @@ fn test_bearer_token() -> String {
     let (token, _) = jwt_config
         .issue_access_token(
             principal,
-            vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
+            vec!["claims:write".to_string(), "claims:read".to_string()],
             "service",
             Some(principal),
             Some(principal),

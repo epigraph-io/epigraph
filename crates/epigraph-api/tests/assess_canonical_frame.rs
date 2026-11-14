@@ -83,6 +83,7 @@ async fn try_assess(
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
     let state = AppState::with_db(pool.clone(), ApiConfig::default());
     let Json(resp) = assess_claim(
+        write_scope(),
         ViewerExtractor(viewer),
         State(state),
         Path(claim),
@@ -595,6 +596,7 @@ async fn another_route_cannot_write_into_an_assessment_slot(pool: PgPool) {
     let viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
     let state = AppState::with_db(pool.clone(), ApiConfig::default());
     let err = submit_evidence(
+        write_scope(),
         ViewerExtractor(viewer),
         State(state.clone()),
         Path(first.frame_id),
@@ -619,6 +621,7 @@ async fn another_route_cannot_write_into_an_assessment_slot(pool: PgPool) {
         ApiConfig::default(),
     );
     let _ = submit_evidence(
+        write_scope(),
         ViewerExtractor(viewer),
         State(scoped_state),
         Path(first.frame_id),
@@ -1176,4 +1179,26 @@ async fn an_assessment_moves_ownership_off_a_frame_holding_only_the_ingest_templ
         full_cache(&pool, twin).await,
         "the cache must be the real frame's fold, exactly as on a twin with no template"
     );
+}
+
+/// The `claims:write` scope the write handlers now take as their first
+/// extractor (backlog f00d75ab). A direct handler call stands in for the
+/// bearer middleware, so it supplies the scope the route checks.
+fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
+    let principal = uuid::Uuid::new_v4();
+    epigraph_api::middleware::bearer::RequireScopeWrite(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: epigraph_api::middleware::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    )
 }

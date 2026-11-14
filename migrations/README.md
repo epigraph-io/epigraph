@@ -2645,6 +2645,33 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **212**: public `sealed_row_vector_guard` (backlog f78526ad; closes the
+  tenancy register's `D-SEAL-vector-column-row-guard`). Two `BEFORE UPDATE OF
+  embedding, embedding_3072` triggers, `claims_refuse_sealed_vector` and
+  `evidence_refuse_sealed_vector`, `WHEN (NEW.embedding IS NOT NULL OR
+  NEW.embedding_3072 IS NOT NULL)`, refuse (42501) a vector on a row that has
+  its OWN encryption row (`claim_encryption.claim_id`,
+  `evidence_encryption.evidence_id`; never keyed on `visibility` or on an
+  evidence row's parent claim). The seal's nulling, every UPDATE that names
+  neither vector column and every INSERT are admitted, so a legacy sealed row
+  that still carries a vector is refused only when a writer touches its
+  vectors. The two functions are SECURITY DEFINER on 172's form, owned by
+  `epigraph_maintenance` (guarded), EXECUTE revoked from PUBLIC: an INVOKER
+  body would see the FORCEd encryption rows only for a session in the sealing
+  group and fail open. Pinned by `epigraph-db/tests/sealed_row_vector_guard.rs`.
+  Undo: `docs/runbooks/212-undo.sql` (drops both triggers and functions; no
+  binary depends on 212). **Deploy order:** none; it can be applied before or
+  after the binary. Before applying, run CLAUDE.md's `sealed_with_embedding`
+  audit on both tables: a non-zero count is an existing violation that 212
+  does not repair (it only stops new ones). To repair one, null BOTH vector
+  columns in ONE statement (`SET embedding = NULL, embedding_3072 = NULL`, the
+  seal's own form): a statement that nulls one column and leaves the other
+  non-NULL still satisfies the WHEN clause and is refused, which includes
+  `epigraph-embeddings`' `EmbeddingRepository::delete` (it nulls `embedding`
+  only). 212 sets `lock_timeout = '3s'` (as 197 does): if it times out behind a
+  long write transaction on `claims` or `evidence`, nothing was applied, and it
+  can be re-run when those tables are quiet. **Applied to throwaway databases
+  only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

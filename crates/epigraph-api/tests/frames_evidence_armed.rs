@@ -243,6 +243,7 @@ async fn submit_body(w: &World, frame: Uuid, caller: Uuid, body: Value) -> Resul
     let request: SubmitEvidenceRequest = serde_json::from_value(body).expect("request");
     let viewer = Viewer::resolve(&w.pool, caller).await.expect("viewer");
     submit_evidence(
+        write_scope(),
         ViewerExtractor(viewer),
         State(w.state.clone()),
         Path(frame),
@@ -739,4 +740,26 @@ async fn the_callers_own_private_perspective_calibrates_its_evidence(pool: PgPoo
         "the perspective's 0.5 calibration must discount m({{0}}) 0.8 to 0.4, got {belief}: \
          {resp}"
     );
+}
+
+/// The `claims:write` scope the write handlers now take as their first
+/// extractor (backlog f00d75ab). A direct handler call stands in for the
+/// bearer middleware, so it supplies the scope the route checks.
+fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
+    let principal = uuid::Uuid::new_v4();
+    epigraph_api::middleware::bearer::RequireScopeWrite(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: epigraph_api::middleware::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    )
 }
