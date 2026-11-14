@@ -347,11 +347,12 @@ pub struct AppState {
     /// §5 tells operators their dashboards for those two event types will read
     /// empty.
     ///
-    /// Not deleted here because removing it means touching `AppState`'s two
-    /// non-db constructors, and the `not(feature = "db")` configuration does
-    /// not compile today (28 pre-existing errors), so the change could not be
-    /// verified. It is dead weight, not a hazard: nothing reads it on a request
-    /// path.
+    /// Not deleted in PR-03 because removing it means touching `AppState`'s
+    /// two non-db constructors, and the `not(feature = "db")` configuration
+    /// did not compile then, so the change could not be verified. That reason
+    /// has lapsed: CI now runs
+    /// `cargo check -p epigraph-api --no-default-features --locked`. The field
+    /// is still dead weight, not a hazard: nothing reads it on a request path.
     pub signature_state: SignatureVerificationState,
     /// Thread-safe propagation orchestrator for truth propagation
     ///
