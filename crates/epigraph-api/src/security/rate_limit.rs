@@ -252,6 +252,46 @@ impl TokenBucket {
     }
 }
 
+/// How many per-key buckets a limiter tracks before it prunes ([`BucketMap`]).
+pub const DEFAULT_MAX_TRACKED_KEYS: usize = 100_000;
+
+/// The least time between two prune passes over a full map: a pass is
+/// O(tracked keys), and a flood of new keys at the cap would otherwise pay it
+/// on every request.
+const PRUNE_INTERVAL_MS: i64 = 1_000;
+
+/// The per-key buckets, bounded.
+///
+/// A key is any client the middleware can tell apart, so an anonymous client
+/// that rotates its address mints keys at will. At `max` keys the map first
+/// drops every bucket that has refilled to capacity (lossless: a full bucket
+/// behaves exactly like a fresh one). If that frees nothing, a NEW key is
+/// charged to one shared overflow bucket until a later prune frees a slot;
+/// tracked keys, including throttled ones, keep their own buckets and debts.
+#[derive(Debug, Default)]
+struct BucketMap {
+    map: HashMap<AgentId, TokenBucket>,
+    overflow: Option<TokenBucket>,
+    last_prune: Option<DateTime<Utc>>,
+}
+
+impl BucketMap {
+    /// Drop refilled buckets, at most once per [`PRUNE_INTERVAL_MS`].
+    fn prune(&mut self) {
+        let now = Utc::now();
+        if let Some(last) = self.last_prune {
+            if now.signed_duration_since(last).num_milliseconds() < PRUNE_INTERVAL_MS {
+                return;
+            }
+        }
+        self.last_prune = Some(now);
+        self.map.retain(|_, bucket| {
+            bucket.refill();
+            bucket.tokens < bucket.max_tokens
+        });
+    }
+}
+
 /// Per-agent rate limiter with global limits
 ///
 /// # Thread Safety
@@ -262,8 +302,10 @@ impl TokenBucket {
 pub struct AgentRateLimiter {
     /// Configuration
     config: RateLimitConfig,
-    /// Per-agent token buckets
-    agent_buckets: Arc<RwLock<HashMap<AgentId, TokenBucket>>>,
+    /// Per-agent token buckets, bounded by `max_tracked_keys`
+    agent_buckets: Arc<RwLock<BucketMap>>,
+    /// The most per-key buckets tracked at once ([`BucketMap`])
+    max_tracked_keys: usize,
     /// Global token bucket
     global_bucket: Arc<RwLock<TokenBucket>>,
     /// Custom limits per agent (requests per minute)
@@ -284,11 +326,30 @@ impl AgentRateLimiter {
 
         Self {
             config,
-            agent_buckets: Arc::new(RwLock::new(HashMap::new())),
+            agent_buckets: Arc::new(RwLock::new(BucketMap::default())),
+            max_tracked_keys: DEFAULT_MAX_TRACKED_KEYS,
             global_bucket: Arc::new(RwLock::new(global_bucket)),
             agent_limits: Arc::new(RwLock::new(HashMap::new())),
             trusted_proxies: TrustedProxies::none(),
         }
+    }
+
+    /// Cap the number of per-key buckets tracked at once (builder pattern;
+    /// at least 1). See [`BucketMap`] for what happens at the cap.
+    #[must_use]
+    pub fn with_max_tracked_keys(mut self, max: usize) -> Self {
+        self.max_tracked_keys = max.max(1);
+        self
+    }
+
+    /// How many per-key buckets are tracked now (never above the cap).
+    #[must_use]
+    pub fn tracked_keys(&self) -> usize {
+        self.agent_buckets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map
+            .len()
     }
 
     /// Set the proxies whose `X-Forwarded-For` is believed (builder pattern).
@@ -347,24 +408,41 @@ impl AgentRateLimiter {
 
     /// Check per-agent rate limit
     fn check_agent(&self, agent_id: &AgentId) -> Result<(), RateLimitError> {
-        let mut buckets = self
+        // Read the limit BEFORE taking the bucket lock: `set_agent_limit`
+        // takes the limits lock and then the bucket lock, so holding the
+        // bucket lock while reading limits could deadlock against it.
+        let limit = self.get_agent_limit(agent_id);
+        let mut guard = self
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let limit = self.get_agent_limit(agent_id);
+        let buckets = &mut *guard;
 
-        let bucket = buckets
-            .entry(*agent_id)
-            .or_insert_with(|| TokenBucket::new(limit, limit as f64 / 60.0));
+        if !buckets.map.contains_key(agent_id) && buckets.map.len() >= self.max_tracked_keys {
+            buckets.prune();
+        }
+        let bucket =
+            if buckets.map.contains_key(agent_id) || buckets.map.len() < self.max_tracked_keys {
+                buckets
+                    .map
+                    .entry(*agent_id)
+                    .or_insert_with(|| TokenBucket::new(limit, limit as f64 / 60.0))
+            } else {
+                let rpm = self.config.default_rpm;
+                buckets
+                    .overflow
+                    .get_or_insert_with(|| TokenBucket::new(rpm, rpm as f64 / 60.0))
+            };
+        let bucket_limit = bucket.max_tokens as u32;
 
         bucket.try_consume().map_err(|retry_after| {
             // Calculate approximate current rate (tokens used)
-            let used_tokens = (limit as f64 - bucket.tokens).max(0.0) as u32;
+            let used_tokens = (bucket.max_tokens - bucket.tokens).max(0.0) as u32;
             RateLimitError::AgentLimitExceeded {
                 agent_id: *agent_id,
                 retry_after_secs: retry_after,
-                current_rate: used_tokens.min(limit) + 1, // +1 for the current request
-                limit,
+                current_rate: used_tokens.min(bucket_limit) + 1, // +1 for the current request
+                limit: bucket_limit,
             }
         })
     }
@@ -399,7 +477,7 @@ impl AgentRateLimiter {
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(bucket) = buckets.get_mut(&agent_id) {
+        if let Some(bucket) = buckets.map.get_mut(&agent_id) {
             bucket.max_tokens = rpm as f64;
             bucket.refill_rate = rpm as f64 / 60.0;
         }
@@ -425,7 +503,7 @@ impl AgentRateLimiter {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if let Some(bucket) = buckets.get_mut(agent_id) {
+        if let Some(bucket) = buckets.map.get_mut(agent_id) {
             bucket.refill();
             bucket.tokens as u32
         } else {
@@ -440,7 +518,7 @@ impl AgentRateLimiter {
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        buckets.remove(agent_id);
+        buckets.map.remove(agent_id);
     }
 
     /// Reset global rate limit (for testing or admin use)
@@ -483,7 +561,10 @@ impl AgentRateLimiter {
                 .agent_buckets
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for bucket in buckets.values_mut() {
+            for bucket in buckets.map.values_mut() {
+                bucket.last_refill -= duration;
+            }
+            if let Some(bucket) = buckets.overflow.as_mut() {
                 bucket.last_refill -= duration;
             }
         }
@@ -495,14 +576,8 @@ impl std::fmt::Debug for AgentRateLimiter {
         f.debug_struct("AgentRateLimiter")
             .field("config", &self.config)
             .field("trusted_proxies", &self.trusted_proxies)
-            .field(
-                "agent_buckets_count",
-                &self
-                    .agent_buckets
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .len(),
-            )
+            .field("agent_buckets_count", &self.tracked_keys())
+            .field("max_tracked_keys", &self.max_tracked_keys)
             .finish()
     }
 }
@@ -559,6 +634,69 @@ mod tests {
         assert!(t.contains("::1".parse().unwrap()));
         assert!(!t.contains("203.0.113.1".parse().unwrap()));
         assert!(!t.contains("::2".parse().unwrap()));
+    }
+
+    fn key(n: u128) -> AgentId {
+        AgentId::from_uuid(uuid::Uuid::from_u128(n))
+    }
+
+    fn per_key(rpm: u32) -> AgentRateLimiter {
+        AgentRateLimiter::new(RateLimitConfig {
+            default_rpm: rpm,
+            global_rpm: 1_000_000,
+            replenish_interval_secs: 60,
+            enable_global_limit: false,
+        })
+    }
+
+    /// bd5c0f40: one bucket per distinct key, forever, is a memory leak an
+    /// anonymous client drives by rotating its address. Buckets that have
+    /// refilled are indistinguishable from fresh ones, so dropping them at
+    /// the cap loses nothing.
+    #[test]
+    fn the_bucket_map_is_capped_and_refilled_buckets_are_pruned() {
+        let limiter = per_key(2).with_max_tracked_keys(4);
+        for n in 0..4 {
+            limiter.check(&key(n)).unwrap();
+        }
+        assert_eq!(limiter.tracked_keys(), 4);
+        // Every bucket refills fully.
+        limiter.advance_time(chrono::Duration::minutes(2));
+        for n in 4..8 {
+            // Each newcomer gets a bucket of its OWN (2 requests, then 429):
+            // the refilled buckets made room, so nobody lands in the shared
+            // overflow bucket.
+            limiter.check(&key(n)).unwrap();
+            limiter.check(&key(n)).unwrap();
+            assert!(limiter.check(&key(n)).is_err());
+            assert!(limiter.tracked_keys() <= 4, "map grew past its cap");
+        }
+    }
+
+    /// When every tracked bucket is still draining, nothing can be dropped
+    /// without forgiving a client its debt. New keys then share ONE overflow
+    /// bucket, so the map stays bounded and a client already being throttled
+    /// stays throttled.
+    #[test]
+    fn at_the_cap_new_keys_share_an_overflow_bucket() {
+        let limiter = per_key(2).with_max_tracked_keys(2);
+        for n in 0..2 {
+            limiter.check(&key(n)).unwrap();
+            limiter.check(&key(n)).unwrap();
+            assert!(limiter.check(&key(n)).is_err());
+        }
+        // The overflow bucket holds default_rpm (2) between all newcomers.
+        limiter.check(&key(100)).unwrap();
+        limiter.check(&key(101)).unwrap();
+        assert!(
+            limiter.check(&key(102)).is_err(),
+            "the third newcomer at the cap is charged to the spent overflow bucket"
+        );
+        assert!(limiter.tracked_keys() <= 2, "map grew past its cap");
+        assert!(
+            limiter.check(&key(0)).is_err(),
+            "a tracked, throttled key keeps its debt"
+        );
     }
 
     #[test]
