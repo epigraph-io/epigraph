@@ -68,7 +68,9 @@ pub use errors::EmbeddingError;
 pub use service::{EmbeddingService, MultimodalEmbeddingService, MultimodalInput, TokenUsage};
 
 // Re-export provider implementations
-pub use providers::{JinaProvider, MockMultimodalProvider, MockProvider, OpenAiProvider};
+pub use providers::{
+    JinaProvider, MockMultimodalProvider, MockProvider, OpenAiProvider, RetryPolicy,
+};
 
 // Re-export utility types
 pub use cache::EmbeddingCache;

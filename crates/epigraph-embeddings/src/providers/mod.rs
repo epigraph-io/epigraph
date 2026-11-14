@@ -13,4 +13,4 @@ pub use jina::JinaProvider;
 pub use mock::MockMultimodalProvider;
 pub use mock::MockProvider;
 pub use mock::MockProviderWithFallback;
-pub use openai::OpenAiProvider;
+pub use openai::{OpenAiProvider, RetryPolicy};

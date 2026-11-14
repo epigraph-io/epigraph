@@ -77,6 +77,12 @@ impl Tokenizer {
 
     /// Truncate text to fit within the token limit
     ///
+    /// The result is a prefix of `text` whose [`count_tokens`](Self::count_tokens)
+    /// is at most `max_tokens`. The first cut is the "about 4 characters per
+    /// token" estimate, at a word boundary where there is one; on dense text
+    /// (CJK, code, long digit runs) that estimate lands over the limit, so the
+    /// prefix is then shrunk in proportion to the overshoot until it fits.
+    ///
     /// # Arguments
     /// * `text` - The text to truncate
     ///
@@ -84,17 +90,37 @@ impl Tokenizer {
     /// The truncated text (or original if already within limit)
     #[must_use]
     pub fn truncate(&self, text: &str) -> String {
-        let token_count = self.count_tokens(text);
-        if token_count <= self.max_tokens {
-            return text.to_string();
+        self.truncate_counted(text).0
+    }
+
+    /// [`truncate`](Self::truncate), also returning the token count of the
+    /// result, so a caller that needs both counts the text once rather than
+    /// twice (with the `openai` feature every count is a BPE encode).
+    #[must_use]
+    pub fn truncate_counted(&self, text: &str) -> (String, usize) {
+        let mut tokens = self.count_tokens(text);
+        if tokens <= self.max_tokens {
+            return (text.to_string(), tokens);
         }
 
         // Estimate character limit from token limit
         let estimated_char_limit = self.max_tokens * CHARS_PER_TOKEN_ESTIMATE;
 
         // Truncate at word boundary if possible, fall back to character truncation
-        Self::truncate_at_word_boundary(text, estimated_char_limit)
-            .unwrap_or_else(|| text.chars().take(estimated_char_limit).collect())
+        let mut out = Self::truncate_at_word_boundary(text, estimated_char_limit)
+            .unwrap_or_else(|| text.chars().take(estimated_char_limit).collect());
+
+        // Converge: shrink by the overshoot ratio, always by at least one char,
+        // so the loop ends (an empty string counts zero tokens).
+        loop {
+            tokens = self.count_tokens(&out);
+            if tokens <= self.max_tokens {
+                return (out, tokens);
+            }
+            let chars = out.chars().count();
+            let keep = (chars.saturating_mul(self.max_tokens) / tokens).min(chars - 1);
+            out = out.chars().take(keep).collect();
+        }
     }
 
     /// Truncate at a word boundary
@@ -157,5 +183,23 @@ mod tests {
         let truncated = tokenizer.truncate(long_text);
         // Should be shorter than original
         assert!(truncated.len() < long_text.len());
+    }
+
+    /// `truncate` must return text that FITS: its output is what gets sent to a
+    /// provider whose hard limit is `max_tokens`. A cut made by "about 4 chars per
+    /// token" lands far over the limit on dense text (CJK, code, digits), and the
+    /// provider answers 400 (backlog ef32cdeb).
+    #[test]
+    fn truncate_always_fits_the_limit_on_dense_text() {
+        let tokenizer = Tokenizer::new(50);
+        let text = "漢字のテストは密度が高い".repeat(120);
+        let out = tokenizer.truncate(&text);
+        assert!(!out.is_empty(), "truncation must keep a prefix");
+        assert!(text.starts_with(&out), "truncation must keep a prefix");
+        let tokens = tokenizer.count_tokens(&out);
+        assert!(
+            tokens <= 50,
+            "truncated text is {tokens} tokens against a limit of 50"
+        );
     }
 }

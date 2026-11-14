@@ -71,16 +71,64 @@ pub enum StorePath {
 }
 
 /// A replacement for the embedding provider behind [`McpEmbedder::generate`]:
-/// given the (truncated) input text, the vector to store. See
+/// given the caller's input text, the vector to store. See
 /// [`McpEmbedder::with_generator`].
 pub type EmbeddingGenerator =
     std::sync::Arc<dyn Fn(&str) -> Result<Vec<f32>, String> + Send + Sync>;
+
+/// Generation for [`McpEmbedder`] is `epigraph_embeddings::OpenAiProvider`, the
+/// same client the HTTP API embeds with, so a claim gets the same truncation,
+/// bounded retry and normalization whichever surface wrote it (backlog
+/// ef32cdeb: the hand-rolled POST this replaced clipped long input while the
+/// API refused it, so one long claim was embedded on MCP and NULL over HTTP).
+/// One provider per model, built only when a usable key is configured; no mock
+/// fallback, so a keyless embedder still refuses every `generate`.
+struct OpenAiModels {
+    small_1536: epigraph_embeddings::OpenAiProvider,
+    large_3072: epigraph_embeddings::OpenAiProvider,
+}
+
+impl OpenAiModels {
+    fn new(api_key: &str) -> Result<Self, EmbeddingError> {
+        Ok(Self {
+            small_1536: openai_provider(api_key, 1536)?,
+            large_3072: openai_provider(api_key, 3072)?,
+        })
+    }
+
+    fn at_dim(&self, dim: u32) -> Option<&epigraph_embeddings::OpenAiProvider> {
+        match dim {
+            1536 => Some(&self.small_1536),
+            3072 => Some(&self.large_3072),
+            _ => None,
+        }
+    }
+}
+
+/// An `OpenAiProvider` for the model [`model_for_dim`] names at `dim`.
+///
+/// The response cache is OFF: the provider's default keeps up to 10 000
+/// vectors (about 60 MB at 1536 dims) per instance, and this server ran
+/// without one before. Rate limiting and retry are the provider's defaults.
+fn openai_provider(
+    api_key: &str,
+    dim: u32,
+) -> Result<epigraph_embeddings::OpenAiProvider, EmbeddingError> {
+    let model = model_for_dim(dim)
+        .ok_or_else(|| EmbeddingError::ConfigError(format!("no OpenAI model for dim {dim}")))?;
+    let mut config = epigraph_embeddings::EmbeddingConfig::openai(dim as usize).with_cache(false);
+    config.provider = epigraph_embeddings::config::ProviderConfig::OpenAi {
+        model: model.to_string(),
+        api_base_url: None,
+    };
+    epigraph_embeddings::OpenAiProvider::new(config, api_key.to_string())
+}
 
 pub struct McpEmbedder {
     api_key: Option<String>,
     pool: PgPool,
     store_path: StorePath,
-    http: reqwest::Client,
+    models: Option<OpenAiModels>,
     generator: Option<EmbeddingGenerator>,
 }
 
@@ -116,11 +164,21 @@ impl McpEmbedder {
     /// no API key, so `generate` refuses before any store is attempted.
     #[must_use]
     pub fn new(pool: PgPool, api_key: Option<String>) -> Self {
+        let models = api_key
+            .as_deref()
+            .filter(|k| !key_disabled(Some(k)))
+            .and_then(|k| match OpenAiModels::new(k) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::error!(error = %e, "OpenAI embedding provider init failed; embeddings disabled");
+                    None
+                }
+            });
         Self {
             api_key,
             pool,
             store_path: StorePath::Undeclared,
-            http: reqwest::Client::new(),
+            models,
             generator: None,
         }
     }
@@ -190,48 +248,35 @@ impl McpEmbedder {
 
     /// Generate an embedding vector without storing it.
     ///
-    /// Returns the raw `Vec<f32>` from OpenAI. Callers can format it
-    /// with `format_pgvector()` for SQL queries.
+    /// `text-embedding-3-small` through `OpenAiProvider`: an input over the
+    /// model's token limit is clipped (the stored claim content stays full
+    /// verbatim; only the embedding input is cut), and a 429 / 5xx is retried
+    /// within a bounded budget. Callers can format the vector with
+    /// `format_pgvector()` for SQL.
     pub async fn generate(&self, text: &str) -> Result<Vec<f32>, String> {
         if let Some(generator) = &self.generator {
-            return generator(&truncate_embedding_input(text));
+            return generator(text);
         }
-        let api_key = self
-            .api_key
-            .as_deref()
-            .filter(|k| !k.is_empty() && *k != "mock")
-            .ok_or_else(|| "embeddings disabled (no API key)".to_string())?;
-
-        // Truncate the EMBEDDING INPUT only to the OpenAI model's 8191-token limit;
-        // the stored claim content stays full verbatim. Verbatim_v2 paragraph
-        // nodes can carry whole sections that exceed the embedding context — an
-        // over-limit request 400s, so clip here rather than drop the embedding.
-        let truncated = truncate_embedding_input(text);
-        generate_openai_embedding_with_model(
-            &self.http,
-            api_key,
-            &truncated,
-            "text-embedding-3-small",
-        )
-        .await
+        self.generate_with(text, 1536).await
     }
 
     /// Generate an embedding at the requested dimension by selecting the right
     /// OpenAI model. Returns the raw `Vec<f32>`; caller formats with format_pgvector.
     pub async fn generate_at_dim(&self, text: &str, dim: u32) -> Result<Vec<f32>, String> {
-        let api_key = self
-            .api_key
-            .as_deref()
-            .filter(|k| !k.is_empty() && *k != "mock")
+        self.generate_with(text, dim).await
+    }
+
+    async fn generate_with(&self, text: &str, dim: u32) -> Result<Vec<f32>, String> {
+        let models = self
+            .models
+            .as_ref()
             .ok_or_else(|| "embeddings disabled (no API key)".to_string())?;
-
-        let model = model_for_dim(dim)
+        let provider = models
+            .at_dim(dim)
             .ok_or_else(|| format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"))?;
-
-        // Truncate the embedding input to the model token limit (stored content
-        // is untouched); see `generate` for the verbatim-spine rationale.
-        let truncated = truncate_embedding_input(text);
-        generate_openai_embedding_with_model(&self.http, api_key, &truncated, model).await
+        EmbeddingService::generate(provider, text)
+            .await
+            .map_err(|e| format!("OpenAI embedding failed: {e}"))
     }
 
     /// Store an already-formatted pgvector on `claims.embedding`, through this
@@ -509,7 +554,8 @@ impl std::ops::DerefMut for SearchConn<'_> {
 // EmbeddingService implementation
 // ---------------------------------------------------------------------------
 //
-// `McpEmbedder` uses the OpenAI API directly (text-embedding-3-small, 1536d).
+// `McpEmbedder` generates through `epigraph_embeddings::OpenAiProvider`
+// (text-embedding-3-small, 1536d, unless a test generator replaces it).
 // This impl exposes it through the canonical trait so callers — including the
 // library `recall` function in `epigraph-engine` — only need `&dyn EmbeddingService`.
 //
@@ -573,18 +619,6 @@ impl EmbeddingService for McpEmbedder {
     }
 }
 
-/// Clip text to the OpenAI embedding model's 8191-token context window before
-/// it is sent as an embedding input. Returns the original string unchanged when
-/// it is already within the limit. This truncates ONLY the embedding input — the
-/// caller-supplied claim content is stored full-length elsewhere; this function
-/// never sees or mutates stored content. Uses the embeddings crate's
-/// [`Tokenizer`](epigraph_embeddings::Tokenizer) (tiktoken when the `openai`
-/// feature is on, char-estimate fallback otherwise).
-fn truncate_embedding_input(text: &str) -> String {
-    epigraph_embeddings::Tokenizer::new(epigraph_embeddings::config::DEFAULT_MAX_TOKENS)
-        .truncate(text)
-}
-
 /// Format a vector as a pgvector string literal: `"[0.1,0.2,...]"`.
 ///
 /// Public so callers can format a cached `Vec<f32>` for direct SQL use
@@ -592,39 +626,6 @@ fn truncate_embedding_input(text: &str) -> String {
 pub fn format_pgvector(vec: &[f32]) -> String {
     let inner: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
     format!("[{}]", inner.join(","))
-}
-
-async fn generate_openai_embedding_with_model(
-    http: &reqwest::Client,
-    api_key: &str,
-    text: &str,
-    model: &str,
-) -> Result<Vec<f32>, String> {
-    let resp = http
-        .post("https://api.openai.com/v1/embeddings")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&serde_json::json!({
-            "model": model,
-            "input": text,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("OpenAI request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error {status}: {body}"));
-    }
-
-    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse error: {e}"))?;
-    let embedding = json["data"][0]["embedding"]
-        .as_array()
-        .ok_or("missing embedding in response")?
-        .iter()
-        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-        .collect();
-    Ok(embedding)
 }
 
 #[cfg(test)]
@@ -668,38 +669,34 @@ mod tests {
         );
     }
 
-    // An over-limit input (a verbatim_v2 paragraph can be a whole section) must
-    // be clipped to <= the OpenAI 8191-token window before it is sent, so the
-    // embedding request never 400s on length. We measure with the SAME tokenizer
-    // the truncator uses, so the assertion holds regardless of whether tiktoken
-    // (openai feature) or the char-estimate fallback is active. No network.
+    // Truncation and retry are `OpenAiProvider`'s now, and are measured against
+    // an HTTP fixture in `epigraph-embeddings/tests/openai_provider_http.rs`.
+    // What is left here is the routing: which provider each dim reaches.
     #[test]
-    fn truncate_embedding_input_clips_over_limit_text() {
-        let limit = epigraph_embeddings::config::DEFAULT_MAX_TOKENS;
-        let tokenizer = epigraph_embeddings::Tokenizer::new(limit);
-        // Build a string comfortably over the token limit (~5 chars/word).
-        let huge = "word ".repeat(limit * 2);
-        assert!(
-            tokenizer.count_tokens(&huge) > limit,
-            "fixture must exceed the token limit to exercise truncation"
-        );
-
-        let clipped = super::truncate_embedding_input(&huge);
-        assert!(
-            tokenizer.count_tokens(&clipped) <= limit,
-            "truncated input must fit the model's token window"
-        );
-        assert!(
-            clipped.len() < huge.len(),
-            "over-limit input must actually be shortened"
-        );
+    fn each_supported_dim_reaches_a_provider_of_that_dim() {
+        use epigraph_embeddings::EmbeddingService as _;
+        let models = super::OpenAiModels::new("sk-test-not-sent").expect("providers build");
+        assert_eq!(models.at_dim(1536).map(|p| p.dimension()), Some(1536));
+        assert_eq!(models.at_dim(3072).map(|p| p.dimension()), Some(3072));
+        assert!(models.at_dim(1024).is_none());
     }
 
-    // Short inputs (the common case) must pass through byte-for-byte: truncation
-    // must not silently alter content that already fits.
-    #[test]
-    fn truncate_embedding_input_passes_through_short_text() {
-        let text = "The Earth orbits the Sun.";
-        assert_eq!(super::truncate_embedding_input(text), text);
+    // No mock fallback: a keyless embedder refuses at both dims, before any
+    // request, with the message `embeddings_disabled` callers grep for.
+    #[tokio::test]
+    async fn a_keyless_embedder_refuses_instead_of_falling_back() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://unused@127.0.0.1:1/unused").expect("lazy pool");
+        for key in [None, Some(String::new()), Some("mock".to_string())] {
+            let embedder = super::McpEmbedder::new(pool.clone(), key.clone());
+            assert!(embedder.embeddings_disabled(), "{key:?} must disable");
+            for dim in [1536, 3072] {
+                let err = embedder
+                    .generate_at_dim("text", dim)
+                    .await
+                    .expect_err("a keyless embedder must refuse");
+                assert!(err.contains("embeddings disabled"), "{key:?}@{dim}: {err}");
+            }
+        }
     }
 }

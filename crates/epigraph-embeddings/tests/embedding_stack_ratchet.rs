@@ -177,3 +177,22 @@ fn the_generation_trait_has_no_storage_methods() {
          {offenders:?}"
     );
 }
+/// One OpenAI embeddings client in the workspace: `OpenAiProvider`.
+///
+/// Fails on a tree that still has `epigraph-engine/src/embedder.rs` or the
+/// hand-rolled POST in `epigraph-mcp/src/embed.rs`.
+#[test]
+fn only_the_embeddings_crate_talks_to_the_openai_endpoint() {
+    let mut offenders: Vec<String> = production_sources()
+        .into_iter()
+        .filter(|(_, text)| text.contains("api.openai.com"))
+        .map(|(path, _)| path)
+        .collect();
+    offenders.sort();
+    assert_eq!(
+        offenders,
+        vec!["crates/epigraph-embeddings/src/providers/openai.rs".to_string()],
+        "a production file other than OpenAiProvider names the OpenAI endpoint: route it \
+         through epigraph_embeddings::OpenAiProvider instead of a second client"
+    );
+}

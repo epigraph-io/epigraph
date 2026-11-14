@@ -12,7 +12,6 @@
 
 use async_trait::async_trait;
 use std::sync::Mutex;
-#[cfg(feature = "openai")]
 use std::time::Duration;
 
 use crate::cache::EmbeddingCache;
@@ -42,10 +41,44 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Prevents memory exhaustion from oversized batch requests.
 const MAX_BATCH_SIZE: usize = 2048;
 
+/// Base URL of the `OpenAI` API when the config names none.
+const DEFAULT_API_BASE: &str = "https://api.openai.com";
+
+/// Bounded retry for transient `OpenAI` failures.
+///
+/// A 429, a 5xx and a failed connection are retried; any other status (a 400
+/// for a malformed request, a 401 for a bad key) is returned at once, because
+/// repeating it cannot succeed. `max_attempts` counts the first try, so the
+/// default of 3 means at most two retries. Every wait, including one a
+/// `Retry-After` header asks for, is capped at `max_delay`: the MCP server
+/// embeds inside tool calls, and an uncapped server-requested wait would hold
+/// a tool call for as long as the provider likes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Total attempts, including the first. Values below 1 are treated as 1.
+    pub max_attempts: u32,
+    /// Wait before retry `n` (1-based) is `base_delay * 2^(n-1)`, unless the
+    /// response carried a `Retry-After`.
+    pub base_delay: Duration,
+    /// Upper bound on any single wait.
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(5),
+        }
+    }
+}
+
 /// `OpenAI` embedding provider
 ///
 /// Uses the `OpenAI` API for generating embeddings.
-/// Supports caching, rate limiting, and automatic retry.
+/// Supports caching, rate limiting, truncation of over-limit input, and a
+/// bounded retry of transient failures ([`RetryPolicy`]).
 pub struct OpenAiProvider {
     /// Configuration
     config: EmbeddingConfig,
@@ -63,6 +96,8 @@ pub struct OpenAiProvider {
     rate_limiter: RateLimiter,
     /// Token usage tracking
     token_usage: Mutex<TokenUsage>,
+    /// Retry policy for transient API failures
+    retry: RetryPolicy,
 }
 
 impl OpenAiProvider {
@@ -110,7 +145,43 @@ impl OpenAiProvider {
             cache,
             rate_limiter,
             token_usage: Mutex::new(TokenUsage::default()),
+            retry: RetryPolicy::default(),
         })
+    }
+
+    /// Replace the retry policy (the default is [`RetryPolicy::default`]).
+    #[must_use]
+    pub const fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// The API base URL: `ProviderConfig::OpenAi::api_base_url`, or the public
+    /// `OpenAI` endpoint when that is unset.
+    fn api_base(&self) -> &str {
+        match &self.config.provider {
+            crate::config::ProviderConfig::OpenAi {
+                api_base_url: Some(url),
+                ..
+            } => url.trim_end_matches('/'),
+            _ => DEFAULT_API_BASE,
+        }
+    }
+
+    /// The wait before retry number `attempt` (1-based): the server's
+    /// `Retry-After` when it sent one, else exponential from `base_delay`, and
+    /// never more than `max_delay`.
+    #[cfg(feature = "openai")]
+    fn backoff(&self, attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+        let wanted = retry_after_secs.map_or_else(
+            || {
+                self.retry
+                    .base_delay
+                    .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+            },
+            Duration::from_secs,
+        );
+        wanted.min(self.retry.max_delay)
     }
 
     /// Track token usage
@@ -167,27 +238,64 @@ impl OpenAiProvider {
             input: texts.to_vec(),
         };
 
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/embeddings")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            if status == 429 {
+        let url = format!("{}/v1/embeddings", self.api_base());
+        let attempts = self.retry.max_attempts.max(1);
+        let mut attempt = 1u32;
+        let response = loop {
+            let sent = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&request)
+                .send()
+                .await;
+            let response = match sent {
+                Ok(r) => r,
+                // A connection that never opened is transient; a timeout is
+                // not retried, because it already cost a full request timeout.
+                Err(e) if e.is_connect() && attempt < attempts => {
+                    let wait = self.backoff(attempt, None);
+                    tracing::debug!(attempt, ?wait, "OpenAI connect failed, retrying");
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let status = response.status();
+            if status.is_success() {
+                break response;
+            }
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            let transient = status.as_u16() == 429 || status.is_server_error();
+            if transient && attempt < attempts {
+                let wait = self.backoff(attempt, retry_after);
+                tracing::debug!(
+                    attempt,
+                    status = status.as_u16(),
+                    ?wait,
+                    "OpenAI transient error, retrying"
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+            if status.as_u16() == 429 {
                 return Err(EmbeddingError::RateLimitExceeded {
-                    retry_after_secs: 60,
+                    retry_after_secs: retry_after
+                        .unwrap_or_else(|| self.retry.max_delay.as_secs().max(1)),
                 });
             }
             let error_text = response.text().await.unwrap_or_default();
             return Err(EmbeddingError::ApiError {
                 message: error_text,
-                status_code: Some(status),
+                status_code: Some(status.as_u16()),
             });
-        }
+        };
 
         let embedding_response: EmbeddingResponse = response.json().await?;
 
@@ -209,21 +317,23 @@ impl EmbeddingService for OpenAiProvider {
             return Err(EmbeddingError::EmptyText);
         }
 
-        // Validate and count tokens
-        let token_count = self.tokenizer.validate(text)?;
-
-        // Check cache
+        // Check cache (keyed on the caller's text, truncated or not)
         if self.config.cache_enabled {
             if let Some(cached) = self.cache.get(text) {
                 return Ok(cached);
             }
         }
 
+        // Clip an over-limit input to the model's context instead of refusing
+        // it: the embedding is of the text's head, the stored content is
+        // untouched (backlog ef32cdeb).
+        let (input, token_count) = self.tokenizer.truncate_counted(text);
+
         // Check rate limit
         self.rate_limiter.wait_if_needed(token_count as u32).await;
 
         // Call API
-        let embeddings = self.call_api(&[text]).await?;
+        let embeddings = self.call_api(&[input.as_str()]).await?;
         let mut embedding =
             embeddings
                 .into_iter()
@@ -259,13 +369,16 @@ impl EmbeddingService for OpenAiProvider {
             )));
         }
 
-        // Validate all texts
+        // Validate all texts, clipping each over-limit one (see `generate`)
         let mut total_tokens = 0;
+        let mut inputs = Vec::with_capacity(texts.len());
         for text in texts {
             if text.is_empty() {
                 return Err(EmbeddingError::EmptyText);
             }
-            total_tokens += self.tokenizer.validate(text)?;
+            let (input, tokens) = self.tokenizer.truncate_counted(text);
+            total_tokens += tokens;
+            inputs.push(input);
         }
 
         // Check rate limit
@@ -284,7 +397,7 @@ impl EmbeddingService for OpenAiProvider {
                 }
             }
             results.push(None);
-            uncached_texts.push(*text);
+            uncached_texts.push(inputs[i].as_str());
             uncached_indices.push(i);
         }
 
