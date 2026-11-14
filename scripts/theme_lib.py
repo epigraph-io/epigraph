@@ -75,7 +75,8 @@ def public_label_source(alias="c"):
     """SQL predicate: claim `alias`'s text may be quoted in a STORED label.
 
     A stored label (`cluster_labels.label`, which project_to_themes copies onto
-    a theme, and `claim_themes.label` / `description` from label_themes_llm) is
+    a theme, and `claim_themes.label` / `description` from label_themes_llm and
+    seed_themes_from_textbooks) is
     not viewer-derived: it is shown to every viewer who can read one member of
     the theme. So only text EVERY viewer may read can go into one, which is a
     `visibility = 'public'` claim. A group-private member's text, summarised
@@ -86,7 +87,12 @@ def public_label_source(alias="c"):
     the label samples only (membership, sizes and centroids are unchanged):
       * label_themes_llm.load_themes_with_samples (claim_themes.label and
         description, LLM); a theme with no public member gets the placeholder
-        `label_themes_llm.NO_PUBLIC_MEMBER_LABEL` and no LLM call;
+        NO_PUBLIC_MEMBER_LABEL and no LLM call;
+      * seed_themes_from_textbooks (claim_themes.label and description, LLM
+        over a textbook level-1 section and sampled level-3 atoms): the
+        section is sent only when it passes this predicate, else the theme is
+        seeded with NO_PUBLIC_MEMBER_LABEL and no LLM call; the atoms are
+        filtered by it;
       * cluster_claims.label_clusters and evidential_clustering.store_results
         (cluster_labels, member-text excerpts);
       * refine_clusters.auto_refine (cluster_labels, LLM), the split step of
@@ -96,9 +102,9 @@ def public_label_source(alias="c"):
         train_and_apply): the operator who types the sub-label names is shown
         only public members' text.
     Checked and NOT routed through it, each for its stated reason:
-      * seed_themes_from_textbooks and anchor_papers_to_themes read only
-        claims whose properties carry source_type 'Textbook' or 'Paper' or a
-        decomposition `level`, and store no member text as a label;
+      * anchor_papers_to_themes writes no theme row: its LLM-derived
+        `refined_anchor_label` is stored as an edge property through the API,
+        so it is outside theme labels (a separate question);
       * project_to_themes copies cluster_labels (filtered above);
         split_theme, maintain_themes.auto_split_theme and the
         create-with-centroid route write placeholder or derived labels;
@@ -114,7 +120,9 @@ def public_label_source(alias="c"):
         already read.
     Labels stored before this rule existed are not rewritten by it: re-run
     label_themes_llm with --relabel-all (and re-label cluster runs) to replace
-    them.
+    them. That run reads only themes with a 1536-d `centroid`; a seeded theme
+    whose section had only 3072-d embeddings has none and needs a separate
+    relabel.
     """
     return f"({alias}.visibility = 'public' AND {not_intake_owned(alias)})"
 
