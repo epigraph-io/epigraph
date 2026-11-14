@@ -88,7 +88,7 @@ async fn set_ds_cache(pool: &PgPool, claim: Uuid, belief: f64, plausibility: f64
     .expect("seed DS cache");
 }
 
-fn node<'a>(walk: &'a Value, id: Uuid) -> &'a Value {
+fn node(walk: &Value, id: Uuid) -> &Value {
     walk["nodes"]
         .as_array()
         .expect("nodes")

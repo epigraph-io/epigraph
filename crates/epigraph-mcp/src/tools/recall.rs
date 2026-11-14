@@ -1855,8 +1855,7 @@ async fn recall_with_context_post_embed(
     // serves the page in rank order rather than losing it.
     if params.group_by_parent {
         let ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
-        match epigraph_db::ClaimContextRepository::first_parent_ids(&mut read, viewer, &ids).await
-        {
+        match epigraph_db::ClaimContextRepository::first_parent_ids(&mut read, viewer, &ids).await {
             Ok(parents) => {
                 for hit in &mut results {
                     hit.parent_claim_id = parents.get(&hit.paragraph_id).copied();
