@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::docs::level_documents;
 use super::files::{
     index_attachments, prepare_export_dir, write_index, write_theme, ExportIndex, ExportTheme,
-    ResultDoc, EXPORT_FORMAT,
+    ResultDoc, ResultTheme, EXPORT_FORMAT,
 };
 use super::tree::{check_tree, map_key, resolve_tree, MeaningTree, ResolveStats};
 
@@ -229,20 +229,39 @@ pub async fn resolve_result(
     );
     let mut out = Vec::with_capacity(result.themes.len());
     for t in &result.themes {
-        let members = AtlasMeaningRepository::theme_members(tx, viewer, map, t.theme_id).await?;
-        let ids: BTreeSet<Uuid> = members.embedded.iter().map(|(id, _)| *id).collect();
-        let tree = check_tree(map, HIERARCHY, t.theme_id, &t.groups, &ids)?;
-        let all: Vec<Uuid> = ids.iter().copied().collect();
-        let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &all).await?;
-        let (tree, stats) = resolve_tree(&tree, &rows, cap)?;
-        out.push(ResolvedTheme {
-            tree,
-            stats,
-            id_chunk_cuts: t.id_chunk_cuts,
-            unembedded: members.unembedded,
-        });
+        out.push(resolve_theme(tx, viewer, map, t, cap).await?);
     }
     Ok(out)
+}
+
+/// One theme of a result, checked against the theme's current embedded
+/// members on `map` now ([`check_tree`]) and resolved with W3
+/// ([`resolve_tree`]). [`resolve_result`] runs it for every theme after its
+/// whole-map checks; the "by links" export runs it for the themes of one
+/// batch, to number the meaning leaves its mirrors follow. Call it on the
+/// build's transaction, after `begin_build_snapshot`.
+///
+/// # Errors
+/// Any refusal of [`check_tree`] or [`resolve_tree`], or a database error.
+pub async fn resolve_theme(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    theme: &ResultTheme,
+    cap: usize,
+) -> anyhow::Result<ResolvedTheme> {
+    let members = AtlasMeaningRepository::theme_members(tx, viewer, map, theme.theme_id).await?;
+    let ids: BTreeSet<Uuid> = members.embedded.iter().map(|(id, _)| *id).collect();
+    let tree = check_tree(map, HIERARCHY, theme.theme_id, &theme.groups, &ids)?;
+    let all: Vec<Uuid> = ids.iter().copied().collect();
+    let rows = AtlasLeafRepository::read_leaf_rows(tx, viewer, map, &all).await?;
+    let (tree, stats) = resolve_tree(&tree, &rows, cap)?;
+    Ok(ResolvedTheme {
+        tree,
+        stats,
+        id_chunk_cuts: theme.id_chunk_cuts,
+        unembedded: members.unembedded,
+    })
 }
 
 /// Write every level document of `themes` into the unfinished run `run_id`
