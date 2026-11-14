@@ -38,7 +38,8 @@ pub trait NameBackend {
 
 /// The model `scripts/label_themes_llm.py` labels themes with.
 pub const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
-/// How long one call may take before the child is killed.
+/// How long one call may take, its output included, before the CLI's
+/// process group is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Environment variables removed from the CLI's environment: an API key
@@ -189,8 +190,9 @@ pub fn ensure_private_base(base: &Path) -> std::io::Result<()> {
     check_ancestors(base)
 }
 
-/// `claude -p` (see [`cli_args`]), the prompt on stdin, run in an empty
-/// owner-only directory and killed at the timeout.
+/// `claude -p` (see [`cli_args`]), the prompt on stdin, run in its own
+/// process group in an empty owner-only directory, and the whole group
+/// killed at the timeout.
 #[derive(Debug)]
 pub struct ClaudeCliBackend {
     program: PathBuf,
@@ -285,11 +287,19 @@ fn envelope_result(stdout: &str) -> Result<String, BackendError> {
     Ok(result)
 }
 
+/// Kill the process group this call started (its leader is the CLI, whose
+/// pid is the group id).
+fn kill_group(pgid: rustix::process::Pid) {
+    let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL);
+}
+
 impl NameBackend for ClaudeCliBackend {
     fn complete(&self, prompt: &str) -> Result<String, BackendError> {
+        use std::os::unix::process::CommandExt;
         let mut cmd = Command::new(&self.program);
         cmd.args(cli_args(&self.model))
             .current_dir(&self.workdir)
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -302,23 +312,28 @@ impl NameBackend for ClaudeCliBackend {
         let mut child = cmd
             .spawn()
             .map_err(|e| BackendError(format!("spawn {}: {e}", self.program.display())))?;
+        let pgid = rustix::process::Pid::from_child(&child);
+        let deadline = Instant::now() + self.timeout;
         let mut stdin = child.stdin.take().expect("piped stdin");
         let body = prompt.to_string();
-        let writer = std::thread::spawn(move || {
+        // Detached: it ends when the prompt is written or the pipe closes.
+        std::thread::spawn(move || {
             let _ = stdin.write_all(body.as_bytes());
         });
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let reader = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             let mut s = String::new();
             let _ = stdout.read_to_string(&mut s);
-            s
+            let _ = tx.send(s);
         });
-        let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    // Only the child this call spawned.
+                    // The child is not reaped yet, so its group id is still
+                    // this call's.
+                    kill_group(pgid);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(BackendError(format!(
@@ -327,11 +342,28 @@ impl NameBackend for ClaudeCliBackend {
                     )));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                Err(e) => return Err(BackendError(format!("wait for the CLI: {e}"))),
+                Err(e) => {
+                    kill_group(pgid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BackendError(format!("wait for the CLI: {e}")));
+                }
             }
         };
-        let _ = writer.join();
-        let out = reader.join().unwrap_or_default();
+        // The output may still be held open by a process the CLI started;
+        // it gets what is left of the same deadline.
+        let out = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(s) => s,
+            Err(_) => {
+                // Something in the group still holds the pipe, so the group
+                // still exists and its id is still this call's.
+                kill_group(pgid);
+                return Err(BackendError(format!(
+                    "the CLI's output was still open after {:?}",
+                    self.timeout
+                )));
+            }
+        };
         if !status.success() {
             return Err(BackendError(format!("the CLI exited with {status}")));
         }
@@ -572,6 +604,47 @@ mod tests {
         let got = backend(&d, p, Duration::from_millis(500)).complete("prompt");
         assert!(got.is_err());
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A process the CLI leaves behind holding its output open does not
+    /// stretch the call past the timeout, and is killed with the group.
+    #[test]
+    fn a_process_left_holding_the_output_is_killed_at_the_timeout() {
+        let d = dir();
+        let pidfile = d.join("grandchild");
+        let p = stub(
+            &d,
+            &format!(
+                "sleep 30 &\necho $! > '{}'\n{OK_BODY}\nexit 0",
+                pidfile.display()
+            ),
+        );
+        let t = Instant::now();
+        let got = backend(&d, p, Duration::from_millis(1500)).complete("prompt");
+        let took = t.elapsed();
+        assert!(got.is_err(), "{got:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let stat = format!("/proc/{}/stat", pid.trim());
+        // Killed: gone, or a zombie waiting for whoever adopted it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::read_to_string(&stat) {
+                Err(_) => break,
+                Ok(s)
+                    if s.rsplit(')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start()
+                        .starts_with('Z') =>
+                {
+                    break
+                }
+                Ok(s) => assert!(Instant::now() < deadline, "still running: {s}"),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let _ = std::fs::remove_dir_all(d);
     }
 }
