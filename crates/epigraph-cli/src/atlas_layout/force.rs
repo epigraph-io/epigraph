@@ -62,6 +62,8 @@ use super::math::round4;
 /// arithmetic changes, so a stored layout is not reused under new rules: a
 /// run recorded under another tag is neither copied nor warm-started from
 /// (`super::fill`), so every level is laid out cold again.
+/// `tests::the_layout_output_is_pinned_to_the_algorithm_tag` fails until it
+/// is changed.
 pub const LAYOUT_ALGO: &str = "atlas-w6-v1";
 
 /// A leaf's nodes lie inside this disc (after rounding).
@@ -1706,6 +1708,79 @@ mod tests {
         assert_eq!(
             layout_leaf_from(seed(), &input, &layout_leaf(seed(), &other)),
             layout_leaf(seed(), &input)
+        );
+    }
+
+    /// Lower-hex SHA-256 of positions as `id x y r` lines (`{:?}` of an f64
+    /// is its shortest round-trip form, so the text is the bits).
+    fn digest(lines: impl Iterator<Item = String>) -> String {
+        let mut h = Sha256::new();
+        for l in lines {
+            h.update(l.as_bytes());
+            h.update(b"\n");
+        }
+        hex::encode(h.finalize())
+    }
+
+    #[test]
+    fn the_layout_output_is_pinned_to_the_algorithm_tag() {
+        // A stored level is reused while its input hash matches, and the hash
+        // covers the tag and the constants but not the code. So a change to
+        // the arithmetic must come with a new LAYOUT_ALGO; this pin fails
+        // until both the tag and the digests below are updated together.
+        // It is also the cross-host check: another architecture must give
+        // these bytes.
+        let (_, leaf) = random_leaf(5, 100, 400);
+        let cold_leaf = layout_leaf(seed(), &leaf);
+        let (ids, _) = random_leaf(5, 100, 400);
+        let grown = LeafInput::new(
+            leaf.nodes()
+                .iter()
+                .copied()
+                .chain([(Uuid::from_u64_pair(88, 88), LayoutNodeKind::Claim)])
+                .filter(|(id, _)| *id != ids[1]),
+            leaf.edges()
+                .iter()
+                .copied()
+                .filter(|(a, b)| *a != ids[1] && *b != ids[1])
+                .chain([(Uuid::from_u64_pair(88, 88), ids[0])]),
+        )
+        .unwrap();
+        let warm_leaf = layout_leaf_from(seed(), &grown, &cold_leaf);
+        let group = random_group(77, 128, 256);
+        let cold_group = layout_group(seed(), &group);
+        let warm_group = layout_group_from(
+            seed(),
+            &resized(&group, group.children()[3].0, |s| s * 3),
+            &cold_group,
+        );
+        let leaf_lines = |p: &BTreeMap<Uuid, [f64; 2]>| {
+            p.iter()
+                .map(|(id, q)| format!("{id} {:?} {:?}", q[0], q[1]))
+                .collect::<Vec<_>>()
+        };
+        let group_lines = |p: &BTreeMap<Uuid, Circle>| {
+            p.iter()
+                .map(|(id, c)| format!("{id} {:?} {:?} {:?}", c.x, c.y, c.r))
+                .collect::<Vec<_>>()
+        };
+        let got = [
+            digest(leaf_lines(&cold_leaf).into_iter()),
+            digest(leaf_lines(&warm_leaf).into_iter()),
+            digest(group_lines(&cold_group).into_iter()),
+            digest(group_lines(&warm_group).into_iter()),
+        ];
+        eprintln!("atlas W6 layout digests under {LAYOUT_ALGO}: {got:?}");
+        assert_eq!(LAYOUT_ALGO, "atlas-w6-v1", "update the digests below too");
+        assert_eq!(
+            got,
+            [
+                "e947bdf92b216e9b5719c9ca3e98a7aa4595739852d81219c57e20fa9b39ff97",
+                "982b5643909a69f9dedd8b45fa3f770af71a3ba40f50219c39264853001b1a43",
+                "6d591e47392be1892a0dd503a4df691ce9b38cfbc529aaec4ec03f0f6f056d3c",
+                "97927dc4110a314e9fd49510cf300f9acaaad5a028a8e51d43cfb19f35ef2d2c",
+            ],
+            "the layout output changed: bump LAYOUT_ALGO and re-pin"
         );
     }
 }
