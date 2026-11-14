@@ -153,18 +153,14 @@ fn walk<'v>(v: &'v Value, f: &mut dyn FnMut(Option<&'v str>, &'v Value)) {
     }
 }
 
+/// The region and theme routes carry no belief value. The list is shared
+/// with the nested-level contract tests (`tests/atlas_contract.rs`), whose
+/// documents carry none either: a leaf claim node has no `betp`.
 fn assert_no_belief_keys(v: &Value) {
     walk(v, &mut |k, _| {
         if let Some(k) = k {
             assert!(
-                ![
-                    "belief",
-                    "plausibility",
-                    "pignistic_prob",
-                    "epistemic",
-                    "mean_betp"
-                ]
-                .contains(&k),
+                !common::atlas_contract::BELIEF_KEYS.contains(&k),
                 "a body carries `{k}`"
             );
         }

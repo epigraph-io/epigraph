@@ -14,6 +14,8 @@
 
 #![allow(dead_code)] // each test binary uses a different subset
 
+pub mod atlas_contract;
+
 use std::collections::HashMap;
 
 use axum::body::{to_bytes, Body};

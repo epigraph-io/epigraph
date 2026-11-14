@@ -1,0 +1,11 @@
+{
+  "body": {
+    "details": {
+      "entity": "atlas_level",
+      "id": "bd443c72-4acc-4e0a-81dd-d0a197c012ef"
+    },
+    "error": "NotFound",
+    "message": "atlas_level with ID bd443c72-4acc-4e0a-81dd-d0a197c012ef not found"
+  },
+  "status": 404
+}
