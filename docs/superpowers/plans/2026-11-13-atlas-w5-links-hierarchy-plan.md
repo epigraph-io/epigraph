@@ -90,9 +90,19 @@ claim, embeddings of the linked claims.
 5. **Mirrors (W5b).** For each meaning leaf with unlinked claims, ONE links
    leaf holding exactly those claims (U ∩ meaning leaf). It fits because it
    is a subset of a meaning leaf that fits. Mirror leaves sit directly under
-   the root beside L's top-level bins: an intermediate group of mirrors that
-   fits would have to be a leaf (merging two meaning leaves' claims), so none
-   is made. More than 128 root children is refused.
+   the root beside L's top-level bins while the root's children number at
+   most MAX_FANOUT (16). Past that they are nested (`_mirror_children`): in
+   meaning-leaf order, cut into runs that close once their union weight
+   reaches T = max(cap + 1, ceil(S / budget)) (S the sum of the mirrors' own
+   weights, budget = 16 minus the link bins, at least 2), a short last run
+   joining the one before it. Every run weighs MORE than the cap, so it never
+   fits (a group of mirrors that fits would have to be a leaf, merging two
+   meaning leaves) and holds two or more mirrors; a run of more than 16
+   mirrors is cut again the same way. A group of mirrors can be wider than
+   16 (cutting it further would make groups that fit). Mirrors too light to
+   make two runs stay flat up to 128; more than 128 of them is refused.
+   (Review finding: flat, 130 meaning leaves with unlinked claims refused the
+   whole map.)
 6. **Ids.** W4's mint with `hierarchy = links`: the root from
    `(map, links, theme)`, every other group from its sorted member claims.
 
@@ -174,6 +184,11 @@ the affected targets run, then restored and `touch`ed):
 | Python: T never grows (fanout unbounded) | `test_many_small_components_keep_the_root_fanout_bounded`, the fixture tests |
 | Python: no affinity merge (first-fit only) | `test_parts_of_one_component_are_packed_together` |
 | Python: validate skips the mirror rule | `test_validate_tree_refuses_a_malformed_tree[mirror_split, mirror_with_linked_claim, unlinked_in_linked_leaf]` |
+| Python: mirrors always flat under the root | `test_many_mirror_leaves_nest_under_the_root` (132 children refused), `test_a_few_dozen_mirrors_keep_the_root_fanout_bounded` (root of 42), `test_mirrors_too_light_to_nest_beyond_the_child_limit_are_refused` (wrong refusal) |
+| Python: a group of mirrors falls through to the leaf rule | `test_many_mirror_leaves_nest_under_the_root`, `test_a_few_dozen_mirrors_keep_the_root_fanout_bounded` (mirror rule refused) |
+| Python: mirror runs close below the cap | the same three (a group of mirrors that fits; no refusal) |
+| Python: mirrors ordered by smallest claim, not meaning leaf | `test_many_mirror_leaves_nest_under_the_root` (runs not contiguous in meaning order) |
+| `check_mirrors` requires a mirror directly under the root | `mirrors_nested_under_a_group_of_mirrors_are_accepted` |
 | W3 edge read without `co_owner_group_id IS NULL` | `no_co_owned_or_other_team_edge_counts_as_a_link` and four more DB tests |
 | W3 edge read without the owner check | `no_co_owned_or_other_team_edge_counts_as_a_link` |
 | `counted_links` without the relationship filter | `only_counted_claim_links_between_members_count` |
@@ -198,8 +213,7 @@ path to break): `test_ids_match_the_golden_vector` and
 `test_a_mirror_over_the_cap_is_refused`, `test_a_claim_over_the_cap_alone_is_refused`,
 `test_a_theme_under_the_cap_is_one_root_leaf`,
 `test_a_theme_with_no_links_mirrors_every_meaning_leaf` (red under the
-one-bucket mutation only). The refusal of more than 128 root children has no
-test.
+one-bucket mutation only).
 
 **Not tested end to end:** a database export computed by the Python core
 and applied back (as for W4: the build hosts have no numpy; the halves meet
@@ -221,8 +235,9 @@ and whose result passes the Rust tree and mirror checks).
 
 ## Needs prod measurement (the orchestrator's)
 
-- Per theme and map: linked vs unlinked members, and meaning leaves per theme
-  (root fanout = top-level link bins + mirror leaves; refused over 128).
+- Per theme and map: linked vs unlinked members, and the number of meaning
+  leaves holding unlinked claims (over 16 the mirrors nest; more than 128
+  mirrors whose union weighs under about 2 x (cap + 1) is refused).
 - Counted-edge counts per theme, and how many are `decomposes_to`.
 - Louvain reproducibility across compute hosts (the result records the
   networkx version; ids persist only while it reproduces).

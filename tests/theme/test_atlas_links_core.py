@@ -308,6 +308,100 @@ def test_a_theme_with_no_links_mirrors_every_meaning_leaf():
     t.validate(groups)
 
 
+def _many_mirrors(n_leaves, per_leaf, seed, shared_agents=4):
+    """A theme of two linked clusters (one bin each) and `n_leaves` meaning
+    leaves of `per_leaf` unlinked claims, each claim with one of a few shared
+    agents and an evidence row of its own. The meaning-leaf integers are
+    shuffled against the claim ids, so meaning-leaf order and claim-id order
+    differ."""
+    n = 60 + n_leaves * per_leaf
+    t = Theme(n, seed=seed)
+    for i in range(n):
+        t.att[i] = [i % shared_agents, 1000 + i]
+    t.clique(range(0, 30))
+    t.clique(range(30, 60))
+    perm = np.random.RandomState(seed).permutation(n_leaves)
+    for i in range(60, n):
+        t.meaning_leaf[i] = 10 + int(perm[(i - 60) // per_leaf])
+    for i in range(60):
+        t.meaning_leaf[i] = i // 30
+    return t
+
+
+def _check_nested_mirrors(t, groups, cap=100):
+    """Every leaf holding an unlinked claim is its exact mirror; every group
+    of mirrors holds two or more children, weighs over the cap (so it could
+    not have been a leaf) and holds no linked claim; the root holds at most
+    MAX_FANOUT children and every level at most MAX_CHILDREN. (A group of
+    mirrors can be wider than MAX_FANOUT: cutting it further would make
+    groups that fit, which must be leaves, and a leaf of two mirrors breaks
+    the mirror rule.)"""
+    t.validate(groups, cap=cap)
+    by_id = {g["id"]: g for g in groups}
+    linked = {t.ids[i] for p in t.links for i in p}
+
+    def claims(g):
+        if g["kind"] == "leaf":
+            return set(g["members"])
+        return set().union(*(claims(by_id[k]) for k in g["children"]))
+
+    mirror_groups = 0
+    for g in groups:
+        if g["kind"] != "group":
+            continue
+        limit = core.MAX_FANOUT if g["parent"] is None else core.MAX_CHILDREN
+        assert 2 <= len(g["children"]) <= limit, (g["depth"], len(g["children"]))
+        if g["parent"] is not None and not (claims(g) & linked):
+            mirror_groups += 1
+            assert _weight(claims(g), t) > cap, "a group of mirrors that fits must not exist"
+    return mirror_groups
+
+
+def test_many_mirror_leaves_nest_under_the_root():
+    """390 unlinked claims in 130 meaning leaves plus two linked bins: flat,
+    the root would hold 132 children, over the contract's 128 (the whole map
+    refused). Nested, every level holds at most MAX_FANOUT children, every
+    mirror is still exact, and the mirrors are grouped in meaning-leaf order."""
+    t = _many_mirrors(130, 3, seed=21)
+    groups, stats = t.build()
+    assert stats["mirrors"] == 130
+    assert _check_nested_mirrors(t, groups) >= 2
+    by_id = {g["id"]: g for g in groups}
+    # A mirror group holds a contiguous run of meaning leaves.
+    for g in groups:
+        if g["kind"] == "group" and g["parent"] is not None:
+            kids = [by_id[k] for k in g["children"]]
+            if all(k["kind"] == "leaf" for k in kids):
+                ml = sorted({t.meaning_leaf[t.ids.index(k["members"][0])] for k in kids})
+                if ml[0] >= 10:
+                    assert ml == list(range(ml[0], ml[-1] + 1))
+    again, _ = t.build(order=list(np.random.RandomState(5).permutation(len(t.ids))))
+    assert sorted(map(json.dumps, again)) == sorted(map(json.dumps, groups))
+
+
+def test_a_few_dozen_mirrors_keep_the_root_fanout_bounded():
+    """40 mirrors under the 128-child limit still nest: the root fanout stays
+    within the MAX_FANOUT the packing aims for."""
+    t = _many_mirrors(40, 3, seed=22)
+    groups, _ = t.build()
+    assert _check_nested_mirrors(t, groups) >= 2
+    assert len(groups[0]["children"]) <= core.MAX_FANOUT
+
+
+def test_mirrors_too_light_to_nest_beyond_the_child_limit_are_refused():
+    """130 one-claim mirrors with no attachments weigh 130 together: they
+    cannot make two groups over the cap of 100, and flat they are over the
+    128-child limit, so the theme is refused (fail closed), naming the
+    counts."""
+    t = Theme(190, seed=23)
+    t.clique(range(0, 30))
+    t.clique(range(30, 60))
+    for i in range(190):
+        t.meaning_leaf[i] = i if i >= 60 else i // 30
+    with pytest.raises(ValueError, match="130 mirror leaves weighing 130"):
+        t.build()
+
+
 def test_ids_match_the_golden_vector():
     # The same vectors are pinned in crates/epigraph-cli/src/atlas_links/graph.rs.
     assert core.root_id(MAP, "links", THEME) == "a3f580a9-6493-540c-a047-19edb935e318"

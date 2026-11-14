@@ -42,9 +42,18 @@ attachment integers over them, so a shared agent is one node per group.
      bins, T doubles (staying below w) and the packing repeats. Every bin is
      a child, and since T < w there are always two or more.
   5. W5b: for each meaning leaf with unlinked claims, ONE leaf holding exactly
-     those claims (a MIRROR of the meaning leaf), directly under the root.
-     It fits because the meaning leaves come resolved (each fits) and a
-     mirror is a subset of one.
+     those claims (a MIRROR of the meaning leaf). It fits because the meaning
+     leaves come resolved (each fits) and a mirror is a subset of one. The
+     mirrors sit directly under the root while the root's children (link
+     bins plus mirrors) number at most MAX_FANOUT. Past that they are nested
+     (`_mirror_children`): taken in meaning-leaf order (so neighbouring
+     meaning leaves sit together) and cut into runs that each weigh MORE than
+     the cap, so a mirror group never fits (a group that fits would have to
+     be a leaf, and a leaf merging two meaning leaves breaks the mirror rule)
+     and always holds two or more mirrors. The runs at one level number at
+     most the fanout budget; a run with more than MAX_FANOUT mirrors is cut
+     again the same way. Mirrors whose union weighs too little to make two
+     such runs stay flat, up to MAX_CHILDREN; past that the theme is refused.
 
 **Ids.** W4's mint with hierarchy "links": the root "{map}|links|{theme}|root",
 every other group from its sorted member claims. The box-side apply mints
@@ -270,6 +279,46 @@ def _unit_neighbours(units, adj):
 
 # ── the tree ────────────────────────────────────────────────────────────────
 
+def _mirror_children(mirrors, att, cap, budget):
+    """The children that hold `mirrors` (index arrays, one per meaning leaf,
+    in meaning-leaf order) under one group, at most `budget` (>= 2) of them
+    where the mirrors allow it. Each child is ("leaf", mirror, None) or
+    ("mirrors", claims, sub_mirrors): a group of two or more mirrors that
+    weighs more than the cap, so it never collapses into a leaf.
+
+    Mirrors are cut in order into runs that close once their union weight
+    reaches T = max(cap + 1, ceil(S / budget)), S the sum of the mirrors'
+    own weights; a last run that has not reached T joins the run before it.
+    Every closed run weighs at least T and the runs' weights sum to at most
+    S, so there are at most `budget` runs. When fewer than two runs close
+    (the mirrors' union is too light to make two groups over the cap) the
+    mirrors stay flat; more than MAX_CHILDREN of them is refused."""
+    if len(mirrors) <= budget:
+        return [("leaf", m, None) for m in mirrors]
+    total = sum(_weight(m, att) for m in mirrors)
+    target = max(cap + 1, math.ceil(total / budget))
+    runs, run, run_size, run_nodes = [], [], 0, set()
+    for m in mirrors:
+        run.append(m)
+        run_size += len(m)
+        run_nodes |= set().union(*(att[i] for i in m))
+        if run_size + len(run_nodes) >= target:
+            runs.append(run)
+            run, run_size, run_nodes = [], 0, set()
+    if run:
+        if runs:
+            runs[-1].extend(run)
+        else:
+            runs.append(run)
+    if len(runs) < 2:
+        if len(mirrors) > MAX_CHILDREN:
+            raise ValueError(f"{len(mirrors)} mirror leaves weighing {total} together cannot be "
+                             f"nested into groups over the cap of {cap}, and a level holds at "
+                             f"most {MAX_CHILDREN} children")
+        return [("leaf", m, None) for m in mirrors]
+    return [("mirrors", np.sort(np.concatenate(r)), r) for r in runs]
+
+
 def _order(parts):
     """Children by claim count descending, then by smallest claim (ids are
     sorted, so the smallest index is the smallest id)."""
@@ -313,7 +362,8 @@ def build_tree(ids, attachments, links, meaning_leaf, embeddings, *, map_key, th
 
     def group(idx, depth, parent, children):
         """`children`: (kind, claims, payload) with kind "leaf" (payload
-        None) or "units" (payload: the unit arrays of a bin)."""
+        None), "units" (payload: the unit arrays of a bin) or "mirrors"
+        (payload: the mirror arrays of a mirror group)."""
         if depth >= MAX_DEPTH:
             raise ValueError(f"theme {theme_id} needs more than {MAX_DEPTH} levels")
         if not 2 <= len(children) <= MAX_CHILDREN:
@@ -337,6 +387,9 @@ def build_tree(ids, attachments, links, meaning_leaf, embeddings, *, map_key, th
 
     def node(child, depth, parent):
         kind, idx, parts = child
+        if kind == "mirrors":
+            # Never a leaf: it merges meaning leaves (and weighs over the cap).
+            return group(idx, depth, parent, _mirror_children(parts, att, cap, MAX_FANOUT))
         if kind == "leaf" or len(parts) == 1 or _weight(idx, att) <= cap:
             return leaf(idx, depth, parent)
         return group(idx, depth, parent, bins_of(parts))
@@ -355,14 +408,20 @@ def build_tree(ids, attachments, links, meaning_leaf, embeddings, *, map_key, th
     by_leaf = defaultdict(list)
     for i in unlinked:
         by_leaf[ml[i]].append(i)
+    mirrors = []
     for m in sorted(by_leaf):
         idx = np.asarray(by_leaf[m])
         if _weight(idx, att) > cap:
             raise ValueError(f"theme {theme_id}: the unlinked claims of one meaning leaf weigh "
                              f"{_weight(idx, att)} > {cap}; the meaning leaves must come "
                              "resolved (every one within the cap)")
-        children.append(("leaf", idx, None))
-    stats["mirrors"] = len(by_leaf)
+        mirrors.append(idx)
+    stats["mirrors"] = len(mirrors)
+    try:
+        children.extend(_mirror_children(mirrors, att, cap,
+                                         max(2, MAX_FANOUT - len(children))))
+    except ValueError as e:
+        raise ValueError(f"theme {theme_id}: {e}") from None
     group(everything, 0, None, children)
     return groups, stats
 
