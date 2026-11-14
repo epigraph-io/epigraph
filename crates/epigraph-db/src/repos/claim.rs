@@ -8087,6 +8087,39 @@ impl ClaimRepository {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    /// Return the ids of the claims assigned to theme `theme_id`
+    /// (`claims.theme_id`) that `viewer` may read.
+    ///
+    /// The `theme_id` filter of `GET /api/v1/claims` (backlog ea26d7aa):
+    /// resolved once into the `ids` predicate of [`ClaimListFilter`], like
+    /// [`Self::claim_ids_by_methodology`]. A theme the viewer reads nothing in,
+    /// and a uuid that names no theme, both resolve to the empty set.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    pub async fn claim_ids_by_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id
+            FROM claims c
+            WHERE c.theme_id = $1
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(theme_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Return claim IDs that have at least one evidence record of the given type.
     ///
     /// Valid values mirror the DB evidence_type column:
