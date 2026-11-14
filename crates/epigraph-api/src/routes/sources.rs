@@ -60,8 +60,17 @@ pub struct SourcePaper {
     pub title: Option<String>,
     /// ONE ingest's authors (the paper's first ingest the caller can read,
     /// `authors_ingested_by`), in position order, not awaiting
-    /// countersignature; at most 10.
+    /// countersignature.
     pub authors: Vec<SourceAuthor>,
+    /// Authors that ingest named without speaking for them, awaiting their
+    /// countersignature, in position order. Never under `authors`.
+    ///
+    /// Listed rather than dropped because both lists come from ONE bounded
+    /// window of at most 10 authorship rows (as on `GET /api/v1/papers`): a
+    /// filter applied after the bound could leave `authors` empty with
+    /// `authors_truncated` set while every row of the window was pending.
+    pub pending_authors: Vec<SourceAuthor>,
+    /// More than 10 authorship rows (both lists together) exist.
     pub authors_truncated: bool,
     pub authors_ingested_by: Option<Uuid>,
 }
@@ -241,19 +250,26 @@ pub async fn sources_overview(
             let paper = (r.kind == "paper").then(|| {
                 let id = id.unwrap_or_default();
                 let (listed, authors_truncated) = authors.remove(&id).unwrap_or_default();
+                let mut plain = Vec::new();
+                let mut pending = Vec::new();
+                for (a, _) in listed {
+                    let item = SourceAuthor {
+                        id: a.agent_id,
+                        display_name: a.display_name,
+                        position: a.position,
+                    };
+                    if a.pending_countersign {
+                        pending.push(item);
+                    } else {
+                        plain.push(item);
+                    }
+                }
                 SourcePaper {
                     id,
                     doi: r.doi.clone(),
                     title: r.title.clone(),
-                    authors: listed
-                        .into_iter()
-                        .filter(|(a, _)| !a.pending_countersign)
-                        .map(|(a, _)| SourceAuthor {
-                            id: a.agent_id,
-                            display_name: a.display_name,
-                            position: a.position,
-                        })
-                        .collect(),
+                    authors: plain,
+                    pending_authors: pending,
                     authors_truncated,
                     authors_ingested_by: firsts.get(&id).map(|p| p.ingested_by),
                 }

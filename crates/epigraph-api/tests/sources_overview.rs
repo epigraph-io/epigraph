@@ -112,6 +112,25 @@ async fn evidence_at(pool: &PgPool, claim: Uuid, url: &str) {
     .expect("seed evidence");
 }
 
+/// `author`'s authorship of `paper`, as `by`'s document ingest writes it.
+async fn authored(pool: &PgPool, author: Uuid, paper: Uuid, by: Uuid, props: Value) {
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        by,
+        author,
+        "agent",
+        paper,
+        "paper",
+        "authored",
+        Some(props),
+    )
+    .await
+    .expect("authored edge");
+}
+
 /// `by`'s document ingest asserts `claim` from `paper`. Returns the edge.
 async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("conn");
@@ -174,6 +193,14 @@ struct Corpus {
     ingester: Uuid,
     stranger: Uuid,
     member: Uuid,
+    /// The paper's authors as the ingester's ingest wrote them: `lead` at
+    /// position 1, `second` at 2, and `pending` at 0, awaiting
+    /// countersignature. `outsider` is the filer's authorship of the paper,
+    /// written by an ingest that is not the paper's first.
+    lead: Uuid,
+    second: Uuid,
+    pending: Uuid,
+    outsider: Uuid,
 }
 
 async fn corpus(pool: &PgPool) -> Corpus {
@@ -232,6 +259,26 @@ async fn corpus(pool: &PgPool) -> Corpus {
     for c in [c1, c2, c3, c4, hidden, c5] {
         in_theme(pool, c, t).await;
     }
+    // The paper's authors. `authored` edges run agent -> paper, so they move
+    // no claim count. The pending author sorts FIRST by position, which is
+    // the case where dropping pending rows after the bound used to hide them.
+    let (lead, _) = named_agent(pool, "Lead Author").await;
+    let (second, _) = named_agent(pool, "Second Author").await;
+    let (pending, _) = named_agent(pool, "Pending Author").await;
+    let pos = |p: i64| json!({"position": p, "role": "author", "affiliations": []});
+    authored(pool, second, paper, ingester, pos(2)).await;
+    authored(pool, lead, paper, ingester, pos(1)).await;
+    authored(
+        pool,
+        pending,
+        paper,
+        ingester,
+        json!({"position": 0, "pending_countersign": true, "ingested_by": ingester.to_string()}),
+    )
+    .await;
+    // Another ingest's author list is never mixed into the first one's.
+    let (outsider, _) = named_agent(pool, "Outsider Author").await;
+    authored(pool, outsider, paper, filer, pos(0)).await;
     // Outside the theme: the paper asserts one more claim.
     let other = viewer_fixture::seed_public_claim(pool, ingester, "sources other").await;
     asserts(pool, paper, other, ingester).await;
@@ -244,6 +291,10 @@ async fn corpus(pool: &PgPool) -> Corpus {
         ingester,
         stranger,
         member,
+        lead,
+        second,
+        pending,
+        outsider,
     }
 }
 
@@ -306,7 +357,25 @@ async fn a_themes_sources_group_by_kind_with_the_callers_counts(pool: PgPool) {
     let p = find("paper");
     assert_eq!(p["paper"]["doi"], json!("10.5555/sources.p"), "{p}");
     assert_eq!(p["paper"]["title"], json!("Sources Paper"), "{p}");
-    assert!(p["paper"]["authors"].is_array(), "{p}");
+    assert_eq!(p["paper"]["authors_ingested_by"], json!(k.ingester), "{p}");
+    assert_eq!(
+        p["paper"]["authors"],
+        json!([
+            {"id": k.lead, "display_name": "Lead Author", "position": 1},
+            {"id": k.second, "display_name": "Second Author", "position": 2},
+        ]),
+        "the first ingest's plain authors in position order; no other ingest's: {p}"
+    );
+    assert_eq!(
+        p["paper"]["pending_authors"],
+        json!([{"id": k.pending, "display_name": "Pending Author", "position": 0}]),
+        "the pending author is listed apart, not dropped: {p}"
+    );
+    assert_eq!(p["paper"]["authors_truncated"], json!(false), "{p}");
+    assert!(
+        !p.to_string().contains(&k.outsider.to_string()),
+        "another ingest's author is not listed: {p}"
+    );
     let a = find("agent");
     assert_eq!(
         a["agent"],
