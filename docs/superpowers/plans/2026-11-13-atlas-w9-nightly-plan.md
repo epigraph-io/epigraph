@@ -129,8 +129,9 @@ results, or let the nightly carry the map.
 | File | What |
 |---|---|
 | `crates/epigraph-db/src/repos/atlas_map.rs` | `prune_runs`, `lock_map_for_publish`, `lock_map_for_build`/`unlock_map_for_build` (the operator applies' session lock), `maps_with_finished_runs`, `run_hierarchies` |
-| `crates/epigraph-db/src/repos/atlas_leaf.rs` | `node_labels` (agents, evidence under the map predicate); the edge limit as a split reason (`ATLAS_LEAF_EDGE_CAP`, `SplitReason::EdgeCap`, an edge-aware `fallback_split`) |
-| `crates/epigraph-db/src/repos/atlas_meaning.rs` | `unthemed_embedded_count`, `themes_over_member_cap`, `unembedded_members_on_map` (viewer-spliced, no new exemption) |
+| `crates/epigraph-db/src/repos/atlas_leaf.rs` | `node_labels` (agents, evidence under the map predicate); the edge limit as a split reason (`ATLAS_LEAF_EDGE_CAP`, `SplitReason::EdgeCap`, an edge-aware `fallback_split`); `map_claim_links` (the map's drawable claim-to-claim edges) |
+| `crates/epigraph-db/src/repos/atlas_meaning.rs` | `unthemed_embedded_count`, `themes_over_member_cap`, `unembedded_members_on_map`, `claim_truth_values` (viewer-spliced, no new exemption) |
+| `crates/epigraph-cli/src/atlas_nightly/links.rs` | pure: group `bundles` and `targets`, leaf `outgoing`, under the contract caps |
 | `crates/epigraph-db/src/repos/maintenance_lock.rs` | `ATLAS_NIGHTLY_LOCK_KEY` |
 | `crates/epigraph-cli/src/atlas_nightly/previous.rs` | pure: the previous run's trees from its stored rows |
 | `crates/epigraph-cli/src/atlas_nightly/incremental.rs` | pure: the meaning and links updates, collapse, re-mint |
@@ -221,3 +222,85 @@ is held; flow reads per leaf; memory to hold a whole map's levels (the unit
 sets `MemoryMax`); model calls on the first night (every level is unnamed);
 whether the 197 theme-level layout needs a refresh after theme assignment
 changes theme sizes.
+
+## Operator rulings 2026-11-13
+
+The operator ruled on what this item had left for later: the nightly builds
+the cross-group links, and fills each leaf claim's `truth_value`.
+
+### Cross-group links
+
+Built once per map, in the build snapshot, after every theme is final (built
+or carried) and before `fill_positions`, so W6's group layout pulls linked
+children together from the sibling bundles (`atlas_nightly::links`).
+
+- **Edge set.** `AtlasLeafRepository::map_claim_links`: claim-to-claim edges
+  in force between two claims the run draws, under the same map edge rule as
+  W3 and W5 (public, or owned by the team with no co-owner). W5's
+  `is_counted` decides which relationships are links (the epistemic edges
+  plus `decomposes_to`). Rows repeating (source, target, lower-cased
+  relationship) are one link. A co-owned edge is never read.
+- **Where a link shows**, per hierarchy:
+  - same theme: a sibling bundle at the lowest common ancestor, in the stored
+    direction; every level below it lists the link towards the shallowest
+    group outside that level that holds the other end (the child of the
+    common ancestor on that side);
+  - another theme: every level on the path lists it towards that theme's
+    root in the same hierarchy (depth 0). W11's stub path resolves a depth-0
+    target (it attaches the theme root and selects it).
+  - An outside link is listed from the inside end whichever way the edge row
+    points, so a leaf whose claims are only cited still has its stubs.
+- **Count and sign.** `count` is the number of links; `net_sign` the sign of
+  the sum of W7's link signs (+1 supporting, -1 opposing, 0 other).
+- **Caps.** A group keeps its 160 heaviest outside targets (bundles to a cut
+  target go with it), then its 2,048 heaviest bundles; a leaf its 64 heaviest
+  `outgoing` targets. Ties go to the smaller id. The cuts are counted (no
+  ids) under `links` in the night report and the run's `params`; they never
+  fail the night. Children stay capped at 128 by the tree.
+- **Incremental.** Builder's call: a deterministic recompute of every level
+  from the snapshot's edges, not a rebuild of "changed" levels only. Unchanged
+  input gives the same bytes (the second night still writes nothing), and a
+  changed link changes only the levels it passes through. Rebuilding only
+  levels whose own members changed would leave a target pointing at a group
+  whose member-derived id has moved, and a carried theme's counts must follow
+  the map's edge rule as it stands that night.
+
+### Leaf claim `truth_value`
+
+`AtlasMeaningRepository::claim_truth_values` reads it under the map's claim
+predicate; `fill_leaf` sets it as the colour value only, after and apart from
+W7's weights. A claim the read does not return carries null, never a default.
+`claims.truth_value` is NOT NULL, so on a real map every drawn claim has one.
+A carried theme keeps the values its stored leaves hold.
+
+### Proofs (fresh database, each mutation applied alone and restored)
+
+| Criterion | Test |
+|---|---|
+| two themes with links across groups, leaves and themes give the expected bundles, targets and outgoing in both hierarchies, named as their levels | `links_across_groups_leaves_and_themes_fill_bundles_targets_and_outgoing`; unit `links_are_aggregated_at_every_level_towards_the_shallowest_outside_group` |
+| a co-owned or other team's edge never contributes; a public one does | `a_co_owned_or_other_teams_edge_never_makes_a_link_but_a_public_one_does`; `map_claim_links_return_only_claim_edges_the_map_may_draw` (epigraph-db) |
+| over-cap truncation keeps the heaviest and reports the rest | `a_leaf_over_the_outgoing_cap_keeps_its_heaviest_targets_and_the_night_reports_the_rest`; unit tests for all three caps |
+| positions pull linked children together | `the_group_layout_pulls_linked_children_together` (two families of six; linked pairs closer than unlinked ones, and closer than W6 places the same children with no bundles) |
+| a second night over unchanged input is byte-identical with 0 model calls; a new link changes only the levels it crosses | `links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_passes`; unit `the_result_does_not_depend_on_link_order_and_replaces_what_was_there` |
+| leaf claim `truth_value` matches the row, null without one | `leaf_claims_carry_their_stored_truth_value`; unit `a_claims_truth_value_is_its_stored_one_and_none_without_one`; `claim_truth_values_read_only_the_claims_the_map_may_draw` (epigraph-db) |
+
+| Mutation | Tests that went red |
+|---|---|
+| the nightly skips the cross-link fill | `links_across_...`, `a_co_owned_or_other_teams_...`, `links_stay_byte_identical_...`, `the_group_layout_pulls_linked_children_together`, `a_leaf_over_the_outgoing_cap_...` |
+| the link read admits a co-owned edge | `map_claim_links_return_only_claim_edges_the_map_may_draw`, `a_co_owned_or_other_teams_...`, `links_across_...` |
+| the link read admits another team's edge | the same three |
+| a link points at the far leaf, not the shallowest outside group | unit `links_are_aggregated_...`, `links_across_...` |
+| an opposing net sign reads as 0 | unit `links_are_aggregated_...`, `links_across_...` |
+| a same-theme link is also listed above the common ancestor | unit `links_are_aggregated_...`, `links_across_...`, `links_stay_byte_identical_...` |
+| the caps keep the lightest | the three unit cap tests, `a_leaf_over_the_outgoing_cap_...` |
+| no outgoing cap | the unit leaf and target cap tests, `a_leaf_over_the_outgoing_cap_...` (the contract refuses the leaf) |
+| `outgoing` sources in hash order (not deterministic) | unit `links_are_aggregated_...`, `links_stay_byte_identical_...` |
+| leaf `truth_value` left null | unit `a_claims_truth_value_...`, `leaf_claims_carry_their_stored_truth_value` |
+| leaf `truth_value` defaults to 0.5 with no stored value | unit `a_claims_truth_value_...` |
+| the truth read without the map predicate | `claim_truth_values_read_only_the_claims_the_map_may_draw` |
+
+### Needs prod measurement (added)
+
+The size and time of the map-wide claim-to-claim edge read on the largest
+map, and how many levels hit a cap (the `links` counts of the first night).
+

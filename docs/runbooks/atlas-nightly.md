@@ -22,7 +22,11 @@ Nothing in the repository installs it. Every step below is an operator step.
      the nearest centroid) and "by links" tree (W5b mirrors, new links join
      their neighbours' leaf), a leaf over the 100-node cap or the contract's
      1,024 edges split on the box by W3's fallback split (`resplit_leaves`);
-   - builds real leaves (claims, agents, evidence, W7 flow weights);
+   - builds real leaves (claims with their stored `truth_value` as the
+     colour value, agents, evidence, W7 flow weights);
+   - once every theme is final, builds the map's cross-group links: group
+     `bundles` and `targets`, leaf `outgoing` (team-owned edges with no
+     co-owner, or public ones; never a co-owned edge);
    - then lays out only the changed levels (W6, warm-started) and names only
      the changed groups (W8, through the Claude CLI, `--max-calls` per map).
 3. **Writes** one new run per changed map, holding both hierarchies, then
@@ -43,6 +47,10 @@ newer run was published while the night ran; nothing was written) or
   linked, mirrors), `themes.carried`, `themes.dropped`, `themes.unbuilt`;
 - `unembedded_members` (current themed claims the map may draw with no
   embedding, in every theme, also one with no embedded member: in no leaf);
+- `links` (the cross-group links: `links` read, and what the contract caps
+  cut: `dropped_targets`, `dropped_bundles`, `dropped_outgoing`,
+  `dropped_links`; also stored in the run's `params`). A cut keeps the
+  heaviest and never fails the night;
 - `layout.relaid` (the levels laid out again) and `naming.renamed` (the
   levels whose naming input changed), `naming.report.calls`.
 
