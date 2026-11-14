@@ -38,7 +38,8 @@
 //!         [--attest-shared-signer <uuid,...>] [--apply]
 //!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
-//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
+//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl \
+//!         [--allow-truncated-tail] [--apply]
 //!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
@@ -1170,6 +1171,13 @@ enum Command {
         batch_size: usize,
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
+        /// Tolerate ONE torn final line per manifest (no trailing newline,
+        /// not JSON): what a run that crashed mid-append leaves. It is
+        /// dropped and printed as a WARN line; every other malformed line is
+        /// still refused. Prove first, from the database, that the batch the
+        /// torn record belongs to rolled back, and dry-run on a copy.
+        #[arg(long)]
+        allow_truncated_tail: bool,
     },
 }
 
@@ -2651,12 +2659,14 @@ async fn main_inner() -> anyhow::Result<i32> {
             apply,
             batch_size,
             lock_timeout,
+            allow_truncated_tail,
         } => {
             let opts = reverse::Options {
                 manifests: manifest,
                 apply,
                 batch_size,
                 lock_timeout,
+                allow_truncated_tail,
             };
             let report = reverse::run(&mut conn, &opts, &mut stdout).await?;
             Ok(if !report.batch_failures.is_empty() {
