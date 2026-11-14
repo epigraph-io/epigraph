@@ -759,6 +759,71 @@ async fn abstract_edges_are_marked_and_skipped_by_the_sheaf_reads(pool: PgPool) 
     );
 }
 
+/// An abstraction may generalise a revision successor: it re-points no
+/// `supersedes`, so a source that already carries one is no obstacle. A merge
+/// over the same sources is still refused (backlog 22602dd8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn abstract_mode_may_generalise_a_revision_successor(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let older = seed_claim(&pool, author, "revision older text", &[]).await;
+    let newer = seed_claim(&pool, author, "revision newer text", &[]).await;
+    let other = seed_claim(&pool, author, "an unrelated second source", &[]).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(older)
+        .execute(&pool)
+        .await
+        .expect("retire the older revision");
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(older)
+        .bind(newer)
+        .execute(&pool)
+        .await
+        .expect("make newer its successor");
+
+    let merge = ClaimRepository::consolidate(
+        &pool,
+        &[newer, other],
+        "merge over a revision successor",
+        0.6,
+        ConsolidateMode::Merge,
+        "merge",
+        author,
+    )
+    .await;
+    let merge_err = format!(
+        "{:?}",
+        merge.expect_err("a merge over a successor is refused")
+    );
+    assert!(
+        merge_err.contains("already superseded"),
+        "control: a merge still refuses a source that already has a supersedes pointer: {merge_err}"
+    );
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[newer, other],
+        "a generalisation over a revision successor",
+        0.6,
+        ConsolidateMode::Abstract,
+        "generalisation",
+        author,
+    )
+    .await
+    .expect("an abstraction may generalise a revision successor");
+    let (is_current, supersedes): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(newer)
+            .fetch_one(&pool)
+            .await
+            .expect("read successor");
+    assert!(is_current, "the successor stays current");
+    assert_eq!(supersedes, Some(older), "its own pointer is untouched");
+    assert_eq!(
+        count_edges(&pool, res.merged_id, newer, "generalizes").await,
+        1
+    );
+}
+
 /// `identity` writes no new claim: it is the dedup act, run per source by the
 /// tool layer. The merge act refuses it as an input error, before it writes
 /// anything (backlog 22602dd8).
