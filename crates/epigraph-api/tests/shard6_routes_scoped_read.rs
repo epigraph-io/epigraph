@@ -914,6 +914,58 @@ async fn agent_reputation_counts_the_viewers_own_group_private_claim(pool: PgPoo
     );
 }
 
+/// `GET /agents/:id/reputation` — a RETIRED claim is not a refutation
+/// (backlog 0f22d7b7).
+///
+/// `ClaimRepository::deprecate_claim` writes `truth_value = 0.05` in the same
+/// statement that flips `is_current = false`; the calculator reads anything
+/// under 0.2 as refuted. The second claim here is retired with that exact
+/// statement, so before the `is_current` filter it was returned, counted in
+/// `total_claims` and scored as a refutation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn agent_reputation_ignores_a_retired_claim(pool: PgPool) {
+    let (agent, _group) = seed_agent_with_group(&pool, "s6-rep-retired").await;
+    let kept = seed_public_claim(&pool, agent, "s6 rep: a claim that stays current").await;
+
+    let state = split_state(&pool).await;
+    let viewer = viewer_for(&pool, agent).await;
+
+    let before = get_agent_reputation(ViewerExtractor(viewer), State(state.clone()), Path(agent))
+        .await
+        .expect("the agent exists")
+        .0;
+    assert_eq!(before.total_claims, 1, "only {kept} exists so far");
+
+    let retired =
+        seed_public_claim(&pool, agent, "s6 rep: a workflow step, later deprecated").await;
+    let rows =
+        epigraph_db::ClaimRepository::deprecate_claim(&pool, epigraph_core::ClaimId::from(retired))
+            .await
+            .expect("deprecate_claim on the superuser test pool");
+    assert_eq!(rows, 1, "the deprecation must have retired {retired}");
+
+    let viewer = viewer_for(&pool, agent).await;
+    let after = get_agent_reputation(ViewerExtractor(viewer), State(state), Path(agent))
+        .await
+        .expect("the agent exists")
+        .0;
+
+    assert_eq!(
+        after.total_claims, 1,
+        "the deprecated claim {retired} is retired (is_current = false), so the \
+         reputation must still be computed over {kept} alone; 2 means the retired \
+         row was read"
+    );
+    assert!(
+        (after.reputation_score - before.reputation_score).abs() < 1e-9,
+        "deprecating a claim wrote the 0.05 sentinel into truth_value; that is an \
+         operational marker and must not move the author's reputation \
+         (before {}, after {})",
+        before.reputation_score,
+        after.reputation_score
+    );
+}
+
 /// `GET /api/v1/agents/:id/claims` — the arm over all three of this handler's
 /// sites, and the one that shows why the page and its total must carry the same
 /// tenancy stamp: `total` is asserted to the same exact value as `items`.

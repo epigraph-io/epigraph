@@ -116,6 +116,12 @@ CREATE ROLE <migration_login> LOGIN SUPERUSER PASSWORD '<secret>';  -- or a sche
 CREATE DATABASE epigraph OWNER <migration_login>;
 ```
 
+pgvector must be 0.8.0 or newer because the semantic search and recall
+queries set `hnsw.iterative_scan`, which that release introduced. Once the
+extension exists,
+`SELECT extversion FROM pg_extension WHERE extname = 'vector';` shows its
+version.
+
 Migration `001` runs `CREATE EXTENSION IF NOT EXISTS` for `pg_trgm`,
 `uuid-ossp` and `vector`, all in schema `public`. Migrations 060 and 161 run
 `CREATE ROLE`. A superuser migration login does all of this itself, and it is
@@ -482,6 +488,25 @@ not to the API.
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims` | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `EPIGRAPH_AGENT_ID` | `scripts/_api_client.py` | The `agent_id` claim of tokens the Python helpers mint (section 7). |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
+
+### Optional LLM, rerank and NLI integrations
+
+A base install needs none of these. Each one, when set, sends text from the
+graph or from a request to a service outside the host, so decide on them one
+at a time.
+
+| Variable | Read by | Default | Meaning |
+|---|---|---|---|
+| `RERANK_API_KEY` | the MCP server, for `recall_with_context` called with `rerank: true` | unset | The key for a cross-encoder rerank service. Unset → the call degrades to plain ANN order with a warning. Set → the query and the candidate claims' content are sent to `RERANK_ENDPOINT`. |
+| `RERANK_ENDPOINT`, `RERANK_MODEL` | as above, only when `RERANK_API_KEY` is set | `https://api.cohere.com/v2/rerank`, `rerank-english-v3.0` | The rerank endpoint and the model it is asked for. |
+| `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` | the built-in Anthropic client (`epigraph-cli`, `enrichment::llm_client`): the CLIs that call an LLM (`decompose_claims`, `protocol_gen`, `method_search`, `embed_bridge`, `rerank_bridges`, `ingest_git --enricher llm`) and the API server in a `genai` build | unset | Credentials for the Anthropic API. The OAuth token is used when both are set. With neither, the `epigraph` auto-detect selector finds no active provider and the caller fails. |
+| `ENRICHMENT_MODEL` | the same client | `claude-sonnet-4-5-20250929` | The model that client requests. |
+| `EPIGRAPH_LLM_PROVIDER` | the API server, in a build with the `genai` feature | `anthropic` | The provider behind `POST /api/v1/analyze/unconstrained`: `anthropic`, `epigraph` (the first active registered provider), `mock`, or the name of a registered extension. The request's question is sent to it. A build without `genai` answers that route 503. |
+| `ENRICHMENT_LLM_PROVIDER` | `ingest_git --enricher llm` | `epigraph` | The provider selector for the commit enricher; same values. |
+| `ENRICHMENT_WINDOW_SIZE`, `ENRICHMENT_WINDOW_OVERLAP` | `ingest_git --enricher llm` | `20`, `5` | Commits per enrichment window, and how many of them overlap the next window. |
+| `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` | `ingest_git` | unset | The orchestrator agent's UUID when neither `--orchestrator-id` nor an `Epigraph-Orchestrator-Id` trailer in the PR body or commits names one. |
+| `API_ENDPOINT` | `embed_bridge` | `http://localhost:8080` | The API's base URL for that CLI. |
+| `NLI_SERVICE_URL` | `NliClient::from_env` (`epigraph-cli`, `enrichment::nli_client`) | unset | The URL of an NLI classification service, which is POSTed `{premise, hypothesis}`. No binary in this tree calls `from_env` at the time of writing, so setting the variable changes nothing yet. |
 
 ## 4. Database migrations
 

@@ -44,6 +44,12 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+# The Atlas level contract test helper (tests/common/atlas_contract.rs):
+# a JSON Schema validator and gzip for the payload budget. default-features
+# = false: the defaults resolve remote `$ref`s over HTTP, which the schema
+# never needs.
+flate2 = "1"
+jsonschema = { version = "0.61", default-features = false }
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 

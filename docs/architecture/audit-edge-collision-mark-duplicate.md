@@ -67,9 +67,15 @@ Row 2:  source_id = B,  target_id = C,  relationship = 'alternative_of'
 
 This pre-condition is reachable whenever two claims that are later identified
 as duplicates have independently been placed in the same `alternative_of`
-equivalence class — a normal outcome of the cross-source matcher promoting
-match candidates into `alternative_of` edges via
-`POST /api/v1/edges/epistemic`.
+equivalence class — a normal outcome of `alternative_of` edges being written
+through `POST /api/v1/edges` (the generic edge create in
+`crates/epigraph-api/src/routes/edges.rs`, whose relationship allow-list
+admits `alternative_of`) or the MCP `link_alternative` tool.
+
+(Corrected: this paragraph used to name `POST /api/v1/edges/epistemic`, a
+route the router does not register, and to attribute these edges to the
+cross-source matcher. A match-candidate promotion writes `CORROBORATES` or
+`contradicts`, per `crates/epigraph-mcp/src/tools/matching.rs`.)
 
 ### What `mark_duplicate` does
 
