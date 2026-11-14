@@ -16,7 +16,11 @@
 --     their owner and ACL; never DROP them: a DROP resets the ACL and breaks
 --     every trigger and policy that names them);
 --   * drops `epigraph_step_lineage_has_hidden_executor(uuid)` (nothing in SQL
---     names it).
+--     names it);
+--   * REFUSES, changing nothing, unless both functions hold 219's bodies (or
+--     already hold 070's and 168's, a second run). A later migration that
+--     re-stated either one (a merged body) would otherwise be reverted to
+--     168's, losing that migration's change: undo that migration first.
 --
 -- WHAT IT LEAVES:
 --   * every edge 219's section 4 narrowed, and every edge written or re-met
@@ -32,6 +36,27 @@
 -- ===================================================================
 BEGIN;
 SET LOCAL lock_timeout = '3s';
+
+-- The guard: md5(prosrc) of 219's bodies, or of 070's and 168's (already
+-- undone). Anything else was re-stated after 219.
+DO $$
+DECLARE v_node text; v_prop text;
+BEGIN
+    SELECT md5(p.prosrc) INTO v_node FROM pg_catalog.pg_proc p
+     WHERE p.oid = 'public.epigraph_node_tenancy(uuid, text)'::regprocedure;
+    SELECT md5(p.prosrc) INTO v_prop FROM pg_catalog.pg_proc p
+     WHERE p.oid = 'public.epigraph_propagate_tenancy()'::regprocedure;
+    IF (v_node, v_prop) IS DISTINCT FROM ('d08bf867256ced915ba54f65cf620de7',
+                                          '574ca9041faaae85cece692bfb0a79fb')
+       AND (v_node, v_prop) IS DISTINCT FROM ('8e97895802b7dbb334f92b3c5a4d884a',
+                                              '763b53778fcd779f1f968d38af58b3d7') THEN
+        RAISE EXCEPTION '219-undo: epigraph_node_tenancy (prosrc md5 %) or '
+                        'epigraph_propagate_tenancy (prosrc md5 %) is neither 219''s body nor '
+                        '070''s / 168''s: a later migration re-stated it. Undo that migration '
+                        'first; nothing was changed', v_node, v_prop
+              USING ERRCODE = '55000';
+    END IF;
+END $$;
 
 -- 070's body.
 CREATE OR REPLACE FUNCTION public.epigraph_node_tenancy(p_id uuid, p_type text)

@@ -2660,7 +2660,11 @@ restart.
   SECURITY DEFINER `epigraph_step_lineage_has_hidden_executor(uuid)` on 172's
   form (owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and
   granted to `epigraph_app`) for the `evolve_step` authority gates, which
-  could no longer see a hidden plan's `executes` edge. Registered in
+  could no longer see a hidden plan's `executes` edge.
+  A GUARD refuses to apply 219 unless `epigraph_node_tenancy` and
+  `epigraph_propagate_tenancy` still hold 070's and 168's bodies (md5 of
+  `prosrc`), so 219 never silently reverts another re-statement; the undo
+  carries the same guard against 219's bodies. Registered in
   `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS` and the grant register).
   Pinned by `epigraph-db/tests/workflow_endpoint_tenancy.rs`,
   `epigraph-db/tests/workflow_endpoint_tenancy_undo.rs`,
@@ -2670,10 +2674,11 @@ restart.
   maintenance role or a superuser (it refuses otherwise). Undo:
   `docs/runbooks/219-undo.sql` (tested: run twice, it returns the `public`
   catalog to below 219, both bodies byte for byte); edges 219 narrowed stay
-  narrowed. Checked before claiming: no migration on main, origin branch or
-  local worktree re-states either function after 168, and the slot was
-  assigned to this batch. **Deploy order:** migrate before rolling out the
-  219 binary (its `evolve_step` gates call the definer); undo only after
+  narrowed. Checked before claiming: no migration on main re-states either
+  function after 070 / 168; one change in flight also re-states the
+  propagation, and the guard makes whichever lands second re-state the merged
+  body. The slot was assigned to this batch. **Deploy order:** migrate
+  before rolling out the 219 binary (its `evolve_step` gates call the definer); undo only after
   rolling every 219 binary back. **Applied to throwaway databases only, NOT
   to any deployed database.**
 

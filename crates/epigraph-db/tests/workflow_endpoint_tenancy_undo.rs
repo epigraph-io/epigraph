@@ -10,6 +10,13 @@
 //! pins that the undo restores 070's `epigraph_node_tenancy` and 168's
 //! `epigraph_propagate_tenancy` byte for byte (body, SECURITY DEFINER, pinned
 //! `search_path`), with their owner and ACL.
+//!
+//! [`migration_219_refuses_over_a_restated_propagation_body`] and
+//! [`the_219_undo_refuses_over_a_later_restatement`]: 219 and its undo each
+//! re-state a SHARED body (`epigraph_propagate_tenancy`, which another
+//! migration may also re-state), so each refuses, changing nothing, unless
+//! the function holds exactly the body it was written against. Without that,
+//! whichever re-statement applied later would silently revert the other.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -138,4 +145,105 @@ async fn the_219_undo_returns_the_catalog_below_219(pool: PgPool) {
             "after the {run} run the catalog is exactly the one below 219"
         );
     }
+}
+
+/// The propagation body re-stated with one added comment, as a migration that
+/// re-states it would leave it; returns the marker it carries.
+async fn restate_propagation(pool: &PgPool) -> &'static str {
+    const MARK: &str = "-- re-stated by a later migration";
+    let def: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef('public.epigraph_propagate_tenancy()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the propagation's definition");
+    assert!(
+        def.contains("\nBEGIN\n"),
+        "CALIBRATION: a plpgsql body: {def}"
+    );
+    let restated = def.replacen("\nBEGIN\n", &format!("\nBEGIN\n    {MARK}\n"), 1);
+    sqlx::raw_sql(&restated)
+        .execute(pool)
+        .await
+        .expect("re-state the propagation");
+    MARK
+}
+
+async fn propagation_src(pool: &PgPool) -> String {
+    sqlx::query_scalar("SELECT prosrc FROM pg_proc WHERE proname = 'epigraph_propagate_tenancy'")
+        .fetch_one(pool)
+        .await
+        .expect("prosrc")
+}
+
+/// 219 over a propagation body that is not 168's (a migration before it
+/// re-stated the function) refuses, and applies nothing: the re-statement
+/// survives and 219's definer does not exist. Mutation: the guard removed ->
+/// 219 applies and puts 168's body (plus the joins) back over the change.
+#[sqlx::test(migrations = false)]
+async fn migration_219_refuses_over_a_restated_propagation_body(pool: PgPool) {
+    migrate(&pool, &up_to(218)).await;
+    let mark = restate_propagation(&pool).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = up_to(219)
+        .run(&mut *conn)
+        .await
+        .expect_err("219 refuses over a body it was not written against");
+    drop(conn);
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("is not the body 219 builds on"),
+        "the refusal says why: {text}"
+    );
+    assert!(
+        propagation_src(&pool).await.contains(mark),
+        "the earlier re-statement survives"
+    );
+    let applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'epigraph_step_lineage_has_hidden_executor')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("definer probe");
+    assert!(!applied, "nothing of 219 was applied");
+}
+
+/// The undo over a propagation body that is neither 219's nor 168's (a later
+/// migration re-stated it) refuses and changes nothing. Mutation: the undo's
+/// guard removed -> it re-states 168's body and the later change is lost.
+#[sqlx::test(migrations = false)]
+async fn the_219_undo_refuses_over_a_later_restatement(pool: PgPool) {
+    migrate(&pool, &up_to(219)).await;
+    let mark = restate_propagation(&pool).await;
+    let before = catalog(&pool).await;
+
+    let undo = repo_file("docs/runbooks/219-undo.sql");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = sqlx::raw_sql(&undo)
+        .execute(&mut *conn)
+        .await
+        .expect_err("the undo refuses over a later re-statement");
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the aborted undo transaction");
+    drop(conn);
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("neither 219's body"),
+        "the refusal says why: {text}"
+    );
+    assert!(
+        propagation_src(&pool).await.contains(mark),
+        "the later re-statement survives"
+    );
+    assert_eq!(
+        catalog(&pool)
+            .await
+            .symmetric_difference(&before)
+            .collect::<Vec<_>>(),
+        Vec::<&String>::new(),
+        "the refused undo changed nothing"
+    );
 }

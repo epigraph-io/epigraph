@@ -95,14 +95,52 @@
 -- Undo (roll every 219 binary back first): `docs/runbooks/219-undo.sql`
 -- re-states 070's `epigraph_node_tenancy` and 168's
 -- `epigraph_propagate_tenancy` (CREATE OR REPLACE, never DROP: a DROP resets
--- the ACL) and DROPs section 5's definer (nothing in SQL names it). The edges
+-- the ACL) and DROPs section 5's definer (nothing in SQL names it); it
+-- refuses unless both functions still hold 219's bodies. The edges
 -- section 4 narrowed STAY narrowed (fail-closed); the NOTICE lists how many
 -- there were.
 --
--- Checked before claiming: no migration on main, and no origin branch or
--- local worktree, re-states either function after 168.
+-- Re-stating a shared body: on main nothing re-states
+-- `epigraph_node_tenancy` after 070 or `epigraph_propagate_tenancy` after 168,
+-- but another change in flight re-states the propagation too. Whichever of
+-- two such migrations applies LATER would silently put back the earlier one's
+-- body without the other's change. So the GUARD below refuses to apply
+-- unless both functions still hold exactly the bodies this file builds on
+-- (070's and 168's, by the md5 of `prosrc`): a re-statement applied before
+-- this file fails it loudly instead. The migration that lands second must
+-- take the higher number, re-state the MERGED body, and make its own undo
+-- restore the merged predecessor. The undo runbook carries the same guard
+-- against this file's bodies.
 
 SET LOCAL lock_timeout = '3s';
+
+-- ===================================================================
+-- GUARD: re-state only the bodies this file was written against
+-- ===================================================================
+-- Sections 1 and 2 re-state 070's and 168's bodies plus the workflow arm and
+-- joins. Over any other body they would silently revert whatever re-stated it
+-- after 070 / 168, so refuse (see "Re-stating a shared body" above). The
+-- literals are md5(prosrc) of the bodies in 070_tenancy_triggers.sql and
+-- 168_outsider_owned_challenges.sql (pinned by
+-- `epigraph-db/tests/workflow_endpoint_tenancy_undo.rs`, and by every suite
+-- that migrates to head, which a wrong literal would fail).
+DO $$
+DECLARE v_node text; v_prop text;
+BEGIN
+    SELECT md5(p.prosrc) INTO v_node FROM pg_catalog.pg_proc p
+     WHERE p.oid = 'public.epigraph_node_tenancy(uuid, text)'::regprocedure;
+    SELECT md5(p.prosrc) INTO v_prop FROM pg_catalog.pg_proc p
+     WHERE p.oid = 'public.epigraph_propagate_tenancy()'::regprocedure;
+    IF v_node IS DISTINCT FROM '8e97895802b7dbb334f92b3c5a4d884a'
+       OR v_prop IS DISTINCT FROM '763b53778fcd779f1f968d38af58b3d7' THEN
+        RAISE EXCEPTION '219: epigraph_node_tenancy (prosrc md5 %) or epigraph_propagate_tenancy '
+                        '(prosrc md5 %) is not the body 219 builds on (070''s and 168''s). '
+                        'A migration before 219 re-stated it; re-stating it here would revert '
+                        'that change. Re-state the MERGED body in the later migration',
+                        v_node, v_prop
+              USING ERRCODE = '55000';
+    END IF;
+END $$;
 
 -- ===================================================================
 -- 1. THE ORACLE: 070's body plus the workflow arm
