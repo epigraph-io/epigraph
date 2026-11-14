@@ -19,8 +19,8 @@
 //!   deleted one fails until its entry goes.
 //! * [`every_scoped_route_checks_its_scope`]: for a [`Gate::Scope`] entry, the
 //!   handler's `db` definition shows the scope, either as a `RequireScope*`
-//!   extractor in its signature or as a `check_scopes(` / `has_scope(` call in
-//!   a body that names the scope literal. For [`Gate::Via`], the handler calls
+//!   extractor in its signature or as the scope literal inside a
+//!   `check_scopes(` / `has_scope(` call's arguments. For [`Gate::Via`], the handler calls
 //!   the named helper and the helper's body shows the scope that way.
 //! * [`every_exemption_says_why`]: a [`Gate::Exempt`] carries a reason.
 //! * [`the_scope_evidence_scanner_is_not_vacuous`]: calibration. A handler
@@ -59,6 +59,13 @@ const READ_ONLY_POST: &str =
     "a read shaped as POST: the body is a query, the handler writes nothing and its reads are \
      viewer-filtered";
 const PURE_COMPUTE: &str = "pure computation over the request body: no database read or write";
+/// Honest, not a clean bill: these read on the unstamped `state.db_pool`
+/// with no viewer, so row security admits only what an anonymous session
+/// sees. A scope would not change what they read; whether they leak beyond
+/// public rows is a viewer question, recorded as a found-not-fixed item.
+const RAW_POOL_READ_POST: &str =
+    "a read shaped as POST that writes nothing, but reads on the unstamped `state.db_pool` with \
+     no viewer (not viewer-filtered); a scope would not narrow what it reads";
 const OAUTH: &str =
     "OAuth protocol endpoint: authenticated by the protocol's own client or user credential, \
      before any bearer exists";
@@ -132,7 +139,7 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("community::add_member", Scope("groups:admin")),
     ("community::create_community", Scope("groups:write")),
     ("community::remove_member", Scope("groups:admin")),
-    ("computation::compose_subgraphs", Exempt(READ_ONLY_POST)),
+    ("computation::compose_subgraphs", Exempt(RAW_POOL_READ_POST)),
     (
         "computation::propagate_beliefs",
         Exempt(
@@ -191,7 +198,10 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
         "elevation::end_elevation",
         Exempt("ends the caller's own elevation session; narrows authority, never widens it"),
     ),
-    ("embeddings::neighborhood_density", Exempt(READ_ONLY_POST)),
+    (
+        "embeddings::neighborhood_density",
+        Exempt(RAW_POOL_READ_POST),
+    ),
     ("entities::batch_create_mentions", Scope("claims:write")),
     ("entities::batch_create_triples", Scope("claims:write")),
     ("entities::create_entity", Scope("claims:write")),
@@ -417,8 +427,8 @@ fn db_fn<'a>(src: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
 }
 
 /// The scopes a handler's own source shows it checking: a `RequireScope*`
-/// extractor in its signature, or a `check_scopes(` / `has_scope(` call in a
-/// body that names the scope literal.
+/// extractor in its signature, or a scope literal inside the argument list of
+/// a `check_scopes(` / `has_scope(` call in its body.
 fn scope_evidence(signature: &str, body: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for (extractor, scope) in EXTRACTORS {
@@ -432,20 +442,49 @@ fn scope_evidence(signature: &str, body: &str) -> BTreeSet<String> {
             found.insert((*scope).to_string());
         }
     }
-    if body.contains("check_scopes(") || body.contains("has_scope(") {
-        let mut rest = body;
-        while let Some(q1) = rest.find('"') {
-            let Some(len) = rest[q1 + 1..].find('"') else {
-                break;
-            };
-            let lit = &rest[q1 + 1..q1 + 1 + len];
-            if lit.contains(':') && !lit.contains(' ') && !lit.contains('/') {
-                found.insert(lit.to_string());
+    // Only a literal INSIDE a check call's argument list counts: a handler
+    // that checks `claims:read` and names "claims:write" in an error message
+    // shows `claims:read`, not both. A call whose scope argument is a local
+    // (`check_scopes(&auth, required)`) counts the literals of that local's
+    // `let` statement.
+    for call in ["check_scopes(", "has_scope("] {
+        for (at, _) in body.match_indices(call) {
+            let open = at + call.len() - 1;
+            // `close_of` returns the index just past the `)`.
+            let args = &body[open + 1..close_of(body, open) - 1];
+            let before = found.len();
+            scope_literals(args, &mut found);
+            if found.len() > before {
+                continue;
             }
-            rest = &rest[q1 + 2 + len..];
+            // The scope argument is the last one; strip `&` and whitespace.
+            let last = args.rsplit(',').next().unwrap_or(args);
+            let ident = last.trim().trim_start_matches('&').trim();
+            if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            if let Some(l) = body.find(&format!("let {ident}")) {
+                let end = l + body[l..].find(';').unwrap_or(body.len() - l);
+                scope_literals(&body[l..end], &mut found);
+            }
         }
     }
     found
+}
+
+/// Every scope-shaped string literal (`area:verb`) in `text`.
+fn scope_literals(text: &str, found: &mut BTreeSet<String>) {
+    let mut rest = text;
+    while let Some(q1) = rest.find('"') {
+        let Some(len) = rest[q1 + 1..].find('"') else {
+            break;
+        };
+        let lit = &rest[q1 + 1..q1 + 1 + len];
+        if lit.contains(':') && !lit.contains(' ') && !lit.contains('/') {
+            found.insert(lit.to_string());
+        }
+        rest = &rest[q1 + 2 + len..];
+    }
 }
 
 fn handler_source(handler: &str) -> (String, String) {
@@ -583,6 +622,30 @@ fn the_scope_evidence_scanner_is_not_vacuous() {
     assert_eq!(
         scope_evidence(sig, body),
         BTreeSet::from(["edges:write".to_string()])
+    );
+
+    // A scope named outside the check call (here in an error message) is not
+    // evidence: the handler checks claims:read, and that is all it shows.
+    let mismatched = "pub async fn f(\n    auth: AuthContext,\n) -> R {\n    \
+                      if !auth.has_scope(\"claims:read\") {\n        \
+                      return Err(forbidden(\"needs claims:write\"));\n    }\n    \
+                      let _ = \"claims:write\";\n    Ok(())\n}\n";
+    let (sig, body) = db_fn(mismatched, "f").unwrap();
+    assert_eq!(
+        scope_evidence(sig, body),
+        BTreeSet::from(["claims:read".to_string()])
+    );
+
+    // A scope chosen into a local and passed to the check is read from the
+    // local's `let` statement.
+    let via_local = "pub async fn f(\n    auth: AuthContext,\n) -> R {\n    \
+                     let required: &[&str] = if x { &[\"claims:admin\"] } else { \
+                     &[\"claims:write\"] };\n    \
+                     check_scopes(&auth, required)?;\n    Ok(())\n}\n";
+    let (sig, body) = db_fn(via_local, "f").unwrap();
+    assert_eq!(
+        scope_evidence(sig, body),
+        BTreeSet::from(["claims:admin".to_string(), "claims:write".to_string()])
     );
 
     // The db definition is chosen over a `not(db)` stub of the same name.
