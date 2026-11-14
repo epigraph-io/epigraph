@@ -17,7 +17,9 @@
 //! * backlog 31285392: the moved claim's cached belief is refolded for its new
 //!   audience. A claim whose cache folded a BBA citing evidence that stays
 //!   behind (pinned) serves, after the act, exactly the value of a control
-//!   claim that never had that BBA.
+//!   claim that never had that BBA. Its stored scoped folds
+//!   (`ds_combined_beliefs`, `ds_bayesian_divergence`) are deleted as stale,
+//!   and another claim's are kept.
 //! * the refold fails closed: an operated agent whose session does not itself
 //!   write the target team is refused, and nothing moves.
 
@@ -501,7 +503,7 @@ async fn publicize_carries_a_source_whose_fragments_all_went_public(pool: PgPool
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 31285392: the moved claim's cached belief
+// 31285392: the moved claim's belief, cached and scoped
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `(pignistic_prob, belief, plausibility)` as stored on the claim.
@@ -588,9 +590,47 @@ async fn refold(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) {
     tx.commit().await.expect("commit");
 }
 
+/// The two stored scoped folds of `claim`: a global `ds_combined_beliefs` row
+/// and a `ds_bayesian_divergence` row, on the claim's submit frame.
+async fn scoped_rows(pool: &PgPool, claim: Uuid) {
+    let (frame, _) = submit_frame(pool, claim).await;
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, belief, plausibility, \
+                                          pignistic_prob) \
+         VALUES ($1, $2, 'global', 0.1, 0.2, 0.15)",
+    )
+    .bind(frame)
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("seed ds_combined_beliefs");
+    sqlx::query(
+        "INSERT INTO ds_bayesian_divergence (claim_id, frame_id, pignistic_prob, \
+                                             bayesian_posterior, kl_divergence) \
+         VALUES ($1, $2, 0.15, 0.8, 0.4)",
+    )
+    .bind(claim)
+    .bind(frame)
+    .execute(pool)
+    .await
+    .expect("seed ds_bayesian_divergence");
+}
+
+async fn scoped_count(pool: &PgPool, claim: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM ds_combined_beliefs WHERE claim_id = $1), \
+                (SELECT count(*) FROM ds_bayesian_divergence WHERE claim_id = $1)",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("scoped counts")
+}
+
 /// Publicize: the claim's cache had folded a refuting BBA citing evidence
 /// that stays group-only (pinned). After the act every reader is served the
-/// value of a control claim that never had that BBA, not the old fold.
+/// value of a control claim that never had that BBA, not the old fold. The
+/// claim's stored scoped folds are gone; the control's are kept.
 #[sqlx::test(migrations = "../../migrations")]
 async fn publicize_refolds_the_belief_without_the_bba_on_evidence_left_behind(pool: PgPool) {
     let s = app_role(&pool).await;
@@ -605,6 +645,8 @@ async fn publicize_refolds_the_belief_without_the_bba_on_evidence_left_behind(po
     refuting_bba(&pool, c, eve, hidden).await;
     refold(&pool, &s, eve, c).await;
     refold(&pool, &s, eve, control).await;
+    scoped_rows(&pool, c).await;
+    scoped_rows(&pool, control).await;
     let stale = cache(&pool, c).await;
     let expected = cache(&pool, control).await;
     assert!(
@@ -621,6 +663,15 @@ async fn publicize_refolds_the_belief_without_the_bba_on_evidence_left_behind(po
         "a stranger is served the fold of what it may read ({served:?}), not the team's \
          fold ({stale:?}); control {expected:?}"
     );
+    assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
+    assert_eq!(
+        scoped_count(&pool, control).await,
+        (1, 1),
+        "another claim's"
+    );
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["scoped_beliefs_cleared"], 1, "{events:?}");
+    assert_eq!(events[0]["divergence_rows_cleared"], 1, "{events:?}");
 }
 
 /// Share: the private claim's cache had folded a refuting BBA citing evidence
@@ -641,6 +692,7 @@ async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool:
     refuting_bba(&pool, c, alice, hidden).await;
     refold(&pool, &s, alice, c).await;
     refold(&pool, &s, alice, control).await;
+    scoped_rows(&pool, c).await;
     let stale = cache(&pool, c).await;
     let expected = cache(&pool, control).await;
     assert!(
@@ -661,6 +713,7 @@ async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool:
         "the teammate is served the fold of what the team may read ({served:?}), not the \
          home fold ({stale:?}); control {expected:?}"
     );
+    assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
 }
 
 /// The refold fails closed. An agent its human operates writes a private

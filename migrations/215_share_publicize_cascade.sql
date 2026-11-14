@@ -18,7 +18,7 @@
 -- from PUBLIC and granted to `epigraph_app`; the write window (`public,
 -- pg_temp` around the write statements only); no session state; locked
 -- before classified; membership read live. `CREATE OR REPLACE` keeps the
--- owner and the grants, and section 5 re-states them anyway.
+-- owner and the grants, and section 6 re-states them anyway.
 --
 -- ===================================================================
 -- 1. EDGES ON A MOVED CLAIM'S EVIDENCE
@@ -89,12 +89,46 @@
 -- claims, leave the source, report it) and the act's outcome is unchanged.
 -- `harvester_sources` has no widening guard (074's `claims_block_widening` is
 -- on `claims` only); its 115 owner guard admits the maintenance owner.
+--
+-- ===================================================================
+-- 3. THE MOVED CLAIMS' STORED SCOPED BELIEFS (backlog 31285392)
+-- ===================================================================
+--
+-- THE GAP. A claim's cached belief may fold a BBA only when every source of
+-- it is at least as widely readable as the claim
+-- (`derivation_scope.rs::CACHE_ADMISSIBLE_SQL`). Neither 206 act recomputes
+-- anything, so a value folded under the old tenancy is served to the new
+-- audience: after a publicize, a fold that took in a BBA citing PINNED
+-- evidence (110, still group-only) or a group-private edge source reaches
+-- every reader; after a share, a BBA citing evidence pinned in the home group
+-- reaches the team. `ds_combined_beliefs` and `ds_bayesian_divergence` rows
+-- follow the claim (arm (d)) with their values already folded.
+--
+-- THE FIX, IN TWO HALVES.
+-- * The scoped stores, here: every `ds_combined_beliefs` and
+--   `ds_bayesian_divergence` row of a moved claim is deleted as stale, as
+--   184's retraction deletes the scoped folds a retracted BBA entered. They
+--   are derived stores, and the next computation that stores them (the REST
+--   belief routes, `assess`) writes them afresh. Counted in the audit row
+--   (`scoped_beliefs_cleared`, `divergence_rows_cleared`). Maintenance has
+--   held DELETE on `ds_combined_beliefs` since 184; it is granted DELETE on
+--   `ds_bayesian_divergence` here (section 7), the one more reviewed delete
+--   path 070's "stamps and reads and never destroys" grant gains.
+-- * The claim's own cache (`claims.belief`, `plausibility`, `pignistic_prob`,
+--   `mass_on_empty`, `mass_on_missing`, `classification`) is a Dempster-Shafer
+--   fold, and the fold runs in Rust (114 records why a definer takes cache
+--   values from its caller rather than computing them). So it is NOT here: the
+--   one caller of both acts, `epigraph_engine::visibility_act`, refolds each
+--   moved claim in the same transaction, after this function returns and
+--   before the commit, through `edge_factor::recompute_claim_cached_belief`
+--   (ruling R-80's vacate included), and refuses the whole act when the
+--   session cannot write the claim it would refold.
 SET LOCAL lock_timeout = '3s';
 
 -- ===================================================================
--- 3. epigraph_publicize_claims(ids, reason): group -> public
+-- 4. epigraph_publicize_claims(ids, reason): group -> public
 -- ===================================================================
--- 206 section 4, with section 1's evidence-endpoint edges and section 2's sources.
+-- 206 section 4, with sections 1 to 3.
 CREATE OR REPLACE FUNCTION public.epigraph_publicize_claims(p_claim_ids uuid[], p_reason text)
 RETURNS TABLE (claim_id uuid, outcome text)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -114,6 +148,8 @@ DECLARE
     v_ev_edges bigint := 0;
     v_sources_moved bigint := 0;
     v_sources_held bigint := 0;
+    v_scoped bigint := 0;
+    v_divergence bigint := 0;
     v_pinned bigint := 0;
     v_owners uuid[];
     v_moved bigint := 0;
@@ -298,6 +334,13 @@ BEGIN
     SELECT (SELECT count(*) FROM moved), (SELECT count(*) FROM agree a WHERE a.n > 1)
       INTO v_sources_moved, v_sources_held;
 
+
+    -- Section 3: the moved claims' stored scoped folds are stale.
+    DELETE FROM public.ds_combined_beliefs d WHERE d.claim_id = ANY(v_todo);
+    GET DIAGNOSTICS v_scoped = ROW_COUNT;
+    DELETE FROM public.ds_bayesian_divergence dv WHERE dv.claim_id = ANY(v_todo);
+    GET DIAGNOSTICS v_divergence = ROW_COUNT;
+
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.publicized', v_principal, true,
             jsonb_build_object('claim_ids', to_jsonb(v_todo),
@@ -307,6 +350,8 @@ BEGIN
                                'evidence_edges_rewritten', v_ev_edges,
                                'harvester_sources_moved', v_sources_moved,
                                'harvester_sources_held', v_sources_held,
+                               'scoped_beliefs_cleared', v_scoped,
+                               'divergence_rows_cleared', v_divergence,
                                'evidence_kept_private', v_pinned,
                                'migration', 215,
                                'session_user', session_user::text));
@@ -319,9 +364,9 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_publicize_claims(uuid[], text) FROM PUBLIC;
 
 -- ===================================================================
--- 4. epigraph_share_claims_with_team(ids, group, reason): private -> team
+-- 5. epigraph_share_claims_with_team(ids, group, reason): private -> team
 -- ===================================================================
--- 206 section 5, with section 1's evidence-endpoint edges and section 2's sources.
+-- 206 section 5, with sections 1 to 3.
 CREATE OR REPLACE FUNCTION public.epigraph_share_claims_with_team(
     p_claim_ids uuid[], p_group_id uuid, p_reason text)
 RETURNS TABLE (claim_id uuid, outcome text)
@@ -343,6 +388,8 @@ DECLARE
     v_ev_edges bigint := 0;
     v_sources_moved bigint := 0;
     v_sources_held bigint := 0;
+    v_scoped bigint := 0;
+    v_divergence bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'VIS01: sharing with a team needs an authenticated principal; '
@@ -495,6 +542,13 @@ BEGIN
     SELECT (SELECT count(*) FROM moved), (SELECT count(*) FROM agree a WHERE a.n > 1)
       INTO v_sources_moved, v_sources_held;
 
+
+    -- Section 3: the moved claims' stored scoped folds are stale.
+    DELETE FROM public.ds_combined_beliefs d WHERE d.claim_id = ANY(v_cls_ids);
+    GET DIAGNOSTICS v_scoped = ROW_COUNT;
+    DELETE FROM public.ds_bayesian_divergence dv WHERE dv.claim_id = ANY(v_cls_ids);
+    GET DIAGNOSTICS v_divergence = ROW_COUNT;
+
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('claim.shared_with_team', v_principal, true,
             jsonb_build_object('claim_ids', to_jsonb(v_cls_ids), 'from_group_id', v_home,
@@ -502,6 +556,8 @@ BEGIN
                                'evidence_edges_rewritten', v_ev_edges,
                                'harvester_sources_moved', v_sources_moved,
                                'harvester_sources_held', v_sources_held,
+                               'scoped_beliefs_cleared', v_scoped,
+                               'divergence_rows_cleared', v_divergence,
                                'migration', 215, 'session_user', session_user::text));
     PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
 
@@ -510,10 +566,12 @@ END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_share_claims_with_team(uuid[], uuid, text) FROM PUBLIC;
 
 -- ===================================================================
--- 5. OWNERSHIP AND GRANTS (206 section 6, for the two bodies re-stated)
+-- 6. OWNERSHIP AND GRANTS (206 section 6, for the two bodies re-stated)
+-- 7. MAINTENANCE DELETE ON ds_bayesian_divergence (section 3)
 -- ===================================================================
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'GRANT DELETE ON public.ds_bayesian_divergence TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_publicize_claims(uuid[], text) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_share_claims_with_team(uuid[], uuid, text) '
