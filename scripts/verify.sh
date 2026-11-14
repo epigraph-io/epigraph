@@ -2,12 +2,22 @@
 #
 # verify.sh — local / agent pre-commit gate.
 #
-# Runs the same static checks the CI `test` job enforces (see
+# Runs the cargo steps of the CI `lint` and `test` jobs (see
 # .github/workflows/ci.yml), so `cargo build` + `cargo test` alone don't let a
 # formatting or lint failure slip through to CI. KEEP THIS IN SYNC WITH ci.yml.
 #
+# What it runs, in CI's terms:
+#   lint job: fmt, workspace clippy, the no-db check, the genai clippy pair,
+#             the tls clippy and the two tls tests (none needs a database);
+#   test job: build, then (only with DATABASE_URL) the non-DB workspace tests
+#             and each DB package on its own, with CI's excludes and thread
+#             counts.
+# What it does NOT run: CI's `Run migrations` step (bring your own migrated
+# test database, see below), the purge of linked test executables between test
+# steps, and the kanban, python, audit and secrets jobs.
+#
 # Usage:
-#   ./scripts/verify.sh            # fmt + clippy + build (+ workspace tests if DATABASE_URL is set),
+#   ./scripts/verify.sh            # the lint steps + build (+ the test steps if DATABASE_URL is set),
 #                                  # then the standalone services/explorer crate (always)
 #   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/<testdb> ./scripts/verify.sh
 #
@@ -38,15 +48,47 @@ cargo fmt --check
 step "cargo clippy --workspace --all-targets --locked -- -D warnings"
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
+# The feature-gated checks of the CI `lint` job. No other step compiles the
+# no-db variant of epigraph-api or the off-by-default `genai` and `tls`
+# features, so without these a change passes here and fails CI.
+step "cargo check -p epigraph-api --no-default-features --locked"
+cargo check -p epigraph-api --no-default-features --locked
+
+# One invocation per package, as in ci.yml: a combined `-p a -p b` run unifies
+# features and can hide a break that only one package alone shows.
+for pkg in epigraph-api epigraph-cli; do
+  step "cargo clippy -p ${pkg} --features genai --all-targets --locked -- -D warnings"
+  cargo clippy -p "${pkg}" --features genai --all-targets --locked -- -D warnings
+done
+
+step "cargo clippy -p epigraph-api --features tls --all-targets --locked -- -D warnings"
+cargo clippy -p epigraph-api --features tls --all-targets --locked -- -D warnings
+
+step "cargo test -p epigraph-api --features tls --locked --test tls_pem_loading --test tls_provider_choice"
+cargo test -p epigraph-api --features tls --locked --test tls_pem_loading --test tls_provider_choice
+
 step "cargo build --workspace --locked"
 cargo build --workspace --locked
 
 if [ -n "${DATABASE_URL:-}" ]; then
-  step "cargo test --workspace --locked"
-  cargo test --workspace --locked
+  # The packages with #[sqlx::test] or live-DB tests are excluded here and run
+  # one at a time below, as in ci.yml (they race on _sqlx_migrations when run
+  # together, and running them here as well ran each of them twice).
+  step "cargo test --workspace --locked (non-DB packages)"
+  cargo test --workspace --locked \
+    --exclude epigraph-db \
+    --exclude epigraph-api \
+    --exclude epigraph-engine \
+    --exclude epigraph-mcp \
+    --exclude epigraph-embeddings
 
-  # DB crates use #[sqlx::test]; serialize within each binary (CI does the same).
-  for pkg in epigraph-db epigraph-api epigraph-engine epigraph-mcp; do
+  # epigraph-db is cleared to run 4 tests at a time; the explicit flag is what
+  # overrides RUST_TEST_THREADS=1 from .cargo/config.toml.
+  step "cargo test -p epigraph-db --locked -- --test-threads=4"
+  cargo test -p epigraph-db --locked -- --test-threads=4
+
+  # The rest serialize within each binary (CI does the same).
+  for pkg in epigraph-api epigraph-engine epigraph-mcp epigraph-embeddings; do
     step "cargo test -p ${pkg} --locked -- --test-threads=1"
     cargo test -p "${pkg}" --locked -- --test-threads=1
   done
