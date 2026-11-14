@@ -609,7 +609,10 @@ fn public_only_viewer_is_built_only_by_the_guest_routes() {
                 .map(|l| l.find("//").map_or(l, |i| &l[..i]))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let calls = code.matches("public_only()").count();
+            // The bare token, not `public_only()`: passing the constructor as
+            // a function value (`unwrap_or_else(Viewer::public_only)`) builds
+            // the same viewer without the parentheses.
+            let calls = word_count(&code, "public_only");
             let allowed = if rel.ends_with("epigraph-api/src/routes/guest.rs") {
                 calls
             } else if rel.ends_with("epigraph-db/src/visibility.rs") {
@@ -625,7 +628,27 @@ fn public_only_viewer_is_built_only_by_the_guest_routes() {
     }
     assert!(
         offenders.is_empty(),
-        "Viewer::public_only() called outside the guest routes:\n{}",
+        "Viewer::public_only referenced outside the guest routes:\n{}",
         offenders.join("\n")
     );
+}
+
+/// Occurrences of `word` in `text` not run into an identifier on either side,
+/// so `public_only_viewer_reads_…` and `is_public_only` do not count.
+fn word_count(text: &str, word: &str) -> usize {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices(word)
+        .filter(|(i, _)| {
+            let before = text[..*i].chars().next_back();
+            let after = text[i + word.len()..].chars().next();
+            !before.is_some_and(ident) && !after.is_some_and(ident)
+        })
+        .count()
+}
+
+#[test]
+fn word_count_matches_the_bare_token_only() {
+    let code = "a(Viewer::public_only()); b.unwrap_or_else(Viewer::public_only); \
+                fn public_only_viewer_reads() {} let is_public_only = 1;";
+    assert_eq!(word_count(code, "public_only"), 2);
 }
