@@ -768,12 +768,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
+///
 /// 210 -> 207 when `routes/isomorphism.rs` was DELETED (backlog 54db73b5): a
 /// removal of never-compiled code, not a conversion, and its key went with it
 /// (`HIGH_WATER_FILES` falls by one).
 /// 207 -> 206 when `supersede_claim`'s detached factor-count spawn was deleted
 /// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
-const HIGH_WATER: usize = 206;
+///
+/// 206 -> 205: `routes/perspective.rs::set_source_reliability` writes on
+/// `AppState::write_as` (backlog 0f2f9ddb); the file keeps one site, so the
+/// file count does not move.
+const HIGH_WATER: usize = 205;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1077,12 +1082,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // and not convertible.
     ("routes/papers.rs", 8),
     // 5 before conversion shard 5, which moved `list_perspectives`,
-    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`. The
-    // two that remain both WRITE -- `create_perspective` (which also creates a
-    // PERSPECTIVE_OF edge) and `set_source_reliability` (an `UPDATE`) -- and
-    // neither `PerspectiveRepository::create` nor `::set_source_reliability`
-    // takes a `Viewer`. Same owner as `context.rs`'s residue.
-    ("routes/perspective.rs", 2),
+    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`, and
+    // 2 before `set_source_reliability` (an `UPDATE`) moved onto
+    // `AppState::write_as` (backlog 0f2f9ddb). The one that remains WRITES --
+    // `create_perspective` (which also creates a PERSPECTIVE_OF edge) -- and
+    // `PerspectiveRepository::create` takes no `Viewer`. Same owner as
+    // `context.rs`'s residue.
+    ("routes/perspective.rs", 1),
     // 9 before the operator-binding delta review, which moved
     // `create_challenge`'s transaction onto `AppState::begin_claim_write`.
     ("routes/policies.rs", 8),
