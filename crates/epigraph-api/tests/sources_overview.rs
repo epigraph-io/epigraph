@@ -507,3 +507,26 @@ fn a_failed_overview_read_that_did_not_time_out_is_a_500() {
         epigraph_api::errors::ApiError::InternalError { .. }
     ));
 }
+
+/// An IPv6 literal host is its whole bracketed literal, not the text up to
+/// its first colon (which the port-stripping used to cut it at).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_ipv6_host_is_keyed_by_its_bracketed_literal(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (filer, _) = named_agent(&pool, "v6 filer").await;
+    let (reader, _) = named_agent(&pool, "v6 reader").await;
+    let t = theme(&pool, "sources-v6").await;
+    let a = viewer_fixture::seed_public_claim(&pool, filer, "v6 a").await;
+    let b = viewer_fixture::seed_public_claim(&pool, filer, "v6 b").await;
+    evidence_at(&pool, a, "http://[2001:DB8::1]:8080/x").await;
+    evidence_at(&pool, b, "https://user@[2001:db8::1]/y").await;
+    in_theme(&pool, a, t).await;
+    in_theme(&pool, b, t).await;
+
+    let got = walk(&state, reader, &format!("theme_id={t}&kind=web&limit=50")).await;
+    assert_eq!(
+        got,
+        vec![("web".to_string(), "[2001:db8::1]".to_string(), 2)],
+        "{got:?}"
+    );
+}

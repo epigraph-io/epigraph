@@ -8,8 +8,9 @@
 //!   document ingest writes that edge (`crate::ingest_written`), so a
 //!   hand-written edge of the same shape credits no paper.
 //! * **`web`**: the host of a readable evidence row's `source_url` (key: the
-//!   lower-cased host, port and a leading `www.` dropped). Evidence without a
-//!   URL, or with one that names no host, counts nowhere.
+//!   lower-cased host, port and a leading `www.` dropped; an IPv6 literal
+//!   keeps its brackets, `[2001:db8::1]`, since its colons are not a port).
+//!   Evidence without a URL, or with one that names no host, counts nowhere.
 //! * **`agent`**: the filer (`claims.agent_id`) of a claim NO readable paper
 //!   asserts: a claim filed directly. A claim whose only paper assertion the
 //!   caller cannot read is the filer's for that caller, exactly as a claim's
@@ -200,7 +201,7 @@ impl SourcesRepository {
                      SELECT 'web'::text, d.host, COUNT(DISTINCT d.claim_id) \
                        FROM (SELECT ev.claim_id, \
                                     regexp_replace(lower(substring(ev.source_url \
-                                        FROM '^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#@]*@)?([^/?#:]+)')), \
+                                        FROM '^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#@]*@)?(\\[[^]]*\\]|[^/?#:]+)')), \
                                         '^www\\.', '') AS host \
                                FROM vc JOIN evidence ev ON ev.claim_id = vc.id \
                               WHERE ($2::text[] IS NULL OR 'web' = ANY($2)) \
