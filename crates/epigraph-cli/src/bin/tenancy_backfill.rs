@@ -1699,10 +1699,18 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // It fails SILENTLY for an incident edge outside the caller's writable
     // groups: 117's restrictive `edges_update_owner` filters that row out, so
     // the claim goes public and the edge stays group-only.
+    // 215 re-states it (and the share below) and adds, under the same owner:
+    // the re-meet of edges on the moved claims' evidence (as above, LOUD or
+    // SILENT); a `harvester_sources` tenancy change, which the 115
+    // owner-immutable guard 173 attached refuses LOUD outside a privileged
+    // frame; and the deletes of the moved claims' `ds_combined_beliefs` and
+    // `ds_bayesian_divergence` rows, which row security filters SILENTLY to
+    // the rows the owner can see, leaving stale scoped folds behind.
     ("epigraph_publicize_claims", 206),
     // 206's private -> team share changes `claims.owner_group_id`, which 115's
     // `claims_owner_immutable` refuses outside a privileged frame: every share
-    // fails LOUD (42501) with nothing moved.
+    // fails LOUD (42501) with nothing moved. 215 adds the same three steps as
+    // publicize, with the same failure modes.
     ("epigraph_share_claims_with_team", 206),
     // 209, an agent's private default and the operator's setter. The READ
     // `epigraph_default_private` reads only `agents` (readable to every role),
