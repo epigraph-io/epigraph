@@ -62,6 +62,9 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 /// The header that carries the request id, in and out.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// The longest incoming request id that is kept.
+pub const MAX_INCOMING_REQUEST_ID_LEN: usize = 64;
+
 /// The serving settings, read once at boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServeSettings {
@@ -151,10 +154,11 @@ impl ServeSettings {
 
 /// Wrap the application router in the request-id, trace and timeout layers.
 ///
-/// Outermost first: a request id is set (an incoming `x-request-id` is kept,
-/// otherwise a UUID is minted), the request is traced in a span carrying that
-/// id, the id is copied onto the response, and the handler runs under the
-/// timeout. So a 408 from the timeout is traced and carries the id too.
+/// Outermost first: a request id is set (an incoming `x-request-id` is kept
+/// when [`is_acceptable_request_id`] passes it, otherwise a UUID is minted),
+/// the request is traced in a span carrying that id, the id is copied onto the
+/// response, and the handler runs under the timeout. So a 408 from the timeout
+/// is traced and carries the id too.
 ///
 /// The span records the method, the path (through [`loggable_path`]) and the
 /// request id, and nothing else. Not the query string (`/oauth/authorize` and
@@ -167,10 +171,43 @@ pub fn apply_layers(router: Router, settings: &ServeSettings) -> Router {
     };
     router.layer(
         ServiceBuilder::new()
+            .map_request(drop_unacceptable_request_id::<axum::body::Body>)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(TraceLayer::new_for_http().make_span_with(request_span))
             .layer(PropagateRequestIdLayer::x_request_id()),
     )
+}
+
+/// Whether a client-supplied request id is kept: 1 to
+/// [`MAX_INCOMING_REQUEST_ID_LEN`] characters of `[A-Za-z0-9._-]`.
+///
+/// The id is recorded into the request span, which every event the request
+/// emits carries, and the text log writes span fields unquoted. A header like
+/// `x path=/api/v1/admin method=DELETE` would forge fields into each of those
+/// lines, and a header of many KiB would be copied into each of them. Anything
+/// else is replaced by a minted UUID, so a request is still traceable.
+#[must_use]
+pub fn is_acceptable_request_id(raw: &[u8]) -> bool {
+    (1..=MAX_INCOMING_REQUEST_ID_LEN).contains(&raw.len())
+        && raw
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Remove an incoming `x-request-id` that [`is_acceptable_request_id`]
+/// refuses (every one, when the header is repeated and any copy is refused), so
+/// `SetRequestIdLayer` mints one instead.
+fn drop_unacceptable_request_id<B>(mut request: Request<B>) -> Request<B> {
+    let headers = request.headers_mut();
+    if headers
+        .get_all(REQUEST_ID_HEADER)
+        .iter()
+        .any(|v| !is_acceptable_request_id(v.as_bytes()))
+        || headers.get_all(REQUEST_ID_HEADER).iter().count() > 1
+    {
+        headers.remove(REQUEST_ID_HEADER);
+    }
+    request
 }
 
 /// The trace span for one request: method, path and request id only.
@@ -454,5 +491,41 @@ mod tests {
         )
         .await;
         assert_eq!(kept.headers().get(REQUEST_ID_HEADER).unwrap(), "abc-123");
+    }
+
+    #[tokio::test]
+    async fn an_incoming_request_id_that_could_forge_log_fields_is_replaced() {
+        let settings = ServeSettings::default();
+        let long = "a".repeat(MAX_INCOMING_REQUEST_ID_LEN + 1);
+        for forged in [
+            "x path=/api/v1/admin method=DELETE",
+            "a\"b",
+            "id%0a",
+            long.as_str(),
+        ] {
+            let response = call(
+                apply_layers(slow_router(), &settings),
+                "/fast",
+                Some(forged),
+            )
+            .await;
+            let id = response
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .expect("a request id")
+                .to_str()
+                .unwrap();
+            assert_ne!(id, forged, "an unsafe incoming id was kept");
+            assert!(
+                uuid::Uuid::parse_str(id).is_ok(),
+                "{forged:?} -> {id}: not minted"
+            );
+        }
+        // The boundary that is kept.
+        let at_limit = "a".repeat(MAX_INCOMING_REQUEST_ID_LEN);
+        for ok in ["req.1_A-z", at_limit.as_str()] {
+            let response = call(apply_layers(slow_router(), &settings), "/fast", Some(ok)).await;
+            assert_eq!(response.headers().get(REQUEST_ID_HEADER).unwrap(), ok);
+        }
     }
 }
