@@ -768,7 +768,15 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-const HIGH_WATER: usize = 210;
+///
+/// 210 -> 207 (backlog f64cf9c6): `create_reasoning_trace` moved its three
+/// pool sites onto the caller's `AppState::write_as` transaction
+/// (`routes/crud.rs` 30 -> 27, keeping sites).
+///
+/// 207 -> 206 (backlog 8a168dd6): `query_security_events` reads on the
+/// caller's `AppState::read_as`; `routes/audit.rs` reached zero and its key
+/// was DELETED (`HIGH_WATER_FILES` falls by one with it).
+const HIGH_WATER: usize = 206;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -836,7 +844,8 @@ const HIGH_WATER: usize = 210;
 /// 40 -> 39 when `routes/graph_query.rs` reached zero (HTTP public-only reads).
 /// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
 /// caller's stamped transaction; merged with the line above on staging).
-const HIGH_WATER_FILES: usize = 38;
+/// 38 -> 37 when `routes/audit.rs` reached zero (backlog 8a168dd6).
+const HIGH_WATER_FILES: usize = 37;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -848,7 +857,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/agent_keys.rs", 6),
     ("routes/agents.rs", 10),
     ("routes/assess.rs", 1),
-    ("routes/audit.rs", 1),
+    // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
+    // `query_security_events` reads on `AppState::read_as` with the caller's
+    // viewer.
     // 17 before this PR. Shard 4 converted the FOURTEEN read-only handlers onto
     // `AppState::read_as`. The row SURVIVES at 3 rather than being deleted, and
     // the remainder is a class rather than a leftover: `create_frame`,
@@ -971,7 +982,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 31 -> 30: `build_themes_from_corpus` (the k-means bootstrap, a corpus-wide
     // write on `state.db_pool`) was deleted with the prototype, backlog
     // a0ed0180. A removal, not a conversion.
-    ("routes/crud.rs", 30),
+    // 30 -> 27 (backlog f64cf9c6): `create_reasoning_trace` writes its author
+    // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
+    // transaction. Its provenance append stays on the pool, as every
+    // `record_provenance` call does.
+    ("routes/crud.rs", 27),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
