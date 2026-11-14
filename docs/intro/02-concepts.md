@@ -121,12 +121,25 @@ everywhere. Three seed strategies are in use today:
   the LEGACY seed: once a deployment registers its system agent in the
   `system_agents` registry (migration 148), the registry is
   authoritative and the agent's key can be rotated to a secret one.
-- **LLM-driven agents (planned, tracked in [issue #166](https://github.com/epigraph-io/epigraph/issues/166))** —
-  the seed is a hash of `(model identifier, system prompt)` so the same
-  model+prompt pair resolves to the same agent identity across sessions.
-  User OAuth passthrough sits next on that roadmap, so writes
-  attributed to "Claude with prompt X acting for Jeremy" can be
-  distinguished from "Claude with prompt X acting for Carrie".
+- **LLM-driven agents** — the seed is the model identifier plus the
+  BLAKE3 hash of the system prompt, so the same model+prompt pair
+  resolves to the same agent identity across sessions. The MCP server
+  derives its signer this way when it is started with `--agent-model`
+  (`EPIGRAPH_AGENT_MODEL`) and `--agent-system-prompt` or
+  `--agent-system-prompt-hash` (`keypair_from_llm_agent` in
+  `epigraph-crypto`; first tracked in
+  [issue #166](https://github.com/epigraph-io/epigraph/issues/166)).
+  Both inputs are public, so anyone who can read them can recompute
+  that private key. User OAuth passthrough sits next on that roadmap,
+  so writes attributed to "Claude with prompt X acting for Jeremy" can
+  be distinguished from "Claude with prompt X acting for Carrie".
+
+A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
+
+1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with `EPIGRAPH_AGENT_SIGNING_KEY`: the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with the two options below.
+2. `--agent-model`, the LLM-agent seed above. It takes precedence over `--agent-key`.
+3. `--agent-key` (`EPIGRAPH_MCP_AGENT_KEY`): a fixed 32-byte secret key that you generate once and keep. This is what the [quickstart](01-quickstart.md) sets up.
+4. None of these: the server generates a fresh keypair on every launch and says so on stderr. Each launch then authors as a different agent, and the server warns that ownership cannot be decided for such a signer.
 
 A `did:key` URI looks like this:
 
@@ -154,7 +167,7 @@ Two flows mint different tokens, and it is easy to confuse them:
 
 The bearer-token's `agent_id` claim — when present — pins the resulting writes to a specific agent; without it, writes are attributed to the OAuth client's default agent. Either way the agent identity is the *durable* identity; the bearer token is just the per-session capability that lets a process act on its behalf.
 
-Practical implication for new code: never generate an Ed25519 keypair at runtime "to identify this process". Use the deterministic helper that matches the actor type: `did_key_for_author` for human authors, fixed system-agent seed helpers for named infrastructure agents, and `did_key_for_llm_agent(model_id, system_prompt)` for autonomous LLM agents. The LLM helper hashes the system prompt and combines it with the model identifier, so the same model+prompt pair gets the same DID across hosts while any model or prompt revision becomes a distinct signing identity. Let the get-or-create pattern in `system_agent.rs` find or insert the matching `agents` row. The same role on a different machine then writes against the same agent UUID and the same signing key, so attribution composes cleanly across hosts.
+Practical implication for new code: never generate an Ed25519 keypair on each run "to identify this process" (rung 4 above is the fallback, not a pattern to copy). Give the process a stable identity: a fixed key generated once and stored (`--agent-key`), or the deterministic helper that matches the actor type: `did_key_for_author` for human authors, fixed system-agent seed helpers for named infrastructure agents, and `keypair_from_llm_agent(model_id, system_prompt)` for autonomous LLM agents (`did_key_for_llm_agent` returns the `did:key` of the same keypair). The LLM helper hashes the system prompt and combines it with the model identifier, so the same model+prompt pair gets the same DID across hosts while any model or prompt revision becomes a distinct signing identity. Let the get-or-create pattern in `system_agent.rs` find or insert the matching `agents` row. The same role on a different machine then writes against the same agent UUID and the same signing key, so attribution composes cleanly across hosts.
 
 **See also:** [`crates/epigraph-crypto/src/did_key.rs`](../../crates/epigraph-crypto/src/did_key.rs) for `did:key` derivation; [`crates/epigraph-ingest-executor/src/system_agent.rs`](../../crates/epigraph-ingest-executor/src/system_agent.rs) for the get-or-create pattern; user-memory `reference_epigraph_oauth_mint.md` for the Ed25519 client-assertion shape against `/oauth/token`.
 
