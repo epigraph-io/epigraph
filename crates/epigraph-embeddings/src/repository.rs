@@ -46,13 +46,24 @@ impl EmbeddingRepository {
     /// `visibility`: a group-private claim is ordinary plaintext and is still
     /// embedded.
     ///
+    /// The predicate is only as good as the session's view of
+    /// `claim_encryption`, which 077's policy shows only to the sealing group
+    /// (or a row-security-bypassing role). This pool is unstamped, so on a
+    /// role subject to row security the subquery sees no encryption row and
+    /// excludes nothing; migration 212's row trigger is then what refuses the
+    /// write, and a sealed claim comes back as `Err` (a database error,
+    /// SQLSTATE 42501), not `Ok(false)`.
+    ///
     /// # Arguments
     /// * `claim_id` - The claim's UUID
     /// * `embedding` - The embedding vector
     ///
     /// # Returns
     /// * `Ok(true)` - Stored
-    /// * `Ok(false)` - No row matched: no such claim, or the claim is sealed
+    /// * `Ok(false)` - No row matched: no such claim, or a sealed claim the
+    ///   session can see is sealed
+    /// * `Err(EmbeddingError::DatabaseError)` - Includes 212's refusal of a sealed
+    ///   claim the session cannot see is sealed
     /// * `Err(EmbeddingError::DimensionMismatch)` - If dimension is wrong
     pub async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<bool, EmbeddingError> {
         if embedding.len() != self.dimension {
