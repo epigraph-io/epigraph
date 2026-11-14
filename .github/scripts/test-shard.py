@@ -19,7 +19,7 @@ cannot drift apart.
                                        and that every whole-tree source scan is
                                        declared in WALKERS
     test-shard.py ci-plan              the `plan` job: GITHUB_OUTPUT lines for
-                                       this event (matrix, run flags)
+                                       this event (matrix, run flags, runner)
     test-shard.py gate                 the `test` job: fail unless every job the
                                        plan asked for succeeded
     test-shard.py scan-args <targets>  the source-scans shard's cargo invocations,
@@ -172,6 +172,13 @@ EXTRA_JOBS = {
     "test-unqualified": ("epigraph-jobs", "engine-integration-tests"),
     "lint-features": ("epigraph-api", "epigraph-cli"),
 }
+
+# The runner for the shards when the SHARD_RUNS_ON variable is unset or
+# unusable, and always for a pull request from a fork.
+HOSTED_RUNNER = "ubuntu-latest"
+# `max-parallel` when SHARD_MAX_PARALLEL is unset: GitHub's matrix limit, so
+# in effect unlimited.
+UNLIMITED_PARALLEL = 256
 
 
 def load():
@@ -687,6 +694,69 @@ def event_full_reason(event, head_ref, labels):
     return None
 
 
+def shard_runner(event, head_repo, repository, raw):
+    """(the shards' `runs-on`, a warning or None).
+
+    SHARD_RUNS_ON (a repository variable, JSON: a label, a list of labels, or
+    {"group": ..., "labels": [...]}) is honoured only for an event whose code
+    the repository's own members pushed: a push, a merge-queue run, a manual
+    or scheduled run, or a pull request whose head is in this repository. A
+    pull request from a fork always gets the GitHub-hosted runner whatever the
+    variable says: self-hosted runners must never run code from a fork of a
+    public repository. A deleted fork has no head repository and is a fork.
+    """
+    if not raw or not raw.strip():
+        return HOSTED_RUNNER, None
+    if event == "pull_request":
+        if not head_repo or head_repo != repository:
+            return HOSTED_RUNNER, None
+    elif event not in FULL_EVENTS:
+        return HOSTED_RUNNER, None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return HOSTED_RUNNER, f"SHARD_RUNS_ON is not JSON ({raw!r}); using {HOSTED_RUNNER}"
+
+    def label(x):
+        return isinstance(x, str) and x.strip() != ""
+
+    ok = (
+        label(value)
+        or (isinstance(value, list) and value and all(label(x) for x in value))
+        or (
+            isinstance(value, dict)
+            and value
+            and set(value) <= {"group", "labels"}
+            and ("group" not in value or label(value["group"]))
+            and (
+                "labels" not in value
+                or label(value["labels"])
+                or (
+                    isinstance(value["labels"], list)
+                    and value["labels"]
+                    and all(label(x) for x in value["labels"])
+                )
+            )
+        )
+    )
+    if not ok:
+        return HOSTED_RUNNER, f"SHARD_RUNS_ON is not a runs-on value ({raw!r}); using {HOSTED_RUNNER}"
+    return value, None
+
+
+def max_parallel(raw):
+    """(the shards' `max-parallel`, a warning or None)."""
+    if not raw or not raw.strip():
+        return UNLIMITED_PARALLEL, None
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        n = 0
+    if n < 1:
+        return UNLIMITED_PARALLEL, f"SHARD_MAX_PARALLEL is not a positive integer ({raw!r}); not capping"
+    return n, None
+
+
 def decide(root, pkgs, shards, env, changed=None, reads=None):
     """The plan for one workflow run, from its environment.
 
@@ -694,7 +764,7 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
     `reads` (`scan_reads`'s first result) from the tree. Returns a
     dict: mode ("full" or "affected"), reason, ids (the matrix's shard ids,
     source-scans included), whole and partial (see `affected`), matrix, run,
-    warnings."""
+    runs_on, max_parallel, warnings."""
     event = env.get("GITHUB_EVENT_NAME", "")
     try:
         labels = json.loads(env.get("PR_LABELS") or "[]")
@@ -733,6 +803,14 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
         whole, partial = {p: "full run" for p in pkgs}, {}
         ids = list(shards)
         mode = "full"
+    runs_on, w = shard_runner(
+        event, env.get("HEAD_REPO", ""), env.get("GITHUB_REPOSITORY", ""), env.get("SHARD_RUNS_ON", "")
+    )
+    if w:
+        warnings.append(w)
+    cap, w = max_parallel(env.get("SHARD_MAX_PARALLEL", ""))
+    if w:
+        warnings.append(w)
     matrix = matrix_for(shards, ids, partial)
     ids = [e["shard"] for e in matrix["include"]]
     return {
@@ -744,6 +822,8 @@ def decide(root, pkgs, shards, env, changed=None, reads=None):
         "partial": partial,
         "matrix": matrix,
         "run": run_flags(ids, whole, mode == "full"),
+        "runs_on": runs_on,
+        "max_parallel": cap,
         "warnings": warnings,
     }
 
@@ -763,6 +843,7 @@ def explain(d, out):
                 for t, why in sorted(ts.items()):
                     print(f"  {name} --test {t}: {why}", file=out)
     print("jobs: " + ", ".join(f"{j}={'run' if r else 'skip'}" for j, r in d["run"].items()), file=out)
+    print(f"runs-on: {json.dumps(d['runs_on'])}; max-parallel: {d['max_parallel']}", file=out)
 
 
 def gate(needs):
@@ -874,6 +955,8 @@ def main(argv):
         print(f"matrix={json.dumps(d['matrix'])}")
         print(f"count={len(d['ids'])}")
         print(f"run={json.dumps(d['run'])}")
+        print(f"runs_on={json.dumps(d['runs_on'])}")
+        print(f"max_parallel={d['max_parallel']}")
         print(f"mode={d['mode']}")
         return 0
     if len(argv) != 3 or argv[2] not in shards:

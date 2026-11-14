@@ -61,7 +61,25 @@ jobs:
   # all jobs": the label is read live, not from the event), and on any change
   # to migrations/, Cargo.lock, the root Cargo.toml, .github/, rust-toolchain*,
   # .sqlx/ or .cargo/. The coverage check below always runs on the full plan.
-
+  #
+  # SELF-HOSTED SHARD RUNNERS (off unless the operator turns them on). Self-
+  # hosted runners do not count against the 20-job cap. Set the repository
+  # variable SHARD_RUNS_ON to a JSON `runs-on` value, e.g.
+  #   gh variable set SHARD_RUNS_ON -R epigraph-io/epigraph \
+  #     --body '["self-hosted", "linux", "x64", "epigraph-shard"]'
+  # and only the shards move; unset it (`gh variable delete SHARD_RUNS_ON`) to
+  # move them back. A pull request from a FORK always gets ubuntu-latest
+  # whatever the variable says (test-shard.py `shard_runner`): self-hosted
+  # runners must never run a stranger's code on a public repository. Each
+  # runner must be Linux with Docker (the Postgres service container),
+  # `mold` and Python 3 installed, and one runner per machine or VM (the
+  # service binds host port 5432); ephemeral (`--ephemeral`) runners are the
+  # safe default. An org runner group does not serve public repositories
+  # until its "Allow public repositories" setting is on.
+  #
+  # PER-PR CAP. The repository variable SHARD_MAX_PARALLEL (a positive
+  # integer) caps how many shards of ONE run execute at once, so a single PR
+  # cannot take every runner; unset means no cap.
   plan:
     name: Plan test shards
     runs-on: ubuntu-latest
@@ -75,6 +93,8 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
       run: ${{ steps.plan.outputs.run }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -106,6 +126,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SHARD_RUNS_ON: ${{ vars.SHARD_RUNS_ON }}
+          SHARD_MAX_PARALLEL: ${{ vars.SHARD_MAX_PARALLEL }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             export DIFF_BASE=HEAD^1
@@ -124,7 +147,10 @@ jobs:
     # is then skipped rather than started with an empty matrix, which GitHub
     # rejects, and the `test` gate accepts the skip because the plan said so.
     if: ${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}
-    runs-on: ubuntu-latest
+    # ubuntu-latest unless the operator set SHARD_RUNS_ON; never a self-hosted
+    # runner for a fork's PR. Computed and validated by the planner: do not
+    # read the variable here, or the fork guard is bypassed.
+    runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
     # A shard takes 25-40 minutes (setup and build ~10, tests 10-25). 90 bounds
     # a hang with a named cause and leaves room for a slow runner; if a shard
     # approaches it, add a shard in test-shard.py instead of raising this.
@@ -133,6 +159,8 @@ jobs:
       # Every shard reports. One red shard must not hide a second failure in
       # another, or fixing CI takes one three-hour round trip per failure.
       fail-fast: false
+      # SHARD_MAX_PARALLEL, or 256 (GitHub's matrix limit: no cap).
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
@@ -208,10 +236,13 @@ jobs:
         # Replaces rust-lld for the workspace. mold uses dramatically less
         # RAM than lld on multi-binary workspaces — the other half of the
         # linker-OOM fix above. apt's mold on ubuntu-24.04 runners is
-        # sufficient (>= 2.x).
+        # sufficient (>= 2.x). A self-hosted runner must have mold installed:
+        # it is never apt-installed there.
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y mold
+          if ! command -v mold >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y mold
+          fi
           mkdir -p .cargo
           {
             echo ""
@@ -237,6 +268,10 @@ jobs:
         # NOTE: an earlier attempt set CARGO_TARGET_DIR=/mnt — inert, because the
         # mount table shows no separate /mnt disk (/mnt is a dir on /dev/root).
         # The df -ih / df -h lines record the headroom actually reclaimed.
+        #
+        # GitHub-hosted only: on a self-hosted runner these directories are
+        # the machine's own, and deleting them is not this job's call.
+        if: runner.environment == 'github-hosted'
         run: |
           df -ih / ; df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \

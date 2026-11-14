@@ -1,5 +1,6 @@
 """Tests for .github/scripts/test-shard.py: the affected-shard selection, the
-`test` gate, and the CI job graph that wires them together.
+runner switch and its fork guard, the `test` gate, and the CI job graph that
+wires them together.
 
 Run from the repository root (the `plan` job does):
 
@@ -293,6 +294,56 @@ class EventPolicy(unittest.TestCase):
         self.assertEqual(ts.decide(root, pkgs, shards, env)["mode"], "full")
 
 
+class RunnerSwitch(unittest.TestCase):
+    REPO = "epigraph-io/epigraph"
+    SELF = '["self-hosted", "linux", "epigraph-shard"]'
+
+    def test_unset_variable_means_github_hosted(self):
+        self.assertEqual(ts.shard_runner("pull_request", self.REPO, self.REPO, ""), ("ubuntu-latest", None))
+        self.assertEqual(ts.shard_runner("push", "", self.REPO, ""), ("ubuntu-latest", None))
+
+    def test_same_repository_pull_request_uses_the_variable(self):
+        runs_on, warning = ts.shard_runner("pull_request", self.REPO, self.REPO, self.SELF)
+        self.assertEqual(runs_on, ["self-hosted", "linux", "epigraph-shard"])
+        self.assertIsNone(warning)
+
+    def test_fork_pull_request_never_gets_a_self_hosted_runner(self):
+        for head in ("someone/epigraph", "epigraph-io/epigraph-fork", "EPIGRAPH-IO/EPIGRAPH", "", None):
+            runs_on, _ = ts.shard_runner("pull_request", head, self.REPO, self.SELF)
+            self.assertEqual(runs_on, "ubuntu-latest", head)
+
+    def test_fork_guard_holds_for_every_runs_on_shape(self):
+        for raw in ('"self-hosted"', '{"group": "aws-lanes"}', '{"group": "g", "labels": ["x"]}'):
+            self.assertEqual(ts.shard_runner("pull_request", "x/y", self.REPO, raw)[0], "ubuntu-latest", raw)
+            self.assertNotEqual(ts.shard_runner("push", "", self.REPO, raw)[0], "ubuntu-latest", raw)
+
+    def test_trusted_events_use_the_variable_and_others_do_not(self):
+        for event in ("push", "merge_group", "workflow_dispatch", "schedule"):
+            self.assertEqual(ts.shard_runner(event, "", self.REPO, self.SELF)[0][0], "self-hosted", event)
+        for event in ("pull_request_target", "issue_comment", "workflow_run"):
+            self.assertEqual(ts.shard_runner(event, self.REPO, self.REPO, self.SELF)[0], "ubuntu-latest", event)
+
+    def test_an_unusable_variable_falls_back_with_a_warning(self):
+        for raw in ("self-hosted", "[]", '[""]', "{}", '{"label": "x"}', "3", '["a", 1]'):
+            runs_on, warning = ts.shard_runner("push", "", self.REPO, raw)
+            self.assertEqual(runs_on, "ubuntu-latest", raw)
+            self.assertIsNotNone(warning, raw)
+
+    def test_the_plan_carries_the_guarded_runner(self):
+        fork = pr_plan(["docs/x.md"], HEAD_REPO="someone/epigraph", GITHUB_REPOSITORY=self.REPO, SHARD_RUNS_ON=self.SELF)
+        self.assertEqual(fork["runs_on"], "ubuntu-latest")
+        own = pr_plan(["docs/x.md"], HEAD_REPO=self.REPO, GITHUB_REPOSITORY=self.REPO, SHARD_RUNS_ON=self.SELF)
+        self.assertEqual(own["runs_on"][0], "self-hosted")
+
+    def test_max_parallel(self):
+        self.assertEqual(ts.max_parallel(""), (256, None))
+        self.assertEqual(ts.max_parallel(" 4 "), (4, None))
+        for raw in ("0", "-2", "four", "2.5"):
+            cap, warning = ts.max_parallel(raw)
+            self.assertEqual(cap, 256, raw)
+            self.assertIsNotNone(warning, raw)
+
+
 class Gate(unittest.TestCase):
     def needs(self, run, **results):
         out = {"plan": {"result": "success", "outputs": {"run": json.dumps(run)}}}
@@ -347,10 +398,23 @@ class Workflow(unittest.TestCase):
         cls.ci = yaml.safe_load(cls.text)
         cls.jobs = cls.ci["jobs"]
 
-    def test_shard_matrix_and_skip_come_from_the_plan(self):
+    def test_shards_run_on_the_planner_runner_only(self):
+        self.assertEqual(self.jobs["test-shard"]["runs-on"], "${{ fromJSON(needs.plan.outputs.runs_on) }}")
+        # The variable reaches the planner and nothing else: an expression that
+        # read it directly would bypass the fork guard.
+        self.assertEqual(self.text.count("vars.SHARD_RUNS_ON"), 1)
+        step = [s for s in self.jobs["plan"]["steps"] if s.get("id") == "plan"][0]
+        self.assertEqual(step["env"]["SHARD_RUNS_ON"], "${{ vars.SHARD_RUNS_ON }}")
+        self.assertEqual(step["env"]["HEAD_REPO"], "${{ github.event.pull_request.head.repo.full_name }}")
+        for name, job in self.jobs.items():
+            if name != "test-shard":
+                self.assertNotIn("needs.plan.outputs.runs_on", json.dumps(job.get("runs-on")), name)
+
+    def test_shard_matrix_cap_and_skip_come_from_the_plan(self):
         shard = self.jobs["test-shard"]
         self.assertEqual(shard["needs"], "plan")
         self.assertEqual(shard["strategy"]["matrix"], "${{ fromJSON(needs.plan.outputs.matrix) }}")
+        self.assertEqual(shard["strategy"]["max-parallel"], "${{ fromJSON(needs.plan.outputs.max_parallel) }}")
         self.assertFalse(shard["strategy"]["fail-fast"])
         self.assertEqual(shard["if"], "${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}")
 
@@ -398,6 +462,14 @@ class Workflow(unittest.TestCase):
         self.assertTrue(any(r.strip() == "python3 .github/scripts/test-shard.py check" for r in runs))
         self.assertTrue(any("unittest discover -s .github/scripts/tests" in r for r in runs))
         self.assertTrue(any("DIFF_BASE=HEAD^1" in r and "ci-plan" in r for r in runs))
+
+    def test_machine_altering_steps_are_github_hosted_only(self):
+        for step in self.jobs["test-shard"]["steps"]:
+            run = step.get("run", "")
+            if "rm -rf" in run:
+                self.assertEqual(step.get("if"), "runner.environment == 'github-hosted'", step.get("name"))
+            if "apt-get install" in run:
+                self.assertIn("command -v mold", run, step.get("name"))
 
     def test_source_scans_shard_has_its_own_test_step(self):
         steps = {s.get("name"): s for s in self.jobs["test-shard"]["steps"]}
