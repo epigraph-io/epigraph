@@ -68,21 +68,25 @@ claim, embeddings of the linked claims.
    U = the rest.
 2. **Root.** If the theme's weight fits the cap, the root is one leaf (the
    meaning root is then one leaf too).
-3. **Units (bottom-up).** Decompose L into atomic units that each fit:
-   Louvain (seeded, nodes and edges inserted in id order) on the subgraph; a
-   community that fits is a unit and is never split again; one over the cap
-   is decomposed again on its own subgraph; when Louvain returns a single
-   community (a dense one that will not split), W4's embedding split
-   (`atlas_meaning_core._split`) cuts it instead.
+3. **Units (bottom-up).** Decompose L into atomic units that each fit, and
+   never cut a unit again: a set that fits is a unit; a disconnected set over
+   the cap is cut into its connected components (a component that fits stays
+   whole); a connected one into its Louvain communities (seeded, nodes and
+   edges inserted in id order); when Louvain returns a single community (a
+   dense one that will not split), W4's embedding split
+   (`atlas_meaning_core._split`) cuts it instead. Each part is cut again the
+   same way.
 4. **Packing (top-down).** A set of units whose union fits is a leaf.
    Otherwise the units are packed into bins of target weight
-   `T = max(cap, ceil(w / k))`, `k = clamp(ceil(w / cap), 2, 16)`: units in
-   order of weight (descending) then smallest id; each goes to the open bin it
-   has the most links to among those it fits in (ties: the earliest bin), or
-   opens a new bin. More than 16 bins: T doubles (while below w) and the
-   packing repeats. Every bin is a child: one unit is a leaf, a union that
-   fits is a leaf, anything else recurses. Since T < w there are always at
-   least two bins, so no level has a single child and recursion terminates.
+   `T = max(cap, ceil(w / k))`, `k = clamp(ceil(w / cap), 2, 16)`: first the
+   linked units are merged, most links first (ties: smaller unit index),
+   while the merged bin stays within T, so the parts Louvain cut out of one
+   component sit together; then the merged groups are packed first-fit
+   decreasing (weight, then smallest id). More than 16 bins: T doubles (while
+   below w) and the packing repeats. Every bin is a child: one unit is a leaf,
+   a union that fits is a leaf, anything else recurses. Since T < w there are
+   always at least two bins, so no level has a single child and recursion
+   terminates.
 5. **Mirrors (W5b).** For each meaning leaf with unlinked claims, ONE links
    leaf holding exactly those claims (U ∩ meaning leaf). It fits because it
    is a subset of a meaning leaf that fits. Mirror leaves sit directly under
@@ -123,6 +127,7 @@ CI's pins: numpy 1.26.4, scikit-learn 1.8.0, umap-learn 0.5.11, networkx 3.6.1):
 - `test_every_leaf_weight_is_within_the_cap` (shared agents, evidence);
 - `test_a_densely_linked_cluster_stays_in_one_leaf`;
 - `test_a_fitting_component_is_never_split_across_leaves`;
+- `test_parts_of_one_component_are_packed_together`;
 - `test_a_clique_over_the_cap_is_split_by_embedding`;
 - `test_an_unlinked_claim_lands_in_its_meaning_leafs_mirror`;
 - `test_no_level_has_a_single_child`;
