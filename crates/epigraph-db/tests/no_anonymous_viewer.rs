@@ -23,6 +23,19 @@
 //!
 //! 3. Since PR-04, one live database test: plan §4.3's personal-group invariant,
 //!    whose failure mode is silent and therefore cannot be left as prose.
+//!
+//! # The one exception to D3: the guest reads
+//!
+//! D3 said a caller with no credential reads nothing. The guest read surface
+//! (backlog `1deb9dbf`, `epigraph-api` `routes/guest.rs`) amends that: a
+//! signed-out caller reads the PUBLIC graph, and only while the operator has
+//! switched it on (`EPIGRAPH_GUEST_READS=on`). It does so through
+//! `Viewer::public_only`, which is NOT one of the banned shapes below: it is a
+//! `Scoped` viewer over the nil principal with no group, so it reads the
+//! public rows (a positive answer every guest test checks), never "nothing".
+//! Its call sites are pinned to the guest routes by
+//! `epigraph-api/tests/guest_public_reads.rs::
+//! public_only_viewer_is_built_only_by_the_guest_routes`.
 
 use epigraph_db::{repos::AgentRepository, SystemReason, Viewer};
 use sqlx::PgPool;

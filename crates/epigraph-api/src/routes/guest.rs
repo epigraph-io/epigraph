@@ -6,8 +6,8 @@
 //! handler here reads as [`Viewer::public_only`], a scoped viewer over no
 //! group, so it reads `visibility = 'public'` rows and nothing else. On the
 //! production pool both migration 077's row policies and the in-query `$V`
-//! predicate apply, exactly as for a signed-in principal that has joined
-//! nothing. A valid bearer the request happens to carry does not widen what
+//! predicate apply, as for a signed-in principal that has joined nothing,
+//! less that principal's personal group. A valid bearer the request happens to carry does not widen what
 //! these routes read (a signed-in caller reads its own graph through the
 //! authenticated routes); it only moves the rate-limit charge from the client
 //! address to the principal. A present but invalid bearer is refused 401 by the

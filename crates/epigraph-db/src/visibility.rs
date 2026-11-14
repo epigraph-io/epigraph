@@ -17,10 +17,15 @@
 //!
 //!   The guest read surface (backlog `1deb9dbf`) is not a shape either.
 //!   [`Viewer::public_only`] is an ordinary `Scoped` viewer over the nil
-//!   principal with EMPTY read and write sets: exactly what [`Viewer::resolve`]
-//!   answers for a signed-in principal that has joined nothing, so it reads the
+//!   principal with EMPTY read and write sets, so it reads the
 //!   `visibility = 'public'` rows and nothing else, and it writes nothing. It
-//!   carries no authority any signed-in stranger does not already hold.
+//!   is strictly narrower than what [`Viewer::resolve`] answers for a
+//!   signed-in principal that has joined nothing, because `resolve` always
+//!   adds that principal's personal group. It carries no authority any
+//!   signed-in stranger does not already hold. It is, though, an amendment to
+//!   D3: the guest routes serve these public rows to a caller with no
+//!   credential, which D3 had ruled out (`docs/tenancy.md`). Those routes stay
+//!   off until an operator switches them on (`EPIGRAPH_GUEST_READS`).
 //! * **No `Default`, no `From<Option<Uuid>>`, no `From<&AuthContext>`, no
 //!   zero-argument `unrestricted()`.** Every one of those is a way to
 //!   materialise read authority out of nothing at a call site that looks
@@ -473,14 +478,17 @@ impl Viewer {
     /// `owner_group_id`), and the pool stamps empty `epigraph.group_ids` and
     /// `epigraph.writable_group_ids` for it, so the row policies of migration
     /// 077 admit the same public rows. Its write fragment matches nothing. It
-    /// is exactly what [`Self::resolve`] answers for a principal with no live
-    /// membership, minus the round trip, so a test fixture's
-    /// `resolve(pool, Uuid::nil())` and this constructor describe one viewer.
+    /// is strictly narrower than what [`Self::resolve`] answers for a
+    /// principal with no live membership: `resolve` always unions in the
+    /// principal's personal group (`tests/no_anonymous_viewer.rs::
+    /// resolve_unions_in_the_principals_personal_group`), and this viewer has
+    /// no group at all.
     ///
     /// The nil principal names no agent: no `agents` row has that id, and the
     /// nil uuid elsewhere is a GROUP id (the world group), never a principal.
-    /// So a policy or ownership check keyed on `epigraph.agent_id` matches no
-    /// row for this viewer.
+    /// So a policy or ownership check keyed on `epigraph.principal_id` (the
+    /// GUC the pool stamps and `epigraph_principal_id()` reads) matches no row
+    /// for this viewer.
     ///
     /// This is not the banned anonymous shape. That shape "matched nothing",
     /// which no adversarial test can tell from a correct answer. This one
