@@ -163,7 +163,8 @@ impl Node {
 pub struct Edge {
     pub source: Uuid,
     pub target: Uuid,
-    /// As stored, in either casing (`AUTHORED`, `supports`): compare it
+    /// Lower-cased by the builder (the `edges` table spells names in both
+    /// casings); the contract still admits upper case, so compare it
     /// case-insensitively.
     pub relationship: String,
     pub sign: i8,

@@ -101,9 +101,11 @@ positions and weights.
     `validate` reject a sign-0 proxy edge with any other weight. No belief factor of any
     kind enters it (see "No belief value" below);
   - `none`: every other pair, such as an agent's authorship, so weight 0 and sign 0.
-- `relationship` is the stored name, unnormalised: `^[A-Za-z][A-Za-z0-9_]*$`, at most
-  32 characters. The `edges` table uses both casings (`AUTHORED` and `authored`,
-  `SUPPORTS` and `supports`), so the view compares names case-insensitively.
+- `relationship` matches `^[A-Za-z][A-Za-z0-9_]*$`, at most 32 characters. The
+  `edges` table uses both casings (`AUTHORED` and `authored`, `SUPPORTS` and
+  `supports`); builders serve the stored name lower-cased and collapse repeated rows
+  on the lower-cased name. The pattern still admits upper case (some fixtures keep it
+  on purpose), so the view compares names case-insensitively.
 - The builder draws only edge rows the map's audience can read. An edge row has its
   own visibility and owner and co-owner groups, apart from its endpoints. The public
   map draws public rows only; a team map draws public rows and the rows that team owns
@@ -113,7 +115,7 @@ positions and weights.
   no test in this crate can prove it.
 - The `edges` table keeps one row per submission (migration 018), so a stored
   (source, target, relationship) can repeat. After the audience filter, the builder
-  collapses such rows into one edge with the largest `flow_weight`: a resubmission is
+  collapses rows sharing (source, target, lower-cased relationship) into one edge with the largest `flow_weight`: a resubmission is
   not more support. Filtering first matters, or an unreadable row's larger weight
   would win the collapse.
 - `outgoing[]`: links leaving the leaf, aggregated by target group. Each has the

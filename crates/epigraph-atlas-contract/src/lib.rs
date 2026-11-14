@@ -336,8 +336,10 @@ impl Node {
 ///
 /// The `edges` table keeps one row per submission (migration 018 dropped
 /// its triple-uniqueness), so one (source, target, relationship) can have
-/// several rows. After the audience filter above, the builder collapses
-/// them into one edge with the largest `flow_weight` among them: a
+/// several rows, and the table spells one relationship in both casings
+/// (`SUPPORTS` and `supports`). After the audience filter above, the builder
+/// collapses the rows that share a source, a target and a lower-cased
+/// relationship into one edge with the largest `flow_weight` among them: a
 /// resubmission is not more support. Filtering first matters: otherwise an
 /// unreadable row's larger weight would win the collapse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,8 +347,11 @@ impl Node {
 pub struct Edge {
     pub source: Uuid,
     pub target: Uuid,
-    /// The stored relationship name, unnormalised: both `AUTHORED` and
-    /// `authored` are in use, so the view compares names case-insensitively.
+    /// The relationship name, lower-cased by the builder: the `edges` table
+    /// spells names in both casings (`AUTHORED` and `authored`), and the
+    /// builder serves the lower-cased stored name. The name pattern still
+    /// admits upper case (some fixtures keep it on purpose), so a reader
+    /// compares names case-insensitively.
     pub relationship: String,
     /// 1 supporting, -1 opposing, 0 no belief direction.
     pub sign: i8,
@@ -459,7 +464,8 @@ pub fn gzip_len(bytes: &[u8]) -> usize {
 
 /// Whether `s` is a relationship name the contract accepts: an ASCII letter,
 /// then letters, digits or `_`, at most [`MAX_RELATIONSHIP_CHARS`] long.
-/// Both casings are in use (`AUTHORED`, `authored`).
+/// Either casing passes: builders serve names lower-cased, and the pattern
+/// still admits the stored upper-case spellings (`AUTHORED`).
 pub fn is_relationship_name(s: &str) -> bool {
     s.len() <= MAX_RELATIONSHIP_CHARS
         && s.starts_with(|c: char| c.is_ascii_alphabetic())
