@@ -177,6 +177,7 @@ fn cfg(name: &str, addr: &str, prefix: Option<&str>) -> ExtensionConfig {
         addr: addr.to_string(),
         scope: format!("{name}:tools"),
         prefix: prefix.map(str::to_string),
+        call_timeout: epigraph_mcp::federation::config::DEFAULT_CALL_TIMEOUT,
     }
 }
 
@@ -740,4 +741,62 @@ async fn a_reconnect_does_not_route_a_kernel_tool_name() {
         federation.route_config("submit_claim").is_none(),
         "a kernel tool name must never route to an extension"
     );
+}
+
+// ── Backlog 7ea4bd74: a proxied call that never answers is bounded ──────────
+
+/// A downstream that accepts a `tools/call` and never answers is cut off at
+/// the extension's `call_timeout_secs=`, and says so.
+///
+/// Mutation: in `client::invoke_once`, await `call_tool` without the
+/// `tokio::time::timeout` (the pre-fix code) -> the call hangs, the outer
+/// 20 s deadline here fires, and this fails.
+#[tokio::test]
+async fn a_downstream_call_that_never_answers_times_out_at_the_configured_bound() {
+    let (addr, _control) = stub::spawn_controlled_stub(&[stub::HANG_TOOL]).await;
+    let mut config = cfg("slow", &addr, None);
+    config.call_timeout = std::time::Duration::from_secs(1);
+    let registry = FederationRegistry::build(vec![config], "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        registry.invoke(stub::HANG_TOOL, "tok", None),
+    )
+    .await
+    .expect("a call to a downstream that never answers must be bounded, not hang");
+    match outcome {
+        Err(epigraph_mcp::federation::client::FederationError::CallTimeout(waited)) => {
+            assert_eq!(waited, std::time::Duration::from_secs(1));
+        }
+        Err(other) => panic!("expected CallTimeout, got {other}"),
+        Ok(_) => panic!("the hanging tool cannot have answered"),
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the bound is the configured 1 s, not some other timeout ({:?})",
+        started.elapsed()
+    );
+}
+
+/// The downstream's MCP error survives the client layer whole: the variant
+/// the server hands the caller unchanged.
+///
+/// Mutation: map `call_tool`'s error with `FederationError::Request(e.to_string())`
+/// (the pre-fix code) -> `Request`, not `Downstream`, and this fails.
+#[tokio::test]
+async fn a_downstream_mcp_error_is_carried_whole() {
+    let (addr, _control) = stub::spawn_controlled_stub(&[stub::FAIL_TOOL]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr, None)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+    match registry.invoke(stub::FAIL_TOOL, "tok", None).await {
+        Err(epigraph_mcp::federation::client::FederationError::Downstream(answer)) => {
+            assert_eq!(answer, stub::fail_error());
+        }
+        Err(other) => panic!("expected Downstream, got {other}"),
+        Ok(_) => panic!("the failing tool cannot have succeeded"),
+    }
 }

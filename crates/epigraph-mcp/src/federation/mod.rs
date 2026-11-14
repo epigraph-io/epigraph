@@ -345,7 +345,14 @@ impl FederationRegistry {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
-        client::invoke_once(&config.addr, caller_token, downstream_name, arguments).await
+        client::invoke_once(
+            &config.addr,
+            caller_token,
+            downstream_name,
+            arguments,
+            config.call_timeout,
+        )
+        .await
     }
 
     /// Every extension currently mounted unhealthy, as `(index, config)` pairs,
@@ -551,7 +558,14 @@ impl SharedFederation {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
-        client::invoke_once(&config.addr, caller_token, downstream_name, arguments).await
+        client::invoke_once(
+            &config.addr,
+            caller_token,
+            downstream_name,
+            arguments,
+            config.call_timeout,
+        )
+        .await
     }
 
     /// One reconnect pass: re-dial every extension currently mounted unhealthy

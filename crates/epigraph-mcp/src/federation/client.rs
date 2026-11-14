@@ -17,6 +17,10 @@
 //!
 //! ## Timeouts
 //!
+//! The proxied `tools/call` is bounded by the extension's `call_timeout_secs=`
+//! ([`super::config::DEFAULT_CALL_TIMEOUT`] when unset), and surfaces
+//! [`FederationError::CallTimeout`].
+//!
 //! The `initialize` handshake ([`serve_client`]) is wrapped in a bounded
 //! [`tokio::time::timeout`]. A downstream that accepts the TCP connection but
 //! never completes `initialize` would otherwise hang the gateway's `build()`
@@ -97,6 +101,12 @@ pub enum FederationError {
     #[error("request to extension failed: {0}")]
     Request(String),
 
+    /// The downstream accepted the `tools/call` and gave no answer within the
+    /// extension's `call_timeout_secs=` (backlog 7ea4bd74). The gateway stopped
+    /// waiting and dropped the session; the call may still complete there.
+    #[error("extension gave no answer within {0:?}")]
+    CallTimeout(Duration),
+
     /// No mounted extension routes this effective tool name (any more): the
     /// route was looked up and was gone, e.g. the extension was demoted
     /// between the caller's lookup and the call.
@@ -156,7 +166,8 @@ pub async fn list_all_tools(client: &ExtensionClient) -> Result<Vec<Tool>, Feder
 
 /// Proxy a single `tools/call` to the extension at `addr` on a **fresh**
 /// ephemeral session authenticated with `caller_token` (the caller's raw
-/// bearer, forwarded verbatim so the downstream sees the real principal).
+/// bearer, forwarded verbatim so the downstream sees the real principal),
+/// waiting at most `call_timeout` for the answer.
 ///
 /// The session is dropped when this function returns; rmcp's transport worker
 /// issues `delete_session` on drop, so the downstream session is released and
@@ -166,21 +177,22 @@ pub async fn list_all_tools(client: &ExtensionClient) -> Result<Vec<Tool>, Feder
 /// [`FederationError::Timeout`] / [`FederationError::Connect`] on handshake
 /// failure; [`FederationError::Downstream`] if the downstream answers the
 /// `tools/call` with an MCP error; [`FederationError::Request`] if the call
-/// fails without one.
+/// fails without one; [`FederationError::CallTimeout`] if it gives no answer
+/// within `call_timeout`.
 pub async fn invoke_once(
     addr: &str,
     caller_token: &str,
     name: &str,
     arguments: Option<rmcp::model::JsonObject>,
+    call_timeout: Duration,
 ) -> Result<CallToolResult, FederationError> {
     let client = connect(addr, Some(caller_token)).await?;
     let mut params = CallToolRequestParams::new(name.to_string());
     params.arguments = arguments;
-    let result = client
-        .peer()
-        .call_tool(params)
-        .await
-        .map_err(FederationError::from_service);
+    let result = match tokio::time::timeout(call_timeout, client.peer().call_tool(params)).await {
+        Ok(answer) => answer.map_err(FederationError::from_service),
+        Err(_elapsed) => Err(FederationError::CallTimeout(call_timeout)),
+    };
     // Explicit drop: releasing the session (and its downstream `delete_session`)
     // is the whole point of the ephemeral-per-call model. Dropping after we have
     // the result keeps the RAII contract obvious to future readers.

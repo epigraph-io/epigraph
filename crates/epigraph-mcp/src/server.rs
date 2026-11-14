@@ -838,8 +838,9 @@ impl EpiGraphMcpFull {
     /// - The gateway could not open a session, or found no route
     ///   ([`FederationError::Connect`], [`FederationError::Timeout`],
     ///   [`FederationError::NoRoute`]): "extension `<name>` unavailable".
-    /// - The call broke off without an answer ([`FederationError::Request`]):
-    ///   says so.
+    /// - The call broke off without an answer ([`FederationError::Request`]),
+    ///   or gave none within the extension's `call_timeout_secs=`
+    ///   ([`FederationError::CallTimeout`]): says so, and that it may have run.
     ///
     /// The designed messages name the extension and never the error's own
     /// text, which carries the dialed URI (deployment topology); that goes to
@@ -860,6 +861,15 @@ impl EpiGraphMcpFull {
                     "Federated tool '{tool}' is unavailable: extension '{extension}' unavailable \
                      (the gateway could not open a session with it: it is down, or it refused \
                      this caller's token). Retry once it is back; nothing was sent to it."
+                ),
+                err,
+            ),
+            FederationError::CallTimeout(waited) => crate::errors::internal_error_logged(
+                format!(
+                    "Federated tool '{tool}' failed: extension '{extension}' gave no answer \
+                     within {} s, so the gateway stopped waiting. The call may still complete \
+                     there; check before calling it again.",
+                    waited.as_secs()
                 ),
                 err,
             ),

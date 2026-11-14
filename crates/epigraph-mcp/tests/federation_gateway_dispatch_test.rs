@@ -358,3 +358,32 @@ async fn an_unreachable_extension_is_answered_as_unavailable_by_name() {
         "the extension's address must not reach the caller: {error}"
     );
 }
+
+/// The caller of a tool that never answers is told so at the extension's
+/// bound, and warned that the call may still run.
+///
+/// Mutation: drop the `tokio::time::timeout` in `client::invoke_once` -> no
+/// answer arrives within the 15 s read, and this fails.
+#[tokio::test]
+async fn a_call_that_never_answers_is_answered_at_the_extensions_bound() {
+    let (addr, _control) = stub::spawn_controlled_stub(&[stub::HANG_TOOL]).await;
+    let configs = epigraph_mcp::federation::config::parse_extensions(Some(&format!(
+        "ext=tcp:{addr};scope=ext:tools;call_timeout_secs=1"
+    )))
+    .expect("a well-formed test entry");
+    let registry = FederationRegistry::build(configs, "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let error = call_for_error(&url, stub::HANG_TOOL, std::time::Duration::from_secs(15)).await;
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("extension 'ext' gave no answer within 1 s"),
+        "the caller must be told the extension did not answer in time: {error}"
+    );
+    assert!(
+        message.contains("may still complete"),
+        "and that the call may have run anyway: {error}"
+    );
+}

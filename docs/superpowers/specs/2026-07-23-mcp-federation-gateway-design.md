@@ -206,7 +206,13 @@ either clash with a `prefix=`.
 
 - Downstream socket down at startup → its tools are **absent** from `tools/list`
   (logged); gateway serves everything else. Reconnect on a timer; tools reappear.
-- Downstream errors mid-call → surfaced as a normal MCP tool error.
+- Downstream errors mid-call → the downstream's own MCP error reaches the caller
+  **unchanged** (code, message, data); `EpiGraphMcpFull::federated_call_error` (backlog
+  7ea4bd74). A downstream the gateway cannot open a session with is answered "extension
+  `<name>` unavailable", naming the extension and never its address.
+- A downstream that accepts a call and never answers → cut off at the extension's
+  `call_timeout_secs=` (default 300 s), and the caller is told it gave no answer and that
+  the call may still complete there.
 - Collision at startup (two extensions, or an extension and the kernel, exporting the same
   effective tool name) → **refuse to start**.
 - Collision at runtime (an extension that reconnects, or re-lists, with a name the kernel
