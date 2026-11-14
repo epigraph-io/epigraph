@@ -28,7 +28,29 @@ const fn default_version() -> u32 {
 }
 
 impl FrameOfDiscernment {
-    /// Create a new frame, rejecting empty or duplicate hypotheses
+    /// The first hypothesis name that appears more than once in `hypotheses`,
+    /// or `None` when every name is distinct.
+    ///
+    /// [`Self::new`] removes duplicates silently, so a frame STORED as
+    /// `["a", "a", "b"]` is folded as the two-hypothesis `["a", "b"]`, and
+    /// everything positional about it (BBA focal-set keys,
+    /// `claim_frames.hypothesis_index`) then means something other than what
+    /// its writer intended (backlog e5da67ef). The places that create a stored
+    /// frame call this first and refuse the request instead.
+    #[must_use]
+    pub fn first_duplicate_hypothesis(hypotheses: &[String]) -> Option<&str> {
+        let mut seen = BTreeSet::new();
+        hypotheses
+            .iter()
+            .find(|h| !seen.insert(h.as_str()))
+            .map(String::as_str)
+    }
+
+    /// Create a new frame, rejecting an empty one. Duplicate hypothesis names
+    /// are REMOVED (first occurrence kept), not rejected: frames already
+    /// stored with a duplicate must stay foldable. A writer creating a stored
+    /// frame refuses duplicates up front with
+    /// [`Self::first_duplicate_hypothesis`].
     ///
     /// # Errors
     /// Returns `DsError::EmptyFrame` if `hypotheses` is empty after dedup.
@@ -211,6 +233,34 @@ impl Eq for FrameOfDiscernment {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_duplicate_hypothesis_names_the_repeat() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            FrameOfDiscernment::first_duplicate_hypothesis(&names(&["a", "b", "c"])),
+            None
+        );
+        assert_eq!(
+            FrameOfDiscernment::first_duplicate_hypothesis(&names(&["a", "b", "a", "b"])),
+            Some("a"),
+            "the first name seen twice, in list order"
+        );
+        // What the check exists for: `new` would fold this as a 2-frame while
+        // the stored row keeps three entries.
+        let stored = names(&["a", "a", "b"]);
+        assert_eq!(
+            FrameOfDiscernment::first_duplicate_hypothesis(&stored),
+            Some("a")
+        );
+        assert_eq!(
+            FrameOfDiscernment::new("f", stored)
+                .unwrap()
+                .hypotheses
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn create_frame() {

@@ -960,9 +960,18 @@ pub fn cross_frame_combine(
     redistribute(&m1_reindexed, &m2_reindexed, method, gamma)
 }
 
-/// Check that two mass functions are defined on the same frame
+/// Check that two mass functions are defined on the same frame: the same id
+/// AND the same hypotheses in the same order, which is what
+/// `FrameOfDiscernment`'s `PartialEq` means by equal.
+///
+/// Comparing the id alone (backlog e5da67ef) admitted two frames that share an
+/// id and differ in hypotheses, which `FrameOfDiscernment::extend` produces by
+/// construction. Focal sets are indices into the frame, so combining across
+/// such a pair reads one operand's indices against the other's hypothesis
+/// list. That is what `cross_frame_combine` (reindex onto the union frame) is
+/// for.
 fn check_frame_compat(m1: &MassFunction, m2: &MassFunction) -> Result<(), DsError> {
-    if m1.frame().id != m2.frame().id {
+    if m1.frame() != m2.frame() {
         return Err(DsError::IncompatibleFrames {
             left: m1.frame().id.clone(),
             right: m2.frame().id.clone(),
@@ -1065,6 +1074,41 @@ pub fn combine_alternative_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog e5da67ef: `check_frame_compat` compared the frame id alone, so
+    /// a mass on a frame and a mass on that frame EXTENDED (same id, one more
+    /// hypothesis, which is what `FrameOfDiscernment::extend` returns) were
+    /// combined index against index. They are different frames by the type's
+    /// own `PartialEq`, and the combine must say so.
+    #[test]
+    fn combining_across_a_frame_and_its_extension_is_incompatible() {
+        let base = FrameOfDiscernment::new("f", vec!["a".into(), "b".into()]).unwrap();
+        let extended = base.extend(vec!["c".into()]).unwrap();
+        assert_eq!(base.id, extended.id, "extend keeps the id");
+        assert_ne!(base, extended, "and changes the hypotheses");
+
+        let on_base = MassFunction::simple(base.clone(), BTreeSet::from([0]), 0.8).unwrap();
+        // {c}: index 2 does not exist on the base frame.
+        let on_extended = MassFunction::simple(extended, BTreeSet::from([2]), 0.6).unwrap();
+
+        for (name, result) in [
+            ("conjunctive", conjunctive_combine(&on_base, &on_extended)),
+            ("dempster", dempster_combine(&on_base, &on_extended)),
+        ] {
+            assert!(
+                matches!(result, Err(DsError::IncompatibleFrames { .. })),
+                "{name}: same id, different hypotheses must be refused, got {result:?}"
+            );
+        }
+
+        // The same frame built twice is still the same frame.
+        let again = FrameOfDiscernment::new("f", vec!["a".into(), "b".into()]).unwrap();
+        let other = MassFunction::simple(again, BTreeSet::from([1]), 0.5).unwrap();
+        assert!(
+            dempster_combine(&on_base, &other).is_ok(),
+            "two masses on equal frames combine as before"
+        );
+    }
     use crate::frame::FrameOfDiscernment;
 
     fn binary_frame() -> FrameOfDiscernment {

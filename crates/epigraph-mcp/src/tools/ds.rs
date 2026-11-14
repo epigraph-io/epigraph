@@ -57,6 +57,14 @@ pub async fn create_frame(
     if params.hypotheses.len() < 2 {
         return Err(invalid_params("frame requires at least 2 hypotheses"));
     }
+    // Refused, not deduplicated (backlog e5da67ef): see
+    // `FrameOfDiscernment::first_duplicate_hypothesis`.
+    if let Some(dup) = FrameOfDiscernment::first_duplicate_hypothesis(&params.hypotheses) {
+        return Err(invalid_params(format!(
+            "frame hypotheses must be distinct: `{dup}` appears more than once. Nothing was \
+             written."
+        )));
+    }
 
     // Check if parent is specified and valid
     if let Some(ref parent_id_str) = params.parent_frame_id {
