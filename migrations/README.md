@@ -2645,6 +2645,41 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **217**: public `factors_definer_writes` (backlog a2c5f714). Belief-
+  propagation factors are written only by the database's own triggers and
+  the maintenance cascades, never by an application statement. Re-states the
+  two factor trigger functions, `auto_create_factor_from_edge()` (038's mint
+  behind `edges_auto_factor`) and `deactivate_superseded_factors()` (001's
+  clear behind `claims_deactivate_factors`), unchanged in meaning, as
+  SECURITY DEFINER on 172's form (`search_path = pg_catalog, pg_temp`, every
+  public object qualified), owned by `epigraph_maintenance`, each refusing to
+  run on any table but its own (`FCT01`, 42501), with EXECUTE revoked from
+  PUBLIC and `epigraph_app` (so no session can attach one to a temporary
+  table of its own). Revokes INSERT, UPDATE, DELETE and TRUNCATE on
+  `public.factors` from `epigraph_app` and grants back UPDATE on `frame_id`
+  only (the hypothesis promote route); `factors` leaves 118's app-role table
+  allowlist. Refuses (`FCT02`, 55000, nothing applied) when the database
+  carries any other trigger whose function writes `factors` as a role this
+  migration leaves without that write (an invoker, or a definer whose owner
+  lacks INSERT/UPDATE/DELETE on it): a trigger attached outside these
+  migrations, such as a legacy hand-applied one on `public.edges`, would
+  otherwise abort the application's edge writes with 42501. No table,
+  column, policy or index. Registered in
+  `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS`). Pinned by
+  `epigraph-db/tests/factors_write_posture.rs`,
+  `epigraph-db/tests/app_role_table_lockdown.rs` and
+  `epigraph-db/tests/factors_definer_writes_undo.rs`. Undo:
+  `docs/runbooks/217-undo.sql` (tested: run twice, it returns the functions,
+  triggers and `factors` grants to below 217, both bodies byte for byte).
+  Checked before claiming: no migration on main, open PR or origin branch
+  carries a `217` (slot assigned by the batch orchestrator). **Deploy
+  order:** none against the binary; no shipped request path writes `factors`
+  except through the two triggers and the promote route's `frame_id` move.
+  If it stops with `FCT02`, drop each trigger it names (or make its function
+  a maintenance-owned SECURITY DEFINER) and re-run. Run
+  `epigraph-tenancy-backfill verify` after migrating (it checks both
+  definers' owner). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
