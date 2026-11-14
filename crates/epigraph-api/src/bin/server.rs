@@ -470,11 +470,11 @@ async fn main() {
                 dsn_var = dsn.var,
                 "migrating on boot over the migration DSN"
             );
-            // MAINTENANCE-DSN-EXEMPT: a short-lived pool on the MIGRATION DSN
-            // (DDL privilege, a different and stronger role than the
-            // maintenance one), built only under EPIGRAPH_MIGRATE_ON_BOOT and
-            // closed below, before this process serves anything.
-            let migration_pool = match epigraph_db::PgPool::connect(&dsn.url).await {
+            // A short-lived pool on the MIGRATION DSN (DDL privilege, a
+            // stronger role than the maintenance one), built only under
+            // EPIGRAPH_MIGRATE_ON_BOOT by the shared constructor and closed
+            // below, before this process serves anything.
+            let migration_pool = match epigraph_api::migrate::connect_migration_pool(&dsn).await {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!(

@@ -32,28 +32,17 @@ async fn main() {
     if dsn.fell_back() {
         tracing::warn!("{}", epigraph_api::migrate::MIGRATION_DSN_FALLBACK_WARNING);
     }
-    let (url, var) = (dsn.url, dsn.var);
+    let var = dsn.var;
     tracing::info!(dsn_var = var, "resolved migration DSN");
     // Log the host but not credentials.
-    let host_hint = url.split('@').nth(1).unwrap_or("<unknown>");
+    let host_hint = dsn.url.split('@').nth(1).unwrap_or("<unknown>");
     tracing::info!(host = host_hint, "Connecting to PostgreSQL");
-    // MAINTENANCE-DSN-EXEMPT: the migrator needs DDL privilege, which is a
-    // different and strictly stronger role than `epigraph_maintenance` — a
-    // maintenance DSN here would be the WRONG credential, not a safer one.
-    //
-    // PR-16 wired `MIGRATION_DATABASE_URL` above, and the exemption STAYS.
-    // `no_unmaintained_dsn.rs` is keyed on POOL CONSTRUCTION, not on which
-    // environment variable supplies the URL — its own module doc says so at
-    // length, with two measured reasons. Swapping the variable while keeping
-    // `PgPool::connect` therefore changes nothing this lint can see, and
-    // `the_exemption_set_is_exactly_what_was_reviewed` asserts an exempt file
-    // STILL builds an unmaintained pool, so deleting the entry is what would
-    // turn CI red. Removing it requires routing this binary through a
-    // maintenance-style constructor, which the reason above argues against.
-    // Pinned with this reason in `crates/epigraph-db/tests/no_unmaintained_dsn.rs`.
-    let pool = epigraph_db::PgPool::connect(&url)
+    // DDL privilege, so not a maintenance constructor: the pool is built by
+    // `migrate::connect_migration_pool`, the one exempt construction site
+    // (see its doc and `crates/epigraph-db/tests/no_unmaintained_dsn.rs`).
+    let pool = epigraph_api::migrate::connect_migration_pool(&dsn)
         .await
-        .unwrap_or_else(|e| panic!("PgPool::connect to {var} failed: {e}"));
+        .unwrap_or_else(|e| panic!("connecting to the migration database ({var}) failed: {e}"));
     // Issue #492: a database AHEAD of this binary's embedded migration set is
     // refused unless the operator opts in, by flag or by env. Either spelling
     // suffices; both are named in the refusal text.

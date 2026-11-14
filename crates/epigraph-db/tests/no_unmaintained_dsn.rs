@@ -147,26 +147,15 @@ const EXEMPT: &[(&str, &str)] = &[
          reads DATABASE_URL at all, so a DSN-keyed lint would have passed it silently.",
     ),
     (
-        "crates/epigraph-api/src/bin/epigraph-migrate.rs",
-        "PR-16 DONE, and the exemption STAYS. The migrator now reads MIGRATION_DATABASE_URL \
-         (falling back to DATABASE_URL with a WARN), and .github/workflows/ci.yml sets it. \
-         What it still does NOT do is build its pool through a maintenance constructor, and \
-         it must not: applying migrations needs DDL privilege on every tier-A table, which is \
-         a strictly stronger role than epigraph_maintenance -- that role holds \
-         SELECT/INSERT/UPDATE and no DDL at all (migration 070's grant block). This lint is \
-         keyed on pool construction, not on the DSN variable, so the PR-16 change is invisible \
-         to it by design; the entry is what records that the remaining PgPool::connect is \
-         deliberate.",
-    ),
-    (
-        "crates/epigraph-api/src/bin/server.rs",
-        "Backlog e1b96df7. Its request pool is a ScopedPool; the one PgPool::connect is the \
-         EPIGRAPH_MIGRATE_ON_BOOT path, which migrates on MIGRATION_DATABASE_URL (falling back \
-         to DATABASE_URL with a WARN, the epigraph-migrate rule) instead of on the request \
-         pool. Migrating needs DDL privilege, which neither the application role nor \
-         epigraph_maintenance holds, so a maintenance constructor would be the wrong \
-         credential. The pool is built only when the operator opts in, and closed before the \
-         process serves a request.",
+        "crates/epigraph-api/src/migrate.rs",
+        "`connect_migration_pool`, the one migration-pool construction, shared by \
+         `bin/epigraph-migrate.rs` and the server's EPIGRAPH_MIGRATE_ON_BOOT path (backlog \
+         e1b96df7). It connects on MIGRATION_DATABASE_URL (falling back to DATABASE_URL with a \
+         WARN). It must not use a maintenance constructor: applying migrations needs DDL \
+         privilege on every tier-A table, a strictly stronger role than epigraph_maintenance, \
+         which holds SELECT/INSERT/UPDATE and no DDL at all (migration 070's grant block). \
+         epigraph-migrate.rs was exempt for this construction until it moved here; keeping it \
+         in the library keeps bin/server.rs under the per-file scan.",
     ),
     (
         "scripts/subcluster_outliers.py",
@@ -219,6 +208,10 @@ const RUST_ROOTS: &[&str] = &[
     "crates/epigraph-jobs/src",
     "crates/epigraph-api/src/bin",
     "crates/epigraph-mcp/src/main.rs",
+    // Not a process: the migration-pool constructor both migrating binaries
+    // call (`connect_migration_pool`). Scanned so its one construction stays
+    // an exempt, reasoned site rather than an unscanned library call.
+    "crates/epigraph-api/src/migrate.rs",
 ];
 
 fn collect(root: &Path, ext: &str, out: &mut Vec<PathBuf>) {

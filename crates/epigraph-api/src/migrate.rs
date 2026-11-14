@@ -144,6 +144,30 @@ pub fn migration_dsn_from_env() -> Result<MigrationDsn, String> {
     )
 }
 
+/// Open a pool on the migration DSN. The one place a migration pool is built,
+/// for every entry point that migrates: `epigraph-migrate` and the server's
+/// `EPIGRAPH_MIGRATE_ON_BOOT` path.
+///
+/// Keeping the construction here, and out of the binaries, keeps
+/// `bin/server.rs` under `no_unmaintained_dsn.rs`'s per-file scan: the
+/// request-serving binary then builds no raw pool of its own, so a second one
+/// added later is a finding rather than hidden behind a whole-file exemption.
+///
+/// # Errors
+/// The connect error. It does not carry the URL; the caller names
+/// [`MigrationDsn::var`] and never prints [`MigrationDsn::url`].
+pub async fn connect_migration_pool(
+    dsn: &MigrationDsn,
+) -> Result<epigraph_db::PgPool, sqlx::Error> {
+    // MAINTENANCE-DSN-EXEMPT: migrating needs DDL privilege on every tier-A
+    // table, a different and strictly stronger role than
+    // `epigraph_maintenance` (SELECT/INSERT/UPDATE, no DDL: migration 070's
+    // grant block), so a maintenance constructor would be the WRONG credential,
+    // not a safer one. Pinned with this reason in
+    // `crates/epigraph-db/tests/no_unmaintained_dsn.rs`.
+    epigraph_db::PgPool::connect(&dsn.url).await
+}
+
 /// Caller policy for [`run_migrations`].
 ///
 /// `Default` is the strict policy: a database carrying migrations this binary
