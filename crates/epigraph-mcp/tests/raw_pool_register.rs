@@ -162,6 +162,22 @@ const FIXTURE_ENTRY: &str = "FIXTURE_ENTRY: a `*_via_pool` entry point that exis
 
 const REGISTER: &[(&str, &str, usize, &str)] = &[
     // ── epigraph-engine ──────────────────────────────────────────────────
+    // The unauthenticated listener's principal: `find_or_create` provisions its
+    // fixed reader agent (an agents read, then an idempotent create); `resolve`
+    // reads that agent's live memberships to prove it holds none. Both run before
+    // any viewer exists, on agent-identity tables, as the server's own does.
+    (
+        "epigraph-mcp/src/unauthenticated_reader.rs",
+        "find_or_create",
+        2,
+        NO_CALLER,
+    ),
+    (
+        "epigraph-mcp/src/unauthenticated_reader.rs",
+        "resolve",
+        1,
+        PRE_VIEWER,
+    ),
     (
         "epigraph-engine/src/belief_query.rs",
         "for_perspective",
@@ -603,7 +619,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 84;
+///
+/// 84 -> 87 once, when `unauthenticated_reader.rs` (the unauthenticated
+/// listener's zero-membership principal) landed with its three identity
+/// reads unregistered. They are not conversions that regressed but sites the
+/// register never held, so the ceiling records them; lower it as they move.
+const HIGH_WATER: usize = 87;
 
 // ===========================================================================
 // The scanner.
