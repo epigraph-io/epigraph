@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey", "dep:epigraph-atlas-contract"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey"]
 genai = ["db"]
 
 [[bin]]
@@ -265,6 +265,13 @@ name = "embed_backfill_workflows"
 path = "tests/embed_backfill_workflows.rs"
 required-features = ["db"]
 
+# Atlas W6: positions filled into a synthetic map and stored through W2's
+# `AtlasMapRepository` (a fresh database per test).
+[[test]]
+name = "atlas_w6_layout_store"
+path = "tests/atlas_w6_layout_store.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "bootstrap_clients"
 path = "src/bin/bootstrap_clients.rs"
@@ -423,12 +430,13 @@ epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-mcp = { workspace = true }
 epigraph-ingest = { workspace = true }
-# v5: the Atlas "by meaning" group ids (atlas_meaning::tree). Already enabled
+# Atlas: the v1 level documents. W6's `atlas_layout::fill` (always built) puts
+# positions into them, and the "by meaning" build (db feature) stores them.
+epigraph-atlas-contract = { workspace = true }
+# v4 + v5: the Atlas "by meaning" group ids (atlas_meaning::tree). v5 is already
 # in the build graph (uuid's sha1_smol is in the lockfile), so no new crate.
 uuid = { workspace = true, features = ["v4", "v5"] }
 epigraph-db = { workspace = true, optional = true }
-# The Atlas level documents the "by meaning" build stores (schema v1, W10a).
-epigraph-atlas-contract = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 # `epigraph-operator verify-confirmations` (elevation plan EL-13): re-verifies
 # every stored passkey assertion offline. Links OpenSSL (webauthn-rs-core);
@@ -463,6 +471,8 @@ ndarray = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# Atlas W6: the contract's fixture levels, for `atlas_layout::fill`'s tests.
+epigraph-atlas-contract = { workspace = true, features = ["check"] }
 sqlx = { workspace = true }
 # PR-hierarchical ingest integration test (tests/pr_hierarchical_ingest_test.rs):
 # oneshot the real epigraph-api handlers the CLI hits against epigraph_db_repo_test.
