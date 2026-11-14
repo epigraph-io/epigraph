@@ -103,6 +103,7 @@ async fn link_hierarchical_refuses_supersedes_in_every_spelling(pool: PgPool) {
                 target_claim_id: target.to_string(),
                 relationship: rel.to_string(),
                 properties: None,
+                ..Default::default()
             },
             None,
         )
@@ -124,6 +125,7 @@ async fn link_hierarchical_refuses_supersedes_in_every_spelling(pool: PgPool) {
             target_claim_id: target.to_string(),
             relationship: "decomposes_to".to_string(),
             properties: None,
+            ..Default::default()
         },
         None,
     )

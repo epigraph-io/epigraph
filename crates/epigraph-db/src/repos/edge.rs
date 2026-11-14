@@ -2228,6 +2228,49 @@ impl EdgeRepository {
         Ok(found.unwrap_or(false))
     }
 
+    /// Whether `to` is reachable from `from` along IN-FORCE edges whose
+    /// relationship is one of `relationships`, followed source -> target
+    /// (backlog 41d7b27a: the cycle guard for the workflow references
+    /// `invokes` and `depends_on`). `from == to` answers true.
+    ///
+    /// A writer about to add `a -rel-> b` asks `reaches(b, a)`: true means the
+    /// new edge would close a cycle. The walk is a recursive `UNION`, which
+    /// discards a node already reached, so it terminates on a graph that
+    /// already holds a cycle.
+    ///
+    /// Run it on the writer's STAMPED transaction: `edges_tenancy` bounds the
+    /// walk to edges that session reads, so an edge it cannot see does not
+    /// count toward a cycle (a cycle closed only through another group's
+    /// private edge is not refused).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn reaches_in_force_conn(
+        conn: &mut sqlx::PgConnection,
+        from: Uuid,
+        to: Uuid,
+        relationships: &[&str],
+    ) -> Result<bool, DbError> {
+        let rels: Vec<String> = relationships.iter().map(|r| (*r).to_string()).collect();
+        let reached: bool = sqlx::query_scalar(&format!(
+            "WITH RECURSIVE reach(node) AS ( \
+                 SELECT $1::uuid \
+               UNION \
+                 SELECT e.target_id FROM reach r \
+                   JOIN edges e ON e.source_id = r.node \
+                  WHERE e.relationship = ANY($3) AND {EDGE_IN_FORCE} \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM reach WHERE node = $2)"
+        ))
+        .bind(from)
+        .bind(to)
+        .bind(&rels)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(reached)
+    }
+
     /// Get edges by target entity
     ///
     /// # Errors

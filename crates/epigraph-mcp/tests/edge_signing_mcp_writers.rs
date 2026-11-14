@@ -271,6 +271,7 @@ async fn the_link_tools_attest_their_edges_and_not_a_dedup_hit(pool: PgPool) {
         target_claim_id: t.to_string(),
         relationship: "decomposes_to".to_string(),
         properties: None,
+        ..Default::default()
     };
     let out = epigraph_mcp::tools::link_hierarchical::do_link_hierarchical(
         &server,

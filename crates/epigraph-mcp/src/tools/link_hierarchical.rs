@@ -7,9 +7,17 @@
 //! when the API binary is unavailable.
 //!
 //! Tight contract — narrower than the generic `POST /api/v1/edges` route:
-//! - both endpoints must be existing claims (`source_type` / `target_type`
-//!   are always `"claim"` and not caller-controllable),
-//! - `relationship` must be one of `HIERARCHICAL_RELATIONSHIPS`,
+//! - `relationship` must be one of `HIERARCHICAL_RELATIONSHIPS` (claim to
+//!   claim) or `WORKFLOW_REFERENCE_RELATIONSHIPS` (backlogs 03d87e3a and
+//!   41d7b27a: `executes` workflow -> claim, `invokes` workflow|claim ->
+//!   workflow, `depends_on` workflow -> workflow),
+//! - both endpoints must exist and be readable; their types default to
+//!   `"claim"`, are validated against the `entity_types` registry, and must be
+//!   a pair the relationship admits ([`endpoint_types_for`]),
+//! - a workflow SOURCE requires authority over that workflow
+//!   (`require_workflow_authority`, the gate `add_step` uses), and the write
+//!   is recorded as that gate's writes are,
+//! - `invokes` and `depends_on` refuse an edge that would close a cycle,
 //! - the call is idempotent on `(source, target, relationship)`.
 //!
 //! Intentionally side-effect-free vs the generic POST: no DS recomputation,
@@ -32,8 +40,73 @@ use epigraph_db::{ClaimRepository, EdgeRepository};
 pub const HIERARCHICAL_RELATIONSHIPS: &[&str] =
     &["decomposes_to", "section_follows", "continues_argument"];
 
+/// The workflow references (backlogs 03d87e3a, 41d7b27a), all structural and
+/// belief-neutral. Kept apart from [`HIERARCHICAL_RELATIONSHIPS`], which
+/// mirrors the HTTP hierarchical route's claim-only list.
+pub const WORKFLOW_REFERENCE_RELATIONSHIPS: &[&str] = &["executes", "invokes", "depends_on"];
+
+/// The `(source_type, target_type)` pairs `relationship` admits; empty for a
+/// relationship this tool does not write.
+///
+/// - the document-structure relationships stay claim to claim;
+/// - `executes`: a workflow runs a step claim (the edge `store_workflow` and
+///   `add_step` write; this is its repair path);
+/// - `invokes`: a sub-workflow reference, from a workflow or from one of its
+///   step claims;
+/// - `depends_on`: a prerequisite workflow.
+#[must_use]
+pub fn endpoint_types_for(relationship: &str) -> &'static [(&'static str, &'static str)] {
+    match relationship {
+        "decomposes_to" | "section_follows" | "continues_argument" => &[("claim", "claim")],
+        "executes" => &[("workflow", "claim")],
+        "invokes" => &[("workflow", "workflow"), ("claim", "workflow")],
+        "depends_on" => &[("workflow", "workflow")],
+        _ => &[],
+    }
+}
+
+/// The relationships a cycle through a new `relationship` edge is walked
+/// along, or `None` when the relationship is not cycle-checked.
+///
+/// `invokes` walks `executes` too: a step claim's `invokes` belongs to the
+/// workflow that executes the step, so `W1 -executes-> S1 -invokes-> W2`
+/// followed by `W2 -invokes-> W1` is a cycle.
+#[must_use]
+pub fn cycle_walk_for(relationship: &str) -> Option<&'static [&'static str]> {
+    match relationship {
+        "invokes" => Some(&["invokes", "executes"]),
+        "depends_on" => Some(&["depends_on"]),
+        _ => None,
+    }
+}
+
 fn is_hierarchical_relationship(s: &str) -> bool {
-    HIERARCHICAL_RELATIONSHIPS.contains(&s)
+    HIERARCHICAL_RELATIONSHIPS.contains(&s) || WORKFLOW_REFERENCE_RELATIONSHIPS.contains(&s)
+}
+
+/// Whether the `(id, entity_type)` endpoint exists for `viewer`, on the
+/// stamped transaction. Only the types [`endpoint_types_for`] names reach
+/// here.
+async fn endpoint_exists(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: uuid::Uuid,
+    entity_type: &str,
+) -> Result<bool, McpError> {
+    match entity_type {
+        "claim" => Ok(
+            ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(id))
+                .await
+                .map_err(internal_error)?
+                .is_some(),
+        ),
+        "workflow" => epigraph_db::WorkflowRepository::viewer_reads_row(&mut *conn, viewer, id)
+            .await
+            .map_err(internal_error),
+        other => Err(internal_error(format!(
+            "link_hierarchical: no existence check for entity type '{other}'"
+        ))),
+    }
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -62,22 +135,32 @@ pub async fn do_link_hierarchical(
 ) -> Result<CallToolResult, McpError> {
     let source_id = parse_uuid(&params.source_claim_id)?;
     let target_id = parse_uuid(&params.target_claim_id)?;
+    let source_type = params.source_type.as_deref().unwrap_or("claim");
+    let target_type = params.target_type.as_deref().unwrap_or("claim");
 
     // Tight allow-list — narrower than VALID_RELATIONSHIPS on purpose. New
-    // entries must come from `HIERARCHICAL_RELATIONSHIPS`.
+    // entries must come from `HIERARCHICAL_RELATIONSHIPS` or
+    // `WORKFLOW_REFERENCE_RELATIONSHIPS`.
     if !is_hierarchical_relationship(&params.relationship) {
         return Err(invalid_params(format!(
-            "invalid relationship '{}'. Valid hierarchical types: {}",
+            "invalid relationship '{}'. Valid hierarchical types: {}. Valid workflow references: {}",
             params.relationship,
             HIERARCHICAL_RELATIONSHIPS.join(", "),
+            WORKFLOW_REFERENCE_RELATIONSHIPS.join(", "),
         )));
     }
 
-    // No self-loops — both endpoints are claims so equal UUIDs always loop.
+    // No self-loops: equal UUIDs always loop (ids are unique across tables).
     if source_id == target_id {
         return Err(invalid_params(
-            "self-loops are not allowed (source and target are the same claim)",
+            "self-loops are not allowed (source and target are the same entity)",
         ));
+    }
+    if params.at_step.is_some() && params.relationship != "invokes" {
+        return Err(invalid_params(format!(
+            "at_step is only meaningful for invokes, not '{}'",
+            params.relationship
+        )));
     }
 
     // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1). The two
@@ -103,33 +186,100 @@ pub async fn do_link_hierarchical(
     // intersection read) and nothing is written. Whether a caller should carry
     // write authority into a group this process cannot write is the cross-agent
     // ownership question (#374), not a stamping one.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        server.write_identity(auth, viewer).await?,
-        "link_hierarchical",
-    )
-    .await?;
+    let actor = server.write_identity(auth, viewer).await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, actor, "link_hierarchical").await?;
 
-    // Verify both claims exist via the repo layer (per CLAUDE.md, SQL stays
-    // in epigraph-db). Disambiguate which side is missing so the caller can
-    // fix the right end of the link.
-    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(source_id))
-        .await
-        .map_err(internal_error)?
-        .is_none()
-    {
+    // Endpoint types: registered (the `entity_types` registry, as the HTTP
+    // edges route validates them), then a pair this relationship admits.
+    for (side, ty) in [("source_type", source_type), ("target_type", target_type)] {
+        if epigraph_db::EntityTypeRepository::get_by_name_conn(&mut tx, ty)
+            .await
+            .map_err(internal_error)?
+            .is_none()
+        {
+            return Err(invalid_params(format!(
+                "{side} '{ty}' is not a registered entity type"
+            )));
+        }
+    }
+    let admitted = endpoint_types_for(&params.relationship);
+    if !admitted.contains(&(source_type, target_type)) {
+        let pairs: Vec<String> = admitted
+            .iter()
+            .map(|(s, t)| format!("{s} -> {t}"))
+            .collect();
         return Err(invalid_params(format!(
-            "source_claim_id {source_id} not found"
+            "'{}' does not link {source_type} -> {target_type}. It links: {}",
+            params.relationship,
+            pairs.join(", "),
         )));
     }
-    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(target_id))
-        .await
-        .map_err(internal_error)?
-        .is_none()
-    {
+
+    // Verify both endpoints exist via the repo layer (per CLAUDE.md, SQL stays
+    // in epigraph-db). Disambiguate which side is missing so the caller can
+    // fix the right end of the link.
+    if !endpoint_exists(&mut tx, viewer, source_id, source_type).await? {
         return Err(invalid_params(format!(
-            "target_claim_id {target_id} not found"
+            "source_claim_id {source_id} not found (no readable {source_type} has that id)"
         )));
+    }
+    if !endpoint_exists(&mut tx, viewer, target_id, target_type).await? {
+        return Err(invalid_params(format!(
+            "target_claim_id {target_id} not found (no readable {target_type} has that id)"
+        )));
+    }
+
+    // A workflow SOURCE changes what that workflow runs or references, so it
+    // takes the authority `add_step` takes over it (backlog 03d87e3a: "under
+    // the same authority checks"), decided before anything is written.
+    let grant = if source_type == "workflow" {
+        let not_found = move || invalid_params(format!("source workflow {source_id} not found"));
+        Some(
+            crate::tools::workflow_authority::require_workflow_authority(
+                server,
+                &mut tx,
+                auth,
+                actor,
+                source_id,
+                "link_hierarchical",
+                &not_found,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // Cycle refusal (backlog 41d7b27a): `source -rel-> target` closes a cycle
+    // exactly when `target` already reaches `source`.
+    if let Some(walk) = cycle_walk_for(&params.relationship) {
+        if EdgeRepository::reaches_in_force_conn(&mut tx, target_id, source_id, walk)
+            .await
+            .map_err(internal_error)?
+        {
+            return Err(invalid_params(format!(
+                "refused: {source_type} {source_id} {} {target_type} {target_id} would close a \
+                 cycle ({target_id} already reaches {source_id} through {}). Nothing was written.",
+                params.relationship,
+                walk.join(" / "),
+            )));
+        }
+    }
+
+    let mut properties = params.properties.clone();
+    if let Some(step) = params.at_step {
+        let mut obj = match properties.take() {
+            None => serde_json::Map::new(),
+            Some(serde_json::Value::Object(m)) => m,
+            Some(_) => {
+                return Err(invalid_params(
+                    "properties must be a JSON object when at_step is given",
+                ))
+            }
+        };
+        obj.insert("at_step".to_string(), serde_json::json!(step));
+        properties = Some(serde_json::Value::Object(obj));
     }
 
     // Attested at INSERT by this server's key (R-49/R-50); a dedup hit
@@ -138,16 +288,34 @@ pub async fn do_link_hierarchical(
         &mut tx,
         Some(server.edge_signing_key().await?),
         source_id,
-        "claim",
+        source_type,
         target_id,
-        "claim",
+        target_type,
         &params.relationship,
-        params.properties.clone(),
+        properties,
         None,
         None,
     )
     .await
     .map_err(internal_error)?;
+    if let Some(grant) = grant {
+        crate::tools::workflow_authority::record_workflow_write(
+            &mut tx,
+            auth,
+            actor,
+            "link_hierarchical",
+            source_id,
+            grant,
+            serde_json::json!({
+                "edge_id": edge_row.id,
+                "relationship": params.relationship,
+                "target_id": target_id,
+                "target_type": target_type,
+                "created": was_created,
+            }),
+        )
+        .await?;
+    }
     let owned_by_caller = EdgeRepository::owned_by_session(&mut *tx, edge_row.id)
         .await
         .map_err(internal_error)?;
