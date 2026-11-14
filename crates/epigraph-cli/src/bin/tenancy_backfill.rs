@@ -1749,6 +1749,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // update policy (42501): nothing is ever confirmed or declined that the
     // owner could not see.
     ("epigraph_countersign_authorship", 208),
+    // 217, the two factor triggers (backlog a2c5f714): the application role
+    // holds no INSERT / DELETE on `factors`, so they write it as their owner.
+    // Under a non-member owner without the `factors` grant the edge mint
+    // fails LOUD (every claim-claim edge INSERT is refused 42501 at the
+    // factor INSERT, an outage of edge writes), and the retirement clear the
+    // same way (every retirement refused). Under one that holds the grant the
+    // mint's `claims` read is RLS-filtered, so an edge to a superseded claim
+    // the owner cannot see is minted over, silently.
+    ("auto_create_factor_from_edge", 217),
+    ("deactivate_superseded_factors", 217),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the

@@ -127,6 +127,12 @@ pub struct FactorRepository;
 
 impl FactorRepository {
     /// Insert a new factor.
+    ///
+    /// Only a privileged (maintenance or superuser) pool can: since migration
+    /// 217 the application role holds no INSERT on `factors`, whose rows are
+    /// minted by the edge INSERT trigger (`auto_create_factor_from_edge`, a
+    /// maintenance-owned definer) and by the maintenance cascades. On the
+    /// application role this returns `42501`.
     pub async fn insert(
         pool: &PgPool,
         factor_type: &str,

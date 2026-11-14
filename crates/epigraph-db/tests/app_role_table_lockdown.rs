@@ -41,6 +41,11 @@
 //!   INSERT on one: fails `no_rowless_table_is_app_writable_unless_allowlisted`
 //!   and `append_only_tables_keep_insert_and_cascades_still_clear_them`; a
 //!   column-level UPDATE re-grant fails the ratchet.
+//! * migration 217 (`factors` writes moved into maintenance-owned trigger
+//!   definers) removed: fails
+//!   `no_rowless_table_is_app_writable_unless_allowlisted` (`factors` is
+//!   app-writable again and no longer allowlisted). 217's own attack tests are
+//!   in `factors_write_posture.rs`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -61,9 +66,9 @@ use uuid::Uuid;
 /// security. One reason per class; migration 118's header names the tables it
 /// closed. A table leaves this list when its privilege is revoked, its writes
 /// move into a definer, or it gains row security.
-const DERIVED_BP: &str = "derived belief-propagation state: written on the application role \
-    by the request path and by invoker triggers (edges_auto_factor inserts factors, \
-    claims_deactivate_factors deletes them); tenancy for derived rows is a follow-up";
+const DERIVED_BP: &str = "derived belief-propagation messages: upserted and cleared on the \
+    application role by every propagation run; tenancy for derived rows is a follow-up \
+    (`factors` left this list at migration 217: its writers are maintenance-owned definers)";
 const DERIVED_CLUSTER: &str = "derived clustering / theme / neighbourhood state, rebuilt by \
     jobs and the clusters routes; no credential or authority content";
 const OPERATIONAL: &str = "an operational record the request path writes on the application \
@@ -93,7 +98,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("entity_types", REGISTRY),
     ("experiment_results", OPERATIONAL),
     ("experiments", OPERATIONAL),
-    ("factors", DERIVED_BP),
     ("graph_cluster_runs", DERIVED_CLUSTER),
     ("graph_clusters", DERIVED_CLUSTER),
     ("match_candidates", MATCH),
@@ -1740,27 +1744,25 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
     assert_eq!(status_of(&pool, id).await, "stale");
 }
 
-/// The derived BP tables stay writable by the application role (they are on the
-/// allowlist): factor insert, BP-message upsert (INSERT ... ON CONFLICT DO
-/// UPDATE, which needs UPDATE) and the clear before a propagation run.
+/// `bp_messages` stays writable by the application role (it is on the
+/// allowlist): BP-message upsert (INSERT ... ON CONFLICT DO UPDATE, which needs
+/// UPDATE) and the clear before a propagation run. The factor they hang off is
+/// minted by the edge trigger; since migration 217 the application role writes
+/// no factor itself (`factors_write_posture.rs`).
 #[sqlx::test(migrations = "../../migrations")]
-async fn factor_and_bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
+async fn bp_message_writes_still_work_on_the_app_role(pool: PgPool) {
     use epigraph_db::FactorRepository;
     let (agent, _) = fixture::seed_agent_with_group(&pool, "w11-bp").await;
     let a = fixture::seed_public_claim(&pool, agent, &format!("w11 bp a {}", Uuid::new_v4())).await;
     let b = fixture::seed_public_claim(&pool, agent, &format!("w11 bp b {}", Uuid::new_v4())).await;
+    let edge = fixture::seed_edge(&pool, a, b).await;
+    let factor: Uuid =
+        sqlx::query_scalar("SELECT id FROM factors WHERE properties->>'source_edge_id' = $1::text")
+            .bind(edge)
+            .fetch_one(&pool)
+            .await
+            .expect("the edge trigger minted the factor");
     let app = app_pool(&pool, 2).await;
-
-    let factor = FactorRepository::insert(
-        &app,
-        "evidential_support",
-        &[a, b],
-        &serde_json::json!({"strength": 0.7}),
-        Some("w11 app-role factor"),
-        None,
-    )
-    .await
-    .expect("factor insert on the application role");
     for iteration in [1, 2] {
         FactorRepository::upsert_bp_message(
             &app,
