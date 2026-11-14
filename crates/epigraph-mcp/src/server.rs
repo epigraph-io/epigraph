@@ -715,6 +715,21 @@ impl EpiGraphMcpFull {
         Self::tool_router().list_all()
     }
 
+    /// The name of every kernel tool: the names no federated extension may
+    /// export (backlog 351d3def). `FederationRegistry::build` reserves them, so a
+    /// clash fails the gateway's boot instead of listing the name twice and
+    /// routing it only to the kernel.
+    ///
+    /// Taken from [`static_tools`](Self::static_tools), the full router, rather
+    /// than any one server's: a read-only server's router has the same names.
+    #[must_use]
+    pub fn kernel_tool_names() -> HashSet<String> {
+        Self::static_tools()
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect()
+    }
+
     /// Look up the required scope for `tool_name` and verify the
     /// caller has it. Returns `Err` with a JSON-RPC-style error if:
     /// - no `AuthContext` is attached (token validation never ran or
@@ -3318,9 +3333,9 @@ impl ServerHandler for EpiGraphMcpFull {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         // Kernel tools first, then every federated tool the gateway currently
-        // advertises. Static-first mirrors `call_tool`'s resolution order: a
-        // kernel tool always wins a name clash (the operator resolves clashes
-        // between an extension and the kernel with a `prefix=`).
+        // advertises. The two never share a name: the registry refuses an
+        // extension tool named like a kernel tool (at boot, and leaves it
+        // unrouted on a reconnect; backlog 351d3def).
         //
         // The kernel list is THIS caller's (elevation plan EL-11, D2):
         // `sudo`/`unsudo` only to a holder of a live elevating role, and an
@@ -3344,8 +3359,8 @@ impl ServerHandler for EpiGraphMcpFull {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        // Static router first (kernel tools win name clashes, as in call_tool),
-        // then fall back to a federated tool from the routing map.
+        // Static router first, as in call_tool, then a federated tool from the
+        // routing map. The registry never routes a kernel tool's name.
         self.tool_router.get(name).cloned().or_else(|| {
             self.federation
                 .list_federated_tools()

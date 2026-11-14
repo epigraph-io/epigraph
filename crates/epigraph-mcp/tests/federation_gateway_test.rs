@@ -21,6 +21,9 @@
 //!   boot race that left episcience unroutable in production for hours — and is
 //!   a no-op against one that is still down or already healthy.
 
+#[path = "support/federation_stub.rs"]
+mod stub;
+
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -659,4 +662,82 @@ async fn a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied(
         .expect("stub returns text content")
         .text;
     assert_eq!(text.len(), 15 * 1024 * 1024);
+}
+
+// ── Backlog 351d3def: an extension tool named like a kernel tool ────────────
+//
+// `call_tool` tries the kernel router first, so an extension tool sharing a
+// kernel tool's name could never be called, and the manifest listed the name
+// twice. `build` reserves every kernel tool name and refuses the clash, as it
+// refuses two extensions exporting the same name. `submit_claim` is a real
+// kernel tool, so these tests pin the reserved set `build` actually uses.
+
+/// Mutation: drop the `reserved.contains` check from `build_reserving` (or
+/// have `build` reserve an empty set) -> the build succeeds and this fails.
+#[tokio::test]
+async fn an_extension_exporting_a_kernel_tool_name_fails_build() {
+    assert!(
+        epigraph_mcp::EpiGraphMcpFull::kernel_tool_names().contains("submit_claim"),
+        "CALIBRATION: `submit_claim` is a kernel tool"
+    );
+    let (addr, _slot) = spawn_stub("submit_claim").await;
+    let result =
+        FederationRegistry::build(vec![cfg("clashing", &addr, None)], "discovery-tok").await;
+    let err = match result {
+        Ok(_) => panic!("an extension exporting a kernel tool name must fail the build"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("submit_claim"), "must name the tool: {msg}");
+    assert!(msg.contains("clashing"), "must name the extension: {msg}");
+    assert!(
+        msg.contains("kernel"),
+        "must say what it clashes with: {msg}"
+    );
+    assert!(msg.contains("prefix="), "must name the remedy: {msg}");
+}
+
+/// The remedy the refusal names works: under a prefix the name is distinct.
+#[tokio::test]
+async fn a_prefix_resolves_a_kernel_tool_name_clash() {
+    let (addr, _slot) = spawn_stub("submit_claim").await;
+    let registry =
+        FederationRegistry::build(vec![cfg("clashing", &addr, Some("ext__"))], "discovery-tok")
+            .await
+            .expect("a prefixed name does not clash with the kernel");
+    assert!(registry.route("ext__submit_claim").is_some());
+    assert!(registry.route("submit_claim").is_none());
+}
+
+/// An extension down at boot is checked against nothing then, so the clash
+/// first appears at reconnect. The running gateway is not taken down: the
+/// kernel-named tool is left unrouted and unlisted, and the rest are routed.
+///
+/// Mutation: drop the `reserved.contains` arm from `admit` -> `submit_claim`
+/// is routed to the extension and listed twice, and this fails.
+#[tokio::test]
+async fn a_reconnect_does_not_route_a_kernel_tool_name() {
+    let addr = stub::dead_addr().await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("late", &addr, None)], "discovery-tok")
+            .await
+            .expect("an unreachable extension must not fail the build"),
+    );
+    let _control = stub::spawn_controlled_stub_on(&addr, &["submit_claim", "late_probe"]).await;
+    federation.reconnect_tick().await;
+
+    let listed: Vec<String> = federation
+        .list_federated_tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["late_probe".to_string()],
+        "only the non-clashing tool is routed after the reconnect"
+    );
+    assert!(
+        federation.route_config("submit_claim").is_none(),
+        "a kernel tool name must never route to an extension"
+    );
 }

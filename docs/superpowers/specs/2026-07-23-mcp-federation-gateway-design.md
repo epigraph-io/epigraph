@@ -180,10 +180,11 @@ compile-time `SCOPE_MAP`, so federated tools must **not** be added to `SCOPE_MAP
 coverage is a static test invariant). Instead a **separate** `enforce_federated_scope`
 checks the caller holds the extension's configured `scope=…`. `call_tool` branches to
 federation **only after** the static `tool_router` misses the name, so the static gate
-never runs for a federated tool and never runs the federated gate for a kernel tool. A
-kernel tool always wins a name clash (build-time collision detection only guards clashes
-*between extensions*; an extension-vs-kernel clash is the operator's `prefix=`
-responsibility).
+never runs for a federated tool and never runs the federated gate for a kernel tool.
+The two never share a name: `FederationRegistry::build` reserves every kernel tool name
+(`EpiGraphMcpFull::kernel_tool_names`) and refuses an extension that exports one, exactly as
+it refuses two extensions exporting the same name (backlog 351d3def). The operator resolves
+either clash with a `prefix=`.
 
 ## Data flow (federated call)
 
@@ -206,7 +207,12 @@ responsibility).
 - Downstream socket down at startup → its tools are **absent** from `tools/list`
   (logged); gateway serves everything else. Reconnect on a timer; tools reappear.
 - Downstream errors mid-call → surfaced as a normal MCP tool error.
-- Collision at startup (two servers, same tool name, no prefix) → **refuse to start**.
+- Collision at startup (two extensions, or an extension and the kernel, exporting the same
+  effective tool name) → **refuse to start**.
+- Collision at runtime (an extension that reconnects, or re-lists, with a name the kernel
+  or another mounted extension already routes) → that one name is **not routed** to it, with
+  a warning; the rest of its tools are. The running gateway is never taken down, and the
+  clash is refused at the next start.
 
 ## Testing
 

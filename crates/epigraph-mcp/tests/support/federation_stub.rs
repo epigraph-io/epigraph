@@ -146,6 +146,25 @@ async fn gate(
 pub async fn spawn_controlled_stub(tools: &[&str]) -> (String, Arc<StubControl>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    (addr, serve_controlled_stub(listener, tools))
+}
+
+/// As [`spawn_controlled_stub`], on a caller-chosen `host:port`: brings an
+/// extension up on the address a gateway already failed to reach.
+pub async fn spawn_controlled_stub_on(addr: &str, tools: &[&str]) -> Arc<StubControl> {
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    serve_controlled_stub(listener, tools)
+}
+
+/// A loopback `host:port` nothing listens on: bound, then released.
+pub async fn dead_addr() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("127.0.0.1:{port}")
+}
+
+fn serve_controlled_stub(listener: tokio::net::TcpListener, tools: &[&str]) -> Arc<StubControl> {
     let control = Arc::new(StubControl {
         tools: Mutex::new(tools.iter().map(|n| (*n).to_string()).collect()),
         alive: AtomicBool::new(true),
@@ -173,5 +192,5 @@ pub async fn spawn_controlled_stub(tools: &[&str]) -> (String, Arc<StubControl>)
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (addr, control)
+    control
 }

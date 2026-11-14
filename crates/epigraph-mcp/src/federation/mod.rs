@@ -27,7 +27,7 @@
 pub mod client;
 pub mod config;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -37,10 +37,11 @@ use crate::federation::client::{ExtensionClient, FederationError};
 use crate::federation::config::ExtensionConfig;
 
 /// Failure building a [`FederationRegistry`]. The only fatal condition is a tool
-/// name COLLISION (two reachable extensions exporting the same effective tool
-/// name) — that is an operator misconfiguration the gateway must not paper over,
-/// because silent last-writer-wins routing would send calls to the wrong
-/// backend. An *unreachable* extension at startup is NOT fatal: it is logged and
+/// name COLLISION: a reachable extension exporting an effective tool name that
+/// the kernel or another reachable extension already exports. That is an
+/// operator misconfiguration the gateway must not paper over, because the
+/// clashing name would be listed twice and routed to only one of its owners.
+/// An *unreachable* extension at startup is NOT fatal: it is logged and
 /// skipped (see [`FederationRegistry::build`]).
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -56,6 +57,21 @@ pub enum RegistryError {
         first: String,
         /// Name of the second extension that collided.
         second: String,
+    },
+
+    /// An extension exports an effective tool name the kernel already
+    /// registers (backlog 351d3def). `call_tool` tries the kernel router first,
+    /// so the extension's tool could never be called, and the manifest would
+    /// list the name twice.
+    #[error(
+        "federated tool-name collision on `{tool}`: extension `{extension}` exports a \
+         tool the kernel already registers; set a `prefix=` on the extension"
+    )]
+    KernelCollision {
+        /// The effective tool name the kernel and the extension both export.
+        tool: String,
+        /// Name of the extension that exported it.
+        extension: String,
     },
 }
 
@@ -107,6 +123,9 @@ pub struct FederationRegistry {
     /// [`reconnect_tick`](SharedFederation::reconnect_tick) can re-dial dropped
     /// extensions without the caller threading the token back through.
     discovery_token: String,
+    /// Effective names no extension may route: the kernel's own tools. Kept
+    /// so a reconnect applies the same rule `build` refused a clash under.
+    reserved: HashSet<String>,
 }
 
 impl FederationRegistry {
@@ -122,6 +141,7 @@ impl FederationRegistry {
             extensions: Vec::new(),
             routes: HashMap::new(),
             discovery_token: String::new(),
+            reserved: HashSet::new(),
         }
     }
 
@@ -135,13 +155,39 @@ impl FederationRegistry {
     /// [`reconnect_tick`](SharedFederation::reconnect_tick) brings it up without
     /// a gateway restart.
     ///
+    /// Reserves every kernel tool name
+    /// ([`EpiGraphMcpFull::kernel_tool_names`](crate::EpiGraphMcpFull::kernel_tool_names)):
+    /// computed here rather than passed in, so no caller can mount extensions
+    /// without the kernel's names reserved.
+    ///
     /// # Errors
+    /// [`RegistryError::KernelCollision`] if a *reachable* extension exports an
+    /// effective tool name the kernel registers, and
     /// [`RegistryError::Collision`] if two *reachable* extensions export the
-    /// same effective tool name. This is the sole fatal condition: it is an
-    /// operator misconfiguration (ambiguous routing) that must fail loudly.
+    /// same one. These are the only fatal conditions: each is an operator
+    /// misconfiguration (ambiguous routing) that must fail loudly.
     pub async fn build(
         configs: Vec<ExtensionConfig>,
         discovery_token: &str,
+    ) -> Result<Self, RegistryError> {
+        Self::build_reserving(
+            configs,
+            discovery_token,
+            crate::EpiGraphMcpFull::kernel_tool_names(),
+        )
+        .await
+    }
+
+    /// [`build`](Self::build) with a caller-chosen set of `reserved` effective
+    /// names in place of the kernel's: an extension exporting one fails the
+    /// build with [`RegistryError::KernelCollision`].
+    ///
+    /// # Errors
+    /// As [`build`](Self::build).
+    pub async fn build_reserving(
+        configs: Vec<ExtensionConfig>,
+        discovery_token: &str,
+        reserved: HashSet<String>,
     ) -> Result<Self, RegistryError> {
         let mut extensions: Vec<MountedExtension> = Vec::with_capacity(configs.len());
         let mut routes: HashMap<String, usize> = HashMap::new();
@@ -156,6 +202,12 @@ impl FederationRegistry {
                         // fatal. Detect BEFORE moving `tools` into the mount.
                         for tool in &tools {
                             let name = tool.name.to_string();
+                            if reserved.contains(&name) {
+                                return Err(RegistryError::KernelCollision {
+                                    tool: name,
+                                    extension: config.name.clone(),
+                                });
+                            }
                             if let Some(&prior) = routes.get(&name) {
                                 return Err(RegistryError::Collision {
                                     tool: name,
@@ -217,6 +269,7 @@ impl FederationRegistry {
             extensions,
             routes,
             discovery_token: discovery_token.to_string(),
+            reserved,
         })
     }
 
@@ -324,33 +377,13 @@ impl FederationRegistry {
     /// freshly-established discovery `session`.
     ///
     /// The **write half** of a reconnect pass: sync, no `.await`, so it runs
-    /// entirely under the write lock. A reconnect that would introduce a
-    /// tool-name collision with an already-mounted extension is skipped (logged)
-    /// rather than errored — reconnect must never take down the running gateway;
-    /// the collision is surfaced at the next `build`. Returns `true` when the
-    /// extension was actually promoted.
-    fn apply_reconnect(
-        &mut self,
-        index: usize,
-        session: ExtensionClient,
-        tools: Vec<Tool>,
-    ) -> bool {
-        // Guard against stealing a route owned by a *different* extension. The
-        // snapshot this reconnect was planned from may be stale: another tick
-        // (or a concurrent revival) could have claimed the name in between.
-        for tool in &tools {
-            let name = tool.name.as_ref();
-            if let Some(&owner) = self.routes.get(name) {
-                if owner != index {
-                    tracing::warn!(
-                        extension = %self.extensions[index].config.name,
-                        tool = %name,
-                        "federation: reconnect skipped — tool collides with a mounted extension"
-                    );
-                    return false;
-                }
-            }
-        }
+    /// entirely under the write lock. A tool whose name collides with a kernel
+    /// tool or one another mounted extension routes is skipped (logged; see
+    /// [`admit`](Self::admit)) rather than errored: reconnect must never take
+    /// down the running gateway, and the collision is refused at the next
+    /// `build`. The rest of the extension's tools are routed.
+    fn apply_reconnect(&mut self, index: usize, session: ExtensionClient, tools: Vec<Tool>) {
+        let tools = self.admit(index, tools);
         for tool in &tools {
             self.routes.insert(tool.name.to_string(), index);
         }
@@ -363,7 +396,48 @@ impl FederationRegistry {
         ext.client = Some(session);
         ext.tools = tools;
         ext.healthy = true;
-        true
+    }
+
+    /// The subset of `tools` extension `index` may route at runtime: every one
+    /// whose effective name is neither a kernel tool ([`Self::reserved`]) nor
+    /// routed to a *different* extension. Each one dropped is logged.
+    ///
+    /// `build` refuses either clash outright. At runtime the gateway is already
+    /// serving, so the clashing name is not routed to this extension and
+    /// everything else is: the kernel, or the extension that routed the name
+    /// first, keeps it, and no name is ever listed twice. The routes checked
+    /// are the live ones, because the snapshot a reconnect was planned from
+    /// may be stale.
+    fn admit(&self, index: usize, tools: Vec<Tool>) -> Vec<Tool> {
+        let extension = &self.extensions[index].config.name;
+        tools
+            .into_iter()
+            .filter(|tool| {
+                let name = tool.name.as_ref();
+                if self.reserved.contains(name) {
+                    tracing::warn!(
+                        extension = %extension,
+                        tool = %name,
+                        "federation: tool not routed, the kernel already registers this name; \
+                         set a `prefix=` on the extension"
+                    );
+                    return false;
+                }
+                match self.routes.get(name) {
+                    Some(&owner) if owner != index => {
+                        tracing::warn!(
+                            extension = %extension,
+                            tool = %name,
+                            owner = %self.extensions[owner].config.name,
+                            "federation: tool not routed, another mounted extension routes \
+                             this name; set a distinct `prefix=`"
+                        );
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect()
     }
 }
 
