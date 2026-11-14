@@ -117,6 +117,8 @@ Start here:
   verb-edges, agents and signing, Dempster-Shafer beliefs, perspectives,
   hierarchical extraction, and backlog discipline.
 - [`docs/intro/04-glossary.md`](docs/intro/04-glossary.md): vocabulary.
+  (The numbering skips `03`: the walkthroughs page planned under that number
+  was not written.)
 - [`docs/intro/05-next-steps.md`](docs/intro/05-next-steps.md): pointers for
   contributors, operators and downstream projects.
 
