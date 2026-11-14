@@ -704,6 +704,14 @@ async fn write_submission(
                 .signer
                 .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
         );
+        // The row signature above covers `content_hash` (BLAKE3 of
+        // evidence_data) only. A dataset's structured fields (root, manifest
+        // digest, counts) get a signature of their own, bound to this row's
+        // evidence and claim ids, under the separate `Dataset` signing domain,
+        // so the bytes every existing evidence signature covers are unchanged
+        // (backlog c8beb101). A no-op for any other evidence type.
+        e.evidence_type
+            .attest_dataset(e.id, e.claim_id, &server.signer);
         e
     };
 

@@ -156,7 +156,7 @@ pub struct SubmitClaimParams {
     #[serde(default)]
     pub group_id: Option<String>,
     #[schemars(
-        description = "Structured dataset evidence (optional): the evidence commits to a multi-file dataset by its manifest's digest, so a reader can resolve and verify the data without parsing evidence_data. When given, the evidence row is stored as type \"dataset\" with these fields (returned by get_claim's datasets and get_provenance); evidence_type still sets the evidence weight as usual, and evidence_data is still required (a one-line description of the run is enough). Evidence on one claim is de-duplicated on evidence_data, so two datasets on the same claim need different evidence_data. An invalid dataset refuses the call and writes nothing."
+        description = "Structured dataset evidence (optional): the evidence commits to a multi-file dataset by its manifest's digest, so a reader can resolve and verify the data without parsing evidence_data. When given, the evidence row is stored as type \"dataset\" with these fields plus an attestation: this server's Ed25519 signature over them, bound to the evidence and claim ids (returned by get_claim's datasets and get_provenance); evidence_type still sets the evidence weight as usual, and evidence_data is still required (a one-line description of the run is enough). Evidence on one claim is de-duplicated on evidence_data, so two datasets on the same claim need different evidence_data. An invalid dataset refuses the call and writes nothing."
     )]
     #[serde(default)]
     pub dataset: Option<DatasetEvidenceParams>,
@@ -169,7 +169,7 @@ pub struct SubmitClaimParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DatasetEvidenceParams {
     #[schemars(
-        description = "Where the dataset lives: a URI or path naming its root directory (e.g. s3://bucket/campaign/run-0042/). Also stored as the evidence's source_url."
+        description = "Where the dataset lives: a URI or path naming its root directory (e.g. s3://bucket/campaign/run-0042/). Also stored as the evidence's source_url when the call passes no source_url of its own."
     )]
     pub root_uri: String,
 

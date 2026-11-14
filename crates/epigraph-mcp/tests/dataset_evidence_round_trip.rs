@@ -4,7 +4,9 @@
 //! A claim filed with a `dataset` must carry evidence `{type: dataset,
 //! root_uri, manifest_hash: blake3:..., file_count, total_bytes}` that a reader
 //! gets back from `get_claim` and `get_provenance` without parsing
-//! `evidence_data`, on a row signed exactly as every other MCP evidence row is.
+//! `evidence_data`, on a row signed exactly as every other MCP evidence row is,
+//! with the dataset fields themselves covered by a server attestation that a
+//! reader verifies (review finding 1).
 //!
 //! Params are built from JSON, not struct literals, on purpose: serde ignores
 //! unknown fields here, so against the pre-dataset types the same payload
@@ -87,6 +89,37 @@ fn test_server_key() -> [u8; 32] {
         .public_key()
 }
 
+/// `properties` without its `attestation`, and whether there was one.
+fn without_attestation(mut v: Value) -> (Value, bool) {
+    let had = v
+        .as_object_mut()
+        .and_then(|o| o.remove("attestation"))
+        .is_some();
+    (v, had)
+}
+
+/// Whether a dataset as a reader receives it (stored `properties`, or a
+/// `get_claim` `datasets` entry, whose extra `evidence_id` serde ignores)
+/// carries an attestation that verifies under the test server key for these
+/// ids. `None` when it carries none.
+fn attestation_verifies(dataset: &Value, evidence_id: Uuid, claim_id: Uuid) -> Option<bool> {
+    let parsed: epigraph_core::EvidenceType =
+        serde_json::from_value(dataset.clone()).expect("a dataset value");
+    parsed.verify_dataset_attestation(
+        epigraph_core::EvidenceId::from_uuid(evidence_id),
+        epigraph_core::ClaimId::from_uuid(claim_id),
+        &test_server_key(),
+    )
+}
+
+fn get_claim_params(claim_id: Uuid) -> epigraph_mcp::types::GetClaimParams {
+    epigraph_mcp::types::GetClaimParams {
+        claim_id: claim_id.to_string(),
+        frame_id: None,
+        perspective_id: None,
+    }
+}
+
 async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
         .bind(content)
@@ -134,7 +167,17 @@ async fn a_dataset_submission_round_trips_through_a_signed_write(pool: PgPool) {
         Some(ROOT),
         "root_uri is the source_url"
     );
-    assert_eq!(properties, expected_dataset());
+    let (fields, attested) = without_attestation(properties.clone());
+    assert_eq!(fields, expected_dataset());
+    assert!(
+        attested,
+        "the server must attest the dataset fields: {properties}"
+    );
+    assert_eq!(
+        attestation_verifies(&properties, evidence_id, claim_id),
+        Some(true),
+        "the stored attestation must verify under the server key: {properties}"
+    );
     let hash: [u8; 32] = hash.try_into().unwrap();
     assert_eq!(
         hash,
@@ -175,6 +218,11 @@ async fn a_dataset_submission_round_trips_through_a_signed_write(pool: PgPool) {
     assert_eq!(d["hash_algorithm"], "blake3");
     assert_eq!(d["file_count"], 1204);
     assert_eq!(d["total_bytes"], 73_014_444_032_u64);
+    assert_eq!(
+        attestation_verifies(d, evidence_id, claim_id),
+        Some(true),
+        "get_claim must hand the reader an attestation that verifies: {got}"
+    );
 
     // get_provenance.
     let prov = first_text(
@@ -200,6 +248,140 @@ async fn a_dataset_submission_round_trips_through_a_signed_write(pool: PgPool) {
     );
     assert_eq!(entity["dataset"]["root_uri"], ROOT);
     assert_eq!(entity["dataset"]["file_count"], 1204);
+    assert_eq!(
+        attestation_verifies(&entity["dataset"], evidence_id, claim_id),
+        Some(true),
+        "get_provenance must carry the verifying attestation: {text}"
+    );
+}
+
+/// Review finding 1: the evidence row's signature covers only
+/// `content_hash`, so an edit to the stored dataset fields, or a dataset
+/// copied onto another claim's row, used to leave every stored signature
+/// verifying while `get_claim` served the edited digest. With the attestation
+/// a reader of `get_claim` detects both, and the row signature still verifies
+/// (so this is the attestation's doing, not a broken row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edited_or_transplanted_dataset_fails_its_attestation(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let submit = |content: &'static str, dataset: Value| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            let body = first_text(
+                &epigraph_mcp::tools::claims::submit_claim(
+                    server,
+                    viewer,
+                    submission(content, dataset),
+                    None,
+                )
+                .await
+                .expect("submit_claim"),
+            );
+            parse_uuid_field(&body, "claim_id")
+        }
+    };
+    let first = submit("c8beb101: tamper target run 1", dataset_json()).await;
+    let mut other_dataset = dataset_json();
+    other_dataset["root_uri"] = json!(format!("{ROOT}-other"));
+    other_dataset["file_count"] = json!(7);
+    let second = submit("c8beb101: transplant target run 2", other_dataset).await;
+
+    let evidence_of = |claim: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM evidence WHERE claim_id = $1 AND evidence_type = 'dataset'",
+            )
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("a dataset row")
+        }
+    };
+    let first_ev = evidence_of(first).await;
+    let second_ev = evidence_of(second).await;
+    let dataset_from_get_claim = |claim: Uuid| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            let got = first_text(
+                &epigraph_mcp::tools::claims::get_claim(server, viewer, get_claim_params(claim))
+                    .await
+                    .expect("get_claim"),
+            );
+            got["datasets"][0].clone()
+        }
+    };
+    // Both verify before anything is touched.
+    assert_eq!(
+        attestation_verifies(&dataset_from_get_claim(first).await, first_ev, first),
+        Some(true)
+    );
+    assert_eq!(
+        attestation_verifies(&dataset_from_get_claim(second).await, second_ev, second),
+        Some(true)
+    );
+
+    // Edit: the review's exact UPDATE on the manifest digest.
+    sqlx::query(
+        "UPDATE evidence SET properties = jsonb_set(properties, '{manifest_hash}', $2) \
+          WHERE id = $1",
+    )
+    .bind(first_ev)
+    .bind(json!(format!("blake3:{}", "0".repeat(64))))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let edited = dataset_from_get_claim(first).await;
+    assert_eq!(
+        edited["manifest_hash"],
+        format!("blake3:{}", "0".repeat(64))
+    );
+    assert_eq!(
+        attestation_verifies(&edited, first_ev, first),
+        Some(false),
+        "an edited manifest digest must fail its attestation: {edited}"
+    );
+
+    // Transplant: the second row's whole properties, attestation included,
+    // copied onto the first claim's row.
+    sqlx::query(
+        "UPDATE evidence SET properties = (SELECT properties FROM evidence WHERE id = $2) \
+          WHERE id = $1",
+    )
+    .bind(first_ev)
+    .bind(second_ev)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let transplanted = dataset_from_get_claim(first).await;
+    assert_eq!(transplanted["file_count"], 7, "{transplanted}");
+    assert_eq!(
+        attestation_verifies(&transplanted, first_ev, first),
+        Some(false),
+        "a dataset copied from another row must fail its attestation: {transplanted}"
+    );
+
+    // The row signature is untouched by either edit and still verifies: it
+    // never covered these fields, which is the gap the attestation closes.
+    let (hash, sig): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT content_hash, signature FROM evidence WHERE id = $1")
+            .bind(first_ev)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        SignatureVerifier::verify_entity(
+            &test_server_key(),
+            SignedEntity::Evidence,
+            &hash.try_into().unwrap(),
+            &sig.try_into().unwrap()
+        )
+        .unwrap(),
+        Some(SignatureScheme::V1)
+    );
 }
 
 /// A claim filed without a dataset still answers `datasets: []`, so a reader
@@ -296,5 +478,7 @@ async fn batch_entries_carry_their_own_dataset(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("the good entry's dataset row");
-    assert_eq!(props, expected_dataset());
+    let (fields, attested) = without_attestation(props);
+    assert_eq!(fields, expected_dataset());
+    assert!(attested, "a batch entry's dataset is attested too");
 }
