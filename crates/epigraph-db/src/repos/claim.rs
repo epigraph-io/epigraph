@@ -11454,40 +11454,102 @@ mod label_tests {
     }
 }
 
-/// How a consolidation restates its sources. Recorded in
-/// `properties.merge.mode`; the server does not interpret it — the caller
-/// supplies the synthesized content either way.
+/// What a consolidation does to its sources (backlog 22602dd8). Three
+/// explicit modes, because "these claims are the same" and "these claims
+/// together say something new" are different acts with different reversals:
+///
+/// - [`Self::Identity`]: the sources are restatements of one of them, the
+///   caller-chosen survivor. Each other source is marked a duplicate of the
+///   survivor through the dedup act (`mark_duplicate`), so it gets the
+///   identity edge, its belief inputs pool onto the survivor, and it can be
+///   un-marked. No new claim is written. The merge act below refuses this
+///   mode: the MCP `consolidate_claims` tool runs the dedup act per source.
+/// - [`Self::Merge`]: the sources are complementary, not duplicates. A new
+///   merged claim is written and every source is retired into it.
+/// - [`Self::Abstract`]: a new, higher-level claim generalises the sources.
+///   It is linked to each source by a `generalizes` edge, and nothing is
+///   retired: the sources stay current and keep their edges.
+///
+/// Recorded in `properties.merge.mode` on the new claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsolidateMode {
-    /// Combined restatement of all sources.
+    /// Mark every non-survivor source a duplicate of the survivor.
+    Identity,
+    /// A new merged claim; every source is retired into it.
     Merge,
-    /// Higher-level generalisation over the sources.
+    /// A new generalisation; the sources stay current.
     Abstract,
-    /// Refined restatement (typically N=2, near-identical inputs).
-    Rewrite,
 }
 
 impl ConsolidateMode {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Identity => "identity",
             Self::Merge => "merge",
             Self::Abstract => "abstract",
-            Self::Rewrite => "rewrite",
         }
     }
 
-    /// Parse a wire-format mode string.
+    /// Whether this mode retires its sources into a new claim.
+    #[must_use]
+    pub fn retires_sources(self) -> bool {
+        matches!(self, Self::Merge)
+    }
+
+    /// Parse a wire-format mode string. `rewrite`, a former mode that
+    /// behaved exactly as a merge, is still accepted and means [`Self::Merge`].
     ///
     /// # Errors
     /// Returns the offending string when it is not a known mode.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "merge" => Ok(Self::Merge),
+            "identity" => Ok(Self::Identity),
+            "merge" | "rewrite" => Ok(Self::Merge),
             "abstract" => Ok(Self::Abstract),
-            "rewrite" => Ok(Self::Rewrite),
             other => Err(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod consolidate_mode_tests {
+    use super::ConsolidateMode;
+
+    #[test]
+    fn the_three_modes_parse_and_rewrite_is_a_merge() {
+        assert_eq!(
+            ConsolidateMode::parse("identity"),
+            Ok(ConsolidateMode::Identity)
+        );
+        assert_eq!(
+            ConsolidateMode::parse(" Merge "),
+            Ok(ConsolidateMode::Merge)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("rewrite"),
+            Ok(ConsolidateMode::Merge)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("abstract"),
+            Ok(ConsolidateMode::Abstract)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("obliterate"),
+            Err("obliterate".to_string())
+        );
+        // `rewrite` is an alias, not a fourth recorded mode.
+        assert_eq!(
+            ConsolidateMode::parse("rewrite").map(ConsolidateMode::as_str),
+            Ok("merge")
+        );
+    }
+
+    #[test]
+    fn only_merge_retires_its_sources() {
+        assert!(ConsolidateMode::Merge.retires_sources());
+        assert!(!ConsolidateMode::Abstract.retires_sources());
+        assert!(!ConsolidateMode::Identity.retires_sources());
     }
 }
 
@@ -11639,7 +11701,9 @@ impl ClaimRepository {
             acting_agent_id,
         )
         .await?;
-        if !result.already_existed {
+        // Only a merge retires its sources, so only a merge has edges to move:
+        // an abstraction leaves every source current with its edges.
+        if !result.already_existed && mode.retires_sources() {
             let m = migrate_consolidated_edges(&mut tx, result.merged_id, source_ids).await?;
             result.edges_migrated = m.migrated.len() as u64;
             result.edges_deduped = m.retracted.len() as u64;
@@ -11649,8 +11713,15 @@ impl ClaimRepository {
     }
 
     /// The consolidation's own act, and nothing else: validate and lock the
-    /// sources, insert the merged claim, retire every source (`supersedes =
-    /// merged`) and insert the `supersedes` edges merged → source.
+    /// sources, insert the new claim, and then by mode:
+    ///
+    /// - [`ConsolidateMode::Merge`]: retire every source (`supersedes =
+    ///   merged`) and insert the `supersedes` edges merged → source.
+    /// - [`ConsolidateMode::Abstract`]: retire nothing; insert a
+    ///   `generalizes` edge abstraction → source for each source.
+    /// - [`ConsolidateMode::Identity`] is refused (input): it writes no new
+    ///   claim, and runs as the dedup act per source instead
+    ///   ([`Self::mark_duplicate_act_attributed_conn`]).
     ///
     /// Every row it writes is one the consolidating caller authors or must be
     /// able to write (the merged claim, its own sources, the edges between
@@ -11675,6 +11746,18 @@ impl ClaimRepository {
     ) -> Result<ConsolidateResult, DbError> {
         use sqlx::Acquire;
         let refused = |kind: crate::RefusalKind, m: String| DbError::Refused { kind, message: m };
+
+        if mode == ConsolidateMode::Identity {
+            // Input: identity writes no new claim. Each non-survivor source is
+            // marked a duplicate of the survivor through the dedup act, which
+            // records the identity edge this act does not and can be un-marked.
+            return Err(refused(
+                crate::RefusalKind::Input,
+                "consolidate: mode 'identity' writes no new claim; mark each non-survivor \
+                 source a duplicate of the survivor (mark_duplicate) instead"
+                    .into(),
+            ));
+        }
 
         if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES
         {
@@ -11746,7 +11829,9 @@ impl ClaimRepository {
                     format!("consolidate: source {} is not current", r.id),
                 ));
             }
-            if r.supersedes.is_some() {
+            // Only a merge re-points `supersedes`; an abstraction may
+            // generalise a revision successor, which keeps its own pointer.
+            if mode.retires_sources() && r.supersedes.is_some() {
                 return Err(refused(
                     crate::RefusalKind::State,
                     format!(
@@ -11959,37 +12044,47 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Retire sources. One statement: chk_deprecated_no_embedding (migration
-        // 052) is a per-statement CHECK, so is_current=false and both
-        // embedding=NULL / embedding_3072=NULL must land together.
-        sqlx::query!(
-            r#"
+        // Retire sources (a merge only). One statement:
+        // chk_deprecated_no_embedding (migration 052) is a per-statement
+        // CHECK, so is_current=false and both embedding=NULL /
+        // embedding_3072=NULL must land together.
+        if mode.retires_sources() {
+            sqlx::query!(
+                r#"
             UPDATE claims
             SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL, updated_at = NOW()
             WHERE id = ANY($2)
             "#,
-            merged_id,
-            source_ids,
-        )
-        .execute(&mut *tx)
-        .await?;
+                merged_id,
+                source_ids,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
 
-        // Reverse fan-out: merged → each source, mirroring supersede()'s edge.
+        // Reverse fan-out, new claim → each source: a merge's `supersedes`
+        // (mirroring supersede()'s edge), an abstraction's `generalizes`.
+        let relationship = if mode.retires_sources() {
+            "supersedes"
+        } else {
+            "generalizes"
+        };
         for src in source_ids {
-            sqlx::query!(
+            sqlx::query(
                 r#"
                 INSERT INTO edges (source_id, source_type, target_id, target_type,
                                    relationship, properties)
-                VALUES ($1, 'claim', $2, 'claim', 'supersedes', $3)
+                VALUES ($1, 'claim', $2, 'claim', $3, $4)
                 "#,
-                merged_id,
-                src,
-                serde_json::json!({
-                    "reason": reason,
-                    "mode": mode.as_str(),
-                    "merged_at": chrono::Utc::now().to_rfc3339(),
-                }),
             )
+            .bind(merged_id)
+            .bind(src)
+            .bind(relationship)
+            .bind(serde_json::json!({
+                "reason": reason,
+                "mode": mode.as_str(),
+                "merged_at": chrono::Utc::now().to_rfc3339(),
+            }))
             .execute(&mut *tx)
             .await?;
         }
@@ -11998,7 +12093,11 @@ impl ClaimRepository {
 
         Ok(ConsolidateResult {
             merged_id,
-            superseded: source_ids.to_vec(),
+            superseded: if mode.retires_sources() {
+                source_ids.to_vec()
+            } else {
+                Vec::new()
+            },
             edges_migrated: 0,
             edges_deduped: 0,
             already_existed: false,

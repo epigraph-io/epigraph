@@ -605,3 +605,120 @@ async fn invalid_source_sets_are_rejected(pool: PgPool) {
         "nonexistent source"
     );
 }
+
+/// An abstraction generalises its sources; it retires none of them (backlog
+/// 22602dd8). The new claim links to each source by a `generalizes` edge, and
+/// every source stays current, with no forwarding pointer, and keeps its own
+/// edges: nothing is migrated onto the abstraction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn abstract_mode_retires_nothing_and_writes_generalizes_edges(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let actor = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "abstract source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "abstract source two", &[]).await;
+    let supporter = seed_claim(&pool, author, "supports source one", &[]).await;
+    seed_edge(&pool, supporter, s1, "supports").await;
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "the general pattern behind both sources",
+        0.6,
+        ConsolidateMode::Abstract,
+        "generalisation",
+        actor,
+    )
+    .await
+    .expect("abstract consolidation");
+    assert!(!res.already_existed);
+    assert!(
+        res.superseded.is_empty(),
+        "an abstraction retires nothing: {:?}",
+        res.superseded
+    );
+
+    for s in [s1, s2] {
+        let (is_current, supersedes): (bool, Option<Uuid>) =
+            sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+                .bind(s)
+                .fetch_one(&pool)
+                .await
+                .expect("read source");
+        assert!(is_current, "source {s} stays current under an abstraction");
+        assert_eq!(supersedes, None, "source {s} gets no forwarding pointer");
+        assert_eq!(
+            count_edges(&pool, res.merged_id, s, "generalizes").await,
+            1,
+            "abstraction -generalizes-> {s}"
+        );
+        assert_eq!(
+            count_edges(&pool, res.merged_id, s, "supersedes").await,
+            0,
+            "an abstraction is not a lineage successor of {s}"
+        );
+    }
+    let a_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(res.merged_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read abstraction");
+    assert!(a_current, "the abstraction is current");
+    assert_eq!(
+        count_edges(&pool, supporter, s1, "supports").await,
+        1,
+        "the source keeps its own edge"
+    );
+    assert_eq!(
+        count_edges(&pool, supporter, res.merged_id, "supports").await,
+        0,
+        "nothing is migrated onto the abstraction"
+    );
+}
+
+/// `identity` writes no new claim: it is the dedup act, run per source by the
+/// tool layer. The merge act refuses it as an input error, before it writes
+/// anything (backlog 22602dd8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_is_refused_by_the_merge_act_and_writes_nothing(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "identity source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "identity source two", &[]).await;
+
+    let err = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "identity would-be merged text",
+        0.6,
+        ConsolidateMode::Identity,
+        "restatements",
+        author,
+    )
+    .await
+    .expect_err("identity is not the merge act's mode");
+    assert!(
+        matches!(
+            err,
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Input,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(format!("{err:?}").contains("mark_duplicate"), "{err:?}");
+
+    let written: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE content = 'identity would-be merged text'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(written, 0, "no new claim");
+    let current: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1) AND is_current")
+            .bind(&[s1, s2][..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current, 2, "no source retired");
+}

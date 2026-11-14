@@ -243,7 +243,7 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 - **`ClaimRepository::supersede_act_conn`** — `"UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL"`
 - **`ClaimRepository::evolve_step_conn`** — same statement, under `if edge_type == "supersedes"`
 - **`ClaimRepository::deprecate_claim`** — `SET truth_value = 0.05, is_current = false, embedding = NULL,`
-- **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL`
+- **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL` (mode `merge` only: `abstract` retires nothing, and `identity` goes through `mark_duplicate_act` below)
 - **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
 
 `scripts/fuzzy_dedup_claims.py` marks through `POST /api/v1/claims/:id/dedup`
