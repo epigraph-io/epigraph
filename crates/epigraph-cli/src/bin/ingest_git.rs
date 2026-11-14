@@ -2892,8 +2892,8 @@ mod tests {
 
     #[test]
     fn author_signer_is_deterministic_per_email() {
-        let a = author_signer("Jeremy Barton", "jeremy.barton@gmail.com");
-        let b = author_signer("J. Barton", "jeremy.barton@gmail.com"); // name differs, email same
+        let a = author_signer("A. Developer", "owner@example.com");
+        let b = author_signer("A. Dev", "owner@example.com"); // name differs, email same
         let c = author_signer("Someone", "other@example.com");
         assert_eq!(a.public_key(), b.public_key(), "same email => same key");
         assert_ne!(
@@ -2905,8 +2905,8 @@ mod tests {
 
     #[test]
     fn author_email_is_normalized() {
-        let a = author_signer("x", "Jeremy.Barton@Gmail.com  ");
-        let b = author_signer("x", "jeremy.barton@gmail.com");
+        let a = author_signer("x", "Owner@Example.com  ");
+        let b = author_signer("x", "owner@example.com");
         assert_eq!(
             a.public_key(),
             b.public_key(),

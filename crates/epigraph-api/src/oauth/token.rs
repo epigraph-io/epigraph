@@ -1835,13 +1835,13 @@ mod refresh_gate_tests {
         let r = registry_with(
             "google",
             "google_id_token",
-            vec!["jeremy.barton@gmail.com".into()],
+            vec!["owner@example.com".into()],
             vec![],
         );
         assert!(refresh_allowed(
             &r,
-            "google:107485523387294236292",
-            "jeremy.barton@gmail.com",
+            "google:<subject-id>",
+            "owner@example.com",
             false
         ));
     }
@@ -1853,7 +1853,7 @@ mod refresh_gate_tests {
         let r = registry_with(
             "google",
             "google_id_token",
-            vec!["jeremy.barton@gmail.com".into()],
+            vec!["owner@example.com".into()],
             vec![],
         );
         assert!(!refresh_allowed(
@@ -1872,7 +1872,7 @@ mod refresh_gate_tests {
         let r = registry_with(
             "google",
             "google_id_token",
-            vec!["jeremy.barton@gmail.com".into()],
+            vec!["owner@example.com".into()],
             vec![],
         );
         // hex pubkey (agent): no ':' → skip.
@@ -1888,7 +1888,7 @@ mod refresh_gate_tests {
         // ':'; a colon-bearing id for an UNregistered provider also skips).
         assert!(refresh_allowed(
             &r,
-            "google_107485523387294236292",
+            "google_000000000000000000000",
             "evil@attacker.com",
             false
         ));
