@@ -3367,19 +3367,20 @@ async fn require_api_workflow_authority(
 /// transaction, before the act. Returns each workflow with its grant, for
 /// [`record_api_lineage_writes`].
 ///
-/// # Accepted residual: the lineage split (operator ruling R-21)
+/// # A workflow the caller cannot see
 ///
 /// The workflow set is read on the caller's RLS-bound transaction, so it holds
 /// only the workflows whose `executes` edge (and lineage member) the caller
-/// can see. A group-private workflow outside the caller's groups that executes
-/// the same lineage is therefore not in the set and is not authority-checked.
-/// Every claim of a lineage takes its parent's tenancy at `evolve_step` and an
-/// `executes` edge takes its step's, so this needs a lineage whose members were
-/// split across tenancies; the ruling ACCEPTS that residual rather than moving
-/// the read into a privileged (definer) frame. Stated on
-/// `WorkflowRepository::workflows_executing_step_lineage` and in the MCP
-/// `evolve_step` tool description, whose twin
-/// (`tools/evolve_step.rs::require_lineage_authority`) shares it.
+/// can see. Since migration 219 an `executes` edge also takes its PLAN's
+/// tenancy, so a group plan reusing a public step is invisible to a
+/// non-member, edge and all. Before the set is checked, the gate therefore
+/// asks `WorkflowRepository::step_lineage_has_hidden_executor` (219's
+/// definer: one boolean, never an id) whether any workflow executing the
+/// lineage is a row the caller cannot read, and refuses as for a missing
+/// parent when one is: the caller cannot hold authority over a plan it cannot
+/// read. This also closes the earlier residual of a lineage whose members
+/// were split across tenancies. The MCP twin
+/// (`tools/evolve_step.rs::require_lineage_authority`) does the same.
 #[cfg(feature = "db")]
 async fn require_api_lineage_authority(
     conn: &mut sqlx::PgConnection,
@@ -3403,6 +3404,19 @@ async fn require_api_lineage_authority(
         entity: "Claim".into(),
         id: parent.to_string(),
     };
+    // Since migration 219 such a workflow's `executes` edge is hidden from the
+    // caller too, so `workflows` above does not hold it: ask the definer.
+    let hidden =
+        epigraph_db::WorkflowRepository::step_lineage_has_hidden_executor(&mut *conn, parent)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!(
+                    "evolve_step: could not check the workflows executing the step's lineage: {e}"
+                ),
+            })?;
+    if hidden {
+        return Err(not_found());
+    }
     let mut grants = Vec::with_capacity(workflows.len());
     for workflow in workflows {
         let grant = workflow_authority(

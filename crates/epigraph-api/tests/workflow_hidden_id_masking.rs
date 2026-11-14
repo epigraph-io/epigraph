@@ -436,9 +436,10 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
 }
 
 /// `evolve_step` of a PUBLIC step that only a group workflow executes: the
-/// outsider reads the step and its `executes` edge (the edge takes the step's
-/// tenancy) but not the workflow row. It answers as a missing parent on REST
-/// and MCP, naming nothing hidden. The member, who reads the row, is the
+/// outsider reads the step, but neither the workflow row nor (since migration
+/// 219, the edge takes the plan's tenancy too) its `executes` edge. It answers
+/// as a missing parent on REST and MCP, naming nothing hidden: the gate finds
+/// the hidden plan through 219's definer. The member, who reads the row, is the
 /// submitter and evolves the step; once the row records no submitter, the
 /// member's refusal does not call the GROUP row a "legacy platform workflow".
 #[sqlx::test(migrations = "../../migrations")]
@@ -477,7 +478,10 @@ async fn evolve_of_a_step_a_hidden_workflow_executes_answers_as_a_missing_parent
     .fetch_one(&pool)
     .await
     .expect("edge");
-    assert_eq!(edge_visibility, "public", "the outsider reads the edge");
+    assert_eq!(
+        edge_visibility, "group",
+        "the edge is the group plan's (migration 219): the outsider does not read it"
+    );
     let missing = Uuid::new_v4();
     let evolve = |p: Uuid| json!({"parent_id": p, "content": "a revision", "edge_type": "revises"});
 

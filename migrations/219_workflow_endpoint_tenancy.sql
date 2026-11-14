@@ -51,6 +51,14 @@
 --      when its (owner, visibility, co-owner) triple differs. Counts by
 --      relationship and transition are RAISEd as a NOTICE: they are the
 --      measurement of what this changed.
+--   4. `epigraph_step_lineage_has_hidden_executor(uuid)`, a boolean definer
+--      for the `evolve_step` authority gates (section 5). They found the
+--      workflows executing a step's lineage through `executes` edges read
+--      under the caller's row security; after item 1 a group plan's edge onto
+--      a public step is hidden from a non-member, who would then be admitted
+--      to supersede a step that plan runs. The gates refuse when this answers
+--      true.
+--
 -- A group workflow whose other endpoint is private to ANOTHER group now gets
 -- a CO-OWNED edge (072's intersection: readable only by a member of both).
 -- That is the meet's rule for every cross-group edge, and it is fail-closed:
@@ -76,14 +84,20 @@
 --
 -- Apply as the maintenance role or a superuser (section 4 refuses otherwise:
 -- an RLS-filtered backfill would see no private workflow and re-meet
--- nothing). No binary depends on it. New edges written after it from a group
--- plan to a public claim are ('group', plan group), so the writer must write
--- that group, which every plan write path already requires.
+-- nothing). Deploy order: migrate BEFORE rolling out a binary built with it
+-- (its `evolve_step` gates call section 5's definer; that binary also re-meets
+-- a privatized plan's workflow edges). An older binary on a 219 database
+-- keeps working but its `evolve_step` gate misses a hidden plan's edge, so
+-- roll the binary out promptly. New edges written after 219 from a group plan
+-- to a public claim are ('group', plan group), so the writer must write that
+-- group, which every plan write path already requires.
 --
--- Undo: `docs/runbooks/219-undo.sql` re-states 070's `epigraph_node_tenancy`
--- and 168's `epigraph_propagate_tenancy` (CREATE OR REPLACE, never DROP: a
--- DROP resets the ACL). The edges section 4 narrowed STAY narrowed
--- (fail-closed); the NOTICE lists how many there were.
+-- Undo (roll every 219 binary back first): `docs/runbooks/219-undo.sql`
+-- re-states 070's `epigraph_node_tenancy` and 168's
+-- `epigraph_propagate_tenancy` (CREATE OR REPLACE, never DROP: a DROP resets
+-- the ACL) and DROPs section 5's definer (nothing in SQL names it). The edges
+-- section 4 narrowed STAY narrowed (fail-closed); the NOTICE lists how many
+-- there were.
 --
 -- Checked before claiming: no migration on main, and no origin branch or
 -- local worktree, re-states either function after 168.
@@ -382,4 +396,64 @@ BEGIN
       FROM counts;
     RAISE NOTICE '219: re-met % edge(s) with a group-private workflow endpoint (%)',
                  v_total, v_summary;
+END $$;
+
+-- ===================================================================
+-- 5. THE EVOLVE_STEP GATE: does a workflow the session cannot read execute
+--    this step's lineage?
+-- ===================================================================
+-- `evolve_step` (REST and MCP) requires workflow authority over EVERY
+-- workflow that executes the parent's step lineage, and found them through
+-- `WorkflowRepository::workflows_executing_step_lineage`, under the caller's
+-- row security. Before 219 a group plan's `executes` edge onto a public step
+-- was public, so a caller outside the plan's group still found the plan, and
+-- its authority check refused (answered as a missing parent). After section 1
+-- that edge is the plan's group's, the caller no longer finds it, and would
+-- be admitted to supersede a step a private plan runs.
+--
+-- So the gate also asks this definer, which reads the edges and the lineage
+-- members unfiltered and answers ONE BOOLEAN: true when some workflow
+-- executing the lineage (retracted `executes` edges included, as the
+-- repository read counts them) is a row the session cannot read: not
+-- public, and not owned by a group in `epigraph_session_groups()`, or no row
+-- at all. It never returns an id, so it names no hidden plan; the gate then
+-- refuses exactly as it refuses a missing parent. A privileged session
+-- (`epigraph_bypass()`) reads every row, so it is never true there. NOT
+-- 183's `workflows_read` USING clause verbatim: its `epigraph_definer_bypass()`
+-- arm is always true inside this maintenance-owned body.
+--
+-- 172's form: `pg_catalog, pg_temp`, every public name qualified. Owned by
+-- `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
+-- `epigraph_app` (the gate runs on the request DSN).
+CREATE OR REPLACE FUNCTION public.epigraph_step_lineage_has_hidden_executor(p_claim uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+    SELECT NOT public.epigraph_bypass()
+       AND EXISTS (
+           SELECT 1
+             FROM public.edges e
+             LEFT JOIN public.workflows w ON w.id = e.source_id
+            WHERE e.relationship = 'executes'
+              AND e.source_type = 'workflow' AND e.target_type = 'claim'
+              AND (e.target_id = p_claim
+                   OR e.target_id IN (
+                       SELECT m.id FROM public.claims m
+                         JOIN public.claims p ON p.step_lineage_id = m.step_lineage_id
+                        WHERE p.id = p_claim))
+              AND (w.id IS NULL
+                   OR NOT (w.visibility = 'public'
+                           OR w.owner_group_id = ANY (public.epigraph_session_groups()))))
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_step_lineage_has_hidden_executor(uuid) FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_step_lineage_has_hidden_executor(uuid) '
+                'OWNER TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_step_lineage_has_hidden_executor(uuid) '
+                'TO epigraph_app';
+    END IF;
 END $$;

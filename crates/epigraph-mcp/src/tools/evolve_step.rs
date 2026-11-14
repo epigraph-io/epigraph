@@ -292,10 +292,13 @@ pub async fn evolve_step(
 /// `workflow_authority.rs` (the caller reads the workflow row and writes its
 /// owner group; then the submitter or its operator).
 ///
-/// Accepted residual (operator ruling R-21): the set is read under the
-/// caller's row security, so a workflow the caller cannot see that executes
-/// the same lineage (a lineage split across tenancies) is not checked. See the
-/// REST twin, `routes/workflows.rs::require_api_lineage_authority`.
+/// The set is read under the caller's row security, and since migration 219
+/// an `executes` edge takes its plan's tenancy, so a group plan reusing a
+/// public step is invisible to a non-member, edge and all. The gate therefore
+/// first asks `WorkflowRepository::step_lineage_has_hidden_executor` (219's
+/// definer: one boolean, never an id) and refuses as for a missing parent when
+/// a workflow the caller cannot read executes the lineage. See the REST twin,
+/// `routes/workflows.rs::require_api_lineage_authority`.
 async fn require_lineage_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
@@ -316,6 +319,20 @@ async fn require_lineage_authority(
     // plan reusing a public step) is answered as an unknown parent, never by
     // its id (backlog c831df4a).
     let not_found = || parent_not_found(parent);
+    // Since migration 219 such a workflow's `executes` edge is hidden from the
+    // caller too, so `workflows` above does not hold it: ask the definer.
+    let hidden =
+        epigraph_db::WorkflowRepository::step_lineage_has_hidden_executor(&mut *conn, parent)
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    "evolve_step: could not check the workflows executing the step's lineage",
+                    e,
+                )
+            })?;
+    if hidden {
+        return Err(not_found());
+    }
     let mut grants = Vec::with_capacity(workflows.len());
     for workflow in workflows {
         let grant = require_workflow_authority(

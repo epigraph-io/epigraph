@@ -38,12 +38,15 @@ fn evolve_step_description_names_the_supersede_cascade_and_what_stays() {
     }
 }
 
-/// Operator ruling R-21 (backlog c0ab097a, part 1): the lineage authority gate
-/// reads the workflows executing a lineage under the caller's row security, so
-/// a workflow the caller cannot see is not checked. The ruling ACCEPTS that
-/// residual and requires it to be stated where agents choose the tool.
+/// Backlog c0ab097a (part 1), as migration 219 changes it: the lineage
+/// authority gate reads the workflows executing a lineage under the caller's
+/// row security, and since 219 a group plan's `executes` edge onto a public
+/// step is hidden from a non-member. The gate also asks a definer whether a
+/// workflow the caller cannot read executes the lineage, and refuses without
+/// naming it. The description states that rule where agents choose the tool
+/// (it used to state the residual this closes).
 #[test]
-fn evolve_step_description_states_the_accepted_lineage_split_residual() {
+fn evolve_step_description_states_that_a_hidden_executor_refuses() {
     let tools = EpiGraphMcpFull::all_tools_json();
     let description = tools
         .as_array()
@@ -54,14 +57,18 @@ fn evolve_step_description_states_the_accepted_lineage_split_residual() {
         .expect("evolve_step is registered with a description");
 
     for needle in [
-        "Accepted residual",
-        "caller's own row security",
-        "is not authority-checked",
+        "A workflow you cannot read that executes the lineage refuses the evolve too",
+        "even when its `executes` edge is hidden from you",
+        "without naming it",
     ] {
         assert!(
             description.contains(needle),
-            "evolve_step's description must state the lineage-split residual ({needle:?}): \
+            "evolve_step's description must state the hidden-executor rule ({needle:?}): \
              {description}"
         );
     }
+    assert!(
+        !description.contains("Accepted residual"),
+        "the residual is closed; the description must not still state it: {description}"
+    );
 }
