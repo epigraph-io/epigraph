@@ -12,7 +12,10 @@
 //! # What is eligible
 //!
 //! A listed claim that is `public` and owned by the WORLD group. With
-//! `--allow-non-world-owner`, any public claim. Every other listed claim is
+//! `--allow-non-world-owner`, any public claim, including one the TARGET
+//! already owns: that one is narrowed in place (`public` -> `group`, owner
+//! unchanged), which is how a claim created through MCP/HTTP into its
+//! author's personal group is made private there. Every other listed claim is
 //! HELD with its reason; a claim already `('group', target)` counts as done, so
 //! a re-run resumes where the last one stopped.
 //!
@@ -1255,8 +1258,14 @@ async fn run_batch(
     let epoch_bump_due = tables::layout_epoch_bump_due(conn).await?;
 
     let moved = sqlx::query(
+        // No `owner_group_id IS DISTINCT FROM $2`: a public claim the target
+        // already owns is narrowed IN PLACE (owner unchanged). `classify_claim`
+        // counts it eligible, and the trigger's firing gate is the
+        // (owner, visibility) pair, so the cascade runs on the visibility
+        // change alone. With that predicate the UPDATE skipped the claim the
+        // plan had counted and the batch rolled back (backlog 57e9be7a).
         "UPDATE claims SET visibility = 'group', owner_group_id = $2 \
-          WHERE id = ANY($1) AND visibility = 'public' AND owner_group_id IS DISTINCT FROM $2",
+          WHERE id = ANY($1) AND visibility = 'public'",
     )
     .bind(&claim_ids)
     .bind(ctx.target)
