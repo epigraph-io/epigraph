@@ -227,7 +227,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // viewer-filtered edges, and best-effort derived rows (community scope,
     // silence alarm) that reach no response field. narrows: the source count
     // keeps only the cache-admissible rows of `get_for_claim_frame`, read
-    // through the viewer just before it.
+    // through the viewer just before it. `ds_divergence::apply_beta_update`
+    // reads and writes the gated claim's own Beta columns on the stamped
+    // transaction (the step shared with the MCP DS tools, backlog f50344c0).
     (
         "belief.rs",
         "submit_evidence",
@@ -235,7 +237,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "CommunityRepository::communities_for_perspective",
             "CommunityRepository::member_perspective_ids",
             "ConflictDensityRepository::for_frames",
-            "DivergenceRepository::store",
             "MassFunctionRepository::store_with_perspective",
             "ScopedBeliefRepository::upsert",
             "ScopedBeliefRepository::upsert",
@@ -246,11 +247,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "create_edge_under_savepoint",
             "create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
+            "ds_divergence::apply_beta_update",
             "sqlx::query(INSERT).execute",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_scalar(SELECT).fetch_optional",
