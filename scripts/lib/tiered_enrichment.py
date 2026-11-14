@@ -254,9 +254,13 @@ _REPO_CALIBRATION_TOML = os.path.join(os.path.dirname(__file__), "..", "..", "ca
 def routing_quantiles() -> dict[str, float]:
     """The `[conformal.quantiles]` auto_tier routes on, read once.
 
-    Same file the Rust engine reads: `CALIBRATION_PATH` when set, else the
-    repository's calibration.toml. Raises ValueError when the section is
-    missing (see scifact_conformal.load_conformal_quantiles).
+    `CALIBRATION_PATH` when set, else the repository's calibration.toml.
+    The variable is the one the Rust engine reads, but the fallback is not:
+    `CalibrationConfig::resolve` serves its compiled-in copy when the
+    override does not load, while this fails closed. A missing file raises
+    FileNotFoundError and a file without the section raises ValueError (see
+    scifact_conformal.load_conformal_quantiles), so a `CALIBRATION_PATH` the
+    Rust server tolerates can still stop the worker.
     """
     path = os.environ.get("CALIBRATION_PATH") or os.path.normpath(_REPO_CALIBRATION_TOML)
     return load_conformal_quantiles(path)

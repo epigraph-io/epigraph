@@ -480,6 +480,7 @@ not to the API.
 | `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims`, `scripts/_api_client.py` (section 7) | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
+| `CALIBRATION_PATH` | `scripts/run_assessment_worker.py` and `scripts/lib/tiered_enrichment.py::auto_tier` | The file whose `[conformal.quantiles]` Tier-1 routing reads; unset, the repository's `calibration.toml`. Unlike the Rust binaries, the scripts have no compiled-in copy to fall back to: a missing file or one without `[conformal.quantiles]` is an error, and the worker exits at startup (also under `--dry-run`). |
 
 ## 4. Database migrations
 
