@@ -7,7 +7,7 @@ edition = "2021"
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigraph-mcp", "dep:epigraph-passkey"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigraph-mcp", "dep:epigraph-passkey", "dep:epigraph-atlas-contract"]
 jina = ["epigraph-embeddings/jina"]
 genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
@@ -47,6 +47,8 @@ epigraph-ingest = { workspace = true, features = ["openapi"] }  # Workflow/docum
 epigraph-ingest-executor = { workspace = true, optional = true }  # Persistence executor for workflow ingest (db feature)
 epigraph-jobs = { workspace = true }  # Background job runner + ClusterGraph handler
 epigraph-core = { workspace = true }
+# Atlas W10: the nested-level routes serve v1 level documents through `LevelDocument::for_viewer` (db feature).
+epigraph-atlas-contract = { workspace = true, optional = true }
 epigraph-crypto = { workspace = true }
 epigraph-engine = { workspace = true }
 epigraph-embeddings = { workspace = true }
@@ -105,6 +107,8 @@ ed25519-dalek = { workspace = true }  # Ed25519 agent assertion verification
 url = "2"  # Safe redirect-URL construction (percent-encodes attacker-supplied OAuth `state`); resolves to locked 2.5.8, already in graph via reqwest
 
 [dev-dependencies]
+# Atlas W10 route tests: check_level_body, check_not_found and the worst-case fixtures.
+epigraph-atlas-contract = { workspace = true, features = ["check"] }
 axum-test = "14"  # Testing utilities for Axum
 tokio-test = "0.4"  # Async test utilities
 # futures moved to [dependencies] (used in handler, not just tests)
