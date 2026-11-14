@@ -3201,3 +3201,276 @@ async fn a_compromised_revoke_waits_for_and_sweeps_a_completion_in_flight(pool: 
         "a completion on a revoked backup's act",
     );
 }
+
+// =====================================================================
+// 214: THE COMPROMISED REVOKE UNDER READ COMMITTED ONLY, LOCKED TO A FIXPOINT
+// =====================================================================
+
+/// The backend pid of `conn`.
+async fn backend_pid(conn: &mut sqlx::PgConnection) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(conn)
+        .await
+        .expect("pg_backend_pid")
+}
+
+/// A compromised revoke of `passkey` started on its own maintenance
+/// connection inside `BEGIN ISOLATION LEVEL <isolation>`, committed when it
+/// succeeds and rolled back when it is refused: `(its backend pid, the task)`.
+async fn start_revoke(
+    pool: &PgPool,
+    isolation: &'static str,
+    passkey: Uuid,
+    reason: &'static str,
+) -> (
+    i32,
+    tokio::task::JoinHandle<Result<Vec<(Uuid, i32, bool)>, sqlx::Error>>,
+) {
+    use sqlx::Executor;
+    let mut m = pool.acquire().await.expect("acquire");
+    m.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .expect("as maintenance");
+    let pid = backend_pid(&mut m).await;
+    let task = tokio::spawn(async move {
+        m.execute(format!("BEGIN ISOLATION LEVEL {isolation}").as_str())
+            .await
+            .expect("begin");
+        let r = sqlx::query_as(
+            "SELECT revoked_id, lineage_depth, revoked_now \
+               FROM public.epigraph_revoke_passkey_compromised($1, $2)",
+        )
+        .bind(passkey)
+        .bind(reason)
+        .fetch_all(&mut *m)
+        .await;
+        m.execute(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })
+            .await
+            .expect("end the transaction");
+        m.execute("RESET SESSION AUTHORIZATION")
+            .await
+            .expect("reset");
+        r
+    });
+    (pid, task)
+}
+
+/// Wait (at most 20 s) until backend `pid` is blocked by backend `by`, or
+/// the task `done` has finished: true when it is blocked.
+async fn blocked_by<T>(
+    pool: &PgPool,
+    pid: i32,
+    by: i32,
+    done: &tokio::task::JoinHandle<T>,
+) -> bool {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if done.is_finished() {
+                return false;
+            }
+            let blockers: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+                .bind(pid)
+                .fetch_one(pool)
+                .await
+                .expect("pg_blocking_pids");
+            if blockers.contains(&by) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("backend {pid} neither finished nor was blocked by {by} in 20 s"))
+}
+
+/// An enrollment completion recorded ATTESTED (`packed`) on an app session
+/// and left UNCOMMITTED: `(the session, its backend pid, the new passkey)`.
+/// Commit it, then `release` the session.
+async fn complete_uncommitted(
+    pool: &PgPool,
+    enrollment: Uuid,
+    n: u8,
+) -> (sqlx::pool::PoolConnection<sqlx::Postgres>, i32, Uuid) {
+    use sqlx::Executor;
+    let mut a = app_session(pool).await;
+    let pid = backend_pid(&mut a).await;
+    a.execute("BEGIN").await.expect("begin");
+    sqlx::query(
+        "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+    )
+    .bind(enrollment)
+    .execute(&mut *a)
+    .await
+    .expect("the enrollment challenge");
+    let key: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_complete_passkey_enrollment($1, $2, '{\"cred\": 1}'::jsonb, \
+                '2fc0579f-8113-47ea-b116-bb5a8db9202a'::uuid, 'packed', true, false)",
+    )
+    .bind(enrollment)
+    .bind(credential(n))
+    .fetch_one(&mut *a)
+    .await
+    .expect("the attested completion, uncommitted");
+    (a, pid, key)
+}
+
+/// `fut`, or a panic naming `what` after 20 s (a setup step that waits on a
+/// lock this test holds would otherwise hang the run).
+async fn within<F: std::future::Future>(what: &str, fut: F) -> F::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+        .await
+        .unwrap_or_else(|_| panic!("{what}: still waiting after 20 s"))
+}
+
+/// The compromised revoke runs only under READ COMMITTED. Its lock wait is
+/// what makes a completion in flight visible to its walk, and only READ
+/// COMMITTED gives the walk a snapshot taken AFTER the wait. The probe, at
+/// each level on fresh fixtures: the phone, its attested backup, and an
+/// attested completion in flight (uncommitted) on an act the backup
+/// confirmed. Under READ COMMITTED the revoke waits for the completion and
+/// reaches 3 passkeys: the phone, the backup and the one that completed.
+/// Under REPEATABLE READ and SERIALIZABLE it is refused at once (25000),
+/// without waiting and with nothing revoked; without the refusal it would
+/// walk the snapshot taken before the wait, reach 2, commit, and leave the
+/// attested child live. Verified to fail without migration 214: under
+/// REPEATABLE READ and SERIALIZABLE the revoke waits, returns 2 rows and the
+/// child stays live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compromised_revoke_runs_only_under_read_committed(pool: PgPool) {
+    use sqlx::Executor;
+    for (round, isolation) in ["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"]
+        .into_iter()
+        .enumerate()
+    {
+        let base = 10 * (u8::try_from(round).unwrap() + 1);
+        let p = elevated_custodian(&pool, &format!("phone owner {round}"), base).await;
+        let (_, e_backup) = anchored_enrollment(&pool, &p).await;
+        let backup = try_complete(&pool, e_backup, base + 1, "packed")
+            .await
+            .unwrap();
+        let via_backup = Elevated {
+            passkey: backup,
+            cred: credential(base + 1),
+            ..p.clone()
+        };
+        let (_, e_child) = anchored_enrollment(&pool, &via_backup).await;
+
+        let (mut a, a_pid, child) = complete_uncommitted(&pool, e_child, base + 2).await;
+        let (r_pid, revoke) = start_revoke(&pool, isolation, p.passkey, "phone stolen").await;
+        let waited = blocked_by(&pool, r_pid, a_pid, &revoke).await;
+        a.execute("COMMIT").await.unwrap();
+        release(a).await;
+        let got = within(isolation, revoke).await.unwrap();
+
+        if isolation == "READ COMMITTED" {
+            assert!(
+                waited,
+                "CALIBRATION: under READ COMMITTED the revoke waits for the completion"
+            );
+            let mut got = got.expect("the compromised revoke under READ COMMITTED");
+            got.sort();
+            let mut want = vec![(p.passkey, 0, true), (backup, 1, true), (child, 2, true)];
+            want.sort();
+            assert_eq!(
+                got, want,
+                "under READ COMMITTED the walk reaches the passkey that completed during the wait"
+            );
+            assert!(revoked(&pool, child).await.is_some(), "and revokes it");
+        } else {
+            assert_code(&got, "25000", isolation);
+            assert!(!waited, "{isolation}: refused before taking any lock");
+            for live in [p.passkey, backup, child] {
+                assert!(
+                    revoked(&pool, live).await.is_none(),
+                    "{isolation}: nothing revoked ({live})"
+                );
+            }
+        }
+    }
+}
+
+fn repo_text(rel: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel),
+    )
+    .unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+async fn compromised_revoke_md5(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT md5(prosrc) FROM pg_proc \
+          WHERE oid = 'public.epigraph_revoke_passkey_compromised(uuid, text)'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the compromised revoke")
+}
+
+/// `docs/runbooks/214-undo.sql` returns the catalog to 213's (200's body of
+/// the compromised revoke byte for byte, its owner unchanged; `catalog`
+/// holds each function's body md5 and owner); a second run changes nothing.
+/// Both 214 and its undo refuse (55000, nothing changed) over a body that is
+/// not the one they expect, so neither silently discards another
+/// migration's re-statement. Mutations: the undo's body edited by one
+/// character -> the catalog differs; either md5 check dropped -> the foreign
+/// body is replaced.
+#[sqlx::test(migrations = false)]
+async fn the_214_undo_restores_200s_compromised_revoke(pool: PgPool) {
+    let undo = repo_text("docs/runbooks/214-undo.sql");
+    let migration = repo_text("migrations/214_compromised_revoke_read_committed.sql");
+    migrate(&pool, &up_to(213)).await;
+    let before = catalog(&pool).await;
+    let body_200 = compromised_revoke_md5(&pool).await;
+    migrate(&pool, &up_to(214)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 214 changed the catalog"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+    assert_eq!(
+        catalog(&pool).await,
+        before,
+        "the catalog is 213's after the undo"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(catalog(&pool).await, before, "idempotent");
+
+    // A foreign body: both refuse and leave it.
+    sqlx::raw_sql(
+        "CREATE OR REPLACE FUNCTION public.epigraph_revoke_passkey_compromised(p_id uuid, \
+                                                                          p_reason text) \
+         RETURNS TABLE (revoked_id uuid, lineage_depth integer, revoked_now boolean) \
+         LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp \
+         AS $$ BEGIN RETURN; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-body the function");
+    let foreign = compromised_revoke_md5(&pool).await;
+    assert_ne!(foreign, body_200, "CALIBRATION: a foreign body");
+    let r = sqlx::raw_sql(&migration).execute(&pool).await;
+    assert_code(&r, "55000", "214 over a foreign body");
+    // The undo opens its own transaction: end it on the same connection.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    assert_code(&r, "55000", "the undo over a foreign body");
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the undo's transaction");
+    drop(conn);
+    assert_eq!(
+        compromised_revoke_md5(&pool).await,
+        foreign,
+        "neither replaced the foreign body"
+    );
+}
