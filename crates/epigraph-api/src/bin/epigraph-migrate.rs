@@ -25,40 +25,24 @@ async fn main() {
     // after this ships. `ci.yml` is updated in the same PR to set both, so CI
     // exercises the new variable; the fallback exists for the operator who has
     // not split the credentials yet.
-    let (url, var) = match std::env::var("MIGRATION_DATABASE_URL") {
-        Ok(u) => (u, "MIGRATION_DATABASE_URL"),
-        Err(_) => {
-            let u = std::env::var("DATABASE_URL")
-                .expect("MIGRATION_DATABASE_URL or DATABASE_URL environment variable required");
-            tracing::warn!(
-                "MIGRATION_DATABASE_URL is unset; falling back to DATABASE_URL. Migrations \
-                 need DDL privilege, which the application role must not have -- see \
-                 docs/deploy.md."
-            );
-            (u, "DATABASE_URL")
-        }
-    };
+    //
+    // The rule is `epigraph_api::migrate::select_migration_dsn`, shared with
+    // the server's EPIGRAPH_MIGRATE_ON_BOOT path; a blank value is unset.
+    let dsn = epigraph_api::migrate::migration_dsn_from_env().unwrap_or_else(|e| panic!("{e}"));
+    if dsn.fell_back() {
+        tracing::warn!("{}", epigraph_api::migrate::MIGRATION_DSN_FALLBACK_WARNING);
+    }
+    let var = dsn.var;
     tracing::info!(dsn_var = var, "resolved migration DSN");
     // Log the host but not credentials.
-    let host_hint = url.split('@').nth(1).unwrap_or("<unknown>");
+    let host_hint = dsn.url.split('@').nth(1).unwrap_or("<unknown>");
     tracing::info!(host = host_hint, "Connecting to PostgreSQL");
-    // MAINTENANCE-DSN-EXEMPT: the migrator needs DDL privilege, which is a
-    // different and strictly stronger role than `epigraph_maintenance` — a
-    // maintenance DSN here would be the WRONG credential, not a safer one.
-    //
-    // PR-16 wired `MIGRATION_DATABASE_URL` above, and the exemption STAYS.
-    // `no_unmaintained_dsn.rs` is keyed on POOL CONSTRUCTION, not on which
-    // environment variable supplies the URL — its own module doc says so at
-    // length, with two measured reasons. Swapping the variable while keeping
-    // `PgPool::connect` therefore changes nothing this lint can see, and
-    // `the_exemption_set_is_exactly_what_was_reviewed` asserts an exempt file
-    // STILL builds an unmaintained pool, so deleting the entry is what would
-    // turn CI red. Removing it requires routing this binary through a
-    // maintenance-style constructor, which the reason above argues against.
-    // Pinned with this reason in `crates/epigraph-db/tests/no_unmaintained_dsn.rs`.
-    let pool = epigraph_db::PgPool::connect(&url)
+    // DDL privilege, so not a maintenance constructor: the pool is built by
+    // `migrate::connect_migration_pool`, the one exempt construction site
+    // (see its doc and `crates/epigraph-db/tests/no_unmaintained_dsn.rs`).
+    let pool = epigraph_api::migrate::connect_migration_pool(&dsn)
         .await
-        .expect("PgPool::connect to DATABASE_URL failed");
+        .unwrap_or_else(|e| panic!("connecting to the migration database ({var}) failed: {e}"));
     // Issue #492: a database AHEAD of this binary's embedded migration set is
     // refused unless the operator opts in, by flag or by env. Either spelling
     // suffices; both are named in the refusal text.
@@ -96,6 +80,19 @@ async fn main() {
             report.ahead, report.db_head, report.binary_head
         );
     }
+    // Backlog e30316ae: the kernel needs pgvector >= 0.8.0 and nothing checked
+    // it. Checked after migrating (001 creates the extension on a fresh
+    // database) and before the `migrations: ok` marker, so a refused run never
+    // prints it. This binary only: the server does not refuse to boot on it.
+    let pgvector = match epigraph_api::migrate::check_pgvector_version(&pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "pgvector version check FAILED");
+            eprintln!("migrations: FAILED: migrations were applied, but {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(pgvector = %pgvector, "pgvector version ok");
     tracing::info!(
         db_head_before = report.db_head_before,
         db_head = report.db_head,

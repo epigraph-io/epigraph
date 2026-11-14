@@ -6,6 +6,13 @@
 **Date:** 2026-04-30
 **Author:** brainstorming with the user, captured here
 
+**Status (checked against the tree 2026-11-14): implemented, with deviations from this text.** The design below is kept as written; where it and the code differ, the code is right:
+
+- **`store_workflow` was not left untouched.** "Coexistence and deprecation" says the flat tools "keep working unchanged". `store_workflow` (`crates/epigraph-mcp/src/tools/workflows.rs`) now builds a `WorkflowExtraction` and runs the hierarchical ingest: it writes a `workflows` row and step claims and returns a workflows-table id, not a flat-JSON claim id.
+- **The read and outcome tools were bridged, not unified.** `find_workflow` searches both stores (flat `workflow`-labelled claims and `workflows` rows); `report_workflow_outcome` delegates to `report_hierarchical_outcome` when given a workflows-table id. Both families are still registered on the MCP server: `store_workflow` and `ingest_workflow`, `find_workflow` and `find_workflow_hierarchical`, `report_workflow_outcome` and `report_hierarchical_outcome`.
+- **The migration CLI was never written.** There is no `migrate-flat-workflows` binary in the workspace (`crates/epigraph-mcp` has no `src/bin`), and no code writes the `legacy_flat` label; the string appears only in a test name (`crates/epigraph-mcp/tests/report_workflow_outcome_dispatch_test.rs`). Existing flat-JSON workflow claims were therefore not re-ingested by a tool from this spec.
+- **Tool names differ.** The MCP server registers no tool named `improve_workflow`, `report_outcome` or `record_behavioral_execution`; it registers `improve_workflow_hierarchy`, `report_workflow_outcome` and `report_hierarchical_outcome`.
+
 ## Problem
 
 Workflows are currently stored as flat-JSON claims: `store_workflow` writes one claim with content `{"goal":"…","steps":["…"]}`, and the steps are JSON array elements rather than first-class claim nodes. Documents, by contrast, get a four-level decomposition (thesis → sections → paragraphs → atoms) via `epigraph_ingest::DocumentExtraction` and `mcp__epigraph__ingest_document`, with `decomposes_to`/`section_follows`/`continues_argument` edges and deterministic UUIDv5 atom IDs that converge identical text across documents.

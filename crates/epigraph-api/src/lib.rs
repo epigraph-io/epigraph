@@ -18,12 +18,12 @@ pub mod query_parser;
 pub mod routes;
 pub mod security;
 pub mod services;
+pub mod serving;
 pub mod state;
 pub mod tenancy_disclosure;
 #[cfg(feature = "db")]
 pub mod tenancy_gauge;
 pub mod tls;
-pub mod webhook_bridge;
 
 pub use errors::ApiError;
 pub use routes::extensions::{ExtensionNameError, RouterExtension, EXTENSION_PREFIX};

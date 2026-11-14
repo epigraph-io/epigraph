@@ -10,7 +10,7 @@ A signing identity that authors claims and edges. Every claim is keyed by `(cont
 
 ## atom
 
-The finest-grained extracted unit produced by hierarchical extraction — a single self-contained assertion lifted out of a paragraph. Atoms are the children of paragraphs in the paper → paragraph → atom hierarchy and are the unit at which Dempster-Shafer belief is tracked. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+The finest-grained extracted unit produced by hierarchical extraction — a single self-contained assertion lifted out of a paragraph. Atoms are the children of paragraphs in the thesis → section → paragraph → atom hierarchy and are the unit at which Dempster-Shafer belief is tracked. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## backlog
 
@@ -18,7 +18,7 @@ A label applied via `submit_claim` (or `memorize`) with `labels=["backlog"]` to 
 
 ## BetP
 
-The pignistic probability: a scalar in `[0, 1]` derived from a Dempster-Shafer mass function by distributing the mass of each focal set uniformly over its singletons. BetP is the standard projection used to order claims by belief and is the primary belief signal EpiGraph exposes — Bayesian `truth_value` is deprecated. See the LANL Open World DST paper (LA-UR-25-23655) for the standard treatment. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
+The pignistic probability: a scalar in `[0, 1]` derived from a Dempster-Shafer mass function by distributing the mass of each focal set uniformly over its singletons. BetP is the standard projection used to order claims by belief and is the primary belief signal EpiGraph exposes. The scalar `truth_value` column is still set on every claim and is the fallback score for a claim with no Dempster-Shafer state; the Bayesian updater that used to maintain it is deprecated. See the LANL Open World DST paper (LA-UR-25-23655) for the standard treatment. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
 
 ## challenge
 
@@ -54,7 +54,7 @@ The frame of discernment — the finite set of mutually-exclusive hypotheses ove
 
 ## hierarchical extraction
 
-The canonical ingest pipeline that decomposes a source into paper → paragraph (level 2) → atom, with edges linking each level to its parent. Tier 1 hierarchical extraction (`extract-claims` → `ingest_document`) is the only supported ingest path; legacy flat extraction and Jina embeddings break primary-column search and are not used. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+The canonical ingest pipeline that decomposes a source into thesis (level 0) → section (level 1) → paragraph (level 2) → atom (level 3), with `decomposes_to` edges linking each level to its children; the source itself is a `papers` row that `asserts` each of those claims. The `extract-claims` skill produces it with `structure_source` (verbatim sections and paragraphs) → LLM atoms → `ingest_document_inline`; `ingest_document` and the two-phase `ingest_document_spine` write the same tree. Flat extraction (the `ingest_literature` CLI) gives recall no tree to draw context from, and Jina embeddings must not go in the primary embedding column. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## MCP
 
@@ -70,15 +70,15 @@ A `claims` row treated as an entity with stable identity: at most one row per `(
 
 ## paragraph
 
-A level-2 claim in the hierarchical extraction tree: a contiguous span of source text that sits between the paper and its atoms. Paragraphs are the unit the structural context of semantic search is built around (`recall_with_context` searches every embedded claim, then batches in each hit's paper, section, atoms, siblings, corroborating edges, and neighbor paragraphs). [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+A level-2 claim in the hierarchical extraction tree: a contiguous span of source text that sits between its section and its atoms. Paragraphs are the unit the structural context of semantic search is built around (`recall_with_context` searches every embedded claim, then batches in each hit's paper, section, atoms, siblings, corroborating edges, and neighbor paragraphs). [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## perspective
 
-A named viewpoint — typically an agent's or a group's — under which belief and challenges can be projected separately. Perspectives let the graph carry disagreement explicitly: the same atom can have different BetP values from different perspectives without one overwriting the other. [see 02-concepts.md §4 (Perspectives, frames, themes)](02-concepts.md#4--perspectives-frames-themes)
+A named viewpoint — typically an agent's or a group's — under which belief and challenges can be projected separately. Perspectives let the graph carry disagreement explicitly: the same atom can have different BetP values from different perspectives without one overwriting the other. The `perspectives` table also holds internal rows of type `edge` and `evidence`, one per epistemic edge or evidence row, which only key a mass function and are not viewpoints. [see 02-concepts.md §4 (Perspectives, frames, themes)](02-concepts.md#4--perspectives-frames-themes)
 
 ## pignistic probability
 
-Synonym for BetP: the scalar probability obtained by distributing each focal set's mass uniformly over its singleton elements of the frame. It is the standard decision-theoretic projection from a DST mass function and replaces the deprecated `truth_value` for all belief ordering. See the LANL Open World DST paper (LA-UR-25-23655) for derivation. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
+Synonym for BetP: the scalar probability obtained by distributing each focal set's mass uniformly over its singleton elements of the frame. It is the standard decision-theoretic projection from a DST mass function and is the score to rank by; some of the kernel's own queries still order by the scalar `truth_value` (see §3). See the LANL Open World DST paper (LA-UR-25-23655) for derivation. [see 02-concepts.md §3 (Beliefs and DST)](02-concepts.md#3--beliefs-and-dst)
 
 ## provenance
 
