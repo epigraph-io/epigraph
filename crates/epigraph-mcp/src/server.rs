@@ -1406,7 +1406,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is."
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is. Each row also carries conjunct_estimate (a deterministic estimate of how many independent assertions the text makes) and conjunct_signals (the rules behind an estimate above 1: sentences, semicolon, coordination, enumeration, respectively). Both are advisory: they change neither looks_atomic nor what decompose_claims selects, and a looks_atomic=true row stays terminal whatever its estimate."
     )]
     async fn query_undecomposed_claims(
         &self,
@@ -1910,6 +1910,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::recall::recall_with_context(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "The document context of ONE claim, looked up by id: its paper, section, atoms, sibling paragraphs and epistemic edges, with belief fields. Returns {claim_id, context}, where context is exactly the block recall_with_context returns per hit (minus similarity). Use it when you already hold a claim id: searching for the claim's own text can return a near-duplicate instead, and never returns a claim that has no embedding. A claim that is absent or that you cannot read is reported as not found. Read-only; writes no recall audit row."
+    )]
+    async fn claim_context(
+        &self,
+        Parameters(params): Parameters<crate::tools::recall::ClaimContextParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::recall::claim_context(self, viewer, params).await
     }
 
     #[tool(

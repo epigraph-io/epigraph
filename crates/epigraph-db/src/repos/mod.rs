@@ -87,6 +87,7 @@ pub mod scoped_belief;
 pub mod security_event;
 pub mod semantic_link;
 pub mod sheaf;
+pub mod sources;
 pub mod span;
 pub mod structural;
 pub mod system_agent;
@@ -133,7 +134,7 @@ pub use atlas_layout::{
 };
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
-    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperIngest, PaperRef, PromptSnapshotAt,
     PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
@@ -245,6 +246,10 @@ pub use recall_event::{
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
+pub use sources::{
+    SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
+    SourcePage, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX, SOURCE_AUTHORS_MAX,
+};
 pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
