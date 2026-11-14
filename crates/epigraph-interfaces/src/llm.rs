@@ -15,7 +15,13 @@
 //!   does not unregister them.
 //! - [`LlmProvider::complete_json`] is the canonical inference call. Errors
 //!   are wrapped in [`LlmError`]; HTTP-like rate limits get
-//!   [`LlmError::RateLimited`] so callers can implement backoff.
+//!   [`LlmError::RateLimited`] so callers can implement backoff; a model or
+//!   safety-classifier refusal gets [`LlmError::Refusal`], which depends on
+//!   the prompt and should not be retried with the same prompt.
+//! - [`LlmProvider::complete_json_schema`] passes a JSON Schema for the
+//!   answer. Its default ignores the schema and calls `complete_json`;
+//!   providers that can enforce a schema override it. Callers validate the
+//!   answer either way.
 //! - Names are unique. Registering a second provider with the same `name()`
 //!   replaces the existing entry (last write wins).
 //! - Insertion order matters: the most-recently-registered provider is
@@ -49,6 +55,15 @@ pub enum LlmError {
     /// The provider was selected but its credentials are missing.
     #[error("LLM API key not configured for provider: {provider}")]
     MissingApiKey { provider: String },
+
+    /// The model (or a safety classifier in front of it) declined to answer.
+    ///
+    /// A refusal depends on the prompt's content, not on transport or
+    /// parsing, so callers should treat it as terminal for that prompt:
+    /// retrying the same prompt spends budget and gets the same answer.
+    /// `message` says what stopped the request (e.g. a stop reason).
+    #[error("LLM refused the request: {message}")]
+    Refusal { message: String },
 }
 
 /// Pluggable language-model backend.
@@ -85,6 +100,36 @@ pub trait LlmProvider: Send + Sync + 'static {
     /// model's text output (typically by stripping markdown code fences and
     /// running `serde_json::from_str`).
     async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError>;
+
+    /// Like [`complete_json`](Self::complete_json), with `schema` (a JSON
+    /// Schema object) describing the answer's shape.
+    ///
+    /// A provider that can constrain its output to a schema (structured
+    /// output, a CLI `--json-schema` flag, ...) should override this and
+    /// enforce it. The default ignores `schema` and calls `complete_json`
+    /// with the same prompt, so existing implementors need no change.
+    /// Because a provider may ignore the schema, callers must still validate
+    /// every field of the answer.
+    ///
+    /// A forwarding wrapper (an implementor that delegates to an inner
+    /// provider, such as an `Arc` newtype or a recording decorator) must
+    /// override this method and forward it to the inner provider's
+    /// `complete_json_schema`. Without that override the wrapper gets this
+    /// default, and the schema is dropped with no error even when the inner
+    /// provider enforces it.
+    ///
+    /// A downstream subtrait of `LlmProvider` that declares its own method
+    /// named `complete_json_schema` makes method-call syntax ambiguous
+    /// (E0034) wherever both traits are in scope; such a subtrait should be
+    /// removed in favour of this method.
+    async fn complete_json_schema(
+        &self,
+        prompt: &str,
+        schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, LlmError> {
+        let _ = schema;
+        self.complete_json(prompt).await
+    }
 }
 
 // =============================================================================
@@ -217,6 +262,166 @@ mod tests {
         async fn complete_json(&self, _prompt: &str) -> Result<serde_json::Value, LlmError> {
             Ok(serde_json::json!({ "from": self.name }))
         }
+    }
+
+    /// Test provider whose `complete_json` refuses every prompt, as a
+    /// provider does when a safety classifier stops the answer.
+    #[derive(Debug)]
+    struct RefusingProvider;
+
+    #[async_trait]
+    impl LlmProvider for RefusingProvider {
+        fn name(&self) -> &str {
+            "iface_test_refusing"
+        }
+        fn model_name(&self) -> &str {
+            "test"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Err(LlmError::Refusal {
+                message: format!("stopped on prompt {prompt:?}"),
+            })
+        }
+    }
+
+    /// A refusal reaches a caller holding `Arc<dyn LlmProvider>` as
+    /// `Refusal`, with the provider's reason, and not as one of the
+    /// retryable or transport variants, so the caller can stop retrying.
+    #[tokio::test]
+    async fn refusal_reaches_dyn_caller_as_refusal_with_reason() {
+        let p: Arc<dyn LlmProvider> = Arc::new(RefusingProvider);
+        let err = p.complete_json("q1").await.unwrap_err();
+        match &err {
+            LlmError::Refusal { message } => assert_eq!(message, "stopped on prompt \"q1\""),
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+        let shown = err.to_string();
+        assert!(
+            shown.contains("refused") && shown.contains("stopped on prompt"),
+            "Display must name the refusal and keep the reason: {shown}"
+        );
+    }
+
+    /// Test provider that does NOT override `complete_json_schema` and whose
+    /// `complete_json` echoes the prompt it received, so a test can see
+    /// exactly what the default forwarded.
+    #[derive(Debug)]
+    struct EchoProvider;
+
+    #[async_trait]
+    impl LlmProvider for EchoProvider {
+        fn name(&self) -> &str {
+            "iface_test_echo"
+        }
+        fn model_name(&self) -> &str {
+            "test"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({ "path": "complete_json", "prompt": prompt }))
+        }
+    }
+
+    /// Test provider that overrides `complete_json_schema` and reports the
+    /// schema it was handed, as a schema-enforcing provider would use it.
+    #[derive(Debug)]
+    struct SchemaAwareProvider;
+
+    #[async_trait]
+    impl LlmProvider for SchemaAwareProvider {
+        fn name(&self) -> &str {
+            "iface_test_schema_aware"
+        }
+        fn model_name(&self) -> &str {
+            "test"
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
+        async fn complete_json(&self, prompt: &str) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({ "path": "complete_json", "prompt": prompt }))
+        }
+        async fn complete_json_schema(
+            &self,
+            prompt: &str,
+            schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, LlmError> {
+            Ok(serde_json::json!({
+                "path": "complete_json_schema",
+                "prompt": prompt,
+                "schema": schema,
+            }))
+        }
+    }
+
+    fn title_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string", "maxLength": 200 } },
+            "required": ["title"]
+        })
+    }
+
+    /// A provider that does not override `complete_json_schema` answers it
+    /// exactly as `complete_json` answers the same prompt: same value, prompt
+    /// forwarded unchanged, schema not leaked into the prompt.
+    #[tokio::test]
+    async fn complete_json_schema_default_forwards_prompt_to_complete_json() {
+        let p: Arc<dyn LlmProvider> = Arc::new(EchoProvider);
+        let prompt = "narrate cluster 7";
+        let via_schema = p
+            .complete_json_schema(prompt, &title_schema())
+            .await
+            .expect("default must succeed when complete_json does");
+        let direct = p.complete_json(prompt).await.expect("complete_json");
+        assert_eq!(via_schema, direct);
+        assert_eq!(
+            via_schema,
+            serde_json::json!({ "path": "complete_json", "prompt": prompt })
+        );
+    }
+
+    /// An override is reached through `Arc<dyn LlmProvider>` (the form every
+    /// kernel caller holds) and receives the caller's schema intact.
+    #[tokio::test]
+    async fn complete_json_schema_override_receives_schema_via_dyn() {
+        let p: Arc<dyn LlmProvider> = Arc::new(SchemaAwareProvider);
+        let schema = title_schema();
+        let got = p
+            .complete_json_schema("compose", &schema)
+            .await
+            .expect("override succeeds");
+        assert_eq!(got["path"], "complete_json_schema");
+        assert_eq!(got["prompt"], "compose");
+        assert_eq!(got["schema"], schema);
+    }
+
+    /// The default propagates `complete_json`'s error unchanged: a refusal
+    /// stays `Refusal` (terminal) and a missing backend stays `NotAvailable`,
+    /// rather than being flattened into another variant.
+    #[tokio::test]
+    async fn complete_json_schema_default_propagates_errors_unchanged() {
+        let refusing: Arc<dyn LlmProvider> = Arc::new(RefusingProvider);
+        match refusing
+            .complete_json_schema("q2", &title_schema())
+            .await
+            .unwrap_err()
+        {
+            LlmError::Refusal { message } => assert_eq!(message, "stopped on prompt \"q2\""),
+            other => panic!("expected Refusal, got {other:?}"),
+        }
+
+        let noop: Arc<dyn LlmProvider> = Arc::new(NoOpLlmProvider::new());
+        let err = noop
+            .complete_json_schema("q3", &title_schema())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LlmError::NotAvailable(_)), "got {err:?}");
     }
 
     #[test]
