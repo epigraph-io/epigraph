@@ -1,7 +1,11 @@
 //! Property test: the supersede belief cascade
 //! (`retraction_cascade::cascade_after_supersede`) is IDEMPOTENT. Running it a
-//! second time on the state the first run left changes no cached belief and no
-//! stored mass.
+//! second time on the state the first run left changes no cached belief (nor
+//! the frame the cache records), no stored mass, no frame assignment and no
+//! perspective row.
+//!
+//! Scope: the supersede entry point only. The cascade's other entry points
+//! (edge withdrawal, dedup, the retired-source sweep) are not exercised here.
 //!
 //! # Why this is the property
 //!
@@ -160,7 +164,7 @@ async fn wire(pool: &PgPool, viewer: &Viewer, agent: Uuid, s: Uuid, t: Uuid, rel
 }
 
 /// A claim's cached belief columns: id, belief, plausibility, pignistic,
-/// mass on empty, mass on missing, classification.
+/// mass on empty, mass on missing, classification, the frame the cache holds.
 type CacheRow = (
     Uuid,
     Option<f64>,
@@ -169,7 +173,14 @@ type CacheRow = (
     Option<f64>,
     Option<f64>,
     Option<String>,
+    Option<Uuid>,
 );
+
+/// A frame assignment: claim, frame, hypothesis index.
+type FrameRow = (Uuid, Uuid, Option<i32>);
+
+/// A perspective row by content: id, name, owner agent, type.
+type PerspectiveRow = (Uuid, String, Option<Uuid>, Option<String>);
 
 /// A mass row by content: claim, frame, source agent, perspective, masses,
 /// source strength, evidence type, retracted.
@@ -184,17 +195,23 @@ type MassRow = (
     bool,
 );
 
-/// Every cached belief column and every mass row of `claims`, by content.
+/// Every cached belief column, mass row and frame assignment of `claims`, the
+/// perspectives of the edges touching them, and the size of the whole
+/// perspectives table (a stray row keyed to nothing here still counts), by
+/// content.
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     caches: Vec<CacheRow>,
     masses: Vec<MassRow>,
+    frames: Vec<FrameRow>,
+    perspectives: Vec<PerspectiveRow>,
+    perspective_total: i64,
 }
 
 async fn snapshot(pool: &PgPool, claims: &[Uuid]) -> Snapshot {
     let caches = sqlx::query_as(
         "SELECT id, belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, \
-                classification::text \
+                classification::text, belief_frame_id \
            FROM claims WHERE id = ANY($1) ORDER BY id",
     )
     .bind(claims)
@@ -211,7 +228,36 @@ async fn snapshot(pool: &PgPool, claims: &[Uuid]) -> Snapshot {
     .fetch_all(pool)
     .await
     .expect("read the masses");
-    Snapshot { caches, masses }
+    let frames = sqlx::query_as(
+        "SELECT claim_id, frame_id, hypothesis_index FROM claim_frames \
+          WHERE claim_id = ANY($1) ORDER BY claim_id, frame_id",
+    )
+    .bind(claims)
+    .fetch_all(pool)
+    .await
+    .expect("read the frame assignments");
+    let perspectives = sqlx::query_as(
+        "SELECT p.id, p.name, p.owner_agent_id, p.perspective_type::text \
+           FROM perspectives p \
+          WHERE p.id IN (SELECT e.id FROM edges e \
+                          WHERE e.source_id = ANY($1) OR e.target_id = ANY($1)) \
+          ORDER BY p.id",
+    )
+    .bind(claims)
+    .fetch_all(pool)
+    .await
+    .expect("read the edge perspectives");
+    let perspective_total = sqlx::query_scalar("SELECT count(*) FROM perspectives")
+        .fetch_one(pool)
+        .await
+        .expect("count the perspectives");
+    Snapshot {
+        caches,
+        masses,
+        frames,
+        perspectives,
+        perspective_total,
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -275,6 +321,13 @@ async fn running_the_supersede_cascade_twice_equals_running_it_once(pool: PgPool
              comparison below is between two untouched states: {first:?}"
         );
         let once = snapshot(&pool, &claims).await;
+        assert!(
+            !once.frames.is_empty()
+                && !once.perspectives.is_empty()
+                && once.caches.iter().any(|c| c.7.is_some()),
+            "CALIBRATION case {n}: the first run must leave frame assignments, edge \
+             perspectives and a cache frame, or their comparison below is vacuous: {once:?}"
+        );
 
         let second = cascade_after_supersede(&mut conn, &bypass, retiring, replacement).await;
         assert!(second.errors.is_empty(), "case {n}: second run: {second:?}");
