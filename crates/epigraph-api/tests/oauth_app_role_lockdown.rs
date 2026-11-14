@@ -1075,12 +1075,14 @@ async fn an_unanswerable_revocation_lookup_fails_closed(pool: PgPool) {
 /// agent's `client_credentials` assertion is single use when the token
 /// endpoint runs as `epigraph_app`, which holds no write on
 /// `oauth_assertion_nonces` and records the nonce only through the definer.
-/// Two CONCURRENT presentations of one assertion mint exactly once (the
-/// definer's `INSERT .. ON CONFLICT DO NOTHING` is the whole decision), and a
-/// fresh assertion still mints afterwards (calibration: the refusals are the
+/// Two presentations of one assertion issued together (`tokio::join!`) mint
+/// exactly once. The test pins that exactly-once outcome; it does not force
+/// the two requests to overlap. Whether they race or run one after the other,
+/// the definer's `INSERT .. ON CONFLICT DO NOTHING` decides it. A fresh
+/// assertion still mints afterwards (calibration: the refusals are the
 /// replay, not a broken grant on this role).
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_agent_assertion_is_single_use_on_the_app_role(pool: PgPool) {
+async fn an_agent_assertion_mints_exactly_once_on_the_app_role(pool: PgPool) {
     use ed25519_dalek::{Signer, SigningKey};
     let key = SigningKey::from_bytes(&[0x5a; 32]);
     let public_key = key.verifying_key().to_bytes();
@@ -1147,7 +1149,7 @@ async fn an_agent_assertion_is_single_use_on_the_app_role(pool: PgPool) {
     assert_eq!(
         statuses,
         [StatusCode::OK, StatusCode::UNAUTHORIZED],
-        "two concurrent presentations of one assertion mint exactly once: {} / {}",
+        "two presentations of one assertion issued together mint exactly once: {} / {}",
         a.1,
         b.1
     );

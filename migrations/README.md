@@ -2662,7 +2662,12 @@ restart.
   verified under, not by the `oauth_clients` row: an agent's `client_id` is
   its hex key as registered, and hex decoding accepts either case, so two
   rows spelling one key differently would otherwise each grant a captured
-  assertion one more use. `oauth/token.rs` calls it after the assertion's signature and
+  assertion one more use. ACCEPTED BOUND: any session on the application
+  DSN can call the definer with any key and nonce, so it can grow the table
+  for up to an hour per row (AN03 bounds how long a row lives, not how many
+  there are; each call prunes at most 1000). That DSN can already write far
+  larger tables, and nonces are random, so this is not a lockout of a
+  particular agent. `oauth/token.rs` calls it after the assertion's signature and
   freshness verify, on both the `client_credentials` and the refresh grant,
   keeping each nonce until the signed timestamp + 360 s (the 300 s window
   plus a 60 s skew margin). Registered in `tenancy_backfill.rs`
