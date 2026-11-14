@@ -773,7 +773,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// (`HIGH_WATER_FILES` falls by one).
 /// 207 -> 206 when `supersede_claim`'s detached factor-count spawn was deleted
 /// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
-const HIGH_WATER: usize = 206;
+/// 206 -> 205 when `patch_claim`'s ownership read moved onto the caller's
+/// viewer (backlog 4073bbb6): `routes/claims.rs` 17 -> 16.
+const HIGH_WATER: usize = 205;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -892,7 +894,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // UPDATE moved off `state.db_pool` onto `AppState::store_claim_embedding_as`
     // (the caller's stamp). Read off this test's own failure (`recorded 18,
     // measured 17`).
-    ("routes/claims.rs", 17),
+    // 17 -> 16 (backlog 4073bbb6): `patch_claim`'s ownership read moved off
+    // `state.db_pool` onto `AppState::read_as` (`ClaimRepository::write_target_of`
+    // through the caller's viewer), as `update_labels`'s did in batch H6.
+    ("routes/claims.rs", 16),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,

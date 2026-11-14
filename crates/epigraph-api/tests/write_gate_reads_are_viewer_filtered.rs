@@ -10,12 +10,15 @@
 //! through the caller's viewer, so an invisible claim is 404, exactly like a
 //! missing one, and nothing is written.
 //!
-//! `PATCH /claims/:id` has the same unfiltered owner read, and it is kept here as
-//! a regression arm, NOT because it was a live defect. MEASURED: with its read
-//! left unfiltered the arm still passes. The handler re-fetches the patched claim
-//! through the viewer on the SAME transaction before COMMIT, so an invisible
-//! claim 404s there and the whole patch rolls back. The arm pins that the
-//! rollback keeps happening.
+//! `PATCH /claims/:id` HAD the same unfiltered owner read. For the ADMIN caller
+//! of the first test it was not a live defect (MEASURED: with the read left
+//! unfiltered that arm still passes, because the handler re-fetches the patched
+//! claim through the viewer on the SAME transaction before COMMIT, so an
+//! invisible claim 404s there and the whole patch rolls back). For a caller
+//! WITHOUT `claims:admin` it was an existence oracle: the unfiltered read found
+//! the claim and the ownership gate answered 403, where a missing claim answers
+//! 404 (backlog 4073bbb6). The read now runs through the caller's viewer, and
+//! `patch_does_not_tell_a_non_admin_that_an_unreadable_claim_exists` pins it.
 //!
 //! # Why this discriminates even though the test database connects as a superuser
 //!
@@ -246,4 +249,67 @@ async fn a_principal_cannot_act_on_a_claim_it_cannot_read() {
             assert_eq!(after, before, "a refused deprecate must write nothing");
         }
     }
+}
+
+/// The 403-versus-404 half of `PATCH /claims/:id` (backlog 4073bbb6), which the
+/// admin caller above cannot see: `require_owner_or_admin` never refuses it.
+///
+/// A caller with `claims:write` only, who authored neither claim:
+/// * a PUBLIC claim it can read is 403 (calibration: the claim is found, and
+///   the ownership gate is what refuses);
+/// * a claim it CANNOT read is 404, exactly like an id that does not exist.
+///
+/// MEASURED: with the handler's read reverted to the unfiltered
+/// `SELECT agent_id FROM claims WHERE id = $1` the private arm answers 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn patch_does_not_tell_a_non_admin_that_an_unreadable_claim_exists() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:read", "claims:write"]).await;
+    let http = reqwest::Client::new();
+    let patch = |id: Uuid| {
+        let http = http.clone();
+        let token = token.clone();
+        async move {
+            http.patch(format!("http://{addr}/api/v1/claims/{id}"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({"properties": {"wgr": true}}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    let public = seed_public_claim(&pool, "wgr non-admin patch, public", &[]).await;
+    assert_eq!(
+        patch(public).await,
+        403,
+        "calibration: a readable claim the caller does not own is refused by ownership"
+    );
+
+    let private = seed_private_claim(&pool, "wgr non-admin patch, private", &[]).await;
+    let before = state_of(&pool, private).await;
+    let missing = patch(Uuid::new_v4()).await;
+    assert_eq!(
+        missing, 404,
+        "calibration: an id that does not exist is 404"
+    );
+    assert_eq!(
+        patch(private).await,
+        missing,
+        "a claim the caller cannot read must answer exactly as a missing one"
+    );
+    assert_eq!(
+        state_of(&pool, private).await,
+        before,
+        "a refused PATCH must write nothing"
+    );
 }
