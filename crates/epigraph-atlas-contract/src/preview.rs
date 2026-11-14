@@ -21,6 +21,11 @@
 //!   claims, so a theme's count is the same whichever way it is grouped;
 //! - one team leaf (and its twin) is a full 100-node leaf, the size of
 //!   `team_leaf_dense`;
+//! - another team leaf (and its twin) holds evidence with no readable mass,
+//!   the common case, as `team_leaf_sparse_mass` does: most of its
+//!   evidence-to-claim edges are served `none` (weight 0, sign 0, the
+//!   relationship kept), so the page draws them in the tone of their
+//!   relationship with no flow;
 //! - a link target or breadcrumb that points at a level awaiting (re)naming
 //!   carries a null name (those objects have no `needs_naming` flag), so a
 //!   stale name never shows on a stub or a breadcrumb;
@@ -45,8 +50,8 @@ use crate::fixtures::{
     group_name, leaf_level, net_sign, r4, ClaimValues, Frame, Rng, FIXTURE_TEAM_GROUP_ID,
 };
 use crate::{
-    Breadcrumb, Bundle, Child, ChildKind, GroupLevel, Hierarchy, LevelDocument, LinkTarget,
-    MapScope, Switch, SCHEMA_VERSION,
+    Breadcrumb, Bundle, Child, ChildKind, FlowBasis, GroupLevel, Hierarchy, LeafLevel,
+    LevelDocument, LinkTarget, MapScope, Node, Switch, SCHEMA_VERSION,
 };
 
 /// The two hierarchies, in the order the manifest names a theme's roots.
@@ -123,6 +128,38 @@ fn child_kinds(depth: u8) -> &'static [ChildKind] {
 /// hierarchies).
 fn is_dense(map: usize, theme: usize, path: &[usize]) -> bool {
     map == 0 && theme == 0 && path == [2]
+}
+
+/// The sparse-mass leaf: the team map's second theme, the root's second
+/// leaf (in both hierarchies). Its drawn evidence includes both supporting
+/// and refuting edges among those served `none`, in each hierarchy.
+fn is_sparse_mass(map: usize, theme: usize, path: &[usize]) -> bool {
+    map == 0 && theme == 1 && path == [3]
+}
+
+/// Serve the evidence of a leaf as most real evidence is read: every
+/// evidence-to-claim edge `none` (weight 0, sign 0, its relationship kept),
+/// except those of every fourth evidence node, which keep their exact mass.
+/// The rule `team_leaf_sparse_mass` applies; it draws nothing from the rng,
+/// so every other preview level is unchanged.
+fn serve_sparse_mass(leaf: &mut LeafLevel) {
+    let evidence: Vec<Uuid> = leaf
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Evidence(e) => Some(e.id),
+            _ => None,
+        })
+        .collect();
+    for e in &mut leaf.edges {
+        if let Some(i) = evidence.iter().position(|id| *id == e.source) {
+            if i % 4 != 0 {
+                e.sign = 0;
+                e.flow_weight = 0.0;
+                e.flow_basis = FlowBasis::None;
+            }
+        }
+    }
 }
 
 /// A leaf's (claims, agents, evidence) and links per claim.
@@ -507,6 +544,10 @@ pub fn preview() -> Preview {
                 );
                 for (o, t) in leaf.outgoing.iter_mut().zip(targets) {
                     o.target = t;
+                }
+                let sk = &b.sk[i];
+                if is_sparse_mass(sk.map, sk.theme, &sk.path) {
+                    serve_sparse_mass(&mut leaf);
                 }
                 LevelDocument::Leaf(leaf)
             }

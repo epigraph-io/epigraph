@@ -1782,6 +1782,55 @@ mod preview_set {
         }
     }
 
+    /// The preview shows evidence with no readable mass, the common case: in
+    /// each hierarchy a team leaf has most of its evidence edges `none`
+    /// (weight 0, sign 0), both `supports` and `refutes` among them, some
+    /// `exact` evidence beside them, and evidence attached to its claims only
+    /// through `none` edges. So the preview page draws the massless line.
+    #[test]
+    fn the_preview_shows_a_sparse_mass_leaf_in_each_hierarchy() {
+        let p = preview::preview();
+        let mut shown = BTreeSet::new();
+        for (map, doc) in &p.levels {
+            let LevelDocument::Leaf(leaf) = doc else {
+                continue;
+            };
+            let evidence: BTreeSet<Uuid> = leaf
+                .nodes
+                .iter()
+                .filter(|n| n.kind() == NodeKind::Evidence)
+                .map(Node::id)
+                .collect();
+            let ev: Vec<&Edge> = leaf
+                .edges
+                .iter()
+                .filter(|e| evidence.contains(&e.source))
+                .collect();
+            let none: Vec<&&Edge> = ev
+                .iter()
+                .filter(|e| e.flow_basis == FlowBasis::None)
+                .collect();
+            let exact = ev.len() - none.len();
+            let both = ["supports", "refutes"].iter().all(|r| {
+                none.iter()
+                    .any(|e| e.relationship.eq_ignore_ascii_case(r) && e.sign == 0)
+            });
+            let only_none = evidence.iter().any(|id| {
+                let mine: Vec<_> = ev.iter().filter(|e| e.source == *id).collect();
+                !mine.is_empty() && mine.iter().all(|e| e.flow_basis == FlowBasis::None)
+            });
+            if none.len() > exact && exact > 0 && both && only_none {
+                assert_eq!(p.maps[*map].scope, MapScope::Team);
+                shown.insert(format!("{:?}", leaf.hierarchy));
+            }
+        }
+        assert_eq!(
+            shown.len(),
+            HIERARCHIES.len(),
+            "a sparse-mass leaf in each hierarchy, found in {shown:?}"
+        );
+    }
+
     /// Every link a viewer can click in the preview lands on a level of the
     /// set, on the same map: breadcrumbs are the real parent chain, each
     /// switch leads to the other hierarchy of the same map and theme (and
