@@ -264,14 +264,23 @@ impl AtlasServeRepository {
     /// The leaf group(s) of `hierarchy` in `run_id` of `map` whose claim nodes
     /// hold `claim_id`, when the viewer's session can read the claim: the
     /// claim's current theme narrows the search to that theme's leaves of the
-    /// run (a primary-key prefix scan of the run's levels, filtered on the
-    /// theme, then a containment test on those leaves only). Empty when the
+    /// run, then a containment test runs on those leaves only. Empty when the
     /// claim is unreadable, has no theme, or is on no leaf of that theme; a
     /// claim re-themed since the build is found again after the next one.
     /// More than one group means a malformed run; the caller refuses it.
     ///
+    /// Two statements on the viewer's connection, deliberately. With the
+    /// theme read in the same statement, `l.theme_id = c.theme_id` is a JOIN
+    /// filter: the planner scanned every level of the run and ran the jsonb
+    /// tests (detoasting each document) before the theme could narrow
+    /// anything. On a run of 13,860 levels that was 976 ms for one lookup
+    /// (EXPLAIN ANALYZE, 89k buffers; Atlas W12's latency gate, full
+    /// scale). Bound as a parameter, the theme is a cheap scan filter, which
+    /// Postgres orders before the jsonb tests, so only the theme's own
+    /// levels are detoasted.
+    ///
     /// # Errors
-    /// `DbError::QueryFailed` if the statement fails.
+    /// `DbError::QueryFailed` if a statement fails.
     pub async fn leaves_of_claim(
         conn: &mut PgConnection,
         viewer: &Viewer,
@@ -280,31 +289,41 @@ impl AtlasServeRepository {
         hierarchy: AtlasHierarchy,
         claim_id: Uuid,
     ) -> Result<Vec<(Uuid, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.theme_id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Option<Uuid>>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let Some(Some(theme_id)) = q.fetch_optional(&mut *conn).await? else {
+            return Ok(Vec::new());
+        };
+
         let (owner, visibility) = map.tenancy();
         let sql = viewer.splice(
-            "SELECT c.theme_id, l.group_id \
-               FROM claims c \
-               JOIN atlas_map_levels l \
-                 ON l.run_id = $1 AND l.hierarchy = $2 AND l.theme_id = c.theme_id \
+            "SELECT l.theme_id, l.group_id \
+               FROM atlas_map_levels l \
+              WHERE l.run_id = $1 AND l.hierarchy = $2 AND l.theme_id = $3 \
                 AND l.owner_group_id = $4 AND l.visibility = $5 \
                 AND l.schema_version = $6 \
                 AND l.payload->>'kind' = 'leaf' \
                 AND l.payload->'nodes' @> \
-                    jsonb_build_array(jsonb_build_object('kind', 'claim', 'id', $3::text)) \
+                    jsonb_build_array(jsonb_build_object('kind', 'claim', 'id', $7::text)) \
                 /* {VISIBILITY:l} */ \
-              WHERE c.id = $3 \
-                /* {VISIBILITY:c} */ \
               ORDER BY l.group_id \
               LIMIT 2",
-            7,
+            8,
         );
         let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql)
             .bind(run_id)
             .bind(hierarchy.as_str())
-            .bind(claim_id)
+            .bind(theme_id)
             .bind(owner)
             .bind(visibility)
-            .bind(LEVEL_SCHEMA_VERSION);
+            .bind(LEVEL_SCHEMA_VERSION)
+            .bind(claim_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
