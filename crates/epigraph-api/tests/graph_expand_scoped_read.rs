@@ -400,13 +400,17 @@ async fn communities_expand_omits_a_stranger_claim_and_serves_the_viewers_own(po
 /// The single `decomposes_to` edge is forced PUBLIC so the edge predicate
 /// cannot be what withholds a node.
 ///
-/// # MEASURED: compound mode's `compound_nodes` branch is defended twice over
+/// # MEASURED: compound mode's `compound_nodes` branch is defended more than once
 ///
 /// Neutralising ONLY the `claims` marker on that branch leaves this arm green —
 /// the `atoms` CTE's `/* {VISIBILITY:m} */` on `claim_neighborhood_membership`
 /// already keeps the stranger's atom out, so the compound never acquires a
-/// member and never reaches the projection. The arm fails when BOTH go, which
-/// is what was measured rather than assumed. Atomic mode is not like that: one
+/// member and never reaches the projection. The arm failed when BOTH went, as
+/// measured. Since backlog batch B08 the `atoms` CTE also carries
+/// `/* {VISIBILITY:ac} */` on the atom's own `claims` row, a THIRD layer, so
+/// removing those two alone is expected to leave this arm green as well (not
+/// re-measured here); `crates/epigraph-db/tests/graph_view_edge_scope.rs`
+/// isolates the new layer. Atomic mode is not like that: one
 /// statement, and neutralising its `claims` marker alone fails the arm. That
 /// asymmetry is recorded here because a reader checking whether this file is
 /// load-bearing will otherwise mutate one marker, see green, and conclude it is
