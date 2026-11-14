@@ -406,6 +406,8 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
+| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Requests per minute allowed to one client, enforced in-process on every route except the health probes. Unset → the API applies **no** rate limit (logged at boot as `Rate limiting: OFF`); limit at the reverse proxy instead, or set this. The client is its IP, taken from `X-Forwarded-For` / `X-Real-IP` when present, so set it only where a trusted proxy writes those headers, and remember that agents sharing one address share one allowance. An unusable value → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global ceiling) | Requests per minute across all clients together. Read only with `EPIGRAPH_RATE_LIMIT_RPM`, and must not be below it. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |

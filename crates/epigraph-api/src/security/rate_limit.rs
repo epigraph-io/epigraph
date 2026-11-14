@@ -62,6 +62,78 @@ pub struct RateLimitConfig {
     pub enable_global_limit: bool,
 }
 
+/// Per-client requests per minute. Unset or empty: rate limiting is OFF.
+pub const RATE_LIMIT_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_RPM";
+/// Requests per minute across all clients together. Optional; only read when
+/// [`RATE_LIMIT_RPM_ENV`] is set. Unset: no global ceiling.
+pub const RATE_LIMIT_GLOBAL_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM";
+
+impl RateLimitConfig {
+    /// The rate limit an operator configured through
+    /// [`RATE_LIMIT_RPM_ENV`] / [`RATE_LIMIT_GLOBAL_RPM_ENV`], given as the
+    /// two variables' values so the rule is testable without touching the
+    /// process environment.
+    ///
+    /// - `Ok(None)`: neither is set (or both are blank). Rate limiting is off.
+    /// - `Ok(Some(config))`: the per-client limit, with the global ceiling
+    ///   enabled only when one was given.
+    /// - `Err(reason)`: a value was given and is unusable. The server refuses
+    ///   to start on this rather than run with no limit while the operator
+    ///   believes one is installed.
+    ///
+    /// # Errors
+    /// A value that is not a positive integer; a global ceiling given without
+    /// a per-client limit, or lower than it.
+    pub fn from_env_values(
+        per_client: Option<&str>,
+        global: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        fn given(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|v| !v.is_empty())
+        }
+        let parse = |name: &str, raw: &str| -> Result<u32, String> {
+            match raw.parse::<u32>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => Err(format!(
+                    "{name}={raw:?} is not a positive whole number of requests per minute"
+                )),
+            }
+        };
+        let (per_client, global) = (given(per_client), given(global));
+        let Some(per_client) = per_client else {
+            return match global {
+                None => Ok(None),
+                Some(_) => Err(format!(
+                    "{RATE_LIMIT_GLOBAL_RPM_ENV} is set but {RATE_LIMIT_RPM_ENV} is not; the \
+                     per-client limit is what turns rate limiting on"
+                )),
+            };
+        };
+        let default_rpm = parse(RATE_LIMIT_RPM_ENV, per_client)?;
+        let global_rpm = match global {
+            Some(raw) => {
+                let g = parse(RATE_LIMIT_GLOBAL_RPM_ENV, raw)?;
+                if g < default_rpm {
+                    return Err(format!(
+                        "{RATE_LIMIT_GLOBAL_RPM_ENV}={g} is below {RATE_LIMIT_RPM_ENV}=\
+                         {default_rpm}: one client could never reach its own limit"
+                    ));
+                }
+                Some(g)
+            }
+            None => None,
+        };
+        Ok(Some(Self {
+            default_rpm,
+            // Unused when the global limit is off, but the bucket is still
+            // built from it, so it is given a sane value rather than zero.
+            global_rpm: global_rpm.unwrap_or(default_rpm),
+            replenish_interval_secs: 1,
+            enable_global_limit: global_rpm.is_some(),
+        }))
+    }
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -368,6 +440,59 @@ impl std::fmt::Debug for AgentRateLimiter {
                     .len(),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod env_config_tests {
+    use super::RateLimitConfig;
+
+    #[test]
+    fn unset_or_blank_is_off() {
+        assert!(RateLimitConfig::from_env_values(None, None)
+            .unwrap()
+            .is_none());
+        assert!(RateLimitConfig::from_env_values(Some("  "), Some(""))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_per_client_limit_alone_has_no_global_ceiling() {
+        let c = RateLimitConfig::from_env_values(Some("120"), None)
+            .unwrap()
+            .expect("configured");
+        assert_eq!(c.default_rpm, 120);
+        assert!(!c.enable_global_limit);
+    }
+
+    #[test]
+    fn both_limits_are_carried() {
+        let c = RateLimitConfig::from_env_values(Some("120"), Some("3000"))
+            .unwrap()
+            .expect("configured");
+        assert_eq!((c.default_rpm, c.global_rpm), (120, 3000));
+        assert!(c.enable_global_limit);
+    }
+
+    /// An unusable value is an error, never "off": the operator set a limit
+    /// and must not get a server with none.
+    #[test]
+    fn an_unusable_value_is_refused() {
+        for (per_client, global) in [
+            (Some("0"), None),
+            (Some("-5"), None),
+            (Some("sixty"), None),
+            (Some("60"), Some("0")),
+            (Some("60"), Some("lots")),
+            (Some("600"), Some("60")),
+            (None, Some("1000")),
+        ] {
+            assert!(
+                RateLimitConfig::from_env_values(per_client, global).is_err(),
+                "({per_client:?}, {global:?}) must be refused"
+            );
+        }
     }
 }
 
