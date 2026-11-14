@@ -374,9 +374,9 @@ async fn walking_the_item_pages_one_at_a_time_names_no_id_the_actor_cannot_read(
 /// The two tests above assert the rule field by field (`sample`, `items`,
 /// `next_cursor`). This one serialises each WHOLE response body — the preview,
 /// every item page of a `limit = 1` walk, `GET /plans/:id` and `GET /plans` —
-/// and searches the JSON text for the ids of everything the reader cannot read:
-/// the selected claim, the boundary edge, the claim at that edge's far end,
-/// their owning group and their author. A field added to any of these
+/// and searches the JSON text for the ids of everything the reader cannot read
+/// (the selected claim, the boundary edge, the claim at that edge's far end,
+/// their owning group and their author) and for the content of both claims. A field added to any of these
 /// responses later is covered without editing this test.
 ///
 /// Two readers. The plan's author, who seeded it; and a co-admin of the target
@@ -395,8 +395,11 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
     viewer_fixture::make_custodian(&pool, co_admin).await;
 
     let (outsider, elsewhere) = seed_agent_with_group(&pool, "pr-all-fields-elsewhere").await;
-    let unreadable = seed_group_claim(&pool, outsider, elsewhere, "not for you").await;
-    let readable = seed_group_claim(&pool, world.actor, world.target_group, "yours").await;
+    const UNREADABLE_TEXT: &str = "pr-all-fields unreadable selected text";
+    const FAR_UNREADABLE_TEXT: &str = "pr-all-fields unreadable far-end text";
+    const READABLE_TEXT: &str = "pr-all-fields readable selected text";
+    let unreadable = seed_group_claim(&pool, outsider, elsewhere, UNREADABLE_TEXT).await;
+    let readable = seed_group_claim(&pool, world.actor, world.target_group, READABLE_TEXT).await;
     for id in [unreadable, readable] {
         sqlx::query("UPDATE claims SET labels = ARRAY[$2] WHERE id = $1")
             .bind(id)
@@ -409,7 +412,7 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
     // Two claims just OUTSIDE the selection, one per side, each joined to the
     // readable selected claim by an edge owned on its own side.
     let far_readable = seed_public_claim(&pool, world.actor, "next door").await;
-    let far_unreadable = seed_group_claim(&pool, outsider, elsewhere, "far side").await;
+    let far_unreadable = seed_group_claim(&pool, outsider, elsewhere, FAR_UNREADABLE_TEXT).await;
     let world_group = viewer_fixture::world_group(&pool).await;
     let readable_edge =
         viewer_fixture::seed_edge_owned_by(&pool, readable, far_readable, "public", world_group)
@@ -425,6 +428,10 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
         ("their owning group", elsewhere),
         ("their author", outsider),
     ];
+    let forbidden_text: [(&str, &str); 2] = [
+        ("the selected claim's content", UNREADABLE_TEXT),
+        ("the far-end claim's content", FAR_UNREADABLE_TEXT),
+    ];
     let assert_names_none = |what: &str, wire: &serde_json::Value| {
         let text = wire.to_string();
         for (name, id) in &forbidden {
@@ -434,6 +441,12 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
                     "{what}: {name} ({id}) appears in the response body: {text}"
                 );
             }
+        }
+        for (name, content) in &forbidden_text {
+            assert!(
+                !text.contains(content),
+                "{what}: {name} appears in the response body: {text}"
+            );
         }
     };
     let state = split_state(&pool).await;
@@ -476,9 +489,11 @@ async fn every_plan_response_field_names_only_what_the_reader_can_read(pool: PgP
     let preview_text = preview_wire.to_string();
     assert!(
         preview_text.contains(&readable.to_string())
-            && preview_text.contains(&readable_edge.to_string()),
-        "CALIBRATION: the preview must name the readable selected claim and the readable \
-         boundary edge, or the absences below are satisfied by an empty body: {preview_text}"
+            && preview_text.contains(&readable_edge.to_string())
+            && preview_text.contains(READABLE_TEXT),
+        "CALIBRATION: the preview must name the readable selected claim, render its content \
+         and name the readable boundary edge, or the absences below are satisfied by an \
+         empty body: {preview_text}"
     );
     assert_names_none("POST /plans (the preview)", &preview_wire);
 
