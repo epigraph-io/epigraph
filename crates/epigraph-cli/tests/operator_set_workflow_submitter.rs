@@ -489,3 +489,36 @@ async fn refusals_write_nothing(pool: PgPool) {
     let _ = (fx.w_null, fx.w_other, fx.w_same);
     drop_login(&pool, &login).await;
 }
+
+/// The new verb's doc comment must not swallow `reown-reverse`'s: clap
+/// takes a variant's description from the doc comment directly above it,
+/// so inserting the variant between that comment and `ReownReverse` left
+/// `reown-reverse` undescribed and this verb's help opening with the
+/// reversal's sentence. No database.
+#[test]
+fn both_verbs_keep_their_own_help_description() {
+    let help = |args: &[&str]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .env_clear()
+            .output()
+            .expect("spawn epigraph-operator");
+        assert!(out.status.success(), "{args:?} --help failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let top = help(&["--help"]);
+    let line = top
+        .lines()
+        .find(|l| l.trim_start().starts_with("reown-reverse "))
+        .unwrap_or_else(|| panic!("no reown-reverse line in --help"));
+    assert!(
+        line.contains("Restore every row a manifest's run moved"),
+        "reown-reverse lost its description: {line:?}"
+    );
+    let own = help(&["set-workflow-submitter", "--help"]);
+    let first = own.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    assert!(
+        first.starts_with("Set or correct the recorded SUBMITTER"),
+        "set-workflow-submitter's help opens with {first:?}"
+    );
+}

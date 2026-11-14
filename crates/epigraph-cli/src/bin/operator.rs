@@ -1209,7 +1209,6 @@ enum Command {
     /// arrays, with a `security_events` row. A live access token keeps the
     /// scope until it expires; the next refresh drops it.
     RevokeClientScope(ScopeArgs),
-    /// Restore every row a manifest's run moved to the owner it recorded.
     /// Set or correct the recorded SUBMITTER (`metadata.epigraph_submitted_by`)
     /// of selected `workflows` rows, audited; or reverse such a run
     /// (`--reverse <manifest>`). Select with exactly one of --ids-file,
@@ -1258,6 +1257,7 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Restore every row a manifest's run moved to the owner it recorded.
     ReownReverse {
         /// A manifest to reverse. Repeatable: several are applied newest-first
         /// by their header `created_at`, whatever order they are given in.
