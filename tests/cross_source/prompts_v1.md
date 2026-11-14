@@ -7,9 +7,10 @@ ratification does not count toward this protocol.
 ## 0. Why this exists
 
 The LLM verifier is the precision gate of the cross-source matcher.
-`calibration.toml` sets `[matcher.bands] high = 1.01`, so no score
-auto-promotes and every candidate at or above `mid` goes to the verifier
-(`crates/epigraph-engine/src/matching/pipeline.rs::run_pipeline`). A precision
+`crates/epigraph-engine/src/matching/pipeline.rs::run_pipeline` routes every
+candidate scoring at or above `bands.mid` (high band included) to the
+verifier; no score auto-promotes, whatever `[matcher.bands] high` is set to
+in `calibration.toml`. A precision
 figure for that verifier means something only if the following hold:
 
 - the prompt under test is fixed before scoring (§1);
@@ -31,8 +32,11 @@ The prompt text is pinned below. `{pairs_text}` is the per-batch block, one
 entry per pair in this form:
 `Pair {i} (cosine similarity: {sim:.4}):\n  Source [{doi}]: "{content≤300}"\n  Target [{doi}]: "{content≤300}"`.
 A unit test (`rerank::prompt::tests::adjudication_protocol_pins_the_live_prompt`)
-fails if the live prompt drifts from this text. Drift means a new protocol
-version, not a silent re-run.
+fails if the live prompt drifts from this text. `rerank` is compiled only with
+`--features genai`, so CI runs the guard in its own step ("Genai prompt drift
+guard": `cargo test -p epigraph-cli --features genai --lib rerank::prompt`); a
+plain `cargo test` does not. Drift means a new protocol version, not a silent
+re-run.
 
 ```text
 You are a scientific relationship validator for an epistemic knowledge graph.
@@ -91,11 +95,18 @@ How verdicts map to outcomes (`epigraph_engine::matching::verifier::map_relation
 | anything else / `valid=false` | Distinct  | reject |
 | no answer (`None`)        | none          | skipped; not scored |
 
-**Known deviation, which the operator rules on before the sweep:** the live
-prompt shows each claim's DOI to the verifier. The verifier therefore sees
-provenance, which §4 hides from the adjudicators. v1 evaluates the verifier as
-it is deployed, DOIs included. If the operator wants a DOI-blind verifier
-measured, that is a v2 prompt and a separate run.
+**Possible deviation, UNVERIFIED, measure before the operator rules on it:**
+the prompt template has a `[{doi}]` slot per claim, which would show the
+verifier provenance that §4 hides from the adjudicators. But the candidate
+query fills that slot from `claims.properties->>'paper_doi'`
+(`epigraph_cli::rerank::core`), a property no code in this repo writes (paper
+DOIs live on `asserts` edges from `papers`), and `build_validation_prompt`
+falls back to `unknown`. So the verifier most likely sees `[unknown]` on
+almost every pair, and the deviation may not exist. Before the sweep, count
+the claims in the sweep window that carry `properties ? 'paper_doi'`; record
+that count in the report (§7). If it is non-trivial, the operator rules:
+either v1 evaluates the verifier as deployed (DOIs visible on those pairs), or
+a DOI-blind prompt is a v2 and a separate run.
 
 ## 2. Sample frame
 
@@ -113,9 +124,14 @@ after the sweep would therefore flag every pair the sweep just scored.
    `matcher_run_id = <run_id>`. The upsert re-stamps `matcher_run_id` on rows
    that already existed, so previously decided pairs show up here too. Split
    the pairs into **clean** and **contaminated** against the step-1 snapshot
-   with `partition_by_ledger`.
-4. Of those rows, the ones with a `verifier_verdict` are the verifier's
-   answers. Pairs routed to the verifier but left unanswered
+   with `epigraph_engine::matching::contamination::partition_by_ledger`. v1
+   ships no CLI for this step: read the snapshot's `entries` array back as
+   `Vec<LedgerEntry>` (it derives `Deserialize`) and call the function from a
+   one-off script or test harness, recording its sha in the report.
+4. Of the **clean** rows, the ones with a `verifier_verdict` are this run's
+   verifier answers. This does not hold for contaminated rows: the upsert
+   keeps the stored verdict on any row whose `decided_at` is set, so a
+   decided row shows its OLD verdict, not this run's. Pairs routed to the verifier but left unanswered
    (`skipped_no_verdict`) are reported, but they are not part of the
    precision denominator.
 5. Draw the adjudication sample from the clean pairs: all verifier-accepted
@@ -145,8 +161,15 @@ off. Once the sweep's results have been seen, these values cannot be changed.
 - **Miss-rate audit:** across the `N_REJECT_AUDIT` = `<operator>` sampled
   rejections, report the fraction the adjudicators class as a match. This is
   reported only and does not gate the decision.
-- **Contaminated pairs:** report their count and their verifier-agreement
-  separately. They are never part of the headline figure.
+- **Contaminated pairs:** report their count only. Their stored verdict is
+  not necessarily this run's (§2 step 4), so no agreement figure is computed
+  from them. They are never part of the headline figure.
+- **Size of the clean set:** the matcher writes `status = 'rejected'` with a
+  verdict on most pairs it scores, so most pairs the matcher has seen before
+  are contaminated, and the clean set leans towards recently ingested claims.
+  Before fixing `N_MIN`, measure the share of `match_candidates` rows that
+  already carry a `verifier_verdict`; if the clean set cannot reach `N_MIN`,
+  the run is inconclusive, not a reason to admit contaminated pairs.
 
 ## 4. Blinding and randomised artifact ids
 
@@ -175,9 +198,17 @@ calibrate_matcher --contamination-ledger <out>/contamination_ledger.json
 ```
 
 The ledger is built by `epigraph_engine::matching::contamination::contamination_ledger`
-and is corpus-wide (it uses the maintenance DSN). Split the sweep's pairs with
-`partition_by_ledger`, which matches pairs whatever their orientation. Commit
-the ledger, or archive it next to the results, with the run's sha.
+and is corpus-wide (it uses the maintenance DSN, which bypasses row-level
+security). It therefore lists claim ids from every tenant, private groups
+included, with their decision history. **Archive it privately next to the
+results, with the run's sha. Never commit it to this repository**, which is
+public; the same applies to the adjudicator packet, labels and sealed mapping
+(§7). Split the sweep's pairs with `partition_by_ledger`, which matches pairs
+whatever their orientation.
+
+A `decided` reason means only that `decided_at` is set. Retirement stamps it
+too, so a `decided` row may be a retired same-source pair rather than one a
+person judged.
 
 ## 6. Withheld rubric (adjudicators only)
 
@@ -208,8 +239,11 @@ The report records:
 
 - the git sha, `ENRICHMENT_MODEL`, the calibration hash, and the sampling seed;
 - the stage counts from the sweep's JSON;
+- the count of window claims carrying `properties ? 'paper_doi'` (§1);
 - the clean and contaminated counts;
 - per-family confusion tables and the §3 outcome.
 
 Archive the adjudicator packet, the labels and the sealed mapping alongside
-the report.
+the report, privately (§5): they carry claim text and ids from the corpus and
+do not belong in this public repository. Only the aggregate report may be
+published.
