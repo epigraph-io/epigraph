@@ -117,6 +117,8 @@
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
+//!     epigraph-operator approve-client (--client <uuid> | --client-id <string>) \
+//!         --scope S [--scope S ...] [--approved-by <uuid>] --reason TEXT [--apply]
 //!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
@@ -124,10 +126,10 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
-    confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation, group_role, hide,
-    human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows, restrict,
-    retire_link, reverse, system_agent, team_group,
+    self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
+    client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
+    group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows,
+    restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -579,6 +581,36 @@ enum Command {
         #[arg(long)]
         revoke_membership: bool,
         /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Approve ONE PENDING OAuth client (migration 188 made approval a
+    /// maintenance act): `epigraph_oauth_client_approve` sets it `active` with
+    /// exactly the `--scope`s given, and this verb writes its own audit row
+    /// beside the definer's, in one transaction. Refused for a client that is
+    /// not `pending`, for `platform:admin`, and for an admin-only scope while
+    /// migration 128 is armed.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["client", "client_id"])))]
+    ApproveClient {
+        /// The client's `oauth_clients.id` row uuid.
+        #[arg(long)]
+        client: Option<Uuid>,
+        /// The client's `client_id` string (what `/oauth/register` returns),
+        /// mapped to its row.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// A scope to grant (repeatable; at least one). Exactly these become
+        /// the client's `granted_scopes`.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        /// The approving client's `oauth_clients.id`, recorded by the definer
+        /// as the client's `created_by` (the prior value is in the audit row).
+        #[arg(long)]
+        approved_by: Option<Uuid>,
+        /// Recorded in the audit row. Required, not blank.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the approval and its audit rows roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -1293,6 +1325,11 @@ async fn main_inner() -> anyhow::Result<i32> {
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
+    }
+    // approve-client: platform:admin, a blank or repeated scope, or a blank
+    // reason, before any connection is made.
+    if let Command::ApproveClient { scopes, reason, .. } = &cli.command {
+        approve_client::validate(scopes, reason)?;
     }
     // A grant names its window explicitly; refused before any connection.
     let window = if let Command::GrantRole {
@@ -2252,6 +2289,35 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the retire and its audit row were rolled back.");
             }
             Ok(outcome.exit_code())
+        }
+        Command::ApproveClient {
+            client,
+            client_id,
+            scopes,
+            approved_by,
+            reason,
+            apply,
+        } => {
+            let which = match (client, client_id) {
+                (Some(id), None) => approve_client::ClientRef::Row(id),
+                (None, Some(s)) => approve_client::ClientRef::ClientId(s),
+                _ => unreachable!("clap requires exactly one of --client / --client-id"),
+            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome = approve_client::run(
+                &mut conn,
+                &which,
+                &scopes,
+                approved_by,
+                &reason,
+                apply,
+                &who,
+            )
+            .await?;
+            for line in approve_client::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
         }
         cmd @ (Command::SuspendClient(_) | Command::RevokeClient(_)) => {
             let (act, a) = match cmd {

@@ -954,12 +954,10 @@ async fn the_approve_route_approves_nothing_even_on_a_privileged_dsn(pool: PgPoo
     .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
     assert_eq!(body["error"], "maintenance_surface_not_served", "{body}");
-    assert_eq!(body["runs_on"]["kind"], "none", "{body}");
-    assert!(
-        body["runs_on"]["name"]
-            .as_str()
-            .is_some_and(|n| n.contains("epigraph_oauth_client_approve")),
-        "{body}"
+    assert_eq!(body["runs_on"]["kind"], "cli", "{body}");
+    assert_eq!(
+        body["runs_on"]["name"], "epigraph-operator approve-client",
+        "the 501 names the verb that approves: {body}"
     );
     assert_eq!(
         status_and_granted(&pool, client).await,
