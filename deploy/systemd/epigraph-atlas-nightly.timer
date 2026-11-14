@@ -1,0 +1,18 @@
+# Runs epigraph-atlas-nightly.service once a night (Atlas W9). A TEMPLATE:
+# see the service file and docs/runbooks/atlas-nightly.md.
+#
+# 04:30 local: after the 03:30 cross-source sweep and the 04:10 recall-event
+# prune, clear of the 01:00 and 02:00 backup windows, and in the slot the
+# paused 04:00 theme-maintenance task held (this job replaces it).
+
+[Unit]
+Description=Run the EpiGraph Atlas nightly map refresh
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+AccuracySec=1min
+Unit=epigraph-atlas-nightly.service
+
+[Install]
+WantedBy=timers.target
