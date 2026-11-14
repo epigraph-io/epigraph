@@ -47,6 +47,10 @@ schemars = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+# `TaskTracker` (feature `rt`) owns the detached ingest and embedding tasks, so
+# a stdio process can wait for them before it exits (`background.rs`). Already
+# in the lock through rmcp/axum; no new crate.
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # Database
 sqlx = { workspace = true }

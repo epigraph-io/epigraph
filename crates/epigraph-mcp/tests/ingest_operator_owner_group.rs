@@ -48,7 +48,7 @@ mod common;
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::{ScopedPool, SessionGucMode};
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::ingestion::{
     do_ingest_document, ingest_document_inline, ingest_document_spine,

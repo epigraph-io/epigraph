@@ -222,6 +222,8 @@ A **frame** is the hypothesis space a single mass function is defined over — `
 
 A **perspective** is a *viewpoint*: an agent-owned (or community-owned) lens that selects, weights, or filters claims when computing belief. The same atom can carry different BetP values from different perspectives without one overwriting the other — disagreement stays visible instead of being averaged away. Perspectives have a `perspective_type` ("analytical", "narrative", etc.), an optional list of `frame_ids` they operate over, and a `confidence_calibration` factor in `[0, 1]`.
 
+Two `perspective_type` values are **internal BBA slots, not viewpoints**: `edge` (one row per epistemic edge, whose id is the edge's id, named `edge_factor`) and `evidence` (one row per evidence row, sharing that evidence row's id, named `evidence_grounded`). The belief layer writes them so a mass function can be keyed to its edge or evidence row through the `mass_functions.perspective_id` foreign key. Nobody chooses them as a lens, so `list_perspectives`, `GET /api/v1/perspectives` and `GET /api/v1/agents/:id/perspectives` leave them out; they are still readable by id. Do not create a perspective of either type yourself.
+
 ```json
 // mcp__epigraph__list_perspectives  →
 [

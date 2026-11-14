@@ -390,7 +390,7 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
       }],
       "relationships": []
     }"#;
-    let extraction: epigraph_ingest::schema::DocumentExtraction =
+    let extraction: epigraph_ingest::document::schema::DocumentExtraction =
         serde_json::from_str(fixture).expect("fixture parses");
 
     let err = epigraph_mcp::tools::ingestion::do_ingest_document(

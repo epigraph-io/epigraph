@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -19,12 +18,13 @@ use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
-use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
+use epigraph_ingest::common::plan::PlannedClaim;
+use epigraph_ingest::document::builder::build_ingest_plan;
 use epigraph_ingest::document::schema::ByteSpan;
+use epigraph_ingest::document::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 use epigraph_ingest::document::structure::{
     parse_structure, slice_segmentation, SourceFormat, StructuredDoc,
 };
-use epigraph_ingest::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -185,7 +185,7 @@ pub async fn ingest_document(
     let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
-    // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
+    // owned viewer: a spawned task is `'static` and cannot borrow the caller's.
     // `Viewer` is not `Clone`; `detach_scoped` is the narrow replacement, and
     // what it yields is the caller's own scoped read authority and nothing
     // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
@@ -247,7 +247,10 @@ pub async fn ingest_document(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, not a bare `tokio::spawn`: a stdio process whose client closes
+    // the session drains it before exiting (`crate::background`), instead of
+    // cancelling a walk the caller was told is `queued`.
+    server.background_tasks().spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -263,7 +266,7 @@ pub async fn ingest_document(
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
 /// points, run before `ensure_paper_node` writes anything.
 ///
-/// `do_ingest_document` runs in a `tokio::spawn`ed task, so a refusal inside it
+/// `do_ingest_document` runs in a spawned task, so a refusal inside it
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
@@ -386,7 +389,10 @@ pub async fn ingest_document_inline(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, not a bare `tokio::spawn`: a stdio process whose client closes
+    // the session drains it before exiting (`crate::background`), instead of
+    // cancelling a walk the caller was told is `queued`.
+    server.background_tasks().spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -1770,19 +1776,16 @@ pub async fn do_ingest_document_reporting(
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
-    // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
-    // invariant (every is_current claim has an embedding) is satisfied eventually.
-    let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    // by N × ~0.8 s OpenAI calls. The response reports the number QUEUED (0 when
+    // this server has no embedding provider), never a number stored: nothing has
+    // been stored when it is built. The task logs stored against queued.
+    let queued = spawn_created_claim_embeds(
+        server,
+        agent_id,
+        resolution.grant(),
+        embed_queue,
+        "ingest_document",
+    );
 
     let tenancy = IngestTenancy {
         visibility: resolution.label(),
@@ -1801,6 +1804,7 @@ pub async fn do_ingest_document_reporting(
         authors: author_responses,
         ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
+        claims_embedding_queued: queued,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
         relationships_created,
@@ -1813,43 +1817,93 @@ pub async fn do_ingest_document_reporting(
     Ok((result, tenancy))
 }
 
-/// Convert a DOI into a slug form safe for use as a URL path segment or
-/// canonical name: every `/` becomes `-`. Casing is left untouched.
+/// Embed the claims a document walk CREATED, post-commit and best-effort, in a
+/// task on the server's tracker (`crate::background`).
 ///
-/// # Why this has no caller, and must NOT be wired into the label write
+/// Each vector is stored as the walk's AUTHOR, with the team-write grant the
+/// walk wrote under (`claim_helper::embed_claim_author_stamped_with_grant`),
+/// not through `McpEmbedder::embed_and_store`. That path resolves a claim's
+/// author by reading the claim as PUBLIC, and a document ingest that names no visibility
+/// lands in the author's team or private, never public (backlog 46902f71): on
+/// such a claim it found no author and stored nothing, and only a WARN said so.
+/// The walk already knows the author and the grant, as
+/// `workflow_ingest::store_ingest_embedding` knows its author.
 ///
-/// It looks like the missing half of backlog 00ad6fee ("Step 14's
-/// `recompute_beliefs(labels=[doi_slug])` is a no-op — ingest writes
-/// `doi:<doi>`, not the slug"), and the obvious repair is to emit
-/// `doi_to_slug(doi)` alongside `doi:{doi}` at both ingest sites. **Do not.**
-/// That backlog was resolved on the WORKFLOW side and this spelling is now the
-/// one the canonical workflow explicitly warns against.
+/// The queue holds only claims this walk created (a converged claim is skipped
+/// before it is queued), so every row in it is the author's to write.
 ///
-/// MEASURED against prod on 2026-09-22: workflow
-/// `48c58117-4c96-5e72-805a-cb1ce7193012`
-/// (`ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction`),
-/// step_index 14, lineage `b5bb0b73-…`. The step claim the backlog quotes —
-/// `1ad33d15-e517-5e73-b3dd-c6ff00a0e2d3`, "`recompute_beliefs(labels=[doi_slug]`
-/// … DOI with slashes replaced by hyphens" — is `is_current: false`. Its head
-/// is `d079cc79-1ba2-4aa2-8705-05a072764c77` (2026-09-02):
-///
-/// > The label is the literal prefix 'doi:' joined to the DOI with slashes
-/// > INTACT … VERIFIED 2026-09-02 across 24 papers … The hyphen-slug form
-/// > previously documented here … and the bare DOI without the 'doi:' prefix
-/// > BOTH match zero claims.
-///
-/// So `doi:{doi}` (what `do_ingest_document` and the spine path already write,
-/// pinned by `ingest_document_smoke::ingested_claims_carry_doi_label_for_recompute`)
-/// is the canonical spelling on both sides. Adding a second, hyphenated label
-/// to every ingested claim would re-legitimise a form the workflow head calls a
-/// silent no-op, and `check_already_ingested` is keyed on the `doi:<key>`
-/// spelling besides.
-///
-/// Kept, not deleted: the doc comment above describes a URL/path-segment use
-/// that is unrelated to labels, and the unit tests below pin the transform.
-#[allow(dead_code)] // deliberately uncalled — see the doc comment above, not a gap
-fn doi_to_slug(doi: &str) -> String {
-    doi.replace('/', "-")
+/// Returns how many embeddings were QUEUED (backlog fdacc14f): 0 when the queue
+/// is empty or this server has no embedding provider
+/// (`McpEmbedder::embeddings_disabled`), in which case no task is spawned,
+/// because every provider call would fail. The task logs how many it stored
+/// against how many were queued when it finishes.
+fn spawn_created_claim_embeds(
+    server: &EpiGraphMcpFull,
+    author: Uuid,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+    queue: Vec<(Uuid, String)>,
+    tool_name: &'static str,
+) -> usize {
+    if queue.is_empty() {
+        return 0;
+    }
+    if server.embedder.embeddings_disabled() {
+        tracing::warn!(
+            tool = tool_name,
+            claims = queue.len(),
+            "embeddings are disabled on this server (no provider key), so the claims this \
+             ingest created carry no vector until the maintenance backfill reaches them"
+        );
+        return 0;
+    }
+    let queued = queue.len();
+    // A clone shares the parent's pools and tracker; the grant is owned for
+    // the same `'static` reason.
+    let bg = server.clone();
+    let grant = grant.cloned();
+    server.background_tasks().spawn(async move {
+        let mut stored = 0usize;
+        for (id, content) in queue {
+            // A server DECLARED to run on a privileged pool (the operator
+            // `ingest-document` CLI on `MaintenancePool`, mirroring
+            // `begin_ingest_tx`) has no tenancy context to stamp: the
+            // embedder's own declared privileged store applies there.
+            let one = if bg.scoped.is_none() && bg.privileged_pool.is_some() {
+                bg.embedder.embed_and_store(id, &content).await
+            } else {
+                crate::claim_helper::embed_claim_author_stamped_with_grant(
+                    &bg,
+                    author,
+                    grant.as_ref(),
+                    id,
+                    &content,
+                    None,
+                    tool_name,
+                )
+                .await
+            };
+            if one {
+                stored += 1;
+            }
+        }
+        if stored == queued {
+            tracing::info!(
+                tool = tool_name,
+                stored,
+                queued,
+                "background embedding done"
+            );
+        } else {
+            tracing::warn!(
+                tool = tool_name,
+                stored,
+                queued,
+                "background embedding stored fewer vectors than it queued; the rest carry no \
+                 vector until the maintenance backfill reaches them"
+            );
+        }
+    });
+    queued
 }
 
 /// URN prefix for a synthesized (non-DOI) document identity key.
@@ -2700,18 +2754,15 @@ pub async fn do_ingest_document_spine(
         crate::errors::internal_error_logged("ingest_document_spine: could not commit", e)
     })?;
 
-    // ── 6. Detach embeddings ──
-    let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    // ── 6. Detach embeddings (the response reports the number queued; see step 8
+    // of `do_ingest_document_reporting`) ──
+    let queued = spawn_created_claim_embeds(
+        server,
+        agent_id,
+        resolution.grant(),
+        embed_queue,
+        "ingest_document_spine",
+    );
 
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
@@ -2722,6 +2773,7 @@ pub async fn do_ingest_document_spine(
         ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
+        paragraphs_embedding_queued: queued,
         paragraphs_embedded: queued,
         new_paragraph_paths,
         converged_claims_unlabelled: converged_unlabelled,
@@ -2851,19 +2903,6 @@ mod tests {
         .await
         .expect("gate query");
         assert_eq!(hit, Some(paper_id));
-    }
-
-    #[test]
-    fn doi_to_slug_replaces_slash() {
-        assert_eq!(
-            doi_to_slug("10.48550/arXiv.2606.04990"),
-            "10.48550-arXiv.2606.04990"
-        );
-    }
-
-    #[test]
-    fn doi_to_slug_replaces_all_slashes() {
-        assert_eq!(doi_to_slug("10.1000/xyz/123/abc"), "10.1000-xyz-123-abc");
     }
 
     // ── Document identity keying (issue #356) ──────────────────────────────

@@ -117,7 +117,7 @@ async fn labels_of(pool: &PgPool, id: Uuid) -> Vec<String> {
         .expect("read labels")
 }
 
-fn doc_b(labels: &[&str]) -> epigraph_ingest::schema::DocumentExtraction {
+fn doc_b(labels: &[&str]) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {"title": "U035 Paper B", "doi": DOI_B, "source_type": "Paper", "authors": []},
         "thesis": THESIS,

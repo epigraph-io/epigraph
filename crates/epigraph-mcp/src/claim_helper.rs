@@ -597,6 +597,32 @@ pub async fn embed_claim_author_stamped(
     pending_embedding: Option<String>,
     tool_name: &'static str,
 ) -> bool {
+    embed_claim_author_stamped_with_grant(
+        server,
+        author_agent_id,
+        None,
+        claim_id,
+        text,
+        pending_embedding,
+        tool_name,
+    )
+    .await
+}
+
+/// [`embed_claim_author_stamped`] for a claim written under a team-write
+/// `grant` (an operated agent writing its human's team, D-V3): the store is
+/// stamped with the same grant the write was, so the `UPDATE` can match the
+/// row. See [`store_embedding_author_stamped_with_grant`]. The document walks'
+/// post-commit embedding loops call this with the grant they wrote under.
+pub async fn embed_claim_author_stamped_with_grant(
+    server: &EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+    claim_id: uuid::Uuid,
+    text: &str,
+    pending_embedding: Option<String>,
+    tool_name: &'static str,
+) -> bool {
     // Reuse the novelty gate's already-generated vector when there is one; only
     // the gate's embedder-failure path and the repair arm (where an exact
     // resubmit means the gate never ran) pay a second provider call.
@@ -615,10 +641,11 @@ pub async fn embed_claim_author_stamped(
         },
     };
 
-    match store_embedding_author_stamped(
+    match store_embedding_author_stamped_with_grant(
         server.scoped.as_ref(),
         &server.pool,
         author_agent_id,
+        grant,
         claim_id,
         &pgvec,
         tool_name,
@@ -649,6 +676,10 @@ pub async fn embed_claim_author_stamped(
 /// `McpEmbedder::embed_and_store` — used by `store_workflow`, `ingest_workflow`,
 /// `improve_workflow_hierarchy`, `add_step`, `consolidate_claims` and both
 /// `ingest_document` paths — storing through the embedder's own unstamped pool.
+/// (`consolidate_claims` and both document walks have since moved off
+/// `embed_and_store` onto this function directly, with their known author:
+/// that path resolves the author by reading the claim as public, which a
+/// team or private claim is not.)
 /// Seven callers of a broken store, fixed at two call sites. Both entry points
 /// now land here, so there is one place the tenancy argument has to be right.
 ///
@@ -696,12 +727,56 @@ pub(crate) async fn store_embedding_author_stamped(
     pgvec: &str,
     tool_name: &'static str,
 ) -> Result<bool, String> {
+    store_embedding_author_stamped_with_grant(
+        scoped,
+        pool,
+        author_agent_id,
+        None,
+        claim_id,
+        pgvec,
+        tool_name,
+    )
+    .await
+}
+
+/// [`store_embedding_author_stamped`], with the team-write grant the claim was
+/// WRITTEN under stamped into the author's viewer (as
+/// [`begin_author_stamped_tx_for`] stamps it for the write).
+///
+/// An operated agent that writes a team only through its human (D-V3) has that
+/// team in its writable set only through the grant, so a document ingest into
+/// such a team stores its embeddings with the same grant it wrote the claims
+/// with; without it the `UPDATE` matches no row. A grant naming another agent
+/// than `author_agent_id` is refused, as it is for the write.
+///
+/// # Errors
+/// Every error of [`store_embedding_author_stamped`], and a grant that names
+/// another agent.
+pub(crate) async fn store_embedding_author_stamped_with_grant(
+    scoped: Option<&epigraph_db::ScopedPool>,
+    pool: &sqlx::PgPool,
+    author_agent_id: uuid::Uuid,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+    claim_id: uuid::Uuid,
+    pgvec: &str,
+    tool_name: &'static str,
+) -> Result<bool, String> {
     // `author_write_authority` has already logged the specific cause at ERROR on
     // `tenancy.scoped_write`; its message is re-surfaced here so the caller's own
     // warn line carries it too.
     let (scoped, author_viewer) = author_write_authority(scoped, pool, author_agent_id, tool_name)
         .await
         .map_err(|e| e.message.to_string())?;
+    let author_viewer = match grant {
+        None => author_viewer,
+        Some(g) => author_viewer.with_team_write_grant(g).ok_or_else(|| {
+            format!(
+                "the team-write grant names agent {}, not the author {author_agent_id}; \
+                 nothing was stored",
+                g.agent()
+            )
+        })?,
+    };
 
     let mut tx = scoped
         .begin_as(&author_viewer)

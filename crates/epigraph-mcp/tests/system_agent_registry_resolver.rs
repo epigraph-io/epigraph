@@ -702,7 +702,7 @@ async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
 fn document(
     authors: &[&str],
     source_text: Option<&str>,
-) -> epigraph_ingest::schema::DocumentExtraction {
+) -> epigraph_ingest::document::schema::DocumentExtraction {
     let tag = Uuid::new_v4();
     serde_json::from_value(serde_json::json!({
         "source": {
