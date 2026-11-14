@@ -450,6 +450,66 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
     );
 }
 
+/// A one-attempt job that has already been re-delivered
+/// `MAX_CRASH_REDELIVERIES` times after a crash and is found stale again is
+/// failed by the reaper, not re-delivered a fourth time (migration 220,
+/// backlog 1320b4e3). The run reports it as a terminal failure with the
+/// crash-loop message, not the spent-budget one, and exits 1; its handler is
+/// never called.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_one_attempt_job_past_its_crash_redeliveries_is_failed_by_the_reaper(pool: PgPool) {
+    let looping = {
+        let job = fx::apply_job(Uuid::new_v4(), Uuid::new_v4(), "no-such-dispatch");
+        let id: Uuid = job.id.into();
+        PostgresJobQueue::new(pool.clone())
+            .enqueue(job)
+            .await
+            .expect("seed");
+        id
+    };
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = 0, max_retries = 1, redelivery_count = $2 WHERE id = $1",
+    )
+    .bind(looping)
+    .bind(epigraph_jobs::MAX_CRASH_REDELIVERIES)
+    .execute(&pool)
+    .await
+    .expect("age the job on its last re-delivery");
+
+    let scoped = maintenance_scoped(&pool).await;
+    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+    let report = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the drain ran");
+
+    assert_eq!(
+        job_state(&pool, looping).await,
+        (
+            "failed".to_string(),
+            Some(epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE.to_string())
+        ),
+        "a one-attempt job past its re-delivery bound was handed to its handler again"
+    );
+    let failure = report
+        .failures
+        .iter()
+        .find(|f| f.job_id == looping)
+        .unwrap_or_else(|| panic!("the reaped crash loop is not reported: {report:?}"));
+    assert!(failure.terminal, "{report:?}");
+    assert_eq!(
+        failure.error,
+        epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE,
+        "{report:?}"
+    );
+    assert_eq!(
+        (report.recovered_stale, report.completed),
+        (0, 0),
+        "{report:?}"
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
 /// The provider gate on `embedding_generation`, and why the drain filters by
 /// registered type: with a provider that may not write `claims.embedding` the
 /// handler is not registered, and a pending `embedding_generation` job at the
@@ -560,7 +620,8 @@ fn runner_with(
 
 /// Seed a job of `job_type` with an attempt budget of `max_retries`.
 async fn enqueue_typed(pool: &PgPool, job_type: &str, max_retries: u32) -> Uuid {
-    let job = epigraph_jobs::Job::new(job_type, serde_json::json!({})).with_max_retries(max_retries);
+    let job =
+        epigraph_jobs::Job::new(job_type, serde_json::json!({})).with_max_retries(max_retries);
     let id: Uuid = job.id.into();
     PostgresJobQueue::new(pool.clone())
         .enqueue(job)
@@ -697,7 +758,8 @@ fn a_failed_job_outranks_running_out_of_time_in_the_exit_code() {
         ..jobs_drain::DrainReport::default()
     };
     assert_eq!(late.exit_code(), 3);
-    let unregistered = || std::collections::BTreeMap::from([("embedding_generation".to_string(), 2)]);
+    let unregistered =
+        || std::collections::BTreeMap::from([("embedding_generation".to_string(), 2)]);
     let stranded = jobs_drain::DrainReport {
         pending_unregistered: unregistered(),
         ..jobs_drain::DrainReport::default()

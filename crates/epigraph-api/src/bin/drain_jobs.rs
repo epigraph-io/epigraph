@@ -18,7 +18,8 @@
 //!    holds it, print `{"locked": true}` and exit 0;
 //! 5. reap `running` rows older than 90 minutes (a counted attempt: back to
 //!    `pending`, or `failed` once the attempts are used up; a one-attempt row,
-//!    `max_retries <= 1`, is reset uncounted, see
+//!    `max_retries <= 1`, is reset uncounted and re-delivered at most
+//!    `MAX_CRASH_REDELIVERIES` times, then failed, see
 //!    `PostgresJobQueue::reap_stale_jobs_counting_attempts`), then run
 //!    the oldest pending job of a registered type, one at a time, until none
 //!    is left or `--max-runtime` (default 50min) has elapsed.

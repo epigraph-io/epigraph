@@ -54,7 +54,10 @@ pub use async_trait::async_trait;
 
 // PostgreSQL job queue module
 mod postgres_queue;
-pub use postgres_queue::{PostgresJobQueue, ReapedJob, REAPED_SPENT_MESSAGE};
+pub use postgres_queue::{
+    PostgresJobQueue, ReapedJob, MAX_CRASH_REDELIVERIES, REAPED_REDELIVERIES_SPENT_MESSAGE,
+    REAPED_SPENT_MESSAGE,
+};
 
 // Database-backed reputation service
 mod db_reputation_service;

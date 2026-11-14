@@ -44,6 +44,20 @@ use uuid::Uuid;
 pub const REAPED_SPENT_MESSAGE: &str = "reaped: still running past the stale bound on its last \
      attempt (the drain run was killed or died mid-job); no further attempt";
 
+/// The `error_message` of a ONE-attempt row the reaper failed: it was still
+/// `running` past the stale bound after [`MAX_CRASH_REDELIVERIES`] uncounted
+/// re-deliveries, so its handler crashes or is killed on every run.
+pub const REAPED_REDELIVERIES_SPENT_MESSAGE: &str = "reaped: a one-attempt job still running past \
+     the stale bound after its last crash re-delivery (the drain run was killed or died mid-job \
+     on every run); no further delivery";
+
+/// How many times the reaper re-delivers a ONE-attempt row (`max_retries <=
+/// 1`) that was still `running` past the stale bound, before it fails the row
+/// with [`REAPED_REDELIVERIES_SPENT_MESSAGE`] (migration 220's
+/// `jobs.redelivery_count`, backlog 1320b4e3). Three re-deliveries: four runs
+/// that each died mid-job is a crash loop, not bad luck.
+pub const MAX_CRASH_REDELIVERIES: i32 = 3;
+
 /// One row [`PostgresJobQueue::reap_stale_jobs_counting_attempts`] touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReapedJob {
@@ -51,9 +65,15 @@ pub struct ReapedJob {
     pub id: Uuid,
     /// Its type.
     pub job_type: String,
-    /// `true`: the reap used its last attempt and the row is now `failed`.
-    /// `false`: it is back to `pending`.
+    /// `true`: the row is now `failed`, because the reap used its last
+    /// attempt or (a one-attempt row) its last crash re-delivery. `false`: it
+    /// is back to `pending`.
     pub failed: bool,
+    /// `true`: a one-attempt row (`max_retries <= 1`), whose reap is bounded
+    /// by `redelivery_count` instead of `retry_count`; a failed one carries
+    /// [`REAPED_REDELIVERIES_SPENT_MESSAGE`], any other failed row
+    /// [`REAPED_SPENT_MESSAGE`].
+    pub one_attempt: bool,
 }
 
 // ============================================================================
@@ -712,10 +732,17 @@ impl PostgresJobQueue {
     /// [`Self::recover_stale_jobs`]' behaviour.
     ///
     /// Deciding by the row means a new one-attempt enqueuer is covered without
-    /// editing a list here. The cost: a one-attempt job that is killed on EVERY
-    /// run is re-delivered on every run, as it was before this reaper existed.
-    /// What bounds it in practice is the drain unit's start timeout, whose
-    /// failure mails the operator (`OnFailure=`).
+    /// editing a list here.
+    ///
+    /// # A one-attempt row's re-deliveries are bounded by their own counter
+    ///
+    /// An uncounted reset bumps `jobs.redelivery_count` (migration 220) instead
+    /// of `retry_count`, and the reap that would take it past
+    /// [`MAX_CRASH_REDELIVERIES`] fails the row with
+    /// [`REAPED_REDELIVERIES_SPENT_MESSAGE`]. Before that bound a one-attempt
+    /// job killed on EVERY run was re-delivered on every run, for ever
+    /// (backlog 1320b4e3). A privatization job failed this way leaves its plan
+    /// in `applying` / `reverting`; the operator's recovery is the plan's abort.
     ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error or an invalid duration.
@@ -730,31 +757,38 @@ impl PostgresJobQueue {
                     message: format!("Invalid duration: {e}"),
                 }
             })?;
-        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
             r"
             WITH stale AS (
                 SELECT id,
                        max_retries > 1 AS counted,
-                       max_retries > 1 AND retry_count + 1 >= max_retries AS spent
+                       CASE WHEN max_retries > 1 THEN retry_count + 1 >= max_retries
+                            ELSE redelivery_count + 1 > $3 END AS spent
                   FROM jobs
                  WHERE state = 'running' AND started_at < $1
                  FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs j
-               SET retry_count   = CASE WHEN s.counted THEN j.retry_count + 1
-                                        ELSE j.retry_count END,
-                   state         = CASE WHEN s.spent THEN 'failed' ELSE 'pending' END,
-                   started_at    = CASE WHEN s.spent THEN j.started_at ELSE NULL END,
-                   completed_at  = CASE WHEN s.spent THEN NOW() ELSE j.completed_at END,
-                   error_message = CASE WHEN s.spent THEN $2 ELSE j.error_message END,
-                   updated_at    = NOW()
+               SET retry_count      = CASE WHEN s.counted THEN j.retry_count + 1
+                                           ELSE j.retry_count END,
+                   redelivery_count = CASE WHEN s.counted OR s.spent THEN j.redelivery_count
+                                           ELSE j.redelivery_count + 1 END,
+                   state            = CASE WHEN s.spent THEN 'failed' ELSE 'pending' END,
+                   started_at       = CASE WHEN s.spent THEN j.started_at ELSE NULL END,
+                   completed_at     = CASE WHEN s.spent THEN NOW() ELSE j.completed_at END,
+                   error_message    = CASE WHEN NOT s.spent THEN j.error_message
+                                           WHEN s.counted THEN $2
+                                           ELSE $4 END,
+                   updated_at       = NOW()
               FROM stale s
              WHERE j.id = s.id
-            RETURNING j.id, j.job_type, j.state
+            RETURNING j.id, j.job_type, j.state, NOT s.counted
             ",
         )
         .bind(cutoff)
         .bind(REAPED_SPENT_MESSAGE)
+        .bind(MAX_CRASH_REDELIVERIES)
+        .bind(REAPED_REDELIVERIES_SPENT_MESSAGE)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobError::ProcessingFailed {
@@ -762,10 +796,11 @@ impl PostgresJobQueue {
         })?;
         let reaped: Vec<ReapedJob> = rows
             .into_iter()
-            .map(|(id, job_type, state)| ReapedJob {
+            .map(|(id, job_type, state, one_attempt)| ReapedJob {
                 id,
                 job_type,
                 failed: state == "failed",
+                one_attempt,
             })
             .collect();
         if !reaped.is_empty() {

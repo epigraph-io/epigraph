@@ -49,8 +49,11 @@ use crate::embedding_restore::{ClaimEmbeddingJobService, EmbeddingProviderKind};
 /// counted reset bounds that loop by the job's `max_retries`, then fails the
 /// row (a failure of the run: exit 1). A one-attempt row (`max_retries <= 1`:
 /// the privatization apply, revert and reseal jobs) is reset uncounted and
-/// re-delivered to its handler instead. (The unseal's `embedding_generation`
-/// jobs carry a retry budget since backlog 1320b4e3, so their reaps count.)
+/// re-delivered to its handler instead, at most
+/// [`epigraph_jobs::MAX_CRASH_REDELIVERIES`] times (migration 220's
+/// `redelivery_count`); the reap after that fails it, also exit 1. (The
+/// unseal's `embedding_generation` jobs carry a retry budget since backlog
+/// 1320b4e3, so their reaps count.)
 pub const STALE_AFTER: Duration = Duration::from_secs(90 * 60);
 
 /// The per-connection statement timeout of the drain's pool, unless
@@ -237,7 +240,12 @@ pub async fn drain(
             .map(|r| DrainFailure {
                 job_id: r.id,
                 job_type: r.job_type.clone(),
-                error: epigraph_jobs::REAPED_SPENT_MESSAGE.to_string(),
+                error: if r.one_attempt {
+                    epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE
+                } else {
+                    epigraph_jobs::REAPED_SPENT_MESSAGE
+                }
+                .to_string(),
                 terminal: true,
             })
             .collect(),
