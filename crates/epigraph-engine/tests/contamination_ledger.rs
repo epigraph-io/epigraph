@@ -89,7 +89,7 @@ async fn ledger_flags_every_already_decided_candidate_and_nothing_else(pool: PgP
     flagged.sort();
     let mut expected = vec![
         (verdict_only, "verifier_verdict".to_string()),
-        (human, "human_decision".to_string()),
+        (human, "decided".to_string()),
         (legacy, "status:rejected".to_string()),
     ];
     expected.sort();

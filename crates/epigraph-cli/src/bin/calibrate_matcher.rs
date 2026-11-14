@@ -196,12 +196,14 @@ struct Args {
 
     /// Write the contamination ledger to this path and exit, instead of
     /// running the SciFact sweep. The ledger lists every `match_candidates`
-    /// row that already carries a verifier verdict or a human decision; the
-    /// adjudication protocol (`tests/cross_source/prompts_v1.md` §5) excludes
-    /// those pairs from the headline precision figure. Connects through
-    /// `MAINTENANCE_DATABASE_URL` (corpus-wide by construction: a ledger that
-    /// sees one tenant's rows would under-report contamination). Without this
-    /// flag the binary never touches a database.
+    /// row that already carries a verifier verdict, a `decided_at` (operator
+    /// decision or retirement) or a terminal status; the adjudication protocol
+    /// (`tests/cross_source/prompts_v1.md` §5) excludes those pairs from the
+    /// headline precision figure. Connects through `MAINTENANCE_DATABASE_URL`
+    /// (corpus-wide by construction: a ledger that sees one tenant's rows
+    /// would under-report contamination), so the file holds every tenant's
+    /// claim ids: keep it out of the public repo. Without this flag the binary
+    /// never touches a database.
     #[arg(long)]
     contamination_ledger: Option<PathBuf>,
 }

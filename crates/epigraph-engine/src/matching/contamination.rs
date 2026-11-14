@@ -10,7 +10,7 @@
 //! candidate pairs against it.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -19,7 +19,9 @@ use uuid::Uuid;
 pub type ClaimPair = (Uuid, Uuid);
 
 /// One `match_candidates` row that already carries a decision.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Serialisable both ways: `calibrate_matcher --contamination-ledger` writes
+/// these under `entries`, and the post-sweep split reads them back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LedgerEntry {
     /// Canonical order (`claim_a < claim_b`), as the table stores it.
     pub claim_a: Uuid,
@@ -27,10 +29,12 @@ pub struct LedgerEntry {
     pub status: String,
     pub verifier_verdict: Option<String>,
     pub decided_at: Option<DateTime<Utc>>,
-    /// Why the row counts as contaminated: `human_decision` when a human
-    /// decided it (`decided_at` set), else `verifier_verdict` when a verifier
-    /// verdict is stored, else `status:<status>` for a promoted or rejected row
-    /// with neither (legacy rows).
+    /// Why the row counts as contaminated: `decided` when `decided_at` is set
+    /// (an operator decision OR a retirement: both the decide writers and
+    /// `retire_match_candidates` stamp it, so this does not mean "a human
+    /// judged the pair"), else `verifier_verdict` when a verifier verdict is
+    /// stored, else `status:<status>` for a promoted or rejected row with
+    /// neither (legacy rows).
     pub reason: String,
 }
 
@@ -56,7 +60,7 @@ pub async fn contamination_ledger(pool: &PgPool) -> Result<Vec<LedgerEntry>, sql
             let verifier_verdict: Option<String> = row.try_get("verifier_verdict")?;
             let decided_at: Option<DateTime<Utc>> = row.try_get("decided_at")?;
             let reason = if decided_at.is_some() {
-                "human_decision".to_string()
+                "decided".to_string()
             } else if verifier_verdict.is_some() {
                 "verifier_verdict".to_string()
             } else {
