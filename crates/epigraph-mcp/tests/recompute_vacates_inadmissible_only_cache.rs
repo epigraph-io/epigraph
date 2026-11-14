@@ -419,10 +419,10 @@ async fn recompute_beliefs_vacates_a_claim_whose_every_bba_is_inadmissible(pool:
 }
 
 /// A claim with no cache whose every BBA is inadmissible, through the tool:
-/// it keeps no cache. The report still counts it as recomputed and as a
-/// frame write although nothing was written; that over-count is a KNOWN
-/// RESIDUAL pinned here as it stands (`recompute_claim_belief_on_frame`
-/// answers `true` whenever the frame had rows), not intended behaviour.
+/// it keeps no cache, and the report counts no recompute and no frame write
+/// for it (backlog 8d720490 (2): `recompute_claim_belief_on_frame` used to
+/// answer `true` whenever the frame had rows, so the tool reported 1/1 for a
+/// fold that emptied without a write).
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_beliefs_gives_a_claim_without_a_cache_none(pool: PgPool) {
     let w = world(&pool, "r80-tool-null").await;
@@ -443,9 +443,9 @@ async fn recompute_beliefs_gives_a_claim_without_a_cache_none(pool: PgPool) {
     assert_eq!(report["errors"], serde_json::json!([]), "{report}");
     assert_eq!(
         (&report["claims_recomputed"], &report["frame_writes"]),
-        (&serde_json::json!(1), &serde_json::json!(1)),
-        "KNOWN RESIDUAL changed (the tool counts a frame whose fold emptied without a write); \
-         update this pin with the fix: {report}"
+        (&serde_json::json!(0), &serde_json::json!(0)),
+        "recompute_beliefs counted a claim whose fold emptied without a write as recomputed: \
+         {report}"
     );
 }
 

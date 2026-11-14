@@ -578,12 +578,34 @@ pub async fn recompute_claim_belief_binary(
 /// `epigraph-cli/src/bin/recompute_claim_belief.rs`) that need to refresh
 /// the cached BetP after a direct mutation to `mass_functions.source_strength`
 /// landed on a non-binary frame (research_validity, textbook_veracity_*, ...).
-/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
-/// frame-agnostic scalars — last writer wins — so for claims with BBAs
-/// across multiple frames, the caller is responsible for ordering
-/// per-frame recomputes deterministically.
+/// Also called directly, with the frame the caller is handling, by the
+/// per-write paths (MCP `submit_ds_evidence`, the HTTP belief route) and the
+/// retraction cascades.
 ///
-/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`.
+/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are ONE
+/// cache per claim, not one per frame, and `claims.belief_frame_id` records
+/// which frame's combination they hold. This function does NOT apply the
+/// cache-owner rule: it folds the frame it is given and writes that fold to
+/// the cache with `belief_frame_id = frame_id`. Which frame should own the
+/// cache is decided by [`recompute_claim_cached_belief`] (see
+/// `MassFunctionRepository::cache_owner_frame_for_claim`), which then calls
+/// this function with that frame. A caller that passes another frame
+/// re-points the cache to it whenever its session may write the claim row, so
+/// such a caller still decides the outcome by its call order.
+///
+/// The one write the database declines is that of a session that does not
+/// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
+/// reached through `MassFunctionRepository::update_claim_belief`): it may
+/// refresh the cache on the frame already recorded, or seed an empty cache on
+/// `binary_truth`; on any other frame its write is a no-op, not an error.
+///
+/// Returns whether the claim's cache was WRITTEN (backlog 8d720490 (2)):
+/// `Ok(false)` when the claim has no BBAs on `frame_id`, when the derivation
+/// scope rule admits none of them and there is nothing to vacate (ruling
+/// R-80), and when the database declined the write (the migration-114
+/// non-owner case above). It used to answer `Ok(true)` whenever the frame had
+/// BBAs, so `recompute_beliefs` counted a fold that emptied without a write
+/// as a recompute and a frame write.
 ///
 /// # Errors
 /// String error if the frame row can't be loaded, the frame's hypothesis
@@ -616,8 +638,7 @@ pub async fn recompute_claim_belief_on_frame(
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
     )
-    .await?;
-    Ok(true)
+    .await
 }
 
 /// Write-free variant of [`recompute_claim_belief_on_frame`]: loads the frame
@@ -1554,6 +1575,10 @@ const VACATED_CLASSIFICATION: &str = "not_enough_info";
 /// frame when the cache is vacated under ruling R-80). No-ops (does not
 /// write) when the claim has no BBAs on `frame_id`, or none the scope rule
 /// admits and nothing to vacate.
+///
+/// Returns whether the cache was written: `false` for those no-ops and for a
+/// write the database declined (`MassFunctionRepository::update_claim_belief`'s
+/// migration-114 non-owner refusal).
 async fn recompute_combined_belief(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1561,7 +1586,7 @@ async fn recompute_combined_belief(
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some((preview, vacated)) = compute_combined_belief(
         &mut *conn,
         viewer,
@@ -1572,7 +1597,7 @@ async fn recompute_combined_belief(
     )
     .await?
     else {
-        return Ok(());
+        return Ok(false);
     };
 
     let written = MassFunctionRepository::update_claim_belief(
@@ -1609,7 +1634,7 @@ async fn recompute_combined_belief(
             .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
 
-    Ok(())
+    Ok(written)
 }
 
 /// Recompute a claim's cached DS scalars, letting exactly ONE frame own them.

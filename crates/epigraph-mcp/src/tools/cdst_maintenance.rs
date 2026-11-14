@@ -208,8 +208,11 @@ pub async fn recompute_beliefs(
                     error: format!("recomputed but could not commit: {e}"),
                 }),
             },
-            // No input on the owner frame: nothing was written. Dropping `tx`
-            // rolls back the (empty) transaction.
+            // Nothing was written: no input on the owner frame, or the
+            // derivation scope rule admitted none of it and there was nothing
+            // to vacate (backlog 8d720490 (2): such a claim used to be
+            // counted as recomputed and as a frame write). Dropping `tx` rolls
+            // back the (write-free) transaction.
             Ok(false) => {}
             Err(e) => errors.push(RecomputeError {
                 claim_id: claim_id.to_string(),
