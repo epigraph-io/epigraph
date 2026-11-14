@@ -286,3 +286,6 @@ required-features = ["tls"]
 name = "tls_provider_choice"
 path = "tests/tls_provider_choice.rs"
 required-features = ["tls"]
+
+[lints]
+workspace = true

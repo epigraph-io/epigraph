@@ -91,3 +91,6 @@ path = "tests/last_match_scan_column.rs"
 [[test]]
 name = "match_candidate_repo"
 path = "tests/match_candidate_repo.rs"
+
+[lints]
+workspace = true

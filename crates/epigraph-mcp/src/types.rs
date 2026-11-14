@@ -2249,6 +2249,9 @@ pub struct IngestDocumentSpineResponse {
     pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
+    /// The number of spine claims QUEUED for background embedding when the
+    /// response was built, not the number embedded (the same meaning as
+    /// `IngestDocumentResponse::claims_embedded`).
     pub paragraphs_embedded: usize,
     /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
     /// as new in this ingest. Atomize exactly these paragraphs, then call
@@ -2581,6 +2584,12 @@ pub struct IngestDocumentResponse {
     /// `authors[].pending_ingested_by`).
     pub ingested_by: String,
     pub claims_ingested: usize,
+    /// The number of claims QUEUED for background embedding when the response
+    /// was built, NOT the number embedded. The embedding loop is spawned and
+    /// the response returns before any embed call has run, so this is non-zero
+    /// even when every embed then fails (for example with no embedding
+    /// provider configured); a failure is only logged. The name is kept
+    /// because it is the wire field.
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
     pub relationships_created: usize,
