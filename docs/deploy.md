@@ -244,7 +244,7 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host>
 EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
 # OPENAI_API_KEY=<key>            # semantic search and embedding on write
 # EPIGRAPH_METRICS_ADDR=127.0.0.1:9090
-# EPIGRAPH_TRUSTED_PROXIES=127.0.0.1/8,::1   # the reverse proxy in front of the API
+# EPIGRAPH_TRUSTED_PROXIES=127.0.0.0/8,::1/128  # the reverse proxy in front of the API
 # EPIGRAPH_RATE_LIMIT_RPM=600
 ```
 
@@ -416,7 +416,7 @@ For the others, anything else is off.
 | `EPIGRAPH_RATE_LIMIT` | `on` | `off` installs no rate limiter (logged as a warning at boot). Any other value stays on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | `600` | Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
 | `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets. A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
-| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.1/8,::1` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. An entry that does not parse → exit 1. |
+| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
 | `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot and panics on failure. The supported path is `epigraph-migrate`. |
