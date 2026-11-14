@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -568,7 +568,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -878,6 +878,12 @@ pub struct StoreWorkflowParams {
     )]
     #[serde(default)]
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Mint a new generation-0 lineage even when an existing hierarchical workflow has a near-identical goal (default false). Without it, a goal whose embedding is at least 0.90 cosine-similar to a live workflow's goal under a DIFFERENT canonical_name stores nothing and returns the head of that workflow's lineage with matched_existing=true, its similarity and a hint to evolve it with improve_workflow_hierarchy instead. Only a workflow in exactly the tenancy this store would use is matched: the declared tenancy, else the private default a new lineage gets; a public or other-group plan you can merely read is never matched. An identical goal (same canonical_name) is a no-op as before (already_ingested)."
+    )]
+    #[serde(default)]
+    pub force_new: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -901,6 +907,18 @@ pub struct GetWorkflowExecutionsParams {
 
     #[schemars(description = "Max executions to return, newest first (default 20, max 100)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Also return `deviation_summary`: this hierarchical workflow's per-step deviation_reason telemetry rolled up by step lineage over the last `window_days` days, one entry per (step_lineage_id, trimmed reason) with occurrences, first_seen, last_seen and latest_step_claim_id, most frequent first (at most 20). A reason that recurs on one lineage is an evolve_step candidate; nothing is written. Only deviated hierarchical step rows count; a flat workflow claim has none. Default false."
+    )]
+    #[serde(default)]
+    pub include_deviation_summary: Option<bool>,
+
+    #[schemars(
+        description = "Window for deviation_summary, in days back from now (default 30, clamped to 1-365)."
+    )]
+    #[serde(default)]
+    pub window_days: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -952,9 +970,15 @@ pub struct ReportWorkflowOutcomeParams {
     pub execution_log: Vec<StepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim; not stored for a workflows-table id."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim, and on the report's row for a workflows-table id (at most 65536 bytes)."
     )]
     pub outcome_details: String,
+
+    #[schemars(
+        description = "Optional idempotency key, for a workflows-table id only (1-200 characters, e.g. a UUID you generate once per run): a retry with the same key, from you, on the same workflow, writes nothing and returns the first report's result with idempotent_replay=true. Refused for a legacy flat workflow claim."
+    )]
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 
     #[schemars(
         description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)"
@@ -1086,9 +1110,15 @@ pub struct ReportHierarchicalOutcomeParams {
     pub step_executions: Vec<HierarchicalStepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Currently accepted but not stored."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Stored on the report's row (at most 65536 bytes), readable by whoever reads the workflow."
     )]
     pub outcome_details: String,
+
+    #[schemars(
+        description = "Optional idempotency key for this report (1-200 characters, e.g. a UUID you generate once per run). A retry with the same key, from you, on the same workflow, writes nothing and returns the FIRST report's result with idempotent_replay=true, so a timed-out report can be retried without counting the run twice. Without a key every call is a new report."
+    )]
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 
     #[schemars(
         description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)."
@@ -2746,6 +2776,19 @@ pub struct StoreWorkflowResponse {
     /// `true` if a workflow with this `(canonical_name, generation)` was
     /// already present and the call short-circuited.
     pub already_ingested: bool,
+    /// `true` when nothing was stored because an existing hierarchical
+    /// workflow under ANOTHER canonical_name, in the same tenancy this store
+    /// would use, has a near-identical goal (backlog 5e54282f);
+    /// `workflow_id`, `canonical_name`, `goal` and `generation` then describe
+    /// the head of that workflow's lineage. Pass `force_new: true` to mint
+    /// anyway.
+    pub matched_existing: bool,
+    /// The matched workflow's goal similarity (cosine), with `matched_existing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
+    /// What to do instead, with `matched_existing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

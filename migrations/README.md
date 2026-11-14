@@ -2897,6 +2897,27 @@ restart.
   the column; on an older schema every run fails with 42703); an older
   `drain_jobs` ignores it; undo only after rolling every 220 `drain_jobs`
   back. **Applied to throwaway databases only, NOT to any deployed
+- **221**: public `workflow_outcome_reports` (backlog 9928b61f). One row per
+  hierarchical outcome report (`report_hierarchical_outcome`, the hierarchical
+  branch of `report_workflow_outcome`, `POST
+  /api/v1/workflows/hierarchical/:id/outcome`), written on the report's
+  caller-stamped transaction with its counters and step rows: what it said
+  (`success`, `quality`, `run_label`, `outcome_details`, which used to be
+  dropped), an optional `idempotency_key` (unique per workflow, reporter and
+  key, `NULLS NOT DISTINCT`, partial on keyed rows) and the transport-neutral
+  `result` a retry with that key is answered with. FK to `workflows` (`ON
+  DELETE CASCADE`). Row security ENABLEd and FORCEd, inherited from the
+  workflow row: the read and insert policies are `EXISTS` over `workflows`,
+  which `workflows_read` filters; the application role holds SELECT and
+  INSERT only; 126's three elevated refusals as on `workflows` (census class
+  T-PLAN). Pinned by `epigraph-db/tests/workflow_outcome_reports_tenancy.rs`
+  (on the application role), `epigraph-db/tests/elevation_arms_census.rs`,
+  and the idempotency tests in `epigraph-mcp`'s `tools::workflow_hierarchical`
+  and `epigraph-api`'s `routes::workflows`. Undo:
+  `docs/runbooks/221-undo.sql` (drops the table and every stored report).
+  **Deploy order:** migrate before rolling out a 221 binary (it writes the
+  table on every hierarchical report); undo only after rolling every 221
+  binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
 
 ## `-- no-transaction` migrations
