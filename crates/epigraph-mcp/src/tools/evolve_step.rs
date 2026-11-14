@@ -54,6 +54,9 @@ pub struct EvolveStepResponse {
     pub claim_id: Uuid,
     pub step_lineage_id: Uuid,
     pub edge_id: Uuid,
+    /// Whether the new step got its embedding (best-effort; the maintenance
+    /// backfill reaches it otherwise).
+    pub embedded: bool,
     /// `supersedes` only: the Supersede admin cascade that carried the retired
     /// step's edges onto this one (applied, or deferred for the replay), as
     /// `supersede_claim` reports it. Absent for `revises`, which supersedes
@@ -263,10 +266,27 @@ pub async fn evolve_step(
         (r, None, None)
     };
 
+    // The new step is a CURRENT claim (on `supersedes` and `revises` alike), so
+    // it is embedded post-commit, best-effort (CLAUDE.md's write-path rule;
+    // backlog 7628ab2c): without a vector it is invisible to recall. Stored
+    // through `agent_id`, who authored the row and whose stamp wrote it. Any
+    // maintenance session was released with its branch above, so no pooled
+    // connection is held across the provider call.
+    let embedded = crate::claim_helper::embed_claim_author_stamped(
+        server,
+        agent_id,
+        result.new_claim_id,
+        &params.content,
+        None,
+        "evolve_step",
+    )
+    .await;
+
     success_json(&EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_id: result.edge_id,
+        embedded,
         cascade,
         belief_cascade,
     })

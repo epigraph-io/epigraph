@@ -387,6 +387,34 @@ pub async fn record_deferral<'e, E: sqlx::PgExecutor<'e>>(
     })
 }
 
+/// The administrative session a claim act's cascade runs on, or its recorded
+/// deferral: the core both transports' `admin_session_or_deferral` share.
+///
+/// `session` is what the transport's `admin_cascade_session` returned, asked
+/// for BEFORE the caller's act commits. With one, it is handed back with a
+/// default (not yet applied) status. With none (not configured, or not
+/// usable: the `Err` is the reason), the deferral is recorded with
+/// [`record_deferral`] inside the act's own transaction `tx`, stamped with the
+/// caller's viewer, so the act and its audit row commit together.
+///
+/// # Errors
+/// The deferral INSERT's error, unmapped: each transport answers it as its
+/// own error type (CX03 as the caller's denial on supersede, anything else as
+/// a fault), and nothing commits.
+pub async fn session_or_record_deferral<'s>(
+    session: Result<epigraph_db::MaintenanceSession<'s>, String>,
+    tx: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), DbError> {
+    match session {
+        Ok(session) => Ok((Some(session), CascadeStatus::default())),
+        Err(reason) => {
+            let status = record_deferral(&mut *tx, trigger, &reason).await?;
+            Ok((None, status))
+        }
+    }
+}
+
 /// Replace every array in `v` by its length, recursively: the caller's copy of
 /// what a cascade touched.
 fn counts_only(v: &serde_json::Value) -> serde_json::Value {
