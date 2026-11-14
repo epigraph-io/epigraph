@@ -136,11 +136,19 @@ pub enum ChildKind {
 /// and every other pair is `none` ([`FlowBasis::allows`]). So a producer
 /// cannot leave out a claim-to-claim flow by marking the edge `none`.
 ///
-/// An evidence-to-claim edge is `none` when the map's audience can read no
-/// mass row keyed by that evidence on that claim: most stored evidence edges
-/// have none, so this is the common case, not an error. The contract cannot
-/// tell such an edge from one whose builder dropped a readable mass; the
-/// builder (backlog W7) carries that invariant and its known-mass test.
+/// An evidence-to-claim edge is `none` when it carries no mass the map's
+/// audience can read: either that audience can read no mass row keyed by
+/// that evidence on that claim (most stored evidence edges have none, so
+/// this is the common case, not an error), or its relationship carries no
+/// belief direction (anything but `supports` or `refutes`, compared
+/// lower-cased). The contract cannot tell such an edge from one whose
+/// builder dropped a readable mass; the builder (backlog W7) carries that
+/// invariant and its known-mass test.
+///
+/// A `none` edge has sign 0 whatever its relationship, so a `refutes` edge
+/// with no readable mass is served with sign 0, like a `supports` one. A
+/// reader that wants the direction of such evidence takes it from
+/// [`Edge::relationship`], not from [`Edge::sign`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
@@ -163,10 +171,13 @@ pub enum FlowBasis {
     /// sign 0 and so weight 0; validation rejects a proxy edge with sign 0
     /// and any other weight.
     Proxy,
-    /// No belief flow, so weight 0 and sign 0: every pair of kinds other
-    /// than claim to claim and evidence to claim (an agent's authorship, for
-    /// example), and an evidence-to-claim edge with no readable mass. Such
-    /// an evidence node still counts as attached to the claim.
+    /// No belief flow, so weight 0 and sign 0 whatever the relationship:
+    /// every pair of kinds other than claim to claim and evidence to claim
+    /// (an agent's authorship, for example), and an evidence-to-claim edge
+    /// with no readable mass or with a relationship that carries no belief
+    /// direction. Such an evidence node still counts as attached to the
+    /// claim. A `refutes` evidence edge served `none` keeps its direction
+    /// only in its relationship name.
     None,
 }
 
@@ -354,7 +365,11 @@ pub struct Edge {
     /// admits upper case (some fixtures keep it on purpose), so a reader
     /// compares names case-insensitively.
     pub relationship: String,
-    /// 1 supporting, -1 opposing, 0 no belief direction.
+    /// The direction of the belief that flows along the edge: 1 supporting,
+    /// -1 opposing, 0 none. An edge whose `flow_basis` is `none` carries no
+    /// flow and so has sign 0 whatever its relationship: evidence that
+    /// `refutes` a claim but has no readable mass is served with sign 0, and
+    /// a reader takes its direction from `relationship`.
     pub sign: i8,
     /// In [0, 1].
     pub flow_weight: f64,
