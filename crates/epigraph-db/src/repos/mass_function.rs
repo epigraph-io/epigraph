@@ -1819,15 +1819,15 @@ impl MassFunctionRepository {
     /// keeps the rules below.
     ///
     /// **A frame with a cache-admissible input outranks one without**
-    /// (backlog 8d720490 (1), ruling R-71). Admissibility is the fold's own
+    /// (backlog 8d720490 (1)). Admissibility is the fold's own
     /// rule ([`super::derivation_scope::cache_admissible_predicate`]: every
     /// source of the row at least as widely readable as the claim), so the
     /// owner is never a frame whose every input the fold would drop while
     /// another frame has one it keeps. Before this, `binary_truth` holding only
     /// narrowed inputs still owned the cache, so the claim kept a fold of the
     /// narrowed evidence and was neither refolded from its admissible input
-    /// nor vacated (R-80 is claim-wide). When NO input is admissible the order
-    /// below decides as before, and the owner frame's fold is then the R-80
+    /// nor vacated (the vacate is claim-wide). When NO input is admissible the
+    /// order below decides as before, and the owner frame's fold is then the
     /// vacate.
     ///
     /// Then, among the frames holding the claim's remaining inputs (the
@@ -1844,6 +1844,11 @@ impl MassFunctionRepository {
     /// frame each (migration 114 treats the frame named `binary_truth` the same
     /// way). No other frame name plays a part.
     ///
+    /// The rest of this paragraph holds among frames of the SAME admissibility:
+    /// the admissible-first key above is applied before rules 1-4, so a frame
+    /// that gains the claim's only admissible input takes the cache from a
+    /// recorded or canonical owner whose inputs are all inadmissible.
+    ///
     /// Once a claim's cache has an owner, a later input on another non-canonical
     /// frame does not move it (rule 3): `belief_frame_id` is written only by the
     /// claim's owner or by migration 114's definer, which keeps the recorded
@@ -1852,7 +1857,7 @@ impl MassFunctionRepository {
     /// replaces its own BBA ([`Self::store_with_perspective`]'s upsert), so it
     /// decides only a claim with no recorded owner, or one whose recorded owner
     /// no longer holds an input. A canonical frame still outranks the recorded
-    /// owner as soon as the claim has an input on it.
+    /// owner as soon as the claim has an input on it of the same admissibility.
     ///
     /// Read-only: no frame is created.
     #[instrument(skip(executor, viewer))]

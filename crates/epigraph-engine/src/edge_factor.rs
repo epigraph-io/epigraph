@@ -601,8 +601,8 @@ pub async fn recompute_claim_belief_binary(
 ///
 /// Returns whether the claim's cache was WRITTEN (backlog 8d720490 (2)):
 /// `Ok(false)` when the claim has no BBAs on `frame_id`, when the derivation
-/// scope rule admits none of them and there is nothing to vacate (ruling
-/// R-80), and when the database declined the write (the migration-114
+/// scope rule admits none of them and there is nothing to vacate (the
+/// all-inadmissible vacate), and when the database declined the write (the migration-114
 /// non-owner case above). It used to answer `Ok(true)` whenever the frame had
 /// BBAs, so `recompute_beliefs` counted a fold that emptied without a write
 /// as a recompute and a frame write.
