@@ -1485,6 +1485,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Read one claim's structural context BY ID: the same body as GET /api/v1/claims/:id/context. Full mode (no list) returns {claim, paper, papers, section, parents, parts, siblings, edges}: the claim; the paper of its primary document chain and every asserting paper; its level-1 section; its decomposes_to parents and parts; its siblings under the primary parent; and its epistemic edges in both directions (supports, refutes, contradicts, specializes, elaborates, cites, qualifies, corroborates) with per-relationship tallies. Each node carries id, content (clipped to 1500 characters, content_truncated says so), truth_value, is_current, level and theme_id; each list carries items, total and next_cursor. Page mode (list = papers | parents | parts | siblings | edges, with after = a previous next_cursor and limit 1..=200) returns the claim plus that one list. Everything is filtered to what you may read: a hidden node or edge is in no list, total or tally, and a claim you cannot read is reported as not found, the same as an id that names nothing. Use recall_with_context to find claims by text; use this when you have the id."
+    )]
+    async fn claim_context(
+        &self,
+        Parameters(params): Parameters<crate::types::ClaimContextParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claim_context::claim_context(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Resolve an abbreviated claim id (the 8-hex form prose and backlog items cite, e.g. 30d8b667; 8 to 32 hex digits, hyphens and case ignored) to the claims whose ids start with it. Returns {prefix, matches: [{id, content (first 300 characters), content_truncated, is_current}], ambiguous (more than one match), truncated (more than limit exist)}; matches are in id order, every one of them when the prefix is ambiguous. Only claims you may read are matches: a prefix naming only claims you cannot read returns no match, exactly like one naming nothing. Fewer than 8 hex digits, or any non-hex character, is refused as invalid params."
     )]
     async fn resolve_claim_id_prefix(

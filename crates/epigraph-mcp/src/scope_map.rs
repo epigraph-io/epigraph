@@ -32,6 +32,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // ─── claims:read ───────────────────────────────────────────────────
     ("check_already_ingested", "claims:read"),
     ("check_sheaf_consistency", "claims:read"),
+    // The by-id twin of GET /api/v1/claims/:id/context (backlog 0720d208):
+    // viewer-stamped SELECTs only.
+    ("claim_context", "claims:read"),
     ("compare_methods", "claims:read"),
     ("embedding_neighborhood_density", "claims:read"),
     ("entity_neighborhood", "claims:read"),
@@ -315,6 +318,22 @@ mod tests {
     /// (backlog 6fb9e913), so a read-scoped principal could not verify a
     /// claim's signature. Asserted by name because the coverage test passes
     /// for any mapping.
+    /// The backlog batch B41 read tools write nothing, so a read-scoped
+    /// principal reaches them. Asserted by name: their tests call the tool
+    /// functions directly, past the router's scope check, and the coverage
+    /// test passes for any mapping.
+    #[test]
+    fn b41_read_tools_are_read_scoped() {
+        for tool in [
+            "claim_context",
+            "export_provenance_prov_o",
+            "lint_claim_id_citations",
+            "resolve_claim_id_prefix",
+        ] {
+            assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
+        }
+    }
+
     #[test]
     fn pure_read_tools_are_read_scoped() {
         for tool in ["verify_claim", "reconcile_sheaf", "stage_claims"] {
