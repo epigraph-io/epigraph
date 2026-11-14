@@ -7,8 +7,11 @@
 //! group, so it reads `visibility = 'public'` rows and nothing else. On the
 //! production pool both migration 077's row policies and the in-query `$V`
 //! predicate apply, exactly as for a signed-in principal that has joined
-//! nothing. A bearer the request happens to carry changes nothing here: a
-//! signed-in caller reads its own graph through the authenticated routes.
+//! nothing. A valid bearer the request happens to carry does not widen what
+//! these routes read (a signed-in caller reads its own graph through the
+//! authenticated routes); it only moves the rate-limit charge from the client
+//! address to the principal. A present but invalid bearer is refused 401 by the
+//! `public` router's optional bearer layer, as on every route of that router.
 //!
 //! # The routes
 //!
@@ -38,8 +41,12 @@
 //!   a region label is built from its themes' labels. The overview and the
 //!   layout therefore withhold both, and the layout refuses the unplaced list,
 //!   which is ordered by label and whose cursor carries the label bytes.
-//! * **A sealed claim.** A claim with a `claim_encryption` row is answered as
-//!   absent: its `content` is not its plaintext, and sealing is a group act.
+//! * **A sealed claim.** Never public, so never served: the database forbids
+//!   `(public, sealed)` in both directions (migration 081 refuses a seal on a
+//!   public claim, and `epigraph_claims_block_widening`, migration 074,
+//!   refuses publishing a sealed one).
+//!   The card therefore reads no seal record, which the guest's session could
+//!   not see anyway (`claim_encryption` rows are read by group membership).
 //!
 //! # The envelope
 //!
@@ -58,7 +65,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use epigraph_core::ClaimId;
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{AuthoredBy, AuthoredByRepository, ClaimEncryptionRepository, ClaimRepository};
+use epigraph_db::{AuthoredBy, AuthoredByRepository, ClaimRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -146,12 +153,6 @@ async fn read_claim_card(
     else {
         return Err(claim_not_found(id));
     };
-    let sealed = ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, id)
-        .await?
-        .is_some();
-    if sealed {
-        return Err(claim_not_found(id));
-    }
     let authored = AuthoredByRepository::for_claim(
         &mut read,
         viewer,

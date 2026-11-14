@@ -22,8 +22,9 @@
 //! body" assertion, so every test here carries a POSITIVE control (a public row
 //! answers 200 with its content) and checks the 404 is the API's own
 //! `NotFound` JSON, not the empty fallback. The security property (a private
-//! row stays out) was proven separately by widening the guest viewer to a
-//! member's group set and watching the private-row assertions fail.
+//! row stays out) was proven separately by mutation: the scoped read fragment
+//! replaced with an always-true one, on a superuser pool that skips row
+//! security, fails the card, ego, overview and layout private-row assertions.
 
 mod common;
 

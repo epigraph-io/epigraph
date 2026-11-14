@@ -725,14 +725,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "themes_layout_as",
         &["AtlasLayoutRepository::run"],
     ),
-    // untenanted: the seal record of a claim already read through the guest's
-    // public-only viewer, as in `claims.rs::get_claim`; a sealed claim answers
-    // the absent 404.
-    (
-        "guest.rs",
-        "read_claim_card",
-        &["ClaimEncryptionRepository::get_by_claim_id_conn"],
-    ),
     // untenanted: the run, and both drill-down ids resolved to theme ids in
     // one statement (`claim_themes`, `atlas_layout_themes`); each side is then
     // refused unless `any_visible_member` (viewed) finds a readable member.
