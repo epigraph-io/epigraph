@@ -34,7 +34,11 @@
 //! * **Who filed it.** The card carries no `agent_id`, no `trace_id`, no
 //!   tenancy or encryption field and no `authored_by` block, which names
 //!   humans and prompt snapshots. Its `sources` are the documents the claim
-//!   came from (key and title), as read under the guest viewer.
+//!   came from (key and title), as read under the guest viewer. The ego hides
+//!   every edge to an `agent` ([`GUEST_EGO_HIDDEN_TYPES`]): the edges a claim
+//!   write leaves (`AUTHORED`, `asserts`, `generated`, …) would otherwise name
+//!   the filer's id and display name, so they are left out of the count, the
+//!   edges and the nodes alike.
 //! * **A stored theme or region label.** The theme labeller samples members
 //!   with no visibility predicate, so a stored label may be derived from text
 //!   the guest cannot read (residual `D-PR16-theme-cluster-viewer-scope`), and
@@ -70,9 +74,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::ApiError;
-use crate::middleware::bearer::ViewerExtractor;
 use crate::routes::{finish_scoped_read, open_scoped_read};
 use crate::state::AppState;
+
+/// The far-endpoint types the guest ego never shows. An `agent` is the filer,
+/// asserter or ingester of a claim; its display name is what the card leaves
+/// out.
+pub(crate) const GUEST_EGO_HIDDEN_TYPES: &[&str] = &["agent"];
 
 /// Mark a guest answer, success or error, as never stored by any cache.
 fn no_store(mut res: Response) -> Response {
@@ -182,15 +190,22 @@ pub async fn claim_card(State(state): State<AppState>, Path(id): Path<Uuid>) -> 
 // ── Ego ──
 
 /// `GET /api/v1/guest/claims/:id/ego`: [`crate::routes::ego::claim_ego`] read
-/// as the guest.
+/// as the guest, with every edge to a [`GUEST_EGO_HIDDEN_TYPES`] endpoint left
+/// out.
 pub async fn claim_ego(
-    state: State<AppState>,
-    id: Path<Uuid>,
-    params: Query<crate::routes::ego::EgoQuery>,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<crate::routes::ego::EgoQuery>,
 ) -> Response {
     guest_answer(
-        crate::routes::ego::claim_ego(ViewerExtractor(Viewer::public_only()), state, id, params)
-            .await,
+        crate::routes::ego::claim_ego_as(
+            &Viewer::public_only(),
+            &state,
+            id,
+            params,
+            GUEST_EGO_HIDDEN_TYPES,
+        )
+        .await,
     )
 }
 

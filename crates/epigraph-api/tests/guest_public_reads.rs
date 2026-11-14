@@ -351,6 +351,78 @@ async fn a_guest_ego_holds_public_neighbours_only(pool: PgPool) {
     .await;
 }
 
+/// A guest's ego does not name who filed or asserted the claim: an edge from
+/// an agent is left out of the nodes, the edges and the count, though the
+/// card already leaves the filer out. A signed-in reader still sees the agent
+/// node (the hiding is the guest's only).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_guest_ego_does_not_name_the_filer(pool: PgPool) {
+    let (owner, _) = fixture::seed_agent_with_group(&pool, "ego-filer").await;
+    sqlx::query("UPDATE agents SET display_name = 'Filer Display Name' WHERE id = $1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("name the filer");
+    let centre = fixture::seed_public_claim(&pool, owner, "filed centre").await;
+    let near = fixture::seed_public_claim(&pool, owner, "public neighbour").await;
+    edge(&pool, centre, near, "supports").await;
+    // The edge a claim write leaves (`routes/claims.rs`, `AUTHORED`).
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED')",
+    )
+    .bind(owner)
+    .bind(centre)
+    .execute(&pool)
+    .await
+    .expect("seed the authorship edge");
+    let router = router(&pool).await;
+    let path = format!("/api/v1/guest/claims/{centre}/ego");
+
+    let (status, body, text) = guest_json(&router, &path).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        text.contains(&near.to_string()),
+        "positive control: the public neighbour is served: {text}"
+    );
+    assert!(
+        !text.contains(&owner.to_string()),
+        "the guest ego must not carry the filer's id: {text}"
+    );
+    assert!(
+        !text.contains("Filer Display Name"),
+        "the guest ego must not carry the filer's name: {text}"
+    );
+    assert_eq!(
+        body["total_edges"], 1,
+        "the agent edge is not counted either: {body}"
+    );
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 1, "{body}");
+    assert_eq!(body["truncated"], false, "{body}");
+
+    // Control: the signed-in route still shows the agent.
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/claims/{centre}/ego"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let signed_in: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(signed_in["total_edges"], 2, "{signed_in}");
+    assert!(
+        signed_in["nodes"]
+            .as_array()
+            .expect("nodes")
+            .iter()
+            .any(|n| n["id"] == owner.to_string() && n["label"] == "Filer Display Name"),
+        "the signed-in ego keeps the agent node: {signed_in}"
+    );
+}
+
 // ── Overview ──
 
 /// A guest's theme overview counts public members only, lists no theme whose

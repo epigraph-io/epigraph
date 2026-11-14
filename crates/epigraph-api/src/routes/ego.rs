@@ -78,6 +78,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use epigraph_db::visibility::Viewer;
 use epigraph_db::{EgoEntity, EgoRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -222,6 +223,20 @@ pub async fn claim_ego(
     Path(claim_id): Path<Uuid>,
     Query(params): Query<EgoQuery>,
 ) -> Result<Json<EgoResponse>, ApiError> {
+    claim_ego_as(&viewer, &state, claim_id, params, &[]).await
+}
+
+/// The ego body as `viewer` reads it, with every edge whose far endpoint has
+/// a type in `hidden_far_types` left out of the count, the edges and the
+/// nodes (`EgoRepository::edges`). The signed-in route hides nothing; the
+/// guest route (`routes/guest.rs`) hides agents.
+pub(crate) async fn claim_ego_as(
+    viewer: &Viewer,
+    state: &AppState,
+    claim_id: Uuid,
+    params: EgoQuery,
+    hidden_far_types: &[&str],
+) -> Result<Json<EgoResponse>, ApiError> {
     let max_degree = params
         .max_degree
         .unwrap_or(DEFAULT_MAX_DEGREE)
@@ -231,7 +246,7 @@ pub async fn claim_ego(
     // One viewer-stamped connection for all four statements, so the centre
     // check, the degree count and the neighbour hydration describe the same
     // corpus.
-    let mut read = state.read_as(&viewer).await.map_err(|e| {
+    let mut read = state.read_as(viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
             error = %e,
@@ -243,7 +258,7 @@ pub async fn claim_ego(
         }
     })?;
 
-    let Some(center_entity) = EgoRepository::center(&mut read, &viewer, claim_id).await? else {
+    let Some(center_entity) = EgoRepository::center(&mut read, viewer, claim_id).await? else {
         return Err(ApiError::NotFound {
             entity: "Claim".to_string(),
             id: claim_id.to_string(),
@@ -252,10 +267,11 @@ pub async fn claim_ego(
 
     let fetched = EgoRepository::edges(
         &mut read,
-        &viewer,
+        viewer,
         claim_id,
         max_degree,
         relationships.as_deref(),
+        hidden_far_types,
     )
     .await?;
 
@@ -289,7 +305,7 @@ pub async fn claim_ego(
     declared_type.remove(&claim_id);
 
     let neighbour_ids: Vec<Uuid> = declared_type.keys().copied().collect();
-    let hydrated = EgoRepository::hydrate(&mut read, &viewer, &neighbour_ids).await?;
+    let hydrated = EgoRepository::hydrate(&mut read, viewer, &neighbour_ids).await?;
 
     crate::routes::finish_scoped_read(read, "claim_ego").await?;
 
