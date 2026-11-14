@@ -2654,6 +2654,21 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **226**: public `paper_licence` (backlog 8709d128). Adds the nullable
+  `papers.licence text` (an SPDX-style identifier; NULL = unknown) with the
+  CHECK `papers_licence_nonblank` (refuses an empty or padded value). The
+  document ingest writers (`do_ingest_document`, `do_ingest_document_spine`)
+  READ it to decide whether an evidence row may keep the verbatim source
+  passage (`passage_retention_permitted`: public domain, CC0, CC BY and
+  CC BY-SA; never `-NC`/`-ND`); otherwise the row carries the citation, a
+  locator and the passage's BLAKE3 hash only. Ingest never writes the column:
+  an operator sets it. `papers` carries no tenancy, so no policy changes.
+  Pinned by `epigraph-mcp/tests/ingest_evidence_passage_retention.rs`. Undo:
+  `docs/runbooks/226-undo.sql` (loses every recorded licence; roll back every
+  226 binary first). **Deploy order:** migrate before rolling out the 226
+  binary (it reads the column on every document ingest). Stripping passages
+  already stored is a separate operator data repair. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
