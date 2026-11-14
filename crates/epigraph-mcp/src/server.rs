@@ -117,9 +117,15 @@ pub struct EpiGraphMcpFull {
     /// which made `AppState::with_policy_gate` — the documented seam for a
     /// deployment that installs its own policy — reach the HTTP surface and
     /// silently not the MCP one. The two surfaces would have diverged the first
-    /// time anyone exercised the override, on the transport where the divergence
-    /// matters most: `call_tool` runs `enforce_tool_scope` only for HTTP calls,
-    /// so on stdio this gate is the only authorization that runs at all.
+    /// time anyone exercised the override.
+    ///
+    /// **No tool consults it at present.** PR-14 deleted that helper together
+    /// with the `assign_ownership` / `update_partition` tools it guarded (see
+    /// the note in `tools/perspectives.rs`), and nothing else reads this field:
+    /// it is only assigned, by the constructors and by
+    /// [`Self::with_policy_gate`]. It is therefore not an authorization that
+    /// runs on stdio or on HTTP; a tool's writes are authorized by row
+    /// security and by the tool's own checks.
     ///
     /// Defaults to `GroupPolicyGate` in every constructor;
     /// [`Self::with_policy_gate`] replaces it.

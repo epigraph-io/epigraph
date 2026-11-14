@@ -432,8 +432,12 @@ pub struct AppState {
     /// principal owns the resource or holds `admin`/`writer` in its owning
     /// group. `with_policy_gate` replaces it.
     ///
-    /// Unlike the pre-PR-11 field, this one is **consulted**: see
-    /// `routes/ownership.rs::assign_ownership` / `::update_partition`.
+    /// **No handler consults it at present.** Its only callers were the
+    /// ownership routes (`assign_ownership` / `update_partition`), which PR-14
+    /// deleted together with their route file. The field is assigned in every
+    /// constructor and by `with_policy_gate`, and read only by this file's
+    /// `extension_wiring_tests`; write authorization on the request path is
+    /// row security plus each handler's own checks.
     pub policy_gate: SharedPolicyGate,
 
     /// External identity provider registry. Built once at startup from `providers.toml`.
