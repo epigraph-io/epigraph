@@ -1271,7 +1271,7 @@ pub async fn unmark_duplicate(
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule). Stored only if the claim is still current and unsealed.
     let mut embedded = false;
-    if let Some(embedder) = state.embedding_service() {
+    if let Some(embedder) = state.storing_embedding_service() {
         match embedder.generate(&content).await {
             Ok(v) => {
                 let pgvec = format!(

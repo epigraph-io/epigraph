@@ -379,6 +379,13 @@ pub struct AppState {
     /// When absent, semantic search falls back to mock/deterministic embeddings.
     /// This is optional to maintain backward compatibility with existing code.
     pub embedding_service: Option<SharedEmbeddingService>,
+    /// Which provider [`Self::embedding_service`] is, when the process that
+    /// built this state declared it ([`Self::with_embedding_provider`];
+    /// `bin/server.rs` does). `None` for a state built without one (tests and
+    /// embedders that wire their own service), which is treated as owning the
+    /// stored vector columns, as before the provider was carried at all.
+    /// See [`Self::storing_embedding_service`].
+    pub embedding_provider: Option<crate::embedding_restore::EmbeddingProviderKind>,
     /// Challenge service for claim dispute management
     ///
     /// Manages the lifecycle of challenges against claims, including
@@ -1181,6 +1188,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1232,6 +1240,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1264,6 +1273,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1603,6 +1613,21 @@ impl AppState {
         Ok(ClaimWriteTx::Unscoped(tx))
     }
 
+    /// The backstop behind [`Self::storing_embedding_service`]: a store helper
+    /// refuses a vector from a provider that does not own the column, whatever
+    /// its caller generated it with.
+    #[cfg(feature = "db")]
+    fn refuse_non_owning_provider(&self) -> Result<(), String> {
+        match self.embedding_provider {
+            Some(provider) if !provider.may_restore_claim_embeddings() => Err(format!(
+                "this process's embedding provider is {}, which does not own the stored \
+                 vector columns; nothing was stored",
+                provider.as_str()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Store a claim's embedding after the claim's own write committed, on the
     /// SAME authority that wrote it: a [`Self::begin_claim_write`] transaction
     /// stamped with the request's `viewer`.
@@ -1648,6 +1673,7 @@ impl AppState {
         embedding_pgvector: &str,
         handler: &'static str,
     ) -> Result<bool, String> {
+        self.refuse_non_owning_provider()?;
         let mut tx = self
             .begin_claim_write(viewer, handler)
             .await
@@ -1686,6 +1712,7 @@ impl AppState {
         embedding_pgvector: &str,
         handler: &'static str,
     ) -> Result<bool, String> {
+        self.refuse_non_owning_provider()?;
         let mut tx = self
             .begin_claim_write(viewer, handler)
             .await
@@ -1729,6 +1756,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1763,6 +1791,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1803,6 +1832,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -2376,10 +2406,60 @@ impl AppState {
         self
     }
 
-    /// Get a reference to the embedding service if configured
+    /// Get a reference to the embedding service if configured.
+    ///
+    /// For QUERY vectors (search, density, affinity lookups). A write path
+    /// that will STORE the vector asks [`Self::storing_embedding_service`].
     #[must_use]
     pub fn embedding_service(&self) -> Option<&SharedEmbeddingService> {
         self.embedding_service.as_ref()
+    }
+
+    /// Declare which provider the configured embedding service is (builder
+    /// pattern), so that write paths can tell whether its vectors belong in
+    /// the stored columns.
+    #[must_use]
+    pub fn with_embedding_provider(
+        mut self,
+        provider: crate::embedding_restore::EmbeddingProviderKind,
+    ) -> Self {
+        self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Whether this process's embedding provider may write the stored vector
+    /// columns (`claims.embedding`, `evidence.embedding`): the rule
+    /// [`EmbeddingProviderKind::may_restore_claim_embeddings`] states for the
+    /// job handler, applied to the request-serving write paths too (backlog
+    /// 211bd623). `true` when no provider was declared.
+    ///
+    /// [`EmbeddingProviderKind::may_restore_claim_embeddings`]: crate::embedding_restore::EmbeddingProviderKind::may_restore_claim_embeddings
+    #[must_use]
+    pub fn may_store_embeddings(&self) -> bool {
+        self.embedding_provider.is_none_or(
+            crate::embedding_restore::EmbeddingProviderKind::may_restore_claim_embeddings,
+        )
+    }
+
+    /// The embedding service for a vector that will be STORED on a claim or
+    /// evidence row, or `None` when there is no service or its provider does
+    /// not own those columns.
+    ///
+    /// `embedding_service_from_env` falls through OpenAI, Jina and a mock, and
+    /// only the job handler was told which one it got. An API process started
+    /// without `OPENAI_API_KEY` therefore wrote deterministic mock vectors, or
+    /// Jina-space vectors, into `claims.embedding` from every inline write
+    /// path: one ANN column holding two vector spaces, with no error anywhere.
+    /// The service stays available for query embedding through
+    /// [`Self::embedding_service`]; this accessor is what a write path uses,
+    /// so a non-owning provider costs no generate call either.
+    #[must_use]
+    pub fn storing_embedding_service(&self) -> Option<&SharedEmbeddingService> {
+        if self.may_store_embeddings() {
+            self.embedding_service.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Set a custom challenge service for this state (builder pattern)

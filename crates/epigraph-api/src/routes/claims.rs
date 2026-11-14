@@ -1304,7 +1304,7 @@ pub(crate) async fn create_claim_core(
     // claims have placeholder or ciphertext content that wouldn't yield a
     // useful semantic vector.
     if privacy_tier == "public" && was_created {
-        if let Some(embedder) = state.embedding_service() {
+        if let Some(embedder) = state.storing_embedding_service() {
             match embedder.generate(&request.content).await {
                 Ok(embedding) => {
                     let pgvector_str = format!(

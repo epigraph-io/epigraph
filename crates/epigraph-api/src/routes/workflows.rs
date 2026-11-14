@@ -428,7 +428,7 @@ pub async fn store_workflow(
     let embedder = if result.already_ingested {
         None
     } else {
-        state.embedding_service()
+        state.storing_embedding_service()
     };
     if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
@@ -2456,7 +2456,7 @@ pub async fn ingest_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     // `embed: false` (OD-6) sends no text to the embedder at all.
     let embedder = if embed.unwrap_or(true) && !result.already_ingested {
-        state.embedding_service()
+        state.storing_embedding_service()
     } else {
         None
     };

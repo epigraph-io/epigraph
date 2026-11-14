@@ -296,11 +296,22 @@ async fn main() {
         "401 responses will advertise this resource-metadata URL"
     );
 
-    // Create embedding service for semantic search. The provider KIND matters
-    // only to the `embedding_generation` job handler, which runs in the
-    // `drain_jobs` timer (D9), so this process discards it.
-    let (embedding_service, _provider_kind) =
+    // Create embedding service for semantic search. The provider KIND decides
+    // whether this process's inline write paths may STORE its vectors
+    // (`AppState::storing_embedding_service`, backlog 211bd623): only the
+    // provider that owns `claims.embedding` may, the rule the
+    // `embedding_generation` job handler in the `drain_jobs` timer (D9)
+    // already applies. A non-owning provider still serves query embedding.
+    let (embedding_service, provider_kind) =
         epigraph_api::embedding_restore::embedding_service_from_env();
+    if !provider_kind.may_restore_claim_embeddings() {
+        tracing::warn!(
+            provider = provider_kind.as_str(),
+            "Embedding provider does not own claims.embedding: this process will store NO \
+             claim or evidence vectors (claims written here are unembedded until a backfill \
+             by the owning provider); query embedding is unaffected"
+        );
+    }
 
     // Create application state — connect to PostgreSQL when db feature is enabled
     #[cfg(feature = "db")]
@@ -467,6 +478,7 @@ async fn main() {
         let edge_signer = epigraph_api::edge_signer::boot(scoped.inner()).await;
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
+            .with_embedding_provider(provider_kind)
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
@@ -525,7 +537,9 @@ async fn main() {
     };
 
     #[cfg(not(feature = "db"))]
-    let state = AppState::new(config).with_embedding_service(embedding_service);
+    let state = AppState::new(config)
+        .with_embedding_service(embedding_service)
+        .with_embedding_provider(provider_kind);
 
     // Load external identity providers from providers.toml.
     // EPIGRAPH_PROVIDERS_CONFIG overrides the default path. Missing config is
