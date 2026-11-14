@@ -20,6 +20,7 @@ pub mod atlas_leaf;
 pub mod atlas_map;
 pub mod atlas_meaning;
 pub mod atlas_naming;
+pub mod atlas_serve;
 pub mod atom_axiom;
 pub mod authored_by;
 pub mod authorization_code;
@@ -148,6 +149,7 @@ pub use atlas_map::{
 };
 pub use atlas_meaning::{AtlasMeaningRepository, ThemeMembers};
 pub use atlas_naming::{AtlasNamingRepository, FinishedRun, RunLevel, StoredName};
+pub use atlas_serve::{AtlasServeRepository, ServedRun, ThemeRoot};
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
     LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,

@@ -2018,3 +2018,137 @@ mod preview_set {
         assert_eq!(biggest, Some(MAX_LEAF_NODES), "one leaf is full");
     }
 }
+
+// ---- the claim-to-leaf lookup (atlas_claim_leaf v1) ---------------------------
+
+mod claim_leaf {
+    use super::*;
+    use crate::check::{
+        check_claim_leaf_body, check_claim_leaf_not_found, claim_leaf_schema_errors,
+        ClaimLeafExpected,
+    };
+
+    fn team_answer() -> ClaimLeaf {
+        ClaimLeaf {
+            schema_version: CLAIM_LEAF_SCHEMA_VERSION,
+            claim_id: uuid::Uuid::from_u128(1),
+            map_scope: MapScope::Team,
+            map_group_id: Some(FIXTURE_TEAM_GROUP_ID),
+            hierarchy: Hierarchy::Meaning,
+            theme_id: uuid::Uuid::from_u128(2),
+            level_id: uuid::Uuid::from_u128(3),
+        }
+    }
+
+    fn expected() -> ClaimLeafExpected {
+        ClaimLeafExpected {
+            map_scope: MapScope::Team,
+            map_group_id: Some(FIXTURE_TEAM_GROUP_ID),
+            hierarchy: Hierarchy::Meaning,
+            claim_id: uuid::Uuid::from_u128(1),
+        }
+    }
+
+    #[test]
+    fn a_team_answer_passes_and_round_trips() {
+        let body = serde_json::to_vec(&team_answer()).unwrap();
+        let got = check_claim_leaf_body(&body, &expected()).expect("valid");
+        assert_eq!(got, team_answer());
+    }
+
+    #[test]
+    fn the_schema_and_the_type_refuse_the_same_shapes() {
+        let good = serde_json::to_value(team_answer()).unwrap();
+        let mut cases: Vec<(&str, Value)> = Vec::new();
+        let mut v = good.clone();
+        v["count"] = json!(3);
+        cases.push(("an unknown key", v));
+        let mut v = good.clone();
+        v.as_object_mut().unwrap().remove("map_group_id");
+        cases.push(("a missing nullable key", v));
+        let mut v = good.clone();
+        v["map_group_id"] = Value::Null;
+        cases.push(("a team map with no group", v));
+        let mut v = good.clone();
+        v["map_scope"] = json!("public");
+        cases.push(("the public map with a group", v));
+        let mut v = good.clone();
+        v["hierarchy"] = json!("Meaning");
+        cases.push(("a hierarchy in the wrong case", v));
+        let mut v = good.clone();
+        v["schema_version"] = json!(2);
+        cases.push(("another schema version", v));
+        for (what, v) in cases {
+            assert!(
+                !claim_leaf_schema_errors(None, &v).is_empty(),
+                "the schema accepts {what}"
+            );
+            assert!(
+                check_claim_leaf_body(&serde_json::to_vec(&v).unwrap(), &expected()).is_err(),
+                "the checker accepts {what}"
+            );
+        }
+        // The strict type alone refuses the unknown and the missing key.
+        let mut v = good.clone();
+        v["count"] = json!(3);
+        assert!(serde_json::from_value::<ClaimLeaf>(v).is_err());
+        let mut v = good;
+        v.as_object_mut().unwrap().remove("map_group_id");
+        assert!(serde_json::from_value::<ClaimLeaf>(v).is_err());
+    }
+
+    #[test]
+    fn an_answer_for_another_map_hierarchy_or_claim_fails() {
+        let body = serde_json::to_vec(&team_answer()).unwrap();
+        let mut other_map = expected();
+        other_map.map_group_id = Some(uuid::Uuid::from_u128(9));
+        let mut other_h = expected();
+        other_h.hierarchy = Hierarchy::Links;
+        let mut other_claim = expected();
+        other_claim.claim_id = uuid::Uuid::from_u128(8);
+        let public = ClaimLeafExpected {
+            map_scope: MapScope::Public,
+            map_group_id: None,
+            ..expected()
+        };
+        for e in [other_map, other_h, other_claim, public] {
+            assert!(check_claim_leaf_body(&body, &e).is_err(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn the_not_found_bodies_are_closed() {
+        let id = uuid::Uuid::from_u128(1).to_string();
+        let kernel = json!({
+            "error": "NotFound",
+            "message": format!("atlas_claim_leaf with ID {id} not found"),
+            "details": {"entity": "atlas_claim_leaf", "id": id},
+        });
+        let k = serde_json::to_vec(&kernel).unwrap();
+        check_claim_leaf_not_found(Side::Kernel, 404, &k, &id).expect("kernel body");
+        assert!(check_claim_leaf_not_found(Side::Kernel, 403, &k, &id).is_err());
+        assert!(check_claim_leaf_not_found(Side::Kernel, 404, &k, "other").is_err());
+        let mut leaky = kernel.clone();
+        leaky["details"]["level_id"] = json!(id);
+        assert!(check_claim_leaf_not_found(
+            Side::Kernel,
+            404,
+            &serde_json::to_vec(&leaky).unwrap(),
+            &id
+        )
+        .is_err());
+        let bff =
+            json!({"error": "not_found", "message": "We could not find that claim on this map."});
+        check_claim_leaf_not_found(Side::Bff, 404, &serde_json::to_vec(&bff).unwrap(), &id)
+            .expect("bff body");
+        let level_body =
+            json!({"error": "not_found", "message": "We could not find that atlas level."});
+        assert!(check_claim_leaf_not_found(
+            Side::Bff,
+            404,
+            &serde_json::to_vec(&level_body).unwrap(),
+            &id
+        )
+        .is_err());
+    }
+}

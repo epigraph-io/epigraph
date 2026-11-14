@@ -29,7 +29,11 @@
      data-themes-url="{{ shell.themes_url }}"
      data-claim-page-prefix="{{ shell.claim_page_prefix }}"
      data-login-url="{{ shell.login_url }}"
-     data-atlas-url="{{ shell.atlas_url }}">
+     data-atlas-url="{{ shell.atlas_url }}"
+     data-atlas-claim-leaf-url="{{ shell.claim_leaf_url }}"
+     {%- if let Some(maps) = shell.maps_json %}
+     data-atlas-maps="{{ maps }}"
+     {%- endif %}>
   <div class="atlas__bar">
     <div class="atlas__tabs" role="tablist" aria-label="Views">
       <button type="button" role="tab" aria-selected="true" class="atlas__tab">Topics</button>

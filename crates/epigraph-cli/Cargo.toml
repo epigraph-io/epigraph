@@ -467,7 +467,6 @@ serde = { workspace = true }
 # graph through sqlx-core's `json` feature.
 serde_json = { workspace = true, features = ["raw_value"] }
 anyhow = { workspace = true }
-csv = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

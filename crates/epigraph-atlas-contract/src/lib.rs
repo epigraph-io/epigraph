@@ -94,6 +94,29 @@ pub const MAX_LABEL_CHARS: usize = 160;
 /// Characters in an edge relationship.
 pub const MAX_RELATIONSHIP_CHARS: usize = 32;
 
+/// The value of every v1 claim-to-leaf answer's `schema_version`.
+pub const CLAIM_LEAF_SCHEMA_VERSION: u32 = 1;
+
+/// The claim-to-leaf lookup's answer, schema v1
+/// (`services/explorer/contract/atlas_claim_leaf/v1/schema.json`): which leaf
+/// of one map and hierarchy holds a claim the viewer can read, in the run the
+/// level route serves. Enough for a client to fetch the leaf and its
+/// breadcrumb chain. It carries no count, flag or name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimLeaf {
+    pub schema_version: u32,
+    pub claim_id: Uuid,
+    pub map_scope: MapScope,
+    /// The team group of a team map; `None` for the public map.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub map_group_id: Option<Uuid>,
+    pub hierarchy: Hierarchy,
+    pub theme_id: Uuid,
+    /// The leaf level: `<level_url><hierarchy>/<level_id>`.
+    pub level_id: Uuid,
+}
+
 /// Whose map a level belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

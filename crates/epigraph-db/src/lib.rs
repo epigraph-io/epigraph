@@ -188,6 +188,7 @@ pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 // The Atlas layout reads and the operator build (migration 197).
 pub use repos::AtlasLayoutRepository;
 pub use repos::AtlasMapRepository;
+pub use repos::AtlasServeRepository;
 // The Atlas leaf node sets (Atlas W3).
 pub use repos::AtlasLeafRepository;
 // The Atlas "by meaning" hierarchy's reads (Atlas W4).
