@@ -146,7 +146,10 @@ can see (`GET /api/v1/atlas/maps`, then each map's themes and roots) and renders
 them as `data-atlas-maps`: team maps first, then the public map, each keyed
 `team-<32 hex>` or `public`, with `level_url` `/bff/atlas/maps/<key>/`. When the
 kernel lists no map, or the calls fail, the attribute is left out and the regions
-and themes behave exactly as before. The level route
+and themes behave exactly as before. The whole map list runs under one budget, a
+third of `EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` capped at 3 s (2.67 s at the default), so a
+slow or hung API delays the page by that much at most; past it the page renders
+without the list and logs a warning with the elapsed time. The level route
 `/bff/atlas/maps/{key}/{hierarchy}/{id}` passes the kernel's answer through (the
 kernel filters each leaf for the viewer's own session) and:
 - compresses it, gzip or br as the client accepts: the reverse proxy does not, and
