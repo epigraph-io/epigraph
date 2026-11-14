@@ -594,15 +594,20 @@ impl fmt::Display for PgvectorVersionError {
             Self::Query(e) => write!(f, "reading the pgvector version failed: {e}"),
             Self::NotInstalled => write!(
                 f,
-                "the pgvector extension (`vector`) is not installed in this database;                  {major}.{minor}.{patch} or newer is required"
+                "the pgvector extension (`vector`) is not installed in this database; \
+                 {major}.{minor}.{patch} or newer is required"
             ),
             Self::Unparseable { found } => write!(
                 f,
-                "cannot read the pgvector version {found:?}; {major}.{minor}.{patch} or newer                  is required"
+                "cannot read the pgvector version {found:?}; {major}.{minor}.{patch} or newer \
+                 is required"
             ),
             Self::TooOld { found } => write!(
                 f,
-                "pgvector {found} is installed but {major}.{minor}.{patch} or newer is                  required (semantic search sets hnsw.iterative_scan, added in 0.8.0). Install                  a newer pgvector on the server, then run `ALTER EXTENSION vector UPDATE` in                  this database."
+                "pgvector {found} is installed but {major}.{minor}.{patch} or newer is \
+                 required (semantic search sets hnsw.iterative_scan, added in 0.8.0). Install \
+                 a newer pgvector on the server, then run `ALTER EXTENSION vector UPDATE` in \
+                 this database."
             ),
         }
     }
@@ -745,6 +750,19 @@ mod tests {
         // The refusal names what was found and what is required.
         let msg = require_supported_pgvector("0.6.0").unwrap_err().to_string();
         assert!(msg.contains("0.6.0") && msg.contains("0.8.0"), "{msg}");
+        // Each refusal is one readable line: the server prints it on refusing
+        // to serve and docs/deploy.md quotes it, so a mangled continuation
+        // (a run of spaces mid-sentence) breaks the operator's search for it.
+        for e in [
+            PgvectorVersionError::NotInstalled,
+            PgvectorVersionError::Unparseable { found: "x".into() },
+            PgvectorVersionError::TooOld {
+                found: "0.6.0".into(),
+            },
+        ] {
+            let msg = e.to_string();
+            assert!(!msg.contains("  ") && !msg.contains('\n'), "{msg:?}");
+        }
     }
 
     const EMBEDDED: &[i64] = &[1, 2, 3, 36, 37, 38, 59, 60, 101];
