@@ -1748,6 +1748,7 @@ pub async fn submit_evidence(
             counted.then(|| epigraph_engine::ds_divergence::beta_increments(&modified, h_idx));
         epigraph_engine::ds_divergence::apply_beta_update(
             &mut tx,
+            &viewer,
             request.claim_id,
             increments,
             "submit_evidence",

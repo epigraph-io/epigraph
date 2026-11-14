@@ -1720,6 +1720,7 @@ pub async fn update_with_evidence(
     // Beta write) without losing the evidence.
     let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
         &mut tx,
+        viewer,
         claim_id,
         Some(epigraph_engine::ds_divergence::beta_increments(
             &ds.evidence_bba,

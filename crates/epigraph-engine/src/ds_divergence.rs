@@ -34,6 +34,8 @@
 //! evidence to a public claim). Only a failure to open or close the savepoint
 //! itself is returned, because the connection is then unusable.
 
+use epigraph_db::visibility::Viewer;
+use epigraph_db::ClaimRepository;
 use epigraph_ds::{FocalElement, MassFunction};
 use sqlx::Acquire as _;
 use uuid::Uuid;
@@ -72,70 +74,72 @@ pub fn beta_increments(bba: &MassFunction, hypothesis_index: Option<i32>) -> (f6
     (m_support.max(0.0), m_complement.max(0.0))
 }
 
-/// Read the claim's Beta parameters, add `increments` (when `Some`), store
-/// them, and return the posterior `alpha / (alpha + beta)`.
+/// Add `increments` (when `Some`) to the claim's Beta parameters and return
+/// the posterior `alpha / (alpha + beta)`.
 ///
 /// `increments` is `None` for a BBA that is not counted: an identical
 /// resubmission, whose update was applied when it was first stored. The
 /// parameters are then only read. A counted BBA passes
 /// `Some(`[`beta_increments`]`(..))`.
 ///
-/// A missing claim row, or a refused read, reads as the `Beta(1, 1)` prior. A
-/// refused read or write is logged and rolled back to the savepoint, and the
-/// posterior is still reported from the parameters computed here.
+/// The write is `ClaimRepository::add_beta_increments`: one gated `UPDATE`
+/// that adds in SQL, so concurrent writers on one claim cannot lose each
+/// other's increment. When it touches no row (a claim the viewer does not
+/// write: a non-owner attaching evidence to a public claim), the stored
+/// parameters are read through the viewer and the increments added here, so
+/// the reported posterior includes this evidence exactly as it did before the
+/// write moved into the repo layer; nothing is stored. A missing or invisible
+/// claim reads as the `Beta(1, 1)` prior. A refused statement is logged and
+/// rolled back to the savepoint, and the posterior is then computed from the
+/// prior.
 ///
 /// # Errors
 /// Only when the savepoint cannot be opened or closed.
 pub async fn apply_beta_update(
     conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
     claim_id: Uuid,
     increments: Option<(f64, f64)>,
     context: &str,
 ) -> Result<f64, sqlx::Error> {
     let mut sp = conn.begin().await?;
-    let beta_row: Result<Option<(f64, f64)>, sqlx::Error> =
-        sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_optional(&mut *sp)
-            .await;
-
-    let (mut alpha, mut beta) = beta_row
-        .as_ref()
-        .ok()
-        .copied()
-        .flatten()
-        .unwrap_or((1.0, 1.0));
-    if let Some((d_alpha, d_beta)) = increments {
-        if d_alpha > 0.0 {
-            alpha += d_alpha;
+    let outcome: Result<(f64, f64), epigraph_db::DbError> = async {
+        if let Some((d_alpha, d_beta)) = increments {
+            if let Some(stored) =
+                ClaimRepository::add_beta_increments(&mut sp, viewer, claim_id, d_alpha, d_beta)
+                    .await?
+            {
+                return Ok(stored);
+            }
         }
-        if d_beta > 0.0 {
-            beta += d_beta;
-        }
+        let (alpha, beta) = ClaimRepository::get_beta_params(&mut sp, viewer, claim_id)
+            .await?
+            .unwrap_or((1.0, 1.0));
+        Ok(with_increments((alpha, beta), increments))
     }
+    .await;
 
-    let stored = match beta_row {
-        Ok(_) if increments.is_none() => Ok(()),
-        Ok(_) => sqlx::query(
-            "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(claim_id)
-        .bind(alpha)
-        .bind(beta)
-        .execute(&mut *sp)
-        .await
-        .map(|_| ()),
-        Err(e) => Err(e),
-    };
-    match stored {
-        Ok(()) => sp.commit().await?,
+    let (alpha, beta) = match outcome {
+        Ok(params) => {
+            sp.commit().await?;
+            params
+        }
         Err(e) => {
             tracing::warn!("{context}: Beta update refused: {e}");
             sp.rollback().await?;
+            with_increments((1.0, 1.0), increments)
         }
-    }
-
+    };
     Ok(alpha / (alpha + beta))
+}
+
+/// `params` with the positive parts of `increments` added. The arithmetic the
+/// stored update performs, for a posterior that is reported but not stored.
+fn with_increments((alpha, beta): (f64, f64), increments: Option<(f64, f64)>) -> (f64, f64) {
+    match increments {
+        Some((d_alpha, d_beta)) => (alpha + d_alpha.max(0.0), beta + d_beta.max(0.0)),
+        None => (alpha, beta),
+    }
 }
 
 /// Store one `ds_bayesian_divergence` row for `(claim_id, frame_id)`:

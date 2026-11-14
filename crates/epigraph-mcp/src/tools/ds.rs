@@ -472,6 +472,7 @@ pub async fn submit_ds_evidence(
             .and_then(|a| a.hypothesis_index);
     let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
         &mut tx,
+        viewer,
         claim_id,
         (write_outcome != BbaWriteOutcome::Unchanged)
             .then(|| epigraph_engine::ds_divergence::beta_increments(&mass_fn, assigned_index)),
