@@ -270,6 +270,10 @@ pub struct RecallWithContextParams {
     pub limit: Option<u32>,
     pub min_truth: Option<f64>,
     pub centroid_dim: Option<u32>,
+    /// Restrict hits to claims a paper with this DOI / document key `asserts`.
+    /// Applies to the flat ANN path only: combined with `diverse=true` it is
+    /// REJECTED (backlog a2991ea6), because the diverse pipeline's theme
+    /// candidate query has no DOI predicate and would silently ignore it.
     pub paper_doi_filter: Option<String>,
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
@@ -289,6 +293,8 @@ pub struct RecallWithContextParams {
     /// Default `false` (existing flat ANN behaviour).
     ///
     /// Falls back to flat ANN if the corpus has no themes yet.
+    ///
+    /// Rejected together with `paper_doi_filter` (see there).
     ///
     /// [`diverse_select`]: epigraph_engine::diverse_select::diverse_select
     pub diverse: Option<bool>,
@@ -1153,6 +1159,19 @@ async fn recall_with_context_post_embed(
         .transpose()
         .map_err(invalid_params)?;
 
+    // Backlog a2991ea6: the diverse pipeline's theme candidate query
+    // (`candidates_in_themes_at_dim`) has no DOI predicate, so the
+    // combination used to succeed and drop the filter, except on the
+    // flat-ANN fallback, where it applied. Same entry-point reason as above.
+    if params.diverse.unwrap_or(false) && params.paper_doi_filter.is_some() {
+        return Err(invalid_params(
+            "paper_doi_filter cannot be combined with diverse=true: the diverse theme \
+             pipeline has no DOI predicate and would ignore the filter; set diverse=false \
+             (flat ANN) to restrict hits to one paper"
+                .to_string(),
+        ));
+    }
+
     // Every read of the pipeline on ONE connection stamped with the caller's
     // viewer: on the plain pool row security admits public rows only, so a
     // member's own group-private claims would never be seeds, context or
@@ -1172,12 +1191,9 @@ async fn recall_with_context_post_embed(
     //  - `diverse=false` (default): flat whole-corpus ANN over
     //    `claims.embedding[_3072]`.
     //
-    // The `paper_doi_filter` does NOT apply to the diverse path —
-    // candidates_in_themes_at_dim has no DOI predicate. If the caller
-    // provides BOTH `diverse=true` AND `paper_doi_filter`, the filter is
-    // currently ignored on the diverse path. TODO(diverse-recall): wire
-    // paper_doi_filter into candidates_in_themes_at_dim or reject the
-    // combination at param-parse time.
+    // `paper_doi_filter` applies to the flat path only: the combination with
+    // `diverse=true` was rejected above (backlog a2991ea6), so on the diverse
+    // branch it is always `None`, the fallback included.
     let diverse = params.diverse.unwrap_or(false);
     // Stage 3 sizing. When rerank is on, OVER-FETCH the flat candidate pool
     // (`want * pool_factor`, clamped to [want, 200]) so the cross-encoder has a
