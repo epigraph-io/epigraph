@@ -100,8 +100,6 @@ pub mod health;
 pub mod hypothesis;
 pub mod independence;
 pub mod ingest;
-#[cfg(all(feature = "db", feature = "episcience"))]
-pub mod isomorphism;
 #[cfg(feature = "db")]
 pub mod lineage;
 #[cfg(feature = "db")]
@@ -701,7 +699,6 @@ pub fn create_router_with_extensions(
         // interface table say. The `/rotate-key` spelling this comment used to
         // carry was never served by anything.
         .route("/api/v1/groups/:id/rotate", post(groups::rotate_key))
-        // Isomorphism pattern detection (episcience feature)
         // Admin OAuth client management
         .route(
             "/api/v1/admin/clients/:id/approve",
@@ -1164,7 +1161,6 @@ pub fn create_router_with_extensions(
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
         )
-        // /api/v1/isomorphism/patterns — episcience feature
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/:id", get(tasks::get_task))
