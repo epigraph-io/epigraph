@@ -1666,6 +1666,56 @@ impl AppState {
         Ok(stored)
     }
 
+    /// Generate `text`'s embedding and store it on `claim_id` through
+    /// [`Self::store_claim_embedding_as`], for a write path whose claim has
+    /// already committed. Best-effort by contract (CLAUDE.md "Embedding
+    /// policy"): every failure is warned and reported as `false`, never
+    /// returned, because a failed embed must not unwind a committed claim.
+    ///
+    /// `false` also when no embedding service is configured.
+    #[cfg(feature = "db")]
+    pub async fn embed_claim_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim_id: Uuid,
+        text: &str,
+        handler: &'static str,
+    ) -> bool {
+        let Some(embedder) = self.embedding_service() else {
+            tracing::debug!(claim_id = %claim_id, handler, "embedding_service not configured; skipping embed");
+            return false;
+        };
+        let embedding = match embedder.generate(text).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, handler, error = %e, "embedding generation failed (claim still stored)");
+                return false;
+            }
+        };
+        let pgvec = format!(
+            "[{}]",
+            embedding
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        match self
+            .store_claim_embedding_as(viewer, claim_id, &pgvec, handler)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(claim_id = %claim_id, handler, "embedding matched no row (claim missing, sealed, superseded, or not writable by the caller); no vector stored");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, handler, error = %e, "embedding not stored (claim still stored)");
+                false
+            }
+        }
+    }
+
     /// Store an evidence row's embedding after the packet that inserted it
     /// committed, on a [`Self::begin_claim_write`] transaction stamped with the
     /// same `viewer`. The evidence twin of [`Self::store_claim_embedding_as`],
