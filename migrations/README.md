@@ -2919,6 +2919,33 @@ restart.
   table on every hierarchical report); undo only after rolling every 221
   binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **224**: public `oauth_definers_pg_catalog_path` (backlog 368ce622, the
+  family after 190's). Re-states 118's six OAuth definers
+  (`epigraph_oauth_code_consume`, `_session_to_consent`, `_session_take`,
+  `_client_lock_for_link`, `_client_link_agent`, `_client_approve`) on 172's
+  form: `SET search_path = pg_catalog, pg_temp` (from 190's
+  `pg_catalog, public, pg_temp`), with `now()`, `jsonb_build_object(` and
+  `to_jsonb(` qualified `pg_catalog.` and no other byte of the 118 bodies
+  changed (`_client_lock_for_link` calls no function: only its path moves).
+  On the old path a `public.to_jsonb(text[])` decided the scopes the
+  approval's `oauth.client_approved` audit row records, running as the
+  definer's owner. Signatures, owner (`epigraph_maintenance`) and ACL
+  unchanged (188's revoke on the approve definer stands); they stay
+  registered at 118 in `tenancy_backfill.rs`. A precondition checks the md5
+  of each 118 body and RAISEs `55000` (changing nothing) over any other.
+  `PUBLIC_PATH_REGISTER` shrinks from 198 to 192. Pinned by
+  `epigraph-db/tests/definer_search_path_ratchet.rs`
+  (`the_oauth_family_resolves_in_pg_catalog_only`,
+  `the_oauth_client_approval_ignores_a_public_overload_of_to_jsonb`,
+  `migration_224_changes_only_the_oauth_family_paths_and_qualifiers`,
+  `migration_224_refuses_to_apply_over_another_body`,
+  `the_224_undo_restores_the_oauth_family_on_190s_path`). Undo:
+  `docs/runbooks/224-undo.sql` (tested: run twice, it returns every definer
+  to its state below 224; it refuses `55000` over any body but 224's or
+  118's). Checked before claiming: slot 224 is this batch's assignment and no
+  migration on main or an origin branch carries a `224`. **Deploy order:** no
+  binary depends on it; apply whenever. **Applied to throwaway databases
+  only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

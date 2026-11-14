@@ -45,6 +45,16 @@
 //!   [`migration_190_sweep_refuses_temp_before_last_and_pins_the_unpinned`]:
 //!   what 190 changed, its md5 precondition, and its sweep's refusal and
 //!   unpinned / quoted-path branches (shapes a fresh database does not have).
+//! * [`the_oauth_family_resolves_in_pg_catalog_only`]: the OAuth
+//!   authorization-code, authorize-session and client definers (118 sections
+//!   3b and 3c, the next family) are on 172's form since 224, keep their
+//!   owner and grants, and run on it;
+//!   [`the_oauth_client_approval_ignores_a_public_overload_of_to_jsonb`] is
+//!   the resolution 224 closes, observed through the approval's audit row.
+//! * [`migration_224_changes_only_the_oauth_family_paths_and_qualifiers`],
+//!   [`migration_224_refuses_to_apply_over_another_body`] and
+//!   [`the_224_undo_restores_the_oauth_family_on_190s_path`]: what 224
+//!   changed, its md5 precondition, and its undo runbook.
 //!
 //! Each catalog check is CALIBRATED in-test: probe definers of each wrong shape
 //! are created on the test database and must be reported.
@@ -68,7 +78,7 @@
 //! `CAST(x AS some_type)` (it reads a type only after `::` or before `%`); the
 //! second and later relations of a comma-joined `FROM a, b`, and the relation
 //! after `DELETE .. USING`; quoted identifiers. No pg_catalog-only body at
-//! 190 uses any of these forms.
+//! 190 or 224 uses any of these forms.
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is not
 //! extended for one test.
@@ -195,12 +205,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
     "public.epigraph_lock_public_claim_for_attach(uuid)",
     "public.epigraph_node_tenancy(uuid, text)",
-    "public.epigraph_oauth_client_approve(uuid, text[], uuid)",
-    "public.epigraph_oauth_client_link_agent(uuid, uuid)",
-    "public.epigraph_oauth_client_lock_for_link(uuid)",
-    "public.epigraph_oauth_code_consume(bytea)",
-    "public.epigraph_oauth_session_take(text)",
-    "public.epigraph_oauth_session_to_consent(text, text, uuid, text[])",
     "public.epigraph_operates_agents(uuid)",
     "public.epigraph_operator_actor(uuid)",
     "public.epigraph_operator_binding_armed()",
@@ -286,7 +290,7 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 /// [`PUBLIC_PATH_REGISTER`]'s length, which must equal it. Raising it is a
 /// visible decision to add a definer that resolves through `public`; it falls
 /// by one each time a registered definer moves to 172's form.
-const HIGH_WATER: usize = 198;
+const HIGH_WATER: usize = 192;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.
@@ -314,6 +318,32 @@ fn rebodied() -> BTreeSet<&'static str> {
         .filter(|s| !s.contains("refresh_token_rotate"))
         .collect()
 }
+
+/// The OAuth authorization-code, authorize-session and client definers (118
+/// sections 3b and 3c) 224 re-states on 172's form. `(signature, the
+/// application role executes it, the number of `pg_catalog.` qualifiers 224
+/// inserts into its 118 body)`. The approve definer is a maintenance act
+/// since 188.
+const OAUTH_FAMILY_224: &[(&str, bool, usize)] = &[
+    ("public.epigraph_oauth_code_consume(bytea)", true, 2),
+    (
+        "public.epigraph_oauth_session_to_consent(text, text, uuid, text[])",
+        true,
+        1,
+    ),
+    ("public.epigraph_oauth_session_take(text)", true, 1),
+    ("public.epigraph_oauth_client_lock_for_link(uuid)", true, 0),
+    (
+        "public.epigraph_oauth_client_link_agent(uuid, uuid)",
+        true,
+        1,
+    ),
+    (
+        "public.epigraph_oauth_client_approve(uuid, text[], uuid)",
+        false,
+        3,
+    ),
+];
 
 /// One `definers` row: signature, `search_path`, `proconfig`, owner, ACL,
 /// volatility, body.
@@ -1312,5 +1342,426 @@ async fn no_function_keeps_state_in_a_session_temporary_relation(pool: PgPool) {
             .map(|(s, f)| format!("  {s}: {f:?}"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+fn repo_text(rel: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel),
+    )
+    .unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+fn sqlstate<T>(r: &Result<T, sqlx::Error>) -> Option<String> {
+    r.as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned())
+}
+
+/// A client row the OAuth definers act on, inserted on the test's superuser
+/// pool.
+async fn seed_oauth_client(pool: &PgPool, status: &str) -> uuid::Uuid {
+    epigraph_db::repos::oauth_client::OAuthClientRepository::create(
+        pool,
+        &format!("b15_{}", uuid::Uuid::new_v4().simple()),
+        None,
+        "b15 client",
+        "human",
+        &["claims:read".to_string()],
+        &["claims:read".to_string()],
+        status,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed an OAuth client")
+}
+
+/// Migration 224: the OAuth authorization-code, authorize-session and client
+/// definers are on 172's form, keep their owner and grants (188's revoke on
+/// the approve definer included), and run on that path over real rows.
+///
+/// Fails before 224: each pins `pg_catalog, public, pg_temp` (190's sweep of
+/// 118's `pg_catalog, public`) and calls `now()` / `jsonb_build_object(` /
+/// `to_jsonb(` unqualified.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_oauth_family_resolves_in_pg_catalog_only(pool: PgPool) {
+    let defs = definers(&pool).await;
+    for (sig, app_executes, _) in OAUTH_FAMILY_224 {
+        let d = defs
+            .get(*sig)
+            .unwrap_or_else(|| panic!("{sig} is not a SECURITY DEFINER function"));
+        assert_eq!(
+            d.config,
+            vec!["search_path=pg_catalog, pg_temp".to_string()],
+            "{sig}: 172's path"
+        );
+        assert_eq!(d.owner, "epigraph_maintenance", "{sig}: owner");
+        let code = code_only(&d.src);
+        for builtin in ["now(", "jsonb_build_object(", "to_jsonb("] {
+            let all = code.matches(builtin).count();
+            let qualified = code.matches(&format!("pg_catalog.{builtin}")).count();
+            assert_eq!(
+                all, qualified,
+                "{sig}: an unqualified {builtin}..) remains; 172's written form qualifies \
+                 every built-in (a body copied from 118?)"
+            );
+        }
+        let can: (bool, bool) = sqlx::query_as(
+            "SELECT has_function_privilege('public', $1::regprocedure, 'EXECUTE'), \
+                    has_function_privilege('epigraph_app', $1::regprocedure, 'EXECUTE')",
+        )
+        .bind(*sig)
+        .fetch_one(&pool)
+        .await
+        .expect("privileges");
+        assert_eq!(
+            can,
+            (false, *app_executes),
+            "{sig}: (PUBLIC, epigraph_app) EXECUTE"
+        );
+    }
+
+    // Each body still reaches the tables it names on its pinned path. The
+    // four SQL bodies were validated at CREATE; the two plpgsql ones resolve
+    // only when they run.
+    let client = seed_oauth_client(&pool, "active").await;
+    let expires = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let code = format!("b15-code-{}", uuid::Uuid::new_v4()).into_bytes();
+    epigraph_db::repos::authorization_code::AuthorizationCodeRepository::create(
+        &pool,
+        &code,
+        "b15-client",
+        client,
+        "https://example.invalid/callback",
+        "challenge",
+        &["claims:read".to_string()],
+        None,
+        expires,
+    )
+    .await
+    .expect("seed a code");
+    let consume = "SELECT count(*) FROM public.epigraph_oauth_code_consume($1)";
+    for (n, what) in [(1_i64, "the first consume"), (0, "a code is single use")] {
+        let got: i64 = sqlx::query_scalar(consume)
+            .bind(&code)
+            .fetch_one(&pool)
+            .await
+            .expect("code consume runs on its pinned path");
+        assert_eq!(got, n, "{what}");
+    }
+
+    let state = format!("b15-state-{}", uuid::Uuid::new_v4().simple());
+    let consent = format!("b15-consent-{}", uuid::Uuid::new_v4().simple());
+    epigraph_db::repos::authorize_session::AuthorizeSessionRepository::create(
+        &pool,
+        &state,
+        "b15-client",
+        "https://example.invalid/callback",
+        "challenge",
+        Some("claims:read"),
+        None,
+        "verifier",
+        expires,
+    )
+    .await
+    .expect("seed a session");
+    let moved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.epigraph_oauth_session_to_consent($1, $2, $3, $4)",
+    )
+    .bind(&state)
+    .bind(&consent)
+    .bind(client)
+    .bind(vec!["claims:read".to_string()])
+    .fetch_one(&pool)
+    .await
+    .expect("session to consent runs on its pinned path");
+    assert_eq!(moved, 1, "the session moves to consent");
+    let taken: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM public.epigraph_oauth_session_take($1)")
+            .bind(&consent)
+            .fetch_one(&pool)
+            .await
+            .expect("session take runs on its pinned path");
+    assert_eq!(taken, 1, "the consent ticket is taken");
+
+    let locked: Vec<(Option<uuid::Uuid>, String)> = sqlx::query_as(
+        "SELECT agent_id, client_type FROM public.epigraph_oauth_client_lock_for_link($1)",
+    )
+    .bind(client)
+    .fetch_all(&pool)
+    .await
+    .expect("lock for link runs on its pinned path");
+    assert_eq!(locked, vec![(None, "human".to_string())]);
+
+    let r = sqlx::query_scalar::<_, bool>("SELECT public.epigraph_oauth_client_link_agent($1, $2)")
+        .bind(client)
+        .bind(uuid::Uuid::new_v4())
+        .fetch_one(&pool)
+        .await;
+    assert_eq!(
+        sqlstate(&r).as_deref(),
+        Some("23503"),
+        "link to a missing agent is refused OC01 (its plpgsql body resolved): {r:?}"
+    );
+}
+
+/// The resolution 224 closes. On a path that lists `public`, a
+/// `public.to_jsonb(text[])` matches the approve definer's
+/// `to_jsonb(COALESCE(p_granted_scopes, ARRAY[]::text[]))` exactly and beats
+/// pg_catalog's polymorphic `to_jsonb(anyelement)`, so it decides the
+/// `granted_scopes` the `oauth.client_approved` audit row records, and runs as
+/// the definer's owner. On `pg_catalog, pg_temp` with `pg_catalog.to_jsonb`
+/// it is never reached.
+///
+/// Fails before 224: the audit row records the overload's `["claims:admin"]`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_oauth_client_approval_ignores_a_public_overload_of_to_jsonb(pool: PgPool) {
+    let client = seed_oauth_client(&pool, "pending").await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.to_jsonb(text[]) RETURNS jsonb \
+         LANGUAGE sql AS $$ SELECT '[\"claims:admin\"]'::jsonb $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the public overload");
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET search_path = pg_catalog, public, pg_temp")
+        .execute(&mut *conn)
+        .await
+        .expect("the pre-224 path");
+    let calibration: String =
+        sqlx::query_scalar("SELECT to_jsonb(ARRAY['claims:read']::text[])::text")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("calibration");
+    assert_eq!(
+        calibration, r#"["claims:admin"]"#,
+        "CALIBRATION: on a path listing public the overload wins the unqualified call"
+    );
+    sqlx::query("RESET search_path")
+        .execute(&mut *conn)
+        .await
+        .expect("reset");
+
+    // A maintenance act since 188: approve as the definer's owner.
+    sqlx::query("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .execute(&mut *conn)
+        .await
+        .expect("act as maintenance");
+    let approved: bool =
+        sqlx::query_scalar("SELECT public.epigraph_oauth_client_approve($1, $2, NULL)")
+            .bind(client)
+            .bind(vec!["claims:read".to_string()])
+            .fetch_one(&mut *conn)
+            .await
+            .expect("approve on the maintenance role");
+    sqlx::query("RESET SESSION AUTHORIZATION")
+        .execute(&mut *conn)
+        .await
+        .expect("reset authorization");
+    drop(conn);
+    assert!(approved, "the pending client is approved");
+
+    let recorded: Vec<String> = sqlx::query_scalar(
+        "SELECT (details->'granted_scopes')::text FROM public.security_events \
+          WHERE event_type = 'oauth.client_approved' \
+            AND details->>'oauth_client_id' = $1::text",
+    )
+    .bind(client)
+    .fetch_all(&pool)
+    .await
+    .expect("the audit row");
+    assert_eq!(
+        recorded,
+        vec![r#"["claims:read"]"#.to_string()],
+        "the approval's audit row records the scopes granted, not a public overload's"
+    );
+}
+
+/// 224 changes, on the six OAuth definers, only the path (190's
+/// `pg_catalog, public, pg_temp` to `pg_catalog, pg_temp`) and the body by
+/// the `pg_catalog.` qualifiers it inserts (counted per function), and no
+/// other definer at all. No definer appears or disappears, and no owner, ACL
+/// or volatility moves.
+#[sqlx::test(migrations = false)]
+async fn migration_224_changes_only_the_oauth_family_paths_and_qualifiers(pool: PgPool) {
+    migrate(&pool, &below(224))
+        .await
+        .expect("migrate below 224");
+    let before = definers(&pool).await;
+    migrate(&pool, &below(225)).await.expect("migrate to 224");
+    let after = definers(&pool).await;
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "224 adds or drops no definer"
+    );
+    for (sig, _, _) in OAUTH_FAMILY_224 {
+        assert!(
+            before.contains_key(*sig),
+            "CALIBRATION: {sig} exists before 224"
+        );
+    }
+    for (sig, b) in &before {
+        let a = &after[sig];
+        assert_eq!(
+            (&a.owner, &a.acl, &a.volatile),
+            (&b.owner, &b.acl, &b.volatile),
+            "{sig}: owner, ACL and volatility unchanged"
+        );
+        let Some((_, _, qualifiers)) = OAUTH_FAMILY_224.iter().find(|(s, _, _)| s == sig) else {
+            assert_eq!(a, b, "{sig}: not in 224's family, unchanged");
+            continue;
+        };
+        assert_eq!(
+            b.config,
+            vec!["search_path=pg_catalog, public, pg_temp".to_string()],
+            "{sig}: 190's path before 224"
+        );
+        assert_eq!(
+            a.config,
+            vec!["search_path=pg_catalog, pg_temp".to_string()],
+            "{sig}: 172's path after 224"
+        );
+        assert_eq!(
+            (
+                b.src.matches("pg_catalog.").count(),
+                a.src.matches("pg_catalog.").count()
+            ),
+            (0, *qualifiers),
+            "{sig}: the qualifiers 224 inserts"
+        );
+        assert_eq!(
+            a.src.replace("pg_catalog.", ""),
+            b.src,
+            "{sig}: qualification only"
+        );
+    }
+}
+
+/// A body for `epigraph_oauth_session_take` on its pre-224 path.
+fn session_take_with(src: &str) -> String {
+    format!(
+        "CREATE OR REPLACE FUNCTION public.epigraph_oauth_session_take(p_state text) \
+         RETURNS SETOF public.oauth_authorize_sessions LANGUAGE sql VOLATILE SECURITY DEFINER \
+         SET search_path = pg_catalog, public, pg_temp AS $body${src}$body$"
+    )
+}
+
+async fn session_take_src(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT prosrc FROM pg_catalog.pg_proc \
+          WHERE oid = 'public.epigraph_oauth_session_take(text)'::regprocedure",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("session take's body")
+}
+
+/// 224 re-states each body whole, so it refuses to apply over any other body
+/// and changes nothing. POSITIVE CONTROL: restored to 118's body, 224 applies.
+#[sqlx::test(migrations = false)]
+async fn migration_224_refuses_to_apply_over_another_body(pool: PgPool) {
+    migrate(&pool, &below(224))
+        .await
+        .expect("migrate below 224");
+    let original = session_take_src(&pool).await;
+    sqlx::raw_sql(&session_take_with(&format!(
+        "{original}-- a later migration's delta\n"
+    )))
+    .execute(&pool)
+    .await
+    .expect("re-body");
+    let before = definers(&pool).await;
+    let err = migrate(&pool, &below(225))
+        .await
+        .expect_err("224 over another body");
+    assert!(
+        err.contains("is not the body 224 re-states"),
+        "the refusal names the reason: {err}"
+    );
+    let applied: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 224)")
+            .fetch_one(&pool)
+            .await
+            .expect("probe");
+    assert!(!applied, "a refused 224 is not recorded");
+    assert_eq!(
+        definers(&pool).await,
+        before,
+        "a refused 224 changes no definer"
+    );
+
+    sqlx::raw_sql(&session_take_with(&original))
+        .execute(&pool)
+        .await
+        .expect("restore 118's body");
+    migrate(&pool, &below(225))
+        .await
+        .expect("POSITIVE CONTROL: over 118's body, 224 applies");
+}
+
+/// `docs/runbooks/224-undo.sql` returns every definer to its state below 224
+/// (118's bodies on 190's path, owner and ACL as they were, 188's revoke
+/// included), twice over, and refuses (55000, nothing changed) over a body
+/// that is neither 224's nor 118's.
+#[sqlx::test(migrations = false)]
+async fn the_224_undo_restores_the_oauth_family_on_190s_path(pool: PgPool) {
+    let undo = repo_text("docs/runbooks/224-undo.sql");
+    migrate(&pool, &below(224))
+        .await
+        .expect("migrate below 224");
+    let before = definers(&pool).await;
+    migrate(&pool, &below(225)).await.expect("migrate to 224");
+    assert_ne!(
+        definers(&pool).await,
+        before,
+        "CALIBRATION: 224 changed the definers"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo applies");
+    assert_eq!(
+        definers(&pool).await,
+        before,
+        "the definers are as below 224"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(definers(&pool).await, before, "idempotent");
+
+    let foreign = "\n    SELECT * FROM public.oauth_authorize_sessions WHERE false;\n";
+    sqlx::raw_sql(&session_take_with(foreign))
+        .execute(&pool)
+        .await
+        .expect("a foreign body");
+    // The undo opens its own transaction: end it on the same connection.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    assert_eq!(
+        sqlstate(&r).as_deref(),
+        Some("55000"),
+        "the undo over a foreign body: {r:?}"
+    );
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the undo's transaction");
+    drop(conn);
+    assert_eq!(
+        session_take_src(&pool).await,
+        foreign,
+        "the undo left the foreign body"
     );
 }
