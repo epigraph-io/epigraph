@@ -298,7 +298,9 @@ In `~/tenancy-pending-decisions.md`, filed as EpiGraph backlog claims labelled
   group and `public`, which the operator tools' node rule (`restrict-claims`,
   `regroup-claims`) deliberately leaves on its tuple
 - **`F-089-F`** — the harvester trust model. **Decided 2026-09-22: accepted, the ingest
-  path is trusted.** Documented in `docs/tenancy.md` and at migration 218's stamping body
+  path is trusted.** Documented in `docs/tenancy.md` and at migration 218's stamping body.
+  Not yet enforced on every path (an application session can still INSERT a provenance
+  link that arm (d) later follows): new finding `F-218-A`, an operator decision
 
 ### 6.3 When to merge to `main` — **DECIDED, 2026-09-14. Do not re-open.**
 

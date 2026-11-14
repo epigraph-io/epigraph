@@ -2695,13 +2695,16 @@ restart.
   Re-states 115's `epigraph_inherit_fragment_tenancy_stmt()` (the provenance
   stamp; same 115 gate, same sentinel-only target and world-excluded source)
   and 168's `epigraph_propagate_tenancy()` byte for byte except the
-  `harvester_fragments` statement: both rank every citing claim `group` before
-  `public`, a real owner before a sentinel, then the lowest `owner_group_id`;
-  arm (d) also puts the claims its statement changed first at equal
-  visibility (so a share, re-own or regroup still carries the fragment with
-  the claim) and the fragment's current owner before another group. Arm (d)
-  therefore no longer makes a fragment public when one citer is publicized and
-  another is still group-private. `epigraph-tenancy-backfill`'s fragment arm
+  `harvester_fragments` statement: both rank their CANDIDATE citing claims
+  `group` before `public`, a real owner before a sentinel, then the lowest
+  `owner_group_id`. Only a claim the firing act names is a candidate: the
+  stamp ranks its own statement's rows (`newprov`, as 115 did, so an earlier
+  unstamped application-session link never decides a fragment), and arm (d)
+  ranks the claims its statement changed and never moves a fragment to a claim
+  it did not change. Arm (d) adds one guard: when every changed citer ends
+  `public`, a `group` fragment that another group-private claim still cites is
+  left as it is, so publicizing one citer no longer makes the fragment public
+  and does not hand it to the other citer's group. `epigraph-tenancy-backfill`'s fragment arm
   and its `verify` residual use the same order (one shared SQL fragment). Also
   REVOKEs UPDATE on `harvester_claim_provenance` from `epigraph_app` (no writer
   uses it; a re-pointed link ran no stamp), keeping INSERT, SELECT and DELETE.
@@ -2725,9 +2728,12 @@ restart.
   still produced by a later private link, so that shape is ongoing until the
   node-rule question is ruled. Strict `verify` does not change for any row:
   its fragment residual is equivalent to the old one on sentinel-owned rows,
-  the only ones it counts. Before deploying, confirm
-  the external harvester never UPDATEs `harvester_claim_provenance` on an
-  application DSN. Checked before claiming: slot 218 assigned to this batch;
+  the only ones it counts. Before deploying, confirm which role the external
+  harvester connects as, and that it never UPDATEs `harvester_claim_provenance`.
+  The trust model is not yet enforced on every path: `epigraph_app` keeps
+  INSERT on that table, and arm (d) follows a linked claim whoever wrote the
+  link (pre-existing; ledger F-218-A, an operator decision on revoking that
+  INSERT). Checked before claiming: slot 218 assigned to this batch;
   no migration on main carries a `218`. **Applied to throwaway databases only,
   NOT to any deployed database.**
 
