@@ -97,7 +97,7 @@ async fn derive_extracts_paper_doi_from_asserts_edge(pool: PgPool) {
     insert_asserts_edge(&pool, paper_id, claim_id).await;
 
     let key = derive_source_key(&pool, claim_id).await.expect("derive");
-    assert_eq!(key.paper_doi.as_deref(), Some("10.1/regression"));
+    assert_eq!(key.paper_dois, vec!["10.1/regression".to_string()]);
     assert_eq!(key.agent_id, agent_id);
     assert_eq!(key.ingestion_run_id, None);
     assert_eq!(key.derivation_root, None);
@@ -113,4 +113,37 @@ async fn derive_chases_derivation_root(pool: PgPool) {
     insert_derived_from(&pool, leaf, mid).await;
     let key = derive_source_key(&pool, leaf).await.expect("derive");
     assert_eq!(key.derivation_root, Some(root));
+}
+
+/// 50b19b4e: a claim asserted by TWO papers keeps both DOIs, so a claim that
+/// shares only the second paper is still detected as same-source. The DOIs are
+/// chosen so the non-shared one sorts first: the former
+/// `ORDER BY depth, doi LIMIT 1` kept exactly that one and let the pair pass
+/// the filter as cross-source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn derive_keeps_every_asserting_paper_doi(pool: PgPool) {
+    use epigraph_engine::matching::source_key::{is_same_source, SourceFilterConfig};
+
+    let agent_a = insert_agent(&pool).await;
+    let agent_b = insert_agent(&pool).await;
+    let claim_a = insert_claim(&pool, agent_a).await;
+    let claim_b = insert_claim(&pool, agent_b).await;
+    let p_only_a = insert_paper(&pool, "10.1/only-a").await;
+    let p_shared = insert_paper(&pool, "10.2/shared").await;
+    insert_asserts_edge(&pool, p_only_a, claim_a).await;
+    insert_asserts_edge(&pool, p_shared, claim_a).await;
+    insert_asserts_edge(&pool, p_shared, claim_b).await;
+
+    let ka = derive_source_key(&pool, claim_a).await.expect("derive a");
+    let kb = derive_source_key(&pool, claim_b).await.expect("derive b");
+    assert_eq!(
+        ka.paper_dois,
+        vec!["10.1/only-a".to_string(), "10.2/shared".to_string()],
+        "every asserting paper, sorted"
+    );
+    assert_eq!(kb.paper_dois, vec!["10.2/shared".to_string()]);
+    assert!(
+        is_same_source(&ka, &kb, SourceFilterConfig::default()),
+        "claims sharing paper 10.2/shared must be same-source, got {ka:?} vs {kb:?}"
+    );
 }

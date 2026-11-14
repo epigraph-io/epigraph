@@ -4,12 +4,16 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Provenance identity of a claim. Two claims are "same source" iff any
-/// non-null provenance component matches, or both are non-paper claims by the
-/// same agent — see [`is_same_source`].
+/// Provenance identity of a claim. Two claims are "same source" iff they share
+/// an asserting paper, share a derivation root, or are both non-paper claims
+/// by the same agent — see [`is_same_source`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceKey {
-    pub paper_doi: Option<String>,
+    /// DOIs of EVERY paper that asserts the claim or one of its
+    /// `decomposes_to` ancestors, sorted and deduplicated. A claim asserted
+    /// by several papers carries all of them, so a shared paper is never
+    /// hidden behind an arbitrary single pick. Empty = non-paper claim.
+    pub paper_dois: Vec<String>,
     pub agent_id: Uuid,
     pub ingestion_run_id: Option<Uuid>,
     pub derivation_root: Option<Uuid>,
@@ -28,12 +32,13 @@ pub struct SourceFilterConfig {
     pub include_agent_id: bool,
 }
 
-/// True when `a` and `b` share a non-null source component, when both are
+/// True when `a` and `b` share any asserting paper DOI or another non-null
+/// source component, when both are
 /// non-paper claims written by the same agent, or (if `cfg.include_agent_id`)
 /// when they share an `agent_id` at all.
 ///
 /// A non-paper claim (memorize, telemetry, RFP, ...) has no asserting paper,
-/// so `paper_doi` is `None` (`papers.doi` is NOT NULL, so `None` means "no
+/// so `paper_dois` is empty (`papers.doi` is NOT NULL, so empty means "no
 /// `paper -asserts->` edge on the claim or on any `decomposes_to` ancestor",
 /// never "a paper without a DOI"; see [`derive_source_key`]). For such a
 /// claim the authoring agent is the only source signal besides the ingestion
@@ -44,7 +49,9 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     fn both_eq<T: PartialEq>(x: &Option<T>, y: &Option<T>) -> bool {
         matches!((x, y), (Some(xv), Some(yv)) if xv == yv)
     }
-    if both_eq(&a.paper_doi, &b.paper_doi) {
+    // Both lists are sorted (see `derive_source_key`), but they are short, so
+    // a nested scan is clearer than a merge walk and just as cheap.
+    if a.paper_dois.iter().any(|d| b.paper_dois.contains(d)) {
         return true;
     }
     if both_eq(&a.ingestion_run_id, &b.ingestion_run_id) {
@@ -53,7 +60,7 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     if both_eq(&a.derivation_root, &b.derivation_root) {
         return true;
     }
-    let both_non_paper = a.paper_doi.is_none() && b.paper_doi.is_none();
+    let both_non_paper = a.paper_dois.is_empty() && b.paper_dois.is_empty();
     (both_non_paper || cfg.include_agent_id) && a.agent_id == b.agent_id
 }
 
@@ -88,12 +95,12 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     // ingesting agent would resolve no paper and be dropped as same-agent
     // non-paper claims, and two atoms of one paper by different agents would
     // pass as cross-source. So walk the ancestry (capped at depth 32, like
-    // the derivation walk below) and take the nearest asserting paper: a
-    // direct `asserts` edge (depth 0) always wins, so a directly asserted
-    // claim keeps exactly today's DOI. `ORDER BY depth, doi` makes the pick
-    // deterministic for an atom with several parents. The `decomposes_to`
-    // edges are lineage too, so they are not filtered on `valid_to` either.
-    let paper_doi = sqlx::query_scalar::<_, Option<String>>(
+    // the derivation walk below) and collect EVERY asserting paper on it.
+    // Keeping only one (the former `ORDER BY depth, doi LIMIT 1`) made a
+    // claim asserted by several papers look independent of a claim sharing
+    // any of the papers it did not keep. The `decomposes_to` edges are
+    // lineage too, so they are not filtered on `valid_to` either.
+    let paper_dois = sqlx::query_scalar::<_, String>(
         "WITH RECURSIVE ancestry(id, depth) AS ( \
              SELECT $1::uuid, 0 \
              UNION \
@@ -103,16 +110,15 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
                AND d.source_type = 'claim' AND d.target_type = 'claim' \
                AND a.depth < 32 \
          ) \
-         SELECT p.doi FROM ancestry a \
+         SELECT DISTINCT p.doi FROM ancestry a \
          JOIN edges e ON e.target_id = a.id AND e.source_type = 'paper' \
               AND e.relationship = 'asserts' \
          JOIN papers p ON p.id = e.source_id \
-         ORDER BY a.depth, p.doi LIMIT 1",
+         ORDER BY p.doi",
     )
     .bind(claim_id)
-    .fetch_optional(pool)
-    .await?
-    .flatten();
+    .fetch_all(pool)
+    .await?;
 
     let ingestion_run_id = props
         .get("ingestion_run_id")
@@ -147,7 +153,7 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     };
 
     Ok(SourceKey {
-        paper_doi,
+        paper_dois,
         agent_id,
         ingestion_run_id,
         derivation_root,
@@ -160,7 +166,7 @@ mod tests {
 
     fn k(p: Option<&str>, a: Uuid, ir: Option<Uuid>, dr: Option<Uuid>) -> SourceKey {
         SourceKey {
-            paper_doi: p.map(str::to_string),
+            paper_dois: p.into_iter().map(str::to_string).collect(),
             agent_id: a,
             ingestion_run_id: ir,
             derivation_root: dr,
@@ -174,6 +180,23 @@ mod tests {
         let l = k(Some("10.1/x"), a1, None, None);
         let r = k(Some("10.1/x"), a2, None, None);
         assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
+    }
+
+    /// 50b19b4e: a claim asserted by two papers is same-source with a claim
+    /// from EITHER of them, not only with whichever DOI sorted first.
+    #[test]
+    fn any_shared_doi_in_a_multi_paper_key_is_same_source() {
+        let l = SourceKey {
+            paper_dois: vec!["10.1/only-a".into(), "10.2/shared".into()],
+            agent_id: Uuid::new_v4(),
+            ingestion_run_id: None,
+            derivation_root: None,
+        };
+        let r = k(Some("10.2/shared"), Uuid::new_v4(), None, None);
+        let other = k(Some("10.3/unrelated"), Uuid::new_v4(), None, None);
+        assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
+        assert!(is_same_source(&r, &l, SourceFilterConfig::default()));
+        assert!(!is_same_source(&l, &other, SourceFilterConfig::default()));
     }
 
     #[test]
