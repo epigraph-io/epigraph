@@ -193,6 +193,7 @@ pub mod reverse;
 pub mod system_agent;
 pub mod tables;
 pub mod team_group;
+pub mod workflow_submitter;
 
 use anyhow::{anyhow, bail, Context};
 use sqlx::PgConnection;

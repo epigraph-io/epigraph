@@ -597,6 +597,15 @@ pub fn read_ordered(
     }
     let mut ms = Vec::with_capacity(paths.len());
     for p in paths {
+        if super::workflow_submitter::is_manifest_file(p) {
+            bail!(
+                "{} is a set-workflow-submitter manifest; reverse it with \
+                 `epigraph-operator set-workflow-submitter --reverse {}` (it records workflow \
+                 submitters, not row tenancy)",
+                p.display(),
+                p.display()
+            );
+        }
         let m = if allow_truncated_tail {
             manifest::read_tolerating_truncated_tail(p)?
         } else {

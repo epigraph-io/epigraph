@@ -303,6 +303,21 @@ impl Writer {
 }
 
 impl Writer {
+    /// Append raw JSON lines (a manifest whose records are not row-tenancy
+    /// [`Record`]s, e.g. `set-workflow-submitter`'s), then flush and `fsync`.
+    ///
+    /// # Errors
+    /// A write or `fsync` fails.
+    pub fn append_values(&mut self, vs: &[Value]) -> anyhow::Result<usize> {
+        for v in vs {
+            self.write_line(v)?;
+        }
+        if !vs.is_empty() {
+            self.sync()?;
+        }
+        Ok(vs.len())
+    }
+
     /// Append POST-state records unconditionally, then flush and `fsync`.
     ///
     /// # Errors

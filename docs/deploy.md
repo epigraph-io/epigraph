@@ -2737,7 +2737,7 @@ the flags.
 | Area | Verbs |
 |---|---|
 | Humans and links | `register-human-operator`, `revoke-human-operator`, `link`, `retire-link`, `link-retired`, `link-legacy-authors`, `arm-operator-binding`, `register-system-agent`, `allow-author-binding-client`, `revoke-author-binding-client` |
-| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse` |
+| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse`, `set-workflow-submitter` (and its `--reverse`) |
 | Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede` |
 | Groups | `create-group`, `group-member add\|remove\|set-role`, `define-group-role`, `bind-group-role`, `end-group-role-binding`, `group-roster` |
 | Passkeys and elevation | `passkey-enroll`, `list-passkeys`, `revoke-passkey`, `end-elevation`, `list-elevations`, `verify-confirmations` |

@@ -59,6 +59,10 @@
 //!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
 //!         --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest reown-wf-1.jsonl [--apply]
+//!     epigraph-operator set-workflow-submitter (--ids-file F | --canonical-names-file F | \
+//!         --without-submitter) --submitter <agent> --operator <uuid> [--force-reassign] \
+//!         [--apply --confirm-count N --manifest-out wf-sub-1.jsonl --ruling TEXT --reason TEXT]
+//!     epigraph-operator set-workflow-submitter --reverse wf-sub-1.jsonl [--apply --reason TEXT]
 //!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
 //!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
 //!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
@@ -129,7 +133,7 @@ use epigraph_cli::operator::{
     self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
     group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows,
-    restrict, retire_link, reverse, system_agent, team_group,
+    restrict, retire_link, reverse, system_agent, team_group, workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -1206,6 +1210,54 @@ enum Command {
     /// scope until it expires; the next refresh drops it.
     RevokeClientScope(ScopeArgs),
     /// Restore every row a manifest's run moved to the owner it recorded.
+    /// Set or correct the recorded SUBMITTER (`metadata.epigraph_submitted_by`)
+    /// of selected `workflows` rows, audited; or reverse such a run
+    /// (`--reverse <manifest>`). Select with exactly one of --ids-file,
+    /// --canonical-names-file, --without-submitter. A row recording another
+    /// submitter is HELD unless --force-reassign. A dry run unless --apply,
+    /// which needs --confirm-count (the dry run's ELIGIBLE-WORKFLOW-ROWS),
+    /// --ruling, --reason and --manifest-out; one transaction and one
+    /// security_events row per run. Exits 3 when an --apply (or an applied
+    /// reversal) left a selected row unwritten.
+    #[command(group(
+        clap::ArgGroup::new("selector")
+            .required(true)
+            .args(["ids_file", "canonical_names_file", "without_submitter", "reverse"])
+    ))]
+    SetWorkflowSubmitter {
+        /// Workflow ids, one per line.
+        #[arg(long)]
+        ids_file: Option<PathBuf>,
+        /// Canonical names, one per line: every generation of each lineage.
+        #[arg(long)]
+        canonical_names_file: Option<PathBuf>,
+        /// Every workflow that records no submitter.
+        #[arg(long)]
+        without_submitter: bool,
+        /// Reverse a manifest an applied run wrote (compare-and-swap per row).
+        #[arg(long)]
+        reverse: Option<PathBuf>,
+        /// The agent to record as submitter.
+        #[arg(long, required_unless_present = "reverse", conflicts_with = "reverse")]
+        submitter: Option<Uuid>,
+        /// The registered human operator this act is made under (audited).
+        #[arg(long, required_unless_present = "reverse", conflicts_with = "reverse")]
+        operator: Option<Uuid>,
+        /// Replace a submitter another agent is recorded as.
+        #[arg(long, conflicts_with = "reverse")]
+        force_reassign: bool,
+        /// Where the undo record is written (create_new) under --apply.
+        #[arg(long, conflicts_with = "reverse")]
+        manifest_out: Option<PathBuf>,
+        #[arg(long, conflicts_with = "reverse")]
+        confirm_count: Option<usize>,
+        #[arg(long, default_value = "", conflicts_with = "reverse")]
+        ruling: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+        #[arg(long)]
+        apply: bool,
+    },
     ReownReverse {
         /// A manifest to reverse. Repeatable: several are applied newest-first
         /// by their header `created_at`, whatever order they are given in.
@@ -2740,6 +2792,55 @@ async fn main_inner() -> anyhow::Result<i32> {
             .await?;
             println!("{}", client_scope::describe(&outcome));
             Ok(0)
+        }
+        Command::SetWorkflowSubmitter {
+            ids_file,
+            canonical_names_file,
+            without_submitter,
+            reverse: reverse_manifest,
+            submitter,
+            operator: op,
+            force_reassign,
+            manifest_out,
+            confirm_count,
+            ruling,
+            reason,
+            apply,
+        } => {
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            if let Some(path) = reverse_manifest {
+                let r = workflow_submitter::reverse(
+                    &mut conn,
+                    &path,
+                    apply,
+                    &reason,
+                    &who,
+                    &mut stdout,
+                )
+                .await?;
+                return Ok(if apply && r.held > 0 { 3 } else { 0 });
+            }
+            let selection = if let Some(f) = ids_file {
+                workflow_submitter::Selection::Ids(workflow_submitter::read_ids_file(&f)?)
+            } else if let Some(f) = canonical_names_file {
+                workflow_submitter::Selection::CanonicalNames(reown_workflows::read_names_file(&f)?)
+            } else {
+                debug_assert!(without_submitter);
+                workflow_submitter::Selection::WithoutSubmitter
+            };
+            let opts = workflow_submitter::Options {
+                selection,
+                submitter: submitter.expect("clap requires --submitter"),
+                operator: op.expect("clap requires --operator"),
+                force_reassign,
+                apply,
+                confirm_count,
+                ruling,
+                reason,
+                manifest_out,
+            };
+            let report = workflow_submitter::run(&mut conn, &opts, &who, &mut stdout).await?;
+            Ok(workflow_submitter::exit_code(&report, &opts))
         }
         Command::ReownReverse {
             manifest,
