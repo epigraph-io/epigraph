@@ -337,3 +337,67 @@ async fn a_foreign_public_claim_still_takes_evidence_and_gets_no_divergence_row(
     let (a, b) = beta(&pool, claim).await;
     assert!(close(a, 1.0) && close(b, 1.0), "got ({a}, {b})");
 }
+
+/// Two Beta updates on one claim that overlap in time both land.
+///
+/// The shared step is `epigraph_engine::ds_divergence::apply_beta_update`, which
+/// both MCP DS tools and the REST route call. Transaction A adds (0.8, 0.2) and
+/// holds the row. Transaction B adds (0.5, 0.5) while A is still open, then A
+/// commits. A read-then-write update (the shape the step had when it was moved
+/// out of the REST handler) lets B read the pre-A `Beta(1, 1)`, wait on A's row
+/// lock, and store its stale sum `(1.5, 1.5)`, dropping A's increment. The
+/// in-statement addition stores `(2.3, 1.7)`.
+///
+/// `submit_ds_evidence` reaches this step before anything else locks the claim
+/// row, so two calls on one claim and different frames race exactly like this.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overlapping_beta_updates_on_one_claim_lose_no_increment(pool: PgPool) {
+    use epigraph_engine::ds_divergence::apply_beta_update;
+
+    let (_server, group, viewer) = app_role_server(&pool).await;
+    // One pool per transaction: on a shared pool B could wait for a
+    // connection instead of for A's row lock, and then read after A commits,
+    // which a read-then-write update survives too.
+    let url = fixture::database_url_for(&pool).await;
+    let pool_a =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool A");
+    let pool_b =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool B");
+    let claim = own_claim(&pool, group, "Two overlapping Beta updates both count.").await;
+
+    let mut a = pool_a.begin_as(&viewer).await.expect("stamped tx A");
+    let pa = apply_beta_update(&mut a, &viewer, claim, Some((0.8, 0.2)), "tx A")
+        .await
+        .expect("A's update");
+    assert!((pa - 1.8 / 3.0).abs() < 1e-9, "A sees its own update: {pa}");
+
+    let b = async {
+        let mut b = pool_b.begin_as(&viewer).await.expect("stamped tx B");
+        let pb = apply_beta_update(&mut b, &viewer, claim, Some((0.5, 0.5)), "tx B")
+            .await
+            .expect("B's update");
+        b.commit().await.expect("commit B");
+        pb
+    };
+    let commit_a_later = async move {
+        // Long enough for B to reach its statement while A still holds the row.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        a.commit().await.expect("commit A");
+    };
+    let (pb, ()) = tokio::join!(b, commit_a_later);
+
+    let (alpha, beta_param) = beta(&pool, claim).await;
+    assert!(
+        (alpha - 2.3).abs() < 1e-9 && (beta_param - 1.7).abs() < 1e-9,
+        "both increments must be stored: Beta(1,1) + (0.8,0.2) + (0.5,0.5) = (2.3, 1.7), \
+         got ({alpha}, {beta_param})"
+    );
+    assert!(
+        (pb - 2.3 / 4.0).abs() < 1e-9,
+        "B reports the posterior over both increments: {pb}"
+    );
+}
