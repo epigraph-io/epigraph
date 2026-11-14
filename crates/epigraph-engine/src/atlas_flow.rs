@@ -82,6 +82,21 @@ pub const EVIDENCE_REFUTES: &str = "refutes";
 /// belief fold reads exactly those.
 const BINARY_FRAME_SIZE: i32 = 2;
 
+/// How far outside [0, 1] a stored mass value may sit and still read as a
+/// mass: float residue from the combination arithmetic (a Θ of `-1e-17`, a
+/// singleton of `1 + 1e-12`). The same tolerance `epigraph_ds::mass` allows a
+/// BBA's sum. A value within it is clamped into [0, 1]; one further out, or
+/// not a finite number, makes the row unusable.
+const MASS_TOLERANCE: f64 = 1e-9;
+
+/// A stored mass value read under [`MASS_TOLERANCE`], clamped into [0, 1].
+fn tolerant_mass(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .filter(|m| m.is_finite() && (-MASS_TOLERANCE..=1.0 + MASS_TOLERANCE).contains(m))
+        .map(|m| m.clamp(0.0, 1.0))
+}
+
 /// The sign of a claim-to-claim link, from its lower-cased relationship:
 /// +1 for [`SUPPORTING_LINKS`], -1 for [`OPPOSING_LINKS`], 0 for anything
 /// else (`cites`, `qualifies`, the structural kinds).
@@ -134,7 +149,9 @@ pub fn link_strength(raw: Option<&serde_json::Value>, relationship: &str) -> f64
 /// at fold time, not stored). A singleton the BBA puts no mass on reads 0.
 ///
 /// `None` (the row is not usable) when the frame does not have exactly two
-/// hypotheses, or when `masses` is not an object of numbers in [0, 1].
+/// hypotheses, or when `masses` is not an object of numbers in [0, 1]. A
+/// value within [`MASS_TOLERANCE`] of [0, 1] is float residue, not a bad
+/// row: it reads clamped, so the result is always in [0, 1].
 #[must_use]
 pub fn exact_mass(row: &EvidenceMassRow, refutes: bool) -> Option<f64> {
     if row.hypothesis_count != BINARY_FRAME_SIZE {
@@ -143,10 +160,7 @@ pub fn exact_mass(row: &EvidenceMassRow, refutes: bool) -> Option<f64> {
     let masses = row.masses.as_object()?;
     let mut values = BTreeMap::new();
     for (key, value) in masses {
-        let m = value
-            .as_f64()
-            .filter(|m| m.is_finite() && (0.0..=1.0).contains(m))?;
-        values.insert(key.as_str(), m);
+        values.insert(key.as_str(), tolerant_mass(value)?);
     }
     let h = resolve_hypothesis_index(row.hypothesis_index, 2);
     let singleton = if refutes { 1 - h } else { h };
@@ -469,6 +483,39 @@ mod tests {
             None
         );
         assert_eq!(exact_mass(&mass(EV, A, 2, None, json!([0.5])), false), None);
+    }
+
+    #[test]
+    fn float_residue_is_a_mass_but_a_real_excursion_voids_the_row() {
+        // Residue on Θ keeps the row usable.
+        assert_eq!(
+            exact_mass(
+                &mass(EV, A, 2, None, json!({"0": 0.7, "1": 0.3, "0,1": -1e-17})),
+                false
+            ),
+            Some(0.7)
+        );
+        // Residue above 1 on the singleton reads as exactly 1, never 1 + ε.
+        assert_eq!(
+            exact_mass(&mass(EV, A, 2, None, json!({"0": 1.0 + 1e-12})), false),
+            Some(1.0)
+        );
+        assert_eq!(
+            exact_mass(&mass(EV, A, 2, None, json!({"1": -1e-12, "0": 1.0})), true),
+            Some(0.0)
+        );
+        // Beyond the tolerance it is a bad row, not residue.
+        assert_eq!(
+            exact_mass(
+                &mass(EV, A, 2, None, json!({"0": 0.7, "0,1": -1e-6})),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            exact_mass(&mass(EV, A, 2, None, json!({"0": 1.0 + 1e-6})), false),
+            None
+        );
     }
 
     #[test]
