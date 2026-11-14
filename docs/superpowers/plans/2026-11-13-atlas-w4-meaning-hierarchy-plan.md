@@ -27,6 +27,33 @@ the contract types are Rust.
 | `atlas_meaning_core.py compute --from DIR --out result.json` | anywhere (Python, no DB driver) | reads the export, writes the tree: group ids, parents, depth, leaf member claim ids, child ids |
 | `atlas_meaning apply --map M --from result.json [--apply]` | box (Rust bin) | re-reads everything in one snapshot, verifies, writes one run |
 
+**A run is the whole map.** The serving read takes the latest finished run of
+a map, so `apply` refuses a result whose themes are not exactly the themes the
+map draws with an embedded member in the apply snapshot
+(`embedded_theme_ids_on_map`, the same set `export` writes). To keep exports
+small, export in `--theme-id` batches into separate directories, compute each,
+and apply every batch's result at once with repeated `--from`
+(`files::merge_results` refuses batches that differ in map, hierarchy, cap,
+seed or library versions, or repeat a theme). Carrying unchanged themes
+forward from the previous run was rejected: it would serve trees checked
+against an older snapshot.
+
+**The export is owner-only.** Embeddings approximate claim text. `--out` is
+created 0700 when it does not exist; an existing directory must be empty with
+no group or other bits (it is refused, never chmod-ed); every file is created
+new with mode 0600, so no umask exposes it (W1 fixed the same class).
+
+**The result is checked, all of it.** Every id is re-minted, and the
+`versions` the compute records are typed (four keys, short version strings or
+null) before they go into the run's `params`.
+
+**Undo.** There is no `reverse` subcommand yet (deferred). A standalone
+`apply --apply` writes ONE new `atlas_map_runs` row and its levels, and as the
+map's latest finished run it is what is served. To undo it, delete that run
+row by the `run_id` the apply report prints, as the maintenance login; its
+levels go with it (`ON DELETE CASCADE`), and the previous finished run is
+served again. Nothing else is written.
+
 **The off-box rule.** The export holds claim ids, embeddings, and for each
 claim the list of its attachment nodes (its agents and evidence, after W3's
 per-claim cap) as small integers numbered per theme. No agent or evidence id,
@@ -186,6 +213,12 @@ the affected targets run, then restored and `touch`ed):
 | the binary's cap check removed | `the_binary_refuses_a_bad_map_or_cap_before_connecting` |
 | Python: clustering skipped (every split by claim-id position) | `test_the_tree_follows_the_embeddings` |
 | documents stored without `to_stored_json` and a child `r` of 0 | `every_document_validates_and_chains_to_its_parent`, `stored_level_documents_validate_against_the_contract` |
+| (review) export files written with `std::fs::write`, directory created with the default mode | `the_binary_export_is_owner_only_under_umask_022`, `export_files_are_created_new_and_owner_only`, `the_export_directory_must_be_owner_only_and_empty` |
+| (review) apply without the whole-map theme check | `apply_refuses_a_result_that_lacks_a_theme_the_map_draws` |
+| (review) `embedded_theme_ids_on_map` without the map predicate | `apply_refuses_a_result_that_lacks_a_theme_the_map_draws` |
+| (review) `ComputeVersions::check` a no-op | `a_result_with_arbitrary_versions_is_refused` |
+| (review) `leaf_membership` without the other-schema-version refusal | `leaf_membership_reads_back_every_claim` |
+| (review) `atlas_meaning` missing from the help lint's `BINS` | `every_env_backed_arg_hides_its_value` (the review ran it red) |
 
 Not mutation-proved (each asserts a direct property, with no separate code
 path to break): `labels_are_cut_to_the_contract_length`,
@@ -201,10 +234,19 @@ under CI's pins (`tests/requirements-ci.txt`: numpy 1.26.4, scikit-learn
 1.8.0, umap-learn 0.5.11), the versions it was generated with.
 
 **Not tested end to end**: an export from a database, computed by the
-Python core and applied back. The build hosts have no numpy, and each DB test
-database is thrown away, so the two halves meet through the committed fixture
-instead (the Rust writer reproduces the Python export bytes; the Python
-result passes the Rust tree check).
+Python core and applied back. The build hosts have no numpy, and CI's Python
+job has a database but no built binary, so the two halves meet through the
+committed fixture instead (the Rust writer reproduces the Python export bytes;
+the Python result passes the Rust tree check), and
+`the_binary_export_is_owner_only_under_umask_022` runs the box's export as the
+real binary on a fresh database. The first true compute-on-database run is the
+operator's first dry run (`apply` without `--apply`).
+
+**Left for later items.** Current members with no embedding are in no leaf
+(counted in the report and the run's `params`; W5's unlinked claims and W9's
+incremental assignment must handle them). One drifted theme refuses the whole
+apply, and `export` holds one snapshot across every theme it writes (W9's
+nightly decides how to retry).
 
 ## "Done when" → proof
 

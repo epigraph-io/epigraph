@@ -30,6 +30,12 @@
 //! it hides any earlier run's links levels (the nightly writes both into one
 //! run instead).
 //!
+//! Undo (there is no `reverse` subcommand yet): an `apply --apply` writes one
+//! `atlas_map_runs` row and its levels and nothing else. Deleting that row by
+//! the `run_id` the report prints, as the maintenance login, removes its
+//! levels too (`ON DELETE CASCADE`) and the previous finished run is served
+//! again.
+//!
 //! # Authority
 //!
 //! `MAINTENANCE_DATABASE_URL` must be SET (the fallback to `DATABASE_URL` is
