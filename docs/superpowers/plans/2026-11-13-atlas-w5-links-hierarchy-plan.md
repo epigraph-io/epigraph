@@ -126,6 +126,7 @@ to split, or a drifted link, fails it: export and compute again.
 CI's pins: numpy 1.26.4, scikit-learn 1.8.0, umap-learn 0.5.11, networkx 3.6.1):
 - `test_every_leaf_weight_is_within_the_cap` (shared agents, evidence);
 - `test_a_densely_linked_cluster_stays_in_one_leaf`;
+- `test_louvain_finds_dense_clusters_whatever_their_ids`;
 - `test_a_fitting_component_is_never_split_across_leaves`;
 - `test_parts_of_one_component_are_packed_together`;
 - `test_a_clique_over_the_cap_is_split_by_embedding`;
@@ -163,6 +164,7 @@ the affected targets run, then restored and `touch`ed):
 
 | Mutation | Tests that went red |
 |---|---|
+| Python: Louvain replaced by a halving by position | `test_louvain_finds_dense_clusters_whatever_their_ids` (added for it: on the realistic theme the affinity merge put the halves back together, so `test_a_densely_linked_cluster_stays_in_one_leaf` stayed green) |
 | Python: no connected-component cut (Louvain straight away) | `test_a_fitting_component_is_never_split_across_leaves` |
 | Python: no embedding fallback (cut a dense community in half by position) | `test_a_clique_over_the_cap_is_split_by_embedding`, the two fixture tests |
 | Python: unlinked claims in one bucket | `test_a_theme_with_no_links_mirrors_every_meaning_leaf`, and every test on the realistic theme (it is refused) |
@@ -185,6 +187,19 @@ the affected targets run, then restored and `touch`ed):
 | export writes every claim's embedding | `the_writer_reproduces_the_committed_export_bytes`, `no_co_owned_or_other_team_edge_counts_as_a_link` |
 | export numbers every meaning leaf 0 | `no_co_owned_or_other_team_edge_counts_as_a_link` |
 | apply without the theme-set check | `apply_refuses_a_forged_or_drifted_links_result` |
+| the binary's cap check removed | `the_binary_refuses_a_bad_map_or_cap_before_connecting` |
+
+Not mutation-proved (each asserts a direct property with no separate code
+path to break): `test_ids_match_the_golden_vector` and
+`links_ids_match_the_golden_vector` (W4's mint, already proved in W4),
+`a_links_result_with_arbitrary_versions_or_format_is_refused`,
+`batched_links_results_merge_only_when_they_agree`,
+`test_export_reader_refuses_a_truncated_embedding_file`,
+`test_a_mirror_over_the_cap_is_refused`, `test_a_claim_over_the_cap_alone_is_refused`,
+`test_a_theme_under_the_cap_is_one_root_leaf`,
+`test_a_theme_with_no_links_mirrors_every_meaning_leaf` (red under the
+one-bucket mutation only). The refusal of more than 128 root children has no
+test.
 
 **Not tested end to end:** a database export computed by the Python core
 and applied back (as for W4: the build hosts have no numpy; the halves meet

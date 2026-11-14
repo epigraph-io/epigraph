@@ -145,6 +145,31 @@ def test_a_densely_linked_cluster_stays_in_one_leaf(realistic):
         assert len(chain) == 1, f"chain {p} was cut"
 
 
+def test_louvain_finds_dense_clusters_whatever_their_ids():
+    """ONE connected component of four dense clusters of 45 claims (each 45
+    + 45 evidence = 90 nodes) joined by single bridges, the clusters' claims
+    interleaved in id order: only the community detection can separate them
+    (no cut by position or by component would), and each lands whole in one
+    leaf."""
+    t = Theme(180, seed=19)
+    rng = np.random.RandomState(4)
+    for i in range(180):
+        t.att[i] = [500 + i]
+    cluster = [list(range(k, 180, 4)) for k in range(4)]
+    for members in cluster:
+        for a in members:
+            for b in members:
+                if a < b and rng.rand() < 0.5:
+                    t.links.append((a, b))
+    for k in range(3):
+        t.links.append((cluster[k][0], cluster[k + 1][0]))
+    groups, _ = t.build()
+    leaf_of = _leaf_of(groups)
+    for k, members in enumerate(cluster):
+        assert len({leaf_of[t.ids[i]] for i in members}) == 1, f"cluster {k} was cut"
+    t.validate(groups)
+
+
 def test_a_fitting_component_is_never_split_across_leaves():
     """Four separate components of 30 claims (each 30 + 30 evidence = 60
     nodes, fits) in a theme of 240 nodes: each component lands whole in one
