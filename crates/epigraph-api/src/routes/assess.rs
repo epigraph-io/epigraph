@@ -19,6 +19,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// The `events.event_type` of the durable record each assess call writes
+/// (backlog 4a7f90f8): the calling agent as `actor_id`, and a payload of
+/// `claim_id`, `frame_id`, `mass_function_id`, `owner_agent_id`,
+/// `assessed_by`, `replaced` and `contested`.
+///
+/// The slot row names only its OWNER, so this record is the one durable place
+/// that says which agent wrote it. The writer of masses a call replaced is
+/// the `actor_id` of the previous record with the same `mass_function_id`,
+/// ordered by `graph_version` (drawn under the slot lock, so it is that slot's
+/// write order; `created_at` is not commit-ordered). Rows written before this
+/// record existed have no recoverable writer.
+///
+/// The payload carries ids and booleans only, never masses or BetP. Its
+/// `claim_id` is what lets the event list hide the record from a viewer who
+/// cannot read the claim. `POST /api/v1/events` accepts a caller-chosen type
+/// and `actor_id`, so a record of this type is an audit trail to cross-check
+/// against the slot row, not proof of authorship on its own.
+pub const ASSESSMENT_EVENT_TYPE: &str = "claim.assessed";
+
 // =============================================================================
 // REQUEST / RESPONSE TYPES
 // =============================================================================
@@ -83,7 +102,9 @@ pub struct AssessClaimResponse {
     /// to), or the caller itself when bound to none. One assessment per
     /// (claim, frame, owner).
     pub owner_agent_id: Option<Uuid>,
-    /// The agent that made this call (the row records the owner).
+    /// The agent that made this call. The slot row records the owner; this
+    /// agent is recorded durably as the `actor_id` of the call's
+    /// [`ASSESSMENT_EVENT_TYPE`] event.
     pub assessed_by: Option<Uuid>,
     /// The owner's earlier assessment this call replaced in place (the slot row
     /// keeps its id, `mass_function_id` above). Empty when the owner had none.
@@ -309,6 +330,26 @@ pub async fn assess_claim(
     };
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
     epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, slot, owner).await?;
+
+    // The claim's hypothesis on this frame, read before the slot transaction:
+    // whether this call contests the assessment it replaces is decided once,
+    // inside that transaction, and the durable record and the response both
+    // take that one value. Nothing below sets `hypothesis_index` (the
+    // `claim_frames` insert after the commit carries none), so reading it
+    // here is the same read as after the write.
+    let claim_assignment =
+        epigraph_db::FrameRepository::get_claim_assignment(pool, &viewer, claim_id, frame_id)
+            .await?;
+    let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
+    // Each replaced assessment, and whether this call reverses its direction:
+    // Bel(h) against Bel(not h) = 1 - Pl(h), so the sign does not depend on
+    // the frame's size (a 0.5 BetP threshold misreads a 3-way frame).
+    let direction = |m: &MassFunction| {
+        let (bel, pl, _, _) = super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx);
+        bel - (1.0 - pl)
+    };
+    let new_direction = direction(&mass_function);
+
     // The slot read and the slot upsert are ONE unit per (claim, frame, slot):
     // a transaction holding a transaction-scoped advisory lock on that key.
     // Unserialized, two concurrent calls by one owner could both read "no
@@ -335,7 +376,7 @@ pub async fn assess_claim(
     })?;
     // The owner's assessment this call replaces: exactly the row the upsert
     // below overwrites.
-    let replaced_rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> =
+    let replaced_assessments: Vec<ReplacedAssessment> =
         epigraph_db::MassFunctionRepository::get_for_claim_frame(
             &mut *slot_tx,
             &viewer,
@@ -345,7 +386,19 @@ pub async fn assess_claim(
         .await?
         .into_iter()
         .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
-        .map(|row| (row.id, row.source_agent_id, row.masses))
+        .map(|row| {
+            let old = MassFunction::from_json_masses(ds_frame.clone(), &row.masses).ok();
+            ReplacedAssessment {
+                mass_function_id: row.id,
+                source_agent_id: row.source_agent_id,
+                prior_pignistic_prob: old
+                    .as_ref()
+                    .map(|m| super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx).2),
+                contested: old
+                    .as_ref()
+                    .is_some_and(|m| direction(m) * new_direction < 0.0),
+            }
+        })
         .collect();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         &mut *slot_tx,
@@ -365,6 +418,31 @@ pub async fn assess_claim(
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
+    // The durable record of who wrote this assessment, and whether it replaced
+    // and contested the owner's earlier one (backlog 4a7f90f8): in the slot
+    // transaction, so it commits exactly when the write does, and strict (a
+    // failed insert refuses the call) because a record that can silently go
+    // missing leaves the write untraced, the defect it exists to close. The
+    // challenge event's savepoint-wrapped `publish_or_log_conn` is the wrong
+    // contract here for that reason.
+    epigraph_db::EventRepository::insert_on(
+        &mut *slot_tx,
+        ASSESSMENT_EVENT_TYPE,
+        caller,
+        &serde_json::json!({
+            "claim_id": claim_id,
+            "frame_id": frame_id,
+            "mass_function_id": mf_id,
+            "owner_agent_id": owner,
+            "assessed_by": caller,
+            "replaced": !replaced_assessments.is_empty(),
+            "contested": replaced_assessments.iter().any(|r| r.contested),
+        }),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("record the assessment's writer: {e}"),
+    })?;
     slot_tx
         .commit()
         .await
@@ -478,39 +556,11 @@ pub async fn assess_claim(
         )?
     };
 
-    // Compute belief/plausibility for the claim's hypothesis
-    let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, &viewer, claim_id, frame_id)
-            .await?;
-    let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
-
+    // Compute belief/plausibility for the claim's hypothesis (`h_idx` was
+    // read before the slot transaction).
     let (final_bel, final_pl, final_betp, m_missing) =
         super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
 
-    // Each replaced assessment, and whether this call reverses its direction:
-    // Bel(h) against Bel(not h) = 1 - Pl(h), so the sign does not depend on
-    // the frame's size (a 0.5 BetP threshold misreads a 3-way frame).
-    let direction = |m: &MassFunction| {
-        let (bel, pl, _, _) = super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx);
-        bel - (1.0 - pl)
-    };
-    let new_direction = direction(&mass_function);
-    let replaced_assessments: Vec<ReplacedAssessment> = replaced_rows
-        .iter()
-        .map(|(id, source, masses)| {
-            let old = MassFunction::from_json_masses(ds_frame.clone(), masses).ok();
-            ReplacedAssessment {
-                mass_function_id: *id,
-                source_agent_id: *source,
-                prior_pignistic_prob: old
-                    .as_ref()
-                    .map(|m| super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx).2),
-                contested: old
-                    .as_ref()
-                    .is_some_and(|m| direction(m) * new_direction < 0.0),
-            }
-        })
-        .collect();
     // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
     let m_empty = combination::fold_conflict(&combined, &reports);
 
