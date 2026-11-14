@@ -61,7 +61,25 @@ const STEPS: [&str; 6] = [
 
 /// Assert the two preconditions every arm here depends on: the workflow's
 /// `executes` edges tie on `created_at`, and its steps' UUID order is not plan order.
+///
+/// The tie is RESTORED first. The MCP walk now attests each edge at INSERT
+/// (backlog `dae795f8`), and an attested edge carries the writer's clock, not the
+/// transaction's `NOW()`, so a signed plan's `executes` edges no longer tie:
+/// they ascend in plan order, and a time-keyed reader would return plan order
+/// by coincidence. An unsigned walk (an API with no key configured, every
+/// legacy row) still ties, and the readers must be right on that data too, so
+/// the tie is put back as such a walk writes it. That voids the edges'
+/// signatures, which nothing in this file reads.
 async fn assert_tie_and_scramble(pool: &PgPool, workflow_id: Uuid, plan: &[&str]) {
+    sqlx::query(
+        "UPDATE edges SET created_at = (SELECT min(created_at) FROM edges \
+                                          WHERE source_id = $1 AND relationship = 'executes') \
+          WHERE source_id = $1 AND relationship = 'executes'",
+    )
+    .bind(workflow_id)
+    .execute(pool)
+    .await
+    .unwrap();
     let distinct_edge_ts: i64 = sqlx::query_scalar(
         "SELECT count(DISTINCT e.created_at) FROM edges e \
          WHERE e.source_id = $1 AND e.relationship = 'executes'",
@@ -72,9 +90,8 @@ async fn assert_tie_and_scramble(pool: &PgPool, workflow_id: Uuid, plan: &[&str]
     .unwrap();
     assert_eq!(
         distinct_edge_ts, 1,
-        "PRECONDITION: every executes edge of one plan must share ONE created_at (the plan is \
-         written in one transaction). If this fails the walk is no longer transactional and \
-         this file tests nothing"
+        "PRECONDITION: every executes edge of one plan must share ONE created_at (restored \
+         above as an unsigned walk writes it). If this fails this file tests nothing"
     );
 
     let by_id: Vec<String> = sqlx::query_scalar(

@@ -67,6 +67,7 @@ async fn lineage_assigned_to_level_2_and_3_only(pool: PgPool) {
 
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -190,6 +191,7 @@ async fn caller_supplied_lineage_uuid_preserved(pool: PgPool) {
 
     let _result = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )

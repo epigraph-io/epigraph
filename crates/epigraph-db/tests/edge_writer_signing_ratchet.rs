@@ -222,8 +222,6 @@ const BULK_STAGING_COPY: &str = "one INSERT .. SELECT statement copies every app
      signed primitive with the API key, not yet threaded";
 const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signer";
 const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key";
-const NO_KEY_EXECUTOR: &str = "epigraph-ingest-executor is pure-DB and holds no key; its MCP \
-     and HTTP callers would sign through the returned edge ids";
 const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
      analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
      signing caller must receive the edge id";
@@ -268,7 +266,11 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // (`ClaimIngestRepository::record_signed_conn`), registered PRIMITIVE like the
 // `EdgeRepository` twins: unsigned only when a caller passes no key, and both
 // of its callers pass the walk's key.
-const UNSIGNED_SITES_HIGH_WATER: usize = 49;
+// 39: the epigraph-ingest-executor shard. Its ten sites (the plan walk's
+// three, add_step's six, the AUTHORED record's one) take the entry point's
+// key and call the signed twins; the MCP tools pass the server's key and the
+// HTTP routes the API's.
+const UNSIGNED_SITES_HIGH_WATER: usize = 39;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -639,19 +641,19 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-ingest-executor/src/authorship.rs",
         "record_caller_authorship",
         1,
-        Unsigned(NO_KEY_EXECUTOR),
+        Signed,
     ),
     site(
         "crates/epigraph-ingest-executor/src/workflow.rs",
         "execute_plan",
         3,
-        Unsigned(NO_KEY_EXECUTOR),
+        Signed,
     ),
     site(
         "crates/epigraph-ingest-executor/src/workflow_steps.rs",
         "add_step",
         6,
-        Unsigned(NO_KEY_EXECUTOR),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/claim_helper.rs",
