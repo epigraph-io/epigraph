@@ -2645,6 +2645,37 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **219**: public `workflow_endpoint_tenancy` (backlog 630af617, item 3).
+  A `workflow` edge endpoint contributes its own row's tenancy (183's
+  `workflows.owner_group_id`, `visibility`) to the edge's meet. Re-states
+  070's `epigraph_node_tenancy(uuid, text)` with a `workflow` arm and 168's
+  `epigraph_propagate_tenancy()` with a `workflows` LEFT JOIN per endpoint
+  (nothing else in either body changes; CREATE OR REPLACE keeps owner and
+  ACL, and the owner is re-set). Re-meets, once, every edge with a
+  group-private workflow endpoint under the propagation's rules (group meet
+  only, never widening) and RAISEs a NOTICE with the counts by relationship
+  and transition. So a group plan's `variant_of`, `AUTHORED` and `executes`
+  edges (onto a public step or atom too) are the plan's group's, and an edge
+  from a group plan onto another group's claim is co-owned. Adds the boolean
+  SECURITY DEFINER `epigraph_step_lineage_has_hidden_executor(uuid)` on 172's
+  form (owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and
+  granted to `epigraph_app`) for the `evolve_step` authority gates, which
+  could no longer see a hidden plan's `executes` edge. Registered in
+  `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS` and the grant register).
+  Pinned by `epigraph-db/tests/workflow_endpoint_tenancy.rs`,
+  `epigraph-db/tests/workflow_endpoint_tenancy_undo.rs`,
+  `epigraph-api/tests/workflow_ingest_group_tenancy.rs` (HTTP and MCP, on the
+  application role), `epigraph-api/tests/privatization_workflow_rows.rs` and
+  `epigraph-cli/tests/operator_reown_workflows.rs`. Must run as the
+  maintenance role or a superuser (it refuses otherwise). Undo:
+  `docs/runbooks/219-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 219, both bodies byte for byte); edges 219 narrowed stay
+  narrowed. Checked before claiming: no migration on main, origin branch or
+  local worktree re-states either function after 168, and the slot was
+  assigned to this batch. **Deploy order:** migrate before rolling out the
+  219 binary (its `evolve_step` gates call the definer); undo only after
+  rolling every 219 binary back. **Applied to throwaway databases only, NOT
+  to any deployed database.**
 
 ## `-- no-transaction` migrations
 
