@@ -730,16 +730,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AtlasLayoutRepository::run",
         ],
     ),
-    // open finding: F-aggregate-existence-oracles (the two decomposes_to
-    // counts deciding center_kind).
-    (
-        "graph_neighborhood.rs",
-        "claim_compound_neighborhood",
-        &[
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
-        ],
-    ),
     // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
     // with `/claims/:id/placement`) and the neighborhood id in that run.
     (

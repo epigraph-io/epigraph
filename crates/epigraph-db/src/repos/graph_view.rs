@@ -509,7 +509,9 @@ impl GraphViewRepository {
     ///
     /// All four `edges` reads are filtered. `center_atoms`' positive arm and
     /// its `NOT EXISTS` carry the SAME predicate, so the centre is "its
-    /// readable children, or itself when it has none". The projection
+    /// readable children, or itself when it has none"; and
+    /// [`Self::center_decomposition`] uses that predicate too, so the centre's
+    /// reported kind and the neighbour set describe one graph. The projection
     /// `LEFT JOIN edges d` carries it in the `ON`: an atom whose parent edge is
     /// hidden stands as itself rather than projecting onto that parent.
     ///
@@ -584,6 +586,40 @@ impl GraphViewRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Whether `claim_id` has a `decomposes_to` child, and whether it has a
+    /// `decomposes_to` parent, counting only edges the viewer can read.
+    ///
+    /// Backs `center_kind` in `GET /api/v1/claims/:id/compound_neighborhood`.
+    /// The handler ran these as two inline `COUNT(*)`s over unfiltered `edges`,
+    /// so a hidden edge between two public claims turned a standalone centre
+    /// into a `compound` or an `atom` (`F-aggregate-existence-oracles`). Two
+    /// `EXISTS` in one statement, each carrying the same edge predicate as
+    /// [`Self::compound_neighbors`]' `center_atoms`, so the reported kind and
+    /// the neighbour set describe one graph.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn center_decomposition<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<(bool, bool), DbError> {
+        let sql = viewer.splice(
+            "SELECT \
+               EXISTS (SELECT 1 FROM edges ch WHERE ch.source_id = $1 \
+                         AND ch.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:ch} */), \
+               EXISTS (SELECT 1 FROM edges pa WHERE pa.target_id = $1 \
+                         AND pa.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:pa} */)",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (bool, bool)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Claim nodes of an arbitrary id set, for `load_subgraph`.

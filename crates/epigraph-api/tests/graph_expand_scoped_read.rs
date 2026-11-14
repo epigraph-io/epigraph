@@ -730,3 +730,74 @@ async fn compound_neighborhood_of_an_invisible_centre_is_the_same_404_as_a_missi
     .0;
     assert_eq!(out.center_id, secret);
 }
+
+/// `center_kind` describes the decomposition the VIEWER can see
+/// (`F-aggregate-existence-oracles`).
+///
+/// A `decomposes_to` edge the viewer cannot read, between two PUBLIC claims, must
+/// not turn a centre into a `compound` or an `atom`: that would tell the caller a
+/// hidden edge exists. Only the edge predicate can withhold these edges (both
+/// endpoints are public), so this arm observes it directly. The calibration
+/// centre has its child edge private to the viewer's own group and must still be
+/// a `compound`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compound_neighborhood_center_kind_ignores_a_decomposition_the_viewer_cannot_read(
+    pool: PgPool,
+) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "gx-ck-mine").await;
+    let (_stranger, stranger_group) = seed_agent_with_group(&pool, "gx-ck-theirs").await;
+
+    let hidden_children = seed_public_claim(&pool, viewer_agent, "gx ck: hidden child").await;
+    let hidden_parent = seed_public_claim(&pool, viewer_agent, "gx ck: hidden parent").await;
+    let my_compound = seed_public_claim(&pool, viewer_agent, "gx ck: my compound").await;
+    let a = seed_public_claim(&pool, viewer_agent, "gx ck: a").await;
+    let b = seed_public_claim(&pool, viewer_agent, "gx ck: b").await;
+    let m = seed_public_claim(&pool, viewer_agent, "gx ck: m").await;
+
+    for (source, target, owner) in [
+        (hidden_children, a, stranger_group),
+        (b, hidden_parent, stranger_group),
+        (my_compound, m, viewer_group),
+    ] {
+        let id = seed_decomposes_to(&pool, source, target).await;
+        sqlx::query(
+            "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("force decomposes_to edge private");
+    }
+
+    async fn kind(pool: &PgPool, agent: Uuid, center: Uuid) -> String {
+        let out = claim_compound_neighborhood(
+            ViewerExtractor(viewer_for(pool, agent).await),
+            State(split_state(pool).await),
+            Path(center),
+            Query(CompoundNeighborhoodParams { budget: 50 }),
+        )
+        .await
+        .expect("the centre is public, so this must SERVE")
+        .0;
+        assert_eq!(out.nodes.first().map(|n| n.id), Some(center));
+        out.nodes[0].kind.clone()
+    }
+
+    assert_eq!(
+        kind(&pool, viewer_agent, my_compound).await,
+        "compound",
+        "CALIBRATION: a child edge private to the viewer's own group makes a compound"
+    );
+    assert_eq!(
+        kind(&pool, viewer_agent, hidden_children).await,
+        "standalone",
+        "a centre whose only child edge is hidden must be standalone to this viewer"
+    );
+    assert_eq!(
+        kind(&pool, viewer_agent, hidden_parent).await,
+        "standalone",
+        "a centre whose only parent edge is hidden must be standalone to this viewer"
+    );
+}

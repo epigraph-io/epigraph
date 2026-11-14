@@ -610,23 +610,12 @@ pub async fn claim_compound_neighborhood(
     let kept = rows.into_iter().take(budget as usize);
 
     // Determine the kind of the center: compound if it has children;
-    // standalone if no decomposes_to in either direction; else atom.
-    let has_children: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
-    )
-    .bind(claim_id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(internal)?
-        > 0;
-    let has_parent: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM edges WHERE target_id = $1 AND relationship = 'decomposes_to'",
-    )
-    .bind(claim_id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(internal)?
-        > 0;
+    // standalone if no decomposes_to in either direction; else atom. Both
+    // probes count only edges the viewer can read.
+    let (has_children, has_parent) =
+        epigraph_db::GraphViewRepository::center_decomposition(&mut *read, &viewer, claim_id)
+            .await
+            .map_err(internal)?;
     let center_kind = match (has_children, has_parent) {
         (true, _) => "compound",
         (false, true) => "atom",
