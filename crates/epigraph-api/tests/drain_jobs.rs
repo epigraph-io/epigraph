@@ -587,6 +587,133 @@ async fn an_unregistered_job_type_at_the_head_of_the_queue_does_not_wedge_the_dr
     );
 }
 
+/// `--cancel-pending` is the supported way out of exit 4 on an instance that
+/// will never register a type: the named type's PENDING rows end `cancelled`
+/// with the fixed message, the run reports them per type, the job of another
+/// type still runs, and the run exits 0 instead of 4. A row of that type in
+/// any other state is untouched.
+///
+/// A type the run HAS a handler for is refused before any write: its pending
+/// job is left exactly as it was, and so is a stale `running` row the reaper
+/// would otherwise have reset (the refusal precedes the reap).
+#[sqlx::test(migrations = "../../migrations")]
+async fn cancel_pending_clears_an_unregistered_type_and_refuses_a_registered_one(pool: PgPool) {
+    let stranded = enqueue(
+        &pool,
+        EpiGraphJob::EmbeddingGeneration {
+            claim_id: Uuid::new_v4(),
+        },
+    )
+    .await;
+    let finished = enqueue(
+        &pool,
+        EpiGraphJob::EmbeddingGeneration {
+            claim_id: Uuid::new_v4(),
+        },
+    )
+    .await;
+    sqlx::query("UPDATE jobs SET state = 'failed', error_message = 'earlier' WHERE id = $1")
+        .bind(finished)
+        .execute(&pool)
+        .await
+        .expect("mark the second embedding job failed");
+    let cluster = enqueue(
+        &pool,
+        EpiGraphJob::ClusterGraph {
+            resolution: 1.0,
+            retain_runs: 5,
+        },
+    )
+    .await;
+    // A stale `running` cluster job: the reaper resets it on any run that
+    // reaches the reap.
+    let stale = enqueue(
+        &pool,
+        EpiGraphJob::ClusterGraph {
+            resolution: 1.0,
+            retain_runs: 5,
+        },
+    )
+    .await;
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '3 hours' WHERE id = $1",
+    )
+    .bind(stale)
+    .execute(&pool)
+    .await
+    .expect("make the cluster job stale");
+
+    let scoped = maintenance_scoped(&pool).await;
+    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+
+    // Refused: `cluster_graph` has a handler in this run.
+    let refused = jobs_drain::drain_cancelling(
+        &runner,
+        &queue,
+        Duration::from_secs(600),
+        &[
+            "embedding_generation".to_string(),
+            "cluster_graph".to_string(),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(epigraph_jobs::JobError::PermanentFailure { .. })
+        ),
+        "a registered type was accepted for cancellation: {refused:?}"
+    );
+    assert_eq!(job_state(&pool, cluster).await.0, "pending");
+    assert_eq!(
+        job_state(&pool, stranded).await.0,
+        "pending",
+        "a refused run still cancelled the unregistered type"
+    );
+    assert_eq!(
+        job_state(&pool, stale).await.0,
+        "running",
+        "a refused run wrote (it reaped) before refusing"
+    );
+
+    // Accepted: only the unregistered type.
+    let report = jobs_drain::drain_cancelling(
+        &runner,
+        &queue,
+        Duration::from_secs(600),
+        &["embedding_generation".to_string()],
+    )
+    .await
+    .expect("the drain ran");
+    assert_eq!(
+        report.cancelled_unregistered,
+        std::collections::BTreeMap::from([("embedding_generation".to_string(), 1_i64)]),
+        "{report:?}"
+    );
+    assert_eq!(
+        job_state(&pool, stranded).await,
+        (
+            "cancelled".to_string(),
+            Some(jobs_drain::CANCELLED_UNREGISTERED_MESSAGE.to_string())
+        )
+    );
+    assert_eq!(
+        job_state(&pool, finished).await,
+        ("failed".to_string(), Some("earlier".to_string())),
+        "a row that was not pending was rewritten"
+    );
+    assert_eq!(job_state(&pool, cluster).await.0, "completed");
+    assert!(
+        report.pending_unregistered.is_empty(),
+        "the cancelled rows were still reported pending: {report:?}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        0,
+        "a run that cancelled the only unclaimable type did not exit clean: {report:?}"
+    );
+}
+
 /// A drain-test handler whose every attempt fails with `error`.
 struct FailsWith {
     job_type: &'static str,

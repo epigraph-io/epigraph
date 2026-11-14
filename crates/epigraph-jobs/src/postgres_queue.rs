@@ -700,6 +700,44 @@ impl PostgresJobQueue {
         Ok(rows.into_iter().collect())
     }
 
+    /// Set every `pending` job whose type is in `job_types` to `cancelled`,
+    /// with `error_message = message`, and return how many of each type it
+    /// cancelled (one `UPDATE`). Rows in any other state are untouched, so a
+    /// job a run is executing, or one already finished, is never rewritten.
+    ///
+    /// The caller decides which types may be cancelled: `drain_jobs
+    /// --cancel-pending` passes only types its run has NO handler for
+    /// (`jobs_drain::drain_cancelling` refuses any other), so this never
+    /// discards work the queue could still do.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self, message))]
+    pub async fn cancel_pending_of_types(
+        &self,
+        job_types: &[String],
+        message: &str,
+    ) -> Result<std::collections::BTreeMap<String, i64>, JobError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "WITH cancelled AS ( \
+                UPDATE jobs \
+                   SET state = 'cancelled', error_message = $2, \
+                       updated_at = now(), completed_at = now() \
+                 WHERE state = 'pending' AND job_type = ANY($1) \
+                RETURNING job_type \
+             ) \
+             SELECT job_type, count(*) FROM cancelled GROUP BY job_type",
+        )
+        .bind(job_types)
+        .bind(message)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to cancel pending jobs: {e}"),
+        })?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The drain timer's reaper (`drain_jobs`, operator decision D9): reset
     /// every `running` row whose `started_at` is older than `stale_threshold`,
     /// COUNTING the reap as a used attempt, and fail the row outright once its

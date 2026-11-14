@@ -32,8 +32,13 @@
 //! `claims.embedding`; it outranks 3); 3 out of time with work still pending.
 //! The report is JSON on stdout. It writes no audit event of its own.
 //!
-//! Usage: `drain_jobs [--max-runtime <DURATION>]`, where DURATION is seconds
-//! or a number with `s`, `m`/`min` or `h`. `DATABASE_URL` and
+//! An instance that will never register a type clears its exit 4 with
+//! `--cancel-pending <TYPE>` (repeatable): the run sets that type's pending
+//! jobs `cancelled` (`cancelled_unregistered` in the report) before draining.
+//! It refuses, exit 1 with no write, a type this run has a handler for.
+//!
+//! Usage: `drain_jobs [--max-runtime <DURATION>] [--cancel-pending <TYPE>]...`,
+//! where DURATION is seconds or a number with `s`, `m`/`min` or `h`. `DATABASE_URL` and
 //! `MAINTENANCE_DATABASE_URL` come from the environment (the unit's 0600
 //! EnvironmentFile); neither is ever printed.
 
@@ -44,9 +49,11 @@ use epigraph_api::jobs_drain::{self, DrainReport};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: drain_jobs [--max-runtime <DURATION>]\n\
+        "usage: drain_jobs [--max-runtime <DURATION>] [--cancel-pending <TYPE>]...\n\
          Drains the job queue once on MAINTENANCE_DATABASE_URL (which must be set).\n\
-         DURATION: seconds, or a number with s, m/min or h (default 50min)."
+         DURATION: seconds, or a number with s, m/min or h (default 50min).\n\
+         --cancel-pending: cancel the pending jobs of TYPE first; refused for a type\n\
+         this run has a handler for."
     );
     std::process::exit(1);
 }
@@ -66,6 +73,37 @@ fn parse_duration(s: &str) -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
+/// The parsed command line: `--max-runtime` and every `--cancel-pending` type.
+#[derive(Debug, PartialEq, Eq)]
+struct Args {
+    max_runtime: Duration,
+    cancel_pending: Vec<String>,
+}
+
+/// `None` on any unknown flag, a missing value, or an unparseable duration.
+fn parse_args(mut args: impl Iterator<Item = String>) -> Option<Args> {
+    let mut parsed = Args {
+        max_runtime: jobs_drain::DEFAULT_MAX_RUNTIME,
+        cancel_pending: Vec::new(),
+    };
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--max-runtime" => parsed.max_runtime = parse_duration(&args.next()?)?,
+            "--cancel-pending" => {
+                let t = args.next()?;
+                if t.trim().is_empty() || t.starts_with("--") {
+                    return None;
+                }
+                if !parsed.cancel_pending.contains(&t) {
+                    parsed.cancel_pending.push(t);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(parsed)
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("ERROR: drain_jobs: {msg}");
     std::process::exit(1);
@@ -81,20 +119,10 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let mut max_runtime = jobs_drain::DEFAULT_MAX_RUNTIME;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--max-runtime" => {
-                max_runtime = args
-                    .next()
-                    .as_deref()
-                    .and_then(parse_duration)
-                    .unwrap_or_else(|| usage());
-            }
-            _ => usage(),
-        }
-    }
+    let Args {
+        max_runtime,
+        cancel_pending,
+    } = parse_args(std::env::args().skip(1)).unwrap_or_else(|| usage());
 
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         fail("DATABASE_URL is not set (it names the database the maintenance DSN must match)")
@@ -175,9 +203,9 @@ async fn main() {
         embedder,
         provider,
     );
-    let report = jobs_drain::drain(&runner, &queue, max_runtime)
+    let report = jobs_drain::drain_cancelling(&runner, &queue, max_runtime, &cancel_pending)
         .await
-        .unwrap_or_else(|e| fail(&format!("the drain stopped on a queue error: {e}")));
+        .unwrap_or_else(|e| fail(&format!("the drain stopped: {e}")));
     println!(
         "{}",
         serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
@@ -189,8 +217,45 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_duration;
+    use super::{parse_args, parse_duration, Args};
     use std::time::Duration;
+
+    fn args(v: &[&str]) -> Option<Args> {
+        parse_args(v.iter().map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn cancel_pending_is_repeatable_and_needs_a_type() {
+        assert_eq!(
+            args(&[
+                "--cancel-pending",
+                "embedding_generation",
+                "--max-runtime",
+                "10m",
+                "--cancel-pending",
+                "legacy_type",
+                "--cancel-pending",
+                "embedding_generation",
+            ]),
+            Some(Args {
+                max_runtime: Duration::from_secs(600),
+                cancel_pending: vec!["embedding_generation".into(), "legacy_type".into()],
+            })
+        );
+        assert_eq!(
+            args(&[]).map(|a| a.cancel_pending),
+            Some(Vec::<String>::new())
+        );
+        for bad in [
+            &["--cancel-pending"][..],
+            &["--cancel-pending", ""],
+            &["--cancel-pending", "--max-runtime", "10m"],
+            &["--max-runtime"],
+            &["--cancel"],
+        ] {
+            assert_eq!(args(bad), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn max_runtime_accepts_the_unit_file_spellings() {
