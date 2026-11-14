@@ -128,15 +128,35 @@ What the producer and the page must keep (W10, and the nightly builder):
 - A link target or breadcrumb pointing at a level that awaits (re)naming carries a
   null `name` (those objects have no `needs_naming` flag).
 - Search and `#c-` links into a nested theme land on the claim's leaf only once
-  that leaf has been fetched; a claim-to-leaf lookup is not in the contract yet.
+  that leaf has been fetched. The claim-to-leaf lookup now exists (contract
+  `atlas_claim_leaf` v1, `contract/atlas_claim_leaf/v1/schema.json`, checker
+  `tests/common/atlas_claim_leaf.rs`): `GET <data-atlas-claim-leaf-url><map
+  key>/<hierarchy>/<claim id>` answers which leaf holds a claim the viewer can
+  read. `atlas.js` does not call it yet.
 
 With a map list, the picked map sets each theme's name and count, and a theme the
 map does not draw shows "Not on this map" and opens onto nothing. Theme and region
 positions, region names and the links between themes stay on the viewer's own
-layout. `/atlas` does not carry the attribute yet (the level routes are backlog
-W10), so its regions and themes behave exactly as before. The drawing rules live in
+layout. The drawing rules live in
 `static/atlas_nested.js`. They are pure functions, tested with
 `node --test js-tests/atlas_nested.test.cjs` (no dependencies).
+
+**The real routes (backlog W10).** `/atlas` asks the kernel which maps the viewer
+can see (`GET /api/v1/atlas/maps`, then each map's themes and roots) and renders
+them as `data-atlas-maps`: team maps first, then the public map, each keyed
+`team-<32 hex>` or `public`, with `level_url` `/bff/atlas/maps/<key>/`. When the
+kernel lists no map, or the calls fail, the attribute is left out and the regions
+and themes behave exactly as before. The level route
+`/bff/atlas/maps/{key}/{hierarchy}/{id}` passes the kernel's answer through (the
+kernel filters each leaf for the viewer's own session) and:
+- compresses it, gzip or br as the client accepts: the reverse proxy does not, and
+  the 150 KB level budget is gzip bytes;
+- answers `Cache-Control: private, no-cache`, `Vary: Cookie` and a weak ETag
+  `W/"<run id>.<level id>.<digest of the bytes served>"`, and a matching
+  `If-None-Match` gets a 304 only after the kernel has answered 200 for this
+  viewer;
+- answers the contract's `bff_not_found` body for an absent, unreadable or
+  forbidden level and for a key, hierarchy or id that names nothing.
 
 **Fixture preview.** To try the nested levels with no API and no database:
 
