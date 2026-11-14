@@ -232,7 +232,10 @@ impl RunOut {
 #[derive(Debug, Serialize)]
 pub struct RegionOut {
     pub id: Uuid,
-    pub label: String,
+    /// Absent on the guest surface ([`Labels::Withheld`]): a region label is
+    /// built from its themes' stored labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub x: f64,
     pub y: f64,
     pub r: f64,
@@ -244,10 +247,10 @@ pub struct RegionOut {
 }
 
 impl RegionOut {
-    fn of(r: &VisibleRegionRow, with_ids: bool) -> Self {
+    fn of(r: &VisibleRegionRow, with_ids: bool, labels: Labels) -> Self {
         Self {
             id: r.id,
-            label: clip_label(&r.label),
+            label: labels.show(&r.label),
             x: r.x,
             y: r.y,
             r: r.r,
@@ -261,7 +264,12 @@ impl RegionOut {
 #[derive(Debug, Serialize)]
 pub struct ThemeOut {
     pub id: Uuid,
-    pub label: String,
+    /// The stored theme label. NOT viewer-scoped: it may be derived from
+    /// members the caller cannot read (residual
+    /// `D-PR16-theme-cluster-viewer-scope`), so it is absent on the guest
+    /// surface ([`Labels::Withheld`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     pub region_id: Option<Uuid>,
     /// `"shared"` or `"viewer"`; `null` for a theme listed under
     /// `region_id=unplaced`, which has no position of either kind.
@@ -272,10 +280,10 @@ pub struct ThemeOut {
 }
 
 impl ThemeOut {
-    fn of(t: &VisibleThemeRow) -> Self {
+    fn of(t: &VisibleThemeRow, labels: Labels) -> Self {
         Self {
             id: t.theme_id,
-            label: clip_label(&t.label),
+            label: labels.show(&t.label),
             region_id: t.region_id,
             placement: match t.placement {
                 ThemePlacement::Unplaced => None,
@@ -371,15 +379,57 @@ enum Level {
     Unplaced,
 }
 
+/// Whether a layout answer carries the stored theme and region labels.
+///
+/// A theme's stored label is not viewer-scoped: the labeller samples members
+/// with no visibility predicate, so a label may be derived from claims the
+/// caller cannot read, and a region label is built from its themes' labels.
+/// A signed-in caller gets them (the residual is recorded on
+/// `D-PR16-theme-cluster-viewer-scope`). The guest surface (backlog
+/// `1deb9dbf`) is anonymous, so it withholds them and refuses the unplaced
+/// list, which is ordered by label and whose cursor carries the label bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Labels {
+    /// The signed-in routes: labels as stored, clipped.
+    Stored,
+    /// The guest routes: no theme or region label.
+    Withheld,
+}
+
+impl Labels {
+    fn show(self, label: &str) -> Option<String> {
+        match self {
+            Self::Stored => Some(clip_label(label)),
+            Self::Withheld => None,
+        }
+    }
+}
+
 /// `GET /api/v1/graph/themes/layout`
 pub async fn themes_layout(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Query(q): Query<LayoutQuery>,
 ) -> Result<Response, ApiError> {
+    themes_layout_as(&viewer, &state, q, Labels::Stored).await
+}
+
+/// The body of [`themes_layout`] for `viewer`, shared with the guest route
+/// (`routes::guest::themes_layout`, which passes [`Labels::Withheld`]).
+pub(crate) async fn themes_layout_as(
+    viewer: &epigraph_db::Viewer,
+    state: &AppState,
+    q: LayoutQuery,
+    labels: Labels,
+) -> Result<Response, ApiError> {
     // 1. Validate everything before touching the database.
     let level = match q.region_id.as_deref().map(str::trim) {
         None => Level::Top,
+        Some("unplaced") if labels == Labels::Withheld => {
+            return Err(bad_request(
+                "the unplaced list is not served without a sign-in",
+            ));
+        }
         Some("unplaced") => Level::Unplaced,
         Some(s) => Level::Region(
             Uuid::try_parse(s)
@@ -426,7 +476,7 @@ pub async fn themes_layout(
 
     // 2. The caller's stamped connection.
     let mut read = state
-        .read_as(&viewer)
+        .read_as(viewer)
         .await
         .map_err(|e| scoped_read_failed(e, "themes_layout"))?;
 
@@ -453,7 +503,7 @@ pub async fn themes_layout(
         Level::Top => {
             let overview = AtlasLayoutRepository::overview(
                 &mut read,
-                &viewer,
+                viewer,
                 run.id,
                 rels.as_deref(),
                 links_after,
@@ -467,7 +517,7 @@ pub async fn themes_layout(
                 overview
                     .regions
                     .iter()
-                    .map(|r| RegionOut::of(r, true))
+                    .map(|r| RegionOut::of(r, true, labels))
                     .collect()
             };
             Ok(private_json(TopLevelResponse {
@@ -491,7 +541,7 @@ pub async fn themes_layout(
             };
             let detail = AtlasLayoutRepository::region_detail(
                 &mut read,
-                &viewer,
+                viewer,
                 run.id,
                 region_id,
                 rels.as_deref(),
@@ -508,8 +558,12 @@ pub async fn themes_layout(
                 run: RunOut::of(&run),
                 status: None,
                 relationships,
-                region: Some(RegionOut::of(&detail.region, false)),
-                themes: detail.themes.iter().map(ThemeOut::of).collect(),
+                region: Some(RegionOut::of(&detail.region, false, labels)),
+                themes: detail
+                    .themes
+                    .iter()
+                    .map(|t| ThemeOut::of(t, labels))
+                    .collect(),
                 links: fold_links(&detail.links),
                 next: NextOut {
                     themes: detail.next_themes.map(|c| c.encode()),
@@ -520,7 +574,7 @@ pub async fn themes_layout(
         Level::Unplaced => {
             let page = AtlasLayoutRepository::unplaced_themes(
                 &mut read,
-                &viewer,
+                viewer,
                 run.id,
                 themes_after_unplaced,
                 limit,
@@ -532,7 +586,11 @@ pub async fn themes_layout(
                 status: None,
                 relationships,
                 region: None,
-                themes: page.themes.iter().map(ThemeOut::of).collect(),
+                themes: page
+                    .themes
+                    .iter()
+                    .map(|t| ThemeOut::of(t, labels))
+                    .collect(),
                 links: Vec::new(),
                 next: NextOut {
                     themes: page.next.map(|c| c.encode()),
@@ -799,7 +857,10 @@ mod tests {
 
     #[test]
     fn an_unplaced_theme_serialises_placement_as_null() {
-        let v = |p| serde_json::to_value(ThemeOut::of(&theme_row(p))).unwrap()["placement"].clone();
+        let v = |p| {
+            serde_json::to_value(ThemeOut::of(&theme_row(p), Labels::Stored)).unwrap()["placement"]
+                .clone()
+        };
         assert_eq!(v(ThemePlacement::Shared), serde_json::json!("shared"));
         assert_eq!(v(ThemePlacement::Viewer), serde_json::json!("viewer"));
         assert_eq!(v(ThemePlacement::Unplaced), serde_json::Value::Null);
