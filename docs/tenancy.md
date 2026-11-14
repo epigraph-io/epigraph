@@ -1369,7 +1369,8 @@ Two consequences to know:
 * readers of the roster TABLE itself (the REST group routes, the consolidate
   act's membership test, a profile's detail check) see explicit rows only, so
   a derived member is refused there; use `group-roster` to see who holds a
-  group through its bindings;
+  group through its bindings (`MEMBER` lines) next to its explicit rows
+  (`DIRECT` lines);
 * an explicit membership is never granted on the strength of a derived one:
   `group-member add` of a teammate's agent still requires the teammate's own
   explicit writer row (GRP03), so no explicit row outlives a window.
