@@ -40,7 +40,11 @@
 //! on `pool` under the caller's `viewer`, so the merge cannot widen what the
 //! viewer may see; theme rows carry no tenancy, and only their ids are used.
 //! A failed theme leg degrades to the ANN page on Auto, and to the text
-//! fallback on Hierarchical, the same way a failed ANN leg does.
+//! fallback on Hierarchical, the same way a failed ANN leg does. A query
+//! vector at a dimension other than 1536 fails the 1536-d ANN read first, so
+//! Auto and Similarity drop to the text fallback before the theme leg runs;
+//! on Hierarchical the theme read refuses any dimension but 1536 or 3072 and
+//! drops to the text fallback the same way.
 
 use epigraph_core::ClaimId;
 use epigraph_db::{ClaimListFilter, ClaimRepository, ClaimThemeRepository, PgPool, ScopedPool};

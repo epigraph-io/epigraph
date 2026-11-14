@@ -283,6 +283,13 @@ async fn auto_route_merges_theme_member_when_ann_is_weak(pool: PgPool) {
 /// page runs tells the outsider how many hidden rows sit near its query (the
 /// ranking side channel backlog a507966d closed on the ANN leg). The
 /// `limit = 1` case pins that the slot goes to the visible member.
+///
+/// This pins the MEMBER level only. The theme shortlist itself
+/// (`find_similar_themes_at_dim`, 3 nearest centroids) is not viewer-scoped:
+/// themes made up only of claims an outsider cannot read can still take the
+/// shortlist slots, so whether a page carries theme-leg hits says something
+/// about which themes sit near the query. Theme rows carry no tenancy, and
+/// `recall_with_context` and the REST diverse route share that posture.
 #[sqlx::test(migrations = "../../migrations")]
 async fn theme_leg_never_returns_a_claim_the_viewer_cannot_read(pool: PgPool) {
     let c = seed(&pool).await;
@@ -384,4 +391,100 @@ async fn auto_route_skips_theme_leg_when_ann_is_strong(pool: PgPool) {
         ids(&got)
     );
     assert!(!ids(&got).contains(&c.member.to_string()));
+}
+
+/// Break the theme read alone: every theme-leg query reads
+/// `claim_themes.centroid`, and nothing on the ANN, text, belief, dispute or
+/// audit paths does.
+async fn break_theme_read(pool: &PgPool) {
+    sqlx::query("ALTER TABLE claim_themes RENAME COLUMN centroid TO centroid_broken")
+        .execute(pool)
+        .await
+        .expect("rename centroid");
+}
+
+/// A failed theme leg degrades instead of erroring, and differently per route.
+///
+/// - Auto still holds a valid ANN page and must serve it. The query text
+///   "theme member" would make the text fallback return the theme member, so
+///   an Auto that dropped to text search instead serves the wrong page.
+/// - Hierarchical has no ANN page and must fall back to text search: "near
+///   claim a" matches exactly one visible claim. A Hierarchical that served
+///   the empty theme page instead returns nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn failed_theme_leg_degrades_per_route(pool: PgPool) {
+    let c = seed(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, c.outsider)
+        .await
+        .expect("viewer");
+    break_theme_read(&pool).await;
+
+    let auto = recall_routed(
+        &pool,
+        &scoped,
+        &viewer,
+        &embedder(),
+        "theme member",
+        2,
+        0.0,
+        RecallRoute::Auto,
+    )
+    .await
+    .expect("Auto must degrade, not error");
+    let got = ids(&auto);
+    assert_eq!(got.len(), 2, "Auto serves the ANN page: {got:?}");
+    assert!(got.contains(&c.ann_a.to_string()), "{got:?}");
+    assert!(got.contains(&c.ann_b.to_string()), "{got:?}");
+    assert!(auto.iter().all(|r| !r.via_theme_traversal), "{got:?}");
+
+    let hier = recall_routed(
+        &pool,
+        &scoped,
+        &viewer,
+        &embedder(),
+        "near claim a",
+        10,
+        0.0,
+        RecallRoute::Hierarchical,
+    )
+    .await
+    .expect("Hierarchical must degrade, not error");
+    assert_eq!(
+        ids(&hier),
+        vec![c.ann_a.to_string()],
+        "Hierarchical falls back to the text search"
+    );
+}
+
+/// A query vector at a dimension the theme read does not support (768, not
+/// 1536 or 3072) is `InvalidData` from the theme read; Hierarchical, which
+/// skips the ANN leg, must degrade to the text search rather than error or
+/// serve an empty page. (On Auto and Similarity the 1536-d ANN read rejects
+/// the vector first, which is the pre-existing text-fallback path.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn hierarchical_unsupported_dimension_falls_back_to_text(pool: PgPool) {
+    let c = seed(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, c.outsider)
+        .await
+        .expect("viewer");
+    let narrow = FixedEmbedder(
+        vec![0.5f32; 768],
+        MockProvider::new(EmbeddingConfig::openai(768)),
+    );
+    let got = recall_routed(
+        &pool,
+        &scoped,
+        &viewer,
+        &narrow,
+        "near claim a",
+        10,
+        0.0,
+        RecallRoute::Hierarchical,
+    )
+    .await
+    .expect("an unsupported dimension must degrade, not error");
+    assert_eq!(ids(&got), vec![c.ann_a.to_string()]);
+    assert!(got.iter().all(|r| !r.via_theme_traversal));
 }
