@@ -935,11 +935,32 @@ pub struct CorpusScope {
     pub themes_total: usize,
 }
 
+/// Backlog a2991ea6: the diverse pipeline's theme candidate query
+/// (`claims_in_themes_at_dim_since`) has no DOI predicate, so the combination
+/// used to succeed and drop the filter, except on the flat-ANN fallback, where
+/// it applied. Refused until a DOI predicate is wired into the theme reads.
+fn reject_diverse_with_paper_doi_filter(params: &RecallWithContextParams) -> Result<(), McpError> {
+    if params.diverse.unwrap_or(false) && params.paper_doi_filter.is_some() {
+        return Err(invalid_params(
+            "paper_doi_filter cannot be combined with diverse=true: the diverse theme \
+             pipeline has no DOI predicate and would ignore the filter; set diverse=false \
+             (flat ANN) to restrict hits to one paper"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn recall_with_context(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: RecallWithContextParams,
 ) -> Result<CallToolResult, McpError> {
+    // Before any read or the embedding call, so a refused combination costs
+    // no embedding and is reported as invalid_params even with the embedder
+    // down.
+    reject_diverse_with_paper_doi_filter(&params)?;
+
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
@@ -1193,18 +1214,9 @@ async fn recall_with_context_post_embed(
         .transpose()
         .map_err(invalid_params)?;
 
-    // Backlog a2991ea6: the diverse pipeline's theme candidate query
-    // (`candidates_in_themes_at_dim`) has no DOI predicate, so the
-    // combination used to succeed and drop the filter, except on the
-    // flat-ANN fallback, where it applied. Same entry-point reason as above.
-    if params.diverse.unwrap_or(false) && params.paper_doi_filter.is_some() {
-        return Err(invalid_params(
-            "paper_doi_filter cannot be combined with diverse=true: the diverse theme \
-             pipeline has no DOI predicate and would ignore the filter; set diverse=false \
-             (flat ANN) to restrict hits to one paper"
-                .to_string(),
-        ));
-    }
+    // Backlog a2991ea6. Also checked in `recall_with_context` before the
+    // embedding call; repeated here for the same entry-point reason as above.
+    reject_diverse_with_paper_doi_filter(params)?;
 
     // Every read of the pipeline on ONE connection stamped with the caller's
     // viewer: on the plain pool row security admits public rows only, so a
