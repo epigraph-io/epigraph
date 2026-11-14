@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -1040,6 +1039,81 @@ impl IngestTx<'_> {
     }
 }
 
+/// Embed the claims a document ingest just CREATED, in a detached task, and
+/// store each vector as the ingest wrote the claim: stamped from the
+/// ingesting `author`, widened by the ingest's team-write `grant`.
+///
+/// The claims used to go through `McpEmbedder::embed_and_store`, whose store
+/// path resolves a claim's author by reading the row as PUBLIC. A document
+/// ingest's claims have gone to the author's team (or stayed private) by
+/// default since the 2026-11-10 visibility ruling, never silently public, so
+/// for a default ingest that read found nothing and every background embed
+/// was refused with only a WARN (backlog 46902f71). `submit_claim`, `memorize`
+/// and workflow ingest were each moved off that path for this reason; the two
+/// document walkers were not.
+///
+/// `embed_queue` holds only claims this ingest inserted (a dedup-converged
+/// claim never enters it), so the ingesting author is the writer of every
+/// row. A server on a DECLARED privileged pool has no `ScopedPool` to stamp;
+/// there the embedder's own store path (the privileged pool) is the right one,
+/// as before.
+///
+/// Best-effort (CLAUDE.md "Embedding policy"): a failure is warned with its
+/// cause and the claim stays stored.
+fn spawn_ingest_embeds(
+    server: &EpiGraphMcpFull,
+    author: Uuid,
+    grant: Option<epigraph_db::TeamWriteGrant>,
+    embed_queue: Vec<(Uuid, String)>,
+    tool_name: &'static str,
+) {
+    if embed_queue.is_empty() {
+        return;
+    }
+    // The whole server, as the detached walk takes it: the stamped store needs
+    // its `ScopedPool` and its embedder, and reaches the pool only inside
+    // `claim_helper`, where every author-stamped store already does.
+    let bg = server.clone();
+    tokio::spawn(async move {
+        let (mut stored, total) = (0usize, embed_queue.len());
+        for (id, content) in embed_queue {
+            let embedded = if bg.scoped.is_some() {
+                crate::claim_helper::embed_claim_author_stamped_for(
+                    &bg,
+                    author,
+                    id,
+                    &content,
+                    None,
+                    tool_name,
+                    grant.as_ref(),
+                )
+                .await
+            } else {
+                // A DECLARED privileged pool: no stamp to take; the embedder's
+                // own store path is that pool.
+                bg.embedder.embed_and_store(id, &content).await
+            };
+            if embedded {
+                stored += 1;
+            } else {
+                tracing::warn!(
+                    tool = tool_name,
+                    "background embedding failed for claim {id}"
+                );
+            }
+        }
+        if stored < total {
+            tracing::warn!(
+                tool = tool_name,
+                stored,
+                queued = total,
+                "document ingest embedded fewer claims than it queued; the rest are current \
+                 claims with no vector until a backfill reaches them"
+            );
+        }
+    });
+}
+
 async fn begin_ingest_tx<'p>(
     server: &'p EpiGraphMcpFull,
     author: crate::write_identity::WriteIdentity,
@@ -1773,16 +1847,13 @@ pub async fn do_ingest_document_reporting(
     // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
     // invariant (every is_current claim has an embedding) is satisfied eventually.
     let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    spawn_ingest_embeds(
+        server,
+        agent_id,
+        resolution.grant().cloned(),
+        embed_queue,
+        "ingest_document",
+    );
 
     let tenancy = IngestTenancy {
         visibility: resolution.label(),
@@ -2702,16 +2773,13 @@ pub async fn do_ingest_document_spine(
 
     // ── 6. Detach embeddings ──
     let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    spawn_ingest_embeds(
+        server,
+        agent_id,
+        resolution.grant().cloned(),
+        embed_queue,
+        "ingest_document_spine",
+    );
 
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
