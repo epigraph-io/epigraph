@@ -500,8 +500,8 @@ mod tests {
                 }
             }
         }
-        for h in 0..2 {
-            let got: BTreeSet<Uuid> = leaf_of[h].keys().copied().collect();
+        for (h, leaves) in leaf_of.iter().enumerate() {
+            let got: BTreeSet<Uuid> = leaves.keys().copied().collect();
             assert_eq!(got, claims.iter().copied().collect(), "hierarchy {h}");
         }
         // Leaf ids differ by hierarchy anyway; compare the neighbour sets.
@@ -510,7 +510,10 @@ mod tests {
             .windows(2)
             .filter(|w| together(0, w[0], w[1]) != together(1, w[0], w[1]))
             .count();
-        assert!(moved > claims.len() / 4, "only {moved} neighbour pairs moved");
+        assert!(
+            moved > claims.len() / 4,
+            "only {moved} neighbour pairs moved"
+        );
     }
 
     /// Every link a viewer can follow lands on a level of the set: a
@@ -533,7 +536,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("switch of {id} resolves"));
             assert_ne!(twin.hierarchy, l.hierarchy);
             assert_eq!(twin.depth(), depth, "the twin is at the same depth");
-            assert_eq!(envelope(&twin.doc).2.level_id, id, "twins point at each other");
+            assert_eq!(
+                envelope(&twin.doc).2.level_id,
+                id,
+                "twins point at each other"
+            );
             if let Some(p) = l.parent {
                 assert!(has(l.hierarchy, p), "parent of {id}");
             }

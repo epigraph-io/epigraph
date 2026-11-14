@@ -135,7 +135,10 @@ fn the_bff_verdict_is_p95_and_an_empty_case_fails() {
     );
     assert_eq!(
         got,
-        vec![("leaf", Way::Br, Temp::Warm), ("root", Way::Gzip, Temp::Cold)]
+        vec![
+            ("leaf", Way::Br, Temp::Warm),
+            ("root", Way::Gzip, Temp::Cold)
+        ]
     );
 }
 
@@ -303,7 +306,12 @@ fn check(h: &Hit, l: &Level, way: Way) {
                 l.name,
                 way.name()
             );
-            assert_eq!(decode(want, &h.body), l.body, "{} decodes to the fixture", l.name);
+            assert_eq!(
+                decode(want, &h.body),
+                l.body,
+                "{} decodes to the fixture",
+                l.name
+            );
         }
     }
 }
@@ -420,7 +428,11 @@ fn print_table(r: &Value) {
             row["p95_ms"],
             row["max_ms"],
             row["budget_ms"],
-            if row["pass"] == json!(true) { "ok" } else { "OVER" }
+            if row["pass"] == json!(true) {
+                "ok"
+            } else {
+                "OVER"
+            }
         );
     }
 }

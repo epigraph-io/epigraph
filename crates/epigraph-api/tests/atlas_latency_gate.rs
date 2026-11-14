@@ -206,9 +206,7 @@ fn verdict(
         .iter()
         .filter_map(|&(kind, temp)| {
             let b = budget(kind, temp);
-            let p95 = samples
-                .get(&(kind, temp))
-                .and_then(|xs| quantile(xs, 0.95));
+            let p95 = samples.get(&(kind, temp)).and_then(|xs| quantile(xs, 0.95));
             match p95 {
                 Some(p) if p <= b => None,
                 _ => Some(Breach {
@@ -406,15 +404,18 @@ async fn seed(pool: &PgPool, scale: Scale) -> Seeded {
     let mut theme_ids = Vec::new();
     let mut theme_claims: Vec<Vec<Uuid>> = Vec::new();
     for t in 0..scale.themes {
-        let id: Uuid = sqlx::query_scalar(
-            "INSERT INTO claim_themes (label) VALUES ($1) RETURNING id",
-        )
-        .bind(format!("latency theme {t}"))
-        .fetch_one(pool)
-        .await
-        .expect("seed theme");
+        let id: Uuid =
+            sqlx::query_scalar("INSERT INTO claim_themes (label) VALUES ($1) RETURNING id")
+                .bind(format!("latency theme {t}"))
+                .fetch_one(pool)
+                .await
+                .expect("seed theme");
         theme_ids.push(id);
-        theme_claims.push((0..scale.claims_per_theme).map(|_| Uuid::new_v4()).collect());
+        theme_claims.push(
+            (0..scale.claims_per_theme)
+                .map(|_| Uuid::new_v4())
+                .collect(),
+        );
     }
 
     // Claims, in batches of whole themes.
@@ -666,8 +667,15 @@ async fn hit(c: &reqwest::Client, base: &str, path: &str, token: &str) -> Hit {
 /// What a request asks for and how its answer is checked.
 #[derive(Debug, Clone)]
 enum Ask {
-    Level { h: Hierarchy, id: Uuid },
-    ClaimLeaf { h: Hierarchy, claim: Uuid, leaf: Uuid },
+    Level {
+        h: Hierarchy,
+        id: Uuid,
+    },
+    ClaimLeaf {
+        h: Hierarchy,
+        claim: Uuid,
+        leaf: Uuid,
+    },
     Themes,
     Maps,
 }
@@ -824,10 +832,7 @@ async fn measure(pool: &PgPool, s: &Seeded, scale: Scale, delay: Option<&Delay>)
                 let h = hit(&c, &srv.base, &ask.path(s.team), &token).await;
                 let id = check_answer(ask, &h, s);
                 keep(id, &h.body, &mut bodies);
-                samples
-                    .entry((kind, Temp::Warm))
-                    .or_default()
-                    .push(h.took);
+                samples.entry((kind, Temp::Warm)).or_default().push(h.took);
             }
         }
     }
@@ -849,10 +854,7 @@ async fn measure(pool: &PgPool, s: &Seeded, scale: Scale, delay: Option<&Delay>)
             let h = hit(&c, &srv.base, &ask.path(s.team), &token).await;
             let id = check_answer(ask, &h, s);
             keep(id, &h.body, &mut bodies);
-            samples
-                .entry((kind, Temp::Cold))
-                .or_default()
-                .push(h.took);
+            samples.entry((kind, Temp::Cold)).or_default().push(h.took);
         }
     }
 
@@ -935,7 +937,11 @@ fn print_table(r: &Value) {
             row["p95_ms"],
             row["max_ms"],
             row["budget_ms"],
-            if row["pass"] == json!(true) { "ok" } else { "OVER" }
+            if row["pass"] == json!(true) {
+                "ok"
+            } else {
+                "OVER"
+            }
         );
     }
 }
