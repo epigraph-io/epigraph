@@ -108,6 +108,65 @@ fn the_fixtures_cover_team_and_public_maps_and_every_flow_basis() {
     }
 }
 
+/// The common case is in a committed file the view's tests can load: most
+/// evidence edges carry no readable mass and are `none` with sign 0, a
+/// `refutes` one included (its direction is only in the relationship name),
+/// some keep their `exact` mass, and some evidence is attached to its
+/// claims only through `none` edges.
+#[test]
+fn a_fixture_has_evidence_with_no_readable_mass() {
+    let AtlasLevel::Leaf(l) =
+        serde_json::from_slice::<AtlasLevel>(&fixture("team_leaf_sparse_mass")).unwrap()
+    else {
+        panic!("team_leaf_sparse_mass is a leaf")
+    };
+    assert_eq!(l.map_scope, MapScope::Team);
+    let v = fixture_value("team_leaf_sparse_mass");
+    let evidence: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "evidence")
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    let ev_edges: Vec<_> = l
+        .edges
+        .iter()
+        .filter(|e| evidence.contains(&e.source.to_string().as_str()))
+        .collect();
+    let none = ev_edges
+        .iter()
+        .filter(|e| e.flow_basis == FlowBasis::None)
+        .count();
+    let exact = ev_edges
+        .iter()
+        .filter(|e| e.flow_basis == FlowBasis::Exact)
+        .count();
+    assert!(none > exact && exact > 0, "{none} none, {exact} exact");
+    for rel in ["supports", "refutes"] {
+        assert!(
+            ev_edges.iter().any(|e| e.flow_basis == FlowBasis::None
+                && e.relationship.eq_ignore_ascii_case(rel)
+                && e.sign == 0
+                && e.flow_weight == 0.0),
+            "a none {rel} evidence edge"
+        );
+    }
+    assert!(
+        evidence.iter().any(|id| {
+            let mine: Vec<_> = ev_edges
+                .iter()
+                .filter(|e| e.source.to_string() == *id)
+                .collect();
+            !mine.is_empty() && mine.iter().all(|e| e.flow_basis == FlowBasis::None)
+        }),
+        "evidence attached only through none edges"
+    );
+    if let Err(e) = check_as("team_leaf_sparse_mass", &fixture("team_leaf_sparse_mass")) {
+        panic!("{e:#?}");
+    }
+}
+
 #[test]
 fn the_fixtures_fit_the_budget() {
     for stem in LEVEL_FIXTURES {
@@ -395,6 +454,65 @@ fn index_where(v: &Value, f: impl Fn(&Value, &Value) -> bool) -> usize {
         .unwrap()
 }
 
+/// Most stored evidence-to-claim edges have no mass the map's audience can
+/// read, so they are served `none`, weight 0, sign 0. A leaf whose every
+/// evidence edge is such passes the helper, and its evidence nodes still
+/// count as attached to their claims. With a weight or a sign, the same edge
+/// fails, on the schema alone and not on its basis.
+#[test]
+fn the_helper_accepts_an_evidence_edge_with_no_readable_mass() {
+    for stem in ["team_leaf_dense", "public_leaf"] {
+        let v = fixture_value(stem);
+        let n = v["edges"].as_array().unwrap().len();
+        let evidence: Vec<usize> = (0..n)
+            .filter(|&i| edge_is(&v, i, |s, t| s == "evidence" && t == "claim"))
+            .collect();
+        assert!(evidence.len() > 1, "{stem}: evidence edges to flip");
+        let body = mutated(stem, |v| {
+            for &i in &evidence {
+                v["edges"][i]["flow_basis"] = json!("none");
+                v["edges"][i]["flow_weight"] = json!(0.0);
+                v["edges"][i]["sign"] = json!(0);
+            }
+        });
+        if let Err(e) = check_as(stem, &body) {
+            panic!("{stem}: {e:#?}");
+        }
+        let i = evidence[0];
+        for (w, sign) in [(0.5, 0), (0.0, 1), (0.0, -1), (0.4, 1)] {
+            let body = mutated(stem, |v| {
+                v["edges"][i]["flow_basis"] = json!("none");
+                v["edges"][i]["flow_weight"] = json!(w);
+                v["edges"][i]["sign"] = json!(sign);
+            });
+            let errs = check_as(stem, &body).expect_err("a weighted or signed none edge");
+            assert!(errs.iter().any(|e| e.starts_with("schema")), "{errs:#?}");
+            let doc: AtlasLevel = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                invariant_errors(&doc),
+                Vec::<String>::new(),
+                "{stem} weight {w} sign {sign}: the basis is allowed"
+            );
+        }
+    }
+}
+
+/// Whether the endpoint kinds of edge `i` of `v` satisfy `f`.
+fn edge_is(v: &Value, i: usize, f: impl Fn(&Value, &Value) -> bool) -> bool {
+    let nodes = v["nodes"].as_array().unwrap();
+    let kind = |id: &Value| {
+        nodes
+            .iter()
+            .find(|n| &n["id"] == id)
+            .map(|n| n["kind"].clone())
+            .unwrap()
+    };
+    f(
+        &kind(&v["edges"][i]["source"]),
+        &kind(&v["edges"][i]["target"]),
+    )
+}
+
 /// Every rule the kernel's `validate` enforces beyond the schema, each as a
 /// schema-valid mutation that this helper must refuse with an invariant
 /// error naming it. A rule the helper stops checking fails here.
@@ -415,12 +533,10 @@ fn the_helper_enforces_every_kernel_invariant() {
         ),
         (
             "team_leaf_dense",
-            "Evidence to Claim is Exact, not None",
+            "Evidence to Claim is Exact or None, not Proxy",
             |v| {
                 let i = index_where(v, |s, t| s == "evidence" && t == "claim");
-                v["edges"][i]["flow_basis"] = json!("none");
-                v["edges"][i]["flow_weight"] = json!(0.0);
-                v["edges"][i]["sign"] = json!(0);
+                v["edges"][i]["flow_basis"] = json!("proxy");
             },
         ),
         (
