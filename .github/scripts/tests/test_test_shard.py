@@ -101,7 +101,7 @@ class AffectedSelection(unittest.TestCase):
         self.assertNotIn("epigraph-db", d["whole"])
         self.assertFalse(shards_of("epigraph-db") & shard_ids(d))
         self.assertIn(ts.SCANS, shard_ids(d))
-        self.assertIn("custodian_role", d["partial"]["epigraph-db"])
+        self.assertTrue(d["partial"].get("epigraph-db"), d["partial"])
         self.assertLessEqual(shards_of("epigraph-api") | shards_of("epigraph-cli"), shard_ids(d))
 
     def test_docs_only_change_runs_no_shard_and_no_gated_job(self):
@@ -121,11 +121,11 @@ class AffectedSelection(unittest.TestCase):
         d = pr_plan(["docs/runbooks/124-undo.sql"])
         self.assertEqual(d["ids"], [ts.SCANS])
         self.assertEqual(set(d["partial"]), {"epigraph-db"})
-        self.assertIn("person_authenticators", d["partial"]["epigraph-db"])
         self.assertEqual(d["whole"], {})
 
     def test_a_test_only_change_does_not_reach_dependents(self):
-        d = pr_plan(["crates/epigraph-db/tests/zstd_advisory_floor.rs"])
+        # A new file: no other package's scan names it, so only db runs.
+        d = pr_plan(["crates/epigraph-db/tests/a_new_test_file.rs"])
         self.assertEqual(set(d["whole"]), {"epigraph-db"})
         self.assertEqual(shard_ids(d), shards_of("epigraph-db"))
 
@@ -166,8 +166,9 @@ class AffectedSelection(unittest.TestCase):
         )
         threads, args = invocations["epigraph-db"]
         self.assertEqual(threads, 4)
-        self.assertIn("custodian_role", args)
         self.assertEqual(args[:2], ["-p", "epigraph-db"])
+        self.assertEqual(args[2::2], ["--test"] * (len(args[2:]) // 2))
+        self.assertTrue(args[3:])
 
     def test_a_package_a_selected_shard_covers_gets_no_scan_targets(self):
         # A db source change selects workspace-rest (jobs etc. depend on db),

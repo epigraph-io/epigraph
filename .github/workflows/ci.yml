@@ -52,8 +52,9 @@ jobs:
   # the shards of the packages the change can affect: packages with changed
   # files, everything that depends on them, and the test targets whose source
   # scans read a changed file (run together in one `source-scans` shard). A
-  # docs-only change runs no shard at all. test-shard.py's docstring has the
-  # rules; its `affected --base <ref>` mode prints the selection locally.
+  # change no Rust source reads (most docs, Python outside scripts/) runs no
+  # shard at all. test-shard.py's docstring has the rules; its
+  # `affected --base <ref>` mode prints the selection locally.
   #
   # The FULL plan still runs on every push to main, on the staging and
   # integration PRs (head branch integration/**, staging/**, backlog/base-*,
