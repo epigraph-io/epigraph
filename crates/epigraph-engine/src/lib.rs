@@ -108,7 +108,7 @@ pub use reasoning::{
     Contradiction, IndirectChallenge, ReasoningClaim, ReasoningEdge, ReasoningEngine,
     ReasoningResult, ReasoningStats, SupportCluster, TransitiveSupport,
 };
-pub use recall::{recall, RecallError, RecallResult};
+pub use recall::{recall, recall_routed, RecallError, RecallResult, RecallRoute};
 pub use reconciliation::{
     cluster_obstructions, extract_cospan, reconcile, ClusterSummary, ReconciliationConfig,
     ReconciliationResult,
