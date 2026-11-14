@@ -235,8 +235,10 @@ When superseding or otherwise flipping `is_current` to false, null BOTH
 `is_current = false`. `chk_deprecated_no_embedding` (`CHECK (is_current OR
 (embedding IS NULL AND embedding_3072 IS NULL))`) is checked per statement, so a
 separate `UPDATE ... SET embedding = NULL` afterwards is refused with 23514.
-`embedding_3072` matters as much as `embedding`: recall at centroid_dim=3072
-(`ClaimRepository::search_by_embedding_since`) has no `is_current` filter.
+`embedding_3072` matters as much as `embedding`: it is a second live ANN
+column. Recall at centroid_dim=3072 (`ClaimRepository::search_by_embedding_since`)
+has stated `is_current` itself since backlog 7720cb7a, so the CHECK and the
+read now both keep a retired claim out of recall; neither replaces the other.
 
 The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 

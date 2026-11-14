@@ -4001,9 +4001,19 @@ impl ClaimRepository {
     /// so, at 1536d, the partial HNSW index from migration 029).
     /// [`EmbeddingSeedScope::AllClaims`] drops it, so the 1536d statement is
     /// served by `idx_claims_embedding_hnsw` (migration 001, `WHERE embedding
-    /// IS NOT NULL`). No `is_current` predicate is needed in either scope:
-    /// `chk_deprecated_no_embedding` guarantees a retired claim carries no
-    /// vector in either column.
+    /// IS NOT NULL`).
+    ///
+    /// # Current claims only
+    ///
+    /// Both shapes state `c.is_current` (backlog 7720cb7a), as every other
+    /// recall leg does. `chk_deprecated_no_embedding` already keeps a vector
+    /// off a retired row, but that is a write-side invariant of another
+    /// migration; a read that is correct only while it holds resurfaces
+    /// superseded claims the moment it is dropped or re-added `NOT VALID`.
+    /// Neither partial HNSW index encodes `is_current`; both stay usable
+    /// because `c.{column} IS NOT NULL` is still in the WHERE clause, and the
+    /// iterative scan below fills `LIMIT` past rows the extra predicate
+    /// rejects.
     ///
     /// # Iterative HNSW scan
     ///
@@ -4113,6 +4123,7 @@ impl ClaimRepository {
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
                 WHERE {level_clause} c.{column} IS NOT NULL
+                  AND c.is_current
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   AND EXISTS (
                       SELECT 1 FROM edges e
@@ -4133,6 +4144,7 @@ impl ClaimRepository {
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
                 WHERE {level_clause} c.{column} IS NOT NULL
+                  AND c.is_current
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector

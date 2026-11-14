@@ -4,8 +4,9 @@
 //! the sibling column that `embedding_3072` "is always NULL in practice". That
 //! premise stopped holding once `epigraph-cli reembed` started populating the
 //! 3072-d column for ordinary claims, and recall at `centroid_dim = 3072`
-//! (`ClaimRepository::search_by_embedding_since`) has no `is_current` filter —
-//! so a retired claim still carrying a 3072 vector stays retrievable, and the
+//! (`ClaimRepository::search_by_embedding_since`) had no `is_current` filter
+//! (until backlog 7720cb7a) — so a retired claim still carrying a 3072 vector
+//! stayed retrievable, and the
 //! database said nothing. Migration 144 backfills the leftovers and widens the
 //! guard under the SAME constraint name.
 //!
