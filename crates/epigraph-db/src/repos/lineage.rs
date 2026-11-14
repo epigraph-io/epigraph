@@ -11,7 +11,11 @@
 //! # Reasoning
 //! - PostgreSQL WITH RECURSIVE provides efficient graph traversal
 //! - Topological order ensures ancestors always precede descendants
-//! - Diamond dependencies require proper deduplication via DISTINCT ON
+//! - Diamond dependencies require proper deduplication. Every walk that
+//!   reports a claim's SHORTEST depth deduplicates INSIDE the recursion
+//!   (`UNION` over narrow `(id, depth)` rows), so its work is bounded by
+//!   claims x depth rather than by the number of paths (backlog f889c86f);
+//!   the shortest depth is then `MIN(depth)` per claim
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
@@ -52,7 +56,11 @@ pub struct LineageResult {
     pub traces: HashMap<Uuid, LineageTrace>,
     /// Nodes in topological order (ancestors first)
     pub topological_order: Vec<Uuid>,
-    /// Whether a cycle was detected
+    /// Whether a cycle was detected. Always `false` from
+    /// [`LineageRepository::get_lineage`] and
+    /// [`LineageRepository::get_descendants`]: their walks never could set it
+    /// (see `get_lineage_conn`), and [`LineageRepository::detect_cycles`] is
+    /// the cycle check.
     pub cycle_detected: bool,
     /// Maximum depth reached
     pub max_depth_reached: i32,
@@ -116,8 +124,6 @@ struct LineageRow {
     created_at: DateTime<Utc>,
     trace_id: Option<Uuid>,
     depth: i32,
-    path: Vec<Uuid>,
-    cycle_detected: bool,
 }
 
 /// Row for edge queries
@@ -189,9 +195,9 @@ fn probe_depth(max_depth: i32) -> i32 {
 /// Split a walk's rows (fetched to [`probe_depth`]) into the rows within
 /// `max_depth` and whether any visible claim lay beyond it.
 ///
-/// `DISTINCT ON (id) ... ORDER BY id, depth` keeps each claim's SHORTEST depth,
-/// so a row survives past `max_depth` only when that claim is not reachable
-/// within it. Such a row is exactly "the walk stopped before this claim", which
+/// The walk returns each claim once, at its SHORTEST depth (`MIN(depth)` over
+/// the deduplicated `(id, depth)` rows), so a row survives past `max_depth`
+/// only when that claim is not reachable within it. Such a row is exactly "the walk stopped before this claim", which
 /// is what `truncated` reports; a complete walk that ends exactly at
 /// `max_depth` produces none.
 fn drop_probe_layer(rows: Vec<LineageRow>, max_depth: i32) -> (Vec<LineageRow>, bool) {
@@ -287,13 +293,14 @@ impl LineageRepository {
     ///   or `max_nodes` trimmed the result.
     ///
     /// # SQL Pattern
-    /// Uses PostgreSQL recursive CTE with cycle detection and deduplication:
+    /// Uses a PostgreSQL recursive CTE that deduplicates per `(claim, depth)`
+    /// inside the recursion, then hydrates each claim once at its shortest
+    /// depth:
     /// ```sql
-    /// WITH RECURSIVE lineage AS (
-    ///     SELECT id, 0 as depth, ARRAY[id] as path
-    ///     FROM claims WHERE id = $1
-    ///     UNION ALL
-    ///     SELECT c.id, l.depth + 1, l.path || c.id
+    /// WITH RECURSIVE lineage(id, depth) AS (
+    ///     SELECT id, 0 FROM claims WHERE id = $1
+    ///     UNION                                            -- not UNION ALL
+    ///     SELECT c.id, l.depth + 1
     ///     FROM lineage l
     ///     JOIN edges e
     ///       ON e.source_type = 'claim' AND e.target_type = 'claim'
@@ -301,10 +308,21 @@ impl LineageRepository {
     ///         OR (e.source_id = l.id AND lower(e.relationship) = ANY($4)) ) -- supersedes
     ///     JOIN claims c
     ///       ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
-    ///     WHERE l.depth < $2 AND NOT c.id = ANY(l.path)    -- $2 = max_depth + 1
-    /// )
-    /// SELECT DISTINCT ON (id) * FROM lineage ORDER BY id, depth;
+    ///     WHERE l.depth < $2                               -- $2 = max_depth + 1
+    /// ),
+    /// shortest AS (SELECT id, MIN(depth) AS depth FROM lineage GROUP BY id)
+    /// SELECT c.*, s.depth FROM shortest s JOIN claims c ON c.id = s.id ORDER BY s.id;
     /// ```
+    ///
+    /// `UNION` discards an `(id, depth)` row already produced, so each
+    /// iteration's working set holds at most one row per claim and the walk
+    /// does at most claims x (`max_depth` + 1) rows of work. The
+    /// path-enumerating form (`UNION ALL` carrying `ARRAY[id] as path`, then
+    /// `DISTINCT ON (id)`) did one row per PATH: on a dense DAG that is
+    /// exponential in depth (backlog f889c86f). The depth bound alone ends the
+    /// walk on a cycle, and the shortest depth per claim is unchanged: a claim
+    /// first reachable at depth k is reached at k from a claim first reachable
+    /// at k - 1.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database query fails.
@@ -402,38 +420,25 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE lineage AS (
+            WITH RECURSIVE lineage(id, depth) AS (
                 -- Base case: start with the target claim
-                SELECT
-                    c.id,
-                    c.content,
-                    c.truth_value,
-                    c.agent_id,
-                    c.created_at,
-                    c.trace_id,
-                    0 as depth,
-                    ARRAY[c.id] as path,
-                    false as cycle_detected
+                SELECT c.id, 0
                 FROM claims c
                 WHERE c.id = $1
                   /* {VISIBILITY:c} */
 
-                UNION ALL
+                -- UNION, not UNION ALL: an (id, depth) row already produced
+                -- is discarded, so the walk is bounded by claims x depth, not
+                -- by the number of paths (see the SQL pattern on
+                -- `get_lineage`). The rows stay narrow so that dedup hashes a
+                -- uuid and an int, never the content.
+                UNION
 
                 -- Recursive case: find parent claims via DERIVATION edges.
                 -- Direction is a property of the relationship: an incoming
                 -- derivation edge ($3) names its source as the parent; a
                 -- `supersedes` edge ($4, written new->old) names its target.
-                SELECT
-                    c.id,
-                    c.content,
-                    c.truth_value,
-                    c.agent_id,
-                    c.created_at,
-                    c.trace_id,
-                    l.depth + 1,
-                    l.path || c.id,
-                    c.id = ANY(l.path) as cycle_detected
+                SELECT c.id, l.depth + 1
                 FROM lineage l
                 JOIN edges e
                   ON e.source_type = 'claim'
@@ -443,21 +448,29 @@ impl LineageRepository {
                 JOIN claims c
                   ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
                 WHERE l.depth < $2
-                  AND NOT c.id = ANY(l.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+            ),
+            -- Each claim once, at its SHORTEST depth.
+            shortest AS (
+                SELECT id, MIN(depth) AS depth FROM lineage GROUP BY id
             )
-            SELECT DISTINCT ON (id)
-                id,
-                content,
-                truth_value,
-                agent_id,
-                created_at,
-                trace_id,
-                depth,
-                path,
-                cycle_detected
-            FROM lineage
-            ORDER BY id, depth
+            -- Hydrate once per claim. The predicate is redundant with the
+            -- walk's (every id passed it) and costs no bind: every marker
+            -- resolves to the same `$5`. `ORDER BY s.id` is load-bearing: the
+            -- `max_nodes` cut and `topological_order` stable-sort these rows
+            -- by depth, so id order breaks ties inside a depth layer.
+            SELECT
+                c.id,
+                c.content,
+                c.truth_value,
+                c.agent_id,
+                c.created_at,
+                c.trace_id,
+                s.depth
+            FROM shortest s
+            JOIN claims c ON c.id = s.id
+            WHERE true /* {VISIBILITY:c} */
+            ORDER BY s.id
             "#,
             5,
         );
@@ -475,9 +488,15 @@ impl LineageRepository {
         // the same rows as before and only `truncated` learns about the probe.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // Check for cycles. Both of these describe the WALK, so they are
-        // measured before the node cap below trims it.
-        let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
+        // Both of these describe the WALK, so they are measured before the
+        // node cap below trims it.
+        //
+        // `cycle_detected` is `false` by construction, as it always was: the
+        // path-enumerating walk computed it as `c.id = ANY(path)` on rows its
+        // own `NOT c.id = ANY(path)` guard had already excluded, so no row
+        // could set it. The deduplicated walk keeps no path to test against.
+        // `Self::detect_cycles` is the cycle check.
+        let cycle_detected = false;
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
         // Depth-based truncation is exact: the probe layer found a visible
@@ -856,24 +875,26 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE lineage AS (
-                SELECT id, 0 as depth, ARRAY[id] as path
+            WITH RECURSIVE lineage(id, depth) AS (
+                SELECT id, 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
-                UNION ALL
+                -- UNION, not UNION ALL: per-(id, depth) dedup inside the
+                -- recursion bounds the walk by claims x depth (f889c86f).
+                UNION
 
-                SELECT c.id, l.depth + 1, l.path || c.id
+                SELECT c.id, l.depth + 1
                 FROM claims c
                 JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
                 JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
                 WHERE l.depth < $2
-                  AND NOT c.id = ANY(l.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
-            SELECT DISTINCT ON (id) id, depth
+            SELECT id, MIN(depth) AS depth
             FROM lineage
-            ORDER BY id, depth
+            GROUP BY id
+            ORDER BY id
             "#,
             3,
         );
@@ -908,19 +929,21 @@ impl LineageRepository {
     ///   `true` iff a visible descendant lies past `max_depth`.
     ///
     /// # SQL Pattern
-    /// Uses PostgreSQL recursive CTE traversing edges in the opposite direction:
+    /// Uses a PostgreSQL recursive CTE traversing edges in the opposite
+    /// direction, deduplicated per `(claim, depth)` inside the recursion as in
+    /// [`Self::get_lineage`]:
     /// ```sql
-    /// WITH RECURSIVE descendants AS (
-    ///     SELECT id, 0 as depth, ARRAY[id] as path
-    ///     FROM claims WHERE id = $1
-    ///     UNION ALL
-    ///     SELECT c.id, d.depth + 1, d.path || c.id
+    /// WITH RECURSIVE descendants(id, depth) AS (
+    ///     SELECT id, 0 FROM claims WHERE id = $1
+    ///     UNION                                            -- not UNION ALL
+    ///     SELECT c.id, d.depth + 1
     ///     FROM claims c
     ///     JOIN edges e ON e.target_id = c.id AND e.target_type = 'claim'
     ///     JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
-    ///     WHERE d.depth < $2 AND NOT c.id = ANY(d.path)
-    /// )
-    /// SELECT DISTINCT ON (id) * FROM descendants ORDER BY id, depth;
+    ///     WHERE d.depth < $2                               -- $2 = max_depth + 1
+    /// ),
+    /// shortest AS (SELECT id, MIN(depth) AS depth FROM descendants GROUP BY id)
+    /// SELECT c.*, s.depth FROM shortest s JOIN claims c ON c.id = s.id ORDER BY s.id;
     /// ```
     ///
     /// # Errors
@@ -978,54 +1001,40 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE descendants AS (
+            WITH RECURSIVE descendants(id, depth) AS (
                 -- Base case: start with the source claim
-                SELECT
-                    c.id,
-                    c.content,
-                    c.truth_value,
-                    c.agent_id,
-                    c.created_at,
-                    c.trace_id,
-                    0 as depth,
-                    ARRAY[c.id] as path,
-                    false as cycle_detected
+                SELECT c.id, 0
                 FROM claims c
                 WHERE c.id = $1
                   /* {VISIBILITY:c} */
 
-                UNION ALL
+                -- UNION, not UNION ALL: per-(id, depth) dedup inside the
+                -- recursion, as in `get_lineage_conn`.
+                UNION
 
                 -- Recursive case: find child claims via edges (reverse direction)
-                SELECT
-                    c.id,
-                    c.content,
-                    c.truth_value,
-                    c.agent_id,
-                    c.created_at,
-                    c.trace_id,
-                    d.depth + 1,
-                    d.path || c.id,
-                    c.id = ANY(d.path) as cycle_detected
+                SELECT c.id, d.depth + 1
                 FROM claims c
                 JOIN edges e ON e.target_id = c.id AND e.target_type = 'claim'
                 JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
                 WHERE d.depth < $2
-                  AND NOT c.id = ANY(d.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+            ),
+            shortest AS (
+                SELECT id, MIN(depth) AS depth FROM descendants GROUP BY id
             )
-            SELECT DISTINCT ON (id)
-                id,
-                content,
-                truth_value,
-                agent_id,
-                created_at,
-                trace_id,
-                depth,
-                path,
-                cycle_detected
-            FROM descendants
-            ORDER BY id, depth
+            SELECT
+                c.id,
+                c.content,
+                c.truth_value,
+                c.agent_id,
+                c.created_at,
+                c.trace_id,
+                s.depth
+            FROM shortest s
+            JOIN claims c ON c.id = s.id
+            WHERE true /* {VISIBILITY:c} */
+            ORDER BY s.id
             "#,
             3,
         );
@@ -1039,8 +1048,8 @@ impl LineageRepository {
         // The probe layer goes first, as in `get_lineage_conn`.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // Check for cycles
-        let cycle_detected = lineage_rows.iter().any(|r| r.cycle_detected);
+        // `false` by construction, as in `get_lineage_conn`.
+        let cycle_detected = false;
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
         // Collect claim IDs for subsequent queries
@@ -1249,24 +1258,26 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE descendants AS (
-                SELECT id, 0 as depth, ARRAY[id] as path
+            WITH RECURSIVE descendants(id, depth) AS (
+                SELECT id, 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
-                UNION ALL
+                -- UNION, not UNION ALL: per-(id, depth) dedup inside the
+                -- recursion bounds the walk by claims x depth (f889c86f).
+                UNION
 
-                SELECT c.id, d.depth + 1, d.path || c.id
+                SELECT c.id, d.depth + 1
                 FROM claims c
                 JOIN edges e ON e.target_id = c.id AND e.target_type = 'claim'
                 JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
                 WHERE d.depth < $2
-                  AND NOT c.id = ANY(d.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
-            SELECT DISTINCT ON (id) id, depth
+            SELECT id, MIN(depth) AS depth
             FROM descendants
-            ORDER BY id, depth
+            GROUP BY id
+            ORDER BY id
             "#,
             3,
         );
@@ -1330,36 +1341,36 @@ impl LineageRepository {
         // TWO recursive CTEs: six markers, all resolving to the same bind.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE ancestors_a AS (
+            WITH RECURSIVE ancestors_a(id, depth) AS (
                 -- Ancestor set for claim A
-                SELECT id, 0 as depth, ARRAY[id] as path
+                SELECT id, 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
-                UNION ALL
+                -- UNION, not UNION ALL: per-(id, depth) dedup (f889c86f).
+                UNION
 
-                SELECT c.id, a.depth + 1, a.path || c.id
+                SELECT c.id, a.depth + 1
                 FROM claims c
                 JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
                 JOIN ancestors_a a ON e.target_id = a.id AND e.target_type = 'claim'
                 WHERE a.depth < $3
-                  AND NOT c.id = ANY(a.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             ),
-            ancestors_b AS (
+            ancestors_b(id, depth) AS (
                 -- Ancestor set for claim B
-                SELECT id, 0 as depth, ARRAY[id] as path
+                SELECT id, 0
                 FROM claims WHERE id = $2
                   /* {VISIBILITY:claims} */
 
-                UNION ALL
+                -- UNION, not UNION ALL: per-(id, depth) dedup (f889c86f).
+                UNION
 
-                SELECT c.id, b.depth + 1, b.path || c.id
+                SELECT c.id, b.depth + 1
                 FROM claims c
                 JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
                 JOIN ancestors_b b ON e.target_id = b.id AND e.target_type = 'claim'
                 WHERE b.depth < $3
-                  AND NOT c.id = ANY(b.path)
                   /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
             )
             SELECT
@@ -1367,8 +1378,8 @@ impl LineageRepository {
                 a.depth AS depth_a,
                 b.depth AS depth_b,
                 (a.depth + b.depth) AS total_depth
-            FROM (SELECT DISTINCT ON (id) id, depth FROM ancestors_a ORDER BY id, depth) a
-            INNER JOIN (SELECT DISTINCT ON (id) id, depth FROM ancestors_b ORDER BY id, depth) b
+            FROM (SELECT id, MIN(depth) AS depth FROM ancestors_a GROUP BY id) a
+            INNER JOIN (SELECT id, MIN(depth) AS depth FROM ancestors_b GROUP BY id) b
                 ON a.id = b.id
             ORDER BY total_depth ASC
             LIMIT 1
