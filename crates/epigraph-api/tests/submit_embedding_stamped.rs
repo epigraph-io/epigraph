@@ -382,6 +382,67 @@ async fn create_claim_embeds_the_claim_on_the_callers_stamp(pool: PgPool) {
     logs_assert(no_store_refusal);
 }
 
+/// `POST /api/v1/claims/:id/supersede`: the replacement is a current claim
+/// with new text, and the act copies no vector, so the route embeds it
+/// post-commit on the caller's stamp (backlog 7628ab2c). Before that the claim
+/// that replaced an embedded one had `embedding IS NULL`.
+#[sqlx::test(migrations = "../../migrations")]
+#[traced_test]
+async fn supersede_embeds_the_replacement_on_the_callers_stamp(pool: PgPool) {
+    let (state, h, h_group) = human_writer(&pool).await;
+
+    let content = format!("supersede embedding v1 {}", Uuid::new_v4());
+    let req: epigraph_api::routes::claims::CreateClaimRequest = serde_json::from_value(
+        serde_json::json!({ "content": content, "agent_id": h, "initial_truth": 0.6 }),
+    )
+    .expect("request");
+    let _created = epigraph_api::routes::claims::create_claim(
+        ViewerExtractor(Viewer::resolve(&pool, h).await.expect("viewer")),
+        State(state.clone()),
+        Some(human_token(h)),
+        Json(req),
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))
+    .expect("create_claim succeeds");
+    let old: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE content = $1")
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim just created");
+
+    let restated = format!("supersede embedding v2 {}", Uuid::new_v4());
+    let (status, Json(body)) = epigraph_api::routes::versioning::supersede_claim(
+        ViewerExtractor(Viewer::resolve(&pool, h).await.expect("viewer")),
+        State(state),
+        Some(human_token(h)),
+        axum::extract::Path(old),
+        Json(epigraph_api::routes::versioning::SupersedeRequest {
+            content: restated.clone(),
+            truth_value: 0.7,
+            reason: "wording".to_string(),
+        }),
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))
+    .expect("the author supersedes its own claim");
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body.embedded, "the response reports the embed it performed");
+    assert_eq!(
+        claim_rows(&pool, &restated).await,
+        vec![(h, h_group, true)],
+        "the replacement is H's, in H's group, and carries an embedding"
+    );
+    let old_embedded: bool =
+        sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .expect("the retired claim");
+    assert!(!old_embedded, "the retired claim keeps no vector");
+    logs_assert(no_store_refusal);
+}
+
 /// `POST /api/v1/claims/batch` shares `create_claim_core`, one call per item:
 /// every created item carries a vector.
 #[sqlx::test(migrations = "../../migrations")]
