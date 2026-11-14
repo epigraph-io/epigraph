@@ -56,9 +56,9 @@ RESULT_DIR = "/tmp/theme_labels"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
 # Stored for a theme with no public member: there is no text every viewer may
-# read to name it from (theme_lib.public_label_source). The `auto-` prefix makes
-# is_placeholder_label true, so a later run labels it once a public member joins.
-NO_PUBLIC_MEMBER_LABEL = "auto-no-public-member"
+# read to name it from (theme_lib.public_label_source). is_placeholder_label
+# matches it, so a later run labels it once a public member joins.
+NO_PUBLIC_MEMBER_LABEL = theme_lib.NO_PUBLIC_MEMBER_LABEL
 
 
 def load_themes_with_samples(conn, limit=None):
@@ -195,11 +195,13 @@ def is_placeholder_label(label):
     Heuristic from V2: a short label is taken as already named unless it is a
     generated placeholder. Placeholders are `auto-NN` (theme_cluster),
     `cluster-NN` (the cluster_labels fallback that project_to_themes copies
-    onto a theme, and split_theme's `cluster-split-...` parts), and long or
+    onto a theme, and split_theme's `cluster-split-...` parts),
+    NO_PUBLIC_MEMBER_LABEL (a theme no public member could name), and long or
     definitional strings (the semicolon-joined nearest-claim excerpts).
     """
     return (
         not label
+        or label == NO_PUBLIC_MEMBER_LABEL
         or label.startswith("auto-")
         or label.startswith("cluster-")
         or len(label) >= 60

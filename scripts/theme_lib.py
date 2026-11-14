@@ -16,6 +16,15 @@ from maintenance_dsn import maintenance_dsn as _maintenance_dsn
 
 DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
+# The label stored for a theme no public member can name (`public_label_source`):
+# there is no text every viewer may read. label_themes_llm.is_placeholder_label
+# matches it, so a later labelling run names the theme once a public member
+# joins. Its prefix is deliberately NOT `auto-`: seed_themes_from_textbooks
+# --drop-auto-after deletes every `auto-%` theme and unassigns its members,
+# which would discard this theme (and, for a seeded one, its
+# source_textbook_claim_id, so the next seed run would label the section again).
+NO_PUBLIC_MEMBER_LABEL = "unnamed-no-public-member"
+
 
 def maintenance_dsn(default=DEFAULT_DATABASE_URL):
     """Resolve the DSN a corpus-wide script should connect on.
