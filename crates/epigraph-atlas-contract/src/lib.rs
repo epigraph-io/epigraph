@@ -60,6 +60,8 @@ use uuid::Uuid;
 pub mod check;
 #[cfg(any(test, feature = "check"))]
 pub mod fixtures;
+#[cfg(any(test, feature = "check"))]
+pub mod preview;
 #[cfg(test)]
 mod tests;
 

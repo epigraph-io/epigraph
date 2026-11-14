@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epigraph.io/contract/atlas_maps/v1/schema.json",
+  "title": "Atlas map list, v1 (the data-atlas-maps attribute)",
+  "description": "The maps a viewer may pick on the Atlas, first the default, with each theme's name, count and root levels on that map, and where that map's levels are fetched. A level is fetched from <level_url><hierarchy>/<level id> and answered with a contract/atlas_level/v1 document of that map and hierarchy, or its not-found body. Rules a schema cannot express (unique keys, at most one public map, unique team groups, unique themes per map, two distinct roots) are checked by tests/common/atlas_maps.rs::check_atlas_maps_attr.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "maps"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "maps": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/map" }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "level_url": {
+      "description": "A same-origin path prefix: one leading '/', a trailing '/', no query, fragment, backslash or whitespace.",
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 512,
+      "pattern": "^/[^/?#\\\\\\s][^?#\\\\\\s]*/$"
+    },
+    "map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "scope", "group_id", "label", "level_url", "themes"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" },
+        "scope": { "enum": ["team", "public"] },
+        "group_id": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "level_url": { "$ref": "#/$defs/level_url" },
+        "themes": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/theme" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "team" } } },
+          "then": { "properties": { "group_id": { "$ref": "#/$defs/uuid" } } },
+          "else": { "properties": { "group_id": { "type": "null" } } }
+        }
+      ]
+    },
+    "theme": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["theme_id", "label", "claim_count", "roots"],
+      "properties": {
+        "theme_id": { "$ref": "#/$defs/uuid" },
+        "label": {
+          "description": "The theme's name on this map, generated only from text every viewer of the map can read. Null until named.",
+          "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 120 }, { "type": "null" }]
+        },
+        "claim_count": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "roots": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["meaning", "links"],
+          "properties": {
+            "meaning": { "$ref": "#/$defs/uuid" },
+            "links": { "$ref": "#/$defs/uuid" }
+          }
+        }
+      }
+    }
+  }
+}
