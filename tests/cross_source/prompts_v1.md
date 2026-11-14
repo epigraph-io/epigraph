@@ -99,15 +99,26 @@ measured, that is a v2 prompt and a separate run.
 
 ## 2. Sample frame
 
-1. Draw the sweep's seed window exactly as `cross_source_sweep` does
+The order of these steps matters. A `--dry-run` sweep still writes
+`match_candidates` rows that carry a `verifier_verdict`. A ledger written
+after the sweep would therefore flag every pair the sweep just scored.
+
+1. **Snapshot the contamination ledger first** (§5), before the sweep runs.
+   This snapshot is the only ledger the run partitions against.
+2. Run the sweep's seed window exactly as `cross_source_sweep` does
    (`--dry-run`, so no edges are written). Record the git sha, the
-   `calibration.toml` hash, and the seed count.
-2. Take every pair the pipeline routes to the verifier (`mid_band`). Pairs the
-   verifier did not answer (`skipped_no_verdict`) are reported, but they are
-   not part of the precision denominator.
-3. Before scoring, write the contamination ledger (§5) and split the pairs into
-   **clean** and **contaminated**.
-4. Draw the adjudication sample from the clean pairs: all verifier-accepted
+   `calibration.toml` hash, the seed count, and the `run_id` from the sweep's
+   JSON line.
+3. The run's pairs are the `match_candidates` rows with
+   `matcher_run_id = <run_id>`. The upsert re-stamps `matcher_run_id` on rows
+   that already existed, so previously decided pairs show up here too. Split
+   the pairs into **clean** and **contaminated** against the step-1 snapshot
+   with `partition_by_ledger`.
+4. Of those rows, the ones with a `verifier_verdict` are the verifier's
+   answers. Pairs routed to the verifier but left unanswered
+   (`skipped_no_verdict`) are reported, but they are not part of the
+   precision denominator.
+5. Draw the adjudication sample from the clean pairs: all verifier-accepted
    pairs (Same, Paraphrase, Contradicts), plus a random sample of
    verifier-rejected pairs of size `N_REJECT_AUDIT` (§3), so that missed
    matches are also measured. The sampling seed is recorded in the ledger
@@ -156,7 +167,8 @@ off. Once the sweep's results have been seen, these values cannot be changed.
 A pair is **contaminated** if its `match_candidates` row has a
 `verifier_verdict`, a `decided_at`, or status `promoted`/`rejected`. Its
 verdict already exists, so scoring it again measures agreement with that
-earlier verdict, not the verifier. Produce the ledger **before** scoring:
+earlier verdict, not the verifier. Produce the ledger **before running the
+sweep** (§2 step 1):
 
 ```sh
 calibrate_matcher --contamination-ledger <out>/contamination_ledger.json
