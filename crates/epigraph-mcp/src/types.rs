@@ -880,7 +880,7 @@ pub struct StoreWorkflowParams {
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
 
     #[schemars(
-        description = "Mint a new generation-0 lineage even when an existing hierarchical workflow you can read has a near-identical goal (default false). Without it, a goal whose embedding is at least 0.90 cosine-similar to a live workflow's goal under a DIFFERENT canonical_name stores nothing and returns that workflow with matched_existing=true, its similarity and a hint to evolve it with improve_workflow_hierarchy instead. An identical goal (same canonical_name) is a no-op as before (already_ingested)."
+        description = "Mint a new generation-0 lineage even when an existing hierarchical workflow has a near-identical goal (default false). Without it, a goal whose embedding is at least 0.90 cosine-similar to a live workflow's goal under a DIFFERENT canonical_name stores nothing and returns the head of that workflow's lineage with matched_existing=true, its similarity and a hint to evolve it with improve_workflow_hierarchy instead. Only a workflow in exactly the tenancy this store would use is matched: the declared tenancy, else the private default a new lineage gets; a public or other-group plan you can merely read is never matched. An identical goal (same canonical_name) is a no-op as before (already_ingested)."
     )]
     #[serde(default)]
     pub force_new: Option<bool>,
@@ -2777,9 +2777,11 @@ pub struct StoreWorkflowResponse {
     /// already present and the call short-circuited.
     pub already_ingested: bool,
     /// `true` when nothing was stored because an existing hierarchical
-    /// workflow under ANOTHER canonical_name has a near-identical goal (backlog
-    /// 5e54282f); `workflow_id`, `canonical_name`, `goal` and `generation` then
-    /// describe that workflow. Pass `force_new: true` to mint anyway.
+    /// workflow under ANOTHER canonical_name, in the same tenancy this store
+    /// would use, has a near-identical goal (backlog 5e54282f);
+    /// `workflow_id`, `canonical_name`, `goal` and `generation` then describe
+    /// the head of that workflow's lineage. Pass `force_new: true` to mint
+    /// anyway.
     pub matched_existing: bool,
     /// The matched workflow's goal similarity (cosine), with `matched_existing`.
     #[serde(skip_serializing_if = "Option::is_none")]

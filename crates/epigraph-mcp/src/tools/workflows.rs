@@ -378,7 +378,8 @@ pub async fn store_workflow(
     let canonical_name = slugify_workflow_goal(&params.goal);
 
     // Embed the goal ONCE, best-effort: it decides whether this goal is a
-    // rewording of a workflow the caller already reads (backlog 5e54282f), and
+    // rewording of a workflow already in the tenancy this store would use
+    // (backlog 5e54282f; see `matching_workflow`), and
     // the same vector is stored as the new row's goal embedding below. An
     // embedder failure keeps today's behaviour (no matching, no goal vector).
     let goal_vec = match server.embedder.generate(&params.goal).await {
@@ -390,15 +391,21 @@ pub async fn store_workflow(
     };
     if !params.force_new.unwrap_or(false) {
         if let Some(qvec) = goal_vec.as_deref() {
-            if let Some(hit) = matching_workflow(server, viewer, &canonical_name, qvec).await? {
+            let declared = params.tenancy.map(|t| t.decl());
+            if let Some(hit) =
+                matching_workflow(server, viewer, auth, declared, &canonical_name, qvec).await?
+            {
                 return success_json(&StoreWorkflowResponse {
                     workflow_id: hit.id.to_string(),
                     hint: Some(format!(
-                        "A workflow you can read already has a near-identical goal ({:.3} \
-                         similar): '{}' (canonical_name '{}', generation {}). Nothing was \
-                         stored. To change its steps, call improve_workflow_hierarchy with \
-                         parent_canonical_name='{}'; to mint a separate lineage anyway, call \
-                         store_workflow again with force_new=true.",
+                        "A workflow in the tenancy this store would use (visibility '{}', \
+                         owner group {}) already has a near-identical goal ({:.3} similar): \
+                         '{}' (canonical_name '{}', generation {}, the lineage head). Nothing \
+                         was stored. To change its steps, call improve_workflow_hierarchy \
+                         with parent_canonical_name='{}'; to mint a separate lineage anyway, \
+                         call store_workflow again with force_new=true.",
+                        hit.visibility,
+                        hit.owner_group_id,
                         hit.similarity,
                         hit.goal,
                         hit.canonical_name,
@@ -516,47 +523,184 @@ pub async fn store_workflow(
 /// candidates, this one refuses to mint a lineage.
 pub const STORE_WORKFLOW_MATCH_THRESHOLD: f64 = 0.90;
 
-/// The live (`truth_value >= 0.3`) hierarchical workflow `viewer` reads whose
-/// goal is the most similar to `qvec`, when it clears
-/// [`STORE_WORKFLOW_MATCH_THRESHOLD`] under a canonical_name other than
-/// `canonical_name`. `None` when there is none, and ALSO whenever a row named
-/// `canonical_name` itself exists, readable or not, embedded or not, live or
-/// deprecated: an identical goal stays the ingest's own business (its
-/// idempotent `already_ingested` no-op, or its refusal of a name with rows the
-/// caller cannot read), never a match to another lineage. That check does not
-/// go through the goal embedding, which rows stored before goals were embedded
-/// (and `embed: false` ingests) do not have.
+/// A lineage head [`matching_workflow`] found for a reworded goal.
+struct WorkflowMatch {
+    id: uuid::Uuid,
+    canonical_name: String,
+    generation: i32,
+    goal: String,
+    similarity: f64,
+    visibility: String,
+    owner_group_id: uuid::Uuid,
+}
+
+/// The live (`truth_value >= 0.3`) hierarchical workflow LINEAGE HEAD whose
+/// goal (or the goal of an earlier generation of its lineage) is the most
+/// similar to `qvec`, when that clears [`STORE_WORKFLOW_MATCH_THRESHOLD`]
+/// under a canonical_name other than `canonical_name`, AND the head has
+/// exactly the tenancy this store would give a new lineage.
+///
+/// # The tenancy rule
+///
+/// A match redirects every later outcome report (goal text, per-step
+/// deviation reasons, `outcome_details`) onto the matched plan. Matching
+/// anything the caller merely READS would let a store meant to stay private
+/// (the undeclared default, or a declared group) land on another team's
+/// public plan, or on a plan of another group the caller is also in. So the
+/// target tenancy is decided first, exactly as the ingest would: the declared
+/// one, else `epigraph_ingest_executor::owner::resolve_caller_owner` for a new
+/// lineage (the caller's one team, else its own default), on a transaction
+/// stamped from the CALLER (the write identity, which on stdio is this
+/// server's own agent whatever viewer a driver passed). Only a head with the
+/// same `(visibility, owner_group_id)` is a match. When the target cannot be
+/// resolved (an unbound author), nothing is matched and the ingest reports
+/// its own refusal.
+///
+/// # Heads, not generations
+///
+/// The search covers every generation, and each hit is resolved to the head
+/// of its `canonical_name`, so a match never names a superseded generation.
+/// A lineage with rows the caller cannot read is skipped: its readable
+/// "head" may not be the real one.
+///
+/// # An identical goal is not a match
+///
+/// `None` whenever a row named `canonical_name` itself exists, readable or
+/// not, embedded or not, live or deprecated: an identical goal stays the
+/// ingest's own business (its idempotent `already_ingested` no-op, or its
+/// refusal of a name with rows the caller cannot read), never a match to
+/// another lineage. That check does not go through the goal embedding, which
+/// rows stored before goals were embedded (and `embed: false` ingests) do not
+/// have.
 async fn matching_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    declared: Option<epigraph_core::TenancyDecl>,
     canonical_name: &str,
     qvec: &[f32],
-) -> Result<Option<epigraph_db::ScoredHierarchicalWorkflowRow>, McpError> {
-    let mut read = server.read_as(viewer, "store_workflow").await?;
-    let name_taken = WorkflowRepository::head_by_canonical(&mut *read, canonical_name)
+) -> Result<Option<WorkflowMatch>, McpError> {
+    let caller = server.write_identity(auth, viewer).await?;
+    let resolved;
+    let caller_viewer = if viewer.principal() == Some(caller.agent_id()) {
+        viewer
+    } else {
+        resolved = epigraph_db::visibility::Viewer::resolve(&server.pool, caller.agent_id())
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    "store_workflow: could not resolve the caller's viewer",
+                    e,
+                )
+            })?;
+        &resolved
+    };
+    let mut tx =
+        crate::claim_helper::begin_caller_workflow_tx(server, caller, "store_workflow").await?;
+    let target = match declared {
+        Some(d) => d,
+        None => {
+            match epigraph_ingest_executor::owner::resolve_caller_owner(
+                &mut tx,
+                caller.agent_id(),
+                None,
+            )
+            .await
+            {
+                Ok(owner) => owner.decl,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "store_workflow: no target tenancy for matching; not matching"
+                    );
+                    tx.rollback().await.map_err(internal_error)?;
+                    return Ok(None);
+                }
+            }
+        }
+    };
+    let (Some(target_visibility), Some(target_owner)) =
+        (target.visibility_bind(), target.owner_group_bind())
+    else {
+        tx.rollback().await.map_err(internal_error)?;
+        return Ok(None);
+    };
+
+    let name_taken = WorkflowRepository::head_by_canonical(&mut *tx, canonical_name)
         .await
         .map_err(internal_error)?
         .is_some()
-        || WorkflowRepository::name_has_hidden_rows_conn(&mut read, canonical_name)
+        || WorkflowRepository::name_has_hidden_rows_conn(&mut tx, canonical_name)
             .await
             .map_err(internal_error)?;
     if name_taken {
-        read.commit().await.map_err(internal_error)?;
+        tx.rollback().await.map_err(internal_error)?;
         return Ok(None);
     }
     let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
-        &mut *read,
-        viewer,
+        &mut *tx,
+        caller_viewer,
         &format_pgvector(qvec),
         0.3,
         10,
     )
     .await
     .map_err(internal_error)?;
-    read.commit().await.map_err(internal_error)?;
-    Ok(hits
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut found = None;
+    for hit in hits
         .into_iter()
-        .find(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD))
+        .filter(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD)
+    {
+        if seen.contains(&hit.canonical_name) {
+            continue;
+        }
+        seen.push(hit.canonical_name.clone());
+        if WorkflowRepository::name_has_hidden_rows_conn(&mut tx, &hit.canonical_name)
+            .await
+            .map_err(internal_error)?
+        {
+            continue;
+        }
+        let Some(head_id) = WorkflowRepository::head_by_canonical(&mut *tx, &hit.canonical_name)
+            .await
+            .map_err(internal_error)?
+        else {
+            continue;
+        };
+        let Some(head) = WorkflowRepository::row_as_viewer(&mut tx, caller_viewer, head_id)
+            .await
+            .map_err(internal_error)?
+        else {
+            continue;
+        };
+        if head.truth_value < 0.3 {
+            continue;
+        }
+        let Some((visibility, owner_group_id)) =
+            WorkflowRepository::tenancy_as_viewer(&mut tx, caller_viewer, head_id)
+                .await
+                .map_err(internal_error)?
+        else {
+            continue;
+        };
+        if visibility != target_visibility || owner_group_id != target_owner {
+            continue;
+        }
+        found = Some(WorkflowMatch {
+            id: head.id,
+            canonical_name: head.canonical_name,
+            generation: head.generation,
+            goal: head.goal,
+            similarity: hit.similarity,
+            visibility,
+            owner_group_id,
+        });
+        break;
+    }
+    tx.rollback().await.map_err(internal_error)?;
+    Ok(found)
 }
 
 pub async fn find_workflow(

@@ -244,13 +244,42 @@ async fn an_exact_goal_whose_row_has_no_goal_embedding_is_not_matched_elsewhere(
 /// by [`goal_vector`], tenancy as given.
 async fn seeded_workflow(pool: &PgPool, goal: &str, visibility: &str, owner: Uuid) -> Uuid {
     let id = Uuid::new_v4();
+    seeded_generation(
+        pool,
+        id,
+        &format!("seeded-{id}"),
+        0,
+        None,
+        goal,
+        visibility,
+        owner,
+    )
+    .await;
+    id
+}
+
+/// One generation `generation` of lineage `canonical_name`, seeded on the
+/// harness superuser like [`seeded_workflow`].
+#[allow(clippy::too_many_arguments)]
+async fn seeded_generation(
+    pool: &PgPool,
+    id: Uuid,
+    canonical_name: &str,
+    generation: i32,
+    parent_id: Option<Uuid>,
+    goal: &str,
+    visibility: &str,
+    owner: Uuid,
+) {
     sqlx::query(
-        "INSERT INTO workflows (id, canonical_name, goal, visibility, owner_group_id, \
-                                goal_embedding) \
-         VALUES ($1, $2, $3, $4, $5, $6::vector)",
+        "INSERT INTO workflows (id, canonical_name, generation, parent_id, goal, visibility, \
+                                owner_group_id, goal_embedding) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector)",
     )
     .bind(id)
-    .bind(format!("seeded-{id}"))
+    .bind(canonical_name)
+    .bind(generation)
+    .bind(parent_id)
     .bind(goal)
     .bind(visibility)
     .bind(owner)
@@ -258,19 +287,35 @@ async fn seeded_workflow(pool: &PgPool, goal: &str, visibility: &str, owner: Uui
     .execute(pool)
     .await
     .expect("seed workflows row");
-    id
 }
 
-/// On the application role, matching reads as the CALLER: a paraphrase of a
-/// group-private plan the caller does not read mints a new lineage and the
-/// response never carries the private goal, while a paraphrase of a PUBLIC
-/// plan is matched (the positive control: the matching runs at all here).
+async fn tenancy_of(pool: &PgPool, workflow_id: &serde_json::Value) -> (String, Uuid) {
+    sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1::uuid")
+        .bind(workflow_id.as_str().expect("workflow_id"))
+        .fetch_one(pool)
+        .await
+        .expect("read the stored row's tenancy")
+}
+
+/// On the application role, matching reads as the CALLER and stays inside
+/// the tenancy the store would use. The stranger here declares nothing, so a
+/// new lineage of its is private to its own default group:
+///
+/// * a paraphrase of a group-private plan it does not read mints a new
+///   lineage, and the response never carries the private goal;
+/// * a paraphrase of ANOTHER group's PUBLIC plan, which it does read, is not
+///   matched either: matching it would route this caller's outcome reports
+///   (goal text, deviation reasons, outcome_details) onto a public plan. The
+///   new lineage lands private to the stranger's own group;
+/// * a paraphrase of a plan in its own default tenancy IS matched (the
+///   positive control: the matching runs at all here).
 #[sqlx::test(migrations = "../../migrations")]
 async fn matching_never_discloses_a_plan_the_caller_cannot_read(pool: PgPool) {
     let (_, group) = fixture::seed_agent_with_group(&pool, "swm-owner").await;
     let tag = Uuid::new_v4().simple().to_string();
     let private_goal = format!("Rotate the private signing keys of the vault {tag}");
     let public_goal = format!("Publish the weekly release notes to the wiki {tag}");
+    let own_goal = format!("Compact the audit log archive on the replica {tag}");
     let private = seeded_workflow(&pool, &private_goal, "group", group).await;
     let public = seeded_workflow(&pool, &public_goal, "public", group).await;
 
@@ -296,6 +341,8 @@ async fn matching_never_discloses_a_plan_the_caller_cannot_read(pool: PgPool) {
     let stranger = epigraph_db::visibility::Viewer::resolve(&pool, agent)
         .await
         .expect("stranger viewer");
+    let own_group = default_owner_group(&pool, agent).await;
+    let own = seeded_workflow(&pool, &own_goal, "group", own_group).await;
 
     let r = epigraph_mcp::tools::workflows::store_workflow(
         &server,
@@ -323,6 +370,166 @@ async fn matching_never_discloses_a_plan_the_caller_cannot_read(pool: PgPool) {
     .await
     .expect("store_workflow");
     let json = first_text(&r);
+    assert_eq!(
+        json["matched_existing"],
+        serde_json::json!(false),
+        "a private-by-default store was redirected onto another group's public plan: {json}"
+    );
+    assert_ne!(json["workflow_id"], serde_json::json!(public.to_string()));
+    assert_eq!(
+        tenancy_of(&pool, &json["workflow_id"]).await,
+        ("group".to_string(), own_group),
+        "the new lineage keeps the store's own private tenancy"
+    );
+
+    let r = epigraph_mcp::tools::workflows::store_workflow(
+        &server,
+        &stranger,
+        params(&format!("Compact audit log archive on replica {tag}"), None),
+        None,
+    )
+    .await
+    .expect("store_workflow");
+    let json = first_text(&r);
     assert_eq!(json["matched_existing"], serde_json::json!(true), "{json}");
-    assert_eq!(json["workflow_id"], serde_json::json!(public.to_string()));
+    assert_eq!(json["workflow_id"], serde_json::json!(own.to_string()));
+}
+
+/// A keyed TEAM group (kind 'team' carries a 32-byte key) with `member` as a
+/// writer, seeded on the harness superuser. Keyed, because a keyless team
+/// group (`did:epigraph:group:`) counts only an agent with a human operator
+/// as a live member (migration 164).
+async fn seed_team(pool: &PgPool, member: Uuid, label: &str) -> Uuid {
+    let team = Uuid::new_v4();
+    let key: Vec<u8> = team.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind) \
+         VALUES ($1, $2, 'did:epigraph:test-team:' || $1::text, $3, 'team')",
+    )
+    .bind(team)
+    .bind(format!("{label} {team}"))
+    .bind(&key)
+    .execute(pool)
+    .await
+    .expect("seed a team group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(team)
+    .bind(member)
+    .execute(pool)
+    .await
+    .expect("seed a writer membership");
+    team
+}
+
+/// A caller in TWO groups that declares a store into group B is not matched
+/// to a reworded plan of group A, though it reads (and writes) both: the
+/// match would put this B-meant plan's runs on A's plan. Declaring A matches
+/// it (the positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_declared_group_is_not_matched_to_another_groups_plan(pool: PgPool) {
+    let (server, _) = server_with_goal_embedder(&pool).await;
+    let agent = server.server_agent_id().await.expect("server agent");
+    let team_a = seed_team(&pool, agent, "swm team a").await;
+    let team_b = seed_team(&pool, agent, "swm team b").await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer in both teams");
+    let tag = Uuid::new_v4().simple().to_string();
+    let goal = format!("Reindex the vector store after the model upgrade {tag}");
+    let plan_a = seeded_workflow(&pool, &goal, "group", team_a).await;
+
+    let declared = |group: Uuid| {
+        let mut p = params(
+            &format!("Reindex vector store after model upgrade {tag}"),
+            None,
+        );
+        p.tenancy = Some(
+            serde_json::from_value(serde_json::json!({
+                "visibility": "group",
+                "owner_group_id": group,
+            }))
+            .expect("tenancy"),
+        );
+        p
+    };
+
+    let r =
+        epigraph_mcp::tools::workflows::store_workflow(&server, &viewer, declared(team_b), None)
+            .await
+            .expect("store_workflow into B");
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    let json = first_text(&r);
+    assert_eq!(
+        json["matched_existing"],
+        serde_json::json!(false),
+        "a store declared into B was redirected onto A's plan: {json}"
+    );
+    assert_ne!(json["workflow_id"], serde_json::json!(plan_a.to_string()));
+    assert_eq!(
+        tenancy_of(&pool, &json["workflow_id"]).await,
+        ("group".to_string(), team_b)
+    );
+
+    let mut into_a = declared(team_a);
+    into_a.goal = format!("Reindex the vector store after model upgrade {tag}");
+    let r = epigraph_mcp::tools::workflows::store_workflow(&server, &viewer, into_a, None)
+        .await
+        .expect("store_workflow into A");
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    let json = first_text(&r);
+    assert_eq!(json["matched_existing"], serde_json::json!(true), "{json}");
+    assert_eq!(json["workflow_id"], serde_json::json!(plan_a.to_string()));
+    let hint = json["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains(&team_a.to_string()) && hint.contains("'group'"),
+        "the hint names the matched plan's tenancy: {hint}"
+    );
+}
+
+/// A match names the HEAD of the matched lineage, not the superseded
+/// generation whose goal embedding happened to be the hit: outcome reports
+/// on the returned id must land on the plan agents now follow.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_match_names_the_lineage_head_not_a_superseded_generation(pool: PgPool) {
+    let (server, viewer) = server_with_goal_embedder(&pool).await;
+    let agent = server.server_agent_id().await.expect("server agent");
+    let own_group = default_owner_group(&pool, agent).await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let canonical = format!("seeded-lineage-{tag}");
+    let gen0 = Uuid::new_v4();
+    let gen1 = Uuid::new_v4();
+    let goal0 = format!("Archive the stale build caches on the runners {tag}");
+    // The head's goal was reworded enough that it is NOT itself a hit.
+    let goal1 = format!("Prune runner disk space weekly with a retention policy {tag}");
+    seeded_generation(&pool, gen0, &canonical, 0, None, &goal0, "group", own_group).await;
+    seeded_generation(
+        &pool,
+        gen1,
+        &canonical,
+        1,
+        Some(gen0),
+        &goal1,
+        "group",
+        own_group,
+    )
+    .await;
+
+    let json = store(
+        &server,
+        &viewer,
+        &format!("Archive stale build caches on runners {tag}"),
+        None,
+    )
+    .await;
+    assert_eq!(json["matched_existing"], serde_json::json!(true), "{json}");
+    assert_eq!(
+        json["workflow_id"],
+        serde_json::json!(gen1.to_string()),
+        "the match must name the lineage head (generation 1): {json}"
+    );
+    assert_eq!(json["generation"], serde_json::json!(1), "{json}");
+    assert_eq!(json["canonical_name"], serde_json::json!(canonical));
 }
