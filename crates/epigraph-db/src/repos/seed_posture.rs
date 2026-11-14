@@ -24,12 +24,16 @@
 //! superuser, an indirect seed, an ADMIN-only grantee directly and one hop
 //! away, and the application role), and exercises the below-216 branch.
 //!
-//! # Requires PostgreSQL 16
+//! # Parses on PostgreSQL 15
 //!
 //! `pg_auth_members.inherit_option` / `set_option` exist from PostgreSQL 16,
-//! as migration 216 itself requires. The branch that names them is only taken
-//! once 216's function exists, but the columns are resolved at parse time
-//! regardless of the branch, so this expression does not parse on 15.
+//! as migration 216 itself requires. Named as columns they would be resolved
+//! at parse time even in the branch that is never taken, so on 15 the whole
+//! probe statement would fail to parse, and a failed posture read at boot is
+//! only logged: every armed boot refusal would switch off silently. So the
+//! expression reads them through `to_jsonb(m)`, which parses on any version
+//! (a missing key is NULL, which confers nothing). On 15 the database cannot
+//! be at 216, so the `pg_has_role` branch is the one taken there.
 
 /// `true` once migration 216's `public.epigraph_session_is_seed()` exists,
 /// i.e. once the triggers ask the explicit-grant question. Parses at any
@@ -42,7 +46,8 @@ pub const SEED_FUNCTION_EXISTS_SQL: &str =
 ///
 /// At or above 216: the same walk as `epigraph_session_is_seed()` (session
 /// user IS `epigraph_seed`, or reaches it over `pg_auth_members` edges that
-/// confer the role: `inherit_option OR set_option`). Below 216: 074's
+/// confer the role: `inherit_option OR set_option`, read through `to_jsonb`
+/// so the statement parses on PostgreSQL 15; see the module docs). Below 216: 074's
 /// `pg_has_role(..., 'MEMBER')`, which is what the triggers there ask.
 pub const SESSION_IS_SEED_SQL: &str = "(CASE \
     WHEN to_regprocedure('public.epigraph_session_is_seed()') IS NOT NULL THEN \
@@ -53,11 +58,13 @@ pub const SESSION_IS_SEED_SQL: &str = "(CASE \
             members(oid) AS ( \
                 SELECT m.member FROM pg_catalog.pg_auth_members m \
                   JOIN seed s ON m.roleid = s.oid \
-                 WHERE m.inherit_option OR m.set_option \
+                 WHERE (to_jsonb(m) ->> 'inherit_option')::boolean \
+                    OR (to_jsonb(m) ->> 'set_option')::boolean \
                 UNION \
                 SELECT m.member FROM pg_catalog.pg_auth_members m \
                   JOIN members x ON m.roleid = x.oid \
-                 WHERE m.inherit_option OR m.set_option \
+                 WHERE (to_jsonb(m) ->> 'inherit_option')::boolean \
+                    OR (to_jsonb(m) ->> 'set_option')::boolean \
             ) \
             SELECT 1 FROM pg_catalog.pg_roles me, seed s \
              WHERE me.rolname = session_user \
