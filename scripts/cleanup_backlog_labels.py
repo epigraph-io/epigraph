@@ -49,6 +49,12 @@ if not TOKEN:
     )
 AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
+# `GET /api/v1/claims/by-labels` pages by keyset cursor: a full page carries
+# this response header, passed back unchanged as `after` for the next page; no
+# header means the set is exhausted. Offset paging re-read a row whenever a
+# claim was written between two page reads (backlog b444e39f).
+NEXT_CURSOR_HEADER = "x-next-cursor"
+
 FULL_UUID_RE = re.compile(
     r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
     re.IGNORECASE,
@@ -66,22 +72,27 @@ KEYWORD_RE = re.compile(
 
 
 def page_claims(base_url: str, labels: list[str], exclude: list[str], current_only: bool) -> list[dict]:
-    """Page through all claims matching the filter — loops until a short page.
+    """Page through all claims matching the filter, following the keyset cursor.
 
-    Calls `GET /api/v1/claims/by-labels` repeatedly with monotonically
-    increasing `offset` and a fixed `page_size=100`. Stops when a page
-    returns fewer than `page_size` rows (i.e. the result set is exhausted)
-    or the safety belt of 10,000 rows is hit (whichever comes first).
+    Calls `GET /api/v1/claims/by-labels` with a fixed `page_size=100`,
+    passing each page's `X-Next-Cursor` response header back as `after`, so
+    a claim written mid-walk neither duplicates nor skips a row. Stops when a
+    page carries no cursor (the result set is exhausted) or the safety belt
+    of 10,000 rows is hit (whichever comes first). Raises `RuntimeError` on a
+    full page without a cursor (an API that predates keyset paging) or on a
+    repeated cursor, rather than returning a silently truncated walk.
     """
     out: list[dict] = []
-    offset = 0
     page_size = 100
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
     while True:
         params: dict[str, object] = {
             "labels": ",".join(labels),
             "limit": page_size,
-            "offset": offset,
         }
+        if cursor is not None:
+            params["after"] = cursor
         if exclude:
             params["exclude_labels"] = ",".join(exclude)
         if current_only:
@@ -96,10 +107,24 @@ def page_claims(base_url: str, labels: list[str], exclude: list[str], current_on
         r.raise_for_status()
         page = r.json()
         out.extend(page)
-        if len(page) < page_size:
+        cursor = r.headers.get(NEXT_CURSOR_HEADER)
+        if not cursor:
+            if len(page) >= page_size:
+                # The route sends the header on every full page. Its absence
+                # means a server that predates keyset paging; stopping here
+                # would silently truncate the walk at one page.
+                raise RuntimeError(
+                    f"by-labels returned a full page ({len(page)} rows) with no "
+                    f"{NEXT_CURSOR_HEADER} header; the API predates keyset paging"
+                )
             break
-        offset += page_size
-        if offset >= 10_000:  # safety belt
+        if cursor in seen_cursors:
+            raise RuntimeError(
+                f"by-labels repeated the {NEXT_CURSOR_HEADER} cursor {cursor!r}; "
+                "refusing to loop on the same page"
+            )
+        seen_cursors.add(cursor)
+        if len(out) >= 10_000:  # safety belt
             print(
                 f"WARN: page_claims hit 10k cap at labels={labels}",
                 file=sys.stderr,
