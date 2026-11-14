@@ -476,12 +476,27 @@ mod tests {
     use super::*;
     use epigraph_atlas_contract::fixtures;
 
-    /// The contract's fixture levels (two groups, two leaves) with every
-    /// position at the origin: what an assembler hands the fill.
+    /// The fixture levels these tests count on: two groups and two leaves.
+    /// They are picked by name, because the contract may ship further
+    /// fixtures (e.g. its sparse-mass leaf) that would change every count
+    /// below. Every position is set to the origin: what an assembler hands the
+    /// fill.
+    const STEMS: [&str; 4] = [
+        "team_theme_root",
+        "team_group_deep",
+        "team_leaf_dense",
+        "public_leaf",
+    ];
+
     fn unplaced() -> Vec<LevelDocument> {
-        fixtures::level_fixtures()
+        let docs: Vec<LevelDocument> = fixtures::level_fixtures()
             .into_iter()
-            .map(|(_, mut d)| {
+            .filter(|(stem, _)| STEMS.contains(stem))
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(docs.len(), STEMS.len(), "a pinned fixture stem is missing");
+        docs.into_iter()
+            .map(|mut d| {
                 zero(&mut d);
                 d
             })
