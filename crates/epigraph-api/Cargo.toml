@@ -13,9 +13,6 @@ genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPI
 integration = []
 tls = ["axum-server", "dep:rustls"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-# Episcience features: structural isomorphism detection.
-# Enable only when epigraph-isomorphism is added as a dep (epigraph-io/episcience repo).
-episcience = []
 
 # Operator ruling R-39: the `not(feature = "db")` build is CHECK-ONLY (CI runs
 # `cargo check -p epigraph-api --no-default-features --locked`). The server is
@@ -59,9 +56,6 @@ epigraph-passkey = { workspace = true, optional = true }
 epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
 epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
 epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + AnthropicClient (genai feature)
-# The episcience dep is optional and not bundled in the kernel.
-# To enable, add the git dep and uncomment:
-# epigraph-isomorphism = { git = "...", optional = true }
 hmac = "0.12"  # HMAC signing for webhook payloads
 sha2 = "0.10"  # SHA-256 for webhook HMAC signatures
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }  # HTTP client for webhook delivery
@@ -286,3 +280,6 @@ required-features = ["tls"]
 name = "tls_provider_choice"
 path = "tests/tls_provider_choice.rs"
 required-features = ["tls"]
+
+[lints]
+workspace = true

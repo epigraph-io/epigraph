@@ -189,11 +189,32 @@ pub async fn get_task(
     })
 }
 
+/// Page size of `GET /api/v1/tasks` when `limit` is not given.
+#[cfg(feature = "db")]
+const DEFAULT_TASK_LIMIT: i64 = 50;
+
+/// The page size a `limit` query value resolves to: the default when absent,
+/// clamped to the bounds the other list handlers use. A negative or zero value
+/// used to reach SQL `LIMIT` as written, and a large one was unbounded.
+#[cfg(feature = "db")]
+fn list_limit(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(DEFAULT_TASK_LIMIT)
+        .clamp(super::claims::MIN_PAGE_LIMIT, super::claims::MAX_PAGE_LIMIT)
+}
+
 /// List tasks
 ///
 /// GET /api/v1/tasks
 ///
-/// Optional query params: state, workflow_id, limit (default 50).
+/// Optional query params: state, workflow_id, limit.
+///
+/// - `state` alone returns tasks in exactly that state; with no `state` and no
+///   `workflow_id` the pending tasks (`created` / `queued`) are returned.
+/// - `limit` (default 50) is clamped to `[MIN_PAGE_LIMIT, MAX_PAGE_LIMIT]` and
+///   applies to those two listings. A `workflow_id` listing returns every task
+///   of the workflow, as before.
+///
 /// Requires `tasks:read` scope when OAuth2-authenticated.
 #[cfg(feature = "db")]
 pub async fn list_tasks(
@@ -205,16 +226,15 @@ pub async fn list_tasks(
         crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
     }
 
-    let limit = params.limit.unwrap_or(50);
+    let limit = list_limit(params.limit);
 
     let rows = match (params.state.as_deref(), params.workflow_id) {
         // Filter by workflow_id
         (None, Some(wf_id)) => TaskRepository::list_by_workflow(&state.db_pool, wf_id).await?,
-        // Filter by state (use list_pending for created/queued, otherwise list pending as approximation)
-        (Some(_state_filter), None) => {
-            // list_pending covers created/queued; for other states, fall back to pending list
-            // A future enhancement could add a list_by_state repo method
-            TaskRepository::list_pending(&state.db_pool, limit).await?
+        // Filter by state: exactly the requested state. This arm used to
+        // ignore the value and return the pending list for every state.
+        (Some(state_filter), None) => {
+            TaskRepository::list_by_state(&state.db_pool, state_filter, limit).await?
         }
         // No filters — return pending tasks up to limit
         (None, None) => TaskRepository::list_pending(&state.db_pool, limit).await?,
@@ -389,4 +409,20 @@ pub async fn fail_task(
     Err(ApiError::ServiceUnavailable {
         service: "Task failure recording requires database".to_string(),
     })
+}
+
+#[cfg(all(test, feature = "db"))]
+mod tests {
+    use super::*;
+    use crate::routes::claims::MAX_PAGE_LIMIT;
+
+    /// `limit` is bounded on both sides before it reaches SQL `LIMIT`.
+    #[test]
+    fn list_limit_defaults_and_clamps() {
+        assert_eq!(list_limit(None), DEFAULT_TASK_LIMIT);
+        assert_eq!(list_limit(Some(10)), 10);
+        assert_eq!(list_limit(Some(1_000_000)), MAX_PAGE_LIMIT);
+        assert_eq!(list_limit(Some(0)), 1);
+        assert_eq!(list_limit(Some(-5)), 1);
+    }
 }

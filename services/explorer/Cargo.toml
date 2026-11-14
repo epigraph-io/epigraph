@@ -8,7 +8,8 @@ description = "Server-rendered web UI and BFF for the EpiGraph knowledge graph"
 
 # Standalone root: its own Cargo.lock and target/. It is deliberately NOT a
 # member of the kernel workspace, so nothing below may use `workspace = true`
-# (it cannot resolve from here — see crates/epigraph-harvester).
+# (it cannot resolve from here: the empty `[workspace]` table below makes this
+# manifest its own workspace root, with no `[workspace.dependencies]`).
 [workspace]
 
 [lib]

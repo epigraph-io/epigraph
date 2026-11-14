@@ -205,11 +205,11 @@ public-reader path cannot resolve a group-private claim's author.
 When adding a new code path that inserts a claim, embed inline post-commit,
 best-effort (warn on failure, never block the write). Current call-sites:
 
-- **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs:217`
-- **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs:103`
+- **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs::finish_submission` (phase 3 of `submit_claim`, after COMMIT), through `claim_helper::embed_claim_author_stamped`
+- **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs::memorize`, through `claim_helper::embed_claim_author_stamped`
 - **MCP `batch_submit_claims`** — delegates to `submit_claim`
 - **MCP `submit_bug_report`** — `crates/epigraph-mcp/src/tools/bug_report.rs::submit_bug_report`. The one exception to post-commit: the vector is computed best-effort BEFORE the transaction and stored by migration 207's definer in the same statement sequence as the row, because the reporter cannot update an intake-owned claim after commit (row security hides it from them). The embed runs only after `epigraph_bug_report_preflight` passes, so a caller the write would refuse for who it is or its limit (not configured, system agent, unbound, a role's agent whose role its own human does not hold, over its limit) costs no provider call. The theme scripts never turn an intake-owned claim's text into a label (`scripts/theme_lib.py::not_intake_owned`)
-- **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs:321`
+- **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs::do_ingest_document_reporting` (the `embed_queue` drained through `embed_and_store` after the write)
 - **MCP `ingest_document_spine`** — `do_ingest_document_spine` in the same file; phase-1 of the two-phase flow, embeds spine claims (thesis + sections + paragraphs) post-write
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
@@ -217,7 +217,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
-- **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
+- **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
@@ -278,8 +278,12 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- enqueues one embedding_generation job per restored claim.
          --
          -- THE BOUND STAYS AT 24h, AND IT IS NOW A DEPLOYMENT QUESTION RATHER
-         -- THAN A MISSING-CODE ONE. `bin/server.rs` does register a handler for
-         -- that job type, but CONDITIONALLY: only the provider that OWNS this
+         -- THAN A MISSING-CODE ONE. A handler for that job type is registered,
+         -- by `jobs_drain::build_job_runner` (crates/epigraph-api), which only
+         -- the `drain_jobs` timer binary runs: since D9 `bin/server.rs` runs no
+         -- job runner at all, so an instance whose drain timer is not installed
+         -- drains nothing whatever its provider. The registration is
+         -- CONDITIONAL: only the provider that OWNS this
          -- column may write it. That is stricter than "not a mock" -- a real
          -- provider embedding into a different vector space is refused too, and
          -- refused deliberately, because one ANN column holding two spaces
@@ -290,8 +294,10 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- forever on exactly the instances that most need to see it. A
          -- non-zero count of jobs older than the bound now means "this
          -- instance's embedding provider is not the one that owns this
-         -- column", which is a deployment signal rather than a missing-handler
-         -- one; the boot log's own warning says which provider was selected,
+         -- column, or its `drain_jobs` timer is not running", which is a
+         -- deployment signal rather than a missing-handler one; the warning
+         -- in `drain_jobs`'s log (not the server's boot log) says which
+         -- provider was selected,
          -- and `epigraph-cli reembed` remains the recovery path in that case.
          --
          -- Restoration is HALF: the job writes `embedding`, which is the column

@@ -10,7 +10,7 @@ If you have not yet run through [`01-quickstart.md`](01-quickstart.md), do that 
 2. [Agents and signing](#2--agents-and-signing) — who authors and how authorship is cryptographically anchored
 3. [Beliefs and DST](#3--beliefs-and-dst) — how the graph carries uncertainty (BetP, mass functions, discounting)
 4. [Perspectives, frames, themes](#4--perspectives-frames-themes) — viewpoints, hypothesis spaces, topical clusters
-5. [Hierarchical extraction](#5--hierarchical-extraction) — papers → paragraphs → atoms and why paragraphs are primary
+5. [Hierarchical extraction](#5--hierarchical-extraction) — thesis → sections → paragraphs → atoms and why paragraphs are primary
 6. [Backlog discipline](#6--backlog-discipline) — how operational follow-ups live inside the graph
 
 ---
@@ -25,7 +25,14 @@ canonical pattern below is the post-S1 state.
 
 A row in `claims` is a **noun**: a stable-identity entity or
 assertion. Its canonical key is `(content_hash, agent_id)`, and
-there is at most one row per key. Examples:
+the writers are meant to keep one row per key. That is a writer
+contract, not a database constraint: migration 150 dropped
+`UNIQUE (content_hash, agent_id)` because the long-lived database
+holds duplicate groups it could never satisfy. The idempotent create
+paths take an advisory lock on the pair before they look for an
+existing row; a writer that inserts without it can still add a second
+row for the same key (the architecture doc linked below lists which
+writers take the lock). Examples:
 
 - "Evidence supports H₀ at confidence 0.8" (a textbook fact)
 - "Container `epiclaw-tg-7173612411` exists" (entity)
@@ -114,12 +121,25 @@ everywhere. Three seed strategies are in use today:
   the LEGACY seed: once a deployment registers its system agent in the
   `system_agents` registry (migration 148), the registry is
   authoritative and the agent's key can be rotated to a secret one.
-- **LLM-driven agents (planned, tracked in [issue #166](https://github.com/epigraph-io/epigraph/issues/166))** —
-  the seed is a hash of `(model identifier, system prompt)` so the same
-  model+prompt pair resolves to the same agent identity across sessions.
-  User OAuth passthrough sits next on that roadmap, so writes
-  attributed to "Claude with prompt X acting for Jeremy" can be
-  distinguished from "Claude with prompt X acting for Carrie".
+- **LLM-driven agents** — the seed is the model identifier plus the
+  BLAKE3 hash of the system prompt, so the same model+prompt pair
+  resolves to the same agent identity across sessions. The MCP server
+  derives its signer this way when it is started with `--agent-model`
+  (`EPIGRAPH_AGENT_MODEL`) and `--agent-system-prompt` or
+  `--agent-system-prompt-hash` (`keypair_from_llm_agent` in
+  `epigraph-crypto`; first tracked in
+  [issue #166](https://github.com/epigraph-io/epigraph/issues/166)).
+  Both inputs are public, so anyone who can read them can recompute
+  that private key. User OAuth passthrough sits next on that roadmap,
+  so writes attributed to "Claude with prompt X acting for Jeremy" can
+  be distinguished from "Claude with prompt X acting for Carrie".
+
+A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
+
+1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with `EPIGRAPH_AGENT_SIGNING_KEY`: the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with the two options below.
+2. `--agent-model`, the LLM-agent seed above. It takes precedence over `--agent-key`.
+3. `--agent-key` (`EPIGRAPH_MCP_AGENT_KEY`): a fixed 32-byte secret key that you generate once and keep. This is what the [quickstart](01-quickstart.md) sets up.
+4. None of these: the server generates a fresh keypair on every launch and says so on stderr. Each launch then authors as a different agent, and the server warns that ownership cannot be decided for such a signer.
 
 A `did:key` URI looks like this:
 
@@ -129,7 +149,7 @@ did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 
 The `z` is base58btc multibase, the leading bytes inside the base58 payload are the multicodec prefix `0xed01` for Ed25519, and the rest is the 32-byte public key. Resolving a DID requires no network call — the public key is in the URI, so signature verification is purely local.
 
-The schema carries `signature`, `signer_id` and `content_hash` columns on `claims`, `evidence` and `edges` (all three since the initial schema). Every claim and evidence signature written by the MCP server and the in-tree CLIs is over an entity-tagged message, never a bare digest: `b"epigraph-sig-v1:<claim|evidence|edge>:" || digest` (`epigraph_crypto::signing_message`), and a new claim row stores only a v1 claim signature. The tag is the domain separation: a v1 signature over an evidence row's hash does not verify as a signature over a claim with the same hash. The exceptions: rows written before v1 carry a legacy signature over the bare digest; evidence signatures that HTTP packet clients supply are stored as sent (no evidence verifier checks them); and the canonical-JSON struct signatures (`Signable`, used by the harvester) and the `submit_packet` envelope signature are a separate, untagged scheme. The claim verifier tries the v1 message first and then the legacy bare digest, and reports which one verified (`verify_claim`'s `signature_scheme`: `v1` or `legacy`); a legacy signature binds no type, so a legacy evidence signature copied onto a same-content claim still verifies, reported `legacy`. The edge verifier accepts v1 only. Only the signed message changed: stored content hashes and every identity derived from one are unchanged. Claims and evidence written through MCP are signed. Edge signing has a defined attestation (`epigraph_db::repos::edge_signature`), a verifier and a coverage metric (`system_stats` with `detailed: true` reports `edges_signed` / `edges_unsigned`), but no edge writer signs yet; see "Edge signing" in the noun/verb architecture doc for the writer inventory and why. The `provenance_log` table records every create or patch independently of the row-level signature, so even an unsigned edge has a tamper-evident audit trail keyed by the requesting principal.
+The schema carries `signature`, `signer_id` and `content_hash` columns on `claims`, `evidence` and `edges` (all three since the initial schema). Every claim and evidence signature written by the MCP server and the in-tree CLIs is over an entity-tagged message, never a bare digest: `b"epigraph-sig-v1:<claim|evidence|edge>:" || digest` (`epigraph_crypto::signing_message`), and a new claim row stores only a v1 claim signature. The tag is the domain separation: a v1 signature over an evidence row's hash does not verify as a signature over a claim with the same hash. The exceptions: rows written before v1 carry a legacy signature over the bare digest; evidence signatures that HTTP packet clients supply are stored as sent (no evidence verifier checks them); and the canonical-JSON struct signatures (`Signable`, used by the harvester) and the `submit_packet` envelope signature are a separate, untagged scheme. The claim verifier tries the v1 message first and then the legacy bare digest, and reports which one verified (`verify_claim`'s `signature_scheme`: `v1` or `legacy`); a legacy signature binds no type, so a legacy evidence signature copied onto a same-content claim still verifies, reported `legacy`. The edge verifier accepts v1 only. Only the signed message changed: stored content hashes and every identity derived from one are unchanged. Claims and evidence written through MCP are signed. Edge signing has a defined attestation (`epigraph_db::repos::edge_signature`), a verifier and a coverage metric (`system_stats` with `detailed: true` reports `edges_signed` / `edges_unsigned`), and some edge writers sign: the MCP server signs the edges its tools write, at INSERT, with the server's own signing key, and the HTTP API's routes sign with the API's separate key when `EPIGRAPH_API_SIGNING_KEY_FILE` is configured (with no key they write unsigned). The repository acts (supersede, dedup, consolidate, match promotion), the ingest executor, the operator CLIs and the database functions that insert edges do not sign. See ["Edge signing" in the noun/verb architecture doc](../architecture/noun-claims-and-verb-edges.md#edge-signing) for the writer table and why. The `provenance_log` table records every create or patch independently of the row-level signature, so even an unsigned edge has a tamper-evident audit trail keyed by the requesting principal.
 
 Two flows mint different tokens, and it is easy to confuse them:
 
@@ -147,7 +167,7 @@ Two flows mint different tokens, and it is easy to confuse them:
 
 The bearer-token's `agent_id` claim — when present — pins the resulting writes to a specific agent; without it, writes are attributed to the OAuth client's default agent. Either way the agent identity is the *durable* identity; the bearer token is just the per-session capability that lets a process act on its behalf.
 
-Practical implication for new code: never generate an Ed25519 keypair at runtime "to identify this process". Use the deterministic helper that matches the actor type: `did_key_for_author` for human authors, fixed system-agent seed helpers for named infrastructure agents, and `did_key_for_llm_agent(model_id, system_prompt)` for autonomous LLM agents. The LLM helper hashes the system prompt and combines it with the model identifier, so the same model+prompt pair gets the same DID across hosts while any model or prompt revision becomes a distinct signing identity. Let the get-or-create pattern in `system_agent.rs` find or insert the matching `agents` row. The same role on a different machine then writes against the same agent UUID and the same signing key, so attribution composes cleanly across hosts.
+Practical implication for new code: never generate an Ed25519 keypair on each run "to identify this process" (rung 4 above is the fallback, not a pattern to copy). Give the process a stable identity: a fixed key generated once and stored (`--agent-key`), or the deterministic helper that matches the actor type: `did_key_for_author` for human authors, fixed system-agent seed helpers for named infrastructure agents, and `keypair_from_llm_agent(model_id, system_prompt)` for autonomous LLM agents (`did_key_for_llm_agent` returns the `did:key` of the same keypair). The LLM helper hashes the system prompt and combines it with the model identifier, so the same model+prompt pair gets the same DID across hosts while any model or prompt revision becomes a distinct signing identity. Let the get-or-create pattern in `system_agent.rs` find or insert the matching `agents` row. The same role on a different machine then writes against the same agent UUID and the same signing key, so attribution composes cleanly across hosts.
 
 **See also:** [`crates/epigraph-crypto/src/did_key.rs`](../../crates/epigraph-crypto/src/did_key.rs) for `did:key` derivation; [`crates/epigraph-ingest-executor/src/system_agent.rs`](../../crates/epigraph-ingest-executor/src/system_agent.rs) for the get-or-create pattern; user-memory `reference_epigraph_oauth_mint.md` for the Ed25519 client-assertion shape against `/oauth/token`.
 
@@ -155,7 +175,13 @@ Practical implication for new code: never generate an Ed25519 keypair at runtime
 
 ## 3 — Beliefs and DST
 
-EpiGraph does not store a single scalar "truth" for each claim. Instead, every claim that has been judged carries a **Dempster-Shafer mass function** over a frame of discernment, and beliefs are projected from that mass function on demand. This matters because real-world evidence is often partial, conflicting, or missing entirely, and a single scalar cannot distinguish "we think it's 0.5" from "we have no idea, so we are reporting 0.5".
+EpiGraph does not treat a single scalar as a claim's belief. Every claim row does carry one scalar, `truth_value` (`NOT NULL`, default 0.5). A claim that has been judged also carries **Dempster-Shafer mass functions** over a frame of discernment, stored per `(claim, frame)`, and its belief is their combination. This matters because real-world evidence is often partial, conflicting, or missing entirely, and a single scalar cannot distinguish "we think it's 0.5" from "we have no idea, so we are reporting 0.5".
+
+Which number you are served depends on the read:
+
+- **Unframed `get_belief`** returns the combination cached on the claim row (`belief`, `plausibility`, `pignistic_prob`, and the two diagnostic masses). The cache holds ONE frame's combination, recorded in `claims.belief_frame_id`. A cache recompute (`recompute_claim_cached_belief` in `crates/epigraph-engine/src/edge_factor.rs`) picks that frame as `binary_truth` when the claim has evidence there, else `claim_validity`, else the frame already recorded, else the frame of the claim's earliest evidence.
+- **Framed `get_belief`** (a `frame_id`, optionally a perspective) recombines the stored mass functions on that frame at read time.
+- **A claim no Dempster-Shafer write has touched** has no cache. `get_belief` then reports an interval rebuilt from `truth_value` (`belief = pignistic_prob = truth_value`, `plausibility = 1.0`), so that an unassessed claim does not read as a refuted one.
 
 A frame of discernment is the finite set of mutually-exclusive hypotheses the claim ranges over — `{H0, H1}` for a binary fact, or a longer list for multi-class assertions. A mass function assigns probability mass to *subsets* of the frame (focal elements), not just to singletons; mass on the full frame represents ignorance. Mass that does not fit anywhere lands in two diagnostic buckets: `mass_on_conflict` (combination produced contradictory evidence) and `mass_on_missing` (the writer ran out of evidence to attribute). DST handles "we do not know yet" cleanly because ignorance is a first-class quantity, not a synthetic prior.
 
@@ -170,7 +196,7 @@ The canonical scalar belief score in EpiGraph is **BetP** — pignistic probabil
   "pignistic_prob": 0.78,
   "mass_on_conflict": 0.04,
   "mass_on_missing": 0.00,
-  "source": "combined"
+  "source": "cached"
 }
 ```
 
@@ -189,9 +215,11 @@ The fields decode like this:
 - `mass_on_missing` tracks mass that the writer could not attribute
   to any focal set — open-world ignorance, distinct from the
   "neither side" ignorance counted under `ignorance`.
-- `source` reports how the value was assembled (`"stored"`,
-  `"combined"`, etc.) so callers can tell whether they got a fresh
-  combination or a cached value.
+- `source` reports how the value was assembled: `"cached"` for an
+  unframed read (the claim row's cache, or the `truth_value` fallback
+  described above), `"recomputed"` or `"recomputed_perspective"` for a
+  framed read, and `"no_bbas"` when the frame holds no mass function
+  for the claim.
 
 The struct lives at `BeliefResponse` in `crates/epigraph-mcp/src/types.rs`.
 
@@ -201,16 +229,31 @@ When evidence from multiple sources is combined, the writer
 ignorance) before applying Dempster combination — this is the
 correct way to fuse evidence under uncertainty per Shenoy-Shafer.
 The `submit_ds_evidence` MCP tool exposes the `reliability`
-parameter directly; multiple combination methods are wired in
-(`Dempster`, `Conjunctive`, `YagerOpen`, `YagerClosed`,
-`DuboisPrade`, `Inagaki`) and `compare_methods` projects all of
-them so you can see how sensitive a claim is to the choice.
+parameter directly. A claim's belief is always recomputed by one
+shared Dempster fold. `submit_ds_evidence` still accepts a
+`combination_method` (`Dempster`, `Conjunctive`, `YagerOpen`,
+`YagerClosed`, `DuboisPrade`, `Inagaki`), but the parameter is
+deprecated: the name is validated, stored on the mass function and
+echoed back as `method_used`, and has no effect on belief; any value
+other than `Dempster` adds a warning to the response. The other
+rules are implemented in `crates/epigraph-ds`, and the read-only
+`compare_methods` tool runs all six over a claim's stored mass
+functions so you can see how sensitive it is to the choice.
 
-Scalar Bayesian belief propagation was tried earlier and removed: multiplying scalar truth values along edges collapses them toward zero independently of how strong the evidence actually is (see user-memory `project_bp_cdst_primary.md` and `feedback_pignistic_not_bayesian.md`). The deprecated `truth_value` column is still present in some rows for back-compat; do not order claims by it. The `bp_messages` table that backed the scalar engine is dead and a candidate for drop (`project_bp_messages_dead.md`).
+Scalar propagation is no longer what belief is served from, but it has not been removed from the tree. Multiplying scalar truth values along edges collapses them toward zero independently of how strong the evidence actually is, which is why the Dempster-Shafer path is primary. What remains: the loopy belief-propagation engine (`crates/epigraph-engine/src/bp.rs`) is reachable through `POST /api/v1/bp/propagate` as a read-only diagnostic (a request to write its results is refused with 409 unless the server was started with `EPIGRAPH_BP_APPLY=on`), and a few HTTP paths still write `truth_value` through the deprecated `BayesianUpdater`: a packet submission's initial truth, the workflow outcome report, and forgetting a convention.
 
-Math kept at intro level: full DST adds operations like Yager normalisation (re-attributing conflict mass to ignorance), Dubois-Prade combination (used when sources are not independent), and discounting with `mass_on_missing` to model open-world ignorance. Those live in the deeper architecture docs — for the intro, hold onto the three-bucket story: belief, plausibility, ignorance, with BetP as the scalar projection you sort by.
+`truth_value` is not a leftover column. It is set on every claim and the kernel still reads and writes it:
 
-**See also:** the LANL Open World DST paper (LA-UR-25-23655) — user-memory `reference_lanl_open_world_dst.md` — for the practitioner's foundation; [`crates/epigraph-mcp/src/tools/ds.rs`](../../crates/epigraph-mcp/src/tools/ds.rs) for `submit_ds_evidence`, `get_belief`, and `compare_methods`; user-memory `feedback_pignistic_not_bayesian.md` for the BetP-first rule; user-memory `project_bp_cdst_primary.md` for why CDST replaced scalar BP.
+- **What it holds.** The scalar the claim was authored with, or a copy of the cache: `submit_claim` and `update_with_evidence` store `truth_value = clamped(pignistic_prob)` when they fold evidence. A later cache recompute rewrites the cache and not `truth_value`, so such a copy can be stale; the operator binary `refresh_truth_mirrors` (`crates/epigraph-cli`) brings stale copies back in step with the cache.
+- **Where it is read.** The belief score that `recall` and `query_claims` gate on with `min_truth` is the pignistic probability when the claim has a Dempster-Shafer cache and `truth_value` when it does not. Several queries order by the column directly: `ClaimRepository::get_high_truth` / `get_low_truth`, the workflow listings in `crates/epigraph-db/src/repos/workflow.rs`, and the ranking of a recall hit's epistemic neighbors.
+
+So rank by `pignistic_prob` (or a result's `belief_score`) in your own code, and expect `truth_value` to decide the order wherever the kernel's own queries sort by it.
+
+The `bp_messages` table has not been dropped either. `FactorRepository` keeps its read and write functions for it (nothing outside the tests calls the write at the time of writing), and retiring a promoted match candidate deletes that factor's rows from it.
+
+Math kept at intro level: full DST adds operations like Yager normalisation (re-attributing conflict mass to ignorance), Dubois-Prade combination (each conflicting pair's mass goes to the union of the two sets), the cautious rule (for sources that are not independent), and discounting with `mass_on_missing` to model open-world ignorance. Those live in `crates/epigraph-ds/src/combination.rs` — for the intro, hold onto the three-bucket story: belief, plausibility, ignorance, with BetP as the scalar projection you sort by.
+
+**See also:** the LANL Open World DST paper (LA-UR-25-23655) for the practitioner's foundation; [`crates/epigraph-mcp/src/tools/ds.rs`](../../crates/epigraph-mcp/src/tools/ds.rs) for `submit_ds_evidence`, `get_belief`, and `compare_methods`; [`crates/epigraph-engine/src/belief_query.rs`](../../crates/epigraph-engine/src/belief_query.rs) for the unframed and framed reads.
 
 ---
 
@@ -242,6 +285,24 @@ A **perspective** is a *viewpoint*: an agent-owned (or community-owned) lens tha
 ]
 ```
 
+The `perspectives` table also has a second, internal use that is not a
+viewpoint. A machine-written mass function is keyed by
+`(claim, frame, agent, perspective)`, and `mass_functions.perspective_id`
+is a foreign key, so the kernel creates a synthetic perspective row to
+give each such mass function its own slot:
+
+- one per epistemic edge: `name = 'edge_factor'`,
+  `perspective_type = 'edge'`, and the row's `id` is the edge's id
+  (`PerspectiveRepository::ensure_edge_perspective`);
+- one per evidence row or assessment slot: `name = 'evidence_grounded'`,
+  `perspective_type = 'evidence'`; for an evidence row it shares the
+  evidence id (`PerspectiveRepository::ensure_evidence_perspective`).
+
+These rows are slots, not lenses. `list_perspectives` does not filter
+them out (`PerspectiveRepository::list` has no `perspective_type`
+predicate), so on a graph with epistemic edges or evidence its output
+includes rows of those two types; skip them when you choose a lens.
+
 A **theme** is a topical cluster derived from semantic clustering
 over claim embeddings. Themes are stored as rows in `claim_themes`
 (`label`, `description`, `centroid` vector, `claim_count`), and
@@ -263,7 +324,8 @@ label.
 Rule of thumb:
 
 - A **frame** is *what is being judged* — a fixed hypothesis space.
-- A **perspective** is *who is judging* — an agent's or group's lens.
+- A **perspective** is *who is judging* — an agent's or group's lens
+  (apart from the internal `edge` and `evidence` rows above).
 - A **theme** is *what topic* the claims are about — a cluster label.
 
 They are orthogonal. A single claim can sit in one frame, be
@@ -276,27 +338,55 @@ at the same time, and none of those facts contradict each other.
 
 ## 5 — Hierarchical extraction
 
-EpiGraph stores documents as a tree, not a flat bag of sentences. Each ingested source becomes a **paper** node; each paper has child **paragraph** nodes; each paragraph has child **atom** nodes. The level lives in `properties->>'level'`: papers are level 1, paragraphs are level 2, atoms are level 3. Edges link each level to its parent so the tree is graph-traversable in either direction, and each child carries its own embedding so searches at any granularity are possible — but only paragraph-level search is *canonical*.
+EpiGraph stores documents as a tree, not a flat bag of sentences. Each ingested source becomes four levels of claims: a **thesis** (when the extraction has one), its **sections**, each section's **paragraphs**, and each paragraph's **atoms**. The level lives in `properties->>'level'`: the thesis is level 0, sections are level 1, paragraphs are level 2, atoms are level 3. A `decomposes_to` edge links each node to its children, so the tree is graph-traversable in either direction, and each claim carries its own embedding, so every level is searchable; `recall_with_context` searches all of them and uses the tree as context (next paragraph).
+
+The source itself is not a claim in that tree. It is a row in the `papers` table, and an `asserts` edge runs from the paper to each claim of the document. A query for `properties->>'level' = '1'` returns section headings, not papers.
 
 ```text
-                paper (level 1)
-                  │
-        ┌─────────┼─────────┐
-   paragraph    paragraph    paragraph   (level 2)
-        │
-   ┌────┼────┐
-  atom atom atom                          (level 3)
+                  thesis (level 0)
+                     │
+          ┌──────────┼──────────┐
+       section    section    section       (level 1)
+          │
+    ┌─────┼─────┐
+paragraph paragraph paragraph              (level 2)
+    │
+ ┌──┼──┐
+atom atom atom                             (level 3)
+
+papers row ──asserts──▶ each claim above
 ```
 
 **Every embedded claim is a search candidate; the hierarchy is context.** The `recall_with_context` MCP tool runs vector kNN over every claim that carries an embedding — paragraphs, atoms, sections, workflow steps, and claims written on their own with `submit_claim` or `memorize` — then *batches in* the structural context for each hit: its parent paper and section, its atoms (level 3), its sibling paragraphs in the same section (level 2), its corroborating and epistemic edges, and its neighbor paragraphs. Parentage is an enrichment attribute, not an eligibility filter: a hit with no paper attribution comes back without a `paper` key and with `section: null`, rather than being dropped. The hierarchy lists (atoms, siblings, neighbor paragraphs) are filled only for paragraph hits; corroborating and epistemic edges come from the hit's own edges whatever its level (backlog `a1d89aab`, drain U082). Paragraphs are still the unit of meaning the hierarchy is built around — an atom on its own strips away its surrounding context, and a 50-page document averages out into a single embedding that does not retrieve well — which is why the tree's context travels with every hit that has one. Earlier versions searched level-2 paragraphs only; an exactly matching standalone claim then lost to weaker paragraphs because it was never a candidate.
 
-This shape exists only because ingestion *creates* it that way. The
-single canonical ingest path is **Tier 1 hierarchical extraction**:
-the `extract-claims` LLM extractor consumes a paper, emits
-paragraph- and atom-level claims as a tree, and the
-`ingest_document` writer lands them with the parent edges already
-in place. There is no supported flat-extraction path. Two
-historical failure modes are worth knowing about:
+This shape exists only because ingestion *creates* it that way.
+Hierarchical extraction is the canonical shape, and more than one
+writer produces it. The MCP server registers four document tools:
+
+- `structure_source` — read-only and deterministic. It splits raw
+  markdown or plain text into a `DocumentExtraction` whose sections
+  and paragraphs are byte-exact slices of the source, with the atoms
+  left empty. No LLM rewrites the spine text.
+- `ingest_document_inline` — the writer. It takes a complete
+  `DocumentExtraction` in the call and lands the thesis, sections,
+  paragraphs and atoms with their edges; when the extraction carries
+  `source_text` it re-verifies the spans against it. For an authored
+  record with no external source to quote (a lab-notebook entry, a run
+  summary), omit `source_text` and this one call is the whole path.
+- `ingest_document` — the same writer, reading the extraction from a
+  JSON file inside the server's working directory.
+- `ingest_document_spine` — phase 1 of a two-phase flow: it writes the
+  thesis, sections and paragraphs, ignores atoms, and returns the paths
+  of the paragraphs that are new, so only those are atomized before
+  `ingest_document_inline` adds the atoms.
+
+The `extract-claims` skill drives the first route for extracted
+sources: `structure_source`, then the LLM fills in atoms only, then
+`ingest_document_inline`. Outside MCP, the operator `ingest_document`
+CLI runs the document writer on the maintenance connection, and the
+`ingest_literature` CLI is a flat path: it submits each extracted
+claim as its own packet, with no tree. Two historical failure modes
+are worth knowing about:
 
 - **Jina embeddings in the primary column.** Earlier attempts at
   populating the primary embedding column with Jina vectors broke
@@ -331,6 +421,7 @@ A single recall hit for an ingested paragraph, abbreviated, looks like this — 
   "paragraph_content": "DNA-origami actuators driven by ...",
   "similarity": 0.83,
   "truth_value": 0.71,
+  "belief_score": 0.78,
   "paper": {"doi": "10.1038/s41586-024-...", "title": "..."},
   "atoms":       [/* level-3 children */],
   "siblings":    [/* level-2 siblings in same section */],
@@ -339,9 +430,9 @@ A single recall hit for an ingested paragraph, abbreviated, looks like this — 
 }
 ```
 
-Each batched list also carries a `_total` and `_truncated` field (e.g., `atoms_total`, `atoms_truncated`) so the caller can tell when the structural fan-out was clipped. The `truth_value` field on `RecallHit` is a legacy scalar carried for back-compat; treat `pignistic_prob` from `get_belief` (§3) as the authoritative belief signal for ranking.
+Each batched list also carries a `_total` and `_truncated` field (e.g., `atoms_total`, `atoms_truncated`) so the caller can tell when the structural fan-out was clipped. The `truth_value` field on `RecallHit` is the claim's own `claims.truth_value`, reported unchanged; it is not what `min_truth` compares against. That is the hit's `belief_score`: the pignistic probability when the claim has a Dempster-Shafer cache, and `truth_value` when it does not (§3).
 
-**See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the whole-corpus kNN logic and the full `RecallHit` shape; user-memory `feedback_tier1_ingestion_only.md` for the single-canonical-ingest-path rule; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
+**See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the whole-corpus kNN logic and the full `RecallHit` shape; `docs/superpowers/specs/2026-06-18-deterministic-spine-ingest-design.md` for the verbatim-spine design; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
 
 ---
 
@@ -396,11 +487,21 @@ gets forgotten.
 
 Related but not the same:
 
-- **Cross-agent backlog retire** is not allowed via
-  `resolve_backlog_item` directly — it enforces owner-equality. The
-  workaround is a free-text "Resolves <UUID>:" prefix on the
-  resolution claim and letting the daily reconciler patch the
-  label (user-memory `feedback_cross_agent_backlog_retire.md`).
+- **Who may retire an item.** `resolve_backlog_item` checks who owns
+  the original claim, and the same check runs on any `update_labels`,
+  `patch_claim` or `update_with_evidence` call that adds or removes
+  `resolved`. The owner is the claim's author. On stdio it is also an
+  agent linked to the same operator as the author (so an agent whose
+  model was bumped, and which therefore runs under a new identity, can
+  retire its predecessor's items) and an agent live-linked to the
+  author itself (its delegate). Over HTTP it is the author's operator
+  or a live delegated run token, and a `claims:admin` token also
+  passes. A stdio agent that shares no operator with the author is
+  refused, and so is a stdio server with no declared signer
+  (`--agent-key` / `--agent-model`) on any claim it did not author.
+  There is no free-text workaround: a bare "Resolves <UUID>:" claim is
+  exactly the drift the "Do **not**" list above forbids. If you are
+  refused, have an owner retire the item.
 - **EpiClaw dedup-first rule** — EpiClaw's `CLAUDE.md` requires a
   `recall()` and a restatement test *before* `submit_claim` or
   `memorize`, including before filing a backlog item. This stops
