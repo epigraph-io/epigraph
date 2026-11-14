@@ -550,14 +550,13 @@ mod tests {
     #[test]
     fn a_torn_final_line_is_dropped_only_when_allowed_and_reported() {
         let (dir, p) = file_with(&torn(20));
-        let err = read(&p).err().expect("the strict reader refuses a torn tail");
+        let err = read(&p)
+            .err()
+            .expect("the strict reader refuses a torn tail");
         assert!(format!("{err:#}").contains(":4: not JSON"), "{err:#}");
         let m = read_tolerating_truncated_tail(&p).expect("the tail is tolerated");
         assert_eq!(m.records.len(), 2, "the two whole records are kept");
-        assert_eq!(
-            m.truncated_tail,
-            Some(TruncatedTail { line: 4, bytes: 20 })
-        );
+        assert_eq!(m.truncated_tail, Some(TruncatedTail { line: 4, bytes: 20 }));
         assert!(read(&p).is_err(), "tolerating once changes nothing on disk");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -591,9 +590,18 @@ mod tests {
         let (a, b) = (rec_line("a"), rec_line("b"));
         for (what, body) in [
             ("a bad line mid-file", format!("{h}\n{a}\n{{\"tab\n{b}\n")),
-            ("a bad line mid-file, no final newline", format!("{h}\n{{\"tab\n{b}")),
-            ("a bad final line WITH its newline", format!("{h}\n{a}\n{{\"tab\n")),
-            ("a torn header, nothing before it", "{\"manifest\": \"t".to_string()),
+            (
+                "a bad line mid-file, no final newline",
+                format!("{h}\n{{\"tab\n{b}"),
+            ),
+            (
+                "a bad final line WITH its newline",
+                format!("{h}\n{a}\n{{\"tab\n"),
+            ),
+            (
+                "a torn header, nothing before it",
+                "{\"manifest\": \"t".to_string(),
+            ),
             ("two torn lines", format!("{h}\n{a}\n{{\"x\n{{\"tab")),
         ] {
             let (dir, p) = file_with(body.as_bytes());
