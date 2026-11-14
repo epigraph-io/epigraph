@@ -326,6 +326,8 @@ async fn with_an_existing_twin_the_canonical_row_is_the_one_returned() {
 /// the canonical key. The loser must get the winner's row, not a unique
 /// violation surfaced as a 500. Deterministic: the canonical row's INSERT is
 /// held open on another connection until the POST is seen waiting on it.
+/// The loser lands in the INSERT's `ON CONFLICT` arm, which must fill only
+/// NULL fields and so leave the winner's title in place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_post_racing_another_spelling_of_a_new_doi_returns_that_row_not_a_500() {
     let (url, pool) = connect().await;
@@ -374,6 +376,19 @@ async fn a_post_racing_another_spelling_of_a_new_doi_returns_that_row_not_a_500(
         vec![(held_id, bare.clone())],
         "one paper, under the canonical key"
     );
+    // The racing POST landed in the INSERT's `ON CONFLICT (doi) DO UPDATE`
+    // arm. That arm fills only NULL fields (backlog 62ce37ca): the winner's
+    // title stands, in the response and in the stored row.
+    assert_eq!(
+        body["title"], "held",
+        "the loser's title is not written: {body}"
+    );
+    let stored: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE id = $1")
+        .bind(held_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored.as_deref(), Some("held"), "the winner's title stands");
 }
 
 /// A resolver spelling with no scheme (`doi.org/…`, `dx.doi.org/…`,
