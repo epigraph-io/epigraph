@@ -186,6 +186,64 @@ async fn each_assessment_records_its_writer_and_any_contest_durably(pool: PgPool
     assert_eq!(prior, Some(Some(one)), "the contested assessment's writer");
 }
 
+/// The record is part of the slot write, not a best-effort side effect: when
+/// the event INSERT fails, the call is refused AND the slot upsert rolls back.
+/// A savepoint-wrapped (log-and-continue) insert would answer 200 with the row
+/// stored and no record; a strict insert issued after the slot transaction
+/// commits would refuse with the row already stored. Both leave an
+/// assessment with no writer on record, which is what this item closes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_record_refuses_the_call_and_stores_no_assessment(pool: PgPool) {
+    let (author, _) = seed_agent_with_group(&pool, "assess-writer-strict-author").await;
+    let (caller, _) = seed_agent_with_group(&pool, "assess-writer-strict-caller").await;
+    let claim = seed_public_claim(&pool, author, "assess writer record: strict").await;
+    sqlx::query(
+        "CREATE FUNCTION refuse_assessment_event() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.event_type = 'claim.assessed' THEN \
+             RAISE EXCEPTION 'test: assessment record refused'; \
+           END IF; \
+           RETURN NEW; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_assessment_event BEFORE INSERT ON events \
+         FOR EACH ROW EXECUTE FUNCTION refuse_assessment_event()",
+    )
+    .execute(&pool)
+    .await
+    .expect("install the refusing trigger");
+
+    let viewer = Viewer::resolve(&pool, caller)
+        .await
+        .expect("resolve caller");
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let result = assess_claim(
+        write_scope(),
+        ViewerExtractor(viewer),
+        State(state),
+        Path(claim),
+        Json(request(true, 0.9)),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "an assessment whose writer could not be recorded must be refused"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("count slot rows");
+    assert_eq!(
+        rows, 0,
+        "the refused call's slot upsert must roll back with its record"
+    );
+}
+
 /// The `claims:write` scope the write handlers now take as their first
 /// extractor (backlog f00d75ab). A direct handler call stands in for the
 /// bearer middleware, so it supplies the scope the route checks.
