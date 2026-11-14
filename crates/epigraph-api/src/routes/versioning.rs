@@ -152,6 +152,10 @@ pub struct SupersessionResponse {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
+    /// Whether the replacement got its embedding (best-effort, post-commit; a
+    /// backfill covers a `false`). `#[serde(default)]` as for the two above.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 /// A single version entry in a claim's history
@@ -507,6 +511,15 @@ pub async fn supersede_claim(
         )
         .await;
 
+    // 9a'. Embed the replacement: a current claim with new text and no vector
+    // (the act copies none on purpose). Post-commit and best-effort, on the
+    // caller's stamp, which just wrote the row (CLAUDE.md "Embedding policy";
+    // backlog 7628ab2c). Without it the claim that replaced a recallable one
+    // was invisible to dense recall until a backfill ran.
+    let embedded = state
+        .embed_claim_as(&viewer, new_uuid, &request.content, "supersede_claim.embed")
+        .await;
+
     // 9b. The administrative cascade (backlog 20e9ed83; migration 117): migrate
     // the retired claim's edges onto the replacement, then invalidate the
     // edge-factor BBAs frozen from ITS interval and re-derive them. Those edges
@@ -583,6 +596,7 @@ pub async fn supersede_claim(
             created_at: now,
             cascade,
             belief_cascade,
+            embedded,
         }),
     ))
 }
