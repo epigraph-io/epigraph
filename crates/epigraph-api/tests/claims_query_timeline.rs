@@ -208,6 +208,9 @@ async fn include_edges_lists_only_readable_in_force_epistemic_edges_among_the_pa
     // c[3] is off the first page (limit=3, oldest first).
     let on_page = viewer_fixture::seed_edge(&pool, c[0], c[1]).await;
     let off_page = viewer_fixture::seed_edge(&pool, c[1], c[3]).await;
+    // And one whose SOURCE is off the page and target on it: both ends must
+    // be on the page, not just one.
+    let off_page_source = viewer_fixture::seed_edge(&pool, c[3], c[0]).await;
     let private = viewer_fixture::seed_edge_owned_by(&pool, c[1], c[2], "group", owner_group).await;
     let retracted = viewer_fixture::seed_edge(&pool, c[2], c[0]).await;
     sqlx::query("UPDATE edges SET valid_to = now() - interval '1 hour' WHERE id = $1")
@@ -251,8 +254,9 @@ async fn include_edges_lists_only_readable_in_force_epistemic_edges_among_the_pa
     want.sort();
     assert_eq!(
         listed, want,
-        "on-page, in-force, readable epistemic edges only (off_page {off_page}, private \
-         {private}, retracted {retracted}, structural {structural}): {body}"
+        "on-page, in-force, readable epistemic edges only (off_page {off_page}, \
+         off_page_source {off_page_source}, private {private}, retracted {retracted}, \
+         structural {structural}): {body}"
     );
     let e = body["edges"]
         .as_array()
