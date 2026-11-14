@@ -16,9 +16,11 @@ use epigraph_atlas_contract::{
     Edge, FlowBasis, Hierarchy, LeafLevel, LevelDocument, MapScope, Node, PlainNode, Switch,
     SCHEMA_VERSION,
 };
-use epigraph_db::repos::atlas_leaf::{LeafNodeKind, LeafNodeSet, LeafOutcome};
+use epigraph_db::repos::atlas_leaf::{
+    LeafEdge, LeafEdgeOrigin, LeafNode, LeafNodeKind, LeafNodeSet, LeafOutcome,
+};
 use epigraph_db::repos::atlas_map::AtlasMap;
-use epigraph_db::{AtlasLeafRepository, AtlasMapRepository, Viewer};
+use epigraph_db::{AtlasFlowRepository, AtlasLeafRepository, AtlasMapRepository, DbError, Viewer};
 use epigraph_engine::atlas_flow::build_leaf_flow_edges;
 use serde_json::json;
 use sqlx::PgPool;
@@ -1051,5 +1053,134 @@ async fn an_evidence_edge_with_no_readable_mass_is_none_and_the_contract_refuses
         vec![format!(
             "/edges/{index}/flow_basis: an edge from Evidence to Claim has basis Exact, not None"
         )]
+    );
+}
+
+/// Force a co-owned edge: owner `owner`, co-owner `co_owner`.
+async fn force_edge_co_owned(pool: &PgPool, id: Uuid, owner: Uuid, co_owner: Uuid) {
+    let n = sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(co_owner)
+    .execute(pool)
+    .await
+    .expect("force edge co-owner")
+    .rows_affected();
+    assert_eq!(n, 1);
+}
+
+/// `read_flow_inputs` on `map` for `set` plus one extra claim-to-claim edge
+/// `a -> b` carrying the stored row ids `extra`, on a fresh snapshot.
+async fn read_with_extra_edge(
+    pool: &PgPool,
+    viewer: &Viewer,
+    map: AtlasMap,
+    ids: &[Uuid],
+    (a, b): (Uuid, Uuid),
+    extra: &[Uuid],
+) -> Result<epigraph_db::repos::atlas_flow::FlowInputs, DbError> {
+    let mut tx = pool.begin().await.expect("begin the build");
+    AtlasMapRepository::begin_build_snapshot(&mut tx, viewer, map)
+        .await
+        .expect("begin_build_snapshot");
+    let mut set = match AtlasLeafRepository::build_leaf(&mut tx, viewer, map, ids, CAP)
+        .await
+        .expect("build_leaf")
+    {
+        LeafOutcome::Fits(set) => set,
+        other => panic!("expected Fits, got {other:?}"),
+    };
+    if !extra.is_empty() {
+        set.edges.push(LeafEdge {
+            source: LeafNode::claim(a),
+            target: LeafNode::claim(b),
+            relationship: "supports".into(),
+            origin: LeafEdgeOrigin::Stored {
+                edge_ids: extra.to_vec(),
+            },
+        });
+    }
+    let out = AtlasFlowRepository::read_flow_inputs(&mut tx, viewer, map, &set).await;
+    tx.rollback().await.expect("rollback");
+    out
+}
+
+/// The strength read re-applies the leaf's edge rule on its own: a stored
+/// claim-to-claim row id the map's audience cannot read is an error, never a
+/// strength. W3 never hands it such an id, so the set is built by W3 and then
+/// given one: a row another team owns, a row the map's team owns with a
+/// co-owner (readable only by members of both, so never baked into one
+/// team's map), and, on the public map, a row a team owns. A readable id
+/// beside them still reads, so the error is the hidden id's alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_link_row_the_map_cannot_read_is_an_error_not_a_strength(pool: PgPool) {
+    let world = fixture::world_group(&pool).await;
+    let t = team(&pool, "flow-t").await;
+    let u = team(&pool, "flow-u").await;
+    let f = agent(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+
+    // T's map: two of T's claims and one readable link.
+    let (a, b) = (
+        claim(&pool, f, "group", t).await,
+        claim(&pool, f, "group", t).await,
+    );
+    let readable = claim_edge(&pool, a, b, "supports", json!({"strength": 0.4})).await;
+    force_edge_owner(&pool, readable, t).await;
+    let other_team = claim_edge(&pool, a, b, "supports", json!({"strength": 0.9})).await;
+    force_edge_owner(&pool, other_team, u).await;
+    let co_owned = claim_edge(&pool, a, b, "supports", json!({"strength": 0.9})).await;
+    force_edge_co_owned(&pool, co_owned, t, u).await;
+
+    let team_map = AtlasMap::Team(t);
+    let control = read_with_extra_edge(&pool, &system, team_map, &[a, b], (a, b), &[])
+        .await
+        .expect("the unmodified leaf reads");
+    assert_eq!(
+        control.link_strengths.get(&readable),
+        Some(&Some(json!(0.4)))
+    );
+    assert!(!control.link_strengths.contains_key(&other_team));
+    assert!(!control.link_strengths.contains_key(&co_owned));
+    read_with_extra_edge(&pool, &system, team_map, &[a, b], (a, b), &[readable])
+        .await
+        .expect("a readable extra id reads");
+    for (what, hidden) in [("another team's", other_team), ("a co-owned", co_owned)] {
+        let got = read_with_extra_edge(
+            &pool,
+            &system,
+            team_map,
+            &[a, b],
+            (a, b),
+            &[readable, hidden],
+        )
+        .await;
+        assert!(
+            matches!(got, Err(DbError::InvalidData { .. })),
+            "{what} row on T's map: {got:?}"
+        );
+    }
+
+    // The public map: two public claims, a public link, and T's row.
+    let (c, d) = (
+        claim(&pool, f, "public", world).await,
+        claim(&pool, f, "public", world).await,
+    );
+    let public = claim_edge(&pool, c, d, "supports", json!({"strength": 0.4})).await;
+    let teams = claim_edge(&pool, c, d, "supports", json!({"strength": 0.9})).await;
+    force_edge_owner(&pool, teams, t).await;
+    let control = read_with_extra_edge(&pool, &system, AtlasMap::Public, &[c, d], (c, d), &[])
+        .await
+        .expect("the unmodified public leaf reads");
+    assert!(control.link_strengths.contains_key(&public));
+    assert!(!control.link_strengths.contains_key(&teams));
+    let got =
+        read_with_extra_edge(&pool, &system, AtlasMap::Public, &[c, d], (c, d), &[teams]).await;
+    assert!(
+        matches!(got, Err(DbError::InvalidData { .. })),
+        "a team's row on the public map: {got:?}"
     );
 }
