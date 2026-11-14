@@ -371,7 +371,11 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("read the row");
-    assert_eq!(title.as_deref(), Some("winner"), "the winner's title stands");
+    assert_eq!(
+        title.as_deref(),
+        Some("winner"),
+        "the winner's title stands"
+    );
     assert_eq!(
         journal.as_deref(),
         Some("loser journal"),

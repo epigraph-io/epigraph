@@ -173,7 +173,10 @@ async fn list_by_agent_omits_the_agents_own_edge_and_evidence_slots(pool: PgPool
     .fetch_one(&pool)
     .await
     .expect("calibrate");
-    assert_eq!(owned_public, 3, "fixture: three public rows owned by the agent");
+    assert_eq!(
+        owned_public, 3,
+        "fixture: three public rows owned by the agent"
+    );
 
     let viewer = fixture::public_viewer(&pool).await;
     let listed: Vec<Uuid> = PerspectiveRepository::list_by_agent(&pool, &viewer, agent, 100, 0)
