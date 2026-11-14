@@ -290,6 +290,173 @@ impl DecompositionPriorityRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
+    /// `decompose_claims --redecompose`'s read (backlog `c4a8436b`): the
+    /// members of `ids` that are current, not telemetry and longer than 10
+    /// characters, in the given order, WHATEVER their `decomposes_to` edges.
+    ///
+    /// The same row shape and exclusions as [`Self::list_undecomposed_by_ids`]
+    /// minus its two `NOT EXISTS` probes, which are what make a compound atom
+    /// (the target of a `decomposes_to` edge) unreachable there. Whether an id
+    /// already has children is the caller's question
+    /// ([`Self::count_in_force_children`]).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn list_redecompose_by_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<DecomposeCandidate>, DbError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = viewer.splice(
+            r#"
+                SELECT c.id, c.agent_id, c.content, c.content_hash, c.labels, c.created_at,
+                       c.visibility,
+                       0::bigint AS conflict_edges,
+                       NULL::timestamptz AS newest_conflict_at
+                FROM unnest($1::uuid[]) WITH ORDINALITY AS want(id, ord)
+                JOIN claims c ON c.id = want.id
+                WHERE
+                  COALESCE(c.is_current, true) = true
+                  AND length(c.content) > 10
+                  AND NOT ('telemetry' = ANY(c.labels))
+                  AND (c.properties ->> 'event') IS NULL
+                  /* {VISIBILITY:c} */
+                ORDER BY want.ord
+                "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, DecomposeCandidate>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Distinct current children each of `ids` reaches through an in-force
+    /// `decomposes_to` edge, edge and child visible to the viewer. Ids with
+    /// none are absent from the result.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn count_in_force_children<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, i64)>, DbError> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT d.source_id, count(DISTINCT d.target_id)::bigint
+            FROM edges d
+            JOIN claims k ON k.id = d.target_id
+            WHERE d.source_id = ANY($1::uuid[])
+              AND d.relationship = 'decomposes_to'
+              AND d.target_type = 'claim'
+              AND (d.valid_to IS NULL OR d.valid_to > now())
+              AND COALESCE(k.is_current, true) = true
+              /* {EDGE_VISIBILITY:d} */
+              /* {VISIBILITY:k} */
+            GROUP BY d.source_id
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, i64)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Every claim above `id` along `decomposes_to` edges (retired ones
+    /// included), up to 32 levels: the ids an atom of `id` must not be, or
+    /// the new edge would close a cycle. The walk follows only edges the
+    /// viewer can see.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn decomposes_to_ancestors<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE up(id, depth) AS (
+                SELECT $1::uuid, 0
+                UNION
+                SELECT d.source_id, up.depth + 1
+                  FROM up
+                  JOIN edges d ON d.target_id = up.id
+                 WHERE d.relationship = 'decomposes_to'
+                   AND d.source_type = 'claim'
+                   AND d.target_type = 'claim'
+                   AND up.depth < 32
+                   /* {EDGE_VISIBILITY:d} */
+            )
+            SELECT DISTINCT id FROM up WHERE depth > 0
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// `id` itself and every claim above it along `decomposes_to` edges (as
+    /// [`Self::decomposes_to_ancestors`]), each with its `content_hash`: the
+    /// dedup keys an atom text of `id` must not hit.
+    ///
+    /// `POST /api/v1/claims` with `if_not_exists` dedups on
+    /// `(content_hash, agent_id)` and records the atom's derivation on BOTH
+    /// arms, so an atom text whose hash equals the parent's or an ancestor's
+    /// hands back that claim AND writes a derivation naming its own
+    /// descendant as its source. `decompose_claims` compares against these
+    /// BEFORE any POST (review M2, backlog `c4a8436b`). Hidden lineage is not
+    /// returned: the walk and the rows follow the viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn decomposes_to_lineage_hashes<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Vec<(Uuid, Vec<u8>)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE up(id, depth) AS (
+                SELECT $1::uuid, 0
+                UNION
+                SELECT d.source_id, up.depth + 1
+                  FROM up
+                  JOIN edges d ON d.target_id = up.id
+                 WHERE d.relationship = 'decomposes_to'
+                   AND d.source_type = 'claim'
+                   AND d.target_type = 'claim'
+                   AND up.depth < 32
+                   /* {EDGE_VISIBILITY:d} */
+            )
+            SELECT DISTINCT c.id, c.content_hash
+              FROM up
+              JOIN claims c ON c.id = up.id
+             WHERE true
+               /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Vec<u8>)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// In-force contradicts/refutes edges (claim → claim) whose target is a
     /// current parent with at least one current atom reached through an
     /// IN-FORCE `decomposes_to` edge, oldest edge first

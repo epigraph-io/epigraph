@@ -92,6 +92,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
     ("query_undecomposed_claims", "claims:read"),
+    // The atomicity screen (backlogs 72850d43, c4a8436b): viewer-stamped
+    // SELECTs plus a text heuristic; nothing is written.
+    ("query_compound_claims", "claims:read"),
+    ("screen_claim_atomicity", "claims:read"),
     ("recall", "claims:read"),
     ("recall_with_context", "claims:read"),
     // Proposes interval corrections from a viewer-stamped read and writes
@@ -324,6 +328,15 @@ mod tests {
             "lint_claim_id_citations",
             "resolve_claim_id_prefix",
         ] {
+            assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
+        }
+    }
+
+    /// The atomicity screen's tools write nothing. Asserted by name for the
+    /// same reason as the B41 tools above.
+    #[test]
+    fn atomicity_screen_tools_are_read_scoped() {
+        for tool in ["query_compound_claims", "screen_claim_atomicity"] {
             assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
         }
     }
