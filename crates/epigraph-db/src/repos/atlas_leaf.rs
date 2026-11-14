@@ -973,6 +973,63 @@ impl AtlasLeafRepository {
         let rows = Self::read_leaf_rows(conn, viewer, map, claim_ids).await?;
         assemble_leaf(&rows, claim_ids, cap)
     }
+
+    /// The raw label text of a leaf's agent and evidence nodes (Atlas W9's
+    /// real leaves): each agent's `display_name`, and each evidence row's
+    /// `raw_content`, else its `evidence_type`, for the rows `map` may draw.
+    /// An agent with no display name, and an evidence id the map may not
+    /// draw, are absent; the caller supplies a fallback label. Text is
+    /// returned as stored: clipping to the contract's label length is the
+    /// document builder's.
+    ///
+    /// `agents` carries no tenancy (077's `agents_identity` is readable by
+    /// every session); evidence carries the map predicate, as in
+    /// [`Self::read_leaf_rows`].
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a statement fails.
+    pub async fn node_labels(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        agent_ids: &[Uuid],
+        evidence_ids: &[Uuid],
+    ) -> Result<(BTreeMap<Uuid, String>, BTreeMap<Uuid, String>), DbError> {
+        let agents: BTreeMap<Uuid, String> = if agent_ids.is_empty() {
+            BTreeMap::new()
+        } else {
+            sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT a.id, a.display_name FROM agents a \
+                  WHERE a.id = ANY($1) AND a.display_name IS NOT NULL",
+            )
+            .bind(agent_ids)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect()
+        };
+        if evidence_ids.is_empty() {
+            return Ok((agents, BTreeMap::new()));
+        }
+        let sql = viewer.splice(
+            "SELECT ev.id, COALESCE(NULLIF(btrim(ev.raw_content), ''), ev.evidence_type) \
+               FROM evidence ev \
+              WHERE ev.id = ANY($1) \
+                AND (ev.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND ev.visibility = 'group' \
+                         AND ev.owner_group_id = $2)) \
+                /* {VISIBILITY:ev} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql)
+            .bind(evidence_ids)
+            .bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let evidence = q.fetch_all(&mut *conn).await?.into_iter().collect();
+        Ok((agents, evidence))
+    }
 }
 
 /// The team a map's predicate binds: `None` for the public map, so only

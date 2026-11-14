@@ -359,6 +359,156 @@ impl AtlasMapRepository {
         Ok(())
     }
 
+    // ── nightly housekeeping (Atlas W9) ─────────────────────────────────────
+
+    /// Every map with at least one finished run, as `viewer` may read them:
+    /// the public map first, then the team maps by group id. The nightly
+    /// refreshes these (a map with no finished run needs an operator build
+    /// first).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn maps_with_finished_runs(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+    ) -> Result<Vec<AtlasMap>, DbError> {
+        let sql = viewer.splice(
+            "SELECT DISTINCT r.owner_group_id, r.visibility \
+               FROM atlas_map_runs r \
+              WHERE r.finished_at IS NOT NULL \
+                /* {VISIBILITY:r} */ \
+              ORDER BY r.visibility DESC, r.owner_group_id",
+            1,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String)>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|(owner, visibility)| {
+                if visibility == "public" {
+                    AtlasMap::Public
+                } else {
+                    AtlasMap::Team(owner)
+                }
+            })
+            .collect())
+    }
+
+    /// The hierarchies run `run_id` of `map` holds levels of, sorted
+    /// (`meaning` before `links`).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn run_hierarchies(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        run_id: Uuid,
+    ) -> Result<Vec<AtlasHierarchy>, DbError> {
+        let (owner, visibility) = map.tenancy();
+        let sql = viewer.splice(
+            "SELECT DISTINCT l.hierarchy \
+               FROM atlas_map_levels l \
+              WHERE l.run_id = $1 AND l.owner_group_id = $2 AND l.visibility = $3 \
+                /* {VISIBILITY:l} */",
+            4,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql)
+            .bind(run_id)
+            .bind(owner)
+            .bind(visibility);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let mut out: Vec<AtlasHierarchy> = q
+            .fetch_all(&mut *conn)
+            .await?
+            .iter()
+            .filter_map(|h| match h.as_str() {
+                "meaning" => Some(AtlasHierarchy::Meaning),
+                "links" => Some(AtlasHierarchy::Links),
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|h| matches!(h, AtlasHierarchy::Links));
+        Ok(out)
+    }
+
+    /// Serialise the publishers of one map until the caller's transaction
+    /// ends: a transaction-level advisory lock keyed by the map. Every writer
+    /// that checks "is the run I built from still the latest?" before it
+    /// publishes takes it first (the nightly and the naming step's write), so
+    /// the check and the publish cannot interleave with another's.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn lock_map_for_publish(
+        conn: &mut PgConnection,
+        map: AtlasMap,
+    ) -> Result<(), DbError> {
+        let (owner, visibility) = map.tenancy();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended( \
+                 'atlas-map-publish|' || $1::text || '|' || $2, 0))",
+        )
+        .bind(owner)
+        .bind(visibility)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete the old runs of `map` (their levels go by `ON DELETE CASCADE`):
+    /// every finished run but the newest `keep` (by `finished_at`, then id,
+    /// the serving order), and every UNfinished run created before the
+    /// newest finished run was. A run created after it (a build in flight)
+    /// is kept. Scoped by the map's tenancy columns, so no other map's run is
+    /// touched. Returns the number of runs deleted. Maintenance connection
+    /// only (the application role holds SELECT only on these tables).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for `keep == 0` (it would delete the run being
+    /// served); `DbError::QueryFailed` if the statement fails.
+    pub async fn prune_runs(
+        conn: &mut PgConnection,
+        map: AtlasMap,
+        keep: usize,
+    ) -> Result<u64, DbError> {
+        if keep == 0 {
+            return Err(DbError::InvalidData {
+                reason: "pruning must keep at least one finished run".to_string(),
+            });
+        }
+        let keep = i64::try_from(keep).map_err(|_| DbError::InvalidData {
+            reason: "keep is too large".to_string(),
+        })?;
+        let (owner, visibility) = map.tenancy();
+        let done = sqlx::query(
+            "WITH finished AS ( \
+                 SELECT r.id, r.created_at, \
+                        row_number() OVER (ORDER BY r.finished_at DESC, r.id DESC) AS rn \
+                   FROM atlas_map_runs r \
+                  WHERE r.owner_group_id = $1 AND r.visibility = $2 \
+                    AND r.finished_at IS NOT NULL \
+             ) \
+             DELETE FROM atlas_map_runs r \
+              WHERE r.owner_group_id = $1 AND r.visibility = $2 \
+                AND ( r.id IN (SELECT f.id FROM finished f WHERE f.rn > $3) \
+                      OR ( r.finished_at IS NULL \
+                           AND r.created_at < (SELECT f.created_at FROM finished f \
+                                                WHERE f.rn = 1) ) )",
+        )
+        .bind(owner)
+        .bind(visibility)
+        .bind(keep)
+        .execute(&mut *conn)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     // ── serve ────────────────────────────────────────────────────────────────
 
     /// One level of the latest finished run of `map`, as `viewer` may read it:

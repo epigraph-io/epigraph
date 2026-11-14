@@ -158,6 +158,59 @@ impl AtlasMeaningRepository {
         Ok(out)
     }
 
+    /// How many current claims with an embedding have no theme, as `viewer`
+    /// may read them: what the nightly's theme assignment
+    /// (`ClaimThemeRepository::assign_unthemed_batch`) would place. A dry run
+    /// reports this instead of assigning. Corpus-wide, not per map: theme
+    /// membership is one column for every map.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn unthemed_embedded_count(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*)::int8 FROM claims c \
+              WHERE c.theme_id IS NULL AND c.embedding IS NOT NULL \
+                AND COALESCE(c.is_current, true) \
+                /* {VISIBILITY:c} */",
+            1,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
+    /// Every theme holding more than `cap` current claims, as `viewer` may
+    /// read them, with its count, largest first: the themes Atlas W1's
+    /// operator-run split should break up (W1 counts current members, as
+    /// here). The nightly reports them and splits nothing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn themes_over_member_cap(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        cap: i64,
+    ) -> Result<Vec<(Uuid, i64)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.theme_id, COUNT(*)::int8 AS n FROM claims c \
+              WHERE c.theme_id IS NOT NULL AND COALESCE(c.is_current, true) \
+                /* {VISIBILITY:c} */ \
+              GROUP BY c.theme_id HAVING COUNT(*) > $1 \
+              ORDER BY n DESC, c.theme_id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, i64)>(&sql).bind(cap);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
     /// The text of each claim of `claim_ids` that `map` may draw, for a leaf
     /// node's label. Ids the map may not draw are absent.
     ///
