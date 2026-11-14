@@ -37,7 +37,7 @@ async fn seed_public_claim(pool: &PgPool, agent: Uuid, content: &str, truth: f64
     id
 }
 
-fn node<'a>(body: &'a serde_json::Value, claim: Uuid) -> &'a serde_json::Value {
+fn node(body: &serde_json::Value, claim: Uuid) -> &serde_json::Value {
     body["nodes"]
         .as_array()
         .expect("nodes")
