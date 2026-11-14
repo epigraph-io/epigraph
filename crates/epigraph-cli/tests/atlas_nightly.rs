@@ -1038,3 +1038,44 @@ async fn pruning_keeps_exactly_k_finished_runs_of_that_map_only(pool: PgPool) {
             .unwrap();
     assert_eq!(b_runs, 2, "another map's runs are untouched");
 }
+
+/// Done when: pruning keeps exactly K finished runs, through the nightly
+/// itself (`--keep-runs`), not only the repository call: an operator build
+/// and three nights that each change team A's map make four runs of it;
+/// with `keep_runs = 2` exactly the two newest are left.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_nightly_prunes_its_map_to_keep_runs(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let backend = namer();
+    let o = NightOptions {
+        keep_runs: 2,
+        ..opts()
+    };
+    let mut written = Vec::new();
+    for k in 0..3_usize {
+        claims(&pool, None, c.fa, Some(c.a_team), 1, 0).await;
+        let summary = night(&pool, &viewer, &backend, &o).await;
+        let r = map_report(&summary, a_map);
+        assert_eq!(r["status"], "written", "night {k}: {r:#}");
+        written.push(latest(&pool, a_map).await);
+    }
+    let (owner, vis) = a_map.tenancy();
+    let left: BTreeSet<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM atlas_map_runs WHERE owner_group_id = $1 AND visibility = $2",
+    )
+    .bind(owner)
+    .bind(vis)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    assert_eq!(
+        left,
+        set(&written[1..]),
+        "exactly the two newest runs are kept"
+    );
+}
