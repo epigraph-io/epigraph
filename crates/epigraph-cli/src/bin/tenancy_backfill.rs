@@ -1126,18 +1126,22 @@ async fn backfill_agent_keyed(
 /// (no inflated `rows_done`), a seed fragment on a WORLD claim is never stamped
 /// with the other sentinel, and a world fragment on a seed claim still moves as
 /// it always has. [`harvester_fragment_residual`] counts exactly the rows this
-/// statement can move (finding `F-089-D`).
+/// statement can move (finding `F-089-D`): both read [`fragment_restampable`].
+///
+/// # Several citing claims: the most restrictive wins (migration 218)
+///
+/// A fragment cited by more than one claim takes [`FRAGMENT_WINNER`], the same
+/// order migration 218 gives the provenance trigger: group before public, a
+/// real owner before the seed sentinel, then the lowest `owner_group_id`. The
+/// former `UPDATE … FROM` over the provenance join applied whichever joined row
+/// the plan produced first (finding `F-089-A`).
 async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
-    let n = sqlx::query(
-        "UPDATE harvester_fragments f
-            SET owner_group_id = c.owner_group_id, visibility = c.visibility
-           FROM harvester_claim_provenance p
-           JOIN claims c ON c.id = p.claim_id
-          WHERE f.id = p.fragment_id
-            AND f.owner_group_id IN ($1, $2)
-            AND c.owner_group_id <> $1
-            AND (f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)",
-    )
+    let n = sqlx::query(&format!(
+        "UPDATE harvester_fragments t \
+            SET (owner_group_id, visibility) = (SELECT w.g, w.v FROM ({FRAGMENT_WINNER}) w) \
+          WHERE {}",
+        fragment_restampable()
+    ))
     .bind(WORLD)
     .bind(SEED)
     .execute(pool)
@@ -1145,6 +1149,27 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
     .rows_affected();
     finish_entity(pool, "harvester_fragments", n as i64).await?;
     Ok(())
+}
+
+/// The citing claim whose tenancy the fragment `t` inherits (binding `$1` =
+/// [`WORLD`], `$2` = [`SEED`]): the most restrictive of its non-world citing
+/// claims, by migration 218's order. No row when every citer is world-owned
+/// (089's source side: the world group has no tenancy to donate).
+const FRAGMENT_WINNER: &str = "SELECT c.owner_group_id AS g, c.visibility AS v \
+       FROM harvester_claim_provenance p JOIN claims c ON c.id = p.claim_id \
+      WHERE p.fragment_id = t.id AND c.owner_group_id <> $1 \
+      ORDER BY (c.visibility = 'group') DESC, (c.owner_group_id = $2) ASC, \
+               c.owner_group_id ASC \
+      LIMIT 1";
+
+/// The `harvester_fragments t` rows [`backfill_harvester_fragments`] moves:
+/// sentinel-owned (089's target side) and not already on their
+/// [`FRAGMENT_WINNER`]'s tuple.
+fn fragment_restampable() -> String {
+    format!(
+        "(t.owner_group_id IN ($1, $2) AND EXISTS (SELECT 1 FROM ({FRAGMENT_WINNER}) w \
+           WHERE (t.owner_group_id, t.visibility) IS DISTINCT FROM (w.g, w.v)))"
+    )
 }
 
 // `transcribe_legacy_ownership` lived here until PR-22.
@@ -3231,7 +3256,8 @@ async fn residual_for(
 /// `harvester_fragments` rows that SHOULD have moved: the rows
 /// [`backfill_harvester_fragments`] can repair, which is migration 089's
 /// predicate over rows already on disk (a sentinel-owned fragment linked to a
-/// non-world claim whose tenancy differs from it).
+/// non-world claim) with migration 218's winner (the most restrictive such
+/// claim, whose tenancy differs from the fragment's): [`fragment_restampable`].
 ///
 /// * `platform`: exactly those rows.
 /// * `None` / `operator` (strict): every world-owned fragment, as [`residual`]
@@ -3258,16 +3284,11 @@ async fn harvester_fragment_residual(
 /// [`print_offenders`]' id listing, so the ids a strict `verify` prints are the
 /// rows it counted.
 fn harvester_fragment_residual_filter(mode: Option<LegacyOwner>) -> String {
-    const REPAIRABLE: &str = "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
-                                JOIN claims c ON c.id = p.claim_id \
-                               WHERE p.fragment_id = t.id \
-                                 AND c.owner_group_id <> $1 \
-                                 AND (t.owner_group_id, t.visibility) \
-                                     IS DISTINCT FROM (c.owner_group_id, c.visibility))";
+    let repairable = fragment_restampable();
     if mode == Some(LegacyOwner::Platform) {
-        format!("t.owner_group_id IN ($1, $2) AND {REPAIRABLE}")
+        repairable
     } else {
-        format!("t.owner_group_id = $1 OR (t.owner_group_id = $2 AND {REPAIRABLE})")
+        format!("t.owner_group_id = $1 OR {repairable}")
     }
 }
 
