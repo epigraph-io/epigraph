@@ -661,6 +661,14 @@ jobs:
         # it. It needs no database and no API key: it runs the built
         # `cross_source_sweep` binary's argument handling.
         run: cargo test -p epigraph-cli --features genai --locked --test cross_source_sweep_smoke
+      - name: Genai prompt drift guard
+        # `rerank` is `#[cfg(feature = "genai")]`, so its unit tests run in no
+        # other step. rerank::prompt::tests pins the live verifier prompt
+        # against tests/cross_source/prompts_v1.md; without this step an edit
+        # to build_validation_prompt stays green and the pre-registered
+        # protocol silently stops describing the deployed verifier (backlog
+        # ba25c292). Pure string tests: no database, no API key.
+        run: cargo test -p epigraph-cli --features genai --locked --lib rerank::prompt
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
