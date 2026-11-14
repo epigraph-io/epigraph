@@ -157,9 +157,11 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
     };
 
     // No scope → all three.
-    let all = ClaimRepository::search_by_embedding_scoped(&pool, &viewer, &pgvec, 10, None, None)
-        .await
-        .expect("scoped none");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let all =
+        ClaimRepository::search_by_embedding_scoped(&mut conn, &viewer, &pgvec, 10, None, None)
+            .await
+            .expect("scoped none");
     let all_ids = ids(&all);
     assert!(
         [a_x, a_plain, b_x].iter().all(|c| all_ids.contains(c)),
@@ -168,7 +170,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
 
     // Tag scope → only the two carrying topic-x, across agents.
     let tagged = ClaimRepository::search_by_embedding_scoped(
-        &pool,
+        &mut conn,
         &viewer,
         &pgvec,
         10,
@@ -189,7 +191,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
 
     // Agent scope → only agent_a's claims, regardless of tag.
     let by_agent = ClaimRepository::search_by_embedding_scoped(
-        &pool,
+        &mut conn,
         &viewer,
         &pgvec,
         10,
@@ -207,7 +209,7 @@ async fn search_scoped_filters_by_tag_and_agent(pool: PgPool) {
 
     // Both → intersection: agent_a AND topic-x = only a_x.
     let both = ClaimRepository::search_by_embedding_scoped(
-        &pool,
+        &mut conn,
         &viewer,
         &pgvec,
         10,

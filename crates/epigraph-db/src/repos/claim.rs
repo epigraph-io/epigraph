@@ -4209,8 +4209,16 @@ impl ClaimRepository {
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
-        Self::search_by_embedding_scoped(pool, viewer, query_embedding_pgvector, limit, None, None)
-            .await
+        let mut conn = pool.acquire().await?;
+        Self::search_by_embedding_scoped(
+            &mut conn,
+            viewer,
+            query_embedding_pgvector,
+            limit,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`search_by_embedding_current`] with optional scope predicates pushed
@@ -4220,11 +4228,32 @@ impl ClaimRepository {
     /// so the two compose with AND. Scoping at the DB keeps it correct and
     /// index-friendly rather than over-fetching and filtering in Rust.
     ///
+    /// # Iterative HNSW scan (backlog a507966d)
+    ///
+    /// The statement is served by `idx_claims_embedding_hnsw`, whose scan
+    /// yields at most `hnsw.ef_search` rows (pgvector default 40) BEFORE the
+    /// predicates the index does not encode — `is_current`, the scope filters
+    /// and the visibility splice — are applied. With a plain scan, 40 rows the
+    /// viewer cannot read sitting nearer the query than its own rows emptied
+    /// the viewer's page, and how far it emptied told the viewer how many
+    /// foreign rows sat near the query: a ranking side channel across
+    /// tenants, measured as a full page of 10 going to 0. So, exactly as in
+    /// [`Self::search_by_embedding_since_conn`], the statement runs in a short
+    /// transaction that first sets, `is_local`,
+    /// `hnsw.iterative_scan = strict_order` (keep scanning, in exact distance
+    /// order, until `LIMIT` matching rows are found) and
+    /// `hnsw.ef_search = clamp(limit, 40, 1000)`, and is ROLLED BACK so the
+    /// settings never reach the caller's later reads. `hnsw.max_scan_tuples`
+    /// (default 20,000) still bounds the scan.
+    ///
+    /// Takes a connection rather than an executor because the settings need
+    /// a transaction (a savepoint on a caller's own transaction).
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding_scoped<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -4261,7 +4290,18 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(executor).await?;
+
+        // See "Iterative HNSW scan" above.
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
 
         Ok(rows)
     }
