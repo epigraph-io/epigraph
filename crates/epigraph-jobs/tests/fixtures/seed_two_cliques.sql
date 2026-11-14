@@ -1,17 +1,19 @@
--- Six claims in two disjoint epistemic cliques.
--- Assumes 001 + 002 migrations are applied.
+-- Six claims in two disjoint epistemic cliques, plus one governance edge
+-- between the cliques that clustering must ignore.
 --
--- Schema reality (verified against migrations/001_initial_schema.sql, 2026-04-27):
---   claims  NOT NULL: id, content, content_hash (32 bytes), agent_id
---   agents  NOT NULL: id, public_key (32 bytes)
---   edges   NOT NULL: source_id, target_id, source_type, target_type, relationship
--- The seed therefore creates a test agent first, then claims, then edges.
-
--- The validate_edge_reference trigger references tables (propaganda_techniques,
--- coalitions, agent_spans, entities, tasks, events, etc.) not created by
--- 001+002 alone. Disable user triggers on edges for this seed; the
--- integration test validates clustering logic, not FK trigger correctness.
-ALTER TABLE edges DISABLE TRIGGER USER;
+-- Runs on a database migrated to head. The caller gives it a fresh one
+-- (`#[sqlx::test]`), which is why the ids are fixed and nothing is cleaned up.
+--
+-- Tenancy (migrations 062-074):
+--   claims  declare (visibility, owner_group_id) themselves. Migration 074's
+--           `claims_require_tenancy` refuses an undeclared claim (23502)
+--           unless the connection is a member of `epigraph_seed`;
+--           ('public', seed group) is what that escape hatch would stamp.
+--   edges   name no tenancy column. The BEFORE ROW trigger `edges_tenancy`
+--           derives both from the endpoints, as it does for
+--           `EdgeRepository::create`. Do NOT disable user triggers on `edges`
+--           to seed: with that trigger off `owner_group_id` stays NULL and
+--           the insert fails its NOT NULL (backlog bd439a7f).
 
 INSERT INTO agents (id, public_key, display_name, agent_type)
 VALUES (
@@ -22,14 +24,14 @@ VALUES (
 )
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob)
+INSERT INTO claims (id, content, content_hash, agent_id, pignistic_prob, visibility, owner_group_id)
 VALUES
-  ('00000000-0000-0000-0000-000000000001', 'a1', decode(repeat('01', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.7),
-  ('00000000-0000-0000-0000-000000000002', 'a2', decode(repeat('02', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.7),
-  ('00000000-0000-0000-0000-000000000003', 'a3', decode(repeat('03', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.7),
-  ('00000000-0000-0000-0000-000000000004', 'b1', decode(repeat('04', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.3),
-  ('00000000-0000-0000-0000-000000000005', 'b2', decode(repeat('05', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.3),
-  ('00000000-0000-0000-0000-000000000006', 'b3', decode(repeat('06', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.3);
+  ('00000000-0000-0000-0000-000000000001', 'a1', decode(repeat('01', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.7, 'public', '00000000-0000-0000-0000-00000000dead'),
+  ('00000000-0000-0000-0000-000000000002', 'a2', decode(repeat('02', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.7, 'public', '00000000-0000-0000-0000-00000000dead'),
+  ('00000000-0000-0000-0000-000000000003', 'a3', decode(repeat('03', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.7, 'public', '00000000-0000-0000-0000-00000000dead'),
+  ('00000000-0000-0000-0000-000000000004', 'b1', decode(repeat('04', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.3, 'public', '00000000-0000-0000-0000-00000000dead'),
+  ('00000000-0000-0000-0000-000000000005', 'b2', decode(repeat('05', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.3, 'public', '00000000-0000-0000-0000-00000000dead'),
+  ('00000000-0000-0000-0000-000000000006', 'b3', decode(repeat('06', 32), 'hex'), '00000000-0000-0000-0000-0000000000aa', 0.3, 'public', '00000000-0000-0000-0000-00000000dead');
 
 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) VALUES
   ('00000000-0000-0000-0000-000000000001', 'claim', '00000000-0000-0000-0000-000000000002', 'claim', 'SUPPORTS'),
