@@ -1502,7 +1502,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. exclude_spine=true drops every claim whose properties.level is 0-2 before the limit applies: document thesis/section/paragraph nodes (headings, keyword lists, captions, transcript turns) and workflow thesis/phase/step nodes alike, keeping atoms (level 3) and unleveled claims. Returns claims with their labels and retirement state."
+        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. exclude_spine=true drops every claim whose properties.level is 0-2 before the limit applies: document thesis/section/paragraph nodes (headings, keyword lists, captions, transcript turns) and workflow thesis/phase/step nodes alike, keeping atoms (level 3) and unleveled claims. created_after / created_before (RFC 3339, both inclusive, applied in SQL before limit) with offset page through EVERY claim you may read that was created in a window, newest first with ties broken by id, so stepping offset by limit lists each row once and a short page is the last, provided no claim is written into the window between pages (offsets are positional: a claim created or back-dated into the window mid-walk shifts later pages, repeating or skipping one row; narrow created_before to a past instant for a stable walk); an inverted window or a negative offset is refused as invalid params. Returns claims with their labels and retirement state."
     )]
     async fn query_claims(
         &self,
@@ -1591,6 +1591,45 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::workflow_plan::get_workflow_plan(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Read one claim's structural context BY ID: the same body as GET /api/v1/claims/:id/context. Full mode (no list) returns {claim, paper, papers, section, parents, parts, siblings, edges}: the claim; the paper of its primary document chain and every asserting paper; its level-1 section; its decomposes_to parents and parts; its siblings under the primary parent; and its epistemic edges in both directions (supports, refutes, contradicts, specializes, elaborates, cites, qualifies, corroborates) with per-relationship tallies. Each node carries id, content (clipped to 1500 characters, content_truncated says so), truth_value, is_current, level and theme_id; each list carries items, total and next_cursor. Page mode (list = papers | parents | parts | siblings | edges, with after = a previous next_cursor and limit 1..=200) returns the claim plus that one list. Everything is filtered to what you may read: a hidden node or edge is in no list, total or tally, and a claim you cannot read is reported as not found, the same as an id that names nothing. Use recall_with_context to find claims by text; use this when you have the id."
+    )]
+    async fn claim_context(
+        &self,
+        Parameters(params): Parameters<crate::types::ClaimContextParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claim_context::claim_context(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Resolve an abbreviated claim id (the 8-hex form prose and backlog items cite, e.g. 30d8b667; 8 to 32 hex digits, hyphens and case ignored) to the claims whose ids start with it. Returns {prefix, matches: [{id, content (first 300 characters), content_truncated, is_current}], ambiguous (more than one match), truncated (more than limit exist)}; matches are in id order, every one of them when the prefix is ambiguous. Only claims you may read are matches: a prefix naming only claims you cannot read returns no match, exactly like one naming nothing. Fewer than 8 hex digits, or any non-hex character, is refused as invalid params."
+    )]
+    async fn resolve_claim_id_prefix(
+        &self,
+        Parameters(params): Parameters<crate::types::ResolveClaimIdPrefixParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claim_ids::resolve_claim_id_prefix(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Lint a claim's text for claim-id citations that are not wired as edges. Extracts every full uuid and every standalone 8-hex-digit token from the claim's content (distinct, first appearance first, at most 100; longer hex runs such as commit shas and hashes are not citations), resolves each to the claims you may read, and classifies it: wired (a claim it names shares a live edge with this claim, either direction, any relationship), unwired (it names exactly one other claim and no edge joins them), ambiguous (several claims, none wired), unresolved (names no claim you can read: not an id, or one you cannot see), self (names only this claim). Returns {claim_id, citations: [{token, status, matches}], unwired: [tokens], tokens_truncated}. Read-only; it never writes the missing edge. A claim you cannot read is reported as not found."
+    )]
+    async fn lint_claim_id_citations(
+        &self,
+        Parameters(params): Parameters<crate::types::LintClaimIdCitationsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::claim_ids::lint_claim_id_citations(self, viewer, params).await
     }
 
     #[tool(
@@ -1855,7 +1894,7 @@ impl EpiGraphMcpFull {
         crate::tools::claims::patch_claim(self, viewer, params, auth).await
     }
 
-    // ── Provenance (1 tool) ──
+    // ── Provenance (3 tools) ──
 
     #[tool(
         description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order. Walks derivation edges only: supports/elaborates/decomposes_to (incoming) and supersedes (to the predecessor the claim replaced). Contradicts, refutes and cross-source corroborations are not ancestry and are not walked — use get_neighborhood for those."
@@ -1868,6 +1907,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::provenance::get_provenance(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Export one claim's provenance as a W3C PROV-O JSON-LD document (the export_provenance operator CLI's document, bounded): the claim and its ancestors as prov:Entity, one hop of supersedes predecessors, each claim's authoring agent as prov:Agent with a prov:Attribution, and the edges among them as prov:Relation with the internal relationship mapped to its PROV-O predicate (derived_from -> prov:wasDerivedFrom, supersedes -> prov:wasRevisionOf, ...). The ancestor walk follows EVERY claim-to-claim edge into a claim, of any relationship (up to max_depth, default 5, at most 20), but only mapped relationships become relations: an ancestor reached over an unmapped one (refutes, contradicts, supports, ...) is an entity with its attribution and no relation. Bounded: at most max_nodes claims (default 50, at most 200), nearest-first, and each entity's content clipped to max_content_chars (default 500, at most 4000; a clipped entity carries content_truncated and content_chars). `truncated: true` means the node cap cut the export; a max_depth cutoff is not reported. The applied limits are echoed as `limits`. Read-only. The export holds only claims you may read: a claim you cannot read is absent from every list and its id appears nowhere in the document, even when a visible edge points at it. A root claim you cannot read is reported as not found, the same as an id that names nothing."
+    )]
+    async fn export_provenance_prov_o(
+        &self,
+        Parameters(params): Parameters<crate::types::ExportProvenanceProvOParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::prov_export::export_provenance_prov_o(self, viewer, params).await
     }
 
     #[tool(

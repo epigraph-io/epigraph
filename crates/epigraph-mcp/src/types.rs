@@ -157,7 +157,7 @@ pub struct SubmitClaimParams {
     pub group_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct QueryClaimsParams {
     #[schemars(
         description = "Minimum belief score (0.0-1.0, default 0.0). The score is the claim's \
@@ -198,6 +198,37 @@ pub struct QueryClaimsParams {
                        kept. Default false (no level filter)."
     )]
     pub exclude_spine: Option<bool>,
+
+    #[schemars(
+        description = "Keep only claims created at or after this instant (RFC 3339, e.g. \
+                       2026-11-01T00:00:00Z; inclusive). Applied in SQL before limit/offset, so \
+                       with created_before and offset this is a COMPLETE listing of what was \
+                       created in a window, page by page, unlike recall's semantic `since` \
+                       (a capped top-k). Omit for no lower bound."
+    )]
+    #[serde(default)]
+    pub created_after: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Keep only claims created at or before this instant (RFC 3339; \
+                       inclusive). A created_before earlier than created_after is refused as \
+                       invalid params. Omit for no upper bound."
+    )]
+    #[serde(default)]
+    pub created_before: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Rows to skip before the page starts (default 0, never negative). The \
+                       order is created_at newest first with ties broken by id, so stepping \
+                       offset by limit visits every matching row exactly once while the \
+                       window's contents do not change; a page shorter than limit is the \
+                       last. Offsets are positional: a claim created (or written with a \
+                       back-dated created_at) inside the window between pages shifts later \
+                       pages by one, repeating or skipping a row. Fix created_before to a past \
+                       instant for a stable walk."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -397,6 +428,88 @@ pub struct UpdateWithEvidenceParams {
 }
 
 // ── Provenance ──
+
+/// Parameters for MCP `claim_context` (backlog `0720d208`), the query of
+/// `GET /api/v1/claims/:id/context`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClaimContextParams {
+    #[schemars(description = "The UUID of the claim whose structural context to read")]
+    pub claim_id: String,
+
+    #[schemars(
+        description = "Page mode: return the claim plus only this list, one of papers, \
+                       parents, parts, siblings, edges. Omit for full mode (the first page of \
+                       every list)."
+    )]
+    #[serde(default)]
+    pub list: Option<String>,
+
+    #[schemars(
+        description = "The next_cursor of that list's previous page, passed back unchanged. \
+                       Requires list."
+    )]
+    #[serde(default)]
+    pub after: Option<String>,
+
+    #[schemars(description = "Page size for list, clamped to 1..=200. Requires list.")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Parameters for MCP `resolve_claim_id_prefix` (backlog `30d8b667`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveClaimIdPrefixParams {
+    #[schemars(
+        description = "The abbreviated claim id: 8 to 32 hex digits from the start of the uuid \
+                       (e.g. 30d8b667, or 30d8b667-0ca4; hyphens and case are ignored). A full \
+                       uuid resolves to itself."
+    )]
+    pub prefix: String,
+
+    #[schemars(description = "Most matches to return (default 10, at most 50).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// Parameters for MCP `lint_claim_id_citations` (backlog `30d8b667`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LintClaimIdCitationsParams {
+    #[schemars(description = "The UUID of the claim whose text to lint")]
+    pub claim_id: String,
+}
+
+/// Parameters for MCP `export_provenance_prov_o` (backlog `4ba388eb`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExportProvenanceProvOParams {
+    #[schemars(description = "The UUID of the claim whose provenance to export")]
+    pub claim_id: String,
+
+    #[schemars(
+        description = "Maximum ancestor depth to walk. The walk follows every claim-to-claim \
+                       edge INTO a claim, of any relationship (not only derived_from). \
+                       Default 5, clamped to 1..=20. A depth cutoff is NOT reported in \
+                       `truncated`."
+    )]
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+
+    #[schemars(
+        description = "Maximum number of claims kept as entities, nearest-first (the root, \
+                       then ancestors by ascending depth, then supersedes predecessors). \
+                       Default 50, clamped to 1..=200. Only claims you can read count. The \
+                       document reports `truncated: true` when this cap cut it."
+    )]
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+
+    #[schemars(
+        description = "Per-claim content character budget. Default 500, clamped to \
+                       50..=4000. Entities whose content was cut carry \
+                       `content_truncated: true` and the original `content_chars`."
+    )]
+    #[serde(default)]
+    pub max_content_chars: Option<usize>,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetProvenanceParams {
