@@ -143,9 +143,9 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     (
         "computation::propagate_beliefs",
         Exempt(
-            "a read unless `apply_updates: true`, which is refused unless the server runs with \
-             BP apply on, and then writes only on the caller's stamped transaction \
-             (`AppState::write_as`), so row security holds it to the caller's groups",
+            "a read unless `apply_updates: true`; only that write arm checks claims:write (in \
+             the body, so a claims:read token still runs the read-only diagnostic), and it is \
+             also refused unless the server runs with BP apply on",
         ),
     ),
     ("computation::sheaf_reconcile", Exempt(READ_ONLY_POST)),

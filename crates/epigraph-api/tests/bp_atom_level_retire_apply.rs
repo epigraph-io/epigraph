@@ -209,10 +209,27 @@ async fn propagate(
     agent: Uuid,
     request: Value,
 ) -> Result<Value, StatusCode> {
+    propagate_with_scopes(pool, state, agent, request, &["claims:write"]).await
+}
+
+async fn propagate_with_scopes(
+    pool: &PgPool,
+    state: &AppState,
+    agent: Uuid,
+    request: Value,
+    scopes: &[&str],
+) -> Result<Value, StatusCode> {
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve viewer");
     let request: PropagateRequest =
         serde_json::from_value(request).expect("a well-formed propagate request");
-    match propagate_beliefs(ViewerExtractor(viewer), State(state.clone()), Json(request)).await {
+    match propagate_beliefs(
+        ViewerExtractor(viewer),
+        bearer(agent, scopes),
+        State(state.clone()),
+        Json(request),
+    )
+    .await
+    {
         Ok(Json(body)) => Ok(body),
         Err(e) => Err(e.into_response().status()),
     }
@@ -286,6 +303,69 @@ async fn tree(pool: &PgPool) -> Tree {
     evidential_factor(pool, a, b, None).await;
     evidential_factor(pool, k, b, None).await;
     Tree { agent, k, a }
+}
+
+// ── (0) a read token cannot apply (backlog f00d75ab) ───────────────────────
+
+/// With BP apply ON, `apply_updates: true` writes beliefs, so a `claims:read`
+/// token is refused 403 and nothing is written; the same token still runs the
+/// read-only diagnostic, and a `claims:write` token applies (the control that
+/// the refusal is the scope's doing, not an empty result).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_read_token_cannot_apply_bp_updates(pool: PgPool) {
+    let t = tree(&pool).await;
+    let on = state_bp_apply_on(&pool).await;
+    let before = stored(&pool, t.a).await;
+
+    let refused = propagate_with_scopes(
+        &pool,
+        &on,
+        t.agent,
+        json!({"mode": "cdst", "apply_updates": true}),
+        &["claims:read"],
+    )
+    .await;
+    assert_eq!(
+        refused.err(),
+        Some(StatusCode::FORBIDDEN),
+        "a claims:read token must not apply BP updates"
+    );
+    assert_eq!(
+        stored(&pool, t.a).await,
+        before,
+        "a refused apply writes no claim row"
+    );
+
+    let read = propagate_with_scopes(
+        &pool,
+        &on,
+        t.agent,
+        json!({"mode": "cdst", "apply_updates": false}),
+        &["claims:read"],
+    )
+    .await;
+    assert!(
+        read.is_ok(),
+        "the read-only run needs no write scope: {read:?}"
+    );
+
+    let applied = propagate(
+        &pool,
+        &on,
+        t.agent,
+        json!({"mode": "cdst", "apply_updates": true}),
+    )
+    .await
+    .expect("CALIBRATION: a claims:write token applies");
+    assert!(
+        applied["applied_count"].as_u64().unwrap_or(0) >= 1,
+        "CALIBRATION: the write-scoped apply writes at least the atom: {applied}"
+    );
+    assert_ne!(
+        stored(&pool, t.a).await,
+        before,
+        "CALIBRATION: the atom moved"
+    );
 }
 
 // ── (1) BP apply is refused by default ──────────────────────────────────────
@@ -893,4 +973,25 @@ async fn apply_skips_compounds_case(pool: &PgPool, mode: &str) {
             result[&c]
         );
     }
+}
+
+/// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
+/// f00d75ab: `apply_updates: true` needs `claims:write`).
+fn bearer(
+    agent: Uuid,
+    scopes: &[&str],
+) -> axum::Extension<epigraph_api::middleware::bearer::AuthContext> {
+    axum::Extension(epigraph_api::middleware::bearer::AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Service,
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    })
 }
