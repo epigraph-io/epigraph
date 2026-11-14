@@ -198,6 +198,37 @@ async fn the_lineage_carries_dataset_properties(pool: PgPool) {
     assert_eq!(lineage.evidence[&doc].dataset, None);
 }
 
+/// A sealed dataset row has its `properties` blanked to `{}`. The lineage
+/// must then report no dataset rather than a `{}` with no root or digest
+/// (review finding 5), agreeing with `datasets_by_claim_ids`, which skips it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dataset_row_with_blanked_properties_reports_no_dataset(pool: PgPool) {
+    let agent = viewer_fixture::seed_agent_with_group(&pool, "c8beb101-seal")
+        .await
+        .0;
+    let claim = viewer_fixture::seed_public_claim(&pool, agent, "c8beb101: sealed").await;
+    let ds = write_dataset_evidence(&pool, claim, "run 10", "s3://b/run-10").await;
+    // The seal's own blanking (`privatization`: `properties = '{}'::jsonb`).
+    sqlx::query("UPDATE evidence SET properties = '{}'::jsonb WHERE id = $1")
+        .bind(Uuid::from(ds.id))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let lineage = LineageRepository::get_lineage_conn(&mut conn, &viewer, claim, Some(1), Some(10))
+        .await
+        .unwrap();
+    let row = &lineage.evidence[&Uuid::from(ds.id)];
+    assert_eq!(row.evidence_type, "dataset");
+    assert_eq!(row.dataset, None, "a blanked row is not a dataset: {row:?}");
+    let datasets = EvidenceRepository::datasets_by_claim_ids(&pool, &viewer, &[claim], 32)
+        .await
+        .unwrap();
+    assert!(!datasets.contains_key(&claim), "{datasets:?}");
+}
+
 /// `get_claim` always includes a claim's datasets, so the read is capped per
 /// claim (review finding 6): the oldest `limit` rows, per claim, never more.
 #[sqlx::test(migrations = "../../migrations")]

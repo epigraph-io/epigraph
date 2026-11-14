@@ -166,6 +166,24 @@ struct EvidenceQueryRow {
     dataset: Option<serde_json::Value>,
 }
 
+/// A `dataset` row's `properties` as the lineage reports them: only when they
+/// parse as an `EvidenceType::Dataset`.
+///
+/// A sealed row's `properties` are blanked to `{}` (`privatization` seal), and
+/// a hand-written row may hold anything; reporting either as `dataset` would
+/// hand a provenance reader an object with no root, digest or counts.
+/// `EvidenceRepository::datasets_by_claim_ids` skips the same rows, so
+/// `get_provenance` and `get_claim` agree (review finding 5, backlog
+/// c8beb101).
+fn dataset_properties(properties: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    properties.filter(|v| {
+        matches!(
+            serde_json::from_value::<epigraph_core::EvidenceType>(v.clone()),
+            Ok(epigraph_core::EvidenceType::Dataset { .. })
+        )
+    })
+}
+
 /// Row for trace queries
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct TraceQueryRow {
@@ -595,7 +613,7 @@ impl LineageRepository {
                 claim_id: row.claim_id,
                 evidence_type: row.evidence_type,
                 content_hash: row.content_hash,
-                dataset: row.dataset,
+                dataset: dataset_properties(row.dataset),
             };
             evidence_map.insert(row.id, evidence);
             claim_evidence_map
@@ -1120,7 +1138,7 @@ impl LineageRepository {
                 claim_id: row.claim_id,
                 evidence_type: row.evidence_type,
                 content_hash: row.content_hash,
-                dataset: row.dataset,
+                dataset: dataset_properties(row.dataset),
             };
             evidence_map.insert(row.id, evidence);
             claim_evidence_map
