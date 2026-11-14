@@ -557,10 +557,14 @@ jobs:
   # tests/ci/pytest_skip_budget.py reads the run's JUnit XML and fails the step
   # on any skip not named in its --allow list, which also covers skips the flag
   # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
-  # cannot find the ingest_git binary built above). The one allowed skip is
-  # test_executed_dedup_removes_the_duplicate_from_recall: it needs a running
-  # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), which this
-  # job does not provide yet, so that arm does not run in CI.
+  # cannot find the ingest_git binary built above). No skip is allowed:
+  # test_executed_dedup_removes_the_duplicate_from_recall needs a running API
+  # and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), and
+  # tests/ci/with_test_api.sh provides both around that step: it serves
+  # epigraph_py_test with the `server` binary built above, mints a per-run
+  # claims:write + claims:admin token, and stops the server when pytest exits,
+  # so it cannot outlive the step into tests/theme's table wipes (backlog
+  # 03fd7e00).
   #
   # The database arms connect as the service container's superuser, so RLS is
   # bypassed: they verify the scripts' logic against the migrated schema, not
@@ -608,7 +612,9 @@ jobs:
           # budget the `test` job's (much larger) entry depends on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build epigraph-migrate and ingest_git
-        run: cargo build --locked -p epigraph-api --bin epigraph-migrate -p epigraph-cli --bin ingest_git
+        # Also the API `server`, which tests/ci/with_test_api.sh serves the
+        # test database with for the executed-dedup arm (backlog 03fd7e00).
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate --bin server -p epigraph-cli --bin ingest_git
       - name: Install Python test dependencies
         # A venv, not the system interpreter (PEP 668), from a pinned file, and
         # no extra setup action (the trust surface stays the pinned actions).
@@ -632,10 +638,10 @@ jobs:
       - name: Python tests (scripts/tests, tests/dedup)
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export TEST_API_DATABASE_URL="$DEDUP_TEST_DATABASE_URL"
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
-          python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
-          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml" \
-            --allow tests.dedup.test_fuzzy_dedup_retraction::test_executed_dedup_removes_the_duplicate_from_recall
+          tests/ci/with_test_api.sh python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml"
       - name: Python tests (tests/theme)
         # The theme pipeline's pytest files. Their DB fixture wipes the
         # clustering tables of the database it is given, which here is the
