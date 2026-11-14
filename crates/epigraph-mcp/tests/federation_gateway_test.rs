@@ -19,7 +19,12 @@
 //!   panic) instead of taking the gateway down;
 //! - a `reconnect_tick` REVIVES an extension that was down at build time — the
 //!   boot race that left episcience unroutable in production for hours — and is
-//!   a no-op against one that is still down or already healthy.
+//!   a no-op against one that is still down; a healthy one is re-listed, and
+//!   left as it was when its list is unchanged;
+//! - a mounted extension that goes away is demoted, and one whose tool list
+//!   changes has its routes swapped (backlog c19cdae0);
+//! - an extension tool named like a kernel tool is refused (backlog 351d3def);
+//! - a proxied call that never answers is bounded (backlog 7ea4bd74).
 
 #[path = "support/federation_stub.rs"]
 mod stub;
