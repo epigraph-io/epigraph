@@ -5,8 +5,9 @@
 //! `/maps/:map/:hierarchy/claims/:claim_id/leaf`.
 //!
 //! Hermetic `#[sqlx::test]` on a fresh database. `AppState` is built with
-//! `with_scoped_pool` (the `epigraph_app` role), so every read runs on a
-//! viewer-stamped connection under row security. Runs are written on the
+//! `with_scoped_pool` on a pool downgraded to the `epigraph_app` role (see
+//! [`router`]), so every read runs on a viewer-stamped connection under row
+//! security. Runs are written on the
 //! superuser pool with a bypass viewer, the nightly's maintenance stand-in.
 //!
 //! # The world ([`World::seed`])
@@ -41,7 +42,7 @@ use epigraph_atlas_contract::{
     LevelDocument, MapScope, Node, PlainNode, Switch, BUDGET_GZIP_BYTES, SCHEMA_VERSION,
 };
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, LevelDoc, NewMapRun};
-use epigraph_db::AtlasMapRepository;
+use epigraph_db::{AtlasMapRepository, ScopedPool, SessionGucMode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -50,11 +51,28 @@ use uuid::Uuid;
 
 // ---- plumbing ---------------------------------------------------------------------
 
+/// The kernel as production runs it: a `ScopedPool` whose every connection
+/// is downgraded to `epigraph_app`, so the row policies filter each read as
+/// well as the in-query viewer predicate. (`fixture::scoped_pool` would run
+/// on the superuser DSN `#[sqlx::test]` hands out, where no policy is
+/// evaluated.)
 async fn router(pool: &PgPool) -> Router {
-    create_router(AppState::with_scoped_pool(
-        fixture::scoped_pool(pool).await,
-        ApiConfig::default(),
-    ))
+    let scoped = ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("an epigraph_app ScopedPool");
+    let role: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(scoped.inner())
+        .await
+        .expect("the pool's role");
+    assert_eq!(
+        role, "epigraph_app",
+        "the kernel must read as the application role"
+    );
+    create_router(AppState::with_scoped_pool(scoped, ApiConfig::default()))
 }
 
 fn token(agent: Uuid) -> String {

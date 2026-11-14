@@ -65,7 +65,7 @@ use epigraph_atlas_contract::check::{check_level_body, Expected};
 use epigraph_atlas_contract::scale::{theme_levels, ScaleMap, ScaleTheme};
 use epigraph_atlas_contract::{Hierarchy, LevelDocument, MapScope, Node};
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, LevelDoc, NewMapRun};
-use epigraph_db::AtlasMapRepository;
+use epigraph_db::{AtlasMapRepository, ScopedPool, SessionGucMode};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -596,6 +596,15 @@ async fn delay_layer(
 }
 
 /// A kernel on a loopback listener with a fresh scoped pool.
+///
+/// The pool runs as `epigraph_app`, as production does: every connection is
+/// downgraded with `SET SESSION AUTHORIZATION` right after it connects, so
+/// each read is filtered by the `<table>_tenancy` row policies as well as the
+/// in-query viewer predicate. On the superuser DSN `#[sqlx::test]` hands out,
+/// no policy is evaluated and the gate would time a cheaper query than prod
+/// runs. A cold sample's fresh connection therefore pays that one extra
+/// statement too, before its first request (prod pays it once per pooled
+/// connection, never per request), so cold is slightly overstated.
 struct Server {
     base: String,
     task: tokio::task::JoinHandle<()>,
@@ -607,8 +616,20 @@ impl Drop for Server {
     }
 }
 
+/// A fresh `ScopedPool` over `pool`'s database whose every connection is
+/// downgraded to `epigraph_app` (see [`Server`]).
+async fn app_pool(pool: &PgPool) -> ScopedPool {
+    ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("an epigraph_app ScopedPool")
+}
+
 async fn serve(pool: &PgPool, delay: Option<&Delay>) -> Server {
-    let state = AppState::with_scoped_pool(fixture::scoped_pool(pool).await, ApiConfig::default());
+    let state = AppState::with_scoped_pool(app_pool(pool).await, ApiConfig::default());
     let mut router = create_router(state);
     if let Some(d) = delay {
         router = router.layer(axum::middleware::from_fn_with_state(d.clone(), delay_layer));
@@ -954,6 +975,17 @@ fn print_table(r: &Value) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_kernel_meets_the_latency_budget(pool: PgPool) {
     let scale = Scale::from_env();
+    // The kernel under test reads as the application role, under row
+    // security, as production does; checked on a pool of its own so no
+    // timed pool is warmed by the check.
+    let role: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(app_pool(&pool).await.inner())
+        .await
+        .expect("the kernel pool's role");
+    assert_eq!(
+        role, "epigraph_app",
+        "the gate must time the application role"
+    );
     let s = seed(&pool, scale).await;
     let samples = measure(&pool, &s, scale, None).await;
     let breaches = verdict(&samples, &all_expected(), budget);
