@@ -1091,12 +1091,16 @@ impl AtlasLeafRepository {
     /// `(source, target, relationship as stored)`, one per stored row, in
     /// edge-id order: the input of the nightly's cross-group links (group
     /// `bundles` and `targets`, leaf `outgoing`). Both ends must be in
-    /// `claim_ids` (the claims the map's run draws), the edge must be in
-    /// force, and the edge row must pass the MAP edge rule of
-    /// [`Self::read_leaf_rows`]: public, or owned by the team with no
-    /// co-owner. A co-owned edge is never returned, so a link hidden from a
-    /// leaf never reappears between leaves. Which relationships count as a
-    /// link is the caller's rule (W5's), not this read's.
+    /// `claim_ids` (the claims the map's run draws) AND be claims the map may
+    /// draw, under the claim rule of [`Self::read_leaf_rows`] (public, or the
+    /// team's own), whatever the caller passed: group levels are served as
+    /// stored with no per-viewer filter, so a link between claims the map
+    /// cannot draw must never reach one. The edge must be in force, and the
+    /// edge row must pass the MAP edge rule of [`Self::read_leaf_rows`]:
+    /// public, or owned by the team with no co-owner. A co-owned edge is
+    /// never returned, so a link hidden from a leaf never reappears between
+    /// leaves. Which relationships count as a link is the caller's rule
+    /// (W5's), not this read's.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the statement fails.
@@ -1112,13 +1116,23 @@ impl AtlasLeafRepository {
         let sql = viewer.splice(
             "SELECT e.source_id, e.target_id, e.relationship::text \
                FROM edges e \
+               JOIN claims cs ON cs.id = e.source_id \
+               JOIN claims ct ON ct.id = e.target_id \
               WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
                 AND e.source_id = ANY($1) AND e.target_id = ANY($1) \
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
                 AND (e.visibility = 'public' \
                      OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
                          AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
+                AND (cs.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND cs.visibility = 'group' \
+                         AND cs.owner_group_id = $2)) \
+                AND (ct.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND ct.visibility = 'group' \
+                         AND ct.owner_group_id = $2)) \
                 /* {EDGE_VISIBILITY:e} */ \
+                /* {VISIBILITY:cs} */ \
+                /* {VISIBILITY:ct} */ \
               ORDER BY e.id",
             3,
         );
