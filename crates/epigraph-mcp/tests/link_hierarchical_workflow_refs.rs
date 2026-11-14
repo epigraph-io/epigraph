@@ -275,3 +275,70 @@ async fn invokes_through_a_step_claim_refuses_the_closing_edge(pool: PgPool) {
         .expect_err("at_step belongs to invokes only");
     assert!(err.message.contains("at_step"), "{}", err.message);
 }
+
+/// A server whose stdio agent is a DIFFERENT declared signer from
+/// `build_scoped_test_server`'s, on the same database.
+fn outsider_server(pool: PgPool, scoped: epigraph_db::ScopedPool) -> epigraph_mcp::EpiGraphMcpFull {
+    let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x5C; 32]).expect("signer");
+    let embedder =
+        epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    epigraph_mcp::EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
+}
+
+/// A workflow SOURCE takes the `add_step` authority gate (backlog 03d87e3a:
+/// "under the same authority checks"): another agent that is not the
+/// workflow's submitter, its operator or delegate, nor a writer of its owner
+/// group, cannot repair its `executes` edges or give it a prerequisite.
+/// Refused with nothing written, while the submitter's own repair goes
+/// through.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_submitter_cannot_write_a_workflow_sourced_reference(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let outsider = outsider_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let outsider_viewer = epigraph_mcp::tools::viewer::request_viewer(&outsider, None)
+        .await
+        .expect("outsider stdio viewer");
+    let workflow = store(&server, &["gather inputs", "publish output"]).await;
+    let other = store(&server, &["other step"]).await;
+    let (dropped, step) = step_claim(&pool, workflow, "publish output").await;
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(dropped)
+        .execute(&pool)
+        .await
+        .expect("drop the executes edge");
+
+    for (target, target_type, rel) in [
+        (step, "claim", "executes"),
+        (other, "workflow", "depends_on"),
+    ] {
+        let err = do_link_hierarchical(
+            &outsider,
+            &outsider_viewer,
+            link(workflow, "workflow", target, target_type, rel),
+            None,
+        )
+        .await
+        .expect_err("a non-submitter is refused");
+        assert!(
+            err.message.contains("submitter"),
+            "{rel}: refused by the workflow authority rule: {}",
+            err.message
+        );
+        assert_eq!(
+            in_force(&pool, workflow, target, rel).await,
+            0,
+            "{rel}: nothing written"
+        );
+    }
+
+    do_link_hierarchical(
+        &server,
+        &viewer,
+        link(workflow, "workflow", step, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect("the submitter's own repair is admitted");
+    assert_eq!(in_force(&pool, workflow, step, "executes").await, 1);
+}
