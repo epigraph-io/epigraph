@@ -24,6 +24,7 @@ members = [
     "crates/epigraph-mcp",
     "crates/epigraph-ingest",
     "crates/epigraph-ingest-executor",
+    "crates/epigraph-atlas-contract",
     "tests/engine-integration",
 ]
 
@@ -109,6 +110,7 @@ epigraph-tools = { path = "crates/epigraph-tools" }
 epigraph-mcp = { path = "crates/epigraph-mcp" }
 epigraph-ingest = { path = "crates/epigraph-ingest" }
 epigraph-ingest-executor = { path = "crates/epigraph-ingest-executor" }
+epigraph-atlas-contract = { path = "crates/epigraph-atlas-contract" }  # Atlas nested-level payload contract (schema v1)
 
 # Graph algorithms
 petgraph = "0.7"
