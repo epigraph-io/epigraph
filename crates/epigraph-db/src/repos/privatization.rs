@@ -4414,13 +4414,13 @@ impl PrivatizationRepository {
     /// never flipped (which the handler refuses on condition 1, correctly, but
     /// noisily and after the fact).
     ///
-    /// # Plain enqueue, NOT `enqueue_unique_pending`
+    /// # Plain enqueue, never deduplicated by `job_type`
     ///
-    /// `PostgresJobQueue::enqueue_unique_pending` guards on `job_type` plus
-    /// `state = 'pending'` and discriminates nothing about the payload, so a
-    /// second plan's apply would be silently dropped while the first is queued.
-    /// A privatization that reports 202 and never runs is the failure this
-    /// function's shape refuses.
+    /// A dedup that guards on `job_type` plus `state = 'pending'` (the queue
+    /// once had one, `enqueue_unique_pending`, removed with no caller)
+    /// discriminates nothing about the payload, so a second plan's apply would
+    /// be silently dropped while the first is queued. A privatization that
+    /// reports 202 and never runs is the failure this function's shape refuses.
     ///
     /// # `max_retries` IS AN ATTEMPT BUDGET, NOT A COUNT OF RETRIES AFTER THE
     /// FIRST

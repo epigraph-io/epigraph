@@ -433,22 +433,6 @@ pub trait JobQueue: Send + Sync {
     /// Enqueue a new job.
     async fn enqueue(&self, job: Job) -> Result<JobId, JobError>;
 
-    /// Enqueue `job` only if no job of the same `job_type` is already
-    /// `Pending`. Returns `Ok(Some(id))` if it was enqueued, or `Ok(None)`
-    /// if a pending job of that type already exists (deduplicated).
-    ///
-    /// This guards against boot-storm stacking: schedulers that re-fire on
-    /// every process restart can call this so a fresh run is only queued when
-    /// one is not already waiting.
-    ///
-    /// The default implementation does NOT deduplicate — it always enqueues —
-    /// so queues without an efficient pending lookup stay correct (just
-    /// non-deduplicating). Backends like `PostgresJobQueue` override this with
-    /// an atomic conditional insert.
-    async fn enqueue_unique_pending(&self, job: Job) -> Result<Option<JobId>, JobError> {
-        self.enqueue(job).await.map(Some)
-    }
-
     /// Dequeue the next pending job for processing.
     ///
     /// Returns `None` if no jobs are available.
