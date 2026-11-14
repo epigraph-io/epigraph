@@ -90,9 +90,15 @@ struct OpenAiModels {
 
 impl OpenAiModels {
     fn new(api_key: &str) -> Result<Self, EmbeddingError> {
+        Self::at_base(api_key, None)
+    }
+
+    /// Both providers aimed at `api_base_url` (`None` is the public endpoint).
+    /// Only `new` and the routing test call it.
+    fn at_base(api_key: &str, api_base_url: Option<&str>) -> Result<Self, EmbeddingError> {
         Ok(Self {
-            small_1536: openai_provider(api_key, 1536)?,
-            large_3072: openai_provider(api_key, 3072)?,
+            small_1536: openai_provider(api_key, 1536, api_base_url)?,
+            large_3072: openai_provider(api_key, 3072, api_base_url)?,
         })
     }
 
@@ -113,13 +119,14 @@ impl OpenAiModels {
 fn openai_provider(
     api_key: &str,
     dim: u32,
+    api_base_url: Option<&str>,
 ) -> Result<epigraph_embeddings::OpenAiProvider, EmbeddingError> {
     let model = model_for_dim(dim)
         .ok_or_else(|| EmbeddingError::ConfigError(format!("no OpenAI model for dim {dim}")))?;
     let mut config = epigraph_embeddings::EmbeddingConfig::openai(dim as usize).with_cache(false);
     config.provider = epigraph_embeddings::config::ProviderConfig::OpenAi {
         model: model.to_string(),
-        api_base_url: None,
+        api_base_url: api_base_url.map(str::to_string),
     };
     epigraph_embeddings::OpenAiProvider::new(config, api_key.to_string())
 }
@@ -670,6 +677,47 @@ mod tests {
         assert_eq!(models.at_dim(1536).map(|p| p.dimension()), Some(1536));
         assert_eq!(models.at_dim(3072).map(|p| p.dimension()), Some(3072));
         assert!(models.at_dim(1024).is_none());
+    }
+
+    // The 3072 provider must ASK for `text-embedding-3-large`. `dimension()`
+    // only echoes the config, and `OpenAiProvider::generate` does not check the
+    // returned length, so a provider that sent `-small` at 3072 would hand a
+    // 1536-d vector to a `vector(3072)` theme-centroid write and fail only at
+    // the cast. This reads the model off the request the provider actually sent.
+    #[tokio::test]
+    async fn each_dim_requests_the_model_of_that_dim() {
+        use epigraph_embeddings::EmbeddingService as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (dim, want) in [
+            (1536_u32, "text-embedding-3-small"),
+            (3072, "text-embedding-3-large"),
+        ] {
+            let server = MockServer::start().await;
+            let vector = vec![0.5_f32; dim as usize];
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": [{"embedding": vector, "index": 0}],
+                    "usage": {"total_tokens": 1}
+                })))
+                .mount(&server)
+                .await;
+            let models = super::OpenAiModels::at_base("sk-test", Some(&server.uri()))
+                .expect("providers build");
+            let provider = models.at_dim(dim).expect("a provider at this dim");
+            let _ = provider.generate("routing probe").await;
+
+            let requests = server.received_requests().await.expect("recording on");
+            assert_eq!(requests.len(), 1, "{dim}: exactly one request");
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("a JSON request body");
+            assert_eq!(
+                body["model"], want,
+                "dim {dim} sent the wrong model: {body}"
+            );
+        }
     }
 
     // No mock fallback: a keyless embedder refuses at both dims, before any
