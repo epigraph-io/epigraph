@@ -263,3 +263,39 @@ async fn the_http_workflow_writers_attest_their_edges_with_the_api_key(pool: PgP
         );
     }
 }
+
+/// `POST /api/v1/workflows` (store_workflow) has its own authorship record
+/// call beside the shared plan walk: every edge it writes is attested by the
+/// API's key too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_store_workflow_attests_its_edges_with_the_api_key(pool: PgPool) {
+    system_agent_registered(&pool).await;
+    let (caller, _) = seed_agent_with_group(&pool, "dae795f8-http-store-caller").await;
+    let (state, signer) = signed_state(&pool).await;
+
+    let before = edge_ids(&pool).await;
+    let request: epigraph_api::routes::workflows::StoreWorkflowRequest =
+        serde_json::from_value(json!({
+            "goal": "dae795f8 http store: sign the stored workflow's edges",
+            "steps": ["dae795f8 http store: first", "dae795f8 http store: second"],
+            "prerequisites": null,
+            "expected_outcome": null,
+            "confidence": null,
+            "tags": null
+        }))
+        .expect("a well-formed store request");
+    let Json(_) = epigraph_api::routes::workflows::store_workflow(
+        ViewerExtractor(Viewer::resolve(&pool, caller).await.expect("viewer")),
+        State(state.clone()),
+        claims_writer(caller),
+        Json(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_workflow: {e:?}"));
+    let rels = assert_new_edges_attested(&pool, &before, signer, caller, "store_workflow").await;
+    require(
+        &rels,
+        &["executes", "decomposes_to", "step_follows", "AUTHORED"],
+        "store_workflow",
+    );
+}
