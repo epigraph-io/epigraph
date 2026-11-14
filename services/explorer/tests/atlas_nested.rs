@@ -252,6 +252,59 @@ async fn the_atlas_page_omits_the_map_list_when_the_kernel_lists_none() {
     assert_eq!(maps.maps[0].key, "public");
 }
 
+/// A hung API costs the page one budget (a third of the 2 s test upstream
+/// timeout), not one upstream timeout per stage: whether the map list itself
+/// hangs or the list answers and a map's themes hang, the shell renders
+/// without `data-atlas-maps` well inside one upstream timeout.
+#[tokio::test]
+async fn a_hung_api_delays_the_atlas_page_by_the_budget_only() {
+    let hang = || ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30));
+
+    // The map list hangs.
+    let app = spawn().await;
+    let sid = app.sign_in("tok");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/atlas/maps"))
+        .respond_with(hang().set_body_json(json!({"maps": []})))
+        .mount(&app.upstream)
+        .await;
+    let started = std::time::Instant::now();
+    let res = app.get_as("/explorer/atlas", &sid).await;
+    let took = started.elapsed();
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(!res.body.contains("data-atlas-maps"));
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "the page waited {took:?} on a hung map list"
+    );
+
+    // The list answers; the map's themes hang.
+    let app = spawn().await;
+    let sid = app.sign_in("tok");
+    Mock::given(method("GET"))
+        .and(path("/api/v1/atlas/maps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"maps": [
+            {"scope": "public", "group_id": null, "map": "public", "label": "Public map", "run_id": Uuid::nil()},
+        ]})))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/atlas/maps/public/themes"))
+        .respond_with(hang().set_body_json(json!({
+            "scope": "public", "group_id": null, "run_id": Uuid::nil(), "themes": []})))
+        .mount(&app.upstream)
+        .await;
+    let started = std::time::Instant::now();
+    let res = app.get_as("/explorer/atlas", &sid).await;
+    let took = started.elapsed();
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(!res.body.contains("data-atlas-maps"));
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "the page waited {took:?} on hung themes"
+    );
+}
+
 // ---- the level proxy ----------------------------------------------------------------
 
 /// The kernel's bytes are served unchanged, pass the contract, and carry

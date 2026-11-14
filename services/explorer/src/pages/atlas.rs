@@ -10,8 +10,14 @@
 //! `data-atlas-claim-leaf-url`. When the kernel lists no map, or any of those
 //! calls fails, the attribute is left out and the Atlas behaves as before:
 //! themes open onto their claim lists. Every other map item, label and count
-//! still arrives through `/bff/atlas/*`, so the shell renders even while the
-//! API is down and `static/atlas.js` reports each failed fetch inline.
+//! still arrives through `/bff/atlas/*`, and `static/atlas.js` reports each
+//! failed fetch inline.
+//!
+//! The map list is the page's only wait on the API, so it runs under one
+//! budget, [`maps_page_budget`] (a third of the upstream timeout, at most
+//! [`MAPS_PAGE_BUDGET_CAP`]), across both its stages. A slow or hung API
+//! costs the shell that budget, not one upstream timeout per stage, and the
+//! page then renders without the list.
 //!
 //! An anonymous visitor gets a 200 sign-in shell with a generic OG card, as
 //! `/claim/:id` does: a redirect would unfurl as the login page, and would
@@ -19,6 +25,7 @@
 //! link's `return_to`.
 
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::extract::State;
@@ -76,6 +83,35 @@ fn clip_label(s: &str) -> Option<String> {
         return None;
     }
     Some(t.chars().take(MAX_MAP_LABEL_CHARS).collect())
+}
+
+/// The longest the /atlas page waits for the map list, whatever the upstream
+/// timeout.
+pub const MAPS_PAGE_BUDGET_CAP: Duration = Duration::from_secs(3);
+
+/// How long the /atlas page waits for the whole map list (the list, then
+/// every map's themes) before it renders without it: a third of the
+/// per-call upstream timeout, at most [`MAPS_PAGE_BUDGET_CAP`].
+pub fn maps_page_budget(upstream_timeout: Duration) -> Duration {
+    (upstream_timeout / 3).min(MAPS_PAGE_BUDGET_CAP)
+}
+
+/// [`atlas_maps_for`] under [`maps_page_budget`]: `None` when the budget runs
+/// out, so a slow API delays the shell by the budget at most.
+pub async fn atlas_maps_within_budget(state: &AppState, auth: &RequestAuth) -> Option<AtlasMaps> {
+    let budget = maps_page_budget(state.upstream.timeout());
+    let started = Instant::now();
+    match tokio::time::timeout(budget, atlas_maps_for(state, auth)).await {
+        Ok(maps) => maps,
+        Err(_) => {
+            tracing::warn!(
+                budget_ms = budget.as_millis() as u64,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "the atlas map list ran past the page budget; serving the Atlas without it"
+            );
+            None
+        }
+    }
 }
 
 /// The map list for `auth`, as `data-atlas-maps` carries it, or `None` when
@@ -217,7 +253,7 @@ async fn atlas(State(state): State<AppState>, caller: Caller) -> Result<Html<Str
         atlas_url: links.atlas(),
         home_url: links.home(),
         search_page_url: links.search_page(),
-        maps_json: atlas_maps_for(&state, &caller.auth)
+        maps_json: atlas_maps_within_budget(&state, &caller.auth)
             .await
             .map(|m| m.to_attr()),
         claim_leaf_url: links.path(CLAIM_LEAF_PREFIX),
@@ -226,4 +262,25 @@ async fn atlas(State(state): State<AppState>, caller: Caller) -> Result<Html<Str
         ctx: caller.ctx,
         shell,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_map_list_budget_is_a_third_of_the_upstream_timeout_capped() {
+        assert_eq!(
+            maps_page_budget(Duration::from_millis(2_000)).as_millis(),
+            666
+        );
+        assert_eq!(
+            maps_page_budget(Duration::from_millis(8_000)).as_millis(),
+            2_666
+        );
+        assert_eq!(
+            maps_page_budget(Duration::from_secs(60)),
+            MAPS_PAGE_BUDGET_CAP
+        );
+    }
 }
