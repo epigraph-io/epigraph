@@ -411,6 +411,45 @@ mod tests {
         assert!(check_mirrors(&good, &linked, &short).is_err());
     }
 
+    /// The core nests mirrors under groups of mirrors once the root would
+    /// pass the fanout (a theme with many meaning leaves). The box accepts
+    /// that shape: each mirror is still exact wherever it sits, and every
+    /// level, the group of mirrors included, has a switch target.
+    #[test]
+    fn mirrors_nested_under_a_group_of_mirrors_are_accepted() {
+        let linked = set(&[c(1), c(2), c(5), c(6)]);
+        let m = meaning_leaf_of(&meaning());
+        let root = root_id(MAP, L, THEME);
+        let lk = group_id(MAP, L, THEME, &linked);
+        let nest = group_id(MAP, L, THEME, &set(&[c(3), c(4), c(7)]));
+        let m34 = group_id(MAP, L, THEME, &set(&[c(3), c(4)]));
+        let m7 = group_id(MAP, L, THEME, &set(&[c(7)]));
+        let m89 = group_id(MAP, L, THEME, &set(&[c(8), c(9)]));
+        let tree = check_tree(
+            MAP,
+            L,
+            THEME,
+            &[
+                group(root, None, 0, &[lk, nest, m89]),
+                leaf(lk, Some(root), 1, &[c(1), c(2), c(5), c(6)]),
+                group(nest, Some(root), 1, &[m34, m7]),
+                leaf(m34, Some(nest), 2, &[c(3), c(4)]),
+                leaf(m7, Some(nest), 2, &[c(7)]),
+                leaf(m89, Some(root), 1, &[c(8), c(9)]),
+            ],
+            &(1..=9).map(c).collect(),
+        )
+        .unwrap();
+        assert_eq!(check_mirrors(&tree, &linked, &m).unwrap(), 3);
+        let s = switch_targets(&tree, &meaning()).unwrap();
+        assert_eq!(s.len(), tree.nodes.len(), "every level has a switch target");
+        // {3,4,7}: 2/5 with {1,2,3,4} beats 1/5 with {5,6,7} and 3/9 with the root.
+        assert_eq!(
+            s[&nest],
+            group_id(MAP, M, THEME, &set(&[c(1), c(2), c(3), c(4)]))
+        );
+    }
+
     #[test]
     fn a_single_root_leaf_needs_no_mirror() {
         let all = [c(1), c(2), c(3)];
