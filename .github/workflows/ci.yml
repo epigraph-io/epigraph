@@ -71,7 +71,19 @@ jobs:
   # and only the shards move; unset it (`gh variable delete SHARD_RUNS_ON`) to
   # move them back. A pull request from a FORK always gets ubuntu-latest
   # whatever the variable says (test-shard.py `shard_runner`): self-hosted
-  # runners must never run a stranger's code on a public repository. Each
+  # runners must never run a stranger's code on a public repository.
+  #
+  # THAT GUARD IS NOT THE SECURITY BOUNDARY. On a `pull_request` event GitHub
+  # runs the workflow and scripts from the PR's own merge ref, so a fork can
+  # edit `runs-on` (or `shard_runner`, or its test) in its PR and target the
+  # self-hosted labels directly. The guard only keeps the UNMODIFIED workflow
+  # from sending a fork's code there. Before setting SHARD_RUNS_ON, put a
+  # GitHub-side control in place that stops fork PR runs reaching these
+  # runners whatever their workflow says, and verify it with a test fork PR
+  # (candidates to check, not verified here: requiring approval to run
+  # workflows for every outside contributor, and the runner group's
+  # repository / workflow restrictions; GitHub's own guidance warns against
+  # self-hosted runners on public repositories). Each
   # runner must be Linux with Docker (the Postgres service container),
   # `mold` and Python 3 installed, and one runner per machine or VM (the
   # service binds host port 5432); ephemeral (`--ephemeral`) runners are the
@@ -149,8 +161,9 @@ jobs:
     # rejects, and the `test` gate accepts the skip because the plan said so.
     if: ${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}
     # ubuntu-latest unless the operator set SHARD_RUNS_ON; never a self-hosted
-    # runner for a fork's PR. Computed and validated by the planner: do not
-    # read the variable here, or the fork guard is bypassed.
+    # runner for a fork's PR from THIS workflow (a fork can edit its copy: see
+    # SELF-HOSTED SHARD RUNNERS above). Computed and validated by the planner:
+    # do not read the variable here, or this workflow bypasses the guard.
     runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
     # A shard takes 25-40 minutes (setup and build ~10, tests 10-25). 90 bounds
     # a hang with a named cause and leaves room for a slow runner; if a shard

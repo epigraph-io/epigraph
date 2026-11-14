@@ -754,6 +754,10 @@ def shard_runner(event, head_repo, repository, raw):
     pull request from a fork always gets the GitHub-hosted runner whatever the
     variable says: self-hosted runners must never run code from a fork of a
     public repository. A deleted fork has no head repository and is a fork.
+
+    This protects the unmodified workflow only. A fork's pull request runs the
+    fork's own copy of this script and of ci.yml, so the boundary has to be a
+    GitHub-side setting (see ci.yml, SELF-HOSTED SHARD RUNNERS).
     """
     if not raw or not raw.strip():
         return HOSTED_RUNNER, None
