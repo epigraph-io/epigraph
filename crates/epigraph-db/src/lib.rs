@@ -105,7 +105,7 @@ pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
     AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
     AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
-    AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
+    AnalysisRecord, AnalysisRepository, AssertionNonceRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
     ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
