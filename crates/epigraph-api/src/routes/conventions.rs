@@ -121,6 +121,55 @@ pub struct SkillResponse {
 }
 
 // =============================================================================
+// EMBEDDING
+// =============================================================================
+
+/// Embed a claim one of these handlers just created, best-effort (CLAUDE.md
+/// "Embedding policy"): every failure is logged and swallowed, because the
+/// claim is already stored and a failed embed must not fail the request.
+///
+/// Stored on `pool`, the handler's own `state.db_pool`: these handlers write
+/// the claim itself and everything attached to it there, so the vector lands
+/// on the authority that wrote the row. `ClaimRepository::store_embedding`
+/// carries the "not sealed" predicate every claim-vector writer needs.
+async fn embed_created_claim(
+    state: &AppState,
+    pool: &epigraph_db::PgPool,
+    claim_id: Uuid,
+    content: &str,
+    route: &'static str,
+) {
+    let Some(embedder) = state.embedding_service() else {
+        tracing::debug!(claim_id = %claim_id, route, "no embedding service; not embedded");
+        return;
+    };
+    let embedding = match embedder.generate(content).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(claim_id = %claim_id, route, error = %e, "Failed to generate embedding");
+            return;
+        }
+    };
+    let pgvector = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    match epigraph_db::ClaimRepository::store_embedding(pool, claim_id, &pgvector).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(claim_id = %claim_id, route, "embedding matched no row; no vector stored");
+        }
+        Err(e) => {
+            tracing::warn!(claim_id = %claim_id, route, error = %e, "Failed to store embedding");
+        }
+    }
+}
+
+// =============================================================================
 // HANDLERS
 // =============================================================================
 
@@ -287,6 +336,16 @@ pub async fn learn_convention(
         None,
         None,
         None,
+    )
+    .await;
+
+    // After every write of this request, so a failed embed changes nothing.
+    embed_created_claim(
+        &state,
+        pool,
+        claim_uuid,
+        &request.content,
+        "learn_convention",
     )
     .await;
 
@@ -552,6 +611,16 @@ pub async fn share_skill(
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("Failed to commit the SHARED_BY edge: {e}"),
     })?;
+
+    // The shared copy is a new current claim, so it is embedded like one.
+    embed_created_claim(
+        &state,
+        pool,
+        shared_claim.id.as_uuid(),
+        &claim.content,
+        "share_skill",
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,

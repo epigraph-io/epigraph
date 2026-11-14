@@ -217,6 +217,8 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
+- **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
+- **HTTP `POST /api/v1/policy-challenges`** — embeds a NEW challenge after `tx.commit()` on the caller's stamp (`AppState::store_claim_embedding_as`); a repeat request creates nothing and embeds nothing; `crates/epigraph-api/src/routes/policies.rs::embed_new_challenge`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
