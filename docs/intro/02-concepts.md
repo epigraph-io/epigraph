@@ -10,7 +10,7 @@ If you have not yet run through [`01-quickstart.md`](01-quickstart.md), do that 
 2. [Agents and signing](#2--agents-and-signing) — who authors and how authorship is cryptographically anchored
 3. [Beliefs and DST](#3--beliefs-and-dst) — how the graph carries uncertainty (BetP, mass functions, discounting)
 4. [Perspectives, frames, themes](#4--perspectives-frames-themes) — viewpoints, hypothesis spaces, topical clusters
-5. [Hierarchical extraction](#5--hierarchical-extraction) — papers → paragraphs → atoms and why paragraphs are primary
+5. [Hierarchical extraction](#5--hierarchical-extraction) — thesis → sections → paragraphs → atoms and why paragraphs are primary
 6. [Backlog discipline](#6--backlog-discipline) — how operational follow-ups live inside the graph
 
 ---
@@ -338,16 +338,23 @@ at the same time, and none of those facts contradict each other.
 
 ## 5 — Hierarchical extraction
 
-EpiGraph stores documents as a tree, not a flat bag of sentences. Each ingested source becomes a **paper** node; each paper has child **paragraph** nodes; each paragraph has child **atom** nodes. The level lives in `properties->>'level'`: papers are level 1, paragraphs are level 2, atoms are level 3. Edges link each level to its parent so the tree is graph-traversable in either direction, and each child carries its own embedding so searches at any granularity are possible — but only paragraph-level search is *canonical*.
+EpiGraph stores documents as a tree, not a flat bag of sentences. Each ingested source becomes four levels of claims: a **thesis** (when the extraction has one), its **sections**, each section's **paragraphs**, and each paragraph's **atoms**. The level lives in `properties->>'level'`: the thesis is level 0, sections are level 1, paragraphs are level 2, atoms are level 3. A `decomposes_to` edge links each node to its children, so the tree is graph-traversable in either direction, and each claim carries its own embedding, so every level is searchable; `recall_with_context` searches all of them and uses the tree as context (next paragraph).
+
+The source itself is not a claim in that tree. It is a row in the `papers` table, and an `asserts` edge runs from the paper to each claim of the document. A query for `properties->>'level' = '1'` returns section headings, not papers.
 
 ```text
-                paper (level 1)
-                  │
-        ┌─────────┼─────────┐
-   paragraph    paragraph    paragraph   (level 2)
-        │
-   ┌────┼────┐
-  atom atom atom                          (level 3)
+                  thesis (level 0)
+                     │
+          ┌──────────┼──────────┐
+       section    section    section       (level 1)
+          │
+    ┌─────┼─────┐
+paragraph paragraph paragraph              (level 2)
+    │
+ ┌──┼──┐
+atom atom atom                             (level 3)
+
+papers row ──asserts──▶ each claim above
 ```
 
 **Every embedded claim is a search candidate; the hierarchy is context.** The `recall_with_context` MCP tool runs vector kNN over every claim that carries an embedding — paragraphs, atoms, sections, workflow steps, and claims written on their own with `submit_claim` or `memorize` — then *batches in* the structural context for each hit: its parent paper and section, its atoms (level 3), its sibling paragraphs in the same section (level 2), its corroborating and epistemic edges, and its neighbor paragraphs. Parentage is an enrichment attribute, not an eligibility filter: a hit with no paper attribution comes back without a `paper` key and with `section: null`, rather than being dropped. The hierarchy lists (atoms, siblings, neighbor paragraphs) are filled only for paragraph hits; corroborating and epistemic edges come from the hit's own edges whatever its level (backlog `a1d89aab`, drain U082). Paragraphs are still the unit of meaning the hierarchy is built around — an atom on its own strips away its surrounding context, and a 50-page document averages out into a single embedding that does not retrieve well — which is why the tree's context travels with every hit that has one. Earlier versions searched level-2 paragraphs only; an exactly matching standalone claim then lost to weaker paragraphs because it was never a candidate.

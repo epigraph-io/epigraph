@@ -10,7 +10,7 @@ A signing identity that authors claims and edges. Every claim is keyed by `(cont
 
 ## atom
 
-The finest-grained extracted unit produced by hierarchical extraction — a single self-contained assertion lifted out of a paragraph. Atoms are the children of paragraphs in the paper → paragraph → atom hierarchy and are the unit at which Dempster-Shafer belief is tracked. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+The finest-grained extracted unit produced by hierarchical extraction — a single self-contained assertion lifted out of a paragraph. Atoms are the children of paragraphs in the thesis → section → paragraph → atom hierarchy and are the unit at which Dempster-Shafer belief is tracked. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## backlog
 
@@ -54,7 +54,7 @@ The frame of discernment — the finite set of mutually-exclusive hypotheses ove
 
 ## hierarchical extraction
 
-The canonical ingest pipeline that decomposes a source into paper → paragraph (level 2) → atom, with edges linking each level to its parent. Tier 1 hierarchical extraction (`extract-claims` → `ingest_document`) is the only supported ingest path; legacy flat extraction and Jina embeddings break primary-column search and are not used. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+The canonical ingest pipeline that decomposes a source into thesis (level 0) → section (level 1) → paragraph (level 2) → atom (level 3), with `decomposes_to` edges linking each level to its children; the source itself is a `papers` row that `asserts` each of those claims. Tier 1 hierarchical extraction (`extract-claims` → `ingest_document`) is the only supported ingest path; legacy flat extraction and Jina embeddings break primary-column search and are not used. [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## MCP
 
@@ -70,7 +70,7 @@ A `claims` row treated as an entity with stable identity: at most one row per `(
 
 ## paragraph
 
-A level-2 claim in the hierarchical extraction tree: a contiguous span of source text that sits between the paper and its atoms. Paragraphs are the unit the structural context of semantic search is built around (`recall_with_context` searches every embedded claim, then batches in each hit's paper, section, atoms, siblings, corroborating edges, and neighbor paragraphs). [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
+A level-2 claim in the hierarchical extraction tree: a contiguous span of source text that sits between its section and its atoms. Paragraphs are the unit the structural context of semantic search is built around (`recall_with_context` searches every embedded claim, then batches in each hit's paper, section, atoms, siblings, corroborating edges, and neighbor paragraphs). [see 02-concepts.md §5 (Hierarchical extraction)](02-concepts.md#5--hierarchical-extraction)
 
 ## perspective
 
