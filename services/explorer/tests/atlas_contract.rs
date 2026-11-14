@@ -108,6 +108,65 @@ fn the_fixtures_cover_team_and_public_maps_and_every_flow_basis() {
     }
 }
 
+/// The common case is in a committed file the view's tests can load: most
+/// evidence edges carry no readable mass and are `none` with sign 0, a
+/// `refutes` one included (its direction is only in the relationship name),
+/// some keep their `exact` mass, and some evidence is attached to its
+/// claims only through `none` edges.
+#[test]
+fn a_fixture_has_evidence_with_no_readable_mass() {
+    let AtlasLevel::Leaf(l) =
+        serde_json::from_slice::<AtlasLevel>(&fixture("team_leaf_sparse_mass")).unwrap()
+    else {
+        panic!("team_leaf_sparse_mass is a leaf")
+    };
+    assert_eq!(l.map_scope, MapScope::Team);
+    let v = fixture_value("team_leaf_sparse_mass");
+    let evidence: Vec<&str> = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "evidence")
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    let ev_edges: Vec<_> = l
+        .edges
+        .iter()
+        .filter(|e| evidence.contains(&e.source.to_string().as_str()))
+        .collect();
+    let none = ev_edges
+        .iter()
+        .filter(|e| e.flow_basis == FlowBasis::None)
+        .count();
+    let exact = ev_edges
+        .iter()
+        .filter(|e| e.flow_basis == FlowBasis::Exact)
+        .count();
+    assert!(none > exact && exact > 0, "{none} none, {exact} exact");
+    for rel in ["supports", "refutes"] {
+        assert!(
+            ev_edges.iter().any(|e| e.flow_basis == FlowBasis::None
+                && e.relationship.eq_ignore_ascii_case(rel)
+                && e.sign == 0
+                && e.flow_weight == 0.0),
+            "a none {rel} evidence edge"
+        );
+    }
+    assert!(
+        evidence.iter().any(|id| {
+            let mine: Vec<_> = ev_edges
+                .iter()
+                .filter(|e| e.source.to_string() == *id)
+                .collect();
+            !mine.is_empty() && mine.iter().all(|e| e.flow_basis == FlowBasis::None)
+        }),
+        "evidence attached only through none edges"
+    );
+    if let Err(e) = check_as("team_leaf_sparse_mass", &fixture("team_leaf_sparse_mass")) {
+        panic!("{e:#?}");
+    }
+}
+
 #[test]
 fn the_fixtures_fit_the_budget() {
     for stem in LEVEL_FIXTURES {

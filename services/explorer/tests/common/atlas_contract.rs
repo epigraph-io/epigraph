@@ -31,6 +31,7 @@ pub const LEVEL_FIXTURES: &[&str] = &[
     "team_group_deep",
     "team_leaf_dense",
     "public_leaf",
+    "team_leaf_sparse_mass",
 ];
 
 /// The synthetic team group of every team fixture: the kernel generator's

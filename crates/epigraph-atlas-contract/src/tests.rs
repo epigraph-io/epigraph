@@ -30,6 +30,7 @@ const LEVEL_STEMS: &[&str] = &[
     "team_group_deep",
     "team_leaf_dense",
     "public_leaf",
+    "team_leaf_sparse_mass",
 ];
 
 /// What a request for a fixture asks for, from the generator and the
@@ -223,8 +224,8 @@ fn every_fixture_validates() {
 
 /// The fixtures cover what W11, W12 and W10 need: a theme root with about
 /// 40 children and bundles both inside and out, a deep unnamed group, a
-/// full 100-node leaf with every node kind and flow basis, and a public
-/// leaf.
+/// full 100-node leaf with every node kind and flow basis, a public leaf,
+/// and a team leaf whose evidence mostly has no readable mass.
 #[test]
 fn fixtures_cover_the_cases() {
     let docs: Vec<(String, LevelDocument)> = LEVEL_STEMS
@@ -300,6 +301,52 @@ fn fixtures_cover_the_cases() {
     assert_eq!(
         (public.map_scope, public.map_group_id),
         (MapScope::Public, None)
+    );
+
+    // Evidence with no readable mass, the common case, in a committed file:
+    // most evidence edges `none`, both directions among them, some `exact`
+    // beside them, and evidence attached to its claims only through `none`.
+    let LevelDocument::Leaf(sparse) = get("team_leaf_sparse_mass") else {
+        panic!("team_leaf_sparse_mass is a leaf")
+    };
+    assert_eq!(sparse.map_scope, MapScope::Team);
+    let evidence: BTreeSet<Uuid> = sparse
+        .nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::Evidence)
+        .map(Node::id)
+        .collect();
+    let ev_edges: Vec<&Edge> = sparse
+        .edges
+        .iter()
+        .filter(|e| evidence.contains(&e.source))
+        .collect();
+    let none: Vec<&&Edge> = ev_edges
+        .iter()
+        .filter(|e| e.flow_basis == FlowBasis::None)
+        .collect();
+    let exact = ev_edges
+        .iter()
+        .filter(|e| e.flow_basis == FlowBasis::Exact)
+        .count();
+    assert!(
+        none.len() > exact && exact > 0,
+        "{} none, {exact} exact evidence edges",
+        none.len()
+    );
+    for rel in ["supports", "refutes"] {
+        assert!(
+            none.iter()
+                .any(|e| e.relationship.eq_ignore_ascii_case(rel) && e.sign == 0),
+            "a none {rel} evidence edge with sign 0"
+        );
+    }
+    assert!(
+        evidence.iter().any(|id| {
+            let mine: Vec<_> = ev_edges.iter().filter(|e| e.source == *id).collect();
+            !mine.is_empty() && mine.iter().all(|e| e.flow_basis == FlowBasis::None)
+        }),
+        "an evidence node attached only through none edges"
     );
 }
 
