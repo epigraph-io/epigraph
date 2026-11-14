@@ -220,8 +220,12 @@ pub struct QueryClaimsParams {
     #[schemars(
         description = "Rows to skip before the page starts (default 0, never negative). The \
                        order is created_at newest first with ties broken by id, so stepping \
-                       offset by limit visits every matching row exactly once; a page shorter \
-                       than limit is the last."
+                       offset by limit visits every matching row exactly once while the \
+                       window's contents do not change; a page shorter than limit is the \
+                       last. Offsets are positional: a claim created (or written with a \
+                       back-dated created_at) inside the window between pages shifts later \
+                       pages by one, repeating or skipping a row. Fix created_before to a past \
+                       instant for a stable walk."
     )]
     #[serde(default)]
     pub offset: Option<i64>,

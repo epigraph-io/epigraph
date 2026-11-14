@@ -122,14 +122,19 @@ async fn seed(pool: &PgPool) -> Doc {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_body_is_the_engine_body_the_route_serves(pool: PgPool) {
+// What this proves: the tool serializes `epigraph_engine::claim_context::load`
+// unchanged (no field dropped, renamed or reshaped on the MCP side), and the
+// full-mode shape carries real content. It does NOT exercise the HTTP route:
+// that the route serves the same engine body is pinned by the route's own
+// tests (`claim_context_route_test`), which run over the moved function.
+async fn the_tool_serializes_the_engine_body_unchanged(pool: PgPool) {
     let server = app_role_server(&pool).await;
     let d = seed(&pool).await;
 
     let via_tool = ctx(&server, &pool, d.member, params(d.atom)).await.unwrap();
 
-    // The route's body, built by the same function on a stamped connection
-    // for the same viewer: the tool reshapes nothing.
+    // The engine body for the same viewer on a stamped connection: the tool
+    // reshapes nothing.
     let scoped = app_role_scoped(&pool).await;
     let viewer = Viewer::resolve(&pool, d.member).await.unwrap();
     let mut read = scoped.read_as(&viewer).await.unwrap();

@@ -312,12 +312,6 @@ mod tests {
         assert_eq!(required_scope("theme_cluster"), Some("claims:read"));
     }
 
-    /// `verify_claim`, `reconcile_sheaf` and `stage_claims` write nothing: the
-    /// first two open only a viewer-stamped read (`server.read_as`) and the
-    /// third touches no database. They sat in the `claims:write` bucket
-    /// (backlog 6fb9e913), so a read-scoped principal could not verify a
-    /// claim's signature. Asserted by name because the coverage test passes
-    /// for any mapping.
     /// The backlog batch B41 read tools write nothing, so a read-scoped
     /// principal reaches them. Asserted by name: their tests call the tool
     /// functions directly, past the router's scope check, and the coverage
@@ -334,6 +328,12 @@ mod tests {
         }
     }
 
+    /// `verify_claim`, `reconcile_sheaf` and `stage_claims` write nothing: the
+    /// first two open only a viewer-stamped read (`server.read_as`) and the
+    /// third touches no database. They sat in the `claims:write` bucket
+    /// (backlog 6fb9e913), so a read-scoped principal could not verify a
+    /// claim's signature. Asserted by name because the coverage test passes
+    /// for any mapping.
     #[test]
     fn pure_read_tools_are_read_scoped() {
         for tool in ["verify_claim", "reconcile_sheaf", "stage_claims"] {
