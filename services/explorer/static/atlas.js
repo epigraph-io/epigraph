@@ -1532,7 +1532,7 @@
     }
     if (doc.kind === 'leaf') {
       dom.panelBody.appendChild(
-        el('p', 'small muted', 'Dashed links are estimates: link strength × sign, with no belief value. Solid links from evidence carry its stored mass.'),
+        el('p', 'small muted', 'Dashed links are estimates: link strength × sign, with no belief value. Thick solid links from evidence carry its stored mass; thin solid ones with no dots have no stored mass we can read, and take their colour from supports or refutes.'),
       );
     }
   }

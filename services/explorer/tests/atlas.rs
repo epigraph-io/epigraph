@@ -2546,6 +2546,56 @@ fn atlas_js_nested_levels_run_no_layout() {
     }
 }
 
+/// The canvas draws a leaf edge with exactly the style atlas_nested.js
+/// returns (tested under node:test): its width, dash and opacity, with an
+/// arrow and particles only for a flow, and edgeStyle always gets the kinds of
+/// both ends, so only evidence to a claim can read as "no stored mass". The
+/// leaf help text agrees with the legend that some solid evidence lines carry
+/// no stored mass.
+#[test]
+fn atlas_js_draws_leaf_edges_with_the_tested_style() {
+    let js = include_str!("../static/atlas.js");
+    let body_of = |name: &str| {
+        let start = js.find(name).unwrap_or_else(|| panic!("{name}"));
+        &js[start..start + js[start..].find("\n  }\n").expect("its end")]
+    };
+    let draw = body_of("function drawLeafFlows(");
+    for needed in [
+        "NESTED.edgeStyle(e, leafEnds(node, e))",
+        "ctx.lineWidth = style.width * zoom;",
+        "ctx.setLineDash(style.dash);",
+        "ctx.globalAlpha = style.alpha;",
+    ] {
+        assert!(draw.contains(needed), "drawLeafFlows must use {needed}");
+    }
+    assert!(
+        !draw.contains("style.flows ?"),
+        "the stroke opacity is the style's, not re-derived from whether it flows"
+    );
+    let gate = draw.find("if (style.flows) {").expect("a flow gate");
+    for flow_only in ["arrowHead(", "NESTED.particleFractions("] {
+        let at = draw
+            .find(flow_only)
+            .unwrap_or_else(|| panic!("{flow_only}"));
+        assert!(at > gate, "{flow_only} is drawn only for a flow");
+    }
+    let ends = body_of("function leafEnds(");
+    assert!(ends.contains("source: s ? s.sub : null") && ends.contains("target: t ? t.sub : null"));
+    let panel = body_of("function showLeafNodePanel(");
+    assert!(panel.contains("NESTED.edgeStyle(e, leafEnds(leaf, e))"));
+    assert_eq!(
+        js.matches("NESTED.edgeStyle(e)").count(),
+        0,
+        "every edgeStyle call names the edge's ends"
+    );
+    let help = body_of("function showLevelPanel(");
+    assert!(
+        help.contains("no stored mass")
+            && !help.contains("Solid links from evidence carry its stored mass."),
+        "the leaf help text says some solid evidence lines carry no stored mass"
+    );
+}
+
 /// With a map list (`data-atlas-maps`), no theme opens onto the viewer's own
 /// claim list: every read of the theme-claims route sits in a function that
 /// first asks `themeOpens` (or `NS.on`), so the picked map, not the viewer's
