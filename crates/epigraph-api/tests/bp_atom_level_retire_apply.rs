@@ -86,17 +86,21 @@ async fn state_bp_apply_on(pool: &PgPool) -> AppState {
         .with_bp_apply(epigraph_api::state::BpApply::On)
 }
 
-/// A binary frame for the seeded BBAs (`mass_functions.frame_id` is a FK).
+/// The canonical `binary_truth` frame, get-or-create: the only frame whose
+/// BBAs seed BP (`mass_functions.frame_id` is a FK).
 async fn binary_frame(pool: &PgPool) -> Uuid {
-    sqlx::query_scalar(
+    sqlx::query(
         "INSERT INTO frames (name, hypotheses) \
-         VALUES ($1, ARRAY['supported','unsupported']::text[]) \
-         RETURNING id",
+         VALUES ('binary_truth', ARRAY['TRUE','FALSE']::text[]) \
+         ON CONFLICT (name) DO NOTHING",
     )
-    .bind(format!("bp_atom_level_binary_{}", Uuid::new_v4()))
-    .fetch_one(pool)
+    .execute(pool)
     .await
-    .expect("seed a binary frame")
+    .expect("seed the binary_truth frame");
+    sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+        .fetch_one(pool)
+        .await
+        .expect("read the binary_truth frame")
 }
 
 /// A claim private to `group`, carrying a stored belief interval and BetP so

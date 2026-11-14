@@ -730,7 +730,16 @@ async fn apply_bp_updates(
 
 /// The stored BBAs that seed a CDST BP run, with each row's source (writing
 /// agent, its owner, its same-source key), read on one viewer-stamped
-/// connection.
+/// connection, and the belief profile their reliability discount resolves
+/// under.
+///
+/// Only rows on the canonical `binary_truth` frame seed BP (backlog
+/// 42be8a60): BP reads a row's masses by index on {supported, unsupported},
+/// and a row on another frame (three hypotheses, another order, another
+/// question) would be reinterpreted index by index. The profile is that
+/// frame's fold profile, as the served fold discounts under it
+/// ([`epigraph_engine::cdst_bp::seed_mass`]). No `binary_truth` frame the
+/// caller can read means no seeds.
 ///
 /// Ruling R-22: a run that writes caches (`apply`) seeds each claim with the
 /// BBAs its own recompute may fold (every source at least as widely readable
@@ -746,10 +755,13 @@ async fn bp_seed_rows(
     claim_ids: &[Uuid],
     apply: bool,
 ) -> Result<
-    Vec<(
-        epigraph_db::MassFunctionRow,
-        epigraph_engine::source_dependence::BbaSource,
-    )>,
+    (
+        Vec<(
+            epigraph_db::MassFunctionRow,
+            epigraph_engine::source_dependence::BbaSource,
+        )>,
+        epigraph_engine::belief_profile::BeliefProfile,
+    ),
     ApiError,
 > {
     // The BBA load shares the stamped connection with the source reads below.
@@ -762,6 +774,36 @@ async fn bp_seed_rows(
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to load mass functions: {e}"),
         })?;
+    // Before the scope filters and the source read, so rows and sources stay
+    // aligned and nothing off the seed frame is read further.
+    let seed_frame = epigraph_engine::edge_factor::find_binary_frame(&mut read, viewer)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to resolve the binary_truth frame: {e}"),
+        })?;
+    let (rows, profile) = match seed_frame {
+        Some(frame_id) => {
+            let profile = epigraph_engine::edge_factor::frame_fold_profile(
+                &mut read,
+                viewer,
+                frame_id,
+                epigraph_engine::belief_profile::BeliefProfile::served(),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to resolve the binary_truth fold profile: {e}"),
+            })?;
+            let rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| r.frame_id == frame_id)
+                .collect();
+            (rows, profile)
+        }
+        None => (
+            Vec::new(),
+            epigraph_engine::belief_profile::BeliefProfile::served().clone(),
+        ),
+    };
     let rows = if apply {
         epigraph_engine::derivation_scope::retain_for_cache(&mut read, rows).await?
     } else {
@@ -770,7 +812,7 @@ async fn bp_seed_rows(
     let sources =
         epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &rows).await?;
     crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
-    Ok(rows.into_iter().zip(sources).collect())
+    Ok((rows.into_iter().zip(sources).collect(), profile))
 }
 
 /// The claims of a BP run whose connected component in the factor graph
@@ -1028,22 +1070,29 @@ pub async fn propagate_beliefs(
     // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
     // (rulings R-22 and R-36), for the coverage check too, so a BBA the
     // caller may not see a fold of cannot flip the mode either.
-    let (use_cdst, seed_rows) = match mode {
+    let no_seeds = || {
+        (
+            Vec::new(),
+            epigraph_engine::belief_profile::BeliefProfile::served().clone(),
+        )
+    };
+    let (use_cdst, (seed_rows, seed_profile)) = match mode {
         "cdst" => (
             true,
             bp_seed_rows(&state, &viewer, &all_var_ids, apply).await?,
         ),
-        "scalar" | "interval" => (false, Vec::new()),
+        "scalar" | "interval" => (false, no_seeds()),
         _ => {
             // Auto: load mass functions and check coverage (a failed load
-            // reads as no coverage, as before).
-            let rows = bp_seed_rows(&state, &viewer, &all_var_ids, apply)
+            // reads as no coverage, as before). Coverage counts the seed
+            // rows only, so BBAs on other frames no longer pick CDST.
+            let seeds = bp_seed_rows(&state, &viewer, &all_var_ids, apply)
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|_| no_seeds());
             let claims_with_mf: std::collections::HashSet<Uuid> =
-                rows.iter().map(|(r, _)| r.claim_id).collect();
+                seeds.0.iter().map(|(r, _)| r.claim_id).collect();
             let use_cdst = !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len();
-            (use_cdst, rows)
+            (use_cdst, seeds)
         }
     };
 
@@ -1062,7 +1111,9 @@ pub async fn propagate_beliefs(
             )>,
         > = HashMap::new();
         for (row, source) in seed_rows {
-            if let Ok(mf) = epigraph_engine::cdst_bp::parse_mass_function_row(&row.masses) {
+            // Discounted by its reliability before any combine, as the served
+            // fold does.
+            if let Ok(mf) = epigraph_engine::cdst_bp::seed_mass(&row, &seed_profile) {
                 per_claim
                     .entry(row.claim_id)
                     .or_default()

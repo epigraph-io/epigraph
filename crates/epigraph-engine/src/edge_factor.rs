@@ -2205,6 +2205,22 @@ pub async fn ensure_binary_frame(
     ensure_binary_frame_row(conn, viewer).await.map(|r| r.id)
 }
 
+/// The canonical `binary_truth` frame's id, when it exists and `viewer` can
+/// read it. Read-only: unlike [`ensure_binary_frame`] it never creates the
+/// frame, so a read path can call it.
+///
+/// # Errors
+/// The frame lookup fails.
+pub async fn find_binary_frame(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Option<Uuid>, String> {
+    FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
+        .await
+        .map(|row| row.map(|r| r.id))
+        .map_err(|e| format!("get_by_name: {e}"))
+}
+
 /// [`ensure_binary_frame`], returning the frame row (its `properties` carry
 /// the frame tier of the belief profile).
 async fn ensure_binary_frame_row(

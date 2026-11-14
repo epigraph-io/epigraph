@@ -70,9 +70,34 @@ fn anti_support_mass(betp_y: f64) -> MassFunction {
 }
 
 /// Parse a mass function from the JSON `masses` column in the database.
+///
+/// The masses are read by index on BP's binary frame (0 = supported), so the
+/// row must be on the canonical `binary_truth` frame (index 0 = TRUE). A row
+/// on any other frame means something else at each index; see [`seed_mass`].
 pub fn parse_mass_function_row(masses_json: &serde_json::Value) -> Result<MassFunction, String> {
     MassFunction::from_json_masses(BINARY_FRAME.clone(), masses_json)
         .map_err(|e| format!("Failed to parse mass function: {e}"))
+}
+
+/// A stored BBA as a CDST BP seed: parsed on BP's binary frame, then
+/// discounted by the row's reliability under `profile`, as the served fold
+/// discounts every BBA before combining it (backlog 42be8a60).
+///
+/// The caller passes only rows stored on the canonical `binary_truth` frame,
+/// with `profile` resolved for that frame
+/// ([`crate::edge_factor::frame_fold_profile`]). A row on another frame
+/// (`research_validity`, a three-hypothesis frame, ...) is not a statement
+/// about BP's {supported, unsupported} and must not seed it.
+///
+/// # Errors
+/// The masses do not parse on the binary frame, or the discount fails.
+pub fn seed_mass(
+    row: &epigraph_db::MassFunctionRow,
+    profile: &crate::belief_profile::BeliefProfile,
+) -> Result<MassFunction, String> {
+    let stored = parse_mass_function_row(&row.masses)?;
+    let reliability = crate::edge_factor::effective_source_strength_profiled(row, profile);
+    discount(&stored, reliability).map_err(|e| format!("discount: {e}"))
 }
 
 // -- Factor message computation --------------------------------------------
