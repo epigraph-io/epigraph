@@ -1395,6 +1395,14 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
+    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
+    /// estimated number of independent assertions (backlog `72850d43`).
+    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
+    /// selects, and the two can disagree on a short coordinated sentence.
+    pub conjunct_estimate: usize,
+    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
+    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    pub conjunct_signals: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
