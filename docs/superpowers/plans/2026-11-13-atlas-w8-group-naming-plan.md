@@ -212,11 +212,13 @@ the unit and DB targets run, then restored and `touch`ed):
 | named run records a fresh snapshot's epochs | `stored_named_documents_validate_and_agree` |
 | named run drops the source's params | `stored_named_documents_validate_and_agree` |
 | children's names not rewritten | `repeated_names_agree_with_each_group`, `stored_named_documents_validate_and_agree` |
+| (review) write without the newer-run check | `a_run_published_during_naming_is_not_hidden` |
+| `max_calls` ignored | `the_budget_and_a_dry_run_defer_the_rest` |
+| the binary accepts `--max-calls 0` | `the_binary_refuses_bad_arguments_before_connecting` |
 
 Not mutation-proved (direct properties): `a_plain_reply_is_accepted_and_trimmed`,
-`texts_are_clipped_and_flattened`, `the_sample_is_deterministic_and_order_free`,
-`the_budget_and_a_dry_run_defer_the_rest`, the stub-script error cases, and
-`the_binary_refuses_bad_arguments_before_connecting`.
+`texts_are_clipped_and_flattened`, `the_sample_is_deterministic_and_order_free`
+and the stub-script error cases.
 
 ## Decisions to check
 
@@ -226,7 +228,13 @@ Not mutation-proved (direct properties): `a_plain_reply_is_accepted_and_trimmed`
   theme that is one leaf).
 - No description: the contract has no field for one.
 - The binary keeps the source run's `algo` and adds `named_from_run` to the
-  params.
+  params. Its write refuses when a newer run of the map finished while the
+  model ran (a named copy of the older run would otherwise be served in its
+  place); rerun to name the newer one. The check and the write are one
+  transaction but not a lock, so a build finishing in the same instant can
+  still race it.
+- Every write of the binary copies all of the run's levels (storage churn per
+  naming run; W9 avoids it by naming before its own write).
 - `claim_themes.label` is untouched. `label_themes_llm.py` still writes
   team-private-sampled text into the global theme labels; the follow-up is to
   retire it or restrict it to public text once W10 serves the per-map root
