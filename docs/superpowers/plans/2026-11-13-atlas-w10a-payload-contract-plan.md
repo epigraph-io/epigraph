@@ -101,11 +101,16 @@ positions and weights.
     `sign` the direction, so a `cites` edge (sign 0) weighs 0, and both the schema and
     `validate` reject a sign-0 proxy edge with any other weight. No belief factor of any
     kind enters it (see "No belief value" below);
-  - `none`: no belief flow, so weight 0 and sign 0. Every other pair, such as an
-    agent's authorship, and an evidence-to-claim edge with no mass row the audience
-    can read (the common case; §5). That evidence node still counts as attached to
-    the claim. A claim-to-claim edge is never `none`, and evidence to claim never
-    `proxy`.
+  - `none`: no belief flow, so weight 0 and sign 0 whatever the relationship. Every
+    other pair, such as an agent's authorship, and an evidence-to-claim edge that
+    carries no mass the audience can read: no mass row the audience can read (the
+    common case; §5), or a relationship with no belief direction (anything but
+    `supports` or `refutes`, lower-cased). That evidence node still counts as
+    attached to the claim. A claim-to-claim edge is never `none`, and evidence to
+    claim never `proxy`.
+- `sign` is the direction of the flow, so a `none` edge has sign 0 even when its
+  relationship is `refutes`. The direction of evidence with no readable mass is in
+  its relationship name only; the view reads it from there, not from `sign`.
 - `relationship` matches `^[A-Za-z][A-Za-z0-9_]*$`, at most 32 characters. The
   `edges` table uses both casings (`AUTHORED` and `authored`, `SUPPORTS` and
   `supports`); builders serve the stored name lower-cased and collapse repeated rows
@@ -177,14 +182,14 @@ positions and weights.
 | Criterion | Proof |
 |---|---|
 | A versioned schema | `schema.json` with `$id` `urn:epigraph:atlas-level:v1` and `schema_version` const 1. Test: `schema_is_versioned_and_self_valid`. |
-| Fixtures for team, public and non-member | `team_theme_root`, `team_group_deep`, `team_leaf_dense`, `public_leaf`, `non_member_kernel` and `non_member_bff`, from a seeded generator (SplitMix64, synthetic words and ids, no real data). Tests: `fixtures_are_current`, `every_fixture_validates`, `fixtures_cover_the_cases` (kernel); `every_fixture_passes_the_helper`, `the_fixtures_cover_team_and_public_maps_and_every_flow_basis` (explorer). |
+| Fixtures for team, public and non-member | `team_theme_root`, `team_group_deep`, `team_leaf_dense`, `public_leaf`, `team_leaf_sparse_mass`, `non_member_kernel` and `non_member_bff`, from a seeded generator (SplitMix64, synthetic words and ids, no real data). Tests: `fixtures_are_current`, `every_fixture_validates`, `fixtures_cover_the_cases` (kernel); `every_fixture_passes_the_helper`, `the_fixtures_cover_team_and_public_maps_and_every_flow_basis` (explorer). |
 | ≤ 150 KB compressed per level | `every_level_fixture_is_in_budget`, `worst_case_multiscript_documents_are_in_budget`, `a_document_over_budget_is_rejected`, `astral_text_can_exceed_the_budget_and_storage_refuses_it`, `stored_json_is_the_compact_fixture` (kernel); `the_fixtures_fit_the_budget`, `the_helper_rejects_a_body_over_budget` (explorer). |
 | A schema test W10's real responses must pass | `epigraph_atlas_contract::check::{check_level_body, check_not_found, assert_indistinguishable}` (kernel, `check` feature), and the same functions in `tests/common/atlas_contract.rs` (explorer). `check_level_body` takes the request's `Expected` map and level, so a body for another map or level fails (`the_body_must_be_the_map_and_level_requested`, `the_helper_ties_the_body_to_the_request`). The Explorer helper ports every kernel invariant (`the_helper_enforces_every_kernel_invariant`) and compares numbers by value (`an_integer_float_passes_the_helper`). W10 calls them on the route bodies. |
 | Served filtered for the viewer | `every_leaf_filtered_for_a_viewer_is_valid` (96 seeded readable subsets of the two leaves), `for_viewer_drops_what_would_show_a_hidden_claim` (kernel). |
 | serde types ↔ schema | `schema_and_types_agree_on_every_mutation`: in small probe documents cut from the fixtures (both level kinds, both map scopes, every node kind and flow basis), at every key, drop it, add an unknown key beside it, and replace its value 7 ways; the schema's verdict must equal the strict serde and invariant verdict. Also `fixtures_round_trip_through_the_types` (kernel) and `the_mirror_round_trips_every_fixture` (explorer). |
 | No belief value | `the_contract_carries_no_belief_value`, `a_leaf_claim_node_carrying_betp_is_rejected` (kernel); `no_schema_or_fixture_key_carries_belief`, `the_helper_rejects_betp_on_a_leaf_claim` (explorer). |
 | No belief factor in proxy weights | `invariants_enforce_the_schema_rules` (a sign-0 proxy edge weighs 0, kernel and schema); `proxy_weights_are_link_strength_times_sign_only`, `proxy_weights_ignore_every_claim_value` (kernel, on the generator; §5). The builder-side invariance test belongs to W7. |
-| Evidence with no readable mass | `an_evidence_edge_with_no_readable_mass_is_none` (every evidence edge of both leaves flipped to `none`: valid on the schema, the types and the served-body check, and `for_viewer` keeps exactly the readable evidence with a readable claim), `a_none_evidence_edge_with_a_weight_or_sign_is_rejected` (kernel); `the_helper_accepts_an_evidence_edge_with_no_readable_mass` (explorer). §5. |
+| Evidence with no readable mass | `an_evidence_edge_with_no_readable_mass_is_none` (every evidence edge of both leaves flipped to `none`: valid on the schema, the types and the served-body check, and `for_viewer` keeps exactly the readable evidence with a readable claim), `a_none_evidence_edge_with_a_weight_or_sign_is_rejected`, `fixtures_cover_the_cases` on `team_leaf_sparse_mass` (kernel); `the_helper_accepts_an_evidence_edge_with_no_readable_mass`, `a_fixture_has_evidence_with_no_readable_mass` (explorer). §5. |
 | Negative cases | `extra_private_field_is_rejected`, `missing_flow_basis_is_rejected`, `non_member_body_leaks_no_shape`, `the_kernel_not_found_message_names_the_requested_id`, `invariants_catch_what_the_schema_cannot`, `invariants_enforce_the_schema_rules`, `flow_basis_is_limited_by_the_endpoint_kinds`, `a_none_evidence_edge_with_a_weight_or_sign_is_rejected`, `an_agent_or_evidence_node_with_no_claim_edge_is_rejected`, `relationship_names_in_both_casings_are_accepted` (kernel); `the_helper_rejects_an_extra_private_field`, `the_helper_rejects_an_edge_without_its_exact_or_proxy_flag`, `the_helper_rejects_a_dangling_reference`, `the_not_found_answer_leaks_no_shape` (explorer). |
 
 Each new test is shown to fail on a mutated contract:
@@ -249,8 +254,22 @@ Each new test is shown to fail on a mutated contract:
   `proxy`, and every other rule stands. The evidence node still counts as attached, in
   `validate` and in `for_viewer`. The Explorer helper (`basis_allowed`) and mirror
   follow. What the contract can no longer see: a builder that drops a readable mass
-  and serves `none`. W7's known-mass test is that guard. Fixtures are unchanged; the
-  tests flip evidence edges in a copy. `schema_version` stays 1.
+  and serves `none`. W7's known-mass test is that guard. The existing fixtures are
+  unchanged; the tests flip their evidence edges in a copy. `schema_version` stays 1.
+- **A `none` edge's sign is 0 whatever its relationship** (from #801's review). So a
+  `refutes` evidence edge with no readable mass is served with sign 0, like a
+  `supports` one, and its direction is only in the relationship name. The sign, basis
+  and edge docs (kernel, schema, mirror) say so, and also give both reasons an
+  evidence edge is `none`: no readable mass row, or a relationship with no belief
+  direction (W7 serves the second as `none` too). Keeping a sign on such edges would
+  need a new ruling.
+- **A committed fixture with evidence served `none`**: `team_leaf_sparse_mass`, a new
+  team leaf (40 claims, 6 agents, 16 evidence nodes). Every evidence edge is `none`
+  except those of every fourth evidence node, which keep their exact mass: 38 `none`
+  (31 `supports`, 7 `refutes`) against 12 `exact`. Some evidence is attached to its
+  claims only through `none` edges. It is built from the same generator and then
+  rewritten, so every other fixture is byte-identical. The view's tests (W11, W12)
+  can load the common case from disk.
 - **Two stale doc points fixed** (also from #809). Builders serve relationship names
   lower-cased and collapse on the lower-cased name; the pattern still admits upper
   case, so readers compare case-insensitively (§2). A co-owned edge row is readable
@@ -308,3 +327,12 @@ How the evidence-edge rule is proven (each probe restored and touched afterwards
     `none` evidence edge as attaching: its accept test or invariant table, each time.
 - The claim-to-claim and agent cases pass on the old code by design; the too-permissive
   `allows` probe is what proves them.
+
+How the sparse-mass fixture is proven (each probe restored and touched afterwards):
+- On the contract before the evidence-edge rule (kernel, schema, helper and mirror
+  reverted, the new fixture kept), `every_fixture_validates`,
+  `stored_json_is_the_compact_fixture`, `every_fixture_passes_the_helper` and
+  `a_fixture_has_evidence_with_no_readable_mass` fail on it.
+- Generator probes, each re-blessed in a scratch copy: no edge flipped (`0 none, 50
+  exact`); `refutes` edges left `exact`; one `exact` edge kept on every evidence node.
+  Each one fails `fixtures_cover_the_cases` and `a_fixture_has_evidence_with_no_readable_mass`.
