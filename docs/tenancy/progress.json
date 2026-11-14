@@ -2324,7 +2324,7 @@
       "where": "crates/epigraph-api/src/routes/voids.rs::detect_voids",
       "what": "Connection-hold footprint interacts with the shared request pool; analysis held outside this repository.",
       "detail": "Registered as an id, a location and an owner only. Raised during PR-29 and filed by PR-18a.",
-      "status": "open",
+      "status": "CLOSED 2026-11-14 by fix/backlog-b03 (backlog efe82380): detect_voids embeds every concept before it acquires its scoped read, and caps concepts at MAX_VOID_CONCEPTS per request. Pinned by crates/epigraph-api/tests/detect_voids_footprint.rs.",
       "assigned": "the conversion-shard series",
       "disposition": "CONVERSION-TAIL",
       "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
