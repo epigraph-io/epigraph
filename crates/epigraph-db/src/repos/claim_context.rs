@@ -401,6 +401,46 @@ impl ClaimContextRepository {
         Ok(q.fetch_optional(&mut *conn).await?)
     }
 
+    /// [`Self::first_parent`] for a whole page of children at once, at any
+    /// level: for each id in `child_ids` that is visible and has a visible
+    /// `decomposes_to` parent, that parent's id, the first by
+    /// `(created_at, id)`. A child that is hidden, or whose every parent (or
+    /// parent edge) is hidden or retracted, is absent from the map.
+    ///
+    /// Backs `recall_with_context`'s `group_by_parent` (backlog 4e856a99),
+    /// one round-trip per page rather than one per hit.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn first_parent_ids(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        child_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>, DbError> {
+        if child_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT DISTINCT ON (e.target_id) e.target_id AS child_id, c.id AS parent_id
+            FROM edges e
+            JOIN claims c ON c.id = e.source_id /* {VISIBILITY:c} */
+            WHERE e.target_id = ANY($1) AND e.target_type = 'claim' AND e.source_type = 'claim'
+              AND e.relationship = 'decomposes_to'
+              AND (e.valid_to IS NULL OR e.valid_to > now())
+              AND EXISTS (SELECT 1 FROM claims ac WHERE ac.id = e.target_id /* {VISIBILITY:ac} */)
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.target_id, c.created_at, c.id
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql).bind(child_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?.into_iter().collect())
+    }
+
     /// The visible `decomposes_to` children of `parent_id`, ordered
     /// `(created_at, id)` ascending, after `after`.
     ///

@@ -87,8 +87,9 @@ async fn probe_full(
     paragraph_only: bool,
     since: Option<chrono::DateTime<Utc>>,
 ) -> NeighbourhoodThemeCoverage {
+    let mut conn = pool.acquire().await.expect("acquire");
     ClaimThemeRepository::nearest_theme_coverage_since(
-        pool,
+        &mut conn,
         viewer,
         &query(),
         1536,
