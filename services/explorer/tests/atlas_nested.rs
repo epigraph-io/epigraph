@@ -400,9 +400,18 @@ async fn a_level_is_private_and_revalidated_by_etag() {
     let uri = bff_level(&team_key(), h, id);
     let first = get_raw(&app, &uri, Some(&sid), &[]).await;
     let etag = first.header("etag").unwrap().to_string();
-    let again = get_raw(&app, &uri, Some(&sid), &[("if-none-match", &etag)]).await;
+    // Sent as a browser would, accepting gzip: the 304 passes through the
+    // compression layer with no body and no encoding.
+    let again = get_raw(
+        &app,
+        &uri,
+        Some(&sid),
+        &[("if-none-match", &etag), ("accept-encoding", "gzip, br")],
+    )
+    .await;
     assert_eq!(again.status, StatusCode::NOT_MODIFIED);
-    assert!(again.body.is_empty());
+    assert!(again.body.is_empty(), "{} body bytes", again.body.len());
+    assert_eq!(again.header("content-encoding"), None);
     assert_eq!(again.header("etag"), Some(etag.as_str()));
     assert_eq!(again.header("cache-control"), Some("private, no-cache"));
     let other = get_raw(
