@@ -204,3 +204,125 @@ async fn a_reworded_goal_matches_the_existing_lineage_unless_forced(pool: PgPool
     );
     assert_eq!(row_count(&pool).await, base + 3);
 }
+
+/// The exact goal of a row with NO goal embedding (rows stored before
+/// store_workflow embedded goals, and `embed: false` ingests) is still the
+/// ingest's own no-op: it must not be "matched" to another lineage whose goal
+/// vector happens to be identical. Deciding "this canonical_name exists"
+/// through the embedding search alone got this wrong.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_exact_goal_whose_row_has_no_goal_embedding_is_not_matched_elsewhere(pool: PgPool) {
+    let (server, viewer) = server_with_goal_embedder(&pool).await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let goal_a = format!("Back up the Postgres cluster to object storage {tag}");
+    let goal_b = format!("Back up Postgres cluster to object storage {tag}");
+
+    let a = store(&server, &viewer, &goal_a, None).await;
+    sqlx::query("UPDATE workflows SET goal_embedding = NULL WHERE id = $1::uuid")
+        .bind(a["workflow_id"].as_str().expect("workflow_id"))
+        .execute(&pool)
+        .await
+        .expect("null the goal embedding");
+    let b = store(&server, &viewer, &goal_b, Some(true)).await;
+    assert_ne!(b["workflow_id"], a["workflow_id"], "{b}");
+
+    let again = store(&server, &viewer, &goal_a, None).await;
+    assert_eq!(
+        again["matched_existing"],
+        serde_json::json!(false),
+        "the exact goal must not be matched to the other lineage: {again}"
+    );
+    assert_eq!(
+        again["already_ingested"],
+        serde_json::json!(true),
+        "{again}"
+    );
+    assert_eq!(again["workflow_id"], a["workflow_id"], "{again}");
+}
+
+/// A `workflows` row seeded on the harness superuser with its goal embedded
+/// by [`goal_vector`], tenancy as given.
+async fn seeded_workflow(pool: &PgPool, goal: &str, visibility: &str, owner: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal, visibility, owner_group_id, \
+                                goal_embedding) \
+         VALUES ($1, $2, $3, $4, $5, $6::vector)",
+    )
+    .bind(id)
+    .bind(format!("seeded-{id}"))
+    .bind(goal)
+    .bind(visibility)
+    .bind(owner)
+    .bind(epigraph_mcp::embed::format_pgvector(&goal_vector(goal)))
+    .execute(pool)
+    .await
+    .expect("seed workflows row");
+    id
+}
+
+/// On the application role, matching reads as the CALLER: a paraphrase of a
+/// group-private plan the caller does not read mints a new lineage and the
+/// response never carries the private goal, while a paraphrase of a PUBLIC
+/// plan is matched (the positive control: the matching runs at all here).
+#[sqlx::test(migrations = "../../migrations")]
+async fn matching_never_discloses_a_plan_the_caller_cannot_read(pool: PgPool) {
+    let (_, group) = fixture::seed_agent_with_group(&pool, "swm-owner").await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let private_goal = format!("Rotate the private signing keys of the vault {tag}");
+    let public_goal = format!("Publish the weekly release notes to the wiki {tag}");
+    let private = seeded_workflow(&pool, &private_goal, "group", group).await;
+    let public = seeded_workflow(&pool, &public_goal, "public", group).await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let embedder = McpEmbedder::new(scoped.inner().clone(), None)
+        .with_scoped_pool(scoped.clone())
+        .with_generator(std::sync::Arc::new(|text: &str| Ok(goal_vector(text))));
+    let server = EpiGraphMcpFull::new(
+        scoped.inner().clone(),
+        AgentSigner::from_bytes(&[0x5Fu8; 32]).expect("signer"),
+        embedder,
+        false,
+    )
+    .with_scoped_pool(scoped);
+    let agent = server.server_agent_id().await.expect("server agent");
+    let stranger = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("stranger viewer");
+
+    let r = epigraph_mcp::tools::workflows::store_workflow(
+        &server,
+        &stranger,
+        params(&format!("Rotate private signing keys of vault {tag}"), None),
+        None,
+    )
+    .await
+    .expect("store_workflow");
+    let text = first_text(&r).to_string();
+    let json = first_text(&r);
+    assert_eq!(json["matched_existing"], serde_json::json!(false), "{json}");
+    assert_ne!(json["workflow_id"], serde_json::json!(private.to_string()));
+    assert!(
+        !text.contains(&private_goal),
+        "the private plan's goal left the database: {text}"
+    );
+
+    let r = epigraph_mcp::tools::workflows::store_workflow(
+        &server,
+        &stranger,
+        params(&format!("Publish weekly release notes to wiki {tag}"), None),
+        None,
+    )
+    .await
+    .expect("store_workflow");
+    let json = first_text(&r);
+    assert_eq!(json["matched_existing"], serde_json::json!(true), "{json}");
+    assert_eq!(json["workflow_id"], serde_json::json!(public.to_string()));
+}

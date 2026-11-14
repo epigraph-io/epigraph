@@ -519,9 +519,13 @@ pub const STORE_WORKFLOW_MATCH_THRESHOLD: f64 = 0.90;
 /// The live (`truth_value >= 0.3`) hierarchical workflow `viewer` reads whose
 /// goal is the most similar to `qvec`, when it clears
 /// [`STORE_WORKFLOW_MATCH_THRESHOLD`] under a canonical_name other than
-/// `canonical_name`. `None` when there is none, and ALSO when a readable row
-/// already carries `canonical_name` itself: an identical goal is the ingest's
-/// own idempotent no-op (`already_ingested`), not a match.
+/// `canonical_name`. `None` when there is none, and ALSO whenever a row named
+/// `canonical_name` itself exists, readable or not, embedded or not, live or
+/// deprecated: an identical goal stays the ingest's own business (its
+/// idempotent `already_ingested` no-op, or its refusal of a name with rows the
+/// caller cannot read), never a match to another lineage. That check does not
+/// go through the goal embedding, which rows stored before goals were embedded
+/// (and `embed: false` ingests) do not have.
 async fn matching_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -529,6 +533,17 @@ async fn matching_workflow(
     qvec: &[f32],
 ) -> Result<Option<epigraph_db::ScoredHierarchicalWorkflowRow>, McpError> {
     let mut read = server.read_as(viewer, "store_workflow").await?;
+    let name_taken = WorkflowRepository::head_by_canonical(&mut *read, canonical_name)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+        || WorkflowRepository::name_has_hidden_rows_conn(&mut read, canonical_name)
+            .await
+            .map_err(internal_error)?;
+    if name_taken {
+        read.commit().await.map_err(internal_error)?;
+        return Ok(None);
+    }
     let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
         &mut *read,
         viewer,
@@ -539,9 +554,6 @@ async fn matching_workflow(
     .await
     .map_err(internal_error)?;
     read.commit().await.map_err(internal_error)?;
-    if hits.iter().any(|h| h.canonical_name == canonical_name) {
-        return Ok(None);
-    }
     Ok(hits
         .into_iter()
         .find(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD))
