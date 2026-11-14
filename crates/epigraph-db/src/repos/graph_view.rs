@@ -391,8 +391,8 @@ impl GraphViewRepository {
     /// stored `size`, `mean_betp` and `dominant_frame_id` are computed by the
     /// clustering job over ALL members, so returning them would tell a viewer
     /// how many private members a neighbourhood has and leak their mean
-    /// pignistic probability. The membership row and the claim both carry a
-    /// marker (`claim_neighborhood_membership` is tier-A).
+    /// pignistic probability. The membership row, the claim and the
+    /// `claim_frames` row all carry a marker (all three are tier-A).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -409,7 +409,7 @@ impl GraphViewRepository {
                 SELECT m.neighborhood_id,
                        c.pignistic_prob,
                        (SELECT cf.frame_id FROM claim_frames cf
-                        WHERE cf.claim_id = c.id
+                        WHERE cf.claim_id = c.id /* {VISIBILITY:cf} */
                         ORDER BY cf.frame_id LIMIT 1) AS frame_id
                 FROM graph_neighborhoods n
                 JOIN claim_neighborhood_membership m

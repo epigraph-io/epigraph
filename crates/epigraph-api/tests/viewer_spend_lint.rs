@@ -718,6 +718,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
+    // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
+    // with `/claims/:id/placement` and `graph_neighborhood.rs::expand`); the
+    // theme, its neighbourhoods and their edges are read through the viewer
+    // (backlog 01e0b839).
+    (
+        "graph.rs",
+        "themes_expand",
+        &["ClusterRunRepository::latest"],
+    ),
     // untenanted: the Atlas layout run and its epoch flag (migration 197); the
     // run's contents are read through the viewer (`overview`, `region_detail`,
     // `unplaced_themes`).
