@@ -1,6 +1,7 @@
 -- 214: migration 200's COMPROMISED revoke,
 -- `public.epigraph_revoke_passkey_compromised(passkey, reason)`, re-stated to
--- run only under READ COMMITTED (backlog c77931a7).
+-- run only under READ COMMITTED (backlog c77931a7) and to lock every passkey
+-- it walks before it revokes (backlog 2deb56fa).
 --
 -- ===================================================================
 -- 1. WHY
@@ -24,6 +25,18 @@
 -- Minor while the maintenance role runs READ COMMITTED (the default); major
 -- if that ever changes.
 --
+-- Under READ COMMITTED a second gap remains. The person-wide lock reads the
+-- passkeys in ITS snapshot, so a passkey N recorded during its wait (its
+-- completion held a share lock the revoke waited for) is not locked, though
+-- the walk after the wait reaches it. Between that walk and the UPDATE, a
+-- completion on an act N confirmed takes (b)'s share lock on N unhindered
+-- and commits; the UPDATE then waits for it on N, revokes N, and leaves N's
+-- new passkey live if it is attested (the lost cascade (c) reaches only
+-- `none` ones). The window is sub-millisecond, but it is a window on the
+-- one revoke meant to leave nothing of a stolen device's lineage live.
+-- Arranged deterministically in `pending_admin_acts.rs`'s
+-- `a_passkey_enrolled_during_the_lock_wait_is_locked_before_the_walk_ends`.
+--
 -- 200's header (d) and docs/deploy.md say, without condition, that a
 -- completion in flight "is waited for and then walked". 200 is applied and
 -- is never edited; this header is the correction, and deploy.md is updated
@@ -34,11 +47,28 @@
 -- ===================================================================
 --
 -- `CREATE OR REPLACE` of the one function, same signature, same result
--- columns, 200's body otherwise byte for byte, with one check first:
--- `transaction_isolation` other than `read committed` is refused, SQLSTATE
--- 25000 (invalid_transaction_state), before any lock is taken or any row
--- read, nothing revoked. Every other refusal is 200's (22004 a blank
--- reason, ELV04 an unknown passkey).
+-- columns, the same walk, UPDATE, audit mode and result rows as 200's, with
+-- two changes:
+--
+-- (a) First, `transaction_isolation` other than `read committed` is
+--     refused, SQLSTATE 25000 (invalid_transaction_state), before any lock
+--     is taken or any row read, nothing revoked.
+--
+-- (b) The lock and the walk repeat until every passkey the walk reached is
+--     locked (a fixpoint): each pass locks every passkey of the person
+--     visible to it (`FOR NO KEY UPDATE`, in id order, as 200's single pass
+--     did) and walks again. A pass that walks a passkey not yet locked is
+--     followed by one that locks it, waiting for any completion holding it,
+--     and so sees that completion's passkey. When the loop ends, every
+--     walked passkey is locked, so no completion on any of their acts can
+--     commit before this transaction, and one that tries is refused ELV04
+--     once it does. A pass that does not end the loop locks at least one
+--     more passkey; after 32 passes (a person whose lineage keeps growing
+--     while it is being locked; not expected) the call is refused 40001,
+--     nothing revoked, to be run again.
+--
+-- Every other refusal is 200's (22004 a blank reason, ELV04 an unknown
+-- passkey).
 --
 -- `CREATE OR REPLACE` keeps 200's owner (`epigraph_maintenance`) and grants
 -- (EXECUTE revoked from PUBLIC and `epigraph_app`, granted to
@@ -87,7 +117,7 @@ BEGIN
 END $$;
 
 -- The COMPROMISED revoke: the passkey and every passkey whose anchor lineage
--- passes through it, under READ COMMITTED only.
+-- passes through it, under READ COMMITTED only, locked to a fixpoint.
 CREATE OR REPLACE FUNCTION public.epigraph_revoke_passkey_compromised(p_id uuid, p_reason text)
 RETURNS TABLE (revoked_id uuid, lineage_depth integer, revoked_now boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -97,6 +127,8 @@ DECLARE
     v_ids    uuid[];
     v_depths integer[];
     v_hit    uuid[];
+    v_locked uuid[] := '{}';
+    v_pass   integer := 0;
 BEGIN
     -- READ COMMITTED only: the walk must read a snapshot taken AFTER the lock
     -- wait below, which only a per-statement snapshot is.
@@ -119,33 +151,52 @@ BEGIN
         RAISE EXCEPTION 'ELV04: no passkey %', p_id
             USING ERRCODE = 'ELV04';
     END IF;
-    -- Lock every passkey of the person first (the lock the UPDATE takes
-    -- anyway, which conflicts with (b)'s FOR SHARE): a completion in flight
-    -- on an act one of them confirmed is waited for, and the walk below, a
-    -- later statement with a later snapshot, then sees the passkey it
-    -- recorded; a completion that starts later waits for this transaction
-    -- and is refused (ELV04, its confirmer revoked).
-    PERFORM 1 FROM public.person_authenticators k
-      WHERE k.person_agent_id = v_person ORDER BY k.id FOR NO KEY UPDATE;
-    -- The walk, down the acts each passkey confirmed: through revoked
-    -- passkeys too, the same person's only, never round a cycle.
-    WITH RECURSIVE down (id, depth, path) AS (
-        SELECT p_id, 0, ARRAY[p_id]
-        UNION ALL
-        SELECT k.id, down.depth + 1, down.path || k.id
-          FROM down
-          JOIN public.pending_admin_acts a ON a.authenticator_id = down.id
-          JOIN public.passkey_enrollments en
-            ON en.act_id = a.id AND en.created_via = 'confirmed_act'
-          JOIN public.person_authenticators k ON k.enrollment_id = en.id
-         WHERE k.person_agent_id = v_person
-           AND NOT (k.id = ANY (down.path))
-    )
-    SELECT pg_catalog.array_agg(w.id ORDER BY w.depth, w.id),
-           pg_catalog.array_agg(w.depth ORDER BY w.depth, w.id)
-      INTO v_ids, v_depths
-      FROM (SELECT DISTINCT ON (down.id) down.id, down.depth
-              FROM down ORDER BY down.id, down.depth) w;
+    -- Lock every passkey of the person, then walk, and repeat until every
+    -- passkey the walk reached is locked (a fixpoint). The lock is the one
+    -- the UPDATE takes anyway, and it conflicts with (b)'s FOR SHARE: a
+    -- completion in flight on an act one of them confirmed is waited for,
+    -- and the walk, a later statement with a later snapshot, then sees the
+    -- passkey it recorded; a completion that starts later on a locked
+    -- passkey's act waits for this transaction and is refused (ELV04, its
+    -- confirmer revoked). A passkey recorded DURING the wait is not in the
+    -- lock's snapshot, so the walk can reach a passkey the lock does not
+    -- hold, whose own act could still take a completion before the UPDATE:
+    -- the next pass locks it (waiting for such a completion) and walks
+    -- again. Every pass that does not end the loop locks at least one more
+    -- passkey of the person.
+    LOOP
+        v_pass := v_pass + 1;
+        v_locked := v_locked || ARRAY(
+            SELECT k.id FROM public.person_authenticators k
+             WHERE k.person_agent_id = v_person ORDER BY k.id FOR NO KEY UPDATE);
+        -- The walk, down the acts each passkey confirmed: through revoked
+        -- passkeys too, the same person's only, never round a cycle.
+        WITH RECURSIVE down (id, depth, path) AS (
+            SELECT p_id, 0, ARRAY[p_id]
+            UNION ALL
+            SELECT k.id, down.depth + 1, down.path || k.id
+              FROM down
+              JOIN public.pending_admin_acts a ON a.authenticator_id = down.id
+              JOIN public.passkey_enrollments en
+                ON en.act_id = a.id AND en.created_via = 'confirmed_act'
+              JOIN public.person_authenticators k ON k.enrollment_id = en.id
+             WHERE k.person_agent_id = v_person
+               AND NOT (k.id = ANY (down.path))
+        )
+        SELECT pg_catalog.array_agg(w.id ORDER BY w.depth, w.id),
+               pg_catalog.array_agg(w.depth ORDER BY w.depth, w.id)
+          INTO v_ids, v_depths
+          FROM (SELECT DISTINCT ON (down.id) down.id, down.depth
+                  FROM down ORDER BY down.id, down.depth) w;
+        EXIT WHEN v_ids <@ v_locked;
+        IF v_pass >= 32 THEN
+            RAISE EXCEPTION 'epigraph_revoke_passkey_compromised: passkey % kept gaining '
+                            'lineage passkeys while it was being locked (% passes); nothing '
+                            'was revoked', p_id, v_pass
+                USING ERRCODE = '40001',
+                      HINT = 'Run it again.';
+        END IF;
+    END LOOP;
     -- One statement: (c)'s per-row cascade then finds nothing of the walk
     -- still live, and the audit reads the mode.
     PERFORM pg_catalog.set_config('epigraph.passkey_revoke_mode', 'compromised', true);

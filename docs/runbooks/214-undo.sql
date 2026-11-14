@@ -1,7 +1,7 @@
 -- ===================================================================
 -- 214-undo.sql: take migration 214 (the compromised revoke under READ
--- COMMITTED only) back out, in ONE transaction, on the migration (superuser)
--- DSN.
+-- COMMITTED only, locked to a fixpoint) back out, in ONE transaction, on the
+-- migration (superuser) DSN.
 --
 -- READ FIRST: no binary depends on 214, so nothing needs rolling back
 -- first. Run this BEFORE `200-undo.sql` when taking 200 out as well (that
@@ -11,13 +11,15 @@
 -- `public.epigraph_revoke_passkey_compromised(uuid, text)` byte for byte.
 -- `CREATE OR REPLACE` keeps its owner and grants. From then on the revoke
 -- runs under any isolation level again and, under REPEATABLE READ or
--- SERIALIZABLE, can miss a passkey enrolled during its lock wait (214's
--- header, section 1).
+-- SERIALIZABLE, can miss a passkey enrolled during its lock wait; and it
+-- locks once, so a passkey enrolled during that wait is walked but not
+-- locked, and a completion under it can commit unseen before the UPDATE
+-- (214's header, section 1).
 --
 -- PRECONDITION: the body in place must be 214's (md5 of `prosrc`
--- `2fb529a23cf5c19ac02576b12a874e21`) or already 200's
--- (`0dfedeb8a0dc722a743fe2299baae704`, a second run); over any other body it raises
--- 55000 and changes nothing (a later migration re-bodied it: undo that one
+-- `645f997359d64646702e3db2f86ed7ca`) or already 200's
+-- (`0dfedeb8a0dc722a743fe2299baae704`, a second run); over any other body it
+-- raises 55000 and changes nothing (a later migration re-bodied it: undo that one
 -- first).
 --
 -- WHAT IT LEAVES: every passkey and revoke as it stands, and 214's
@@ -34,7 +36,7 @@ BEGIN
     SELECT pg_catalog.md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
      WHERE p.oid = pg_catalog.to_regprocedure(
                        'public.epigraph_revoke_passkey_compromised(uuid, text)');
-    IF v_found IS NULL OR v_found NOT IN ('2fb529a23cf5c19ac02576b12a874e21',
+    IF v_found IS NULL OR v_found NOT IN ('645f997359d64646702e3db2f86ed7ca',
                                           '0dfedeb8a0dc722a743fe2299baae704') THEN
         RAISE EXCEPTION '214-undo: public.epigraph_revoke_passkey_compromised(uuid, text) is '
                         'neither 214''s body nor 200''s; found md5 %. Nothing was changed',
