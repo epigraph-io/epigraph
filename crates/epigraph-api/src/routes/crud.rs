@@ -304,6 +304,15 @@ pub async fn create_evidence(
             field: "evidence_type".to_string(),
             reason: format!("Invalid evidence_type JSON: {e}"),
         })?;
+    // A dataset's own invariants (digest form and length, bounded text). The
+    // shape check above admits any strings; without this a malformed manifest
+    // digest would be stored and no reader could verify against it.
+    evidence_type
+        .validate()
+        .map_err(|e| ApiError::ValidationError {
+            field: format!("evidence_type.{}", e.field),
+            reason: e.reason,
+        })?;
 
     // Compute content hash from raw_content (or use provided hash).
     //
