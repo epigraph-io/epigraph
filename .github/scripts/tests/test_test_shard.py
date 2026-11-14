@@ -569,7 +569,12 @@ class Workflow(unittest.TestCase):
         cls.jobs = cls.ci["jobs"]
 
     def test_shards_run_on_the_planner_runner_only(self):
-        self.assertEqual(self.jobs["test-shard"]["runs-on"], "${{ fromJSON(needs.plan.outputs.runs_on) }}")
+        self.assertEqual(
+            self.jobs["test-shard"]["runs-on"],
+            "${{ (github.event_name == 'pull_request' && "
+            "github.event.pull_request.head.repo.full_name != github.repository) "
+            "&& 'ubuntu-latest' || fromJSON(needs.plan.outputs.runs_on) }}",
+        )
         # The variable reaches the planner and nothing else: an expression that
         # read it directly would bypass the fork guard. This pins THIS
         # workflow only; a fork's PR runs its own edited copy, so the guard is
