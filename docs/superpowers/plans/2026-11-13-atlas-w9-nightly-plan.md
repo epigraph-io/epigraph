@@ -236,31 +236,41 @@ children together from the sibling bundles (`atlas_nightly::links`).
 
 - **Edge set.** `AtlasLeafRepository::map_claim_links`: claim-to-claim edges
   in force between two claims the run draws, under the same map edge rule as
-  W3 and W5 (public, or owned by the team with no co-owner). W5's
+  W3 and W5 (public, or owned by the team with no co-owner). The read also
+  requires both ends to be claims the map may draw (public, or the team's
+  own), whatever ids the caller passes. W5's
   `is_counted` decides which relationships are links (the epistemic edges
   plus `decomposes_to`). Rows repeating (source, target, lower-cased
   relationship) are one link. A co-owned edge is never read.
 - **Where a link shows**, per hierarchy:
   - same theme: a sibling bundle at the lowest common ancestor, in the stored
-    direction; every level below it lists the link towards the shallowest
-    group outside that level that holds the other end (the child of the
-    common ancestor on that side);
-  - another theme: every level on the path lists it towards that theme's
-    root in the same hierarchy (depth 0). W11's stub path resolves a depth-0
-    target (it attaches the theme root and selects it).
-  - An outside link is listed from the inside end whichever way the edge row
-    points, so a leaf whose claims are only cited still has its stubs.
+    direction; every level below it on the SOURCE side lists the link towards
+    the shallowest group outside that level that holds the target (the child
+    of the common ancestor on the target's side);
+  - another theme: every level on the source's path lists it towards the
+    target theme's root in the same hierarchy (depth 0). W11's stub path
+    resolves a depth-0 target (it attaches the theme root and selects it).
+  - A link is listed from its source end only, as the contract defines a
+    bundle ("all links from one child") and an `outgoing` entry ("all links
+    leaving the leaf"). The levels on the target's side list nothing for it,
+    so a stub reads "this claim links to that group", never the reverse. A
+    leaf whose claims are only linked to shows no stub for those links.
 - **Count and sign.** `count` is the number of links; `net_sign` the sign of
   the sum of W7's link signs (+1 supporting, -1 opposing, 0 other).
 - **Caps.** A group keeps its 160 heaviest outside targets (bundles to a cut
-  target go with it), then its 2,048 heaviest bundles; a leaf its 64 heaviest
+  target go with it), then its 2,048 heaviest bundles (a target left with no
+  bundle goes too, and counts as a cut target); a leaf its 64 heaviest
   `outgoing` targets. Ties go to the smaller id. The cuts are counted (no
   ids) under `links` in the night report and the run's `params`; they never
   fail the night. Children stay capped at 128 by the tree.
-- **Incremental.** Builder's call: a deterministic recompute of every level
-  from the snapshot's edges, not a rebuild of "changed" levels only. Unchanged
-  input gives the same bytes (the second night still writes nothing), and a
-  changed link changes only the levels it passes through. Rebuilding only
+- **Incremental. A deviation from the ruling's wording, for the operator to
+  confirm.** The ruling said to rebuild links only for levels whose members
+  or edges changed. This builds a deterministic recompute of every level
+  from the snapshot's edges instead. What the ruling protects holds:
+  unchanged input gives the same bytes (the second night still writes
+  nothing), and a changed link changes only the levels that list it. The
+  cost is one map-wide read of the edges among the run's claims each night,
+  not yet measured on the largest map. Rebuilding only
   levels whose own members changed would leave a target pointing at a group
   whose member-derived id has moved, and a carried theme's counts must follow
   the map's edge rule as it stands that night.
@@ -281,7 +291,7 @@ A carried theme keeps the values its stored leaves hold.
 | a co-owned or other team's edge never contributes; a public one does | `a_co_owned_or_other_teams_edge_never_makes_a_link_but_a_public_one_does`; `map_claim_links_return_only_claim_edges_the_map_may_draw` (epigraph-db) |
 | over-cap truncation keeps the heaviest and reports the rest | `a_leaf_over_the_outgoing_cap_keeps_its_heaviest_targets_and_the_night_reports_the_rest`; unit tests for all three caps |
 | positions pull linked children together | `the_group_layout_pulls_linked_children_together` (two families of six; linked pairs closer than unlinked ones, and closer than W6 places the same children with no bundles) |
-| a second night over unchanged input is byte-identical with 0 model calls; a new link changes only the levels it crosses | `links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_passes`; unit `the_result_does_not_depend_on_link_order_and_replaces_what_was_there` |
+| a second night over unchanged input is byte-identical with 0 model calls; a new link changes only the levels that list it (its bundle's group and its source leaf) | `links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_passes`; unit `the_result_does_not_depend_on_link_order_and_replaces_what_was_there` |
 | leaf claim `truth_value` matches the row, null without one | `leaf_claims_carry_their_stored_truth_value`; unit `a_claims_truth_value_is_its_stored_one_and_none_without_one`; `claim_truth_values_read_only_the_claims_the_map_may_draw` (epigraph-db) |
 
 | Mutation | Tests that went red |
@@ -298,6 +308,9 @@ A carried theme keeps the values its stored leaves hold.
 | leaf `truth_value` left null | unit `a_claims_truth_value_...`, `leaf_claims_carry_their_stored_truth_value` |
 | leaf `truth_value` defaults to 0.5 with no stored value | unit `a_claims_truth_value_...` |
 | the truth read without the map predicate | `claim_truth_values_read_only_the_claims_the_map_may_draw` |
+| a link also listed from its target end (review fix) | unit `links_are_aggregated_...`, `links_across_...`, `a_co_owned_or_other_teams_...`, `links_stay_byte_identical_...` |
+| the link read without the endpoint claim rule (review fix) | `map_claim_links_return_only_claim_edges_the_map_may_draw` |
+| a target the bundle cap empties not counted as cut (review fix) | unit `a_target_the_bundle_cap_leaves_with_no_bundle_is_reported_as_cut` |
 
 ### Needs prod measurement (added)
 

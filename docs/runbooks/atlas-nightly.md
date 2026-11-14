@@ -26,7 +26,8 @@ Nothing in the repository installs it. Every step below is an operator step.
      colour value, agents, evidence, W7 flow weights);
    - once every theme is final, builds the map's cross-group links: group
      `bundles` and `targets`, leaf `outgoing` (team-owned edges with no
-     co-owner, or public ones; never a co-owned edge);
+     co-owner, or public ones, between claims the map draws; never a
+     co-owned edge), each link listed from its source end only;
    - then lays out only the changed levels (W6, warm-started) and names only
      the changed groups (W8, through the Claude CLI, `--max-calls` per map).
 3. **Writes** one new run per changed map, holding both hierarchies, then

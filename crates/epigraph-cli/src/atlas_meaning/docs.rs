@@ -14,12 +14,14 @@
 //!   ring of radius [`CHILD_RING`] with the largest radius that keeps them
 //!   apart, at most [`CHILD_R_MAX`]; a leaf's claims sit evenly on a ring of
 //!   radius [`NODE_RING`];
-//! * **links** (W10): `bundles`, `targets` and `outgoing` are empty;
+//! * **links**: `bundles`, `targets` and `outgoing` are empty. The nightly
+//!   (W9) fills them over the whole map's run (`atlas_nightly::links`);
 //! * **a leaf's agents, evidence and edges** (W3 node set, W7 flow weights):
 //!   not drawn. A W4 leaf is a SKELETON of claim nodes only. W3 still counted
 //!   its agents and evidence against the cap before it was written
 //!   ([`super::tree::resolve_tree`]);
-//! * **`truth_value`**: null (W4 reads no belief or truth column).
+//! * **`truth_value`**: null (W4 reads no belief or truth column; the
+//!   nightly fills each claim's stored value as its colour).
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
