@@ -3,7 +3,8 @@
 Backlog W12 824ac5ac (epic 8fa0282d). Stacked on `feat/atlas-w10` (#813), which
 carries W11 through `atlas/wave4-base`. Design:
 `docs/superpowers/specs/2026-11-12-atlas-nested-groups-and-subgraph-view-design.md`
-§6. No migration, and no change to a route's behaviour.
+§6. No migration, and no change to a route's answers (one route's SQL is
+rewritten for speed, see Results).
 
 ## The budget (design §6) and how it is split
 
@@ -114,8 +115,10 @@ measured nothing cannot be green).
 - **Kernel:** `a_deliberately_slow_route_turns_the_gate_red`. A test-only
   `axum` middleware, layered outside `create_router`'s router, sleeps on leaf
   level paths only. A control run with no delay is green; the run with a delay
-  of twice the warm budget is red, and only `leaf` is in breach (attribution).
-  No change under `src/`.
+  of the cold budget plus 100 ms is red for `leaf` warm and cold, and green
+  for every type that never asks for a leaf (root, group, claim to leaf,
+  themes, maps); a switch may land on a leaf, so it may go red too. No change
+  under `src/`.
 - **BFF:** `a_slow_kernel_turns_the_bff_gate_red`: wiremock's `set_delay` on
   the level route.
 
@@ -128,10 +131,13 @@ refuses a DSN (no port, or the production port). The README's script table
 lists it, so "the scripts/e2e probes that apply" in a staging run include it.
 
 The client check (`atlas-latency-browser.mjs`, Playwright, opt-in like
-`elevation-no-authenticator.mjs`) times click to drawn for a group, a leaf and
-a switch flip against the Explorer's `--atlas-fixture-preview` server. CI has
-no browser (ci.yml and explorer.yml install none), so it is not in the per-PR
-gate.
+`elevation-no-authenticator.mjs`) runs against the Explorer's
+`--atlas-fixture-preview` server, which answers from memory, so what it times
+is the client's own cost: want to drawn per level (the marks atlas.js now
+sets; the zoom's camera flight is not in it, since the view is moving and
+children are prefetched during it) and, for the switch, click to drawn. It
+fails when a kind's p95 exceeds the 50 ms client allowance. CI has no browser
+(ci.yml and explorer.yml install none), so it is not in the per-PR gate.
 
 ## "Done when" (backlog 824ac5ac)
 
@@ -155,3 +161,49 @@ gate.
 The numbers are synthetic. What this cannot see: prod's TOAST and buffer-cache
 state, its concurrent load, real leaf sizes once W9 assembles leaves, and the
 network between the browser and the server.
+
+## Results (measured 2026-11-14)
+
+Kernel, p95 in ms (warm / cold), all within budget after the claim-to-leaf fix:
+
+| Type | small, debug (CI shape) | full, release (staging shape) |
+|---|---|---|
+| root | 6.0 / 54.9 | 5.2 / 22.0 |
+| group | 7.3 / 55.5 | 4.8 / 22.8 |
+| leaf | 20.9 / 76.3 | 8.1 / 28.6 |
+| switch | 21.1 / 23.9 | 7.7 / 18.5 |
+| claim_leaf | 23.5 / 77.6 | 13.8 / 37.1 |
+| themes | 5.4 / 56.5 | 9.3 / 27.4 |
+| maps | 4.0 / 57.2 | 3.0 / 18.0 |
+
+BFF (release, wiremock kernel): leaf gzip 3.6, br 3.3, 304 1.9; root gzip 1.9,
+br 1.7, 304 1.4. Debug: leaf br 21.7 is the highest. Bytes: leaf 129,694 raw,
+17,762 gzip, 16,663 br; root 31,769 raw, 5,208 gzip, 5,146 br.
+
+Browser (preview, headless Chrome, 5 rounds): want to drawn p95 group 19.7,
+leaf 19.9, switch 17.8; switch click to drawn at most 19.1.
+
+**Over budget, fixed here:** claim to leaf. At full scale, debug, warm p95 was
+946 ms (cold 1,270). EXPLAIN (ANALYZE, BUFFERS): a seq scan of
+`atlas_map_levels` running both jsonb tests on all 13,860 rows (89k buffers,
+976 ms), because `l.theme_id = c.theme_id` was a join filter above the scan.
+`leaves_of_claim` now reads the claim's theme first and binds it, so only the
+theme's 66 levels are detoasted: 142.9 ms -> 23.5 ms at small scale in debug,
+13.8 ms at full scale in release. The per-PR scale is 24 themes because at 4
+the old scan measured 34 ms and the gate could not see it.
+
+**Recommended, not done:**
+- `level_for_viewer` recounts the run's levels on every level read
+  (`run.level_count = (SELECT COUNT(*) ...)`), 2.9 ms at 13,860 levels. Fine
+  now; it grows with the run.
+- Theme roots read every level-0 document of the run: 9.3 ms warm at 420
+  documents. Fine now.
+- A warm 304 still costs the kernel's full read (the ETag needs the viewer's
+  bytes): leaf 8.1 ms kernel + 1.9 ms BFF. Within budget, so no change.
+- gzip and br land within 7% of each other on these documents, both far under
+  150 KB; br's encode is no slower in release.
+
+**Gaps:** cold is a fresh pool, server and client in one process, not a fresh
+process (and not a cold OS page cache: the seed has just written the rows).
+Prod's buffer-cache state, concurrent load, real leaf sizes once W9 assembles
+leaves, and the network between browser and server are not measured.
