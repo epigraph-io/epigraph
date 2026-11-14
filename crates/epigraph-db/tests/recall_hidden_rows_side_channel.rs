@@ -17,12 +17,14 @@
 //! which keeps scanning until `LIMIT` visible rows are found (bounded by
 //! `hnsw.max_scan_tuples`, default 20,000).
 //!
-//! Scope: the three legs pinned below, which serve `recall`,
-//! `recall_with_context`'s flat seeds and the library `recall`. Other HNSW
-//! reads still scan without it and are NOT covered here, among them the
-//! diverse pipeline's theme coverage and candidate queries
-//! (`claim_theme.rs`), the workflows leg (`search_by_goal_embedding_since`)
-//! and the write-side novelty gate (`nearest_by_embedding`).
+//! Scope: the five legs pinned below, which serve `recall`,
+//! `recall_with_context`'s flat seeds, the library `recall`, and the diverse
+//! pipeline's theme-coverage probe and theme candidate query (MCP
+//! `recall_with_context diverse=true` and REST `search/semantic?diverse=true`).
+//! NOT covered here: the opt-in workflows leg of `recall`
+//! (`search_by_goal_embedding_since`, served by an IVFFlat index, whose
+//! truncation knobs differ) and the write-side novelty gate
+//! (`nearest_by_embedding`).
 //!
 //! Each test measures the viewer's page BEFORE and AFTER seeding the hidden
 //! rows, on one connection forced onto the HNSW plan (seq scans and explicit
@@ -40,7 +42,9 @@
 mod fixture;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ClaimRepository, EmbeddingSeedScope};
+use epigraph_db::{
+    ClaimRepository, ClaimThemeRepository, EmbeddingSeedScope, NeighbourhoodThemeCoverage,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -386,4 +390,135 @@ async fn hidden_rows_do_not_change_the_hybrid_page(pool: PgPool) {
         "calibration: the hybrid dense leg was not served by idx_claims_embedding_hnsw"
     );
     assert_identical_pages("search_hybrid_scoped", &before, &after, own);
+}
+
+/// One theme holding every embedded claim seeded so far, visible and hidden
+/// alike, so the theme restriction cannot be what keeps a hidden row out.
+/// Re-run after [`seed_hidden`] to enrol the hidden rows too.
+async fn theme_holding_every_claim(pool: &PgPool, theme: Option<Uuid>) -> Uuid {
+    let theme = match theme {
+        Some(t) => t,
+        None => sqlx::query_scalar(
+            "INSERT INTO claim_themes (label) VALUES ('side channel theme') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("seed theme"),
+    };
+    sqlx::query("UPDATE claims SET theme_id = $1 WHERE embedding IS NOT NULL")
+        .bind(theme)
+        .execute(pool)
+        .await
+        .expect("assign theme");
+    theme
+}
+
+async fn theme_candidates_page(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    theme: Uuid,
+) -> Vec<(Uuid, f64)> {
+    ClaimThemeRepository::claims_in_themes_at_dim_since(
+        &mut *conn,
+        viewer,
+        &[theme],
+        &vec_angle(0.0),
+        LIMIT as i32,
+        1536,
+        false,
+        None,
+    )
+    .await
+    .expect("claims_in_themes_at_dim_since")
+    .into_iter()
+    .map(|(id, _, sim)| (id, sim))
+    .collect()
+}
+
+async fn coverage_probe(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    theme: Uuid,
+) -> NeighbourhoodThemeCoverage {
+    ClaimThemeRepository::nearest_theme_coverage_since(
+        &mut *conn,
+        viewer,
+        &vec_angle(0.0),
+        1536,
+        &[theme],
+        1536,
+        // `THEME_COVERAGE_PROBE_K` in epigraph-engine, which this crate
+        // cannot depend on; the K both diverse pipelines probe with.
+        40,
+        false,
+        None,
+    )
+    .await
+    .expect("nearest_theme_coverage_since")
+}
+
+/// The diverse pipeline's candidate query (`claims_in_themes_at_dim_since`)
+/// — what `recall_with_context diverse=true` and the REST diverse route draw
+/// their candidates from. The hidden rows sit in the SAME theme, nearer the
+/// query, so only the scan depth stands between them and the viewer's page.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hidden_rows_do_not_change_the_diverse_theme_candidates(pool: PgPool) {
+    let (w, visible) = world(&pool).await;
+    let theme = theme_holding_every_claim(&pool, None).await;
+
+    let (before, _) = on_hnsw!(&pool, VISIBLE as i64, |conn| theme_candidates_page(
+        conn, &w.viewer, theme
+    )
+    .await);
+    let own = before.iter().filter(|(id, _)| visible.contains(id)).count();
+    seed_hidden(&pool, &w).await;
+    theme_holding_every_claim(&pool, Some(theme)).await;
+    let (after, used_index) = on_hnsw!(&pool, (VISIBLE + HIDDEN) as i64, |conn| {
+        theme_candidates_page(conn, &w.viewer, theme).await
+    });
+
+    assert!(
+        used_index,
+        "calibration: the theme candidate kNN was not served by idx_claims_embedding_hnsw"
+    );
+    assert_identical_pages("claims_in_themes_at_dim_since", &before, &after, own);
+}
+
+/// The diverse pipeline's theme-coverage probe
+/// (`nearest_theme_coverage_since`), whose count decides between the diverse
+/// selection and the flat fallback. If hidden rows could shrink `probed` or
+/// skew `reachable / probed`, rows the viewer cannot read would choose which
+/// algorithm serves its page.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hidden_rows_do_not_change_the_theme_coverage_probe(pool: PgPool) {
+    let (w, _) = world(&pool).await;
+    let theme = theme_holding_every_claim(&pool, None).await;
+
+    let (before, _) = on_hnsw!(&pool, VISIBLE as i64, |conn| coverage_probe(
+        conn, &w.viewer, theme
+    )
+    .await);
+    assert_eq!(
+        before,
+        NeighbourhoodThemeCoverage {
+            probed: VISIBLE as i64,
+            reachable: VISIBLE as i64,
+        },
+        "calibration: the baseline probe must see every visible row, all reachable"
+    );
+    seed_hidden(&pool, &w).await;
+    theme_holding_every_claim(&pool, Some(theme)).await;
+    let (after, used_index) = on_hnsw!(&pool, (VISIBLE + HIDDEN) as i64, |conn| {
+        coverage_probe(conn, &w.viewer, theme).await
+    });
+
+    assert!(
+        used_index,
+        "calibration: the coverage probe was not served by idx_claims_embedding_hnsw"
+    );
+    assert_eq!(
+        after, before,
+        "nearest_theme_coverage_since: {HIDDEN} rows the viewer cannot read changed the \
+         coverage probe, so they now decide whether the viewer gets diverse or flat recall"
+    );
 }

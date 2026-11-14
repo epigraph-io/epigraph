@@ -63,21 +63,25 @@ pub const MAX_CANDIDATE_POOL: u32 = 1000;
 
 /// How many of the query's nearest claims the theme-coverage guard inspects.
 ///
-/// Matched to pgvector's default `hnsw.ef_search` (40): an HNSW index scan
-/// returns at most `ef_search` rows without iterative scanning, so a larger
-/// probe would be truncated to this size on an index plan and not on a
-/// sequential one.
+/// Chosen to match pgvector's default `hnsw.ef_search` (40), when a plain
+/// index scan returned at most `ef_search` rows. The probe now sets
+/// `ef_search` to at least K itself (see below), so K is a sample size, not a
+/// scan limit.
 ///
-/// That keeps the probe the same size across plans only when NO filter
-/// applies. The viewer predicate, the `since` window, and a level filter the
-/// chosen index does not carry are applied after the index scan, so under an
-/// index plan a filtered probe can return far fewer than K rows. The
-/// coverage fraction is therefore computed over the rows actually returned
-/// (see [`epigraph_db::NeighbourhoodThemeCoverage::probed`]), and there is
-/// deliberately no minimum on that count: a floor cannot tell a truncated
-/// scan from a viewer whose visible neighbourhood is genuinely small, and the
-/// flat fallback runs the same kind of post-filtered index scan, so falling
-/// back would not recover the rows the probe missed.
+/// The viewer predicate, the `since` window, and a level filter the chosen
+/// index does not carry are applied after the index scan, so under a PLAIN
+/// index scan a filtered probe could return far fewer than K rows — and rows
+/// the viewer cannot read, sitting nearer the query, could empty it, letting
+/// hidden rows decide between diverse and flat (backlog a507966d). The probe
+/// therefore runs as an iterative HNSW scan
+/// (`ClaimThemeRepository::nearest_theme_coverage_since`), which keeps
+/// scanning until K matching rows are found, bounded by
+/// `hnsw.max_scan_tuples` (default 20,000). The coverage fraction is still
+/// computed over the rows actually returned (see
+/// [`epigraph_db::NeighbourhoodThemeCoverage::probed`]), and there is
+/// deliberately no minimum on that count: a floor cannot tell a scan cut off
+/// at `max_scan_tuples` from a viewer whose visible neighbourhood is
+/// genuinely small.
 pub const THEME_COVERAGE_PROBE_K: i32 = 40;
 
 /// Minimum fraction of the query's nearest neighbourhood that diverse mode
@@ -260,8 +264,9 @@ pub async fn candidates_in_themes_at_dim_since(
     paragraph_only: bool,
     since: Option<DateTime<Utc>>,
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
     ClaimThemeRepository::claims_in_themes_at_dim_since(
-        pool,
+        &mut conn,
         viewer,
         theme_ids,
         query_pgvec,
@@ -438,7 +443,7 @@ pub async fn run_diverse_pipeline_conn(
     // neighbourhood and reachability dimensions are both `centroid_dim`.
     let mut bracket = sqlx::Connection::begin(&mut *conn).await?;
     let probe = ClaimThemeRepository::nearest_theme_coverage_since(
-        &mut *bracket,
+        &mut bracket,
         viewer,
         query_pgvec,
         config.centroid_dim,
