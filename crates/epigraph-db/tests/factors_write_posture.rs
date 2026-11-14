@@ -23,6 +23,9 @@
 //!   is refused by the body's `TG_RELID` guard.
 //! * [`the_factor_triggers_are_maintenance_owned_pinned_definers`] pins the
 //!   catalog.
+//! * [`a_foreign_factor_writing_trigger_refuses_217`]. 217 refuses (`FCT02`,
+//!   nothing applied) on a database carrying another trigger that writes
+//!   `factors` as a role 217 leaves without that write.
 //!
 //! # Verified to fail
 //!
@@ -44,6 +47,8 @@
 //! * 217 keeping table-level UPDATE: fails
 //!   `an_app_session_cannot_forge_rewrite_or_drop_a_factor` (the rewrite and
 //!   the column set).
+//! * 217's §7 deleted: fails `a_foreign_factor_writing_trigger_refuses_217`
+//!   (217 applies over the foreign writer).
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -543,4 +548,110 @@ async fn the_factor_triggers_are_maintenance_owned_pinned_definers(pool: PgPool)
             ),
         ]
     );
+}
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// The tree's migrations up to `max`, unlocked: the refused run below returns
+/// before sqlx releases its advisory lock.
+fn migrations_up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    }
+}
+
+/// 217's §7. A database carrying a trigger attached outside these migrations
+/// that writes `factors` as an invoker (a legacy hand-applied schema did) is
+/// refused with `FCT02` and nothing applied, instead of leaving that trigger
+/// to abort the application's edge INSERTs with 42501. A trigger that only
+/// reads `factors` is not flagged, and with the writer dropped 217 applies.
+///
+/// Mutation: §7 deleted -> the first run applies 217 and the `expect_err`
+/// fails.
+#[sqlx::test(migrations = false)]
+async fn a_foreign_factor_writing_trigger_refuses_217(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrations_up_to(216)
+        .run(&mut *conn)
+        .await
+        .expect("migrate to 216");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.f217_legacy_writer() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.relationship = 'f217-never' THEN \
+             INSERT INTO factors (factor_type, variable_ids, potential) \
+             VALUES ('evidential_support', ARRAY[NEW.source_id, NEW.target_id], '{}'); \
+           END IF; \
+           RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER f217_legacy_writer AFTER INSERT ON public.edges \
+           FOR EACH ROW EXECUTE FUNCTION public.f217_legacy_writer(); \
+         CREATE FUNCTION public.f217_reader() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM count(*) FROM public.factors; RETURN NEW; END $$; \
+         CREATE TRIGGER f217_reader AFTER INSERT ON public.edges \
+           FOR EACH ROW EXECUTE FUNCTION public.f217_reader();",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("attach the foreign triggers");
+
+    let err = MIGRATOR
+        .run(&mut *conn)
+        .await
+        .expect_err("217 refuses a foreign trigger that writes factors as an invoker");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("FCT02"), "{msg}");
+    assert!(
+        msg.contains("f217_legacy_writer"),
+        "names the writer: {msg}"
+    );
+    assert!(
+        !msg.contains("f217_reader"),
+        "does not flag a reader: {msg}"
+    );
+
+    let (applied, mint_definer): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 217), \
+                (SELECT prosecdef FROM pg_proc \
+                  WHERE oid = 'public.auto_create_factor_from_edge()'::regprocedure)",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("state after the refusal");
+    assert_eq!(
+        (applied, mint_definer),
+        (false, false),
+        "nothing of 217 was applied"
+    );
+
+    sqlx::query("DROP TRIGGER f217_legacy_writer ON public.edges")
+        .execute(&mut *conn)
+        .await
+        .expect("drop the writer");
+    MIGRATOR
+        .run(&mut *conn)
+        .await
+        .expect("with the writer gone, 217 applies beside the reader");
+    let (applied, reader_kept): (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 217), \
+                EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'f217_reader')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("state after the re-run");
+    assert_eq!((applied, reader_kept), (true, true));
 }

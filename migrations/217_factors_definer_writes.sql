@@ -59,6 +59,10 @@
 --      `public.factors`, and gets UPDATE back on `frame_id` alone, for the
 --      hypothesis promote route. The REVOKE comes first: a table-level REVOKE
 --      also revokes that privilege's column grants.
+--   4. Refuses (`FCT02`, nothing applied) when the database carries any
+--      other trigger that writes `factors` as a role step 3 leaves without
+--      that write (§7): one attached outside these migrations, which §1
+--      cannot enumerate.
 --
 -- As the definers' owner the mint now reads `claims` through
 -- `epigraph_definer_bypass()`. That is not observable from an application
@@ -219,5 +223,48 @@ DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public.factors FROM epigraph_app';
         EXECUTE 'GRANT UPDATE (frame_id) ON public.factors TO epigraph_app';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- 7. NO OTHER TRIGGER WRITES `factors` ON A ROLE THAT CAN NO LONGER
+-- ===================================================================
+-- §1's enumeration is of this tree. A database can also carry a trigger
+-- attached outside these migrations (a legacy hand-applied schema put an
+-- invoker `INSERT INTO factors` trigger on `public.edges`). After §6 such a
+-- trigger fails 42501 inside the application statement that fires it, so the
+-- edge or claim write itself aborts. Refuse here instead, loudly and with
+-- nothing applied: every non-internal trigger, on any table, other than the
+-- two above, whose function's definition writes `factors` and that runs as a
+-- role without INSERT, UPDATE and DELETE on it (an invoker, or a definer
+-- whose owner lacks them). Reads of `factors` are not flagged. The check runs
+-- after §6 so the privileges it reads are this migration's own.
+DO $$
+DECLARE
+    offenders text;
+BEGIN
+    SELECT pg_catalog.string_agg(
+               pg_catalog.format('%s on %s (%s)', t.tgname, t.tgrelid::pg_catalog.regclass,
+                                 t.tgfoid::pg_catalog.regprocedure),
+               '; ' ORDER BY t.tgname, t.tgrelid)
+      INTO offenders
+      FROM pg_catalog.pg_trigger t
+      JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
+     WHERE NOT t.tgisinternal
+       AND t.tgfoid NOT IN ('public.auto_create_factor_from_edge()'::pg_catalog.regprocedure,
+                            'public.deactivate_superseded_factors()'::pg_catalog.regprocedure)
+       -- The CASE keeps pg_get_functiondef off aggregates (it raises on
+       -- them, and the planner may test this before the join): a trigger
+       -- function is always prokind 'f'.
+       AND (CASE WHEN p.prokind = 'f' THEN pg_catalog.pg_get_functiondef(p.oid) END) ~*
+           '\m(insert\s+into|update|delete\s+from|truncate(\s+table)?)\s+(only\s+)?("?public"?\s*\.\s*)?"?factors\M'
+       AND (NOT p.prosecdef
+            OR NOT (pg_catalog.has_table_privilege(p.proowner, 'public.factors', 'INSERT')
+                    AND pg_catalog.has_table_privilege(p.proowner, 'public.factors', 'UPDATE')
+                    AND pg_catalog.has_table_privilege(p.proowner, 'public.factors', 'DELETE')));
+    IF offenders IS NOT NULL THEN
+        RAISE EXCEPTION 'FCT02: trigger(s) outside this migration write public.factors as a role that loses that write here: %', offenders
+            USING ERRCODE = '55000',
+                  HINT = 'Drop each trigger, or make its function a SECURITY DEFINER owned by epigraph_maintenance, then re-run this migration.';
     END IF;
 END $$;

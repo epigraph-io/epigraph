@@ -2658,7 +2658,13 @@ restart.
   table of its own). Revokes INSERT, UPDATE, DELETE and TRUNCATE on
   `public.factors` from `epigraph_app` and grants back UPDATE on `frame_id`
   only (the hypothesis promote route); `factors` leaves 118's app-role table
-  allowlist. No table, column, policy or index. Registered in
+  allowlist. Refuses (`FCT02`, 55000, nothing applied) when the database
+  carries any other trigger whose function writes `factors` as a role this
+  migration leaves without that write (an invoker, or a definer whose owner
+  lacks INSERT/UPDATE/DELETE on it): a trigger attached outside these
+  migrations, such as a legacy hand-applied one on `public.edges`, would
+  otherwise abort the application's edge writes with 42501. No table,
+  column, policy or index. Registered in
   `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS`). Pinned by
   `epigraph-db/tests/factors_write_posture.rs`,
   `epigraph-db/tests/app_role_table_lockdown.rs` and
@@ -2669,7 +2675,9 @@ restart.
   carries a `217` (slot assigned by the batch orchestrator). **Deploy
   order:** none against the binary; no shipped request path writes `factors`
   except through the two triggers and the promote route's `frame_id` move.
-  Run `epigraph-tenancy-backfill verify` after migrating (it checks both
+  If it stops with `FCT02`, drop each trigger it names (or make its function
+  a maintenance-owned SECURITY DEFINER) and re-run. Run
+  `epigraph-tenancy-backfill verify` after migrating (it checks both
   definers' owner). **Applied to throwaway databases only, NOT to any
   deployed database.**
 
