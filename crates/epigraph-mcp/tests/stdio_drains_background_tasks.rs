@@ -20,9 +20,14 @@
 //!   the drain. Source-level for the reason `stdio_transport_wired_into_main.rs`
 //!   records: a test process cannot boot the binary into stdio mode.
 //!
+//! The operator `ingest-document` CLI (epigraph-cli) has the same exit shape:
+//! its walk returns with the embedding loop still running on the server's
+//! tracker, so it must drain before it exits; a source ratchet pins that too.
+//!
 //! Verified to fail: with `drain` returning without waiting, both drain tests
 //! fail (the task is reported left and is not finished); with the drain lines
-//! removed from `main.rs`, the wiring test fails.
+//! removed from `main.rs`, the wiring test fails; with the drain removed from
+//! the CLI, the CLI ratchet fails.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -193,4 +198,44 @@ fn the_check_catches_the_pre_fix_shape_and_a_skipping_question_mark() {
                  let served = service.waiting().await; \
                  background.drain(LIMIT).await; served?;";
     assert_eq!(drain_wiring_violations(fixed), Vec::<String>::new());
+}
+
+/// Every way the `ingest-document` CLI fails to drain after its walk.
+fn cli_drain_violations(source: &str) -> Vec<String> {
+    let code = normalized(source);
+    let Some(walk) = code.find("do_ingest_document_reporting(&server") else {
+        return vec!["no `do_ingest_document_reporting(&server` call".into()];
+    };
+    if code[walk..].contains("server.background_tasks().drain(") {
+        Vec::new()
+    } else {
+        vec!["`server.background_tasks().drain(` is not called after the walk".into()]
+    }
+}
+
+#[test]
+fn the_ingest_document_cli_drains_before_it_exits() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../epigraph-cli/src/bin/ingest_document.rs"
+    );
+    let source = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let violations = cli_drain_violations(&source);
+    assert!(
+        violations.is_empty(),
+        "the ingest-document CLI must drain the server's background tasks (its embedding \
+         loop) before it exits: {}",
+        violations.join("; ")
+    );
+}
+
+#[test]
+fn the_cli_check_catches_a_missing_drain() {
+    let before = "let (result, tenancy) = do_ingest_document_reporting(&server, viewer, \
+                  &extraction, None, choice).await?; println!(\"{text}\");";
+    assert!(!cli_drain_violations(before).is_empty());
+    let fixed = "let (result, tenancy) = do_ingest_document_reporting(&server, viewer, \
+                 &extraction, None, choice).await?; \
+                 let left = server.background_tasks().drain(LIMIT).await;";
+    assert_eq!(cli_drain_violations(fixed), Vec::<String>::new());
 }
