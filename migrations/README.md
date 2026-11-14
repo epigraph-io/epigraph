@@ -2717,10 +2717,15 @@ restart.
   `public` is not narrowed by the stamp or the backfill when a group-private
   claim cites it; the operator tools' node rule keeps that shape, and which
   rule wins there is an operator question (F-089-A). **Deploy:** no order
-  constraint with any binary; 218 moves no row. Fragments the old trigger or
-  backfill stamped from an arbitrary citer keep their tuple until the claim
-  moves or an operator runs `epigraph-tenancy-backfill run --entity
-  harvester-fragments` (sentinel-owned rows only). Before deploying, confirm
+  constraint with any binary; 218 moves no row, and no tool re-stamps a
+  fragment the old rule already gave a real owner (it is no longer
+  sentinel-owned, so neither the stamp nor `epigraph-tenancy-backfill run
+  --entity harvester-fragments` reaches it; only a move of one of its claims
+  does). A `public` fragment of a real group with a group-private citer is
+  still produced by a later private link, so that shape is ongoing until the
+  node-rule question is ruled. Strict `verify` does not change for any row:
+  its fragment residual is equivalent to the old one on sentinel-owned rows,
+  the only ones it counts. Before deploying, confirm
   the external harvester never UPDATEs `harvester_claim_provenance` on an
   application DSN. Checked before claiming: slot 218 assigned to this batch;
   no migration on main carries a `218`. **Applied to throwaway databases only,

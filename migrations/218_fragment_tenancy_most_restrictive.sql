@@ -125,12 +125,17 @@
 -- 4. WHAT IT DOES NOT DO
 -- ===================================================================
 --
--- It moves no existing row. Fragments the backfill or the old trigger already
--- stamped from an arbitrary citer keep their tuple until the operator runs
--- `epigraph-tenancy-backfill run --entity harvester-fragments` (which now
--- takes the winner for the sentinel-owned rows it reaches) or the claim moves.
--- Measuring how many on-disk fragments have citers of more than one tuple is
--- operator work.
+-- It moves no existing row, and NO TOOL RE-STAMPS a fragment the old rule
+-- already gave a real owner: such a row is no longer sentinel-owned, so
+-- neither this stamp nor `epigraph-tenancy-backfill run --entity
+-- harvester-fragments` (sentinel-owned rows only) reaches it. It changes only
+-- when one of its claims moves (arm (d)). The one shape that matters is a
+-- `public` fragment owned by a real group with a group-private citer, and it
+-- is ONGOING, not only historical: a group-private link inserted in a later
+-- statement than the first public one still leaves the fragment public,
+-- because the stamp's target is sentinel-only. Whether to narrow that shape
+-- waits on the node-rule question in section 1. Counting it on a deployed
+-- database is operator work.
 --
 -- `CREATE OR REPLACE` of both bodies (same signatures) keeps their owner and
 -- ACL; part D below re-asserts the owner anyway, as 089, 114, 122 and 168 do.
