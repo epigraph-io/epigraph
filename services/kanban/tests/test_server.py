@@ -1818,5 +1818,140 @@ class UnitHelpersTest(unittest.TestCase):
         self.assertIn('\\n\\n## Rules (updated)', prompt)
 
 
+class BacklogStatusAndCorroborationTest(unittest.TestCase):
+    """Cards carry the backlog:* label status and a corroboration count (backlog ce4339a3)."""
+
+    SOURCE_1 = "c0000000-0000-4000-8000-000000000001"
+    SOURCE_2 = "c0000000-0000-4000-8000-000000000002"
+
+    def test_backlog_status_from_labels(self):
+        status = kanban.backlog_status
+        self.assertIsNone(status(["backlog"]), "a bare backlog label is not a status")
+        self.assertIsNone(status([]))
+        self.assertIsNone(status(None))
+        self.assertEqual(status(["backlog", "backlog:pending"]), "pending")
+        self.assertEqual(status(["backlog", "backlog:pending", "backlog:working"]), "working")
+        self.assertEqual(status(["backlog:working", "backlog", "backlog:completed"]), "completed")
+        self.assertIsNone(status(["backlog", "backlog:b39", "backlog-hygiene"]), "unknown suffixes are not statuses")
+
+    def app_with(self, routes):
+        """An App whose urlopen serves `routes`: [(url fragment, response list | exception)]."""
+        tmp = tempfile.mkdtemp(prefix="kanban-corr-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        app = kanban.App(kanban.Config(repo=tmp, port=0, env={
+            "KANBAN_HOME": os.path.join(tmp, "home"), "KANBAN_BACKLOG_SOURCE": "http",
+            "EPIGRAPH_TOKEN": "tok", "EPIGRAPH_API_BASE": "http://api.invalid"}))
+        opened = []
+
+        class Resp:
+            def __init__(self, obj):
+                self.data = json.dumps(obj).encode()
+
+            def read(self):
+                return self.data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            opened.append(req)
+            for frag, answer in routes:
+                if frag in req.full_url:
+                    if isinstance(answer, Exception):
+                        raise answer
+                    return Resp(answer)
+            raise AssertionError("unexpected request " + req.full_url)
+
+        patcher = mock.patch.object(kanban.urllib.request, "urlopen", fake_urlopen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return app, opened
+
+    def edges_url(self, claim_id):
+        return "/api/v1/edges?target_id=%s&relationship=corroborates" % claim_id
+
+    def card(self, app, claim_id):
+        return [c for c in app.state_view()["cards"] if c["id"] == claim_id][0]
+
+    def claims(self):
+        return [{"id": CLAIM_A, "content": "a", "labels": ["backlog", "backlog:working"]},
+                {"id": CLAIM_B, "content": "b", "labels": ["backlog"]}]
+
+    def test_refresh_puts_status_and_distinct_corroborating_sources_on_cards(self):
+        edge = {"target_id": CLAIM_A, "relationship": "corroborates"}
+        app, opened = self.app_with([
+            ("/api/v1/claims/by-labels", self.claims()),
+            (self.edges_url(CLAIM_A), [dict(edge, source_id=self.SOURCE_1), dict(edge, source_id=self.SOURCE_1),
+                                       dict(edge, source_id=self.SOURCE_2.upper()),
+                                       dict(edge, source_id=CLAIM_A)]),
+            (self.edges_url(CLAIM_B), []),
+        ])
+        app._refresh_backlog()
+        self.assertIsNone(app.backlog_refresh["error"])
+        a, b = self.card(app, CLAIM_A), self.card(app, CLAIM_B)
+        self.assertEqual(a["backlog_status"], "working")
+        # two distinct other claims; a repeat edge and a self-edge do not count
+        self.assertEqual(a["corroboration_count"], 2)
+        self.assertIsNone(b["backlog_status"])
+        self.assertEqual(b["corroboration_count"], 0, "an empty answer is a real zero")
+        edge_reqs = [r for r in opened if "/api/v1/edges" in r.full_url]
+        self.assertEqual(len(edge_reqs), 2)
+        self.assertTrue(all(r.get_header("Authorization") == "Bearer tok" for r in edge_reqs))
+
+    def test_a_failed_count_is_unknown_not_zero_and_does_not_fail_the_refresh(self):
+        app, _ = self.app_with([
+            ("/api/v1/claims/by-labels", self.claims()),
+            (self.edges_url(CLAIM_A), urllib.error.HTTPError("u", 500, "boom", {}, None)),
+            (self.edges_url(CLAIM_B), [{"source_id": self.SOURCE_1, "target_id": CLAIM_B,
+                                        "relationship": "corroborates"}]),
+        ])
+        app._refresh_backlog()
+        self.assertIsNone(app.backlog_refresh["error"])
+        self.assertIsNone(self.card(app, CLAIM_A)["corroboration_count"])
+        self.assertEqual(self.card(app, CLAIM_B)["corroboration_count"], 1)
+
+    def test_an_unreachable_edges_route_stops_after_a_few_failures(self):
+        ids = ["d0000000-0000-4000-8000-%012d" % i for i in range(10)]
+        app, opened = self.app_with([
+            ("/api/v1/claims/by-labels", [{"id": i, "content": "x", "labels": ["backlog"]} for i in ids]),
+            ("/api/v1/edges", urllib.error.URLError("connection refused")),
+        ])
+        app._refresh_backlog()
+        self.assertIsNone(app.backlog_refresh["error"])
+        self.assertEqual(len(app.state_view()["cards"]), 10)
+        self.assertTrue(all(c["corroboration_count"] is None for c in app.state_view()["cards"]))
+        edge_reqs = [r for r in opened if "/api/v1/edges" in r.full_url]
+        self.assertEqual(len(edge_reqs), kanban.CORROBORATION_MAX_CONSECUTIVE_FAILURES)
+
+    def test_a_later_refresh_updates_the_count_and_the_status(self):
+        edge = {"target_id": CLAIM_A, "relationship": "corroborates"}
+        routes = [("/api/v1/claims/by-labels", self.claims()),
+                  (self.edges_url(CLAIM_A), [dict(edge, source_id=self.SOURCE_1)]),
+                  (self.edges_url(CLAIM_B), [])]
+        app, _ = self.app_with(routes)
+        app._refresh_backlog()
+        self.assertEqual(self.card(app, CLAIM_A)["corroboration_count"], 1)
+        routes[0] = ("/api/v1/claims/by-labels",
+                     [{"id": CLAIM_A, "content": "a", "labels": ["backlog", "backlog:completed"]},
+                      {"id": CLAIM_B, "content": "b", "labels": ["backlog"]}])
+        routes[1] = (self.edges_url(CLAIM_A), [dict(edge, source_id=self.SOURCE_1),
+                                               dict(edge, source_id=self.SOURCE_2)])
+        app._refresh_backlog()
+        a = self.card(app, CLAIM_A)
+        self.assertEqual(a["corroboration_count"], 2)
+        self.assertEqual(a["backlog_status"], "completed")
+
+    def test_the_claude_source_carries_no_count(self):
+        claim = kanban.normalize_claim({"id": CLAIM_A, "content": "a", "labels": ["backlog"]})
+        self.assertIsNone(claim["corroboration_count"])
+        for bad in (True, -1, "3", 2.5):
+            self.assertIsNone(kanban.normalize_claim({"id": CLAIM_A, "corroboration_count": bad})["corroboration_count"])
+        self.assertEqual(kanban.normalize_claim({"id": CLAIM_A, "corroboration_count": 0})["corroboration_count"], 0)
+        self.assertIsNone(kanban.new_card(claim)["corroboration_count"])
+
+
 if __name__ == "__main__":
     unittest.main()
