@@ -13,8 +13,16 @@
 //! applied AFTER the index, so a foreign group that plants 40+ vectors nearer
 //! a query than a viewer's own rows empties that viewer's page — and how much
 //! it empties tells the viewer how many hidden rows sit near the query. The
-//! fix on every leg is pgvector's iterative scan (`hnsw.iterative_scan =
-//! strict_order`), which keeps scanning until `LIMIT` visible rows are found.
+//! fix is pgvector's iterative scan (`hnsw.iterative_scan = strict_order`),
+//! which keeps scanning until `LIMIT` visible rows are found (bounded by
+//! `hnsw.max_scan_tuples`, default 20,000).
+//!
+//! Scope: the three legs pinned below, which serve `recall`,
+//! `recall_with_context`'s flat seeds and the library `recall`. Other HNSW
+//! reads still scan without it and are NOT covered here, among them the
+//! diverse pipeline's theme coverage and candidate queries
+//! (`claim_theme.rs`), the workflows leg (`search_by_goal_embedding_since`)
+//! and the write-side novelty gate (`nearest_by_embedding`).
 //!
 //! Each test measures the viewer's page BEFORE and AFTER seeding the hidden
 //! rows, on one connection forced onto the HNSW plan (seq scans and explicit
