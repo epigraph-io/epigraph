@@ -832,3 +832,54 @@ fn the_binary_refuses_a_bad_map_or_cap_before_connecting() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// W5 finding #4 (fixed for W9): a deep meaning level's switch leads to the
+/// links group it overlaps most (W5's Jaccard rule the other way round), not
+/// to the links root; and every meaning switch names a served links level.
+#[sqlx::test(migrations = "../../migrations")]
+async fn meaning_levels_switch_to_their_best_links_group(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let run = run_id(
+        &apply(&pool, &viewer, &c, &links_result(&c))
+            .await
+            .expect("apply"),
+    );
+    let mut conn = pool.acquire().await.unwrap();
+    let lroot = root_id(map, L, c.theme);
+    let mut deep = 0;
+    for s in stored(&pool, run, "meaning").await {
+        let target: Uuid = serde_json::from_value(s.payload["switch"]["level_id"].clone()).unwrap();
+        let served = AtlasMapRepository::level_for_viewer(&mut conn, &viewer, map, L, target)
+            .await
+            .unwrap();
+        assert!(
+            served.is_some(),
+            "meaning level {} switches to an unserved {target}",
+            s.group_id
+        );
+        if s.level > 0 {
+            deep += 1;
+            assert_ne!(
+                target, lroot,
+                "a deep meaning level switches to the links root"
+            );
+        }
+    }
+    assert!(
+        deep >= 4,
+        "the corpus has four meaning leaves under the root"
+    );
+    // The meaning leaf of the unlinked claims leads to the mirror that holds
+    // exactly them.
+    let mleaf = group_id(map, M, c.theme, &c.mirror2());
+    let level = AtlasMapRepository::level_for_viewer(&mut conn, &viewer, map, M, mleaf)
+        .await
+        .unwrap()
+        .expect("the meaning leaf is served");
+    assert_eq!(
+        level.payload["switch"]["level_id"],
+        serde_json::json!(group_id(map, L, c.theme, &c.mirror2()))
+    );
+}
