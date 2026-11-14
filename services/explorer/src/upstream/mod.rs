@@ -43,6 +43,7 @@ use crate::state::AppState;
 
 pub mod atlas;
 pub mod atlas_level;
+pub mod atlas_maps;
 pub mod core;
 pub mod degraded;
 pub mod entities;
@@ -233,6 +234,16 @@ impl<'a> Api<'a> {
             .await
     }
 
+    /// `GET {api}{path}` → the 2xx body's bytes, unparsed: for a route that
+    /// passes the API's answer through as it came (the Atlas level proxy).
+    /// Errors map exactly as [`Api::get`]'s do.
+    pub async fn get_raw(&self, path: &str) -> Result<Vec<u8>, UpstreamError> {
+        let x = self
+            .send_exchange::<()>(Method::GET, path, None, None)
+            .await?;
+        raw_body(x)
+    }
+
     async fn send<T, Q>(
         &self,
         method: Method,
@@ -244,12 +255,27 @@ impl<'a> Api<'a> {
         T: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
+        decode(self.send_exchange(method, path, query, body).await?)
+    }
+
+    /// One call with the 401 policy applied: the exchange that answers it,
+    /// whatever its status (a second 401 has already ended the session).
+    async fn send_exchange<Q>(
+        &self,
+        method: Method,
+        path: &str,
+        query: Option<&Q>,
+        body: Option<Vec<u8>>,
+    ) -> Result<Exchange, UpstreamError>
+    where
+        Q: Serialize + ?Sized,
+    {
         let token = self.current_token();
         let first = self
             .exchange(&method, path, query, body.as_deref(), token.as_deref())
             .await?;
         if first.status != StatusCode::UNAUTHORIZED {
-            return decode(first);
+            return Ok(first);
         }
 
         // The API distinguishes "token carries no agent_id; re-authenticate
@@ -300,7 +326,7 @@ impl<'a> Api<'a> {
             self.state.sessions.remove(id);
             return Err(UpstreamError::SessionExpired);
         }
-        decode(second)
+        Ok(second)
     }
 
     async fn exchange<Q>(
@@ -472,15 +498,28 @@ fn decode<T: DeserializeOwned>(x: Exchange) -> Result<T, UpstreamError> {
         };
         return serde_json::from_slice(body).map_err(|e| UpstreamError::Decode(e.to_string()));
     }
+    Err(status_error(&x))
+}
 
-    let message = error_message(&x);
-    Err(match status {
+/// A 2xx body as bytes, or the same error [`decode`] gives.
+fn raw_body(x: Exchange) -> Result<Vec<u8>, UpstreamError> {
+    if x.status.is_success() {
+        return Ok(x.body);
+    }
+    Err(status_error(&x))
+}
+
+/// The error for a non-2xx exchange.
+fn status_error(x: &Exchange) -> UpstreamError {
+    let status = x.status;
+    let message = error_message(x);
+    match status {
         StatusCode::NOT_FOUND => UpstreamError::NotFound { message },
         StatusCode::UNAUTHORIZED => UpstreamError::Unauthorized { message },
         StatusCode::FORBIDDEN => UpstreamError::Forbidden { message },
         s if s.is_client_error() => UpstreamError::Rejected {
             status: s.as_u16(),
-            kind: api_error_body(&x).and_then(|b| b.error),
+            kind: api_error_body(x).and_then(|b| b.error),
             message,
         },
         s if s.is_server_error() => UpstreamError::Server {
@@ -488,7 +527,7 @@ fn decode<T: DeserializeOwned>(x: Exchange) -> Result<T, UpstreamError> {
             message,
         },
         s => UpstreamError::Decode(format!("unexpected status {s}")),
-    })
+    }
 }
 
 fn api_error_body(x: &Exchange) -> Option<ApiErrorBody> {

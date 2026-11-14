@@ -36,13 +36,18 @@ subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace"] }
+# compression-*: the Atlas level routes compress their own answers (the prod
+# reverse proxy does not, and the 150 KB level budget is gzip bytes).
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+# The Atlas level proxy test decodes a br answer (already in the graph through
+# tower-http's compression-br).
+brotli = "9"
 # The Atlas level contract test helper (tests/common/atlas_contract.rs):
 # a JSON Schema validator and gzip for the payload budget. default-features
 # = false: the defaults resolve remote `$ref`s over HTTP, which the schema
