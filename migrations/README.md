@@ -2688,6 +2688,54 @@ restart.
   data work. Checked before claiming: slot 216 assigned to this batch; no
   migration on main carries a `216`. **Applied to throwaway databases only,
   NOT to any deployed database.**
+- **218**: `fragment_tenancy_most_restrictive` (backlog 73ea4d4d, 77fbf3f9,
+  0bf301fd; ledger F-089-A, F-089-E, F-089-F). A harvester fragment cited by
+  several claims takes the MOST RESTRICTIVE of them (operator decision
+  2026-09-22) instead of whichever joined row an `UPDATE … FROM` applied.
+  Re-states 115's `epigraph_inherit_fragment_tenancy_stmt()` (the provenance
+  stamp; same 115 gate, same sentinel-only target and world-excluded source)
+  and 168's `epigraph_propagate_tenancy()` byte for byte except the
+  `harvester_fragments` statement: both rank their CANDIDATE citing claims
+  `group` before `public`, a real owner before a sentinel, then the lowest
+  `owner_group_id`. Only a claim the firing act names is a candidate: the
+  stamp ranks its own statement's rows (`newprov`, as 115 did, so an earlier
+  unstamped application-session link never decides a fragment), and arm (d)
+  ranks the claims its statement changed and never moves a fragment to a claim
+  it did not change. Arm (d) adds one guard: when every changed citer ends
+  `public`, a `group` fragment that another group-private claim still cites is
+  left as it is, so publicizing one citer no longer makes the fragment public
+  and does not hand it to the other citer's group. `epigraph-tenancy-backfill`'s fragment arm
+  and its `verify` residual use the same order (one shared SQL fragment). Also
+  REVOKEs UPDATE on `harvester_claim_provenance` from `epigraph_app` (no writer
+  uses it; a re-pointed link ran no stamp), keeping INSERT, SELECT and DELETE.
+  `CREATE OR REPLACE` keeps both bodies' owner and ACL; the owner is re-asserted.
+  The `CASE WHEN` count, the `derived text[] := ARRAY[` literal and the
+  `public.harvester_fragments` arm the operator tools parse are unchanged. The
+  header records the harvester trust model (accepted 2026-09-22). Pinned by
+  `epigraph-db/tests/fragment_tenancy_most_restrictive.rs` and
+  `epigraph-cli/tests/backfill_idempotence.rs::a_multi_citer_fragment_takes_its_most_restrictive_claim`.
+  Undo: `docs/runbooks/218-undo.sql` (tested: run twice, it returns every
+  `public` function and the provenance table's ACL to below 218); it RE-OPENS
+  the defects. **Not done:** a fragment already owned by a real group and
+  `public` is not narrowed by the stamp or the backfill when a group-private
+  claim cites it; the operator tools' node rule keeps that shape, and which
+  rule wins there is an operator question (F-089-A). **Deploy:** no order
+  constraint with any binary; 218 moves no row, and no tool re-stamps a
+  fragment the old rule already gave a real owner (it is no longer
+  sentinel-owned, so neither the stamp nor `epigraph-tenancy-backfill run
+  --entity harvester-fragments` reaches it; only a move of one of its claims
+  does). A `public` fragment of a real group with a group-private citer is
+  still produced by a later private link, so that shape is ongoing until the
+  node-rule question is ruled. Strict `verify` does not change for any row:
+  its fragment residual is equivalent to the old one on sentinel-owned rows,
+  the only ones it counts. Before deploying, confirm which role the external
+  harvester connects as, and that it never UPDATEs `harvester_claim_provenance`.
+  The trust model is not yet enforced on every path: `epigraph_app` keeps
+  INSERT on that table, and arm (d) follows a linked claim whoever wrote the
+  link (pre-existing; ledger F-218-A, an operator decision on revoking that
+  INSERT). Checked before claiming: slot 218 assigned to this batch;
+  no migration on main carries a `218`. **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
