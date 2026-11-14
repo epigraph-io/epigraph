@@ -4,7 +4,8 @@
 //! `epigraph-recompute-belief` operator binary: it refreshes the cached
 //! `claims.{belief, plausibility, pignistic_prob, conflict_k, missing_mass}`
 //! scalars from current `mass_functions` state, writing each claim's cache from
-//! its ONE owner frame (`binary_truth`, else `claim_validity`, else the frame the
+//! its ONE owner frame (a frame with a cache-admissible input first; then
+//! `binary_truth`, else `claim_validity`, else the frame the
 //! cache already records, else the frame holding the claim's earliest input;
 //! see `MassFunctionRepository::cache_owner_frame_for_claim`).
 //!
@@ -67,8 +68,9 @@ struct RecomputeBeliefsResult {
 ///
 /// Target precedence: `claim_ids` (explicit) > `labels` (current claims with
 /// all labels) > bulk enumeration of every claim that has a BBA. Each target
-/// claim's cache is written from ONE owner frame (`binary_truth`, else
-/// `claim_validity`, else the recorded owner, else the first-writer frame), see
+/// claim's cache is written from ONE owner frame (a frame with a
+/// cache-admissible input first; then `binary_truth`, else `claim_validity`,
+/// else the recorded owner, else the first-writer frame), see
 /// `MassFunctionRepository::cache_owner_frame_for_claim`.
 ///
 /// # Every statement runs on the maintenance session's connection
