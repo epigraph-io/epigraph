@@ -437,6 +437,33 @@ const ASSERTION_MAX_AGE_SECS: u64 = 300; // 5 minutes
 /// Maximum clock skew into the future. Assertions timestamped further ahead are rejected.
 const ASSERTION_MAX_FUTURE_SECS: u64 = 30;
 
+/// How long past an assertion's timestamp its nonce is kept (migration 213):
+/// the freshness window plus a margin for clock skew between this host, which
+/// enforces the window, and the database, which prunes on its own clock.
+const ASSERTION_NONCE_RETENTION_SECS: u64 = ASSERTION_MAX_AGE_SECS + 60;
+// A nonce must outlive the window in which its assertion is accepted, and stay
+// under the definer's one-hour bound (AN03) even for a timestamp at the
+// future-skew limit.
+const _: () = assert!(
+    ASSERTION_NONCE_RETENTION_SECS > ASSERTION_MAX_AGE_SECS
+        && ASSERTION_NONCE_RETENTION_SECS + ASSERTION_MAX_FUTURE_SECS < 3600
+);
+
+/// The parts of an assertion that [`verify_agent_assertion`] has verified.
+/// (Its only non-test reader, the nonce record, needs the database.)
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VerifiedAssertion {
+    /// Seconds since the Unix epoch, as signed.
+    timestamp: u64,
+    /// The signed 16-byte nonce.
+    nonce: [u8; 16],
+    /// The 32-byte Ed25519 public key the signature verified under: the key
+    /// the nonce is spent under (migration 213), whatever spelling of it the
+    /// client row's `client_id` carries.
+    public_key: [u8; 32],
+}
+
 /// Verify an Ed25519 agent assertion for the client_credentials grant.
 ///
 /// Assertion format: `timestamp(8B big-endian) || nonce(16B) || Ed25519_signature(64B)`
@@ -445,14 +472,18 @@ const ASSERTION_MAX_FUTURE_SECS: u64 = 30;
 /// Security properties:
 /// - Real Ed25519 verification via `verify_strict` (rejects small-subgroup attacks)
 /// - Timestamp freshness: max 5 minutes old, max 30 seconds into the future
-/// - No nonce tracking (stateless). Replay within the window yields a duplicate
-///   short-lived token (15min). Note: replay can also acquire a 24h refresh token,
-///   so transport security (TLS in production) is the primary replay defense.
+///
+/// This check is stateless. SINGLE USE is enforced by the caller,
+/// [`authenticate_confidential_client`], which records the returned nonce
+/// under the returned public key (migration 213) and refuses a
+/// `(public key, nonce)` already recorded, so a
+/// captured assertion cannot be replayed inside its window. The signed message
+/// is still not bound to a domain or audience (backlog 950696a1, step 2).
 fn verify_agent_assertion(
     assertion_bytes: &[u8],
     pub_key_bytes: &[u8],
     client_id_str: &str,
-) -> Result<(), ApiError> {
+) -> Result<VerifiedAssertion, ApiError> {
     if assertion_bytes.len() != 88 {
         return Err(ApiError::BadRequest {
             message: format!(
@@ -521,7 +552,73 @@ fn verify_agent_assertion(
         });
     }
 
-    Ok(())
+    Ok(VerifiedAssertion {
+        timestamp: assertion_ts,
+        nonce: assertion_bytes[8..24]
+            .try_into()
+            .expect("slice is exactly 16 bytes"),
+        public_key: verifying_key.to_bytes(),
+    })
+}
+
+/// Record a VERIFIED assertion's nonce under the public key it verified with
+/// and refuse a replay (migration 213). Keyed by the key, not by `client`'s
+/// row, so a second client row spelling the same key in another hex case
+/// cannot re-spend it. Runs only after
+/// [`verify_agent_assertion`] has passed, so an unauthenticated request never
+/// writes a row. Fails CLOSED: a database error refuses the assertion.
+#[cfg(feature = "db")]
+async fn consume_assertion_nonce(
+    state: &AppState,
+    client: &epigraph_db::repos::oauth_client::OAuthClientRow,
+    verified: VerifiedAssertion,
+) -> Result<(), ApiError> {
+    let keep_until = verified
+        .timestamp
+        .saturating_add(ASSERTION_NONCE_RETENTION_SECS);
+    let expires_at =
+        chrono::DateTime::<Utc>::from_timestamp(i64::try_from(keep_until).unwrap_or(i64::MAX), 0)
+            .ok_or(ApiError::BadRequest {
+            message: "client_assertion timestamp out of range".to_string(),
+        })?;
+    let outcome = epigraph_db::AssertionNonceRepository::consume(
+        &state.db_pool,
+        &verified.public_key,
+        &verified.nonce,
+        expires_at,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("recording the assertion nonce failed: {e}"),
+    })?;
+    match outcome {
+        epigraph_db::NonceConsumption::Recorded => Ok(()),
+        epigraph_db::NonceConsumption::Replay => {
+            tracing::warn!(
+                client_id = %client.client_id,
+                "Agent assertion rejected: nonce already used (replay)"
+            );
+            Err(ApiError::Unauthorized {
+                reason: "client_assertion has already been used".to_string(),
+            })
+        }
+        // Fresh on this host's clock, but its retention has already passed
+        // on the database clock: the clocks disagree by more than the
+        // retention margin. Refused (the nonce could not be recorded), and
+        // reported as skew so an operator is not sent hunting a replay.
+        epigraph_db::NonceConsumption::Expired => {
+            tracing::error!(
+                client_id = %client.client_id,
+                assertion_ts = verified.timestamp,
+                "Agent assertion rejected: its nonce retention has already passed on the \
+                 database clock; the API host and database clocks are skewed by more than \
+                 the retention margin"
+            );
+            Err(ApiError::Unauthorized {
+                reason: "client_assertion expired (server clock skew)".to_string(),
+            })
+        }
+    }
 }
 
 /// Whether `client_type` is a CONFIDENTIAL client: one that holds a credential
@@ -538,14 +635,18 @@ fn is_confidential_client(client_type: &str) -> bool {
 /// key), or the service's secret, compared in constant time against the
 /// stored hash. The ONE credential check, shared by the `client_credentials`
 /// grant and the refresh grant, so a later secret rotation or key change cuts
-/// both.
+/// both. An agent assertion is single use across both grants: its nonce is
+/// recorded once it verifies (migration 213), so a replay is refused.
 ///
 /// # Errors
 /// `ApiError::BadRequest` for a missing or malformed credential,
-/// `ApiError::Unauthorized` for a wrong one, and `ApiError::Unauthorized` for
-/// a client that is not confidential (see [`is_confidential_client`]).
+/// `ApiError::Unauthorized` for a wrong one or an agent assertion already
+/// used, `ApiError::Unauthorized` for a client that is not confidential (see
+/// [`is_confidential_client`]), and `ApiError::InternalError` when the nonce
+/// cannot be recorded (fail closed).
 #[cfg(feature = "db")]
-fn authenticate_confidential_client(
+async fn authenticate_confidential_client(
+    state: &AppState,
     client: &epigraph_db::repos::oauth_client::OAuthClientRow,
     req: &TokenRequest,
 ) -> Result<(), ApiError> {
@@ -577,7 +678,9 @@ fn authenticate_confidential_client(
                 hex::decode(&client.client_id).map_err(|_| ApiError::BadRequest {
                     message: "client_id must be hex-encoded public key for agents".to_string(),
                 })?;
-            verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
+            let verified =
+                verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
+            consume_assertion_nonce(state, client, verified).await?;
         }
         "service" => {
             let secret = req.client_secret.as_deref().ok_or(ApiError::BadRequest {
@@ -644,7 +747,7 @@ async fn handle_client_credentials(
             message: "client_credentials grant not supported for this client type".to_string(),
         });
     }
-    authenticate_confidential_client(&client, req)?;
+    authenticate_confidential_client(state, &client, req).await?;
 
     let ttl = match client.client_type.as_str() {
         "agent" => Duration::minutes(15),
@@ -850,7 +953,7 @@ async fn handle_refresh_token(
         {
             return Err(invalid_refresh());
         }
-        authenticate_confidential_client(&client, req)?;
+        authenticate_confidential_client(state, &client, req).await?;
     }
 
     if client.status != "active" {
@@ -1662,6 +1765,26 @@ mod assertion_tests {
         let client_id = hex::encode(pk);
 
         assert!(verify_agent_assertion(&assertion, &pk, &client_id).is_ok());
+    }
+
+    /// The nonce recorded for single use (migration 213) is the SIGNED one,
+    /// bytes 8..24, and the retention is measured from the signed timestamp:
+    /// keyed on any other bytes, a replay could vary them without re-signing.
+    #[test]
+    fn verified_assertion_carries_the_signed_nonce_and_timestamp() {
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        let ts = now_secs() - 7;
+        let assertion = build_assertion(&sk, ts);
+        let client_id = hex::encode(pk);
+
+        let verified = verify_agent_assertion(&assertion, &pk, &client_id).expect("verifies");
+        assert_eq!(verified.timestamp, ts);
+        assert_eq!(&verified.nonce[..], &assertion[8..24]);
+        assert_eq!(
+            verified.public_key, pk,
+            "the nonce is spent under the key the signature verified with"
+        );
     }
 
     #[test]

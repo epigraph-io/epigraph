@@ -2645,6 +2645,50 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **213**: public `oauth_assertion_nonces` (backlog 950696a1, step 1). An
+  agent's Ed25519 `client_credentials` assertion is now single use: the table
+  `oauth_assertion_nonces(agent_public_key, nonce, expires_at, used_at)`
+  (primary key `(agent_public_key, nonce)`, 32-byte key and 16-byte nonce
+  CHECKs, no FK, no tenancy columns, no row security, like 141's
+  `revoked_access_tokens`) and
+  one SECURITY DEFINER on 172's form, owned by `epigraph_maintenance`,
+  EXECUTE revoked from PUBLIC and granted to `epigraph_app`:
+  `epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)` answers
+  `'recorded'` when it records the pair, `'replay'` when it is already
+  recorded (one `INSERT .. ON CONFLICT DO NOTHING`), and `'expired'`,
+  recording nothing, when the caller's expiry has already passed on the
+  database clock (API host and database clocks skewed by more than the 60 s
+  margin; refused 401 and logged as skew, not as a replay), raises 22023 on a malformed key or
+  nonce or an expiry more than an hour ahead, and lazily prunes up to 1000
+  rows past their expiry (`FOR UPDATE SKIP LOCKED`). The application role
+  keeps SELECT only. The record is keyed by the public key the signature
+  verified under, not by the `oauth_clients` row: an agent's `client_id` is
+  its hex key as registered, and hex decoding accepts either case, so two
+  rows spelling one key differently would otherwise each grant a captured
+  assertion one more use. ACCEPTED BOUND: any session on the application
+  DSN can call the definer with any key and nonce, so it can grow the table
+  for up to an hour per row (AN03 bounds how long a row lives, not how many
+  there are; each call prunes at most 1000). That DSN can already write far
+  larger tables, and nonces are random, so this is not a lockout of a
+  particular agent. `oauth/token.rs` calls it after the assertion's signature and
+  freshness verify, on both the `client_credentials` and the refresh grant,
+  keeping each nonce until the signed timestamp + 360 s (the 300 s window
+  plus a 60 s skew margin). Registered in `tenancy_backfill.rs`
+  (`DEFERRED_DEFINER_FUNCTIONS` and the grant register). Pinned by
+  `epigraph-db/tests/app_role_table_lockdown.rs` (`CLOSED`, `NO_WRITE`,
+  `assertion_nonces_are_consumed_once_through_the_definer`,
+  `assertion_nonce_prune_removes_only_rows_past_their_window`) and
+  `epigraph-api/tests/agent_assertion_replay.rs`. The signed message is
+  unchanged (no domain or audience tag; that is step 2, a wire-format
+  change). Undo: `docs/runbooks/213-undo.sql` (tested: run twice on a
+  database at 213, it drops the definer, the table and its index, and the
+  second run is a no-op; a captured assertion then replays for its window
+  again). Slot 213
+  was assigned by the 2026-11-14 backlog batch; 210 to 212 are held by other
+  branches. **Deploy order:** migrate before rolling out a binary that calls
+  the definer (such a binary on a database without it refuses every agent
+  mint, 500); undo only after rolling every such binary back. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

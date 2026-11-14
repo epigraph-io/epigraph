@@ -123,6 +123,10 @@ const CLOSED: &[&str] = &[
     // only by `epigraph_purge_mass_functions`; the application role holds no
     // privilege on it.
     "mass_function_purge_grants",
+    // Migration 213: a used agent-assertion nonce, written and pruned only by
+    // `epigraph_oauth_assertion_nonce_consume`. An application DELETE would
+    // re-open the replay the row closes.
+    "oauth_assertion_nonces",
     "oauth_authorization_codes",
     "oauth_authorize_sessions",
     "oauth_clients",
@@ -164,6 +168,9 @@ const NO_WRITE: &[&str] = &[
     // Migration 194: written only by the maintenance purge definer; the
     // application role holds no privilege at all, SELECT included.
     "mass_function_purge_grants",
+    // Migration 213: written only through its definer; the application role
+    // holds SELECT only.
+    "oauth_assertion_nonces",
     "source_artifacts",
 ];
 
@@ -2297,4 +2304,199 @@ async fn a_token_expired_inside_the_skew_margin_is_still_recorded(pool: PgPool) 
             "a token recorded {hours} h past its expiry answers is_revoked"
         );
     }
+}
+
+/// A random 32-byte stand-in for an agent's Ed25519 public key.
+fn random_public_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    key
+}
+
+/// Migration 213 (backlog 950696a1): an agent assertion's nonce is consumed
+/// ONLY through `epigraph_oauth_assertion_nonce_consume`, measured as the
+/// application role. The first presentation of a `(public key, nonce)` records
+/// it (`true`), a second is a replay (`false`), the same nonce under another
+/// key is that key's own first use, and the definer refuses a malformed key, a
+/// malformed nonce and an unbounded expiry. (UPDATE and DELETE are refused through
+/// [`CLOSED`], INSERT through [`NO_WRITE`].) The prune is pinned by
+/// `assertion_nonce_prune_removes_only_rows_past_their_window`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn assertion_nonces_are_consumed_once_through_the_definer(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::{AssertionNonceRepository, NonceConsumption};
+    let app = app_pool(&pool, 2).await;
+    let (key, other) = (random_public_key(), random_public_key());
+    let nonce: [u8; 16] = Uuid::new_v4().into_bytes();
+    let exp = Utc::now() + Duration::minutes(6);
+
+    // No direct INSERT: an application session cannot plant a nonce (and, by
+    // CLOSED, cannot delete one to re-open a replay).
+    let ins = sqlx::query(
+        "INSERT INTO oauth_assertion_nonces (agent_public_key, nonce, expires_at) \
+         VALUES ($1, $2, now() + interval '5 minutes')",
+    )
+    .bind(key.to_vec())
+    .bind(nonce.to_vec())
+    .execute(&app)
+    .await;
+    assert_eq!(
+        sqlstate(ins).as_deref(),
+        Some("42501"),
+        "INSERT oauth_assertion_nonces as epigraph_app"
+    );
+
+    assert_eq!(
+        AssertionNonceRepository::consume(&app, &key, &nonce, exp)
+            .await
+            .expect("consume as epigraph_app"),
+        NonceConsumption::Recorded,
+        "the first presentation of a nonce is recorded"
+    );
+    assert_eq!(
+        AssertionNonceRepository::consume(&app, &key, &nonce, exp)
+            .await
+            .expect("consume again"),
+        NonceConsumption::Replay,
+        "a second presentation of one (key, nonce) is a replay"
+    );
+    assert_eq!(
+        AssertionNonceRepository::consume(&app, &other, &nonce, exp)
+            .await
+            .expect("consume under another key"),
+        NonceConsumption::Recorded,
+        "a nonce is keyed by its public key: another key's first use is not a replay"
+    );
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM oauth_assertion_nonces WHERE agent_public_key = ANY($1)",
+    )
+    .bind(vec![key.to_vec(), other.to_vec()])
+    .fetch_one(&app)
+    .await
+    .expect("the application role reads the table");
+    assert_eq!(n, 2, "one row per (key, nonce), the replay wrote nothing");
+
+    // An expiry already past on the database clock records nothing and is
+    // reported as EXPIRED (clock skew), not as a replay: the nonce is new.
+    let late: [u8; 16] = Uuid::new_v4().into_bytes();
+    assert_eq!(
+        AssertionNonceRepository::consume(&app, &key, &late, Utc::now() - Duration::seconds(1))
+            .await
+            .expect("consume past its window"),
+        NonceConsumption::Expired,
+        "an expiry already past is skew, not a replay"
+    );
+    let late_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM oauth_assertion_nonces WHERE agent_public_key = $1 AND nonce = $2",
+    )
+    .bind(key.to_vec())
+    .bind(late.to_vec())
+    .fetch_one(&app)
+    .await
+    .expect("count the late nonce");
+    assert_eq!(late_rows, 0, "an expired presentation records nothing");
+
+    // Malformed input is refused, not recorded.
+    let soon = Utc::now() + Duration::minutes(6);
+    for (what, bad_key, nonce, exp) in [
+        ("a 31-byte key", vec![1u8; 31], vec![0u8; 16], soon),
+        ("a 33-byte key", vec![1u8; 33], vec![0u8; 16], soon),
+        ("a 15-byte nonce", key.to_vec(), vec![0u8; 15], soon),
+        ("a 17-byte nonce", key.to_vec(), vec![0u8; 17], soon),
+        (
+            "an expiry two hours ahead",
+            key.to_vec(),
+            vec![0u8; 16],
+            Utc::now() + Duration::hours(2),
+        ),
+    ] {
+        let err = AssertionNonceRepository::consume(&app, &bad_key, &nonce, exp)
+            .await
+            .expect_err(what);
+        let epigraph_db::DbError::QueryFailed { source } = &err else {
+            panic!("{what}: {err:?}");
+        };
+        assert_eq!(
+            source.as_database_error().and_then(|d| d.code()).as_deref(),
+            Some("22023"),
+            "{what}: {err:?}"
+        );
+    }
+
+    // Catalog: maintenance-owned definer on 172's path, no PUBLIC EXECUTE,
+    // EXECUTE for the application role.
+    let (definer, owner, config, public_exec, app_exec): (bool, String, String, bool, bool) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, \
+                    coalesce(array_to_string(p.proconfig, ';'), ''), \
+                    has_function_privilege('public', p.oid, 'EXECUTE'), \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE') \
+               FROM pg_proc p \
+              WHERE p.oid = 'public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, \
+                                                                           timestamptz)'::regprocedure",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("catalog");
+    assert!(definer, "SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(config, "search_path=pg_catalog, pg_temp");
+    assert!(!public_exec, "PUBLIC must not execute the nonce definer");
+    assert!(app_exec, "epigraph_app executes the nonce definer");
+}
+
+/// The lazy prune deletes only rows already past their `expires_at` (on the
+/// database clock), so a nonce is never forgotten while its assertion is still
+/// inside the freshness window.
+#[sqlx::test(migrations = "../../migrations")]
+async fn assertion_nonce_prune_removes_only_rows_past_their_window(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    use epigraph_db::{AssertionNonceRepository, NonceConsumption};
+    let app = app_pool(&pool, 2).await;
+    let key = random_public_key();
+    let (live, dead) = (Uuid::new_v4().into_bytes(), Uuid::new_v4().into_bytes());
+    sqlx::query(
+        "INSERT INTO oauth_assertion_nonces (agent_public_key, nonce, expires_at) VALUES \
+         ($1, $2, now() + interval '10 seconds'), ($1, $3, now() - interval '1 second')",
+    )
+    .bind(key.to_vec())
+    .bind(live.to_vec())
+    .bind(dead.to_vec())
+    .execute(&pool)
+    .await
+    .expect("seed as the owner");
+
+    // Any consume prunes, as the application role.
+    let fresh: [u8; 16] = Uuid::new_v4().into_bytes();
+    assert_eq!(
+        AssertionNonceRepository::consume(
+            &app,
+            &random_public_key(),
+            &fresh,
+            Utc::now() + Duration::minutes(6)
+        )
+        .await
+        .expect("a consume prunes"),
+        NonceConsumption::Recorded
+    );
+
+    let left: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT nonce FROM oauth_assertion_nonces WHERE agent_public_key = $1")
+            .bind(key.to_vec())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        left,
+        vec![live.to_vec()],
+        "only the row past its window is pruned; the live one still refuses a replay"
+    );
+    assert_eq!(
+        AssertionNonceRepository::consume(&app, &key, &live, Utc::now() + Duration::minutes(6))
+            .await
+            .expect("replay of the live nonce"),
+        NonceConsumption::Replay,
+        "the surviving row still refuses its replay"
+    );
 }

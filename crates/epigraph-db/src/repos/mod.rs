@@ -14,6 +14,7 @@ pub mod agent_key;
 pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
+pub mod assertion_nonce;
 pub mod atlas_layout;
 pub mod atom_axiom;
 pub mod authored_by;
@@ -256,6 +257,7 @@ pub use workflow::{
 };
 
 // Privacy / encryption repositories
+pub use assertion_nonce::{AssertionNonceRepository, NonceConsumption};
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
