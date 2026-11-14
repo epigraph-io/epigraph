@@ -579,7 +579,7 @@ jobs:
     # for the image's system python3 (3.12; numpy 1.26.4 has none past cp312),
     # so a newer default image would turn the install into a source build.
     runs-on: ubuntu-24.04
-    # A cold debug build of the two binaries plus the suites; 60 cuts off a hang.
+    # A cold debug build of the three binaries plus the suites; 60 cuts off a hang.
     timeout-minutes: 60
     continue-on-error: true
     services:

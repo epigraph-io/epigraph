@@ -6,7 +6,8 @@
 #     tests/ci/with_test_api.sh <command...>
 #
 # Starts the `server` binary (TEST_API_BIN, default target/debug/server) on
-# 127.0.0.1:$TEST_API_PORT (default 18099) against TEST_API_DATABASE_URL, whose
+# $TEST_API_PORT (default: a free port picked at runtime, so two runs on one
+# host never share a listener) against TEST_API_DATABASE_URL, whose
 # database name must end in `_test`. It inserts one agent row, mints an HS256
 # JWT for it with a per-run secret that is never written to disk, and runs the
 # command with
@@ -31,8 +32,18 @@ esac
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${TEST_API_BIN:-$ROOT/target/debug/server}"
-PORT="${TEST_API_PORT:-18099}"
+if [ -n "${TEST_API_PORT:-}" ]; then
+  PORT="$TEST_API_PORT"
+else
+  PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+fi
 [ -x "$BIN" ] || { echo "with_test_api.sh: no server binary at $BIN (cargo build -p epigraph-api --bin server)" >&2; exit 1; }
+# Refuse a port something already answers on: /health from another run's
+# server (different JWT secret) would otherwise pass the readiness check below.
+if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/health"; then
+  echo "with_test_api.sh: port $PORT already answers /health; refusing to share another server" >&2
+  exit 1
+fi
 
 WORK="$(mktemp -d)"
 PID=""
@@ -64,12 +75,16 @@ PID=$!
 
 up=0
 for _ in $(seq 1 90); do
-  if curl -s -o /dev/null "http://127.0.0.1:$PORT/health"; then up=1; break; fi
   kill -0 "$PID" 2>/dev/null || break
+  # Ready only when /health answers AND the server we started is still alive:
+  # a listener that is not ours must never count as up.
+  if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/health" && kill -0 "$PID" 2>/dev/null; then
+    up=1; break
+  fi
   sleep 1
 done
 if [ "$up" != 1 ]; then
-  echo "with_test_api.sh: the API never answered /health on port $PORT; server log tail:" >&2
+  echo "with_test_api.sh: the API we started (pid $PID) never answered /health on port $PORT; server log tail:" >&2
   tail -40 "$WORK/server.log" >&2
   exit 1
 fi
