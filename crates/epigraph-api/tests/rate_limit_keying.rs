@@ -31,8 +31,8 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use epigraph_api::TrustedProxies;
 use epigraph_api::{create_router, AgentRateLimiter, ApiConfig, AppState, RateLimitConfig};
+use epigraph_api::{SecurityAuditLog, TrustedProxies};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -167,6 +167,39 @@ async fn ipv6_clients_are_keyed_by_their_slash_64() {
         discovery(&router, "[2001:db8:1:3::1]:5000", None).await,
         StatusCode::OK,
         "a different /64 is a different client"
+    );
+}
+
+/// A flood of refused requests is not a flood of audit writes. Every 429 used
+/// to log a `rate_limit_exceeded` event in memory AND spawn a database insert,
+/// so one client could turn its own refusals into unbounded write load and
+/// evict every other event from the bounded in-memory log. One event per
+/// client per refusal window is recorded; the rest are counted by the 429s.
+#[tokio::test]
+async fn a_refused_flood_records_one_event_per_client_per_window() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let state = AppState::with_db(pool, ApiConfig::default()).with_rate_limiter(limiter());
+    let router = create_router(state.clone());
+    let mut refused = 0;
+    for _ in 0..(LIMIT + 20) {
+        if discovery(&router, "203.0.113.40:7000", None).await == StatusCode::TOO_MANY_REQUESTS {
+            refused += 1;
+        }
+    }
+    // A second client's first refusal is its own event.
+    for _ in 0..(LIMIT + 2) {
+        discovery(&router, "203.0.113.41:7000", None).await;
+    }
+    assert_eq!(refused, 20, "control: the flood was refused");
+    let events = state
+        .audit_log
+        .query(epigraph_api::SecurityEventFilter::new().with_event_type("rate_limit_exceeded"));
+    assert_eq!(
+        events.len(),
+        2,
+        "one recorded refusal per client per window, not one per 429"
     );
 }
 

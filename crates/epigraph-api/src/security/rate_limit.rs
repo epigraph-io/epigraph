@@ -202,6 +202,9 @@ struct TokenBucket {
     refill_rate: f64,
     /// Last time tokens were refilled
     last_refill: DateTime<Utc>,
+    /// Last time a refusal from this bucket was recorded
+    /// ([`AgentRateLimiter::should_record_rejection`])
+    last_recorded: Option<DateTime<Utc>>,
 }
 
 impl TokenBucket {
@@ -212,6 +215,7 @@ impl TokenBucket {
             max_tokens: max_tokens as f64,
             refill_rate: refill_rate_per_second,
             last_refill: Utc::now(),
+            last_recorded: None,
         }
     }
 
@@ -244,6 +248,22 @@ impl TokenBucket {
         }
     }
 
+    /// Whether a refusal from this bucket is due to be recorded, marking it
+    /// recorded if so.
+    fn take_record_slot(&mut self, now: DateTime<Utc>) -> bool {
+        match self.last_recorded {
+            Some(t)
+                if now.signed_duration_since(t).num_seconds() < REJECTION_RECORD_INTERVAL_SECS =>
+            {
+                false
+            }
+            _ => {
+                self.last_recorded = Some(now);
+                true
+            }
+        }
+    }
+
     /// Get current available tokens (for testing/monitoring)
     #[allow(dead_code)]
     fn available_tokens(&mut self) -> f64 {
@@ -251,6 +271,10 @@ impl TokenBucket {
         self.tokens
     }
 }
+
+/// Seconds between two recorded refusals of one bucket
+/// ([`AgentRateLimiter::should_record_rejection`]).
+pub const REJECTION_RECORD_INTERVAL_SECS: i64 = 60;
 
 /// How many per-key buckets a limiter tracks before it prunes ([`BucketMap`]).
 pub const DEFAULT_MAX_TRACKED_KEYS: usize = 100_000;
@@ -451,6 +475,39 @@ impl AgentRateLimiter {
         })
     }
 
+    /// Whether the caller should RECORD this refusal (audit event, database
+    /// row, info log): true for the first refusal of a bucket in each
+    /// [`REJECTION_RECORD_INTERVAL_SECS`] window, false for the rest.
+    ///
+    /// Every refusal is still answered 429. Recording each one would let a
+    /// single client turn its own refusals into unbounded write load and flush
+    /// every other event out of a bounded in-memory audit log. A key charged
+    /// to the shared overflow bucket shares its window.
+    pub fn should_record_rejection(&self, err: &RateLimitError) -> bool {
+        let now = Utc::now();
+        match err {
+            RateLimitError::AgentLimitExceeded { agent_id, .. } => {
+                let mut guard = self
+                    .agent_buckets
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let buckets = &mut *guard;
+                match buckets.map.get_mut(agent_id) {
+                    Some(bucket) => bucket.take_record_slot(now),
+                    None => buckets
+                        .overflow
+                        .as_mut()
+                        .map_or(true, |bucket| bucket.take_record_slot(now)),
+                }
+            }
+            RateLimitError::GlobalLimitExceeded { .. } => self
+                .global_bucket
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_record_slot(now),
+        }
+    }
+
     /// Get the rate limit for a specific agent
     fn get_agent_limit(&self, agent_id: &AgentId) -> u32 {
         let limits = self
@@ -558,18 +615,22 @@ impl AgentRateLimiter {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             bucket.last_refill -= duration;
+            if let Some(t) = bucket.last_recorded.as_mut() {
+                *t -= duration;
+            }
         }
 
         {
-            let mut buckets = self
+            let mut guard = self
                 .agent_buckets
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for bucket in buckets.map.values_mut() {
+            let buckets = &mut *guard;
+            for bucket in buckets.map.values_mut().chain(buckets.overflow.as_mut()) {
                 bucket.last_refill -= duration;
-            }
-            if let Some(bucket) = buckets.overflow.as_mut() {
-                bucket.last_refill -= duration;
+                if let Some(t) = bucket.last_recorded.as_mut() {
+                    *t -= duration;
+                }
             }
         }
     }
@@ -731,6 +792,33 @@ mod tests {
             limiter.check(&key(4)),
             Err(RateLimitError::GlobalLimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_once_per_key_per_window() {
+        let limiter = per_key(1);
+        limiter.check(&key(1)).unwrap();
+        let err = limiter.check(&key(1)).unwrap_err();
+        assert!(limiter.should_record_rejection(&err), "first refusal");
+        let err = limiter.check(&key(1)).unwrap_err();
+        assert!(!limiter.should_record_rejection(&err), "same window");
+        // Another key's refusal is its own.
+        limiter.check(&key(2)).unwrap();
+        let other = limiter.check(&key(2)).unwrap_err();
+        assert!(limiter.should_record_rejection(&other));
+        // A window later the same key is recorded again.
+        limiter.advance_time(chrono::Duration::seconds(
+            REJECTION_RECORD_INTERVAL_SECS + 1,
+        ));
+        limiter.check(&key(1)).unwrap();
+        let err = limiter.check(&key(1)).unwrap_err();
+        assert!(limiter.should_record_rejection(&err), "next window");
+        // The global bucket has its own window.
+        let g = RateLimitError::GlobalLimitExceeded {
+            retry_after_secs: 1,
+        };
+        assert!(limiter.should_record_rejection(&g));
+        assert!(!limiter.should_record_rejection(&g));
     }
 
     #[test]

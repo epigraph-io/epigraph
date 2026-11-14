@@ -319,6 +319,21 @@ pub async fn rate_limit_middleware(
             ),
         };
 
+        // Record the refusal (in-memory audit event, database row, info log)
+        // once per bucket per window, not once per 429: a client being
+        // refused must not be able to turn its refusals into write load.
+        if !rate_limiter.should_record_rejection(&err) {
+            tracing::debug!(
+                path = %path,
+                agent_id = %agent_id,
+                "Rate limit exceeded (already recorded this window)"
+            );
+            return Err(RateLimitResponse {
+                retry_after_secs: retry_after,
+                message,
+            });
+        }
+
         // Log rate limit exceeded event to audit log (in-memory)
         let correlation_id = Uuid::new_v4().to_string();
         let rate_event = SecurityEvent::rate_limit_exceeded(
