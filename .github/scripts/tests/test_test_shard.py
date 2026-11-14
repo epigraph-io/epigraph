@@ -1,0 +1,410 @@
+"""Tests for .github/scripts/test-shard.py: the affected-shard selection, the
+`test` gate, and the CI job graph that wires them together.
+
+Run from the repository root (the `plan` job does):
+
+    python3 -m unittest discover -s .github/scripts/tests -v
+
+The planner is loaded BY PATH, from TEST_SHARD_SCRIPT when it is set, so the
+same tests can be pointed at another revision of the script:
+
+    git show <rev>:.github/scripts/test-shard.py > /tmp/old.py
+    TEST_SHARD_SCRIPT=/tmp/old.py python3 -m unittest discover -s .github/scripts/tests
+
+The selection tests use the real workspace (`cargo metadata`, `git ls-files`)
+rather than a hand-written graph: what they pin is that THIS repository's
+dependency edges and source scans produce the selection, so an edge or a
+ratchet that moves shows up here.
+"""
+
+import importlib.util
+import io
+import json
+import os
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.environ.get("TEST_SHARD_SCRIPT") or os.path.join(HERE, "..", "test-shard.py")
+WORKFLOW = os.path.join(HERE, "..", "..", "workflows", "ci.yml")
+
+
+def load_planner():
+    spec = importlib.util.spec_from_file_location("test_shard", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ts = load_planner()
+_WORKSPACE = None
+
+
+def workspace():
+    """(root, pkgs, shards), loaded once: `cargo metadata` takes a second."""
+    global _WORKSPACE
+    if _WORKSPACE is None:
+        root, pkgs = ts.load()
+        _WORKSPACE = (root, pkgs, ts.plan(pkgs))
+    return _WORKSPACE
+
+
+_READS = None
+
+
+def reads():
+    """The real tree's source-scan reads, scanned once."""
+    global _READS
+    if _READS is None:
+        root, pkgs, _shards = workspace()
+        _READS = ts.scan_reads(root, pkgs, ts.package_dirs(root, pkgs), ts.git_files(root))
+    return _READS
+
+
+def pr_plan(changed, **env):
+    """The plan for a same-repository pull request with this diff."""
+    root, pkgs, shards = workspace()
+    base = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_HEAD_REF": "feature/x"}
+    base.update(env)
+    return ts.decide(root, pkgs, shards, base, changed=list(changed), reads=reads()[0])
+
+
+def shard_ids(d):
+    return set(d["ids"])
+
+
+def shards_of(package):
+    _root, _pkgs, shards = workspace()
+    return {sid for sid, s in shards.items() if package in s["package"].split()}
+
+
+class AffectedSelection(unittest.TestCase):
+    def test_db_source_change_pulls_in_its_reverse_dependencies(self):
+        d = pr_plan(["crates/epigraph-db/src/lib.rs"])
+        self.assertEqual(d["mode"], "affected")
+        for dependent in ("epigraph-api", "epigraph-mcp", "epigraph-cli", "epigraph-engine"):
+            self.assertIn(dependent, d["whole"], dependent)
+            self.assertEqual(
+                d["whole"][dependent].split()[0], "depends", f"{dependent}: {d['whole'][dependent]}"
+            )
+        for package in ("epigraph-db", "epigraph-api", "epigraph-mcp", "epigraph-cli"):
+            self.assertLessEqual(shards_of(package), shard_ids(d), package)
+        self.assertIn("engine-embeddings", shard_ids(d))
+        # jobs and engine-integration-tests depend on db, so the gated jobs run.
+        self.assertTrue(all(d["run"].values()), d["run"])
+
+    def test_a_dependency_is_not_pulled_in_by_its_dependent(self):
+        # epigraph-api depends on epigraph-db; an api change must not run db's
+        # whole suite. It runs only db's test targets that read api's sources.
+        d = pr_plan(["crates/epigraph-api/src/lib.rs"])
+        self.assertNotIn("epigraph-db", d["whole"])
+        self.assertFalse(shards_of("epigraph-db") & shard_ids(d))
+        self.assertIn(ts.SCANS, shard_ids(d))
+        self.assertIn("custodian_role", d["partial"]["epigraph-db"])
+        self.assertLessEqual(shards_of("epigraph-api") | shards_of("epigraph-cli"), shard_ids(d))
+
+    def test_docs_only_change_runs_no_shard_and_no_gated_job(self):
+        # A doc no Rust source reads (the runbooks, docs/intro and README.md
+        # are read by tests; see the next test).
+        d = pr_plan(["docs/superpowers/plans/2026-11-14-a-plan.md", "docs/deploy.md"])
+        self.assertEqual(d["mode"], "affected")
+        self.assertEqual(d["ids"], [])
+        self.assertEqual(d["matrix"], {"include": []})
+        self.assertEqual(d["run"], {job: False for job in d["run"]})
+
+    def test_python_outside_scripts_runs_no_shard(self):
+        d = pr_plan(["services/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
+        self.assertEqual(d["ids"], [])
+
+    def test_a_runbook_read_by_db_tests_runs_only_those_targets(self):
+        d = pr_plan(["docs/runbooks/124-undo.sql"])
+        self.assertEqual(d["ids"], [ts.SCANS])
+        self.assertEqual(set(d["partial"]), {"epigraph-db"})
+        self.assertIn("person_authenticators", d["partial"]["epigraph-db"])
+        self.assertEqual(d["whole"], {})
+
+    def test_a_test_only_change_does_not_reach_dependents(self):
+        d = pr_plan(["crates/epigraph-db/tests/zstd_advisory_floor.rs"])
+        self.assertEqual(set(d["whole"]), {"epigraph-db"})
+        self.assertEqual(shard_ids(d), shards_of("epigraph-db"))
+
+    def test_migrations_change_runs_the_full_set(self):
+        d = pr_plan(["migrations/999_new.sql"])
+        self.assertEqual(d["mode"], "full")
+        _root, _pkgs, shards = workspace()
+        self.assertEqual(d["ids"], list(shards))
+        self.assertTrue(all(d["run"].values()))
+
+    def test_shard_script_change_runs_the_full_set(self):
+        d = pr_plan([".github/scripts/test-shard.py"])
+        self.assertEqual(d["mode"], "full")
+
+    def test_every_listed_full_path_runs_the_full_set(self):
+        for path in (
+            "Cargo.lock",
+            "Cargo.toml",
+            ".github/workflows/explorer.yml",
+            "rust-toolchain.toml",
+            ".sqlx/query-abc.json",
+            ".cargo/config.toml",
+        ):
+            self.assertEqual(pr_plan(["docs/x.md", path])["mode"], "full", path)
+
+    def test_a_crate_manifest_is_that_crate_not_the_full_set(self):
+        d = pr_plan(["crates/epigraph-tools/Cargo.toml"])
+        self.assertEqual(d["mode"], "affected")
+        self.assertIn("epigraph-tools", d["whole"])
+
+    def test_source_scans_shard_runs_per_package_at_its_thread_count(self):
+        d = pr_plan(["crates/epigraph-api/src/lib.rs"])
+        entry = [e for e in d["matrix"]["include"] if e["shard"] == ts.SCANS]
+        self.assertEqual(len(entry), 1)
+        self.assertFalse(entry[0]["save"])
+        invocations = dict(
+            (args[1], (threads, args)) for threads, args in ts.scan_invocations(json.loads(entry[0]["targets"]))
+        )
+        threads, args = invocations["epigraph-db"]
+        self.assertEqual(threads, 4)
+        self.assertIn("custodian_role", args)
+        self.assertEqual(args[:2], ["-p", "epigraph-db"])
+
+    def test_a_package_a_selected_shard_covers_gets_no_scan_targets(self):
+        # A db source change selects workspace-rest (jobs etc. depend on db),
+        # which runs epigraph-crypto in full, so crypto's ratchet is not also
+        # in source-scans.
+        d = pr_plan(["crates/epigraph-db/src/lib.rs"])
+        self.assertNotIn(ts.SCANS, shard_ids(d))
+
+
+class SourceScanDetection(unittest.TestCase):
+    """`scan_reads` on a synthetic tree, so the rules are pinned independent
+    of what this repository's tests happen to read today."""
+
+    def tree(self, files):
+        root = tempfile.mkdtemp()
+        for path, text in files.items():
+            full = os.path.join(root, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as fh:
+                fh.write(text)
+        pkgs = {}
+        for name in ("alpha", "beta"):
+            d = os.path.join(root, "crates", name)
+            pkgs[name] = {
+                "manifest_path": os.path.join(d, "Cargo.toml"),
+                "dependencies": [],
+                "features": {},
+                "targets": [
+                    {"kind": ["lib"], "name": name, "src_path": os.path.join(d, "src", "lib.rs")},
+                    {"kind": ["test"], "name": "scan", "src_path": os.path.join(d, "tests", "scan.rs")},
+                ],
+            }
+        dirs = ts.package_dirs(root, pkgs)
+        return root, pkgs, dirs, sorted(files)
+
+    BASE = {
+        "crates/alpha/Cargo.toml": "",
+        "crates/alpha/src/lib.rs": "",
+        "crates/beta/Cargo.toml": "",
+        "crates/beta/src/lib.rs": "",
+        "crates/beta/src/routes.rs": "",
+        "docs/runbooks/1-undo.sql": "",
+        "calibration.toml": "",
+    }
+
+    def test_literal_reads_are_found_relative_to_the_manifest_and_the_root(self):
+        files = dict(self.BASE)
+        files["crates/alpha/tests/scan.rs"] = (
+            'const A: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../beta/src/routes.rs");\n'
+            'fn f(root: &Path) { root.join("docs/runbooks/1-undo.sql"); }\n'
+            '// "calibration.toml" in a comment is not a read\n'
+        )
+        root, pkgs, dirs, names = self.tree(files)
+        reads, walkers = ts.scan_reads(root, pkgs, dirs, names)
+        found = {(r[0], r[2], r[3], r[4]) for r in reads}
+        self.assertIn(("alpha", "crates/beta/src/routes.rs", ts.TARGETS, ("scan",)), found)
+        self.assertIn(("alpha", "docs/runbooks/1-undo.sql", ts.TARGETS, ("scan",)), found)
+        self.assertNotIn("calibration.toml", {r[2] for r in reads})
+        self.assertEqual(walkers, set())
+
+    def test_an_include_in_library_code_propagates(self):
+        files = dict(self.BASE)
+        files["crates/alpha/src/lib.rs"] = 'const C: &str = include_str!("../../../calibration.toml");\n'
+        root, pkgs, dirs, names = self.tree(files)
+        reads, _ = ts.scan_reads(root, pkgs, dirs, names)
+        self.assertIn(("alpha", "calibration.toml", ts.PROPAGATES), {(r[0], r[2], r[3]) for r in reads})
+
+    def test_a_read_in_a_unit_test_module_stays_in_the_package(self):
+        files = dict(self.BASE)
+        files["crates/alpha/src/lib.rs"] = '#[cfg(test)]\nmod tests { const P: &str = "docs/runbooks/1-undo.sql"; }\n'
+        root, pkgs, dirs, names = self.tree(files)
+        reads, _ = ts.scan_reads(root, pkgs, dirs, names)
+        self.assertEqual({(r[2], r[3]) for r in reads}, {("docs/runbooks/1-undo.sql", ts.PACKAGE)})
+
+    def test_an_undeclared_whole_tree_walk_is_flagged(self):
+        files = dict(self.BASE)
+        files["crates/alpha/tests/scan.rs"] = (
+            'fn root() -> PathBuf { Path::new(env!("CARGO_MANIFEST_DIR")).join("../..") }\n'
+            'fn walk() { for e in std::fs::read_dir(root().join("crates")).unwrap() {} }\n'
+        )
+        root, pkgs, dirs, names = self.tree(files)
+        _reads, walkers = ts.scan_reads(root, pkgs, dirs, names)
+        self.assertEqual(walkers, {"crates/alpha/tests/scan.rs"})
+        out = io.StringIO()
+        self.assertFalse(ts.check_walkers(walkers, declared={}, out=out))
+        self.assertIn("FAIL crates/alpha/tests/scan.rs", out.getvalue())
+        self.assertTrue(ts.check_walkers(walkers, declared={"crates/alpha/tests/scan.rs": ()}, out=out))
+
+    def test_the_real_tree_declares_every_walker(self):
+        self.assertEqual(reads()[1], set(ts.WALKERS))
+
+
+class EventPolicy(unittest.TestCase):
+    def test_non_pull_request_events_run_the_full_set(self):
+        for event in ("push", "merge_group", "workflow_dispatch", "schedule", "something_new"):
+            d = pr_plan(["docs/x.md"], GITHUB_EVENT_NAME=event)
+            self.assertEqual(d["mode"], "full", event)
+
+    def test_staging_and_integration_heads_run_the_full_set(self):
+        for head in (
+            "integration/2026-11-14",
+            "integration/a/b",
+            "staging/nightly-1114",
+            "backlog/base-20261114",
+            "atlas/w3-base",
+        ):
+            self.assertEqual(pr_plan(["docs/x.md"], GITHUB_HEAD_REF=head)["mode"], "full", head)
+
+    def test_ordinary_heads_are_narrowed(self):
+        for head in ("perf/ci-affected-shards", "atlas/w3", "backlog/b07", "claude/staging-fix"):
+            self.assertEqual(pr_plan(["docs/x.md"], GITHUB_HEAD_REF=head)["mode"], "affected", head)
+
+    def test_the_ci_full_label_runs_the_full_set(self):
+        d = pr_plan(["docs/x.md"], PR_LABELS=json.dumps(["documentation", "ci:full"]))
+        self.assertEqual(d["mode"], "full")
+        d = pr_plan(["docs/x.md"], PR_LABELS=json.dumps(["documentation"]))
+        self.assertEqual(d["mode"], "affected")
+
+    def test_an_undiffable_pull_request_runs_the_full_set(self):
+        root, pkgs, shards = workspace()
+        env = {"GITHUB_EVENT_NAME": "pull_request", "DIFF_BASE": "no-such-ref-anywhere"}
+        self.assertEqual(ts.decide(root, pkgs, shards, env)["mode"], "full")
+        env = {"GITHUB_EVENT_NAME": "pull_request"}
+        self.assertEqual(ts.decide(root, pkgs, shards, env)["mode"], "full")
+
+
+class Gate(unittest.TestCase):
+    def needs(self, run, **results):
+        out = {"plan": {"result": "success", "outputs": {"run": json.dumps(run)}}}
+        for name, result in results.items():
+            out[name.replace("_", "-")] = {"result": result, "outputs": {}}
+        return out
+
+    RUN_NONE = {"test-shard": False, "test-extra": False, "lint-features": False}
+    RUN_ALL = {"test-shard": True, "test-extra": True, "lint-features": True}
+
+    def test_empty_matrix_with_skipped_jobs_passes(self):
+        needs = self.needs(self.RUN_NONE, test_shard="skipped", test_extra="skipped", lint_features="skipped")
+        self.assertEqual(ts.gate(needs), [])
+
+    def test_all_requested_and_successful_passes(self):
+        needs = self.needs(self.RUN_ALL, test_shard="success", test_extra="success", lint_features="success")
+        self.assertEqual(ts.gate(needs), [])
+
+    def test_a_requested_job_that_was_skipped_fails(self):
+        needs = self.needs(self.RUN_ALL, test_shard="skipped", test_extra="success", lint_features="success")
+        self.assertEqual(len(ts.gate(needs)), 1)
+
+    def test_a_failure_or_cancellation_fails(self):
+        for result in ("failure", "cancelled"):
+            needs = self.needs(self.RUN_ALL, test_shard=result, test_extra="success", lint_features="success")
+            self.assertTrue(ts.gate(needs), result)
+
+    def test_a_skipped_job_that_ran_and_failed_fails(self):
+        needs = self.needs(self.RUN_NONE, test_shard="failure", test_extra="skipped", lint_features="skipped")
+        self.assertTrue(ts.gate(needs))
+
+    def test_nothing_passes_without_a_successful_plan(self):
+        for plan in ({"result": "failure", "outputs": {}}, {"result": "success", "outputs": {}}):
+            needs = {"plan": plan, "test-shard": {"result": "skipped"}}
+            self.assertTrue(ts.gate(needs), plan)
+        self.assertTrue(ts.gate({"test-shard": {"result": "success"}}))
+
+    def test_a_job_the_plan_does_not_gate_must_succeed(self):
+        needs = self.needs(self.RUN_NONE, test_shard="skipped", something_new="skipped")
+        self.assertTrue(ts.gate(needs))
+
+
+class Workflow(unittest.TestCase):
+    """The job graph in ci.yml that the planner's outputs drive."""
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml  # the `plan` job installs it when the image lacks it
+
+        with open(WORKFLOW) as fh:
+            cls.text = fh.read()
+        cls.ci = yaml.safe_load(cls.text)
+        cls.jobs = cls.ci["jobs"]
+
+    def test_shard_matrix_and_skip_come_from_the_plan(self):
+        shard = self.jobs["test-shard"]
+        self.assertEqual(shard["needs"], "plan")
+        self.assertEqual(shard["strategy"]["matrix"], "${{ fromJSON(needs.plan.outputs.matrix) }}")
+        self.assertFalse(shard["strategy"]["fail-fast"])
+        self.assertEqual(shard["if"], "${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}")
+
+    def test_gated_jobs_follow_their_run_flag(self):
+        for job in ts.EXTRA_JOBS:
+            self.assertEqual(self.jobs[job]["needs"], "plan", job)
+            self.assertEqual(self.jobs[job]["if"], "${{ fromJSON(needs.plan.outputs.run)['%s'] }}" % job, job)
+
+    def test_gated_jobs_test_only_their_listed_packages(self):
+        import re
+
+        # The test and lint commands; `cargo build -p epigraph-api --bin
+        # epigraph-migrate` is how every database job migrates, not a test of
+        # epigraph-api.
+        for job, packages in ts.EXTRA_JOBS.items():
+            runs = " ".join(
+                line
+                for s in self.jobs[job]["steps"]
+                for line in s.get("run", "").splitlines()
+                if line.lstrip().startswith(("cargo test", "cargo clippy", "cargo check"))
+            )
+            named = set(re.findall(r"(?<![\w-])-p\s+([a-z][a-z0-9-]*)", runs))
+            self.assertTrue(named, job)
+            self.assertLessEqual(named, set(packages), job)
+
+    def test_the_gate_needs_plan_and_every_blocking_test_job(self):
+        gate = self.jobs["test"]
+        self.assertEqual(gate["if"], "${{ !cancelled() }}")
+        self.assertEqual(set(gate["needs"]), {"plan", "test-shard", "test-extra", "lint-features"})
+        run = " ".join(s.get("run", "") for s in gate["steps"])
+        self.assertIn("test-shard.py gate", run)
+        env = [s for s in gate["steps"] if "run" in s][0]["env"]
+        self.assertEqual(env["NEEDS"], "${{ toJSON(needs) }}")
+
+    def test_plan_outputs_are_the_ones_the_jobs_read(self):
+        outputs = set(self.jobs["plan"]["outputs"])
+        used = set(__import__("re").findall(r"needs\.plan\.outputs\.(\w+)", self.text))
+        self.assertLessEqual(used, outputs)
+
+    def test_plan_can_diff_a_pull_request_and_still_checks_the_full_plan(self):
+        steps = self.jobs["plan"]["steps"]
+        checkout = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")][0]
+        self.assertGreaterEqual(checkout["with"]["fetch-depth"], 2)
+        runs = [s.get("run", "") for s in steps]
+        self.assertTrue(any(r.strip() == "python3 .github/scripts/test-shard.py check" for r in runs))
+        self.assertTrue(any("unittest discover -s .github/scripts/tests" in r for r in runs))
+        self.assertTrue(any("DIFF_BASE=HEAD^1" in r and "ci-plan" in r for r in runs))
+
+    def test_source_scans_shard_has_its_own_test_step(self):
+        steps = {s.get("name"): s for s in self.jobs["test-shard"]["steps"]}
+        self.assertEqual(steps["Test"]["if"], "matrix.shard != 'source-scans'")
+        self.assertEqual(steps["Test (source scans)"]["if"], "matrix.shard == '%s'" % ts.SCANS)
+        self.assertIn("scan-args", steps["Test (source scans)"]["run"])
+
+
+if __name__ == "__main__":
+    unittest.main()
