@@ -1275,7 +1275,9 @@ enum Command {
         /// not JSON): what a run that crashed mid-append leaves. It is
         /// dropped and printed as a WARN line; every other malformed line is
         /// still refused. Prove first, from the database, that the batch the
-        /// torn record belongs to rolled back, and dry-run on a copy.
+        /// torn record belongs to rolled back, and dry-run on a copy. Pass
+        /// the crashed manifest together with every manifest a resumed run
+        /// wrote, so they are reversed newest first.
         #[arg(long)]
         allow_truncated_tail: bool,
     },

@@ -2390,6 +2390,14 @@ epigraph-operator restrict-claims ... --manifest-out restrict-1.jsonl --apply \
 epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 ```
 
+- **A crashed run's manifest**: a run that crashed mid-append can leave a torn
+  final line, which `reown-reverse` refuses unless `--allow-truncated-tail`
+  (on any manifest it reads). Every record of the torn batch
+  is phantom, because its batch never committed. First prove from the
+  database that that batch rolled back. Then reverse the crashed manifest
+  TOGETHER with every manifest a resumed run wrote, in one `reown-reverse`
+  call, dry run first and then `--apply`: it applies them newest first, so the
+  crashed manifest cannot restore rows a later run moved again.
 - **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
   public owners). The target must be an existing `active` group, not world or
   seed, administered by `--operator`. A claim whose move would make another
