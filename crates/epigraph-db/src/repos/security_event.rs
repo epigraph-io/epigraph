@@ -250,9 +250,9 @@ impl SecurityEventRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the SELECT fails.
-    #[instrument(skip(pool))]
-    pub async fn query(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn query<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         filter: SecurityEventFilter,
     ) -> Result<Vec<SecurityEventRow>, DbError> {
         let limit = filter.limit.unwrap_or(1000).min(10_000);
@@ -290,7 +290,7 @@ impl SecurityEventRepository {
             filter.failures_only,
             limit,
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(DbError::from)?;
 

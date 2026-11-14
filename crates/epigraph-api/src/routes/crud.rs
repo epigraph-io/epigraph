@@ -556,8 +556,10 @@ pub async fn update_evidence(
 pub struct CreateReasoningTraceRequest {
     /// ID of the claim this trace explains
     pub claim_id: Uuid,
-    /// Agent that produced the reasoning
-    pub agent_id: Uuid,
+    /// Agent that produced the reasoning. Omitted, it is the authenticated
+    /// caller; named, it must BE the caller (backlog f64cf9c6).
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
     /// Methodology: deductive, inductive, abductive, statistical
     pub methodology: String,
     /// Confidence in [0.0, 1.0]
@@ -583,8 +585,24 @@ pub struct ReasoningTraceResponse {
 /// Create a new reasoning trace
 ///
 /// POST /api/v1/reasoning-traces
+///
+/// The author is the authenticated caller (backlog f64cf9c6,
+/// `experiment_loop.rs::caller_author`): an omitted `agent_id` is the caller's
+/// own, a named one that is not the caller is `403`, and an absent
+/// `AuthContext` is a refusal, not a pass. The trace and its `HAS_TRACE` edge
+/// are written on ONE transaction stamped with the caller's viewer
+/// (`AppState::write_as`), so the database decides the trace's owner from the
+/// caller's writable groups.
+///
+/// The claim is read as the caller on that transaction first: a claim the
+/// caller cannot read gets the same `404` as one that does not exist, so the
+/// route is no existence oracle (as `belief.rs::submit_evidence` step 5a). A
+/// readable claim the database refuses the trace on is `403` with nothing
+/// written. The edge stays best-effort, as it was, under a savepoint so a
+/// refused edge does not roll the trace back.
 #[cfg(feature = "db")]
 pub async fn create_reasoning_trace(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateReasoningTraceRequest>,
@@ -592,10 +610,17 @@ pub async fn create_reasoning_trace(
     use epigraph_core::{AgentId, ClaimId, Methodology, ReasoningTrace, TraceInput};
     use epigraph_db::ReasoningTraceRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
+    let author = crate::routes::experiment_loop::caller_author(
+        &viewer,
+        request.agent_id,
+        "a reasoning trace",
+    )?;
 
     // Validate confidence
     if !(0.0..=1.0).contains(&request.confidence) {
@@ -631,38 +656,69 @@ pub async fn create_reasoning_trace(
         vec![]
     };
 
-    // Resolve public key
-    let public_key = epigraph_db::AgentRepository::get_by_id(
-        &state.db_pool,
-        AgentId::from_uuid(request.agent_id),
-    )
-    .await
-    .ok()
-    .flatten()
-    .map(|a| a.public_key)
-    .unwrap_or([0u8; 32]);
+    let refused = |e: &epigraph_db::DbError| {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "create_reasoning_trace",
+            error = %e,
+            "the database refused the reasoning trace"
+        );
+        crate::errors::write_refused("claim")
+    };
+    let mut tx = state.write_as(&viewer, "create_reasoning_trace").await?;
 
+    // The claim, read as the caller. Unreadable and nonexistent answer alike.
+    {
+        let sql = viewer.splice(
+            "SELECT c.id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(request.claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+            .is_none()
+        {
+            return Err(ApiError::NotFound {
+                entity: "claim".to_string(),
+                id: request.claim_id.to_string(),
+            });
+        }
+    }
+
+    // `reasoning_traces` stores neither the author nor its key
+    // (`ReasoningTraceRepository::create_with_reasoning_type`), so no key is
+    // looked up.
     let trace = ReasoningTrace::new(
-        AgentId::from_uuid(request.agent_id),
-        public_key,
+        AgentId::from_uuid(author),
+        [0u8; 32],
         methodology,
         inputs,
         request.confidence,
         request.explanation.clone(),
     );
 
-    let created = ReasoningTraceRepository::create(
-        &state.db_pool,
-        &trace,
-        ClaimId::from_uuid(request.claim_id),
-    )
-    .await?;
+    let created =
+        ReasoningTraceRepository::create(&mut *tx, &trace, ClaimId::from_uuid(request.claim_id))
+            .await
+            .map_err(|e| {
+                if crate::errors::db_is_insufficient_privilege(&e) {
+                    refused(&e)
+                } else {
+                    ApiError::from(e)
+                }
+            })?;
 
     let trace_id: Uuid = created.id.into();
 
-    // Materialize claim --HAS_TRACE--> trace edge
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    // Materialize claim --HAS_TRACE--> trace edge (best-effort, as before)
+    crate::routes::belief::create_edge_under_savepoint(
+        &mut tx,
         state.edge_signing_key(),
         request.claim_id,
         "claim",
@@ -670,28 +726,28 @@ pub async fn create_reasoning_trace(
         "trace",
         "HAS_TRACE",
         None,
-        None,
-        None,
     )
-    .await;
+    .await?;
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the reasoning trace: {e}"),
+    })?;
 
     // Record provenance
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        let hash = blake3::hash(trace_id.as_bytes());
-        if let Err(e) = crate::middleware::provenance::record_provenance(
-            &state.db_pool,
-            auth,
-            "trace",
-            trace_id,
-            "create",
-            hash.as_bytes(),
-            &[],
-            None,
-        )
-        .await
-        {
-            tracing::warn!(trace_id = %trace_id, error = %e, "Failed to record trace provenance");
-        }
+    let hash = blake3::hash(trace_id.as_bytes());
+    if let Err(e) = crate::middleware::provenance::record_provenance(
+        &state.db_pool,
+        auth,
+        "trace",
+        trace_id,
+        "create",
+        hash.as_bytes(),
+        &[],
+        None,
+    )
+    .await
+    {
+        tracing::warn!(trace_id = %trace_id, error = %e, "Failed to record trace provenance");
     }
 
     Ok((
@@ -699,7 +755,7 @@ pub async fn create_reasoning_trace(
         Json(ReasoningTraceResponse {
             id: trace_id,
             claim_id: request.claim_id,
-            agent_id: request.agent_id,
+            agent_id: author,
             methodology: request.methodology,
             confidence: request.confidence,
             explanation: request.explanation,

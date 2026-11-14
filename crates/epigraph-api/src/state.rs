@@ -42,8 +42,11 @@ pub struct CachedSubmission {
     pub created_at: Instant,
 }
 
-/// Idempotency store type alias
-pub type IdempotencyStore = Arc<RwLock<HashMap<String, CachedSubmission>>>;
+/// Idempotency store type alias.
+///
+/// Keyed by `(authenticated principal, client idempotency key)`: a client key
+/// is only unique within the caller that chose it (backlog 449bc6c1).
+pub type IdempotencyStore = Arc<RwLock<HashMap<(Uuid, String), CachedSubmission>>>;
 
 /// Thread-safe propagation orchestrator type alias
 pub type SharedOrchestrator = Arc<RwLock<PropagationOrchestrator>>;

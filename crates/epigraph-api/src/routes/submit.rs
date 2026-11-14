@@ -1805,6 +1805,19 @@ async fn persist_packet(
 // HANDLER
 // =============================================================================
 
+/// The principal the in-process idempotency cache files an entry under
+/// (backlog 449bc6c1). `None` (a viewer with no principal, or the build
+/// without a database, which persists nothing) bypasses the cache.
+#[cfg(feature = "db")]
+fn idempotency_principal(viewer: &epigraph_db::visibility::Viewer) -> Option<Uuid> {
+    viewer.principal()
+}
+
+#[cfg(not(feature = "db"))]
+fn idempotency_principal(_viewer: &crate::middleware::bearer::NoDbViewer) -> Option<Uuid> {
+    None
+}
+
 /// Submit a complete epistemic packet
 ///
 /// POST /api/v1/submit/packet
@@ -1841,8 +1854,21 @@ pub async fn submit_packet(
         }
     };
 
-    // 1. Check for idempotent duplicate
-    if let Some(ref key) = packet.claim.idempotency_key {
+    // 1. Validate the packet
+    if let Err((status, error)) = validate_packet(&packet, &state).await {
+        return error_response(status, error);
+    }
+
+    // 2. Check for idempotent duplicate, AFTER validation and only among this
+    //    caller's own entries (backlog 449bc6c1): the key is the client's, so
+    //    it is namespaced by the authenticated principal, and a packet that
+    //    fails validation never reads the cache.
+    let cache_key: Option<(Uuid, String)> = packet
+        .claim
+        .idempotency_key
+        .as_ref()
+        .and_then(|key| idempotency_principal(&viewer).map(|p| (p, key.clone())));
+    if let Some(ref key) = cache_key {
         let idempotency_store = state.idempotency_store.read().await;
         if let Some(cached_response) = idempotency_store.get(key) {
             return (
@@ -1860,11 +1886,6 @@ pub async fn submit_packet(
             )
                 .into_response();
         }
-    }
-
-    // 2. Validate the packet
-    if let Err((status, error)) = validate_packet(&packet, &state).await {
-        return error_response(status, error);
     }
 
     // 3. Calculate truth value from evidence (NOT from reputation - BAD ACTOR TEST)
@@ -2286,8 +2307,8 @@ pub async fn submit_packet(
         })
         .await;
 
-    // 10. Store in idempotency cache (if key provided)
-    if let Some(ref key) = packet.claim.idempotency_key {
+    // 10. Store in idempotency cache (if key provided), under this caller
+    if let Some(key) = cache_key {
         let mut idempotency_store = state.idempotency_store.write().await;
 
         // Evict oldest entries if cache is at capacity (DoS prevention)
@@ -2305,7 +2326,7 @@ pub async fn submit_packet(
         }
 
         idempotency_store.insert(
-            key.clone(),
+            key,
             CachedSubmission {
                 claim_id,
                 truth_value,

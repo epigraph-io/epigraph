@@ -383,7 +383,11 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // shape on the way. Its `record_provenance` block is a SEPARATE `if let`
     // and is deliberately untouched — it is still counted, in the other
     // register, where the count stays 4.
-    ("crud.rs", 6),
+    // 6 -> 5 (backlog f64cf9c6): `create_reasoning_trace` took `ViewerExtractor`
+    // and the prescribed `let Some(..) = auth_ctx else { return
+    // Err(ApiError::Unauthorized ..) }` shape, and checks `claims:write`
+    // unconditionally.
+    ("crud.rs", 5),
     // `("edges.rs", 5)` REMOVED by batch W12b, on the PR-10 precedent above:
     // the five write handlers (`create_edge`, `create_hierarchical_edge`,
     // `patch_edge`, `delete_edge`, `relate_claims`) took `ViewerExtractor`,
@@ -425,7 +429,9 @@ const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
     // provenance block was respelled out of the needles' view by the move into
     // `create_claim_core`, and the row goes only because the block is now
     // unconditional on the `ctx` the function binds as its first statement.
-    ("crud.rs", 4),
+    // 4 -> 3 (backlog f64cf9c6): `create_reasoning_trace` binds `AuthContext`
+    // unconditionally, so it records provenance on every call.
+    ("crud.rs", 3),
     // `("edges.rs", 4)` REMOVED by batch W12b: the provenance blocks of
     // `create_edge`, `delete_edge`, `patch_edge` and `relate_claims` sit in
     // handlers that now bind `AuthContext` unconditionally (see the

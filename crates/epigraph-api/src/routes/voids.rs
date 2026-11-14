@@ -34,6 +34,10 @@ pub struct DensityQuery {
     pub radius: Option<f64>,
 }
 
+/// The most concepts one `POST /api/v1/voids/detect` request may carry.
+#[cfg(feature = "db")]
+pub const MAX_VOID_CONCEPTS: usize = 50;
+
 // ── Handlers ──
 
 /// POST /api/v1/voids/detect - Detect knowledge voids for concepts.
@@ -70,23 +74,25 @@ pub struct DensityQuery {
 /// purpose: deref coercion does not fire against a generic `E`, so `&mut read`
 /// would infer `E = &mut ScopedRead<'_>` and fail the bound.
 ///
-/// # Footprint: one connection across N embed round trips
+/// # Footprint (F-PR29-A1)
 ///
-/// The acquire is hoisted above the concept loop so that every concept in one
-/// request is answered from the same stamped session — a request that returned
-/// `void` for one concept and `covered` for another because the two sampled
-/// different sessions would be describing two different corpora. The cost is
-/// that the connection is held across `request.concepts.len()` outbound
-/// embedding calls, and `concepts` is caller-supplied and unbounded. That is a
-/// real footprint cost and it is recorded here rather than left implicit; it is
-/// the same shape `F-PR26-lineage-holds-one-connection-for-n-round-trips`
-/// names, and this shard does NOT discharge that finding.
+/// Every concept in one request is answered from the same stamped session — a
+/// request that returned `void` for one concept and `covered` for another
+/// because the two sampled different sessions would be describing two
+/// different corpora. The request size is bounded by [`MAX_VOID_CONCEPTS`].
 #[cfg(feature = "db")]
 pub async fn detect_voids(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<DetectVoidsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if request.concepts.len() > MAX_VOID_CONCEPTS {
+        return Err(ApiError::ValidationError {
+            field: "concepts".to_string(),
+            reason: format!("at most {MAX_VOID_CONCEPTS} concepts per request"),
+        });
+    }
+
     let embedder = state.embedding_service().ok_or(ApiError::InternalError {
         message: "Embedding service not configured".into(),
     })?;
@@ -97,6 +103,18 @@ pub async fn detect_voids(
     let mut voids = Vec::new();
     let mut sparse = Vec::new();
     let mut covered = Vec::new();
+
+    // F-PR29-A1.
+    let mut embeddings = Vec::with_capacity(request.concepts.len());
+    for concept in &request.concepts {
+        let embedding = embedder
+            .generate(concept)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to embed concept '{concept}': {e}"),
+            })?;
+        embeddings.push(embedding);
+    }
 
     // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/claims_query.rs`).
     // `read_as`'s refusal reason is internal design prose aimed at whoever
@@ -115,14 +133,7 @@ pub async fn detect_voids(
         }
     })?;
 
-    for concept in &request.concepts {
-        let embedding = embedder
-            .generate(concept)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to embed concept '{concept}': {e}"),
-            })?;
-
+    for (concept, embedding) in request.concepts.iter().zip(&embeddings) {
         // Find nearest VISIBLE claim. `min_similarity = NO_SIMILARITY_FLOOR`
         // reproduces the old unbounded `ORDER BY embedding <=> $1 LIMIT 1`:
         // cosine similarity is bounded below by -1, so the floor excludes
@@ -130,7 +141,7 @@ pub async fn detect_voids(
         let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
             &mut *read,
             &viewer,
-            epigraph_db::FlatRanking::Query(&format_embedding(&embedding)),
+            epigraph_db::FlatRanking::Query(&format_embedding(embedding)),
             NO_SIMILARITY_FLOOR,
             None,
             None,

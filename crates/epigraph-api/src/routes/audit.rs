@@ -64,20 +64,16 @@ pub struct SecurityEventResponse {
 ///
 /// # Per-principal scoping lives in the database, not here
 ///
-/// This read runs on the unscoped `state.db_pool` — entry
-/// `("routes/audit.rs", 1)` on `no_unscoped_pool.rs`'s register, an accepted
-/// debt, and that register is a count ceiling rather than a certification that
-/// the read is scoped. Per-principal narrowing is therefore the
-/// `security_events_read` RLS policy's job alone, and migration 083 recreates
-/// and widens that policy. Note also that `audit:read` is a member of
-/// `canonical_scopes::READ_SCOPES`, not of `ADMIN_ONLY_SCOPES`.
-///
-/// The coupling between this handler and that policy is carried as an open
-/// obligation in `docs/tenancy/progress.json` under `F-PR18a-B1`, assigned to
-/// the conversion-shard series; analysis is held outside this repository.
-/// PR-18a ships no route and deliberately does not convert this site.
+/// The read runs on a connection stamped with the caller's viewer
+/// (`AppState::read_as`), so the `security_events_read` row-security policy
+/// (latest definition: migration 169) narrows the result to what that policy
+/// admits for the caller. The handler adds no row predicate of its own. Note
+/// that `audit:read` is a member of `canonical_scopes::READ_SCOPES`, not of
+/// `ADMIN_ONLY_SCOPES`, so the scope gate alone does not make this an
+/// administrator's route.
 #[cfg(feature = "db")]
 pub async fn query_security_events(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<SecurityEventQuery>,
@@ -110,7 +106,21 @@ pub async fn query_security_events(
         limit: Some(params.limit.unwrap_or(100).clamp(1, 10_000)),
     };
 
-    let rows = SecurityEventRepository::query(&state.db_pool, filter).await?;
+    // The error shape follows `routes/claims_query.rs`: `read_as`'s refusal
+    // reason is logged in full and answered with an opaque message.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "query_security_events",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows = SecurityEventRepository::query(&mut *read, filter).await?;
+    crate::routes::finish_scoped_read(read, "query_security_events").await?;
 
     let response: Vec<SecurityEventResponse> = rows
         .into_iter()

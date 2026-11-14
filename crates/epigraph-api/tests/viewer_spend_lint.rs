@@ -193,6 +193,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query(UPDATE).execute",
         ],
     ),
+    // stamped (backlog 8a168dd6): the read runs on `AppState::read_as` with the
+    // caller's viewer; `security_events` has no in-query viewer predicate, so
+    // row security (`security_events_read`) is the filter, by design.
+    (
+        "audit.rs",
+        "query_security_events",
+        &["SecurityEventRepository::query"],
+    ),
     // stamped: the write transaction is stamped from the caller's viewer, and
     // the retract / un-retract definer (migration 184) selects the BBA only
     // when it is public or owned by a group in the session's read set, so an
@@ -462,6 +470,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "assign_claim_to_frame",
         &[
             "FrameRepository::assign_claim",
+            "provenance::record_provenance",
+        ],
+    ),
+    // stamped / write (backlog f64cf9c6): the author is the caller; the
+    // claim's viewer-spliced pre-read, the trace and its best-effort edge run
+    // on ONE `AppState::write_as` transaction, so the database decides the
+    // trace's owner (`reasoning_traces_attach_writer`) and refuses what the
+    // caller may not write. Provenance is the audit-trail append.
+    (
+        "crud.rs",
+        "create_reasoning_trace",
+        &[
+            "ReasoningTraceRepository::create",
+            "belief::create_edge_under_savepoint",
             "provenance::record_provenance",
         ],
     ),

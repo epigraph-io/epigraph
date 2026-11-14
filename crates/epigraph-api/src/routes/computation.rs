@@ -839,7 +839,68 @@ fn claims_informed_by_less_readable(
     out
 }
 
+/// The largest `max_iterations` `/bp/propagate` accepts (backlog 69f52e3f).
+#[cfg(feature = "db")]
+pub const BP_MAX_ITERATIONS: usize = 200;
+
+/// `/bp/propagate`'s run parameters, bounded (backlog 69f52e3f).
+///
+/// The BP loops (`epigraph_engine::run_bp`, `cdst_bp::run_cdst_bp`) stop only
+/// at `max_change < convergence_threshold` or at `max_iterations`, so both are
+/// caller-controlled run time: `max_iterations` is at most
+/// [`BP_MAX_ITERATIONS`], `convergence_threshold` must be a finite number above
+/// zero, and `damping` must lie in `[0, 1)` (at `1` no message ever moves).
+/// Out of range is `400`, never a silent clamp.
+#[cfg(feature = "db")]
+fn bp_config_from(request: &PropagateRequest) -> Result<epigraph_engine::BpConfig, ApiError> {
+    let max_iterations = request.max_iterations.unwrap_or(20);
+    if max_iterations > BP_MAX_ITERATIONS {
+        return Err(ApiError::ValidationError {
+            field: "max_iterations".to_string(),
+            reason: format!("must be at most {BP_MAX_ITERATIONS}"),
+        });
+    }
+    let convergence_threshold = request.convergence_threshold.unwrap_or(0.01);
+    if !(convergence_threshold.is_finite() && convergence_threshold > 0.0) {
+        return Err(ApiError::ValidationError {
+            field: "convergence_threshold".to_string(),
+            reason: "must be a finite number greater than 0".to_string(),
+        });
+    }
+    let damping = request.damping.unwrap_or(0.5);
+    if !(0.0..1.0).contains(&damping) {
+        return Err(ApiError::ValidationError {
+            field: "damping".to_string(),
+            reason: "must be at least 0 and less than 1".to_string(),
+        });
+    }
+    Ok(epigraph_engine::BpConfig {
+        max_iterations,
+        convergence_threshold,
+        damping,
+    })
+}
+
+/// Run a BP engine on the blocking pool, off the async runtime's workers
+/// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
+/// sweeps of the factor graph.
+#[cfg(feature = "db")]
+async fn run_bp_blocking<T, F>(run: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(run)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("belief propagation did not complete: {e}"),
+        })
+}
+
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
+///
+/// The run parameters are bounded ([`bp_config_from`]) and the engine runs on
+/// the blocking pool ([`run_bp_blocking`]).
 ///
 /// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
 /// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
@@ -863,11 +924,7 @@ pub async fn propagate_beliefs(
     State(state): State<AppState>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = epigraph_engine::BpConfig {
-        max_iterations: request.max_iterations.unwrap_or(20),
-        convergence_threshold: request.convergence_threshold.unwrap_or(0.01),
-        damping: request.damping.unwrap_or(0.5),
-    };
+    let config = bp_config_from(&request)?;
     let apply = request.apply_updates.unwrap_or(false);
     if apply {
         crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
@@ -1083,12 +1140,16 @@ pub async fn propagate_beliefs(
             ..epigraph_engine::cdst_bp::CdstBpConfig::default()
         };
 
-        let result = epigraph_engine::cdst_bp::run_cdst_bp(
-            &engine_factors,
-            &initial,
-            &evidence,
-            &cdst_config,
-        );
+        let factors_count = engine_factors.len();
+        let result = run_bp_blocking(move || {
+            epigraph_engine::cdst_bp::run_cdst_bp(
+                &engine_factors,
+                &initial,
+                &evidence,
+                &cdst_config,
+            )
+        })
+        .await?;
 
         // Apply updates: write pignistic_prob, belief, plausibility to claims,
         // all-or-nothing on one transaction stamped with the caller's viewer
@@ -1123,7 +1184,7 @@ pub async fn propagate_beliefs(
             "max_change": result.max_change,
             "max_conflict": result.max_conflict,
             "messages_sent": result.messages_sent,
-            "factors_count": engine_factors.len(),
+            "factors_count": factors_count,
             "variables_count": all_var_ids.len(),
             "applied": apply,
             "applied_count": written,
@@ -1138,7 +1199,11 @@ pub async fn propagate_beliefs(
     }
 
     // -- Scalar BP fallback ---------------------------------------------------
-    let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
+    let factors_count = engine_factors.len();
+    let result = run_bp_blocking(move || {
+        epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config)
+    })
+    .await?;
 
     let (mut written, mut skipped, mut skipped_compounds, mut skipped_less_readable) =
         (0_usize, 0_usize, 0_usize, 0_usize);
@@ -1164,7 +1229,7 @@ pub async fn propagate_beliefs(
         "converged": result.converged,
         "max_change": result.max_change,
         "messages_sent": result.messages_sent,
-        "factors_count": engine_factors.len(),
+        "factors_count": factors_count,
         "variables_count": all_var_ids.len(),
         "applied": apply,
         "applied_count": written,
