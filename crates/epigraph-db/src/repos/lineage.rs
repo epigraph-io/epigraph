@@ -616,33 +616,25 @@ impl LineageRepository {
 
         // Query trace parents for DAG structure.
         //
-        // FOLLOW-UP TRACKED: this statement's filtering behaviour is covered by
-        // `F-PR26-trace-parents-followup` in docs/tenancy/progress.json. The
-        // analysis is deliberately held outside this repository; consult it
-        // before changing this statement or the shape it returns.
-        //
-        // Pre-existing and unchanged by the PR-26 conversion, which moved this
-        // statement onto a different CONNECTION and nothing else.
-        //
-        // DO NOT reach for the exemption convention here as a shortcut. It keys
-        // on `(file, fn)` and `visibility_lint.rs` reads comment TEXT, so using
-        // one in this body would register the WHOLE walk as reviewed-and-exempt
-        // and remove it from
-        // `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`.
-        // MEASURED, not reasoned: an earlier draft that spelled the annotation
-        // turned `the_exemption_set_is_exactly_what_was_reviewed` red with both
-        // walks added to the exempt set.
+        // `F-PR26-trace-parents-followup` (docs/tenancy/progress.json):
+        // `trace_parents` has no tenancy columns, so the parent side is joined
+        // to `reasoning_traces` and the viewer predicate is spliced there.
         let trace_parent_rows: Vec<TraceParentRow> = if !trace_ids.is_empty() {
-            sqlx::query_as(
+            let psql = viewer.splice(
                 r#"
-                SELECT trace_id, parent_id
-                FROM trace_parents
-                WHERE trace_id = ANY($1)
+                SELECT tp.trace_id, tp.parent_id
+                FROM trace_parents tp
+                JOIN reasoning_traces pt ON pt.id = tp.parent_id
+                WHERE tp.trace_id = ANY($1)
+                  /* {VISIBILITY:pt} */
                 "#,
-            )
-            .bind(&trace_ids)
-            .fetch_all(&mut *conn)
-            .await?
+                2,
+            );
+            let mut pq = sqlx::query_as::<_, TraceParentRow>(&psql).bind(&trace_ids);
+            if let Some(g) = viewer.group_bind() {
+                pq = pq.bind(g);
+            }
+            pq.fetch_all(&mut *conn).await?
         } else {
             Vec::new()
         };
@@ -1139,33 +1131,25 @@ impl LineageRepository {
 
         // Query trace parents for DAG structure.
         //
-        // FOLLOW-UP TRACKED: this statement's filtering behaviour is covered by
-        // `F-PR26-trace-parents-followup` in docs/tenancy/progress.json. The
-        // analysis is deliberately held outside this repository; consult it
-        // before changing this statement or the shape it returns.
-        //
-        // Pre-existing and unchanged by the PR-26 conversion, which moved this
-        // statement onto a different CONNECTION and nothing else.
-        //
-        // DO NOT reach for the exemption convention here as a shortcut. It keys
-        // on `(file, fn)` and `visibility_lint.rs` reads comment TEXT, so using
-        // one in this body would register the WHOLE walk as reviewed-and-exempt
-        // and remove it from
-        // `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`.
-        // MEASURED, not reasoned: an earlier draft that spelled the annotation
-        // turned `the_exemption_set_is_exactly_what_was_reviewed` red with both
-        // walks added to the exempt set.
+        // `F-PR26-trace-parents-followup` (docs/tenancy/progress.json):
+        // `trace_parents` has no tenancy columns, so the parent side is joined
+        // to `reasoning_traces` and the viewer predicate is spliced there.
         let trace_parent_rows: Vec<TraceParentRow> = if !trace_ids.is_empty() {
-            sqlx::query_as(
+            let psql = viewer.splice(
                 r#"
-                SELECT trace_id, parent_id
-                FROM trace_parents
-                WHERE trace_id = ANY($1)
+                SELECT tp.trace_id, tp.parent_id
+                FROM trace_parents tp
+                JOIN reasoning_traces pt ON pt.id = tp.parent_id
+                WHERE tp.trace_id = ANY($1)
+                  /* {VISIBILITY:pt} */
                 "#,
-            )
-            .bind(&trace_ids)
-            .fetch_all(&mut *conn)
-            .await?
+                2,
+            );
+            let mut pq = sqlx::query_as::<_, TraceParentRow>(&psql).bind(&trace_ids);
+            if let Some(g) = viewer.group_bind() {
+                pq = pq.bind(g);
+            }
+            pq.fetch_all(&mut *conn).await?
         } else {
             Vec::new()
         };
