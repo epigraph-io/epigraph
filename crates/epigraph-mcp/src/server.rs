@@ -159,6 +159,11 @@ pub struct EpiGraphMcpFull {
     /// `recall_with_context`'s `frac_3072` auto-detect read, behind a short
     /// per-scope cache shared by every session (backlog be28f3d2).
     pub(crate) centroid_population: Arc<crate::tools::recall::CentroidPopulationCache>,
+    /// The tasks this server's tool calls left running after their response
+    /// (detached document walks, post-commit embedding loops), shared by every
+    /// clone so a process can wait for them before it exits. See
+    /// [`crate::background`].
+    pub(crate) background: crate::background::BackgroundTasks,
 }
 
 impl EpiGraphMcpFull {
@@ -171,6 +176,15 @@ impl EpiGraphMcpFull {
     /// Propagates whatever [`Self::agent_id`] returns.
     pub async fn server_agent_id(&self) -> Result<uuid::Uuid, McpError> {
         self.agent_id().await
+    }
+
+    /// The tasks this server's tool calls left running, shared with every
+    /// clone of it (and so with every HTTP session cloned from one template).
+    /// A process that is about to exit drains them
+    /// ([`crate::background::BackgroundTasks::drain`]).
+    #[must_use]
+    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
+        self.background.clone()
     }
 
     /// The agent a write on this request authors and stamps as (batch H-b, D1).
@@ -1164,6 +1178,7 @@ impl EpiGraphMcpFull {
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
             centroid_population: Arc::default(),
+            background: crate::background::BackgroundTasks::default(),
         }
     }
 
@@ -1304,6 +1319,7 @@ impl EpiGraphMcpFull {
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
             centroid_population: Arc::default(),
+            background: crate::background::BackgroundTasks::default(),
         }
     }
 

@@ -185,7 +185,7 @@ pub async fn ingest_document(
     let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
-    // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
+    // owned viewer: a spawned task is `'static` and cannot borrow the caller's.
     // `Viewer` is not `Clone`; `detach_scoped` is the narrow replacement, and
     // what it yields is the caller's own scoped read authority and nothing
     // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
@@ -247,7 +247,10 @@ pub async fn ingest_document(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, not a bare `tokio::spawn`: a stdio process whose client closes
+    // the session drains it before exiting (`crate::background`), instead of
+    // cancelling a walk the caller was told is `queued`.
+    server.background_tasks().spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -263,7 +266,7 @@ pub async fn ingest_document(
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
 /// points, run before `ensure_paper_node` writes anything.
 ///
-/// `do_ingest_document` runs in a `tokio::spawn`ed task, so a refusal inside it
+/// `do_ingest_document` runs in a spawned task, so a refusal inside it
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
@@ -386,7 +389,10 @@ pub async fn ingest_document_inline(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, not a bare `tokio::spawn`: a stdio process whose client closes
+    // the session drains it before exiting (`crate::background`), instead of
+    // cancelling a walk the caller was told is `queued`.
+    server.background_tasks().spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -1775,7 +1781,9 @@ pub async fn do_ingest_document_reporting(
     let queued = embed_queue.len();
     if !embed_queue.is_empty() {
         let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
+        // Tracked (`crate::background`), so a stdio process drains the loop
+        // before exiting rather than leaving committed claims unembedded.
+        server.background_tasks().spawn(async move {
             for (id, content) in embed_queue {
                 if !embedder.embed_and_store(id, &content).await {
                     tracing::warn!("background embedding failed for claim {id}");
@@ -2704,7 +2712,9 @@ pub async fn do_ingest_document_spine(
     let queued = embed_queue.len();
     if !embed_queue.is_empty() {
         let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
+        // Tracked (`crate::background`), so a stdio process drains the loop
+        // before exiting rather than leaving committed claims unembedded.
+        server.background_tasks().spawn(async move {
             for (id, content) in embed_queue {
                 if !embedder.embed_and_store(id, &content).await {
                     tracing::warn!("background embedding failed for claim {id}");
