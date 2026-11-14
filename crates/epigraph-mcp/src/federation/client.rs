@@ -27,9 +27,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorData, Tool};
 use rmcp::serve_client;
-use rmcp::service::RunningService;
+use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -82,10 +82,38 @@ pub enum FederationError {
         cause: String,
     },
 
-    /// A request on an established session failed (`list_tools`,
-    /// `call_tool`, …).
+    /// The downstream ANSWERED the request, with an MCP error. Carried whole
+    /// (code, message, data) so the gateway hands the caller the downstream's
+    /// own answer unchanged rather than a redacted "internal error" (backlog
+    /// 7ea4bd74): it is the extension's reply to the caller's own request,
+    /// made under the caller's own token.
+    #[error("extension answered with an MCP error: {0}")]
+    Downstream(ErrorData),
+
+    /// A request on an established session failed without an MCP answer
+    /// (the transport broke, the session closed, the reply was refused as
+    /// oversized, …). Carries the stringified rmcp error, which can name the
+    /// dialed URI, so it is for the server log only.
     #[error("request to extension failed: {0}")]
     Request(String),
+
+    /// No mounted extension routes this effective tool name (any more): the
+    /// route was looked up and was gone, e.g. the extension was demoted
+    /// between the caller's lookup and the call.
+    #[error("no federated route for tool `{0}`")]
+    NoRoute(String),
+}
+
+impl FederationError {
+    /// Classify an rmcp request failure: an MCP error answer is
+    /// [`Downstream`](Self::Downstream), anything else
+    /// [`Request`](Self::Request).
+    fn from_service(e: ServiceError) -> Self {
+        match e {
+            ServiceError::McpError(data) => Self::Downstream(data),
+            other => Self::Request(other.to_string()),
+        }
+    }
 }
 
 /// Build the `http://{addr}/mcp` URI the gateway dials for an extension whose
@@ -116,13 +144,14 @@ pub async fn discovery_session(
 /// following pagination to completion.
 ///
 /// # Errors
-/// [`FederationError::Request`] if the downstream `tools/list` fails.
+/// [`FederationError::Downstream`] or [`FederationError::Request`] if the
+/// downstream `tools/list` fails.
 pub async fn list_all_tools(client: &ExtensionClient) -> Result<Vec<Tool>, FederationError> {
     client
         .peer()
         .list_all_tools()
         .await
-        .map_err(|e| FederationError::Request(e.to_string()))
+        .map_err(FederationError::from_service)
 }
 
 /// Proxy a single `tools/call` to the extension at `addr` on a **fresh**
@@ -135,7 +164,9 @@ pub async fn list_all_tools(client: &ExtensionClient) -> Result<Vec<Tool>, Feder
 ///
 /// # Errors
 /// [`FederationError::Timeout`] / [`FederationError::Connect`] on handshake
-/// failure; [`FederationError::Request`] if the downstream `tools/call` fails.
+/// failure; [`FederationError::Downstream`] if the downstream answers the
+/// `tools/call` with an MCP error; [`FederationError::Request`] if the call
+/// fails without one.
 pub async fn invoke_once(
     addr: &str,
     caller_token: &str,
@@ -149,7 +180,7 @@ pub async fn invoke_once(
         .peer()
         .call_tool(params)
         .await
-        .map_err(|e| FederationError::Request(e.to_string()));
+        .map_err(FederationError::from_service);
     // Explicit drop: releasing the session (and its downstream `delete_session`)
     // is the whole point of the ephemeral-per-call model. Dropping after we have
     // the result keeps the RAII contract obvious to future readers.

@@ -327,7 +327,7 @@ impl FederationRegistry {
     /// ephemeral session authenticated with `caller_token`.
     ///
     /// # Errors
-    /// [`FederationError::Request`] if `effective_name` is not a federated tool
+    /// [`FederationError::NoRoute`] if `effective_name` is not a federated tool
     /// (the caller should have routed it to the kernel), or any transport /
     /// downstream error from [`client::invoke_once`].
     pub async fn invoke(
@@ -337,9 +337,7 @@ impl FederationRegistry {
         arguments: Option<rmcp::model::JsonObject>,
     ) -> Result<CallToolResult, FederationError> {
         let Some(config) = self.route(effective_name) else {
-            return Err(FederationError::Request(format!(
-                "no federated route for tool `{effective_name}`"
-            )));
+            return Err(FederationError::NoRoute(effective_name.to_string()));
         };
         // Strip the gateway prefix back off before forwarding: the downstream
         // knows the tool by its *bare* name, not the gateway's namespaced one.
@@ -547,9 +545,7 @@ impl SharedFederation {
         // downstream round-trip (the `std` guard is `!Send`, so this is enforced
         // rather than merely intended).
         let Some(config) = self.route_config(effective_name) else {
-            return Err(FederationError::Request(format!(
-                "no federated route for tool `{effective_name}`"
-            )));
+            return Err(FederationError::NoRoute(effective_name.to_string()));
         };
         let downstream_name = match config.prefix.as_deref() {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),

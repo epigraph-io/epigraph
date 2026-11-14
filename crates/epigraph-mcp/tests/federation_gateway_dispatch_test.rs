@@ -122,3 +122,239 @@ async fn the_unauthenticated_listener_lists_no_federated_tool() {
          a federated tool"
     );
 }
+
+// ── Backlog 7ea4bd74: what a failed federated call answers ──────────────────
+//
+// Driven over HTTP through the bearer layer and the real `call_tool`, because
+// the defect was in `call_tool`'s mapping (`.map_err(internal_error)`), which
+// redacted every failure, the downstream's own designed refusals included.
+
+const SECRET: &[u8] = b"this-secret-is-at-least-32-bytes-long!!";
+const ACCEPT: &str = "application/json, text/event-stream";
+const SESSION_HEADER: &str = "Mcp-Session-Id";
+
+#[path = "support/static_revocation.rs"]
+mod static_revocation;
+
+fn mint_token(scopes: &[&str]) -> String {
+    let cfg = epigraph_auth::JwtConfig::from_secret(SECRET);
+    let (token, _) = cfg
+        .issue_access_token(
+            uuid::Uuid::new_v4(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "service",
+            None,
+            None,
+            chrono::Duration::minutes(5),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .unwrap();
+    token
+}
+
+/// The gateway behind the bearer layer, serving `federation`. Returns its URL.
+async fn spawn_gateway(federation: SharedFederation) -> String {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let pool = dead_pool();
+    let signer = Arc::new(epigraph_crypto::AgentSigner::generate());
+    let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(EpiGraphMcpFull::new_shared_with_federation(
+                pool.clone(),
+                signer.clone(),
+                embedder.clone(),
+                false,
+                federation.clone(),
+                None,
+            ))
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let state = epigraph_mcp::auth::McpAuthState {
+        jwt_config: Arc::new(epigraph_auth::JwtConfig::from_secret(SECRET)),
+        resource_metadata_url: None,
+        revocation: static_revocation::StaticRevocation::none(),
+    };
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(state, epigraph_mcp::auth::bearer_auth_middleware),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    format!("http://{addr}/mcp")
+}
+
+async fn read_sse_data(resp: &mut reqwest::Response, within: std::time::Duration) -> String {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut acc = String::new();
+    loop {
+        match tokio::time::timeout_at(deadline, resp.chunk()).await {
+            Ok(Ok(Some(bytes))) => {
+                acc.push_str(&String::from_utf8_lossy(&bytes));
+                if acc
+                    .lines()
+                    .any(|l| l.starts_with("data:") && l.trim_end().len() > 5)
+                {
+                    return acc;
+                }
+            }
+            _ => return acc,
+        }
+    }
+}
+
+async fn post(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    session: Option<&str>,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    let mut req = client
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", ACCEPT)
+        .header("Content-Type", "application/json")
+        .json(&body);
+    if let Some(s) = session {
+        req = req.header(SESSION_HEADER, s);
+    }
+    req.send().await.expect("POST")
+}
+
+async fn handshake(client: &reqwest::Client, url: &str, token: &str) -> String {
+    let mut resp = post(
+        client,
+        url,
+        token,
+        None,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "federation-dispatch", "version": "0"}}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200, "initialize");
+    let session = resp
+        .headers()
+        .get(SESSION_HEADER)
+        .expect("session header")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_sse_data(&mut resp, std::time::Duration::from_secs(5)).await;
+    let notif = post(
+        client,
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert_eq!(notif.status().as_u16(), 202, "notifications/initialized");
+    session
+}
+
+/// Call `tool` through the gateway as a caller holding `ext:tools`, and return
+/// the JSON-RPC `error` object of the answer (panics if there is none).
+async fn call_for_error(url: &str, tool: &str, within: std::time::Duration) -> serde_json::Value {
+    let client = reqwest::Client::new();
+    let token = mint_token(&["ext:tools"]);
+    let session = handshake(&client, url, &token).await;
+    let mut resp = post(
+        &client,
+        url,
+        &token,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": {}}
+        }),
+    )
+    .await;
+    let body = read_sse_data(&mut resp, within).await;
+    let data = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_else(|| panic!("no JSON-RPC answer within {within:?}:\n{body}"));
+    let answer: serde_json::Value = serde_json::from_str(data).expect("JSON-RPC answer");
+    answer
+        .get("error")
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a JSON-RPC error, got {answer}"))
+}
+
+/// The downstream's own MCP error reaches the caller unchanged: code, message
+/// and data.
+///
+/// Mutation: map the federated call's error with `internal_error` again (the
+/// pre-fix code) -> the caller reads "internal error; the detail is in the
+/// server log" with code -32603, and this fails.
+#[tokio::test]
+async fn a_downstream_mcp_error_reaches_the_caller_unchanged() {
+    let (addr, _control) = stub::spawn_controlled_stub(&[stub::FAIL_TOOL]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let error = call_for_error(&url, stub::FAIL_TOOL, std::time::Duration::from_secs(10)).await;
+    let expected = stub::fail_error();
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(i64::from(expected.code.0)),
+        "the downstream's code is kept: {error}"
+    );
+    assert_eq!(
+        error["message"].as_str(),
+        Some(expected.message.as_ref()),
+        "the downstream's message is kept: {error}"
+    );
+    assert_eq!(
+        error["data"],
+        expected.data.unwrap(),
+        "the downstream's data is kept: {error}"
+    );
+}
+
+/// An extension that cannot be reached is named as unavailable, and its
+/// address is not: the address is deployment topology.
+///
+/// Mutation: as above -> the caller reads only "internal error", and this
+/// fails.
+#[tokio::test]
+async fn an_unreachable_extension_is_answered_as_unavailable_by_name() {
+    let (addr, control) = stub::spawn_controlled_stub(&["federated_probe"]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+    // Mounted healthy, then gone: the per-call dial fails.
+    control.set_alive(false);
+
+    let error = call_for_error(&url, "federated_probe", std::time::Duration::from_secs(15)).await;
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("extension 'ext' unavailable"),
+        "the caller must be told which extension is unavailable: {error}"
+    );
+    assert!(
+        message.contains("federated_probe"),
+        "and which tool it called: {error}"
+    );
+    assert!(
+        !message.contains(&addr) && !message.contains("127.0.0.1"),
+        "the extension's address must not reach the caller: {error}"
+    );
+}

@@ -826,6 +826,53 @@ impl EpiGraphMcpFull {
         }
     }
 
+    /// The caller's answer to a failed federated `tools/call` (backlog
+    /// 7ea4bd74). Before this every failure was `internal_error`'s redacted
+    /// "internal error", including the downstream's own designed refusals
+    /// ("widget 42 is out of range"), which left the caller nothing to act on.
+    ///
+    /// - The downstream ANSWERED with an MCP error
+    ///   ([`FederationError::Downstream`]): returned as-is (code, message,
+    ///   data). It is the extension's reply to this caller's own request,
+    ///   made under this caller's own token.
+    /// - The gateway could not open a session, or found no route
+    ///   ([`FederationError::Connect`], [`FederationError::Timeout`],
+    ///   [`FederationError::NoRoute`]): "extension `<name>` unavailable".
+    /// - The call broke off without an answer ([`FederationError::Request`]):
+    ///   says so.
+    ///
+    /// The designed messages name the extension and never the error's own
+    /// text, which carries the dialed URI (deployment topology); that goes to
+    /// the server log ([`crate::errors::internal_error_logged`]).
+    #[must_use]
+    pub fn federated_call_error(
+        extension: &str,
+        tool: &str,
+        err: crate::federation::client::FederationError,
+    ) -> McpError {
+        use crate::federation::client::FederationError;
+        match err {
+            FederationError::Downstream(answer) => answer,
+            FederationError::Connect { .. }
+            | FederationError::Timeout(..)
+            | FederationError::NoRoute(_) => crate::errors::internal_error_logged(
+                format!(
+                    "Federated tool '{tool}' is unavailable: extension '{extension}' unavailable \
+                     (the gateway could not open a session with it: it is down, or it refused \
+                     this caller's token). Retry once it is back; nothing was sent to it."
+                ),
+                err,
+            ),
+            FederationError::Request(_) => crate::errors::internal_error_logged(
+                format!(
+                    "Federated tool '{tool}' failed: the call to extension '{extension}' broke \
+                     off before it answered. The call may or may not have run there."
+                ),
+                err,
+            ),
+        }
+    }
+
     /// Scope gate for FEDERATED tools, kept deliberately separate from
     /// [`enforce_tool_scope`](Self::enforce_tool_scope).
     ///
@@ -3158,14 +3205,15 @@ impl ServerHandler for EpiGraphMcpFull {
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
                 // (d) proxy to the downstream on a fresh caller-token session.
-                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
-                // handler's error type directly (no further conversion).
+                // A failure is answered by `federated_call_error`: the
+                // downstream's own MCP error as-is, a designed message naming
+                // the extension otherwise (backlog 7ea4bd74).
                 return self
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map(rmcp::model::CallToolResponse::from)
-                    .map_err(crate::errors::internal_error);
+                    .map_err(|e| Self::federated_call_error(&ext_name, &request.name, e));
             }
 
             // Neither a kernel tool nor a federated route: a ROUTING failure.
