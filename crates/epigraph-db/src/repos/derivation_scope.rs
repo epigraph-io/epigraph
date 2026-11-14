@@ -45,30 +45,42 @@ use crate::visibility::Viewer;
 /// public, or when the claim is not public and the source belongs to the
 /// claim's own owner group (an edge only as a single-owner edge: a co-owned
 /// edge is readable by the members of BOTH groups, fewer than the claim's).
-const CACHE_ADMISSIBLE_SQL: &str = "SELECT mf.id FROM mass_functions mf \
-       JOIN claims c ON c.id = mf.claim_id \
-     WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL \
-       AND (mf.visibility = 'public' \
-            OR (c.visibility <> 'public' AND mf.owner_group_id = c.owner_group_id)) \
-       AND (mf.evidence_id IS NULL \
+///
+/// The ONE spelling of cache admissibility, as a boolean SQL expression over
+/// the `mass_functions` row aliased `mf` and ITS claim aliased `c` (both
+/// already in scope; pass the aliases without a dot). It is read by
+/// [`DerivationScopeRepository::cache_admissible`] (the fold's filter) and by
+/// `MassFunctionRepository::cache_owner_frame_for_claim` (which frame owns
+/// the cache), so the two cannot disagree about a row. Written inclusively
+/// (an `EXISTS` over the visible source, see the module doc): it gives the
+/// same answer on a maintenance connection and on an application session.
+#[must_use]
+pub fn cache_admissible_predicate(mf: &str, c: &str) -> String {
+    format!(
+        "({mf}.retracted_at IS NULL \
+       AND ({mf}.visibility = 'public' \
+            OR ({c}.visibility <> 'public' AND {mf}.owner_group_id = {c}.owner_group_id)) \
+       AND ({mf}.evidence_id IS NULL \
             OR EXISTS (SELECT 1 FROM evidence e \
-                        WHERE e.id = mf.evidence_id \
+                        WHERE e.id = {mf}.evidence_id \
                           AND (e.visibility = 'public' \
-                               OR (c.visibility <> 'public' \
-                                   AND e.owner_group_id = c.owner_group_id)))) \
-       AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
-            OR mf.perspective_id IS NULL \
+                               OR ({c}.visibility <> 'public' \
+                                   AND e.owner_group_id = {c}.owner_group_id)))) \
+       AND ({mf}.combination_method IS DISTINCT FROM 'edge_factor' \
+            OR {mf}.perspective_id IS NULL \
             OR EXISTS (SELECT 1 FROM edges ed \
-                        WHERE ed.id = mf.perspective_id \
+                        WHERE ed.id = {mf}.perspective_id \
                           AND (ed.visibility = 'public' \
-                               OR (c.visibility <> 'public' \
-                                   AND ed.owner_group_id = c.owner_group_id \
+                               OR ({c}.visibility <> 'public' \
+                                   AND ed.owner_group_id = {c}.owner_group_id \
                                    AND ed.co_owner_group_id IS NULL)) \
                           AND EXISTS (SELECT 1 FROM claims s \
                                        WHERE s.id = ed.source_id \
                                          AND (s.visibility = 'public' \
-                                              OR (c.visibility <> 'public' \
-                                                  AND s.owner_group_id = c.owner_group_id)))))";
+                                              OR ({c}.visibility <> 'public' \
+                                                  AND s.owner_group_id = {c}.owner_group_id))))))"
+    )
+}
 
 /// The derivation half of [`DerivationScopeRepository::viewer_derived`], over
 /// a `mass_functions mf` already in scope: every source the row was derived
@@ -109,7 +121,13 @@ impl DerivationScopeRepository {
         if row_ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let ids: Vec<Uuid> = sqlx::query_scalar(CACHE_ADMISSIBLE_SQL)
+        let sql = format!(
+            "SELECT mf.id FROM mass_functions mf \
+               JOIN claims c ON c.id = mf.claim_id \
+             WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL AND {admissible}",
+            admissible = cache_admissible_predicate("mf", "c"),
+        );
+        let ids: Vec<Uuid> = sqlx::query_scalar(&sql)
             .bind(row_ids)
             .fetch_all(executor)
             .await?;

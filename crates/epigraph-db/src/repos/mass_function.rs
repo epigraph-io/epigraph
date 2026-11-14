@@ -1818,7 +1818,20 @@ impl MassFunctionRepository {
     /// `workflow-ingest` system agent, [`super::claim_role::IS_PROCEDURAL_SQL`])
     /// keeps the rules below.
     ///
-    /// Among the frames holding the claim's remaining inputs:
+    /// **A frame with a cache-admissible input outranks one without**
+    /// (backlog 8d720490 (1), ruling R-71). Admissibility is the fold's own
+    /// rule ([`super::derivation_scope::cache_admissible_predicate`]: every
+    /// source of the row at least as widely readable as the claim), so the
+    /// owner is never a frame whose every input the fold would drop while
+    /// another frame has one it keeps. Before this, `binary_truth` holding only
+    /// narrowed inputs still owned the cache, so the claim kept a fold of the
+    /// narrowed evidence and was neither refolded from its admissible input
+    /// nor vacated (R-80 is claim-wide). When NO input is admissible the order
+    /// below decides as before, and the owner frame's fold is then the R-80
+    /// vacate.
+    ///
+    /// Then, among the frames holding the claim's remaining inputs (the
+    /// admissible ones, when there are any):
     ///
     /// 1. the frame named `binary_truth`, when the claim has an input on it;
     /// 2. else the frame named `claim_validity`, when the claim has an input on it;
@@ -1861,6 +1874,13 @@ impl MassFunctionRepository {
               /* {NOT_FROZEN_COMPOUND} */
               /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
             ORDER BY CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM claims ac
+                           WHERE ac.id = mf.claim_id AND {CACHE_ADMISSIBLE}
+                       ) THEN 0
+                       ELSE 1
+                     END,
+                     CASE
                        WHEN f.name = 'binary_truth' THEN 0
                        WHEN f.name = 'claim_validity' THEN 1
                        WHEN mf.frame_id = (
@@ -1876,6 +1896,10 @@ impl MassFunctionRepository {
             LIMIT 1
             "#,
                     "mf.",
+                )
+                .replace(
+                    "{CACHE_ADMISSIBLE}",
+                    &super::derivation_scope::cache_admissible_predicate("mf", "ac"),
                 ),
                 "mf.",
                 "f.",

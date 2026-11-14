@@ -29,7 +29,9 @@
 //!   by a member of the claim's group (the R-80 reads are viewer-spliced);
 //! * the claim-wide gate: an admissible input on ANOTHER frame of the claim
 //!   means not every BBA is inadmissible, so nothing is vacated (public and
-//!   group claims), and the cache is left exactly as it was;
+//!   group claims); that frame owns the cache instead and refolds it from the
+//!   admissible input (backlog 8d720490 (1): the owner rule ranks a frame
+//!   with an admissible input first);
 //! * a compound is never vacated (its cache is not a fold of its own BBAs);
 //! * a claim with no cache stays without one (writing a vacuous value there
 //!   would announce that an unseen BBA exists).
@@ -450,10 +452,13 @@ async fn recompute_beliefs_gives_a_claim_without_a_cache_none(pool: PgPool) {
 }
 
 /// Not every BBA is inadmissible: the claim keeps an admissible input on
-/// `claim_validity` while its `binary_truth` (the cache-owner frame) holds only
-/// a hidden-evidence BBA. R-80 does not vacate it.
+/// `claim_validity` while its `binary_truth` (the canonical first frame) holds
+/// only a hidden-evidence BBA. R-80 does not vacate it, and the cache owner
+/// rule hands the cache to `claim_validity`, whose admissible input the fold
+/// keeps (backlog 8d720490 (1)). It used to keep `binary_truth` as the owner,
+/// so the claim went on serving the fold of the now-hidden evidence.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_admissible_input_on_another_frame_is_not_vacated(pool: PgPool) {
+async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
     let w = world(&pool, "r80-other-frame").await;
     let validity =
         resolve_claim_validity_frame(&mut pool.acquire().await.expect("acquire"), &w.public)
@@ -478,20 +483,78 @@ async fn an_admissible_input_on_another_frame_is_not_vacated(pool: PgPool) {
     );
     hide(&pool, hidden_ev, w.group, w.member).await;
 
-    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
-    let after = cache(&pool, claim).await;
-    // KNOWN RESIDUAL (R-71), not intended behaviour: the value kept here was
-    // folded from the now-hidden evidence. The cache owner rule
-    // (`MassFunctionRepository::cache_owner_frame_for_claim`) still picks
-    // `binary_truth`, whose inputs are all inadmissible, over
-    // `claim_validity`, which has an admissible one, so the claim is neither
-    // vacated (R-80 is claim-wide) nor refolded from its admissible input.
-    // The owner rule should skip a frame whose inputs are all inadmissible.
-    // What R-80 pins here is only that it does not vacate such a claim and
-    // leaves its cache exactly as it was.
+    // The member can read the hidden evidence and the author cannot; the
+    // owner rule's admissibility is the fold's, which answers the same for
+    // both on the application role. Neither owns this public claim (the
+    // fixture's claim is not in either's group), and migration 114 lets a
+    // non-owner refresh the cache only on the frame it already carries, so
+    // the re-pointing recompute runs where the bulk recomputers run: on the
+    // privileged connection.
+    let scoped = app_role(&pool).await;
+    for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
+        assert_eq!(
+            owner_as(&scoped, viewer, claim).await,
+            Some(validity),
+            "the {who} must resolve claim_validity, the frame with the only admissible \
+             input, as the cache owner"
+        );
+    }
+    recompute_claim_cached_belief(
+        &mut pool.acquire().await.expect("acquire"),
+        &w.public,
+        claim,
+    )
+    .await
+    .expect("recompute after the evidence is hidden");
+    assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
+}
+
+/// The cache owner frame of `claim` as `viewer` resolves it on the
+/// application role.
+async fn owner_as(scoped: &ScopedPool, viewer: &Viewer, claim: Uuid) -> Option<Uuid> {
+    let mut tx = scoped.begin_as(viewer).await.expect("stamped app session");
+    let owner = MassFunctionRepository::cache_owner_frame_for_claim(&mut *tx, viewer, claim)
+        .await
+        .expect("owner on the application role");
+    tx.rollback().await.expect("rollback");
+    owner
+}
+
+/// The claim's cache is owned by `frame` (holding the claim's only
+/// admissible input) and holds that frame's fold: not `before`, and not a
+/// vacate.
+async fn assert_holds_fold_of(
+    pool: &PgPool,
+    viewer: &Viewer,
+    claim: Uuid,
+    frame: Uuid,
+    before: &Cache,
+) {
+    let after = cache(pool, claim).await;
+    let want = preview_claim_belief_on_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        viewer,
+        claim,
+        frame,
+    )
+    .await
+    .expect("preview")
+    .expect("the admissible input folds");
     assert_eq!(
-        after, before,
-        "a claim with an admissible BBA on another frame must keep its cache unchanged"
+        after.5,
+        Some(frame),
+        "the cache must move to the frame with the admissible input; it is {after:?} \
+         (before {before:?})"
+    );
+    assert!(
+        near(after.0, want.pignistic_prob)
+            && near(after.1, want.belief)
+            && near(after.2, want.plausibility),
+        "the cache must hold that frame's fold {want:?}; it is {after:?} (before {before:?})"
+    );
+    assert!(
+        !near(after.0, before.0.unwrap_or(f64::NAN)),
+        "the cache still holds the fold of the hidden evidence: {after:?} (before {before:?})"
     );
 }
 
@@ -592,10 +655,10 @@ async fn a_group_claim_whose_evidence_moves_to_another_group_is_vacated(pool: Pg
 /// The claim-wide gate on a GROUP claim: its `binary_truth` BBA cites another
 /// group's evidence, but its `claim_validity` BBA cites evidence in the
 /// claim's own group, which is admissible. Not every BBA is inadmissible, so
-/// the cache is left exactly as it was (the same R-71 owner-rule residual as
-/// `an_admissible_input_on_another_frame_is_not_vacated`).
+/// nothing is vacated, and `claim_validity` takes the cache (the group twin of
+/// `an_admissible_input_on_another_frame_takes_the_cache`).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_group_claim_with_own_group_input_elsewhere_is_not_vacated(pool: PgPool) {
+async fn a_group_claim_with_own_group_input_elsewhere_is_refolded_from_it(pool: PgPool) {
     let w = world(&pool, "r80-group-own").await;
     let (outsider, other_group) =
         fixture::seed_agent_with_group(&pool, "r80-group-own-other").await;
@@ -617,12 +680,14 @@ async fn a_group_claim_with_own_group_input_elsewhere_is_not_vacated(pool: PgPoo
     );
 
     hide(&pool, moved_ev, other_group, outsider).await;
-    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
-    let after = cache(&pool, claim).await;
+    let scoped = app_role(&pool).await;
     assert_eq!(
-        after, before,
-        "a group claim with an own-group BBA on another frame must keep its cache unchanged"
+        owner_as(&scoped, &w.member_viewer, claim).await,
+        Some(validity),
+        "claim_validity, the frame with the only admissible input, must own the cache"
     );
+    recompute_as(&scoped, &w.member_viewer, claim).await;
+    assert_holds_fold_of(&pool, &w.member_viewer, claim, validity, &before).await;
 }
 
 /// A COMPOUND (an in-force `decomposes_to` out-edge to a current leaf) is

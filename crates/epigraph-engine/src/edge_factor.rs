@@ -1679,7 +1679,9 @@ async fn recompute_combined_belief(
 ///
 /// [`MassFunctionRepository::cache_owner_frame_for_claim`] decides, among the
 /// frames holding the claim's combine inputs (cached combination rows are
-/// excluded, as the combine itself excludes them):
+/// excluded, as the combine itself excludes them), preferring a frame with an
+/// input the derivation scope rule admits to the cache over one without
+/// (backlog 8d720490 (1)), and then:
 ///
 /// 1. `binary_truth`, when the claim has an input on it. It is what the
 ///    edge-wiring path writes and what unframed `get_belief` serves.
