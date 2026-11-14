@@ -2365,7 +2365,8 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 ```
 
 - **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
-  public owners). The target must be an existing `active` group, not world or
+  public owners, including the target itself: a public claim the target
+  already owns is narrowed in place, owner unchanged). The target must be an existing `active` group, not world or
   seed, administered by `--operator`. A claim whose move would make another
   group's row readable to the target's members (for example an edge declared
   `('group', H)`) is HELD, not widened. Pinned evidence is left as it is.
