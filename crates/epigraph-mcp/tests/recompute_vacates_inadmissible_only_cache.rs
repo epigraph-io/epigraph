@@ -454,7 +454,7 @@ async fn recompute_beliefs_gives_a_claim_without_a_cache_none(pool: PgPool) {
 
 /// Not every BBA is inadmissible: the claim keeps an admissible input on
 /// `claim_validity` while its `binary_truth` (the canonical first frame) holds
-/// only a hidden-evidence BBA. R-80 does not vacate it, and the cache owner
+/// only a hidden-evidence BBA. The vacate does not apply, and the cache owner
 /// rule hands the cache to `claim_validity`, whose admissible input the fold
 /// keeps (backlog 8d720490 (1)). It used to keep `binary_truth` as the owner,
 /// so the claim went on serving the fold of the now-hidden evidence.
@@ -500,6 +500,31 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
              input, as the cache owner"
         );
     }
+
+    // KNOWN RESIDUAL (request path, until a privileged recompute runs): the
+    // same recompute by a NON-OWNER on the application role folds
+    // `claim_validity`, and migration 114 declines that write because the
+    // recorded frame is `binary_truth`. The cache keeps the hidden-evidence
+    // fold, and the recompute must say it wrote nothing (backlog 8d720490
+    // (2): it used to answer true here).
+    for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
+        let mut tx = scoped.begin_as(viewer).await.expect("stamped app session");
+        let wrote = recompute_claim_cached_belief(&mut tx, viewer, claim)
+            .await
+            .expect("non-owner recompute on the application role");
+        tx.commit().await.expect("commit");
+        assert!(
+            !wrote,
+            "a declined non-owner write by the {who} must not report the cache as written"
+        );
+        let unchanged = cache(&pool, claim).await;
+        assert!(
+            unchanged.5 == Some(w.binary) && near(unchanged.0, before.0.unwrap_or(f64::NAN)),
+            "RESIDUAL: the {who}'s declined write leaves the binary_truth cache as it was; \
+             it is {unchanged:?} (before {before:?})"
+        );
+    }
+
     recompute_claim_cached_belief(
         &mut pool.acquire().await.expect("acquire"),
         &w.public,
@@ -561,7 +586,7 @@ async fn assert_holds_fold_of(
 
 /// An INGEST TEMPLATE row (the near-vacuous placeholder document ingest files
 /// on `research_validity`) is not evidence, so it does not count as an
-/// admissible input for the claim-wide R-80 gate: a claim whose only real BBA
+/// admissible input for the claim-wide vacate gate: a claim whose only real BBA
 /// becomes inadmissible is vacated although its public template row would
 /// pass the admissibility rule. Pins the template exclusion in
 /// `DerivationScopeRepository::combine_input_ids_for_claim` (backlog
