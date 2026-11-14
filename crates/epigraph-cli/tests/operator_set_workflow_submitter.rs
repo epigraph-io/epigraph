@@ -641,9 +641,11 @@ async fn a_non_head_row_selected_alone_warns_naming_the_head(pool: PgPool) {
         with_head.show()
     );
     assert!(
-        with_head.stdout.lines().any(|l| l
-            .starts_with(&format!("WRITE\tworkflow={}", fx.w_null))
-            && l.contains("\thead=yes\t")),
+        with_head
+            .stdout
+            .lines()
+            .any(|l| l.starts_with(&format!("WRITE\tworkflow={}", fx.w_null))
+                && l.contains("\thead=yes\t")),
         "{}",
         with_head.show()
     );
