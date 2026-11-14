@@ -97,6 +97,66 @@ impl MigrateOptions {
     }
 }
 
+/// Environment variable that makes `epigraph-migrate` grant `epigraph_seed`
+/// to its own session user after a successful run. **Test harnesses only.**
+/// Parsed like [`ALLOW_DB_AHEAD_ENV`].
+///
+/// Since migration 216 the tenancy seed escape hatch (074's seed arm) is
+/// taken only by a session holding an EXPLICIT grant of `epigraph_seed`; a
+/// superuser no longer counts by implication (backlog 0512ca33). The
+/// `#[sqlx::test]` harness connects as a superuser and many fixtures insert
+/// rows without naming the tenancy columns, so the harness needs the grant.
+/// Roles are cluster-wide, so one grant before the suite covers every
+/// per-test database. CI's job env sets this variable; `ci.yml`-driven local
+/// gates copy that env into their `epigraph-migrate` run.
+///
+/// A deployed cluster must NEVER set it for a service login: the grant is
+/// exactly what re-opens the hatch, so an undeclared write by that login is
+/// stamped onto the memberless seed group instead of being refused. The API
+/// boot probe warns (and on the application role refuses) when a connection
+/// holds the grant.
+pub const GRANT_SEED_TO_SELF_ENV: &str = "EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF";
+
+/// Is [`GRANT_SEED_TO_SELF_ENV`] set to an enabled value?
+#[must_use]
+pub fn grant_seed_to_self_requested() -> bool {
+    crate::env_flag_enabled(std::env::var(GRANT_SEED_TO_SELF_ENV).ok().as_deref())
+}
+
+/// `GRANT epigraph_seed TO <session_user>` on `conn`, the test-harness grant
+/// [`GRANT_SEED_TO_SELF_ENV`] asks for. Returns the role granted to, or
+/// `None` when the `epigraph_seed` role does not exist (a cluster where 060
+/// could not create it), in which case nothing is changed.
+///
+/// Takes a connection, not the pool, so a test can run it inside a
+/// transaction it rolls back. Granting a role the session user already holds
+/// is a NOTICE, not an error, so a second run is a no-op.
+///
+/// # Errors
+/// The underlying database error, e.g. when the session user may not grant
+/// the role (neither superuser nor holding it WITH ADMIN).
+pub async fn grant_seed_to_session_user(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Option<String>, sqlx::Error> {
+    let who: Option<String> = sqlx::query_scalar(
+        "SELECT session_user::text \
+          WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_seed')",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(who) = who else {
+        return Ok(None);
+    };
+    // A role name cannot be a bind parameter in GRANT; quote it as an
+    // identifier server-side.
+    let stmt: String = sqlx::query_scalar("SELECT format('GRANT epigraph_seed TO %I', $1::text)")
+        .bind(&who)
+        .fetch_one(&mut *conn)
+        .await?;
+    sqlx::query(&stmt).execute(&mut *conn).await?;
+    Ok(Some(who))
+}
+
 /// Where the database stands relative to the binary's embedded migration set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaHeads {
