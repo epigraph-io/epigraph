@@ -14,6 +14,17 @@
 //! - each inline-code label of the form `source:git-history` or `node:<kind>`
 //!   is a string literal in `ingest_git.rs`.
 //!
+//! The page also quotes values the code decides, which go stale without a
+//! renamed name to flag them, so they are pinned too:
+//!
+//! - each captured dry-run packet's methodology, initial truth and confidence
+//!   is what `CommitType::methodology`, `CommitType::initial_truth` and the
+//!   parser's confidence table give its commit type;
+//! - each inline-code `EPIGRAPH_*` variable is read (`"NAME"`) by
+//!   `ingest_git.rs` or the API server's `bin/server.rs`;
+//! - the `#N` reference limit ("up to N current claims") is the `limit` that
+//!   `find_claims_citing_pr` sends, and the edges' `if_not_exists` is set.
+//!
 //! Floors on each count keep a broken scanner from passing on nothing.
 //! The scan is std-only, like `doc_links.rs`.
 
@@ -186,6 +197,226 @@ fn the_walkthrough_quotes_only_flags_keys_and_labels_the_code_has() {
     );
 }
 
+/// The text of `src` from `start` up to the first `end` after it.
+fn section<'a>(src: &'a str, start: &str, end: &str) -> &'a str {
+    let from = src
+        .find(start)
+        .unwrap_or_else(|| panic!("ingest_git.rs has no `{start}`"));
+    let rest = &src[from..];
+    let to = rest
+        .find(end)
+        .unwrap_or_else(|| panic!("no `{end}` after `{start}`"));
+    &rest[..to]
+}
+
+/// One captured dry-run packet: its commit type, whether it has Verification
+/// items, and the methodology, confidence (percent) and initial truth printed.
+#[derive(Debug, PartialEq)]
+struct Captured {
+    commit_type: String,
+    has_verification: bool,
+    methodology: String,
+    confidence_pct: String,
+    initial_truth: String,
+}
+
+/// The packets in the page's fenced dry-run output.
+fn captured_packets(lines: &[String]) -> Vec<Captured> {
+    let mut out = Vec::new();
+    let mut commit_type = None;
+    let mut has_verification = None;
+    for line in lines {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Packet ") {
+            commit_type = rest
+                .split_once("\"[")
+                .and_then(|(_, r)| r.split_once(']'))
+                .map(|(t, _)| t.to_string());
+        } else if let Some((_, v)) = line.split_once("Verification: ") {
+            has_verification = v.split_whitespace().next().map(|n| n != "0");
+        } else if let Some(rest) = line.strip_prefix("Methodology: ") {
+            let fields: Vec<&str> = rest.split(", ").collect();
+            let value = |prefix: &str| {
+                fields
+                    .iter()
+                    .find_map(|f| f.strip_prefix(prefix))
+                    .map(str::to_string)
+            };
+            if let (Some(t), Some(v), Some(m), Some(c), Some(i)) = (
+                commit_type.take(),
+                has_verification.take(),
+                fields.first().map(|m| m.to_string()),
+                value("confidence: ").map(|c| c.trim_end_matches('%').to_string()),
+                value("initial_truth: "),
+            ) {
+                out.push(Captured {
+                    commit_type: t,
+                    has_verification: v,
+                    methodology: m,
+                    confidence_pct: c,
+                    initial_truth: i,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The text of the match arm for `Self::<variant>` in `body`: from its line
+/// up to the next line that starts another arm.
+fn arm<'a>(body: &'a str, variant: &str) -> Option<&'a str> {
+    let pat = format!("Self::{variant}");
+    let lines: Vec<&str> = body.lines().collect();
+    let start = lines.iter().position(|l| {
+        l.match_indices(&pat).any(|(i, _)| {
+            !l[i + pat.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+        })
+    })?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with("Self::"))
+        .map_or(lines.len(), |n| start + 1 + n);
+    let from = body.find(lines[start])?;
+    let to = if end < lines.len() {
+        body.find(lines[end]).unwrap_or(body.len())
+    } else {
+        body.len()
+    };
+    Some(&body[from..to])
+}
+
+/// Float literals (`0.6`) in `text`, in order.
+fn floats(text: &str) -> Vec<f64> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .filter(|w| w.contains('.') && !w.starts_with('.') && !w.ends_with('.'))
+        .filter_map(|w| w.parse().ok())
+        .collect()
+}
+
+fn variant_of(commit_type: &str) -> String {
+    let mut c = commit_type.chars();
+    c.next()
+        .map(|f| f.to_ascii_uppercase().to_string() + c.as_str())
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_walkthrough_quotes_only_values_and_limits_the_code_has() {
+    let page = read("docs/intro/03-walkthroughs.md");
+    let ingest_git = read("crates/epigraph-cli/src/bin/ingest_git.rs");
+    let server = read("crates/epigraph-api/src/bin/server.rs");
+    let mut wrong = Vec::new();
+
+    // Captured packets: methodology, initial truth, confidence.
+    let methodology = section(&ingest_git, "fn methodology(", "fn initial_truth(");
+    let initial_truth = section(&ingest_git, "fn initial_truth(", "\n}\n");
+    let confidence = section(&ingest_git, "let parser_confidence = match", "};");
+    let packets: Vec<Captured> = fenced_blocks(&page)
+        .iter()
+        .flat_map(|(_, body)| captured_packets(body))
+        .collect();
+    for p in &packets {
+        let variant = variant_of(&p.commit_type);
+        match arm(methodology, &variant) {
+            Some(a) if a.contains(&format!("\"{}\"", p.methodology)) => {}
+            _ => wrong.push(format!(
+                "{} packet: methodology {} is not CommitType::{variant}'s",
+                p.commit_type, p.methodology
+            )),
+        }
+        let truth: f64 = p.initial_truth.parse().unwrap_or(f64::NAN);
+        // An arm with an if/else lists the with-Verification value first.
+        let expected = arm(initial_truth, &variant).map(floats).and_then(|f| {
+            match (f.as_slice(), p.has_verification) {
+                ([v], _) | ([v, _], true) | ([_, v], false) => Some(*v),
+                _ => None,
+            }
+        });
+        if !matches!(expected, Some(e) if (e - truth).abs() <= 1e-9) {
+            wrong.push(format!(
+                "{} packet: initial_truth {} is not CommitType::{variant}'s ({expected:?})",
+                p.commit_type, p.initial_truth
+            ));
+        }
+        let pct: f64 = p.confidence_pct.parse().unwrap_or(f64::NAN);
+        let row = format!("(false, false, {}) =>", p.has_verification);
+        let table = confidence
+            .lines()
+            .find(|l| l.contains(&row))
+            .map(floats)
+            .and_then(|f| f.first().copied());
+        if !matches!(table, Some(c) if (c * 100.0 - pct).abs() <= 1e-9) {
+            wrong.push(format!(
+                "{} packet: confidence {}% is not the parser's {row} {table:?}",
+                p.commit_type, p.confidence_pct
+            ));
+        }
+    }
+
+    // Environment variables.
+    let page_prose = prose(&page);
+    let env_vars: Vec<&str> = inline_spans(&page_prose)
+        .filter(|s| {
+            s.starts_with("EPIGRAPH_") && s.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        })
+        .collect();
+    for v in &env_vars {
+        let lit = format!("\"{v}\"");
+        if !ingest_git.contains(&lit) && !server.contains(&lit) {
+            wrong.push(format!(
+                "{v} is read by neither ingest_git nor the API server"
+            ));
+        }
+    }
+
+    // The `#N` reference limit and the edges' `if_not_exists`.
+    let citing = section(&ingest_git, "async fn find_claims_citing_pr(", "\n}\n");
+    let limits: Vec<&str> = page
+        .match_indices("up to ")
+        .filter_map(|(i, m)| {
+            let rest = &page[i + m.len()..];
+            let n = rest.split(' ').next()?;
+            (!n.is_empty()
+                && n.chars().all(|c| c.is_ascii_digit())
+                && rest[n.len()..].starts_with(" current claims"))
+            .then_some(n)
+        })
+        .collect();
+    for n in &limits {
+        if !citing.contains(&format!("(\"limit\", \"{n}\")")) {
+            wrong.push(format!("the #N limit {n} is not find_claims_citing_pr's"));
+        }
+    }
+    if page.contains("`if_not_exists`") && !ingest_git.contains("\"if_not_exists\": true") {
+        wrong.push("ingest_git no longer posts edges with if_not_exists".to_string());
+    }
+
+    assert!(
+        packets.len() >= 3,
+        "expected at least 3 captured packets in the walkthrough, found \
+         {packets:?}; the scanner is broken"
+    );
+    assert!(
+        env_vars.len() >= 2,
+        "expected at least 2 EPIGRAPH_* variables in the walkthrough, found \
+         {env_vars:?}; the scanner is broken"
+    );
+    assert_eq!(
+        limits.len(),
+        1,
+        "expected one \"up to N current claims\" in the walkthrough; the \
+         scanner is broken"
+    );
+    assert!(
+        wrong.is_empty(),
+        "docs/intro/03-walkthroughs.md quotes values the code does not give:\n  {}",
+        wrong.join("\n  ")
+    );
+}
+
 #[test]
 fn the_scanners_pick_out_flags_keys_and_labels() {
     let lines: Vec<String> = [
@@ -222,4 +453,28 @@ fn the_scanners_pick_out_flags_keys_and_labels() {
         ingester_labels("a `node:pr` b `repo:o/r` c `source:git-history` d"),
         vec!["node:pr", "source:git-history"]
     );
+
+    let out: Vec<String> = [
+        "Packet 1: \"[feat][api] x\"",
+        "  Evidence: 2 item(s), Verification: 0 item(s)",
+        "  Methodology: extraction, confidence: 70%, initial_truth: 0.4",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        captured_packets(&out),
+        vec![Captured {
+            commit_type: "feat".into(),
+            has_verification: false,
+            methodology: "extraction".into(),
+            confidence_pct: "70".into(),
+            initial_truth: "0.4".into(),
+        }]
+    );
+
+    let body = "match self {\n    Self::Feat => {\n        if v { 0.6 } else { 0.4 }\n    }\n    Self::Fix | Self::FixUp => 0.7,\n}";
+    assert_eq!(arm(body, "Feat").map(floats), Some(vec![0.6, 0.4]));
+    assert_eq!(arm(body, "Fix").map(floats), Some(vec![0.7]));
+    assert_eq!(arm(body, "Fi"), None);
 }
