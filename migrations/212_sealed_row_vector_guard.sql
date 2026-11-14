@@ -42,6 +42,10 @@
 --     (the WHEN clause is false), every UPDATE that names neither vector
 --     column (the trigger does not fire), and an INSERT (a row cannot have an
 --     encryption row before it exists: both encryption tables reference it).
+--   * refused too: a PARTIAL nulling of a sealed row that still carries
+--     both vectors (`SET embedding = NULL` alone leaves `embedding_3072`
+--     non-NULL, so the WHEN clause is true). Repair a legacy violation by
+--     nulling both columns in one statement, as the seal does.
 --
 -- `UPDATE OF` rather than every UPDATE, deliberately: a sealed row that still
 -- carries a vector from before this migration (the audit's violation) must not

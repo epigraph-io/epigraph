@@ -2663,7 +2663,14 @@ restart.
   binary depends on 212). **Deploy order:** none; it can be applied before or
   after the binary. Before applying, run CLAUDE.md's `sealed_with_embedding`
   audit on both tables: a non-zero count is an existing violation that 212
-  does not repair (it only stops new ones). **Applied to throwaway databases
+  does not repair (it only stops new ones). To repair one, null BOTH vector
+  columns in ONE statement (`SET embedding = NULL, embedding_3072 = NULL`, the
+  seal's own form): a statement that nulls one column and leaves the other
+  non-NULL still satisfies the WHEN clause and is refused, which includes
+  `epigraph-embeddings`' `EmbeddingRepository::delete` (it nulls `embedding`
+  only). 212 sets `lock_timeout = '3s'` (as 197 does): if it times out behind a
+  long write transaction on `claims` or `evidence`, nothing was applied, and it
+  can be re-run when those tables are quiet. **Applied to throwaway databases
   only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

@@ -177,6 +177,14 @@ async fn the_seal_nulling_and_unrelated_updates_are_admitted(pool: PgPool) {
     // Re-writing a vector onto it is refused, even though one is already there.
     let r = write(&pool, CLAIM_1536, claim).await;
     assert_eq!(sqlstate(&r).as_deref(), Some("42501"), "{r:?}");
+    // A partial nulling leaves the other vector in place, so it is refused:
+    // the remedy is both columns in one statement (the README says so).
+    let partial = sqlx::query("UPDATE claims SET embedding = NULL WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .map(|r| r.rows_affected());
+    assert_eq!(sqlstate(&partial).as_deref(), Some("42501"), "{partial:?}");
     // The remedy, the seal's own nulling, is admitted.
     sqlx::query("UPDATE claims SET embedding = NULL, embedding_3072 = NULL WHERE id = $1")
         .bind(claim)
