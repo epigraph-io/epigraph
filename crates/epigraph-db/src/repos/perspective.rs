@@ -352,7 +352,10 @@ impl PerspectiveRepository {
         Ok(row)
     }
 
-    /// List perspectives by agent
+    /// List perspectives by agent. Excludes the internal BBA-slot rows, as
+    /// [`Self::list`] does (backlog 63bb3d2e): `ensure_edge_perspective` and
+    /// `ensure_evidence_perspective` stamp the writing agent as the owner, so
+    /// without the filter an agent's listing is its edge and evidence slots.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -370,6 +373,7 @@ impl PerspectiveRepository {
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
             WHERE owner_agent_id = $1
+              AND COALESCE(perspective_type, '') NOT IN ('edge', 'evidence')
               /* {VISIBILITY:perspectives} */
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -388,7 +392,18 @@ impl PerspectiveRepository {
         Ok(rows)
     }
 
-    /// List all perspectives with pagination
+    /// List all perspectives with pagination.
+    ///
+    /// **Lists viewpoints only** (backlog 63bb3d2e). The rows
+    /// [`Self::ensure_edge_perspective`] (`perspective_type = 'edge'`, one per
+    /// epistemic edge, id = the edge id) and
+    /// [`Self::ensure_evidence_perspective`] (`'evidence'`, one per evidence
+    /// row) write are internal BBA slots: they exist so a mass function can be
+    /// keyed to its edge or evidence row by the `perspective_id` foreign key,
+    /// and are not lenses anyone chose. They are filtered in SQL, before
+    /// `LIMIT`, so a page is full of real perspectives however many slots are
+    /// newer. NULL-safe: a perspective with no type is listed. A slot is
+    /// still readable by id ([`Self::get_by_id`]).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -404,7 +419,8 @@ impl PerspectiveRepository {
             SELECT id, name, description, owner_agent_id, perspective_type,
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
-            WHERE true /* {VISIBILITY:perspectives} */
+            WHERE COALESCE(perspective_type, '') NOT IN ('edge', 'evidence')
+              /* {VISIBILITY:perspectives} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
