@@ -24,6 +24,21 @@ pub const MAX_NAME_WORDS: usize = 8;
 /// instead of naming the group, and is refused.
 pub const QUOTE_WORDS: usize = 5;
 
+/// Punctuation a name may hold besides letters, digits and the ASCII space.
+pub const NAME_PUNCTUATION: &[char] = &[
+    '-', '\u{2013}', '\'', '\u{2019}', ',', '.', ':', '&', '/', '(', ')', '+',
+];
+
+/// The name rule: a letter or digit of any script, the ASCII space, or
+/// [`NAME_PUNCTUATION`]. Everything else, including line and paragraph
+/// separators, format characters (bidirectional overrides, zero-width
+/// spaces), private-use characters and markup such as `<`, `>` or `"`, is
+/// refused.
+#[must_use]
+pub fn name_char_allowed(c: char) -> bool {
+    c == ' ' || c.is_alphanumeric() || NAME_PUNCTUATION.contains(&c)
+}
+
 /// A claim's place in every sample order: SHA-256 of its id. Independent of
 /// the group, so a parent's sample overlaps its children's, and a new claim
 /// enters a sample only if it ranks in it.
@@ -141,7 +156,9 @@ fn reply_object(reply: &str) -> Option<serde_json::Value> {
 ///
 /// # Errors
 /// Why the reply was refused: no JSON object with a string `name`; a name
-/// that is empty, holds a control character (a newline included), is over
+/// that is empty, holds a control character (a newline included) or any
+/// whitespace but the ASCII space, holds a character [`name_char_allowed`]
+/// refuses, is over
 /// [`MAX_NAME_CHARS`] characters or [`MAX_NAME_WORDS`] words, or shares
 /// [`QUOTE_WORDS`] consecutive words with one of `texts`.
 pub fn validate_reply(reply: &str, texts: &[&str]) -> Result<String, String> {
@@ -150,8 +167,16 @@ pub fn validate_reply(reply: &str, texts: &[&str]) -> Result<String, String> {
         .get("name")
         .and_then(serde_json::Value::as_str)
         .ok_or("the reply has no string `name`")?;
-    if raw.chars().any(char::is_control) {
-        return Err("the name holds a control character".into());
+    // Before the trim, which would quietly drop an edge separator instead
+    // of refusing it.
+    if let Some(c) = raw
+        .chars()
+        .find(|c| c.is_control() || (c.is_whitespace() && *c != ' '))
+    {
+        return Err(format!(
+            "the name holds a control or separator character U+{:04X}",
+            u32::from(c)
+        ));
     }
     let name =
         raw.trim_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '“' | '”'));
@@ -165,6 +190,12 @@ pub fn validate_reply(reply: &str, texts: &[&str]) -> Result<String, String> {
         .join(" ");
     if name.is_empty() {
         return Err("the name is empty".into());
+    }
+    if let Some(c) = name.chars().find(|c| !name_char_allowed(*c)) {
+        return Err(format!(
+            "the name holds a character outside the name rule U+{:04X}",
+            u32::from(c)
+        ));
     }
     let chars = name.chars().count();
     if chars > MAX_NAME_CHARS {
@@ -244,6 +275,48 @@ mod tests {
         }
         // Four shared words are not a quote.
         assert!(validate_reply("{\"name\": \"Lattice constant of diamond\"}", &[TEXT]).is_ok());
+    }
+
+    /// Separators, format characters and markup are refused wherever they
+    /// sit, written as JSON escapes so the reply itself parses.
+    #[test]
+    fn a_name_outside_the_character_rule_is_refused() {
+        for (esc, what) in [
+            ("\\u2028", "line separator"),
+            ("\\u2029", "paragraph separator"),
+            ("\\u202e", "right-to-left override"),
+            ("\\u200b", "zero-width space"),
+            ("\\u00a0", "no-break space"),
+            ("\\ue000", "private use"),
+            ("\\u0007", "bell"),
+            ("\\t", "tab"),
+            ("<b>", "markup"),
+            (";", "semicolon"),
+            // Quotation marks are trimmed at the edges, so these sit inside.
+            ("\\\"", "inner quotation mark"),
+            ("`", "backtick"),
+        ] {
+            let mut replies = vec![format!("{{\"name\": \"Diamond{esc}lattice\"}}")];
+            if !matches!(esc, "\\\"" | "`") {
+                replies.push(format!("{{\"name\": \"Diamond lattice{esc}\"}}"));
+            }
+            for reply in replies {
+                let got = validate_reply(&reply, &[TEXT]);
+                let err = got.expect_err(&format!("{what}: {reply}"));
+                assert!(err.contains("character"), "{what}: {err}");
+            }
+        }
+        // Letters of other scripts, digits and the allowed punctuation pass.
+        for ok in [
+            "Diamond (111) surfaces",
+            "Moore\u{2019}s law \u{2013} scaling",
+            "Si:H passivation, 2D films",
+            "Kristallgitter und Gitterkonstanten",
+            "\u{7ed3}\u{6676}\u{5b66}",
+        ] {
+            let reply = format!("{{\"name\": \"{ok}\"}}");
+            assert!(validate_reply(&reply, &[TEXT]).is_ok(), "{ok}");
+        }
     }
 
     #[test]
