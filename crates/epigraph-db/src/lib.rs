@@ -168,6 +168,7 @@ pub use repos::{
     AssertedCredential, CeremonyTicket, Confirmation, ElevationCeremony, EndReason, LiveElevation,
     Redemption, TicketMode, TicketPasskey,
 };
+pub use repos::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use repos::{CeremonyEnrollment, EnrollmentAnchor, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{
     ChoiceResolution, DefaultGroupSetting, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome,

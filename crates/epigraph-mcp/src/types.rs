@@ -471,6 +471,53 @@ pub struct ResolveClaimIdPrefixParams {
     pub limit: Option<i64>,
 }
 
+/// Parameters for MCP `screen_claim_atomicity` (backlog `72850d43`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScreenClaimAtomicityParams {
+    #[schemars(description = "The UUIDs of the claims to screen (1 to 200)")]
+    pub claim_ids: Vec<String>,
+}
+
+/// Parameters for MCP `query_compound_claims` (backlog `c4a8436b`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryCompoundClaimsParams {
+    #[schemars(
+        description = "Which claims to walk: \"atoms\" (default) for the targets of an in-force \
+                       decomposes_to edge, \"all\" for every current claim whatever its edges."
+    )]
+    #[serde(default)]
+    pub population: Option<String>,
+
+    #[schemars(
+        description = "Only claims with no in-force decomposes_to children (default true): the \
+                       compound claims nothing has split yet, which is what \
+                       decompose_claims --redecompose takes. false also returns compound claims \
+                       that already have children."
+    )]
+    #[serde(default)]
+    pub leaves_only: Option<bool>,
+
+    #[schemars(description = "Smallest conjunct_count to return (default 2, at least 2).")]
+    #[serde(default)]
+    pub min_conjuncts: Option<u32>,
+
+    #[schemars(description = "Most claims to return (default 50, at most 200).")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+
+    #[schemars(
+        description = "Most claims to read and screen in this call (default 2000, at most \
+                       10000). The walk stops at the first of limit hits or max_scan reads; \
+                       next_cursor resumes it."
+    )]
+    #[serde(default)]
+    pub max_scan: Option<u32>,
+
+    #[schemars(description = "A previous call's next_cursor, to continue the walk.")]
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
 /// Parameters for MCP `lint_claim_id_citations` (backlog `30d8b667`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LintClaimIdCitationsParams {

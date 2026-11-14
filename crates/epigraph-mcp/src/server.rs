@@ -1419,6 +1419,32 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Screen claims for compound content by id: an estimate of how many logically independent assertions each makes. Returns {claims: [{claim_id, content (first 300 characters), content_truncated, is_current, sentences, clause_joins (a semicolon, or a comma followed by and / but / yet / so / while / whereas / although / though / which, but not the and closing a comma list), quantities (distinct numbers; a dash range is one, numbers glued to a word such as CO2 and bare years are none), conjunct_count = max(sentences + clause_joins, ceil(quantities / 2)), is_compound (conjunct_count >= 2), decomposes_to_children, decomposes_to_parents, labelled_compound_atom}], not_found}. A heuristic for warning and discovery, never a rejection: long narrative claims are legitimate. 1 to 200 ids; an id you cannot read is in not_found, exactly like one that names nothing, and a hidden edge or neighbour is in no count."
+    )]
+    async fn screen_claim_atomicity(
+        &self,
+        Parameters(params): Parameters<crate::types::ScreenClaimAtomicityParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::atomicity::screen_claim_atomicity(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Find compound claims REGARDLESS of their decomposes_to edges, which query_undecomposed_claims cannot: it excludes every claim with such an edge, so a compound atom never reaches it. Walks current claims oldest first (population \"atoms\", the default: targets of an in-force decomposes_to edge; or \"all\"), screens each as screen_claim_atomicity does, and returns those with conjunct_count >= min_conjuncts (default 2), by default only those with no in-force decomposes_to children (leaves_only), each in screen_claim_atomicity's row shape. Returns {claims, scanned, next_cursor, exhausted}: one call reads at most max_scan claims (default 2000) and stops at limit hits (default 50); pass next_cursor as after to continue. Feed the claim_ids to decompose_claims --redecompose --ids-file to split them. Only claims you may read are walked."
+    )]
+    async fn query_compound_claims(
+        &self,
+        Parameters(params): Parameters<crate::types::QueryCompoundClaimsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::atomicity::query_compound_claims(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Find a person, an LLM agent or a system identity by NAME (or by exact ORCID / ROR id). Case-, accent- and punctuation-folded (Jean-Pierre = jean pierre, O'Brien = OBrien); an ORCID matches with or without hyphens or the orcid.org prefix; ranked orcid/ror > exact > prefix (of the name or one of its words) > similar (trigram), then oldest first. Display names collide (many agents share a name), so each result carries what tells them apart: id, display_name, kind (human / llm_agent / system / role / ingest_author / unknown, derived from evidence you may see: a registered human (shown to that human, admins, and everyone when it holds a disclosed role), an LLM model on a visible profile, a binding to a human, the system registry, the document ingest's name-derived author key), kind_evidence, roles (open assignments of non-elevating, non-audit roles, plus your own), orcid / ror_id (when the profile is visible to you), operator_human (the human the agent is currently bound to, {id, display_name}, shown to every reader: its live operator link, else its unrevoked client allowance; null once the link is retired or the allowance revoked; never read from an OPERATED_BY edge; the agent's model and prompt are not on the card), created_at, and counts (authored_papers: papers it has an authorship of that is not awaiting its countersignature (a name-derived author is never countersigned and never pending); pending_authored_papers: papers an ingester named it on, awaiting its countersignature, where it has no other authorship; asserted_claims: claims it filed, plus each claim an ingest that named it as an author attributes to it, that ingest's authorship, paper assertion and attribution all written by ingests of the same principal, so another ingest of the same DOI that does not name it credits it with nothing; each paper and claim counted once; only in-force edges carrying the document ingest's ingest-written marker count, which no other writer can set, so an edge written by any other path never counts whatever its shape, and edges ingested before the marker existed do not count until backfilled; computed only over what you can read, capped at 10000 with capped=true), plus tier and score. kind and role filters apply before the limit; candidates_truncated=true means more than 200 agents matched, so narrow the name. Matches display_name as written (a display_name that is an email address matches like any name); never searches properties or contact fields (full_name, email, affiliations). Same rules as GET /api/v1/agents/search."
     )]
     async fn find_agent(
