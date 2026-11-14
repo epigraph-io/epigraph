@@ -549,7 +549,7 @@ at a time.
 | `EPIGRAPH_LLM_PROVIDER` | the API server, in a build with the `genai` feature | `anthropic` | The provider behind `POST /api/v1/analyze/unconstrained`: `anthropic`, `epigraph` (the first active registered provider), `mock`, or the name of a registered extension. The request's question is sent to it. A build without `genai` answers that route 503. |
 | `ENRICHMENT_LLM_PROVIDER` | `ingest_git --enricher llm` | `epigraph` | The provider selector for the commit enricher; same values. |
 | `ENRICHMENT_WINDOW_SIZE`, `ENRICHMENT_WINDOW_OVERLAP` | `ingest_git --enricher llm` | `20`, `5` | Commits per enrichment window, and how many of them overlap the next window. |
-| `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` | `ingest_git` | unset | The orchestrator agent's UUID when neither `--orchestrator-id` nor an `Epigraph-Orchestrator-Id` trailer in the PR body or commits names one. |
+| `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` | `ingest_git` | unset | The orchestrator agent's UUID when neither `--orchestrator-id` nor an `Epigraph-Orchestrator-Id` trailer in the PR body names one. A trailer in a commit message is not read. The reconciler's `default_orchestrator_id` is not this fallback: when set, it is passed as `--orchestrator-id` and wins over the PR body's trailer. |
 | `API_ENDPOINT` | `embed_bridge` | `http://localhost:8080` | The API's base URL for that CLI. |
 | `NLI_SERVICE_URL` | `NliClient::from_env` (`epigraph-cli`, `enrichment::nli_client`) | unset | The URL of an NLI classification service, which is POSTed `{premise, hypothesis}`. No binary in this tree calls `from_env` at the time of writing, so setting the variable changes nothing yet. |
 
