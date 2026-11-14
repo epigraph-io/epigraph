@@ -3494,6 +3494,143 @@ async fn a_passkey_enrolled_during_the_lock_wait_is_locked_before_the_walk_ends(
     );
 }
 
+/// The lock-and-walk repeats for as long as a walk keeps reaching passkeys
+/// the locks do not hold, not a fixed number of times. The test above needs
+/// two passes; this one takes four (the third walk reaches N3 and the
+/// fourth pass locks it), and a loop capped at two (or two unrolled passes)
+/// leaves N3 live.
+///
+/// Arranged deterministically: C share-locks the phone and its backup, so
+/// the first pass waits; meanwhile N enrolls under the backup and an act N
+/// confirms opens an enrollment. E share-locks N, and C commits: the first walk reaches N, which the first lock does not
+/// hold, so the second pass waits for E on N. Meanwhile N2 enrolls under N
+/// and commits, an act N2 confirms opens an enrollment, and D completes an
+/// ATTESTED N3 on it, uncommitted, holding N2. E commits: the second walk
+/// reaches N2, which the second lock does not hold, so the third pass waits
+/// for D on N2. D commits: the third walk reaches N3, and the fourth pass
+/// locks it. The revoke must reach N3 at depth 4 and revoke it. Verified to
+/// fail with 214's loop capped at two passes: the UPDATE waits for D on N2,
+/// N3 commits unseen, and N3 stays live and is not in the returned rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compromised_revoke_locks_and_walks_until_no_walked_passkey_is_unlocked(pool: PgPool) {
+    use sqlx::Executor;
+    let p = elevated_custodian(&pool, "phone owner", 1).await;
+    let (_, e_backup) = anchored_enrollment(&pool, &p).await;
+    let backup = try_complete(&pool, e_backup, 2, "packed").await.unwrap();
+    let via_backup = Elevated {
+        passkey: backup,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, e_n) = anchored_enrollment(&pool, &via_backup).await;
+
+    // C: a share lock on every passkey the person holds now.
+    let mut c = pool.acquire().await.unwrap();
+    let c_pid = backend_pid(&mut c).await;
+    c.execute("BEGIN").await.unwrap();
+    let held: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM person_authenticators WHERE person_agent_id = $1 ORDER BY id FOR SHARE",
+    )
+    .bind(p.person)
+    .fetch_all(&mut *c)
+    .await
+    .unwrap();
+    let mut want_held = vec![p.passkey, backup];
+    want_held.sort();
+    assert_eq!(
+        held, want_held,
+        "CALIBRATION: C holds the phone and the backup"
+    );
+
+    let (r_pid, revoke) = start_revoke(&pool, "READ COMMITTED", p.passkey, "phone stolen").await;
+    assert!(
+        blocked_by(&pool, r_pid, c_pid, &revoke).await,
+        "CALIBRATION: the first pass waits for C"
+    );
+
+    // During the first pass's wait, N enrolls under the backup and an act N
+    // confirms opens an enrollment (its confirmation takes `FOR UPDATE` on N,
+    // so it comes before E's share lock).
+    let n = within("N's completion", try_complete(&pool, e_n, 3, "packed"))
+        .await
+        .expect("N completes while the first pass waits");
+    let via_n = Elevated {
+        passkey: n,
+        cred: credential(3),
+        ..p.clone()
+    };
+    let (_, e_n2) = within("N's act", anchored_enrollment(&pool, &via_n)).await;
+    // E: a share lock on N, so the second pass's lock on N waits.
+    let mut e = pool.acquire().await.unwrap();
+    let e_pid = backend_pid(&mut e).await;
+    e.execute("BEGIN").await.unwrap();
+    let held_n: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM person_authenticators WHERE id = $1 FOR SHARE")
+            .bind(n)
+            .fetch_all(&mut *e)
+            .await
+            .unwrap();
+    assert_eq!(held_n, vec![n], "CALIBRATION: E holds N");
+
+    c.execute("COMMIT").await.unwrap();
+    drop(c);
+    assert!(
+        blocked_by(&pool, r_pid, e_pid, &revoke).await,
+        "CALIBRATION: past C, the first walk reaches N and the second pass waits for E on it"
+    );
+
+    // During the second pass's wait: N2 enrolls under N and commits, an act
+    // N2 confirms opens an enrollment, and D holds N3's completion on it.
+    let n2 = within("N2's completion", try_complete(&pool, e_n2, 4, "packed"))
+        .await
+        .expect("N2 completes while the second pass waits");
+    let via_n2 = Elevated {
+        passkey: n2,
+        cred: credential(4),
+        ..p.clone()
+    };
+    let (_, e_n3) = within("N2's act", anchored_enrollment(&pool, &via_n2)).await;
+    let (mut d, d_pid, n3) = within("N3's completion", complete_uncommitted(&pool, e_n3, 5)).await;
+    assert!(
+        !revoke.is_finished(),
+        "CALIBRATION: the second pass still waits for E"
+    );
+
+    e.execute("COMMIT").await.unwrap();
+    drop(e);
+    assert!(
+        blocked_by(&pool, r_pid, d_pid, &revoke).await,
+        "CALIBRATION: past E, the revoke reaches N2 and waits for D's lock on it"
+    );
+    d.execute("COMMIT").await.unwrap();
+    release(d).await;
+
+    let mut got = within("the revoke", revoke)
+        .await
+        .unwrap()
+        .expect("the compromised revoke");
+    got.sort();
+    let mut want = vec![
+        (p.passkey, 0, true),
+        (backup, 1, true),
+        (n, 2, true),
+        (n2, 3, true),
+        (n3, 4, true),
+    ];
+    want.sort();
+    assert_eq!(
+        got, want,
+        "the walk reaches N3, which completed under N2 after the second walk reached N2"
+    );
+    let (_, reason) = revoked(&pool, n3)
+        .await
+        .expect("N3 is revoked with the rest of the lineage");
+    assert_eq!(
+        reason,
+        format!("compromised anchor {} (lineage): phone stolen", p.passkey)
+    );
+}
+
 fn repo_text(rel: &str) -> String {
     std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
