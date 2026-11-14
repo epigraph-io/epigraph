@@ -34,10 +34,15 @@
 -- The handlers, the runners and `JobQueue::update` never read or write it, so
 -- a row's other columns mean what they meant before.
 --
--- A constant DEFAULT makes the ADD COLUMN a catalog change; the CHECK scans
--- `jobs` once to validate, which is a small table (completed and failed rows
--- are pruned). No grant or policy changes: `jobs` carries table-level grants
--- and 119's bypass-only `jobs_app` policy, which cover a new column.
+-- A constant DEFAULT makes the ADD COLUMN a catalog change, but the CHECK
+-- scans `jobs` once to validate it, under the ADD COLUMN's ACCESS EXCLUSIVE
+-- lock. Nothing in this tree prunes `jobs` on a schedule
+-- (`PostgresJobQueue::cleanup_old_jobs` has no production caller), so the
+-- scan's cost is the table's size: measure `SELECT count(*),
+-- pg_size_pretty(pg_total_relation_size('public.jobs'))` before applying. The
+-- 3 s `lock_timeout` makes a busy table refuse the migration rather than queue
+-- behind it. No grant or policy changes: `jobs` carries table-level grants and
+-- 119's bypass-only `jobs_app` policy, which cover a new column.
 --
 -- ===================================================================
 -- 2. DEPLOY ORDER AND UNDO
