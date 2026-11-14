@@ -496,7 +496,11 @@ async fn frame_conflict_aggregates_only_the_mass_functions_the_viewer_can_read(p
     let theirs = seed_group_claim(&pool, stranger, stranger_group, "fc agg: their claim").await;
     let frame = common::seed_frame_with_claim(&pool, open).await;
 
-    for (claim, source, k) in [(open, agent, 0.1_f64), (mine, agent, 0.3), (theirs, stranger, 0.9)] {
+    for (claim, source, k) in [
+        (open, agent, 0.1_f64),
+        (mine, agent, 0.3),
+        (theirs, stranger, 0.9),
+    ] {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, conflict_k) \
              VALUES ($1, $2, $3, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb, $4) RETURNING id",
