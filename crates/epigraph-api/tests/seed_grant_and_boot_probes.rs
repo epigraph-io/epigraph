@@ -14,10 +14,14 @@
 //! error, not a refusal, so a statement that no longer parsed would silently
 //! switch off the armed boot refusals.
 //!
-//! What it does not pin: a swap of two same-typed columns whose values
-//! coincide on the harness (a superuser with BYPASSRLS that holds the seed
-//! grant, so all three booleans are true) decodes cleanly. A swap across
-//! types fails the decode and is caught.
+//! On the harness connection (a superuser with BYPASSRLS that holds the seed
+//! grant) the old `pg_has_role` question and 216's explicit-grant question
+//! both answer true, so that test cannot tell them apart. The two
+//! `..._as_a_superuser_with_no_grant` tests run the same two methods on a
+//! pool whose every connection is a throwaway SUPERUSER holding no grant,
+//! where the questions differ: 074's says "seed", 216's says "not a seed".
+//! Putting `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')` back into
+//! either probe turns its test red (checked by that revert).
 //!
 //! # The grant
 //!
@@ -29,6 +33,7 @@
 
 use epigraph_api::{ApiConfig, AppState};
 use sqlx::{Executor, PgPool};
+use tracing_test::traced_test;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_boot_posture_probes_execute_and_report_the_trigger_seed_answer(pool: PgPool) {
@@ -119,4 +124,101 @@ async fn the_harness_seed_grant_makes_the_migrating_role_an_explicit_seed(pool: 
     tx.rollback()
         .await
         .expect("rollback removes the role and its grant");
+}
+
+/// A committed throwaway `NOLOGIN SUPERUSER` role holding no grant of
+/// `epigraph_seed`, and a pool whose every connection has become it.
+///
+/// The role has to be COMMITTED (the probes run on pool connections, not in
+/// one transaction), and roles are cluster-wide, so the name is unique per
+/// call and [`drop_superuser`] removes it. A panic before that leaves one
+/// NOLOGIN role that owns nothing.
+async fn ungranted_superuser_pool(pool: &PgPool) -> (String, PgPool) {
+    let role = format!("seedp_{}", uuid::Uuid::new_v4().simple());
+    pool.execute(format!("CREATE ROLE {role} NOLOGIN SUPERUSER").as_str())
+        .await
+        .expect("create the throwaway superuser");
+    let set = format!("SET SESSION AUTHORIZATION {role}");
+    let as_role = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _meta| {
+            let set = set.clone();
+            Box::pin(async move {
+                conn.execute(set.as_str()).await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .expect("a pool whose connections are the throwaway superuser");
+    (role, as_role)
+}
+
+async fn drop_superuser(pool: &PgPool, as_role: PgPool, role: &str) {
+    as_role.close().await;
+    pool.execute(format!("DROP ROLE {role}").as_str())
+        .await
+        .expect("drop the throwaway superuser");
+}
+
+/// `probe_rls_posture`, run as a superuser with no grant: since 216 that
+/// session is NOT a seed, and the probe must say so. Before this test the
+/// probe could ask 074's `pg_has_role` again and stay green.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rls_posture_probe_reports_no_seed_as_a_superuser_with_no_grant(pool: PgPool) {
+    let (role, as_role) = ungranted_superuser_pool(&pool).await;
+    let state = AppState::with_db(as_role.clone(), ApiConfig::default());
+
+    let facts: (String, bool, bool) = sqlx::query_as(
+        "SELECT session_user::text, \
+                (SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                public.epigraph_session_is_seed()",
+    )
+    .fetch_one(&as_role)
+    .await
+    .expect("read the throwaway session's facts");
+    let posture = state.probe_rls_posture().await;
+    drop_superuser(&pool, as_role, &role).await;
+
+    assert_eq!(
+        facts,
+        (role.clone(), true, false),
+        "precondition: the pool's session is the throwaway superuser, and 216's question \
+         says it is not a seed"
+    );
+    let posture = posture.expect("probe_rls_posture must execute as a superuser");
+    assert!(posture.is_superuser, "{posture:?}");
+    assert!(
+        !posture.is_seed_member,
+        "a superuser holding no grant of epigraph_seed does NOT take the escape hatch since \
+         migration 216, so the boot probe must not report it as a seed member (074's \
+         pg_has_role question would): {posture:?}"
+    );
+}
+
+/// `warn_on_privileged_connection`, run as a superuser with no grant: it must
+/// log the "no grant, undeclared writes raise 23502" warning, and NOT the
+/// "can take the escape hatch, writes are STAMPED" one, which would be false.
+/// The method's findings are observable only as tracing events.
+#[traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_privileged_connection_warning_is_the_no_grant_one_as_a_superuser_with_no_grant(
+    pool: PgPool,
+) {
+    let (role, as_role) = ungranted_superuser_pool(&pool).await;
+    let state = AppState::with_db(as_role.clone(), ApiConfig::default());
+
+    let result = state.warn_on_privileged_connection().await;
+    drop_superuser(&pool, as_role, &role).await;
+
+    result.expect("warn_on_privileged_connection must execute as a superuser");
+    assert!(
+        logs_contain("connected as a SUPERUSER that holds no grant of epigraph_seed"),
+        "the no-grant superuser warning must be logged since migration 216"
+    );
+    assert!(
+        !logs_contain("can take migration 074's epigraph_seed escape hatch"),
+        "a superuser with no grant must not be told its undeclared writes are stamped onto \
+         the seed group: since 216 they raise 23502"
+    );
 }
