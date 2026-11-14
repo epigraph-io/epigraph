@@ -936,6 +936,11 @@ async fn maps_and_themes_list_only_what_the_viewer_reads(pool: PgPool) {
     let t = get(&r, &format!("/api/v1/atlas/maps/{}/themes", w.a), w.m).await;
     assert_eq!(t.status, StatusCode::OK, "{}", t.text());
     let t = t.json();
+    // `claim_count` is 4 although M cannot read B's claim Z: a theme's count,
+    // like a group level's counts, is served as the builder stored it (the
+    // `atlas_level` contract's design; the builder's audience rule guards it).
+    // Only leaf rows are filtered per viewer. What this test locks in is which
+    // MAPS and THEMES a viewer is told about, not a per-viewer count.
     assert_eq!(
         t["themes"],
         serde_json::json!([{
@@ -951,13 +956,25 @@ async fn maps_and_themes_list_only_what_the_viewer_reads(pool: PgPool) {
     assert_eq!(pt["themes"][0]["roots"]["meaning"], w.prm.to_string());
     assert_eq!(pt["themes"][0]["roots"]["links"], w.prl.to_string());
 
+    // A map the viewer may not read, a group with no map (B) and an id that
+    // was never a group: byte for byte the same body once the id asked for
+    // is normalised, so a refusal says nothing a missing map would not.
+    let never = Uuid::new_v4();
     let denied = get(&r, &format!("/api/v1/atlas/maps/{}/themes", w.a), w.s).await;
-    let nothing = get(&r, &format!("/api/v1/atlas/maps/{}/themes", w.b), w.s).await;
-    assert_eq!(denied.status, StatusCode::NOT_FOUND);
-    // B has no map: the same shape, naming only the segment asked for.
+    let no_map = get(&r, &format!("/api/v1/atlas/maps/{}/themes", w.b), w.s).await;
+    let unknown = get(&r, &format!("/api/v1/atlas/maps/{never}/themes"), w.s).await;
+    for (name, a) in [
+        ("denied", &denied),
+        ("no map", &no_map),
+        ("unknown", &unknown),
+    ] {
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{name}: {}", a.text());
+    }
     assert_eq!(denied.json()["details"]["entity"], "atlas_map");
-    assert_eq!(nothing.json()["details"]["entity"], "atlas_map");
     assert_eq!(denied.json()["details"]["id"], w.a.to_string());
+    let normalised = |a: &Answer, id: Uuid| a.text().replace(&id.to_string(), "<map>");
+    assert_eq!(normalised(&denied, w.a), normalised(&no_map, w.b));
+    assert_eq!(normalised(&denied, w.a), normalised(&unknown, never));
 }
 
 // ---- budget -------------------------------------------------------------------------
@@ -966,6 +983,12 @@ async fn maps_and_themes_list_only_what_the_viewer_reads(pool: PgPool) {
 /// real rows (the worst-case leaf's 100 claim nodes are A's claims, so the
 /// per-viewer filter keeps them all), are served whole and within the gzip
 /// budget as served.
+///
+/// This is a calibration, not a guard on the routes: the kernel re-serialises
+/// what the builder stored, so its size is set by the contract's caps, and no
+/// route change short of padding the body can turn it red. The guard on the
+/// bytes on the wire is the Explorer's
+/// `a_level_is_compressed_within_budget_when_gzip_is_accepted`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_largest_documents_are_served_within_budget(pool: PgPool) {
     use epigraph_atlas_contract::fixtures::{worst_case_group, worst_case_leaf};
