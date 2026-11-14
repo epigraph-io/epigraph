@@ -1128,6 +1128,9 @@ async fn anchored_android(
     (rp, phone, finished)
 }
 
+/// What a test does to the status list after the relying party is built.
+type Tamper = Box<dyn FnOnce(&std::path::Path)>;
+
 /// `tamper` for [`anchored_android`]: leave the status list as written.
 fn untouched(_: &std::path::Path) {}
 
@@ -1250,4 +1253,83 @@ async fn an_android_key_whose_standing_cannot_be_checked_is_refused_on_the_ancho
         (dropped.attestation_format.as_str(), dropped.aaguid),
         ("none", Uuid::nil())
     );
+}
+
+/// The status list's OTHER unknown states refuse on the anchored path as the
+/// stale and missing ones do (the attested path's `StatusList::load` errors,
+/// each reaching the anchored finish as status-unknown): a list that is not
+/// JSON, one dated hours in the future, one that exists but cannot be read
+/// (mode 000), and a directory where the file should be. Each is refused
+/// naming the remedy, never recorded `none` or `android-key`.
+/// CALIBRATION: an_android_key_whose_standing_cannot_be_checked_is_refused_on_the_anchored_path
+/// (a fresh list records the same key `android-key`).
+/// Mutations: `StatusList::load` taking a list that does not parse as empty
+/// -> the malformed case records `android-key`; `age_of`'s future check
+/// removed -> the future-dated case records `android-key`; `load`'s read
+/// error taken as an empty list -> the mode-000 and directory cases record
+/// `android-key`; the status-unknown arm dropping -> all four record `none`.
+#[tokio::test]
+async fn every_unknown_status_list_state_is_refused_on_the_anchored_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let vendor = TestAttestation::new("Allowlisted");
+    let google = TestAttestation::new("Android");
+    let genuine = AndroidKeyOpts::default();
+    let hour = Duration::from_secs(3600);
+
+    let future = android_status::fresh_empty();
+    std::fs::File::options()
+        .write(true)
+        .open(&future)
+        .unwrap()
+        .set_modified(SystemTime::now() + 2 * hour)
+        .unwrap();
+    // Run as root (some CI containers), mode 000 does not stop a read: the
+    // case is then not exercised (the directory case still is).
+    let mut root_reads_anything = false;
+    let unreadable = |p: &std::path::Path| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+    };
+    let as_directory = |p: &std::path::Path| {
+        std::fs::remove_file(p).unwrap();
+        std::fs::create_dir(p).unwrap();
+    };
+    let cases: [(&str, PathBuf, Tamper, &str); 4] = [
+        (
+            "malformed",
+            android_status::file("{\"entries\": [", Duration::ZERO),
+            Box::new(untouched),
+            "not a JSON document",
+        ),
+        ("future-dated", future, Box::new(untouched), "in the future"),
+        (
+            "mode 000",
+            android_status::fresh_empty(),
+            Box::new(unreadable),
+            "cannot be read",
+        ),
+        (
+            "a directory",
+            android_status::fresh_empty(),
+            Box::new(as_directory),
+            "cannot be read",
+        ),
+    ];
+    for (label, path, tamper, expected) in cases {
+        let (_, _, r) = anchored_android(&vendor, &google, path.clone(), tamper, &genuine).await;
+        if label == "mode 000" && std::fs::read(&path).is_ok() {
+            root_reads_anything = true;
+            continue;
+        }
+        let why = match r {
+            Err(PasskeyError::AttestationRefused(why)) => why,
+            other => panic!("{label}: expected a policy refusal, got {other:?}"),
+        };
+        assert!(
+            why.contains(expected) && why.contains("refresh"),
+            "{label}: names the list and the remedy: {why}"
+        );
+    }
+    if root_reads_anything {
+        eprintln!("running as root: the mode-000 case was not exercised");
+    }
 }
