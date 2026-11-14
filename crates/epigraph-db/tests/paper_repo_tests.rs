@@ -21,13 +21,63 @@ async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
         .expect("second insert");
     assert_eq!(id1, id2, "same DOI must return same paper id");
 
-    // The conflict path updated the title.
+    // A hit fills only what is missing (backlog 62ce37ca): the first
+    // writer's title stands.
     let row = PaperRepository::find_by_doi(&pool, doi)
         .await
         .expect("find_by_doi")
         .expect("paper row");
     assert_eq!(row.id, id1);
-    assert_eq!(row.title.as_deref(), Some("Title 1 updated"));
+    assert_eq!(row.title.as_deref(), Some("Title 1"));
+    assert_eq!(row.journal.as_deref(), Some("Journal X"));
+}
+
+/// Backlog 62ce37ca: `papers` is a global table with no row security, so a
+/// get-or-create HIT must not rewrite another ingester's bibliographic fields.
+/// It may only fill a field that is still NULL. Both halves are asserted: a
+/// pure insert-only writer would pass the first and fail the second.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
+    let doi = "10.5555/repo-fill-only";
+    let id = PaperRepository::get_or_create(&pool, doi, Some("Original title"), None)
+        .await
+        .expect("first writer");
+
+    let again = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Rewritten by a second ingester"),
+        Some("Second journal"),
+    )
+    .await
+    .expect("second writer");
+    assert_eq!(again, id);
+
+    let row = PaperRepository::find_by_doi(&pool, doi)
+        .await
+        .expect("find_by_doi")
+        .expect("paper row");
+    assert_eq!(
+        row.title.as_deref(),
+        Some("Original title"),
+        "a hit must not overwrite a title another writer set"
+    );
+    assert_eq!(
+        row.journal.as_deref(),
+        Some("Second journal"),
+        "a hit still fills a field the first writer left NULL"
+    );
+
+    // And once filled, the journal is not rewritten either.
+    PaperRepository::get_or_create(&pool, doi, None, Some("Third journal"))
+        .await
+        .expect("third writer");
+    let row = PaperRepository::find_by_doi(&pool, doi)
+        .await
+        .expect("find_by_doi")
+        .expect("paper row");
+    assert_eq!(row.title.as_deref(), Some("Original title"));
+    assert_eq!(row.journal.as_deref(), Some("Second journal"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -189,8 +239,8 @@ async fn get_or_create_reuses_a_legacy_url_keyed_row_instead_of_twinning(pool: P
         .unwrap();
     assert_eq!(
         title.as_deref(),
-        Some("re-ingested"),
-        "the row found is upserted"
+        Some("legacy"),
+        "the row found keeps its title: a hit fills only NULL fields (backlog 62ce37ca)"
     );
 }
 
@@ -271,6 +321,62 @@ async fn concurrent_writers_under_two_spellings_of_a_new_doi_converge(pool: PgPo
         "one paper, under the canonical key"
     );
     assert_eq!(id, held_id);
+}
+
+/// The `ON CONFLICT (doi)` arm of `get_or_create` (reached only when another
+/// writer inserts the same new key concurrently) must fill only NULL fields
+/// too, or the race loser rewrites the winner's title (backlog 62ce37ca).
+/// Same deterministic hold as the test above.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
+    let bare = "10.5555/repo-race-fill-only";
+    let mut held = pool.begin().await.expect("begin held tx");
+    let held_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, journal) VALUES ($1, 'winner', NULL) RETURNING id",
+    )
+    .bind(bare)
+    .fetch_one(&mut *held)
+    .await
+    .expect("held insert");
+
+    let p = pool.clone();
+    let writer = tokio::spawn(async move {
+        PaperRepository::get_or_create(&p, bare, Some("loser"), Some("loser journal")).await
+    });
+
+    for _ in 0..200 {
+        if writer.is_finished() {
+            break;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND query LIKE '%INSERT INTO papers%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    held.commit().await.expect("commit held row");
+
+    let id = writer.await.expect("join").expect("get_or_create");
+    assert_eq!(id, held_id);
+    let (title, journal): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT title, journal FROM papers WHERE id = $1")
+            .bind(held_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the row");
+    assert_eq!(title.as_deref(), Some("winner"), "the winner's title stands");
+    assert_eq!(
+        journal.as_deref(),
+        Some("loser journal"),
+        "the loser fills only what the winner left NULL"
+    );
 }
 
 /// A paper's asserted claims are listed and counted once each, however many
