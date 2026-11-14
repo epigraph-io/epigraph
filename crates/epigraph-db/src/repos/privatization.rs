@@ -463,6 +463,21 @@ pub const SAMPLE_CANDIDATE_WINDOW: usize = 500;
 /// for the whole boundary and turn the sample into the survey.
 pub const MAX_BOUNDARY_EDGE_SAMPLE: i64 = 1000;
 
+/// The attempt budget ([`PrivatizationRepository::enqueue_job_conn`]'s
+/// `max_attempts`, the row's `max_retries`) of a privatization apply, revert or
+/// reseal job: ONE attempt, recovered by re-delivery, never by a retry ladder.
+pub const PRIVATIZATION_JOB_ATTEMPTS: i32 = 1;
+
+/// The attempt budget of the unseal's `embedding_generation` jobs: the first
+/// attempt plus two retries for a transient provider error (a 429, a 503, a
+/// timeout), each on a later drain run (backlog 1320b4e3). The handler is
+/// idempotent. A permanent error fails the job at once:
+/// `ConfigurableEmbeddingHandler` classifies a claim that is sealed, retired or
+/// gone by the time it stores, empty text, a dimension mismatch and a payload
+/// of another variant as permanent. Missing claim TEXT stays transient, because
+/// the service also reports a failed read that way.
+pub const EMBEDDING_RESTORE_JOB_ATTEMPTS: i32 = 3;
+
 /// A persisted plan row, as migration 087's SELECT policy admits it.
 ///
 /// `expires_at` is deliberately ABSENT: FINAL-PLAN §6.5.2 gives a preview a 4 h
@@ -4414,31 +4429,40 @@ impl PrivatizationRepository {
     /// never flipped (which the handler refuses on condition 1, correctly, but
     /// noisily and after the fact).
     ///
-    /// # Plain enqueue, NOT `enqueue_unique_pending`
+    /// # Plain enqueue, never deduplicated by `job_type`
     ///
-    /// `PostgresJobQueue::enqueue_unique_pending` guards on `job_type` plus
-    /// `state = 'pending'` and discriminates nothing about the payload, so a
-    /// second plan's apply would be silently dropped while the first is queued.
-    /// A privatization that reports 202 and never runs is the failure this
-    /// function's shape refuses.
+    /// A dedup that guards on `job_type` plus `state = 'pending'` (the queue
+    /// once had one, `enqueue_unique_pending`, removed with no caller)
+    /// discriminates nothing about the payload, so a second plan's apply would
+    /// be silently dropped while the first is queued. A privatization that
+    /// reports 202 and never runs is the failure this function's shape refuses.
     ///
-    /// # `max_retries` IS AN ATTEMPT BUDGET, NOT A COUNT OF RETRIES AFTER THE
+    /// # `max_attempts` IS AN ATTEMPT BUDGET, NOT A COUNT OF RETRIES AFTER THE
     /// FIRST
     ///
-    /// `JobRunner`'s worker loop evaluates `job.retry_count >= job.max_retries`
-    /// BEFORE it calls `handler.handle`, and marks the job `failed` when it
-    /// holds. So the row's invariant at first dequeue is
-    /// `retry_count < max_retries`, and a row inserted with `(0, 0)` is failed
-    /// without the handler ever running — a 202 that never happens, which is the
-    /// failure this function's shape exists to refuse.
+    /// It is written to `jobs.max_retries`. Both runners (the drain's
+    /// `JobRunner::process_job` and `JobRunner::start`'s loop) evaluate
+    /// `job.retry_count >= job.max_retries` BEFORE they call `handler.handle`,
+    /// and mark the job `failed` when it holds. So the row's invariant at first
+    /// dequeue is `retry_count < max_retries`, and a row inserted with `(0, 0)`
+    /// is failed without the handler ever running — a 202 that never happens,
+    /// which is the failure this function's shape exists to refuse. A value
+    /// below 1 is therefore refused here.
     ///
-    /// `1` is therefore the value that means what `JobHandler::max_retries() =
-    /// 0` means on these two handlers: exactly ONE attempt, no exponential
-    /// ladder. Recovery from a partial apply is the stale-job reaper
-    /// re-dispatching, which re-runs the full re-validation, not a retry into
-    /// the same lock timeout. (`JobHandler::max_retries` is not consulted by the
-    /// runner at all — the row's column is the only load-bearing number — which
-    /// is why this one is spelled out here rather than inferred.)
+    /// The callers pass one of two budgets:
+    ///
+    /// * [`PRIVATIZATION_JOB_ATTEMPTS`] (1) for the apply, revert and reseal
+    ///   jobs: what `JobHandler::max_retries() = 0` means on those handlers,
+    ///   exactly ONE attempt, no ladder. Recovery from a partial apply is the
+    ///   stale-job reaper re-dispatching, which re-runs the full re-validation,
+    ///   not a retry into the same lock timeout.
+    /// * [`EMBEDDING_RESTORE_JOB_ATTEMPTS`] for the unseal's
+    ///   `embedding_generation` jobs, whose failures are mostly transient
+    ///   provider errors and whose handler is idempotent (backlog 1320b4e3).
+    ///
+    /// (`JobHandler::max_retries` is not consulted by either runner — the
+    /// row's column is the only load-bearing number — which is why the budget
+    /// is spelled out here rather than inferred.)
     ///
     /// # Errors
     ///
@@ -4449,18 +4473,28 @@ impl PrivatizationRepository {
         conn: &mut PgConnection,
         job_type: &str,
         payload: &serde_json::Value,
+        max_attempts: i32,
     ) -> Result<Uuid, DbError> {
+        if max_attempts < 1 {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "a job enqueued with max_attempts = {max_attempts} would be failed before \
+                     its handler runs; the budget is at least 1"
+                ),
+            });
+        }
         sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO public.jobs
                    (id, job_type, payload, state, retry_count, max_retries,
                     created_at, updated_at)
-            VALUES (gen_random_uuid(), $1, $2, 'pending', 0, 1, now(), now())
+            VALUES (gen_random_uuid(), $1, $2, 'pending', 0, $3, now(), now())
             RETURNING id
             "#,
         )
         .bind(job_type)
         .bind(payload)
+        .bind(max_attempts)
         .fetch_one(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })

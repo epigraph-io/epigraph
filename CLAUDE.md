@@ -275,9 +275,9 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- enqueues one embedding_generation job per restored claim.
          --
          -- THE BOUND STAYS AT 24h, AND IT IS NOW A DEPLOYMENT QUESTION RATHER
-         -- THAN A MISSING-CODE ONE. `bin/server.rs` does register a handler for
-         -- that job type, but CONDITIONALLY: only the provider that OWNS this
-         -- column may write it. That is stricter than "not a mock" -- a real
+         -- THAN A MISSING-CODE ONE. `drain_jobs` (`jobs_drain::build_job_runner`)
+         -- does register a handler for that job type, but CONDITIONALLY: only
+         -- the provider that OWNS this column may write it. That is stricter than "not a mock" -- a real
          -- provider embedding into a different vector space is refused too, and
          -- refused deliberately, because one ANN column holding two spaces
          -- degrades recall with no error. So an instance on the development
@@ -288,8 +288,11 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- non-zero count of jobs older than the bound now means "this
          -- instance's embedding provider is not the one that owns this
          -- column", which is a deployment signal rather than a missing-handler
-         -- one; the boot log's own warning says which provider was selected,
-         -- and `epigraph-cli reembed` remains the recovery path in that case.
+         -- one; the drain's own warning says which provider was selected.
+         -- Recovery there is `embed_backfill` with the owning provider (it
+         -- writes `embedding`); `epigraph-cli reembed` does NOT restore this
+         -- column, it writes `embedding_3072`. Such jobs keep `drain_jobs` at
+         -- exit 4 until `drain_jobs --cancel-pending embedding_generation`.
          --
          -- Restoration is HALF: the job writes `embedding`, which is the column
          -- this clause reads. `embedding_3072` is nulled by the same seal and

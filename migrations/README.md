@@ -2645,6 +2645,30 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **220**: public `jobs_redelivery_count` (backlog 1320b4e3). Adds
+  `jobs.redelivery_count integer NOT NULL DEFAULT 0` with the CHECK
+  `jobs_redelivery_count_non_negative`. The drain's stale-job reaper
+  (`PostgresJobQueue::reap_stale_jobs_counting_attempts`) resets a
+  one-attempt row (`max_retries <= 1`: the privatization apply, revert and
+  reseal jobs) WITHOUT counting the attempt, so it is re-delivered to its
+  handler; it now bumps this counter on each such reset and fails the row with
+  `REAPED_REDELIVERIES_SPENT_MESSAGE` on the reap past
+  `MAX_CRASH_REDELIVERIES` (3). Before it, a one-attempt job that crashed on
+  every run was re-delivered for ever. A multi-attempt row's reap still
+  counts `retry_count` and leaves this column alone. No grant, policy,
+  function or trigger. Pinned by
+  `epigraph-jobs/tests/recover_stale_jobs_test.rs`,
+  `epigraph-api/tests/drain_jobs.rs` and
+  `epigraph-db/tests/jobs_redelivery_count_undo.rs`. Undo:
+  `docs/runbooks/220-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 220); it loses the counts and leaves rows a bounded reap
+  already failed. Slot 220 was assigned to this batch; checked before
+  claiming: no migration on main, open PR or origin branch carries a `220`.
+  **Deploy order:** migrate before rolling out the 220 `drain_jobs` (it names
+  the column; on an older schema every run fails with 42703); an older
+  `drain_jobs` ignores it; undo only after rolling every 220 `drain_jobs`
+  back. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 

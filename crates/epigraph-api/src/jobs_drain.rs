@@ -23,6 +23,7 @@
 //! `[[bin]]` exports nothing: the drain's behaviour is tested by driving
 //! [`drain`] directly on a maintenance login.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,8 +48,12 @@ use crate::embedding_restore::{ClaimEmbeddingJobService, EmbeddingProviderKind};
 /// uncounted reset would re-run it and have it killed again forever. The
 /// counted reset bounds that loop by the job's `max_retries`, then fails the
 /// row (a failure of the run: exit 1). A one-attempt row (`max_retries <= 1`:
-/// the privatization jobs and the unseal's `embedding_generation` jobs) is
-/// reset uncounted and re-delivered to its handler instead.
+/// the privatization apply, revert and reseal jobs) is reset uncounted and
+/// re-delivered to its handler instead, at most
+/// [`epigraph_jobs::MAX_CRASH_REDELIVERIES`] times (migration 220's
+/// `redelivery_count`); the reap after that fails it, also exit 1. (The
+/// unseal's `embedding_generation` jobs carry a retry budget since backlog
+/// 1320b4e3, so their reaps count.)
 pub const STALE_AFTER: Duration = Duration::from_secs(90 * 60);
 
 /// The per-connection statement timeout of the drain's pool, unless
@@ -77,8 +82,12 @@ pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_secs(50 * 60);
 /// chain falls through to a mock without failing, which is correct for a query
 /// path and destructive for a write path: an unconditional registration would
 /// fill the live ANN column with vectors from whatever provider happened to be
-/// configured. Declining leaves the jobs pending; `epigraph-cli reembed` is the
-/// recovery path.
+/// configured. Declining leaves the jobs pending, and every run reports them
+/// and exits [`EXIT_PENDING_UNREGISTERED`] until a run that registers the type
+/// drains them or an operator cancels them (`drain_jobs --cancel-pending
+/// embedding_generation`, [`drain_cancelling`]). The claims keep a NULL
+/// `claims.embedding` until `embed_backfill` runs with an owning provider;
+/// `epigraph-cli reembed` does not restore them (it writes `embedding_3072`).
 ///
 /// # The privatization handlers are registered together
 ///
@@ -124,7 +133,8 @@ pub fn build_job_runner(
             provider = provider.as_str(),
             "embedding_generation NOT registered: this provider must not write \
              claims.embedding. Unsealed claims keep NULL vectors until \
-             `epigraph-cli reembed` runs"
+             `embed_backfill` runs with an owning provider; their pending jobs \
+             wait (exit 4) until cancelled with `--cancel-pending`"
         );
     }
     runner
@@ -139,8 +149,9 @@ pub struct DrainFailure {
     pub job_type: String,
     /// The handler's error.
     pub error: String,
-    /// `true`: it used its last retry and is now `failed`. `false`: it is back
-    /// to `pending` and the next run retries it.
+    /// `true`: it is now `failed`, because the error was permanent
+    /// ([`JobError::should_retry`] false) or it used its last retry. `false`:
+    /// it is back to `pending` and the next run retries it.
     pub terminal: bool,
 }
 
@@ -163,12 +174,33 @@ pub struct DrainReport {
     /// `true` when the run stopped claiming jobs because `max_runtime` ran out
     /// with work still pending.
     pub out_of_time: bool,
+    /// Pending jobs of a type this run has NO handler for, counted per type at
+    /// the end of the run. The drain never claims them, so they wait until a
+    /// run registers their type (an `embedding_generation` job on an instance
+    /// whose embedding provider may not write `claims.embedding`, or a type no
+    /// handler exists for at all). Empty when there are none.
+    pub pending_unregistered: BTreeMap<String, i64>,
+    /// Pending jobs this run CANCELLED because the operator named their type
+    /// in `--cancel-pending` ([`drain_cancelling`]), per type. Each such type
+    /// had no handler in this run. Empty when none were named or none were
+    /// pending.
+    pub cancelled_unregistered: BTreeMap<String, i64>,
 }
+
+/// The `error_message` of a pending job `drain_jobs --cancel-pending` cancelled.
+pub const CANCELLED_UNREGISTERED_MESSAGE: &str =
+    "cancelled by drain_jobs --cancel-pending: no handler for this job type is registered \
+     on this instance";
+
+/// The exit code of a run that left pending jobs no handler of this run can
+/// claim (and had no job failure): see [`DrainReport::exit_code`].
+pub const EXIT_PENDING_UNREGISTERED: i32 = 4;
 
 impl DrainReport {
     /// The process exit code: 1 when any job failed in this run, retryable or
-    /// terminal; otherwise 3 when the run ran out of time with work pending;
-    /// otherwise 0 (drained, or locked).
+    /// terminal; otherwise 4 ([`EXIT_PENDING_UNREGISTERED`]) when pending jobs
+    /// of an unregistered type are waiting; otherwise 3 when the run ran out of
+    /// time with work pending; otherwise 0 (drained, or locked).
     ///
     /// A retryable failure is a failed run: the job is back to `pending` and
     /// the next run retries it, but an operator hears about it the first time
@@ -176,10 +208,17 @@ impl DrainReport {
     /// A failure outranks running out of time because the unit treats exit 3
     /// as success (`SuccessExitStatus=3`): a failure in a long run must not be
     /// reported as a clean continuation.
+    ///
+    /// Unregistered pending work is its own code, not 0: before it the run
+    /// exited 0 while those jobs sat in the queue for ever, which reads as
+    /// "drained" (backlog f5448fed). It outranks 3 for the same reason a
+    /// failure does, and ranks below 1 so a job failure is never hidden.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         if !self.failures.is_empty() {
             1
+        } else if !self.pending_unregistered.is_empty() {
+            EXIT_PENDING_UNREGISTERED
         } else if self.out_of_time {
             3
         } else {
@@ -193,9 +232,10 @@ impl DrainReport {
 /// type, one at a time, until none is left or `max_runtime` has elapsed.
 ///
 /// Each job's final state is written back with `JobQueue::update`:
-/// `completed`; or, on a handler error, `pending` again with the retry counted
-/// (not retried in this run: the next run is the backoff), or `failed` once
-/// its retries are used up.
+/// `completed`; or, on a transient handler error
+/// ([`JobError::should_retry`]), `pending` again with the retry counted (not
+/// retried in this run: the next run is the backoff), or `failed` once its
+/// retries are used up; or, on a permanent handler error, `failed` at once.
 ///
 /// # Errors
 /// A database error reading or claiming from the queue (the run stops; the
@@ -205,7 +245,42 @@ pub async fn drain(
     queue: &PostgresJobQueue,
     max_runtime: Duration,
 ) -> Result<DrainReport, JobError> {
+    drain_cancelling(runner, queue, max_runtime, &[]).await
+}
+
+/// [`drain`], after cancelling every pending job whose type is in `cancel`
+/// (`drain_jobs --cancel-pending <TYPE>`, repeatable).
+///
+/// This is the supported way out of exit [`EXIT_PENDING_UNREGISTERED`] on an
+/// instance that will never register a type, such as `embedding_generation`
+/// where the embedding provider may not write `claims.embedding`: without it
+/// those rows keep every run at exit 4 and only raw SQL on `jobs` clears them.
+/// The cancelled rows end `cancelled` with [`CANCELLED_UNREGISTERED_MESSAGE`]
+/// and are counted in [`DrainReport::cancelled_unregistered`];
+/// `pending_unregistered` is counted after the cancel, so a run that cancels
+/// the only such type exits 0 (or 3).
+///
+/// # Errors
+/// `JobError::PermanentFailure`, before ANY write (no reap, no cancel), when a
+/// type in `cancel` has a handler in this run: those jobs are work this run
+/// can do, and cancelling them would discard it. Otherwise as [`drain`].
+pub async fn drain_cancelling(
+    runner: &JobRunner,
+    queue: &PostgresJobQueue,
+    max_runtime: Duration,
+    cancel: &[String],
+) -> Result<DrainReport, JobError> {
     let started = Instant::now();
+    let registered = runner.registered_job_types();
+    let refused: Vec<&String> = cancel.iter().filter(|t| registered.contains(t)).collect();
+    if !refused.is_empty() {
+        return Err(JobError::PermanentFailure {
+            message: format!(
+                "refusing --cancel-pending for {refused:?}: this run has a handler for it, so its \
+                 pending jobs are work the drain can do"
+            ),
+        });
+    }
     let reaped = queue.reap_stale_jobs_counting_attempts(STALE_AFTER).await?;
     let mut report = DrainReport {
         recovered_stale: reaped.iter().filter(|r| !r.failed).count() as u64,
@@ -215,7 +290,12 @@ pub async fn drain(
             .map(|r| DrainFailure {
                 job_id: r.id,
                 job_type: r.job_type.clone(),
-                error: epigraph_jobs::REAPED_SPENT_MESSAGE.to_string(),
+                error: if r.one_attempt {
+                    epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE
+                } else {
+                    epigraph_jobs::REAPED_SPENT_MESSAGE
+                }
+                .to_string(),
                 terminal: true,
             })
             .collect(),
@@ -226,6 +306,15 @@ pub async fn drain(
         },
         ..DrainReport::default()
     };
+    if !cancel.is_empty() {
+        report.cancelled_unregistered = queue
+            .cancel_pending_of_types(cancel, CANCELLED_UNREGISTERED_MESSAGE)
+            .await?;
+        tracing::warn!(
+            cancelled_unregistered = ?report.cancelled_unregistered,
+            "drain: cancelled pending jobs of types this run has no handler for (--cancel-pending)"
+        );
+    }
     let mut retry_next_run: Vec<Uuid> = Vec::new();
     loop {
         if started.elapsed() >= max_runtime {
@@ -251,7 +340,10 @@ pub async fn drain(
                 report.completed += 1;
             }
             Err(e) => {
-                let terminal = job.retry_count >= job.max_retries;
+                // A permanent error (`JobError::should_retry` false: a refusal,
+                // a payload that will never parse, an SSRF block) is terminal on
+                // its first occurrence; only a transient one spends the budget.
+                let terminal = !e.should_retry() || job.retry_count >= job.max_retries;
                 job.error_message = Some(e.to_string());
                 job.updated_at = chrono::Utc::now();
                 if terminal {
@@ -278,6 +370,15 @@ pub async fn drain(
                 });
             }
         }
+    }
+    report.pending_unregistered = queue
+        .count_pending_by_type_outside(&report.registered)
+        .await?;
+    if !report.pending_unregistered.is_empty() {
+        tracing::warn!(
+            pending_unregistered = ?report.pending_unregistered,
+            "drain: pending jobs of a type this run has no handler for are waiting"
+        );
     }
     Ok(report)
 }

@@ -54,7 +54,10 @@ pub use async_trait::async_trait;
 
 // PostgreSQL job queue module
 mod postgres_queue;
-pub use postgres_queue::{PostgresJobQueue, ReapedJob, REAPED_SPENT_MESSAGE};
+pub use postgres_queue::{
+    PostgresJobQueue, ReapedJob, MAX_CRASH_REDELIVERIES, REAPED_REDELIVERIES_SPENT_MESSAGE,
+    REAPED_SPENT_MESSAGE,
+};
 
 // Database-backed reputation service
 mod db_reputation_service;
@@ -433,22 +436,6 @@ pub trait JobQueue: Send + Sync {
     /// Enqueue a new job.
     async fn enqueue(&self, job: Job) -> Result<JobId, JobError>;
 
-    /// Enqueue `job` only if no job of the same `job_type` is already
-    /// `Pending`. Returns `Ok(Some(id))` if it was enqueued, or `Ok(None)`
-    /// if a pending job of that type already exists (deduplicated).
-    ///
-    /// This guards against boot-storm stacking: schedulers that re-fire on
-    /// every process restart can call this so a fresh run is only queued when
-    /// one is not already waiting.
-    ///
-    /// The default implementation does NOT deduplicate — it always enqueues —
-    /// so queues without an efficient pending lookup stay correct (just
-    /// non-deduplicating). Backends like `PostgresJobQueue` override this with
-    /// an atomic conditional insert.
-    async fn enqueue_unique_pending(&self, job: Job) -> Result<Option<JobId>, JobError> {
-        self.enqueue(job).await.map(Some)
-    }
-
     /// Dequeue the next pending job for processing.
     ///
     /// Returns `None` if no jobs are available.
@@ -485,6 +472,16 @@ pub struct JobRunner {
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     /// Worker task handles
     worker_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Write a job's state back to its queue from the worker loop, logging (not
+/// dropping) a queue error: the loop has no caller to return it to, and a
+/// silently lost write leaves the row in whatever state the queue last held.
+async fn write_back(queue: &dyn JobQueue, job: &Job) {
+    if let Err(e) = queue.update(job).await {
+        tracing::error!(job_id = %job.id, job_type = %job.job_type, state = %job.state,
+            error = %e, "job runner: could not write the job's state back to the queue");
+    }
 }
 
 impl JobRunner {
@@ -551,69 +548,94 @@ impl JobRunner {
                     }
 
                     // Try to get a job
-                    if let Some(mut job) = queue.dequeue().await {
-                        // Find handler for this job type
-                        if let Some(handler) = handlers.get(&job.job_type) {
-                            // Check if we've exceeded max retries.
-                            //
-                            // Path A — the dequeue handed us a job that was
-                            // already at retry_count >= max_retries. Mark it
-                            // failed, but PRESERVE any prior error_message
-                            // that earlier retry attempts captured. Replacing
-                            // it with a generic "Maximum retries exceeded"
-                            // hides the actual stage failure; instead we
-                            // append.
-                            if job.retry_count >= job.max_retries {
+                    let Some(mut job) = queue.dequeue().await else {
+                        // No jobs available, sleep briefly
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    };
+
+                    // A job of a type this runner has no handler for is failed
+                    // with the reason. A persistent queue has already flipped
+                    // the row to `running`; writing nothing back would strand
+                    // it there with no handler ever to finish it, and putting
+                    // it back to `pending` would hand it straight out again at
+                    // the head of the queue (backlog 99dc2bbd).
+                    let Some(handler) = handlers.get(&job.job_type) else {
+                        let err = JobError::NoHandler {
+                            job_type: job.job_type.clone(),
+                        };
+                        tracing::error!(job_id = %job.id, job_type = %job.job_type,
+                            "job runner: no handler registered; failing the job");
+                        let now = Utc::now();
+                        job.state = JobState::Failed;
+                        job.error_message = Some(err.to_string());
+                        job.updated_at = now;
+                        job.completed_at = Some(now);
+                        write_back(queue.as_ref(), &job).await;
+                        continue;
+                    };
+
+                    // Check if we've exceeded max retries.
+                    //
+                    // Path A — the dequeue handed us a job that was already at
+                    // retry_count >= max_retries. Mark it failed, but PRESERVE
+                    // any prior error_message that earlier retry attempts
+                    // captured. Replacing it with a generic "Maximum retries
+                    // exceeded" hides the actual stage failure; instead we
+                    // append.
+                    if job.retry_count >= job.max_retries {
+                        job.state = JobState::Failed;
+                        let prior = job.error_message.clone().unwrap_or_default();
+                        job.error_message = Some(if prior.is_empty() {
+                            "Maximum retries exceeded (no prior error captured)".to_string()
+                        } else {
+                            format!("Maximum retries exceeded; last error: {prior}")
+                        });
+                        write_back(queue.as_ref(), &job).await;
+                        continue;
+                    }
+
+                    // Transition to Running (a persistent queue's dequeue
+                    // already did; the refused Running -> Running is moot).
+                    let _ = job.transition_to(JobState::Running);
+
+                    // Execute handler
+                    match handler.handle(&job).await {
+                        Ok(_result) => {
+                            let _ = job.transition_to(JobState::Completed);
+                            write_back(queue.as_ref(), &job).await;
+                        }
+                        Err(e) => {
+                            job.retry_count += 1;
+                            job.error_message = Some(e.to_string());
+
+                            // A permanent error is terminal at once; only a
+                            // transient one spends the retry budget.
+                            if !e.should_retry() || job.retry_count >= job.max_retries {
                                 job.state = JobState::Failed;
-                                let prior = job.error_message.clone().unwrap_or_default();
-                                job.error_message = Some(if prior.is_empty() {
-                                    "Maximum retries exceeded (no prior error captured)".to_string()
-                                } else {
-                                    format!("Maximum retries exceeded; last error: {prior}")
-                                });
-                                let _ = queue.update(&job).await;
-                                continue;
+                                job.updated_at = Utc::now();
+                                job.completed_at = Some(Utc::now());
+                            } else {
+                                // Reset to Pending for retry after backoff
+                                job.state = JobState::Pending;
+                                job.started_at = None;
+                                job.updated_at = Utc::now();
+
+                                // Apply backoff before re-enqueueing
+                                let backoff = handler.backoff(job.retry_count - 1);
+                                tokio::time::sleep(backoff).await;
                             }
+                            write_back(queue.as_ref(), &job).await;
 
-                            // Transition to Running
-                            let _ = job.transition_to(JobState::Running);
-
-                            // Execute handler
-                            match handler.handle(&job).await {
-                                Ok(_result) => {
-                                    let _ = job.transition_to(JobState::Completed);
-                                    let _ = queue.update(&job).await;
-                                }
-                                Err(e) => {
-                                    job.retry_count += 1;
-                                    job.error_message = Some(e.to_string());
-
-                                    if job.retry_count >= job.max_retries {
-                                        job.state = JobState::Failed;
-                                        job.updated_at = Utc::now();
-                                        job.completed_at = Some(Utc::now());
-                                    } else {
-                                        // Reset to Pending for retry after backoff
-                                        job.state = JobState::Pending;
-                                        job.started_at = None;
-                                        job.updated_at = Utc::now();
-
-                                        // Apply backoff before re-enqueueing
-                                        let backoff = handler.backoff(job.retry_count - 1);
-                                        tokio::time::sleep(backoff).await;
-                                    }
-                                    let _ = queue.update(&job).await;
-
-                                    // Re-enqueue for retry if not failed
-                                    if job.state == JobState::Pending {
-                                        let _ = queue.enqueue(job).await;
-                                    }
+                            // Re-enqueue for retry if not failed
+                            if job.state == JobState::Pending {
+                                let job_id = job.id;
+                                if let Err(e) = queue.enqueue(job).await {
+                                    tracing::error!(%job_id, error = %e,
+                                        "job runner: could not re-enqueue a job for its retry");
                                 }
                             }
                         }
-                    } else {
-                        // No jobs available, sleep briefly
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                 }
             });
@@ -1572,13 +1594,17 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
                 message: format!("Failed to deserialize job payload: {e}"),
             })?;
 
+        // A payload of another variant will never become an embedding job, so
+        // retrying it only spends the budget: permanent.
         let EpiGraphJob::EmbeddingGeneration { claim_id } = epigraph_job else {
-            return Err(JobError::ProcessingFailed {
+            return Err(JobError::PermanentFailure {
                 message: "Expected EmbeddingGeneration job".to_string(),
             });
         };
 
-        // Step 2: Get the claim text from the service
+        // Step 2: Get the claim text from the service. `None` stays TRANSIENT:
+        // the service also answers `None` when it could not get a connection
+        // or the read failed, which a later run may not hit.
         let claim_text = self
             .embedding_service
             .get_claim_text(claim_id)
@@ -1594,9 +1620,7 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
             .embedding_service
             .generate_and_store(claim_id, &claim_text)
             .await
-            .map_err(|e| JobError::ProcessingFailed {
-                message: e.to_string(),
-            })?;
+            .map_err(embedding_job_error)?;
 
         let execution_duration = start.elapsed();
 
@@ -1641,6 +1665,27 @@ impl<S: EmbeddingJobService + 'static> JobHandler for ConfigurableEmbeddingHandl
         // Exponential backoff: 2^attempt seconds, capped at 1 hour
         let secs = 2u64.saturating_pow(attempt).min(3600);
         Duration::from_secs(secs)
+    }
+}
+
+/// Classify an [`EmbeddingJobError`] for the runner's retry decision
+/// ([`JobError::should_retry`]).
+///
+/// Permanent: the claim is gone, sealed or retired (`NotFound`,
+/// `ClaimNotFound`: a re-run reads the same row), its text is empty, or the
+/// provider returns the wrong dimension (a configuration error a retry does not
+/// change). Transient: a provider or database error (`ApiError`) and a rate
+/// limit, which a later run may not hit.
+fn embedding_job_error(e: EmbeddingJobError) -> JobError {
+    let message = e.to_string();
+    match e {
+        EmbeddingJobError::NotFound { .. }
+        | EmbeddingJobError::ClaimNotFound { .. }
+        | EmbeddingJobError::EmptyText
+        | EmbeddingJobError::DimensionMismatch { .. } => JobError::PermanentFailure { message },
+        EmbeddingJobError::RateLimitExceeded { .. } | EmbeddingJobError::ApiError { .. } => {
+            JobError::ProcessingFailed { message }
+        }
     }
 }
 
