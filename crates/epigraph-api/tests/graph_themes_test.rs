@@ -452,7 +452,19 @@ async fn themes_expand_returns_neighborhoods_for_seeded_theme(pool: PgPool) {
     sqlx::query("INSERT INTO claim_neighborhood_membership (run_id, claim_id, neighborhood_id) VALUES ($1, $2, $3)")
         .bind(run_id).bind(claim_b).bind(nbr_b).execute(&pool).await.unwrap();
 
-    // Inter-neighborhood edge — store canonical (a < b).
+    // The claim edge behind the inter-neighbourhood edge: the route sums
+    // `forward_strength` over readable edges live (SUPPORTS = 0.7). The stored
+    // `neighborhood_edges` row carries a deliberately different weight, so a
+    // route that returned the stored aggregate fails (backlog 01e0b839).
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, 'claim', 'claim', 'SUPPORTS')",
+    )
+    .bind(claim_a)
+    .bind(claim_b)
+    .execute(&pool)
+    .await
+    .unwrap();
     let (lo, hi) = if nbr_a < nbr_b {
         (nbr_a, nbr_b)
     } else {
@@ -460,7 +472,7 @@ async fn themes_expand_returns_neighborhoods_for_seeded_theme(pool: PgPool) {
     };
     sqlx::query(
         "INSERT INTO neighborhood_edges (run_id, neighborhood_a, neighborhood_b, weight) \
-         VALUES ($1, $2, $3, 0.7)",
+         VALUES ($1, $2, $3, 0.3)",
     )
     .bind(run_id)
     .bind(lo)
@@ -497,4 +509,305 @@ async fn themes_expand_returns_neighborhoods_for_seeded_theme(pool: PgPool) {
     let edges = body["neighborhood_edges"].as_array().unwrap();
     assert_eq!(edges.len(), 1, "expected one inter-neighborhood edge");
     assert!((edges[0]["weight"].as_f64().unwrap() - 0.7).abs() < 1e-9);
+}
+
+// ---- GET /api/v1/graph/themes/:id/expand (backlog 01e0b839) -------------------
+
+/// A claim edge `source -> target` of relationship SUPPORTS
+/// (`forward_strength` 0.7).
+async fn seed_supports(pool: &PgPool, source: Uuid, target: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship) \
+         VALUES ($1, $2, 'claim', 'claim', 'SUPPORTS')",
+    )
+    .bind(source)
+    .bind(target)
+    .execute(pool)
+    .await
+    .expect("seed SUPPORTS edge");
+}
+
+/// A neighbourhood of `theme` in `run` with deliberately WRONG stored
+/// aggregates (size 50, mean_betp 0.77, no frame), and its members.
+async fn seed_neighborhood(
+    pool: &PgPool,
+    run: Uuid,
+    theme: Uuid,
+    label: &str,
+    members: &[Uuid],
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO graph_neighborhoods (run_id, theme_id, label, size, mean_betp) \
+         VALUES ($1, $2, $3, 50, 0.77) RETURNING id",
+    )
+    .bind(run)
+    .bind(theme)
+    .bind(label)
+    .fetch_one(pool)
+    .await
+    .expect("seed neighborhood");
+    for m in members {
+        sqlx::query(
+            "INSERT INTO claim_neighborhood_membership (run_id, claim_id, neighborhood_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(run)
+        .bind(m)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed membership");
+    }
+    id
+}
+
+/// `(id, size)` of every neighbourhood in a parsed expand body, in body order.
+fn nbr_sizes(body: &Value) -> Vec<(Uuid, i64)> {
+    body["neighborhoods"]
+        .as_array()
+        .expect("neighborhoods array")
+        .iter()
+        .map(|n| {
+            (
+                n["id"]
+                    .as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .expect("id"),
+                n["size"].as_i64().expect("size is an integer"),
+            )
+        })
+        .collect()
+}
+
+/// `(a, b, weight)` of every neighbourhood edge in a parsed expand body.
+fn nbr_edges(body: &Value) -> Vec<(Uuid, Uuid, f64)> {
+    body["neighborhood_edges"]
+        .as_array()
+        .expect("neighborhood_edges array")
+        .iter()
+        .map(|e| {
+            (
+                Uuid::parse_str(e["a"].as_str().unwrap()).unwrap(),
+                Uuid::parse_str(e["b"].as_str().unwrap()).unwrap(),
+                e["weight"].as_f64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn pair(x: Uuid, y: Uuid) -> (Uuid, Uuid) {
+    if x < y {
+        (x, y)
+    } else {
+        (y, x)
+    }
+}
+
+/// THE TENANCY TEST for expand. A stranger in a different group from the
+/// owner sees no id, label, count, mean, frame or edge weight that a private
+/// member contributes to, and a theme whose only member is private is the
+/// same 404 as a missing theme. The owner's answer over the same rows is the
+/// calibration arm: it proves every hidden value WOULD appear had it leaked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_expand_hides_private_members_and_their_aggregates_from_a_non_member(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let owner = Uuid::new_v4();
+    let stranger = Uuid::new_v4();
+
+    let theme = seed_theme(&pool, "U2 expand theme", 50).await;
+    let pub_a = seed_member(&pool, theme, owner, "public member a").await;
+    let priv_b = seed_member(&pool, theme, owner, "owner's private member b").await;
+    let pub_c = seed_member(&pool, theme, owner, "public member c").await;
+    let priv_d = seed_member(&pool, theme, owner, "owner's private member d").await;
+    common::seed_private_ownership(&pool, priv_b, owner).await;
+    common::seed_private_ownership(&pool, priv_d, owner).await;
+    for (claim, betp) in [(pub_a, 0.2_f64), (priv_b, 0.9), (pub_c, 0.4), (priv_d, 0.6)] {
+        sqlx::query("UPDATE claims SET pignistic_prob = $2 WHERE id = $1")
+            .bind(claim)
+            .bind(betp)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Only the private member b carries a frame.
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0', 'h1']) RETURNING id",
+    )
+    .bind(format!("u2-private-frame-{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+        .bind(priv_b)
+        .bind(frame)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // P: a theme whose one member is private; its label is a unique marker.
+    let p_marker = format!("U2-PRIVATE-THEME-{}", Uuid::new_v4().simple());
+    let p = seed_theme(&pool, &p_marker, 50).await;
+    let p_claim = seed_member(&pool, p, owner, "owner's private member of P").await;
+    common::seed_private_ownership(&pool, p_claim, owner).await;
+
+    let run = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 0, FALSE)",
+    )
+    .bind(run)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // N1 = {a, b} (mixed), N2 = {c} (public), N3 = {d} (private only, with a
+    // marker label).
+    let n3_marker = format!("U2-PRIVATE-NBR-{}", Uuid::new_v4().simple());
+    let n1 = seed_neighborhood(&pool, run, theme, "neighborhood-1", &[pub_a, priv_b]).await;
+    let n2 = seed_neighborhood(&pool, run, theme, "neighborhood-2", &[pub_c]).await;
+    let n3 = seed_neighborhood(&pool, run, theme, &n3_marker, &[priv_d]).await;
+    // a -> c is public; b -> c and d -> c each have a private endpoint.
+    seed_supports(&pool, pub_a, pub_c).await;
+    seed_supports(&pool, priv_b, pub_c).await;
+    seed_supports(&pool, priv_d, pub_c).await;
+    // Stored inter-neighbourhood weights, deliberately wrong.
+    for (x, y) in [pair(n1, n2), pair(n2, n3)] {
+        sqlx::query(
+            "INSERT INTO neighborhood_edges (run_id, neighborhood_a, neighborhood_b, weight) \
+             VALUES ($1, $2, $3, 9.0)",
+        )
+        .bind(run)
+        .bind(x)
+        .bind(y)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    common::seed_claim_with_agent(&pool, "stranger's own unthemed claim", stranger).await;
+    assert_ne!(
+        common::personal_group_of(&pool, stranger).await,
+        common::personal_group_of(&pool, owner).await,
+        "two viewers in DIFFERENT groups"
+    );
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let stranger_token = common::mint_token_with_agent(&["claims:read"], stranger);
+    let path = format!("/api/v1/graph/themes/{theme}/expand");
+
+    // Owner: the calibration arm.
+    let (status, owner_text) = get(addr, &path, Some(&owner_token)).await;
+    assert_eq!(status, 200, "{owner_text}");
+    let owner_body = json(&owner_text);
+    let mut owner_sizes = nbr_sizes(&owner_body);
+    owner_sizes.sort();
+    let mut want = vec![(n1, 2), (n2, 1), (n3, 1)];
+    want.sort();
+    assert_eq!(owner_sizes, want, "{owner_body}");
+    assert_eq!(owner_body["neighborhoods"][0]["id"], n1.to_string());
+    let owner_n1 = &owner_body["neighborhoods"][0];
+    assert!((owner_n1["mean_betp"].as_f64().unwrap() - 0.55).abs() < 1e-9);
+    assert_eq!(owner_n1["dominant_frame_id"], frame.to_string());
+    let mut owner_edges = nbr_edges(&owner_body);
+    owner_edges.sort_by_key(|e| (e.0, e.1));
+    let mut want_edges = vec![(pair(n1, n2), 1.4), (pair(n2, n3), 0.7)];
+    want_edges.sort_by_key(|e| e.0);
+    assert_eq!(owner_edges.len(), 2, "{owner_body}");
+    for ((a, b, w), ((wa, wb), ww)) in owner_edges.iter().zip(&want_edges) {
+        assert_eq!((*a, *b), (*wa, *wb));
+        assert!((w - ww).abs() < 1e-9, "live weight {w}, want {ww}");
+    }
+    assert!(owner_text.contains(&n3_marker), "CALIBRATION: N3's label");
+    let (status, owner_p) = get(
+        addr,
+        &format!("/api/v1/graph/themes/{p}/expand"),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, 200, "{owner_p}");
+    let owner_p = json(&owner_p);
+    assert_eq!(
+        owner_p["neighborhoods"][0]["label"], p_marker,
+        "CALIBRATION, and the single-node answer carries the theme's label, \
+         not `synthetic`: {owner_p}"
+    );
+    assert_eq!(owner_p["neighborhoods"][0]["size"], 1);
+
+    // Stranger.
+    let (status, text) = get(addr, &path, Some(&stranger_token)).await;
+    assert_eq!(status, 200, "{text}");
+    let body = json(&text);
+    // Equal sizes tie-break on id, so compare in id order.
+    let (first, second) = if n1 < n2 { (n1, n2) } else { (n2, n1) };
+    assert_eq!(
+        nbr_sizes(&body),
+        vec![(first, 1), (second, 1)],
+        "N1 and N2 with ONE readable member each, and no N3; got {body}"
+    );
+    let n1_out = body["neighborhoods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == n1.to_string())
+        .expect("N1 is listed");
+    assert!(
+        (n1_out["mean_betp"].as_f64().unwrap() - 0.2).abs() < 1e-9,
+        "N1's mean is over the public member only: {body}"
+    );
+    assert!(
+        n1_out["dominant_frame_id"].is_null(),
+        "the private member's frame is not N1's: {body}"
+    );
+    let edges = nbr_edges(&body);
+    assert_eq!(edges.len(), 1, "{body}");
+    assert_eq!((edges[0].0, edges[0].1), pair(n1, n2));
+    assert!(
+        (edges[0].2 - 0.7).abs() < 1e-9,
+        "only the public a -> c edge counts: {body}"
+    );
+    for needle in [
+        n3.to_string(),
+        n3_marker.clone(),
+        frame.to_string(),
+        priv_b.to_string(),
+        priv_d.to_string(),
+    ] {
+        assert!(
+            !text.contains(&needle),
+            "the stranger's body leaks {needle}: {text}"
+        );
+    }
+
+    // P is the same 404 as a theme that does not exist.
+    let (status, p_text) = get(
+        addr,
+        &format!("/api/v1/graph/themes/{p}/expand"),
+        Some(&stranger_token),
+    )
+    .await;
+    assert_eq!(status, 404, "{p_text}");
+    assert!(!p_text.contains(&p_marker), "{p_text}");
+    let (status, missing) = get(
+        addr,
+        &format!("/api/v1/graph/themes/{}/expand", Uuid::new_v4()),
+        Some(&stranger_token),
+    )
+    .await;
+    assert_eq!(status, 404);
+    assert_eq!(
+        missing, p_text,
+        "a hidden theme and a missing one answer alike"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_expand_requires_a_bearer(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (status, text) = get(
+        addr,
+        &format!("/api/v1/graph/themes/{}/expand", Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(status, 401, "{text}");
 }

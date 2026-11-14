@@ -768,7 +768,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint (`routes/graph_query.rs` and `routes/provenance.rs` both deleted),
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
-const HIGH_WATER: usize = 210;
+///
+/// 210 -> 209 on its own branch (backlog 01e0b839): `themes_expand` holds a
+/// `Viewer` and runs every read on the caller's stamped read
+/// (`routes/graph.rs` 2 -> 1), read off `the_scanner_is_not_vacuous`'s own
+/// failure. No file reached zero.
+const HIGH_WATER: usize = 209;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1016,10 +1021,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // spot enumerated in the Known limits above. 3 -> 2 (backlog 57917c13):
     // `themes_overview` now holds a `Viewer` and reads through
     // `AppState::read_as` and the viewer-spliced
-    // `ClaimThemeRepository::overview_page`. The two that remain (`overview`,
-    // `themes_expand`) are routed GETs that hold NO `Viewer`; their owner is
+    // `ClaimThemeRepository::overview_page`. 2 -> 1 (backlog 01e0b839):
+    // `themes_expand` now holds a `Viewer` and reads through
+    // `AppState::read_as` and the viewer-spliced
+    // `GraphViewRepository::{theme_visible_summary, theme_neighborhoods,
+    // theme_neighborhood_edges}`. The one that remains (`overview`) is a
+    // routed GET that holds NO `Viewer`; its owner is
     // `D-PR16-theme-cluster-viewer-scope`.
-    ("routes/graph.rs", 2),
+    ("routes/graph.rs", 1),
     // `routes/graph_neighborhood.rs` was 2 and is GONE, not zeroed: conversion
     // shard 5 moved `expand` and `claim_compound_neighborhood` onto
     // `AppState::read_as`. It is one of TWO rows that shard deleted; see
