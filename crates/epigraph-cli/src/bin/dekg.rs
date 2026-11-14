@@ -937,6 +937,24 @@ async fn handle_community(client: &Client, base: &str, action: CommunityCmd) -> 
 // MIGRATE HANDLERS (direct DB connection)
 // =============================================================================
 
+/// Add one best-effort INSERT's outcome to a migrate loop's counters: the rows
+/// it actually wrote (0 for an `ON CONFLICT DO NOTHING` that conflicted), or
+/// one failure, printed. The loops keep going past a failure and report the
+/// failures at the end, rather than counting them as written.
+fn tally_insert(
+    r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+    written: &mut u64,
+    failed: &mut u64,
+) {
+    match r {
+        Ok(done) => *written += done.rows_affected(),
+        Err(e) => {
+            *failed += 1;
+            eprintln!("  insert failed: {e}");
+        }
+    }
+}
+
 /// The one pool constructor the five `dekg migrate` subcommands share.
 ///
 /// Every one of them is a corpus-wide integrity check or a bulk write
@@ -1086,19 +1104,22 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 claims_needing_bba.len()
             );
 
-            let mut created = 0i64;
+            let mut created = 0u64;
             for (claim_id, frame_id, truth_value) in &claims_needing_bba {
                 let mass_h = truth_value * confidence_scale;
                 let mass_theta = 1.0 - mass_h;
 
-                // Get hypothesis count to build proper Θ key
-                let hyp_count: (i32,) = sqlx::query_as(
-                    "SELECT COALESCE(jsonb_array_length(hypotheses), 2) FROM frames WHERE id = $1",
-                )
-                .bind(frame_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or((2,));
+                // The frame's hypothesis count builds its Θ key. `hypotheses`
+                // is `text[]` (migration 001; `frames_not_empty` keeps it at
+                // two or more), so its arity is `cardinality`. A failed lookup
+                // stops the run: a guessed arity would write a Θ key for a
+                // frame of another size.
+                let hyp_count: (i32,) =
+                    sqlx::query_as("SELECT cardinality(hypotheses) FROM frames WHERE id = $1")
+                        .bind(frame_id)
+                        .fetch_one(&pool)
+                        .await
+                        .with_context(|| format!("reading the hypotheses of frame {frame_id}"))?;
 
                 let theta_key: String = (0..hyp_count.0)
                     .map(|i| i.to_string())
@@ -1110,21 +1131,24 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     theta_key: mass_theta,
                 });
 
-                sqlx::query(
+                // `mass_functions` has no source_type/source_label columns;
+                // the bootstrap origin is recorded as its combination method.
+                // Only a row the INSERT actually wrote is counted (ON
+                // CONFLICT DO NOTHING writes none).
+                created += sqlx::query(
                     r#"
-                    INSERT INTO mass_functions (claim_id, frame_id, masses, source_type, source_label)
-                    VALUES ($1, $2, $3, 'bootstrap', 'dekg migrate bootstrap-masses')
+                    INSERT INTO mass_functions (claim_id, frame_id, masses, combination_method)
+                    VALUES ($1, $2, $3, 'bootstrap')
                     ON CONFLICT DO NOTHING
-                    "#
+                    "#,
                 )
                 .bind(claim_id)
                 .bind(frame_id)
                 .bind(&masses)
                 .execute(&pool)
                 .await
-                .context("Failed to insert mass function")?;
-
-                created += 1;
+                .context("Failed to insert mass function")?
+                .rows_affected();
             }
             println!("  Created {} mass functions", created);
         }
@@ -1170,7 +1194,8 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 if dry_run { " (DRY RUN)" } else { "" }
             );
 
-            let mut total_created = 0i64;
+            let mut total_created = 0u64;
+            let mut total_failed = 0u64;
 
             // 1. PERSPECTIVE_OF: perspective.owner_agent_id → agent
             let perspectives: Vec<(Uuid, Uuid)> = sqlx::query_as(
@@ -1188,10 +1213,10 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             println!("  PERSPECTIVE_OF: {} edges to create", perspectives.len());
             if !dry_run {
                 for (pid, aid) in &perspectives {
-                    let _ = sqlx::query(
+                    let r = sqlx::query(
                         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) VALUES ($1, 'perspective', $2, 'agent', 'PERSPECTIVE_OF', '{}') ON CONFLICT DO NOTHING"
                     ).bind(pid).bind(aid).execute(&pool).await;
-                    total_created += 1;
+                    tally_insert(r, &mut total_created, &mut total_failed);
                 }
             }
 
@@ -1212,10 +1237,10 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             println!("  MEMBER_OF: {} edges to create", members.len());
             if !dry_run {
                 for (pid, cid) in &members {
-                    let _ = sqlx::query(
+                    let r = sqlx::query(
                         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) VALUES ($1, 'perspective', $2, 'community', 'MEMBER_OF', '{}') ON CONFLICT DO NOTHING"
                     ).bind(pid).bind(cid).execute(&pool).await;
-                    total_created += 1;
+                    tally_insert(r, &mut total_created, &mut total_failed);
                 }
             }
 
@@ -1237,10 +1262,10 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             println!("  CONTRIBUTES_TO: {} edges to create", contributions.len());
             if !dry_run {
                 for (pid, cid) in &contributions {
-                    let _ = sqlx::query(
+                    let r = sqlx::query(
                         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) VALUES ($1, 'perspective', $2, 'claim', 'CONTRIBUTES_TO', '{}') ON CONFLICT DO NOTHING"
                     ).bind(pid).bind(cid).execute(&pool).await;
-                    total_created += 1;
+                    tally_insert(r, &mut total_created, &mut total_failed);
                 }
             }
 
@@ -1252,6 +1277,9 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 );
             } else {
                 println!("\n  Created {} edges", total_created);
+                if total_failed > 0 {
+                    anyhow::bail!("{total_failed} edge insert(s) failed (each is printed above)");
+                }
             }
         }
 
@@ -1360,7 +1388,8 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
 
             // 5. Create frames for each cluster
             let mut frames_created = 0;
-            let mut claims_assigned = 0;
+            let mut claims_assigned = 0u64;
+            let mut assign_failed = 0u64;
 
             for cluster_idx in 0..best_k {
                 let cluster_claims: Vec<(usize, &Uuid, &str)> = labels
@@ -1431,7 +1460,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
 
                     // Assign claims
                     for (h_idx, claim_id, _) in &cluster_claims {
-                        let _ = sqlx::query(
+                        let r = sqlx::query(
                             "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
                         )
                         .bind(claim_id)
@@ -1439,7 +1468,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                         .bind(*h_idx as i32 % hypotheses.len() as i32)
                         .execute(&pool)
                         .await;
-                        claims_assigned += 1;
+                        tally_insert(r, &mut claims_assigned, &mut assign_failed);
                     }
 
                     frames_created += 1;
@@ -1453,6 +1482,11 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     "\n  Created {} frames, assigned {} claims",
                     frames_created, claims_assigned
                 );
+                if assign_failed > 0 {
+                    anyhow::bail!(
+                        "{assign_failed} claim_frames insert(s) failed (each is printed above)"
+                    );
+                }
             }
         }
     }
