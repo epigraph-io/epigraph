@@ -1004,63 +1004,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let sessions = epigraph_mcp::SessionFactory::new(template);
 
-        // PR-09: resolve (and, on first boot, create) the server's own agent
-        // row + personal group, so the `--allow-unauthenticated-http` middleware
-        // has a principal to inject.
+        // The principal the `--allow-unauthenticated-http` middleware injects.
         //
-        // The boot attempt is a WARM-UP, not the answer. It used to be the
-        // answer: its `Option<Uuid>` went straight into the middleware state, so
-        // a database that was briefly unreachable during startup left every
-        // content tool on this listener refusing for the life of the process,
-        // with no way back short of a restart. The fail-closed half is correct
-        // and unchanged — while the id is unresolved the injected context carries
-        // no principal and content tools refuse — but the listener now re-attempts
-        // per request. `UnauthenticatedPrincipal` holds the source for that; the
-        // caching lives in `EpiGraphMcpFull::agent_id`, which stores only on
-        // success and therefore already retries.
+        // Read-only (the default): a dedicated agent that belongs to no group,
+        // so that listener reads PUBLIC rows only (backlog fe514fc3, see
+        // `epigraph_mcp::unauthenticated_reader`). It used to be the server's
+        // own agent, whose personal group every holder of the listener's shared
+        // credential then read with.
+        //
+        // `--allow-unauthenticated-writes`: the server's own agent (the
+        // listener's signer), which its callers' writes are authored by.
+        //
+        // Either way the boot attempt is a WARM-UP, not the answer: a database
+        // briefly unreachable at startup leaves content tools refusing (no
+        // agent principal) only until a later request resolves it.
         let unauthenticated_principal: epigraph_mcp::auth::UnauthenticatedPrincipal =
             if cli.allow_unauthenticated_http {
                 // The probe is a session of the SAME factory, so it shares the
-                // one per-process `agent_db_id` cell with every HTTP session:
-                // warming it here warms them all. It is an
-                // `Arc<dyn ServerPrincipalSource>` handed to the middleware and
-                // reachable for the life of the listener, so it carries the
-                // template's `ScopedPool` like every other session.
+                // one per-process `agent_db_id` cell with every HTTP session.
+                // It is reachable for the life of the listener, so it carries
+                // the template's `ScopedPool` like every other session.
                 let probe = Arc::new(sessions.session());
-                let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
-                    probe.clone() as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
-                )
-                .with_writes(unauthenticated_writes);
                 // Batch HTTP-id: say at boot which one this listener is.
                 match unauthenticated_writes {
                     epigraph_mcp::auth::UnauthenticatedWrites::Refused => tracing::info!(
-                        "--allow-unauthenticated-http listener is READ-ONLY for its callers \
-                         (no authenticated principal, so no author): write tools are refused. \
-                         Writes go through an authenticated (--jwt-secret) listener."
+                        "--allow-unauthenticated-http listener is READ-ONLY and PUBLIC-ONLY for \
+                         its callers (no authenticated principal, so no author and no group): \
+                         write tools are refused and reads see public rows only. Writes and \
+                         group reads go through an authenticated (--jwt-secret) listener."
                     ),
                     epigraph_mcp::auth::UnauthenticatedWrites::AsListenerSigner => {
                         tracing::warn!(
                             "--allow-unauthenticated-writes: callers of this listener write as its \
-                             own signer agent, which no human owns. Use it only on a trusted local \
-                             socket."
+                             own signer agent, which no human owns, and read with that agent's \
+                             groups. Use it only on a trusted local socket."
                         );
                     }
                 }
-                match probe.server_agent_id().await {
-                    Ok(id) => principal.warmed_with(id),
-                    Err(e) => {
-                        // Still loud. The difference is that it is no longer
-                        // terminal for the listener.
-                        tracing::error!(
-                            error = ?e,
-                            "could not resolve the server agent id for \
-                             --allow-unauthenticated-http at boot; content tools on that \
-                             listener refuse (no agent principal) until a later request \
-                             resolves it"
-                        );
-                        principal
-                    }
-                }
+                epigraph_mcp::unauthenticated_reader::listener_principal(
+                    unauthenticated_writes,
+                    probe as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
+                    pool.clone(),
+                )
+                .await
             } else {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
@@ -1121,12 +1107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // behind filesystem perms). Inject a permissive AuthContext so the
             // per-tool scope gate passes — without it every tool 403s on a
             // missing auth context, making the flag misleading (bug be2a3391).
-            // PR-09: the injected context carries the server's own agents.id,
-            // so `tools::viewer::request_viewer` resolves the same viewer this
-            // process uses on stdio. Warming it above also creates the agent row
-            // and its personal group before the first request, rather than racing
-            // on the first concurrent tool call — while leaving a failed warm-up
-            // recoverable.
+            // The injected context carries the principal built above: the
+            // zero-membership reader on a read-only listener (public rows
+            // only), the server's own agent on a write opt-in listener. A
+            // failed warm-up stays recoverable per request.
             router.layer(axum::middleware::from_fn_with_state(
                 unauthenticated_principal,
                 epigraph_mcp::auth::inject_unauthenticated_context,

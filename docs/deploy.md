@@ -299,6 +299,15 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 - A TCP `--listen` address requires `--jwt-secret`. A `unix:/abs/path`
   listener may use `--allow-unauthenticated-http` instead, because its file
   permissions are the trust gate; TCP may not.
+- An `--allow-unauthenticated-http` listener reads PUBLIC rows only. No
+  request on it names a caller, so it acts as a dedicated agent that belongs
+  to no group (`mcp-unauthenticated-reader`, created on first boot), and it
+  refuses every content call if that agent is ever given a group membership
+  (revoke it to reopen the listener). Its write tools are refused. Group reads
+  and writes go through a `--jwt-secret` listener. With
+  `--allow-unauthenticated-writes` the listener instead acts as its own signer
+  agent: its callers write as that agent and read with that agent's groups,
+  so keep that opt-in to a trusted local socket.
 - The HTTP listener rejects any request whose `Host` (or `Origin`) is outside
   its allowlist. The list always holds `localhost`, `127.0.0.1`, `::1` and
   the `--listen` authority. Behind a reverse proxy that preserves the
@@ -426,7 +435,7 @@ For the others, anything else is off.
 | `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
 | `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | Required for a TCP `--listen`. At least 32 bytes. The same secret as the API. |
-| `--allow-unauthenticated-http`, `--allow-unauthenticated-writes` | off | Unix-socket listeners only. Writes are then authored by the listener's own unlinked signer. |
+| `--allow-unauthenticated-http`, `--allow-unauthenticated-writes` | off | Unix-socket listeners only. Without `--allow-unauthenticated-writes` the listener is read-only and public-only (a zero-membership reader agent). With it, writes are authored by the listener's own unlinked signer, whose groups its callers also read. |
 | `--allowed-host` / `EPIGRAPH_MCP_ALLOWED_HOSTS` | — | Extra `Host`/`Origin` names for the HTTP listener. |
 | `--read-only` | off | Query tools only. |
 | `--operator-id` / `EPIGRAPH_OPERATOR_ID` | unset | Records `signer --OPERATED_BY--> operator` at startup. stdio only, with a declared identity. The link function is maintenance-only, so the startup fails on an application DSN; run `epigraph-operator link` from the host instead (section 9). |
