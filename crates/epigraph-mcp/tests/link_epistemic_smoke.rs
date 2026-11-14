@@ -947,7 +947,10 @@ async fn equivalent_to_edge_is_created_without_belief_or_bp_factor(pool: PgPool)
         "link_epistemic must accept 'EQUIVALENT_TO', got {result:?}"
     );
     let resp = parse_response(&result.unwrap());
-    assert!(resp.was_created, "first EQUIVALENT_TO call must create the edge");
+    assert!(
+        resp.was_created,
+        "first EQUIVALENT_TO call must create the edge"
+    );
     assert_eq!(resp.relationship, "EQUIVALENT_TO");
     assert!(
         !resp.belief_wired,
@@ -975,14 +978,16 @@ async fn equivalent_to_edge_is_created_without_belief_or_bp_factor(pool: PgPool)
             .fetch_one(&pool)
             .await
             .expect("count EQUIVALENT_TO BBAs");
-    assert_eq!(bbas, 0, "no mass function may be materialized for EQUIVALENT_TO");
-    let factors: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM factors WHERE properties->>'source_edge_id' = $1",
-    )
-    .bind(&resp.edge_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count BP factors keyed on the edge");
+    assert_eq!(
+        bbas, 0,
+        "no mass function may be materialized for EQUIVALENT_TO"
+    );
+    let factors: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM factors WHERE properties->>'source_edge_id' = $1")
+            .bind(&resp.edge_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count BP factors keyed on the edge");
     assert_eq!(
         factors, 0,
         "no BP factor may be created for an EQUIVALENT_TO edge (it is the neutral link)"
