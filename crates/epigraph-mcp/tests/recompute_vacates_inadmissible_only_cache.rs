@@ -44,6 +44,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
+use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
@@ -555,6 +556,65 @@ async fn assert_holds_fold_of(
     assert!(
         !near(after.0, before.0.unwrap_or(f64::NAN)),
         "the cache still holds the fold of the hidden evidence: {after:?} (before {before:?})"
+    );
+}
+
+/// An INGEST TEMPLATE row (the near-vacuous placeholder document ingest files
+/// on `research_validity`) is not evidence, so it does not count as an
+/// admissible input for the claim-wide R-80 gate: a claim whose only real BBA
+/// becomes inadmissible is vacated although its public template row would
+/// pass the admissibility rule. Pins the template exclusion in
+/// `DerivationScopeRepository::combine_input_ids_for_claim` (backlog
+/// 8d720490 (7)): without it the template keeps the claim on its stale fold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_ingest_template_row_does_not_keep_a_claim_from_being_vacated(pool: PgPool) {
+    let w = world(&pool, "r80-template").await;
+    let (claim, stale) = stale_claim(&pool, &w, "r80 template beside").await;
+    let research: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) \
+         VALUES ($1, ARRAY['TRUE','FALSE']::text[]) \
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+    )
+    .bind(epigraph_db::repos::mass_function::INGEST_TEMPLATE_FRAME_NAME)
+    .fetch_one(&pool)
+    .await
+    .expect("the ingest template frame");
+    let theta = epigraph_db::repos::mass_function::INGEST_TEMPLATE_MIN_THETA + 0.05;
+    MassFunctionRepository::store_with_perspective(
+        &pool,
+        claim,
+        research,
+        Some(w.author),
+        None,
+        &serde_json::json!({"0": 1.0 - theta, "0,1": theta}),
+        None,
+        None, // no combination_method: the template's signature
+        Some(epigraph_db::repos::mass_function::INGEST_TEMPLATE_SOURCE_STRENGTH),
+        None,
+        "unknown",
+        None, // no evidence row: public, so the admissibility rule would admit it
+    )
+    .await
+    .expect("store the ingest template row");
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let inputs =
+            DerivationScopeRepository::combine_input_ids_for_claim(&mut *conn, &w.public, claim)
+                .await
+                .expect("combine inputs");
+        assert_eq!(
+            inputs.len(),
+            1,
+            "the template row must not be counted as a combine input: {inputs:?}"
+        );
+    }
+
+    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
+    let after = cache(&pool, claim).await;
+    assert!(
+        is_vacuous(&after, w.binary),
+        "a claim whose only real BBA is inadmissible must be vacated even with an ingest \
+         template row beside it; it left {after:?} (stale value {stale:?})"
     );
 }
 
