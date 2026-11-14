@@ -275,8 +275,12 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- enqueues one embedding_generation job per restored claim.
          --
          -- THE BOUND STAYS AT 24h, AND IT IS NOW A DEPLOYMENT QUESTION RATHER
-         -- THAN A MISSING-CODE ONE. `bin/server.rs` does register a handler for
-         -- that job type, but CONDITIONALLY: only the provider that OWNS this
+         -- THAN A MISSING-CODE ONE. A handler for that job type is registered,
+         -- by `jobs_drain::build_job_runner` (crates/epigraph-api), which only
+         -- the `drain_jobs` timer binary runs: since D9 `bin/server.rs` runs no
+         -- job runner at all, so an instance whose drain timer is not installed
+         -- drains nothing whatever its provider. The registration is
+         -- CONDITIONAL: only the provider that OWNS this
          -- column may write it. That is stricter than "not a mock" -- a real
          -- provider embedding into a different vector space is refused too, and
          -- refused deliberately, because one ANN column holding two spaces
@@ -287,8 +291,10 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- forever on exactly the instances that most need to see it. A
          -- non-zero count of jobs older than the bound now means "this
          -- instance's embedding provider is not the one that owns this
-         -- column", which is a deployment signal rather than a missing-handler
-         -- one; the boot log's own warning says which provider was selected,
+         -- column, or its `drain_jobs` timer is not running", which is a
+         -- deployment signal rather than a missing-handler one; the warning
+         -- in `drain_jobs`'s log (not the server's boot log) says which
+         -- provider was selected,
          -- and `epigraph-cli reembed` remains the recovery path in that case.
          --
          -- Restoration is HALF: the job writes `embedding`, which is the column
