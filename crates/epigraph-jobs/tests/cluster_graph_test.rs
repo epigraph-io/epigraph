@@ -108,19 +108,17 @@ mod integration {
     #[allow(unused_imports)]
     use super::*;
     use epigraph_jobs::cluster_graph::runner::{run_clustering, RunConfig};
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
+    use uuid::Uuid;
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn end_to_end_two_cliques_produce_two_clusters() {
-        let url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at a scratch DB with 001+002 applied");
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap();
-
-        // Seed (caller is responsible for cleaning up).
+    /// Runs on its own database, created and migrated from empty by
+    /// `#[sqlx::test]` (so `DATABASE_URL` must name a role that may create
+    /// one). `run_clustering` clusters EVERY claim in the database it is
+    /// given, so "exactly two clusters" is only true where the fixture's six
+    /// claims are the only claims; and a fresh database is what lets the
+    /// fixture keep fixed ids and still be seeded on every run.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn end_to_end_two_cliques_produce_two_clusters(pool: PgPool) {
         let seed = include_str!("fixtures/seed_two_cliques.sql");
         sqlx::raw_sql(seed).execute(&pool).await.unwrap();
 
@@ -136,7 +134,36 @@ mod integration {
         assert_eq!(summary.cluster_count, 2);
         assert!(!summary.degraded);
 
-        // Verify cluster_edges has zero rows for this run (cliques are disjoint).
+        // The two clusters are the two cliques: a1..a3 share one, b1..b3 the
+        // other. The fixture's claim ids are 1..=6.
+        let mut clusters = Vec::new();
+        for clique in [[1u128, 2, 3], [4, 5, 6]] {
+            let members: Vec<Uuid> = clique.into_iter().map(Uuid::from_u128).collect();
+            let ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT DISTINCT cluster_id FROM claim_cluster_membership \
+                  WHERE run_id = $1 AND claim_id = ANY($2)",
+            )
+            .bind(summary.run_id)
+            .bind(&members)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(ids.len(), 1, "a clique is one cluster: {clique:?}");
+            clusters.push(ids);
+        }
+        assert_ne!(clusters[0], clusters[1], "the cliques are two clusters");
+
+        // The governance edge was stored, and it is the only edge between
+        // the cliques...
+        let (occupies,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM edges WHERE relationship = 'OCCUPIES'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(occupies, 1, "the fixture seeds one governance edge");
+
+        // ...so zero cluster_edges rows for this run means it was excluded:
+        // counted, it would be one inter-cluster edge of weight 1.
         let (n,): (i64,) =
             sqlx::query_as("SELECT COUNT(*)::bigint FROM cluster_edges WHERE run_id = $1")
                 .bind(summary.run_id)
@@ -144,9 +171,5 @@ mod integration {
                 .await
                 .unwrap();
         assert_eq!(n, 0, "no inter-cluster edges expected");
-
-        // Verify the OCCUPIES edge was excluded — both endpoints in same cluster
-        // would have produced a 0-weight inter-cluster edge anyway, but more
-        // importantly, the modularity must be high (not corrupted by the bridge).
     }
 }

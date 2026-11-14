@@ -250,8 +250,10 @@ jobs:
   # Until this job existed nothing in CI compiled the `integration` feature or
   # passed --ignored, so these tests ran only when someone remembered to. Each
   # step below was run on a fresh database before being added here and passed.
-  # A never-run test rots: the two suites that did NOT pass are in
-  # `test-unqualified` below, each with one test that broke unnoticed.
+  # A never-run test rots: two of these suites (cluster_graph_test, backlog
+  # bd439a7f; engine-integration, backlog 4290a51c) each had one test that had
+  # gone stale unnoticed, and gate here only since that test was fixed. Do not
+  # add `--skip` for a failing test: a skipped test is a never-run test.
   test-extra:
     name: test (feature-gated and ignored suites)
     runs-on: ubuntu-latest
@@ -322,12 +324,20 @@ jobs:
       - name: epigraph-jobs `integration` feature tests
         # The integration-gated arms of postgres_queue_tests and the whole of
         # cluster_graph_neighborhoods_test. cluster_graph_test's gated arm is
-        # in `test-unqualified` until backlog bd439a7f is fixed.
+        # the next step.
         run: >-
           cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
           --test postgres_queue_tests --test cluster_graph_neighborhoods_test
           -- --test-threads=1
-      - name: OAuth authorization-code tests marked #[ignore]
+      - name: epigraph-jobs cluster_graph_test with `integration`
+        # The gated arm seeds two cliques and runs the clustering job end to
+        # end. It is a `#[sqlx::test]`: it creates its own database from
+        # DATABASE_URL, so nothing it seeds reaches the steps around it.
+        run: >-
+          cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
+          --test cluster_graph_test
+          -- --test-threads=1
+      - name: "OAuth authorization-code tests marked #[ignore]"
         # 13 tests in tests/oauth_authorization_code.rs are
         # `#[ignore = "requires DATABASE_URL test DB"]`: the code-redeem,
         # consent and dynamic-client-registration paths (backlog d0c23a32).
@@ -337,88 +347,12 @@ jobs:
           cargo test -p epigraph-api --locked --no-fail-fast
           --test oauth_authorization_code
           -- --ignored --test-threads=1
-
-  # NEVER-RUN SUITES THAT DO NOT PASS YET. Advisory, like `python` and `audit`:
-  # red here does not block a merge, but it is no longer invisible.
-  #
-  # Each of the two steps has exactly one failing test, both stale rather than
-  # known product defects:
-  #   * cluster_graph_test's seed fixture inserts edges without owner_group_id,
-  #     which tenancy made NOT NULL (backlog bd439a7f).
-  #   * sheaf_db.rs hard-codes restriction factors the engine no longer uses
-  #     (backlog 4290a51c).
-  # When one is fixed, move its step up into `test-extra` so it gates. Do not
-  # add `--skip` for the failing test: a skipped test is a never-run test.
-  test-unqualified:
-    name: Never-run suites (advisory)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    continue-on-error: true
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: epigraph
-          POSTGRES_PASSWORD: epigraph
-          POSTGRES_DB: epigraph
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      # Same environment as `test-shard`; the reasons for each value are there.
-      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
-      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
-      SQLX_OFFLINE: "true"
-      EPIGRAPH_TEST_DESTRUCTIVE_DB: "1"
-      CARGO_BUILD_JOBS: "2"
-      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-      - name: Install mold (low-memory parallel linker)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y mold
-          mkdir -p .cargo
-          {
-            echo ""
-            echo "# CI-only: route the workspace through mold. Scoped to the"
-            echo "# runner triple so local dev on other platforms is unaffected."
-            echo "# Uses the default cc driver (-fuse-ld=mold), no clang required."
-            echo "[target.x86_64-unknown-linux-gnu]"
-            echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
-          } >> .cargo/config.toml
-          mold --version
-      - name: Free disk space on /
-        run: |
-          df -ih / ; df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
-          df -ih / ; df -h /
-      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
-        with:
-          shared-key: test-extra
-          save-if: false
-      - name: Build epigraph-migrate
-        run: cargo build --locked -p epigraph-api --bin epigraph-migrate
-      - name: Run migrations
-        run: ./target/debug/epigraph-migrate
-      - name: epigraph-jobs cluster_graph_test with `integration`
-        if: always()
-        run: >-
-          cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
-          --test cluster_graph_test
-          -- --test-threads=1
-      - name: engine-integration suite including #[ignore]d tests
+      - name: "engine-integration suite including #[ignore]d tests"
         # Every DB-backed test in tests/engine-integration is #[ignore]d, so
         # the `workspace-rest` shard compiles the suite and runs none of it.
-        if: always()
+        # Its tests read back only the rows they wrote themselves and delete
+        # their claims afterwards, so the rows the steps above leave in this
+        # database do not reach it.
         run: >-
           cargo test -p engine-integration-tests --locked --no-fail-fast
           -- --include-ignored --test-threads=1
