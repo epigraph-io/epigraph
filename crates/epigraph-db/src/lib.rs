@@ -190,6 +190,8 @@ pub use repos::AtlasLayoutRepository;
 pub use repos::AtlasMapRepository;
 // The Atlas leaf node sets (Atlas W3).
 pub use repos::AtlasLeafRepository;
+// The Atlas "by meaning" hierarchy's reads (Atlas W4).
+pub use repos::AtlasMeaningRepository;
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
     ClaimContextRepository, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ContextClaimRow,

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey", "dep:epigraph-atlas-contract"]
 genai = ["db"]
 
 [[bin]]
@@ -343,6 +343,19 @@ name = "atlas_layout_bin"
 path = "tests/atlas_layout_bin.rs"
 required-features = ["db"]
 
+# Atlas W4: the "by meaning" hierarchy's export and apply (maintenance DSN).
+[[bin]]
+name = "atlas_meaning"
+path = "src/bin/atlas_meaning.rs"
+required-features = ["db"]
+
+# Atlas W4: the "by meaning" hierarchy's export and apply, in process, and
+# the binary's argument refusals.
+[[test]]
+name = "atlas_meaning"
+path = "tests/atlas_meaning.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
@@ -410,8 +423,12 @@ epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-mcp = { workspace = true }
 epigraph-ingest = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+# v5: the Atlas "by meaning" group ids (atlas_meaning::tree). Already enabled
+# in the build graph (uuid's sha1_smol is in the lockfile), so no new crate.
+uuid = { workspace = true, features = ["v4", "v5"] }
 epigraph-db = { workspace = true, optional = true }
+# The Atlas level documents the "by meaning" build stores (schema v1, W10a).
+epigraph-atlas-contract = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 # `epigraph-operator verify-confirmations` (elevation plan EL-13): re-verifies
 # every stored passkey assertion offline. Links OpenSSL (webauthn-rs-core);
