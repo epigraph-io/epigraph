@@ -14,7 +14,14 @@
 //! so a claim whose evidence arrived through the MCP DS tools
 //! (`submit_ds_evidence`, `update_with_evidence`) never got either one, and
 //! `get_divergence` answered "no divergence data" for it (backlog f50344c0).
-//! Every write path now calls the same two functions.
+//! Those three writers now call the same functions.
+//!
+//! The other DS writers do NOT call them yet, so their claims still get no
+//! row: `submit_claim`'s seed wire (`ds_auto::auto_wire_ds_for_claim`), the
+//! batch ingest wire (`auto_wire_ds_batch`), the edge wire
+//! (`auto_wire_ds_for_edge`), `report_workflow_outcome`
+//! (`auto_wire_ds_update`) and the recompute paths. Rows older than
+//! `DivergenceRepository`'s TTL are not served either.
 //!
 //! # Best-effort, under a SAVEPOINT
 //!
