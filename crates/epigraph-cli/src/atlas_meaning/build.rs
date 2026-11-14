@@ -315,6 +315,8 @@ pub async fn apply_result(
     let mut tx = conn.begin().await.context("begin the build transaction")?;
     let epochs = AtlasMapRepository::begin_build_snapshot(&mut tx, viewer, map).await?;
     let themes = resolve_result(&mut tx, viewer, map, result, cap).await?;
+    // A dry run refuses exactly where the apply would.
+    refuse_to_hide_links(&mut tx, viewer, map).await?;
 
     let sum = |f: fn(&ResolvedTheme) -> usize| themes.iter().map(f).sum::<usize>();
     let params = json!({
@@ -371,6 +373,36 @@ pub async fn apply_result(
     report["run_id"] = json!(run_id);
     report["documents"] = json!(docs);
     Ok(report)
+}
+
+/// Refuse a meaning-only write while the map's latest finished run holds
+/// links levels: the serving read takes the latest finished run whatever it
+/// holds, so the new run would hide the links hierarchy and leave every
+/// links switch dangling (Atlas W9's guard). Apply both results together
+/// with `atlas_links apply`, or let the nightly refresh the map.
+///
+/// # Errors
+/// The refusal, or a database error.
+pub async fn refuse_to_hide_links(
+    tx: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+) -> anyhow::Result<()> {
+    let Some(latest) =
+        epigraph_db::AtlasNamingRepository::latest_finished_run(tx, viewer, map, false).await?
+    else {
+        return Ok(());
+    };
+    let held = AtlasMapRepository::run_hierarchies(tx, viewer, map, latest.id).await?;
+    if held.contains(&AtlasHierarchy::Links) {
+        bail!(
+            "map {}'s latest run {} holds the links hierarchy; a meaning-only run would hide it. \
+             Apply both results with `atlas_links apply`, or let the nightly refresh the map",
+            map_key(map),
+            latest.id
+        );
+    }
+    Ok(())
 }
 
 /// The leaf groups of a stored run, by claim: what

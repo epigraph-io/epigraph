@@ -883,3 +883,51 @@ async fn meaning_levels_switch_to_their_best_links_group(pool: PgPool) {
         serde_json::json!(group_id(map, L, c.theme, &c.mirror2()))
     );
 }
+
+/// W4's hand-off guard (W9): a standalone meaning apply refuses while the
+/// map's latest run holds the links hierarchy, which it would hide; its dry
+/// run refuses too, and the served run is left as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_meaning_only_apply_refuses_to_hide_a_links_run(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let mut conn = pool.acquire().await.unwrap();
+    // With no run yet, a meaning-only apply is allowed (dry run).
+    epigraph_cli::atlas_meaning::build::apply_result(
+        &mut conn,
+        &viewer,
+        map,
+        &meaning_result(&c),
+        CAP,
+        false,
+    )
+    .await
+    .expect("no links run to hide yet");
+    let run = run_id(
+        &apply(&pool, &viewer, &c, &links_result(&c))
+            .await
+            .expect("apply"),
+    );
+    for write in [false, true] {
+        let err = epigraph_cli::atlas_meaning::build::apply_result(
+            &mut conn,
+            &viewer,
+            map,
+            &meaning_result(&c),
+            CAP,
+            write,
+        )
+        .await
+        .expect_err("a meaning-only run would hide the links levels");
+        assert!(format!("{err:#}").contains("links"), "{err:#}");
+    }
+    let latest: Uuid = sqlx::query_scalar(
+        "SELECT id FROM atlas_map_runs WHERE finished_at IS NOT NULL \
+          ORDER BY finished_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(latest, run, "nothing was written");
+}
