@@ -131,12 +131,21 @@ pub enum ChildKind {
     Leaf,
 }
 
-/// Where an edge's `flow_weight` comes from. The endpoint kinds fix it, so a
-/// producer cannot leave out a belief flow by marking the edge `none`.
+/// Where an edge's `flow_weight` comes from. The endpoint kinds limit it:
+/// claim to claim is always `proxy`, evidence to claim is `exact` or `none`,
+/// and every other pair is `none` ([`FlowBasis::allows`]). So a producer
+/// cannot leave out a claim-to-claim flow by marking the edge `none`.
+///
+/// An evidence-to-claim edge is `none` when the map's audience can read no
+/// mass row keyed by that evidence on that claim: most stored evidence edges
+/// have none, so this is the common case, not an error. The contract cannot
+/// tell such an edge from one whose builder dropped a readable mass; the
+/// builder (backlog W7) carries that invariant and its known-mass test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
-    /// Evidence to claim, always: the stored mass.
+    /// Evidence to claim with a mass row the map's audience can read: the
+    /// stored mass.
     Exact,
     /// Claim to claim, always: the link's strength times its sign, and
     /// nothing else, which the view labels an estimate. With the sign in
@@ -154,19 +163,32 @@ pub enum FlowBasis {
     /// sign 0 and so weight 0; validation rejects a proxy edge with sign 0
     /// and any other weight.
     Proxy,
-    /// Every other pair of kinds (an agent's authorship, for example): no
-    /// belief flow, so weight 0 and sign 0.
+    /// No belief flow, so weight 0 and sign 0: every pair of kinds other
+    /// than claim to claim and evidence to claim (an agent's authorship, for
+    /// example), and an evidence-to-claim edge with no readable mass. Such
+    /// an evidence node still counts as attached to the claim.
     None,
 }
 
 impl FlowBasis {
-    /// The basis an edge between these node kinds must carry.
+    /// The basis an edge between these node kinds carries when belief flows
+    /// along it: `exact` from evidence to a claim, `proxy` between claims,
+    /// `none` otherwise. An evidence-to-claim edge with no readable mass is
+    /// `none` instead; [`FlowBasis::allows`] is the rule a document must meet.
     pub fn for_kinds(source: NodeKind, target: NodeKind) -> Self {
         match (source, target) {
             (NodeKind::Evidence, NodeKind::Claim) => FlowBasis::Exact,
             (NodeKind::Claim, NodeKind::Claim) => FlowBasis::Proxy,
             _ => FlowBasis::None,
         }
+    }
+
+    /// Whether an edge between these node kinds may carry this basis: the
+    /// one [`FlowBasis::for_kinds`] gives, or `none` from evidence to a claim.
+    pub fn allows(self, source: NodeKind, target: NodeKind) -> bool {
+        self == FlowBasis::for_kinds(source, target)
+            || (self == FlowBasis::None
+                && (source, target) == (NodeKind::Evidence, NodeKind::Claim))
     }
 }
 
@@ -822,13 +844,20 @@ fn validate_leaf(l: &LeafLevel, v: &mut Vec<String>) {
         check_sign(&format!("{p}/sign"), e.sign, v);
         check_unit(&format!("{p}/flow_weight"), e.flow_weight, v);
         if let (Some(s), Some(t)) = (src, dst) {
-            let want = FlowBasis::for_kinds(s, t);
-            if e.flow_basis != want {
+            if !e.flow_basis.allows(s, t) {
+                let want = FlowBasis::for_kinds(s, t);
+                let or_none = if want != FlowBasis::None && FlowBasis::None.allows(s, t) {
+                    " or None"
+                } else {
+                    ""
+                };
                 v.push(format!(
-                    "{p}/flow_basis: an edge from {s:?} to {t:?} has basis {want:?}, not {:?}",
+                    "{p}/flow_basis: an edge from {s:?} to {t:?} has basis {want:?}{or_none}, not {:?}",
                     e.flow_basis
                 ));
             }
+            // Any edge to a claim attaches its other end, whatever its
+            // basis: evidence with no readable mass (`none`) included.
             if s == NodeKind::Claim || t == NodeKind::Claim {
                 anchored.insert(e.source);
                 anchored.insert(e.target);

@@ -1024,48 +1024,69 @@ fn relationship_names_in_both_casings_are_accepted() {
     }
 }
 
-/// The endpoint kinds fix an edge's flow basis, so a producer cannot drop a
-/// belief flow (and the exact/proxy label the view needs) by marking the
-/// edge `none` with weight 0 and sign 0. Each mutation is schema-valid.
+/// The kind of each node of a leaf document, by id.
+fn node_kinds(v: &Value) -> std::collections::BTreeMap<String, String> {
+    v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            let id = n["id"].as_str().unwrap().to_string();
+            (id, n["kind"].as_str().unwrap().to_string())
+        })
+        .collect()
+}
+
+/// The indices of the edges of a leaf document from `src` kind to `dst` kind.
+fn edges_between(v: &Value, src: &str, dst: &str) -> Vec<usize> {
+    let kinds = node_kinds(v);
+    v["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            kinds[e["source"].as_str().unwrap()] == src
+                && kinds[e["target"].as_str().unwrap()] == dst
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The endpoint kinds limit an edge's flow basis, so a producer cannot drop
+/// a claim-to-claim flow (and the proxy label the view needs) by marking the
+/// edge `none` with weight 0 and sign 0, nor label an agent's link or a
+/// claim link `exact`. Evidence to claim may be `exact` or `none`, never
+/// `proxy`. Each mutation is schema-valid.
 #[test]
-fn flow_basis_is_fixed_by_the_endpoint_kinds() {
+fn flow_basis_is_limited_by_the_endpoint_kinds() {
     let v = read_value("team_leaf_dense");
-    let kind_of = |id: &Value| {
-        v["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|n| &n["id"] == id)
-            .map(|n| n["kind"].as_str().unwrap().to_string())
-            .unwrap()
-    };
-    let find = |src: &str, dst: &str| {
-        (0..)
-            .find(|&i| {
-                kind_of(&v["edges"][i]["source"]) == src && kind_of(&v["edges"][i]["target"]) == dst
-            })
-            .unwrap()
-    };
+    let first = |src: &str, dst: &str| edges_between(&v, src, dst)[0];
     let cases = [
         (
-            find("evidence", "claim"),
+            first("claim", "claim"),
             "none",
-            "from Evidence to Claim has basis Exact",
+            "from Claim to Claim has basis Proxy, not None",
         ),
         (
-            find("claim", "claim"),
-            "none",
-            "from Claim to Claim has basis Proxy",
-        ),
-        (
-            find("agent", "claim"),
-            "proxy",
-            "from Agent to Claim has basis None",
-        ),
-        (
-            find("agent", "claim"),
+            first("claim", "claim"),
             "exact",
-            "from Agent to Claim has basis None",
+            "from Claim to Claim has basis Proxy, not Exact",
+        ),
+        (
+            first("evidence", "claim"),
+            "proxy",
+            "from Evidence to Claim has basis Exact or None, not Proxy",
+        ),
+        (
+            first("agent", "claim"),
+            "proxy",
+            "from Agent to Claim has basis None, not Proxy",
+        ),
+        (
+            first("agent", "claim"),
+            "exact",
+            "from Agent to Claim has basis None, not Exact",
         ),
     ];
     for (i, basis, expected) in cases {
@@ -1081,6 +1102,113 @@ fn flow_basis_is_fixed_by_the_endpoint_kinds() {
         );
         let err = types_accept(&m).expect_err(expected);
         assert!(err.contains(expected), "wanted `{expected}` in `{err}`");
+    }
+}
+
+/// Most stored evidence-to-claim edges have no mass row keyed by their
+/// evidence that the map's audience can read, so they are served `none`,
+/// weight 0, sign 0. A leaf whose every evidence edge is such is valid on
+/// the schema, the types and the served-body check; its evidence nodes still
+/// count as attached to their claims, in `validate` and in `for_viewer`.
+#[test]
+fn an_evidence_edge_with_no_readable_mass_is_none() {
+    for stem in ["team_leaf_dense", "public_leaf"] {
+        let mut v = read_value(stem);
+        let flipped = edges_between(&v, "evidence", "claim");
+        assert!(flipped.len() > 1, "{stem}: evidence edges to flip");
+        for &i in &flipped {
+            v["edges"][i]["flow_basis"] = json!("none");
+            v["edges"][i]["flow_weight"] = json!(0.0);
+            v["edges"][i]["sign"] = json!(0);
+        }
+        assert_eq!(schema_errors(&v), Vec::<String>::new(), "{stem}: schema");
+        types_accept(&v).unwrap_or_else(|e| panic!("{stem}: {e}"));
+        let body = serde_json::to_vec(&v).unwrap();
+        let stored = check_as(stem, &body).unwrap_or_else(|e| panic!("{stem}: {e:#?}"));
+        let s = leaf_of(&stored).clone();
+        let evidence: BTreeSet<_> = s
+            .nodes
+            .iter()
+            .filter(|n| n.kind() == NodeKind::Evidence)
+            .map(Node::id)
+            .collect();
+        assert!(!evidence.is_empty(), "{stem}: evidence nodes kept");
+        assert!(s
+            .edges
+            .iter()
+            .all(|e| !evidence.contains(&e.source) || e.flow_basis == FlowBasis::None));
+
+        // Served for viewers who can read some of it: each answer is valid,
+        // and keeps every readable evidence node with a readable claim at
+        // the other end of one of its edges.
+        let claims: BTreeSet<_> = s
+            .nodes
+            .iter()
+            .filter(|n| n.kind() == NodeKind::Claim)
+            .map(Node::id)
+            .collect();
+        let mut rng = Rng::new(0xE51D_0000);
+        let mut kept = 0;
+        for round in 0..24 {
+            let p = 0.3 + 0.7 * round as f64 / 23.0;
+            let readable: BTreeSet<uuid::Uuid> = s
+                .nodes
+                .iter()
+                .map(Node::id)
+                .filter(|_| rng.chance(p))
+                .collect();
+            let Some(served) = stored.for_viewer(|id| readable.contains(&id)) else {
+                continue;
+            };
+            served
+                .validate()
+                .unwrap_or_else(|e| panic!("{stem} round {round}: {e}"));
+            let ids: BTreeSet<_> = leaf_of(&served).nodes.iter().map(Node::id).collect();
+            for ev in evidence.iter().filter(|ev| readable.contains(ev)) {
+                let attached = s.edges.iter().any(|e| {
+                    let other = if e.source == *ev {
+                        e.target
+                    } else if e.target == *ev {
+                        e.source
+                    } else {
+                        return false;
+                    };
+                    claims.contains(&other) && readable.contains(&other)
+                });
+                assert_eq!(
+                    ids.contains(ev),
+                    attached,
+                    "{stem} round {round}: evidence {ev} kept iff attached"
+                );
+                kept += usize::from(attached);
+            }
+        }
+        assert!(kept > 0, "{stem}: some evidence served");
+    }
+}
+
+/// `none` still means no flow: an evidence-to-claim edge marked `none` with
+/// a weight or a sign is refused for that alone (its basis is allowed), by
+/// `validate` and by the schema.
+#[test]
+fn a_none_evidence_edge_with_a_weight_or_sign_is_rejected() {
+    let v = read_value("team_leaf_dense");
+    let i = edges_between(&v, "evidence", "claim")[0];
+    for (w, sign) in [(0.5, 0), (0.0001, 0), (0.0, 1), (0.0, -1), (0.4, 1)] {
+        let mut m = v.clone();
+        m["edges"][i]["flow_basis"] = json!("none");
+        m["edges"][i]["flow_weight"] = json!(w);
+        m["edges"][i]["sign"] = json!(sign);
+        let err = types_accept(&m).expect_err("a weighted or signed none edge");
+        assert_eq!(
+            err,
+            format!("/edges/{i}: an edge with no flow has weight 0 and sign 0"),
+            "weight {w}, sign {sign}"
+        );
+        assert!(
+            !schema_errors(&m).is_empty(),
+            "weight {w}, sign {sign}: the schema accepts it"
+        );
     }
 }
 

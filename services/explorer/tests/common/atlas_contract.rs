@@ -166,12 +166,21 @@ fn kind(n: &Node) -> Kind {
     }
 }
 
+/// The basis an edge between these kinds carries when belief flows along it
+/// (the kernel's `FlowBasis::for_kinds`).
 fn basis_for(s: Kind, t: Kind) -> FlowBasis {
     match (s, t) {
         (Kind::Evidence, Kind::Claim) => FlowBasis::Exact,
         (Kind::Claim, Kind::Claim) => FlowBasis::Proxy,
         _ => FlowBasis::None,
     }
+}
+
+/// Whether an edge between these kinds may carry `b` (the kernel's
+/// `FlowBasis::allows`): the basis above, or `none` from evidence to a claim
+/// when the audience can read no mass for it.
+fn basis_allowed(b: FlowBasis, s: Kind, t: Kind) -> bool {
+    b == basis_for(s, t) || (b == FlowBasis::None && (s, t) == (Kind::Evidence, Kind::Claim))
 }
 
 fn other(h: Hierarchy) -> Hierarchy {
@@ -292,10 +301,15 @@ fn leaf_errors(l: &LeafLevel, e: &mut Vec<String>) {
             ));
         }
         if let (Some(&s), Some(&t)) = (s, t) {
-            let want = basis_for(s, t);
-            if x.flow_basis != want {
+            if !basis_allowed(x.flow_basis, s, t) {
+                let want = basis_for(s, t);
+                let or_none = if want != FlowBasis::None && basis_allowed(FlowBasis::None, s, t) {
+                    " or None"
+                } else {
+                    ""
+                };
                 e.push(format!(
-                    "invariant /edges/{i}/flow_basis: {s:?} to {t:?} is {want:?}, not {:?}",
+                    "invariant /edges/{i}/flow_basis: {s:?} to {t:?} is {want:?}{or_none}, not {:?}",
                     x.flow_basis
                 ));
             }
@@ -338,7 +352,7 @@ fn leaf_errors(l: &LeafLevel, e: &mut Vec<String>) {
 }
 
 /// The rules a JSON Schema cannot express: references, uniqueness, the
-/// flow basis each edge's endpoint kinds fix, and the breadcrumb order.
+/// flow bases each edge's endpoint kinds allow, and the breadcrumb order.
 pub fn invariant_errors(doc: &AtlasLevel) -> Vec<String> {
     let mut e = Vec::new();
     match doc {
