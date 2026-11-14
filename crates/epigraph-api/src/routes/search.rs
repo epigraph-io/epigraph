@@ -811,18 +811,6 @@ async fn probe_theme_coverage_isolated(
     Ok(probe)
 }
 
-#[cfg(feature = "db")]
-fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
 // `build_similarity_neighbors` and the diverse-pipeline helpers live in
 // `epigraph_engine::diverse_retrieval` so the MCP `recall_with_context`
 // tool can share the same retrieval logic. See the module docs for the
@@ -1230,7 +1218,7 @@ pub async fn semantic_search(
             };
             let query_embedding =
                 generate_query_embedding_with_dim(&state, query, target_dim).await;
-            let embedding_str = format_embedding_for_pgvector(&query_embedding);
+            let embedding_str = epigraph_db::pgvector_literal(&query_embedding);
             if target_dim == EMBEDDING_DIM {
                 // `generate_query_embedding` is exactly this call at
                 // `EMBEDDING_DIM`, so the flat tail can reuse the vector.
@@ -1292,7 +1280,7 @@ pub async fn semantic_search(
                     let probe_vec = match &flat_query_vec {
                         Some(v) => v.clone(),
                         None => {
-                            let v = format_embedding_for_pgvector(
+                            let v = epigraph_db::pgvector_literal(
                                 &generate_query_embedding(&state, query).await,
                             );
                             flat_query_vec = Some(v.clone());
@@ -1571,11 +1559,11 @@ pub async fn semantic_search(
             RankBy::ThemeCore => None,
             RankBy::Query => Some(match flat_query_vec {
                 Some(v) => v,
-                None if paged && !diverse => format_embedding_for_pgvector(
+                None if paged && !diverse => epigraph_db::pgvector_literal(
                     &generate_walk_query_embedding(&state, query).await?,
                 ),
                 None => {
-                    format_embedding_for_pgvector(&generate_query_embedding(&state, query).await)
+                    epigraph_db::pgvector_literal(&generate_query_embedding(&state, query).await)
                 }
             }),
         };

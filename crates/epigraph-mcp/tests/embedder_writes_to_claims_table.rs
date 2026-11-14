@@ -33,7 +33,8 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_mcp::embed::{format_pgvector, McpEmbedder};
+use epigraph_db::pgvector_literal;
+use epigraph_mcp::embed::McpEmbedder;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -72,7 +73,7 @@ async fn mcp_embedder_store_writes_to_claims_embedding(pool: PgPool) {
     let fake_vec = vec![0.1_f32; 1536];
 
     let stored = embedder
-        .store_vector(claim_id, &format_pgvector(&fake_vec))
+        .store_vector(claim_id, &pgvector_literal(&fake_vec))
         .await
         .expect("store should succeed on a declared author-stamped embedder");
     assert!(stored, "the store must match the seeded row");
@@ -115,7 +116,7 @@ async fn an_undeclared_embedder_refuses_to_store_rather_than_using_its_pool(pool
     let fake_vec = vec![0.2_f32; 1536];
 
     let err = embedder
-        .store_vector(claim_id, &format_pgvector(&fake_vec))
+        .store_vector(claim_id, &pgvector_literal(&fake_vec))
         .await
         .expect_err(
             "an embedder that declared no StorePath must refuse. If this now succeeds it is \

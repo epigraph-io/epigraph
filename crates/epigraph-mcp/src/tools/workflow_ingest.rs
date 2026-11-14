@@ -725,7 +725,7 @@ pub(crate) async fn embed_created_workflow_claims(
     for (claim_id, content) in inserted {
         match server.embedder.generate(content).await {
             Ok(v) => {
-                let pgvec = crate::embed::format_pgvector(&v);
+                let pgvec = epigraph_db::pgvector_literal(&v);
                 store_ingest_embedding(server, Some(caller.agent_id()), *claim_id, &pgvec).await;
             }
             Err(e) => tracing::warn!("embedding failed (claim still stored): {e}"),

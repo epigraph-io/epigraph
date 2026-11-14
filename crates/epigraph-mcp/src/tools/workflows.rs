@@ -14,7 +14,7 @@ use epigraph_db::{
     WorkflowRepository,
 };
 
-use crate::embed::format_pgvector;
+use epigraph_db::pgvector_literal;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -451,7 +451,7 @@ pub async fn find_workflow(
     // pipeline (extracted to mirror recall.rs's recall_with_context split) lets
     // integration tests skip the OpenAI embedder via `__test_only`.
     let pgvec_opt = match server.embedder.generate(&params.goal).await {
-        Ok(v) => Some(format_pgvector(&v)),
+        Ok(v) => Some(pgvector_literal(&v)),
         Err(e) => {
             tracing::warn!("embedder failed in find_workflow; relying on text fallback: {e}");
             None
@@ -1314,7 +1314,7 @@ pub async fn report_workflow_outcome(
 
     // Embed the goal text for affinity matching
     let goal_embedding_pgvec = match server.embedder.generate(&behavioral_goal).await {
-        Ok(vec) => Some(format_pgvector(&vec)),
+        Ok(vec) => Some(pgvector_literal(&vec)),
         Err(e) => {
             tracing::warn!("behavioral goal embedding failed: {e}");
             None

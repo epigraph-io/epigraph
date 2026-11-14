@@ -629,7 +629,7 @@ pub async fn embed_claim_author_stamped_with_grant(
     let pgvec = match pending_embedding {
         Some(v) => v,
         None => match server.embedder.generate(text).await {
-            Ok(v) => crate::embed::format_pgvector(&v),
+            Ok(v) => epigraph_db::pgvector_literal(&v),
             Err(e) => {
                 tracing::warn!(
                     claim_id = %claim_id,

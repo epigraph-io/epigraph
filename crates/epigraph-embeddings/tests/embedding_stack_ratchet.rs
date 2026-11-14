@@ -196,3 +196,53 @@ fn only_the_embeddings_crate_talks_to_the_openai_endpoint() {
          through epigraph_embeddings::OpenAiProvider instead of a second client"
     );
 }
+
+/// The non-test part of a source file: everything before its first
+/// `#[cfg(test)]` module, where fixtures may build literals by hand.
+fn before_test_module(text: &str) -> &str {
+    text.find("#[cfg(test)]\nmod ").map_or(text, |i| &text[..i])
+}
+
+/// pgvector literals are formatted by one helper, `epigraph_db::pgvector_literal`.
+///
+/// The `[v,v,...]` text bound as `$N::vector` was hand-written at a few dozen
+/// production sites under five names (`format_embedding`,
+/// `format_embedding_for_pgvector`, `format_pgvector`, `pgvector_text`, inline
+/// `format!("[{}]", ... .join(","))`), backlog b72be4e2. A copy that drifts (a
+/// precision specifier, a space after the comma) changes the vector or fails the
+/// cast at only that site.
+#[test]
+fn pgvector_literals_come_from_one_helper() {
+    let named = [
+        "fn format_embedding(",
+        "fn format_embedding_for_pgvector(",
+        "fn format_pgvector(",
+        "fn pgvector_text(",
+        "fn vec_to_pgvec(",
+        "fn vector_literal(",
+    ];
+    let mut offenders = Vec::new();
+    for (path, text) in production_sources() {
+        let body = before_test_module(&text);
+        for n in named {
+            if body.contains(n) {
+                offenders.push(format!("{path}: {n}"));
+            }
+        }
+        let mut from = 0;
+        while let Some(i) = body[from..].find("\"[{}]\"") {
+            let at = from + i;
+            let window: String = body[at..].chars().take(400).collect();
+            if window.contains(".join(\",\")") {
+                let line = body[..at].matches('\n').count() + 1;
+                offenders.push(format!("{path}:{line}: inline `[{{}}]` + join(\",\")"));
+            }
+            from = at + 1;
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "hand-rolled pgvector literals; use epigraph_db::pgvector_literal:\n{}",
+        offenders.join("\n")
+    );
+}

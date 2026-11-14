@@ -474,7 +474,7 @@ pub async fn do_report_hierarchical_outcome_as(
     //    counter UPDATE and every earlier step row.
     let report_ts = chrono::Utc::now();
     let goal_text_owned = goal_text.unwrap_or(GOAL_PLACEHOLDER).to_string();
-    let goal_embedding_pgvec = goal_embedding.map(crate::embed::format_pgvector);
+    let goal_embedding_pgvec = goal_embedding.map(epigraph_db::pgvector_literal);
     let mut unresolved: Vec<usize> = Vec::new();
     for step_exec in step_executions {
         let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
@@ -1100,7 +1100,7 @@ mod tests {
             .unwrap();
         let hits = epigraph_db::BehavioralExecutionRepository::behavioral_affinity_hierarchical(
             &pool,
-            &crate::embed::format_pgvector(&qvec),
+            &epigraph_db::pgvector_literal(&qvec),
             0.5,
             1,
             20,

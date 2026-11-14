@@ -294,10 +294,7 @@ async fn embed_restored(
     };
     match embedder.generate(content).await {
         Ok(v) => {
-            let pgvec = format!(
-                "[{}]",
-                v.iter().map(f32::to_string).collect::<Vec<_>>().join(",")
-            );
+            let pgvec = epigraph_db::pgvector_literal(&v);
             match ClaimRepository::store_embedding_if_unsealed(conn, viewer, dup, &pgvec).await {
                 Ok(stored) => stored,
                 Err(e) => {

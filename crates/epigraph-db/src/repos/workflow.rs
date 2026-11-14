@@ -597,14 +597,7 @@ impl WorkflowRepository {
         min_truth: f64,
         limit: i64,
     ) -> Result<Vec<WorkflowRecallResult>, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            query_embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(query_embedding);
 
         // `find_workflow`'s semantic path lands here. Workflow steps ARE
         // claims, so an unfiltered read returns another tenant's playbook text
@@ -1623,14 +1616,7 @@ impl WorkflowRepository {
         limit: i64,
         resolve_to_latest: bool,
     ) -> Result<Vec<HierarchicalWorkflowRow>, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            query_embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(query_embedding);
         // For embedding-based search, semantic distance is the primary signal —
         // sorting by canonical_name first (as the ILIKE path does for heads-walk
         // dedup) would defeat that. Always sort by distance first; when
@@ -1945,14 +1931,7 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         embedding: &[f32],
     ) -> Result<u64, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(embedding);
         let r = sqlx::query("UPDATE workflows SET goal_embedding = $1::vector WHERE id = $2")
             .bind(&vec_str)
             .bind(workflow_id)

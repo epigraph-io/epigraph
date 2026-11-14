@@ -2116,14 +2116,7 @@ pub async fn submit_packet(
                 match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
                         // Provider-agnostic pgvector literal (Jina, OpenAI, ...).
-                        let pgvector_str = format!(
-                            "[{}]",
-                            embedding
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        );
+                        let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                         // Stored on the authority that wrote the claim: a
                         // transaction stamped with the caller's viewer. On the
                         // unstamped `db_pool` row security refused this UPDATE
@@ -2210,14 +2203,7 @@ pub async fn submit_packet(
 
                     match embedding_result {
                         Ok(embedding) => {
-                            let pgvector_str = format!(
-                                "[{}]",
-                                embedding
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            );
+                            let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                             // Same authority as the packet's insert, for the
                             // same reason as the claim's vector above.
                             match state

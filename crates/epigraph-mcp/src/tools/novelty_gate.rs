@@ -208,7 +208,7 @@ pub async fn decide(
     labels: &[String],
 ) -> Option<(GateDecision, String)> {
     let vector = embedder.generate(content).await.ok()?;
-    let pgvec = crate::embed::format_pgvector(&vector);
+    let pgvec = epigraph_db::pgvector_literal(&vector);
     let mut read = match server.read_as(viewer, "novelty_gate").await {
         Ok(read) => read,
         Err(e) => {
@@ -451,7 +451,7 @@ mod tests {
         let vector = EmbeddingService::generate(&embedder, text)
             .await
             .expect("mock generate");
-        let pgvec = crate::embed::format_pgvector(&vector);
+        let pgvec = epigraph_db::pgvector_literal(&vector);
 
         let neighbor_id = Uuid::new_v4();
         sqlx::query(
@@ -502,7 +502,7 @@ mod tests {
         let vector = EmbeddingService::generate(&embedder, text)
             .await
             .expect("mock generate");
-        let pgvec = crate::embed::format_pgvector(&vector);
+        let pgvec = epigraph_db::pgvector_literal(&vector);
 
         let neighbor_id = Uuid::new_v4();
         sqlx::query(

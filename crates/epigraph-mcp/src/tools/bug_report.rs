@@ -171,7 +171,7 @@ pub async fn submit_bug_report(
     // best-effort, so a provider outage never refuses a report (the
     // maintenance backfill embeds a row that has no vector).
     input.embedding = match server.embedder.generate(&input.content()).await {
-        Ok(v) if v.len() == EMBEDDING_DIM => Some(crate::embed::format_pgvector(&v)),
+        Ok(v) if v.len() == EMBEDDING_DIM => Some(epigraph_db::pgvector_literal(&v)),
         Ok(v) => {
             tracing::warn!(
                 tool = SUBMIT,

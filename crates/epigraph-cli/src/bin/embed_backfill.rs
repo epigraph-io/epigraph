@@ -158,7 +158,7 @@ async fn backfill_claims(
     for (claim_id, content) in rows {
         match provider.generate(&content).await {
             Ok(embedding) => {
-                let pgvec = format_pgvector(&embedding);
+                let pgvec = epigraph_db::pgvector_literal(&embedding);
                 match ClaimRepository::store_embedding(pool, claim_id, &pgvec).await {
                     Ok(true) => written += 1,
                     Ok(false) => {
@@ -193,25 +193,4 @@ fn build_1536d_provider(
         return Ok(Arc::new(MockProvider::new(config)));
     }
     anyhow::bail!("OPENAI_API_KEY is required unless --allow-mock is set");
-}
-
-fn format_pgvector(values: &[f32]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::format_pgvector;
-
-    #[test]
-    fn pgvector_format_matches_postgres_vector_literal() {
-        assert_eq!(format_pgvector(&[0.1, -0.2, 3.0]), "[0.1,-0.2,3]");
-    }
 }

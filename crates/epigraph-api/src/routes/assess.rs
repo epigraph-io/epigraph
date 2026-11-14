@@ -607,14 +607,7 @@ pub async fn assess_claim(
     let embedded = if let Some(ref embedding_service) = state.embedding_service {
         match embedding_service.generate_query(&claim_content).await {
             Ok(embedding) => {
-                let pgvector_str = format!(
-                    "[{}]",
-                    embedding
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                 // The shared writer on the caller's stamped transaction
                 // (backlog f78526ad): it locks the row, then refuses a sealed
                 // or superseded claim and one the caller cannot write. The

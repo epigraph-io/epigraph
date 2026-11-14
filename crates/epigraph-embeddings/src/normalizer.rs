@@ -114,35 +114,6 @@ impl Normalizer {
         1.0 - Self::cosine_similarity(a, b)
     }
 
-    /// Format a vector as a pgvector string literal.
-    ///
-    /// Converts a slice of f32 to the format "[0.1,0.2,0.3,...]" expected by
-    /// `PostgreSQL`'s pgvector extension.
-    ///
-    /// # Arguments
-    /// * `vector` - The vector to format
-    ///
-    /// # Returns
-    /// A string in pgvector format suitable for SQL queries
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let vec = [0.1, 0.2, 0.3];
-    /// let formatted = Normalizer::format_as_pgvector(&vec);
-    /// assert_eq!(formatted, "[0.1,0.2,0.3]");
-    /// ```
-    #[must_use]
-    pub fn format_as_pgvector(vector: &[f32]) -> String {
-        format!(
-            "[{}]",
-            vector
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-    }
-
     /// Parse a pgvector string representation to Vec<f32>.
     ///
     /// Converts a pgvector string literal "[0.1,0.2,0.3]" back to a Vec<f32>.
@@ -215,24 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_as_pgvector() {
-        let vec = [0.1, 0.2, 0.3];
-        let formatted = Normalizer::format_as_pgvector(&vec);
-        assert!(formatted.starts_with('['));
-        assert!(formatted.ends_with(']'));
-        assert!(formatted.contains("0.1"));
-        assert!(formatted.contains("0.2"));
-        assert!(formatted.contains("0.3"));
-    }
-
-    #[test]
-    fn test_format_as_pgvector_empty() {
-        let vec: [f32; 0] = [];
-        let formatted = Normalizer::format_as_pgvector(&vec);
-        assert_eq!(formatted, "[]");
-    }
-
-    #[test]
     fn test_parse_pgvector_valid() {
         let parsed = Normalizer::parse_pgvector("[0.1,0.2,0.3]").unwrap();
         assert_eq!(parsed.len(), 3);
@@ -249,9 +202,9 @@ mod tests {
 
     #[test]
     fn test_pgvector_roundtrip() {
+        // The literal `epigraph_db::pgvector_literal` writes for this vector.
         let original = [0.123, 0.456, 0.789];
-        let formatted = Normalizer::format_as_pgvector(&original);
-        let parsed = Normalizer::parse_pgvector(&formatted).unwrap();
+        let parsed = Normalizer::parse_pgvector("[0.123,0.456,0.789]").unwrap();
 
         for (a, b) in original.iter().zip(parsed.iter()) {
             assert!((a - b).abs() < 1e-6);

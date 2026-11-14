@@ -169,7 +169,7 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
         }
 
         for ((row_id, _), embedding) in rows.iter().zip(embeddings.iter()) {
-            let pgvec = format_pgvector(embedding);
+            let pgvec = epigraph_db::pgvector_literal(embedding);
             if update_embedding_3072(pool, config.target, *row_id, &pgvec).await? {
                 rows_written += 1;
             }
@@ -258,12 +258,6 @@ async fn update_embedding_3072(
     );
     let done = sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
     Ok(done.rows_affected() > 0)
-}
-
-/// Format a `&[f32]` as pgvector literal `[a,b,c,...]`.
-fn format_pgvector(vec: &[f32]) -> String {
-    let inner: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", inner.join(","))
 }
 
 fn read_checkpoint(path: Option<&PathBuf>) -> Result<Option<Uuid>, ReembedError> {

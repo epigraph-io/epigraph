@@ -57,6 +57,7 @@ pub mod operator_binding;
 pub mod pool;
 pub mod refusal_codes;
 pub mod repos;
+pub mod vector_literal;
 pub mod visibility;
 
 // Re-export primary types
@@ -193,6 +194,7 @@ pub use repos::{
     ContextEdgeRow, ContextEdgeTally, ContextPage, ContextPaperRow, EgoEdgeRow, EgoEdges,
     EgoEntity, EgoRepository, CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
+pub use vector_literal::pgvector_literal;
 pub use visibility::{Elevation, MaintenanceLease, SystemReason, Viewer};
 
 // Re-export sqlx types that users will need

@@ -48,10 +48,7 @@ impl EntityRepository {
         properties: serde_json::Value,
     ) -> Result<EntityRow, DbError> {
         // Build the pgvector literal "[v1,v2,...]" when an embedding is provided.
-        let embedding_str: Option<String> = embedding.map(|v| {
-            let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
-            format!("[{}]", inner.join(","))
-        });
+        let embedding_str: Option<String> = embedding.map(crate::pgvector_literal);
 
         let row = if let Some(ref emb) = embedding_str {
             sqlx::query!(
@@ -230,8 +227,7 @@ impl EntityRepository {
         limit: i64,
     ) -> Result<Vec<(EntityRow, f64)>, DbError> {
         // Format embedding as pgvector literal
-        let inner: Vec<String> = embedding.iter().map(|x| x.to_string()).collect();
-        let embedding_str = format!("[{}]", inner.join(","));
+        let embedding_str = crate::pgvector_literal(embedding);
 
         // Two variants: with and without type_top filter.
         // Using query! requires the SQL to be statically known, so we branch.

@@ -962,7 +962,7 @@ pub async fn recall_with_context(
         .generate_at_dim(&params.query, centroid_dim)
         .await
         .map_err(|e| recall_fault("could not embed the query", e))?;
-    let pgvec = crate::embed::format_pgvector(&query_embedding);
+    let pgvec = epigraph_db::pgvector_literal(&query_embedding);
 
     // Resolve + existence-check the optional (frame, perspective) lens ONCE,
     // before the page loop, so a bad lens fails fast and the bounded post-pass

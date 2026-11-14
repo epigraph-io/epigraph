@@ -610,11 +610,6 @@ fn clamp_limit(limit: i64) -> usize {
     usize::try_from(limit.clamp(1, ATLAS_PAGE_MAX)).unwrap_or(1)
 }
 
-fn pgvector_text(v: &[f32]) -> String {
-    let parts: Vec<String> = v.iter().map(ToString::to_string).collect();
-    format!("[{}]", parts.join(","))
-}
-
 /// Fold consecutive bundle rows into pages of whole bundles: keep the first
 /// `limit` bundles, and return the cursor of the last one kept when more
 /// followed.
@@ -787,7 +782,7 @@ impl AtlasLayoutRepository {
         .bind(r.iter().map(|x| x.r).collect::<Vec<_>>())
         .bind(
             r.iter()
-                .map(|x| pgvector_text(&x.centroid))
+                .map(|x| crate::pgvector_literal(&x.centroid))
                 .collect::<Vec<_>>(),
         )
         .execute(&mut *conn)

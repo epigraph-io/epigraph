@@ -252,7 +252,7 @@ impl McpEmbedder {
     /// model's token limit is clipped (the stored claim content stays full
     /// verbatim; only the embedding input is cut), and a 429 / 5xx is retried
     /// within a bounded budget. Callers can format the vector with
-    /// `format_pgvector()` for SQL.
+    /// `epigraph_db::pgvector_literal()` for SQL.
     pub async fn generate(&self, text: &str) -> Result<Vec<f32>, String> {
         if let Some(generator) = &self.generator {
             return generator(text);
@@ -261,7 +261,7 @@ impl McpEmbedder {
     }
 
     /// Generate an embedding at the requested dimension by selecting the right
-    /// OpenAI model. Returns the raw `Vec<f32>`; caller formats with format_pgvector.
+    /// OpenAI model. Returns the raw `Vec<f32>`; caller formats with `epigraph_db::pgvector_literal`.
     pub async fn generate_at_dim(&self, text: &str, dim: u32) -> Result<Vec<f32>, String> {
         self.generate_with(text, dim).await
     }
@@ -397,7 +397,7 @@ impl McpEmbedder {
             }
         };
 
-        let pgvec = format_pgvector(&embedding);
+        let pgvec = epigraph_db::pgvector_literal(&embedding);
         match self.store_vector(claim_id, &pgvec).await {
             Ok(true) => true,
             Ok(false) => {
@@ -477,7 +477,7 @@ impl McpEmbedder {
     ) -> Result<Vec<(uuid::Uuid, f64)>, String> {
         let embedding = self.generate(query).await?;
 
-        let pgvec = format_pgvector(&embedding);
+        let pgvec = epigraph_db::pgvector_literal(&embedding);
         let mut conn = self.search_conn(viewer).await?;
         let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
             &mut *conn, viewer, &pgvec, limit, tags, agent_id,
@@ -504,7 +504,7 @@ impl McpEmbedder {
         agent_id: Option<uuid::Uuid>,
     ) -> Result<Vec<epigraph_db::HybridHit>, String> {
         let embedding = self.generate(query).await?;
-        let pgvec = format_pgvector(&embedding);
+        let pgvec = epigraph_db::pgvector_literal(&embedding);
         let mut conn = self.search_conn(viewer).await?;
         epigraph_db::ClaimRepository::search_hybrid_scoped_since_in_theme_conn(
             &mut conn,
@@ -617,15 +617,6 @@ impl EmbeddingService for McpEmbedder {
             Ok(())
         }
     }
-}
-
-/// Format a vector as a pgvector string literal: `"[0.1,0.2,...]"`.
-///
-/// Public so callers can format a cached `Vec<f32>` for direct SQL use
-/// without going through the embedder.
-pub fn format_pgvector(vec: &[f32]) -> String {
-    let inner: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", inner.join(","))
 }
 
 #[cfg(test)]
