@@ -352,6 +352,84 @@ class ScriptLocation(unittest.TestCase):
                 self.assertEqual(ids, list(shards), sub)
 
 
+class LocalGate(unittest.TestCase):
+    """The command-line selection a local gate drives (ci-shards)."""
+
+    def git(self, root, *args):
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_a_local_diff_includes_uncommitted_and_untracked_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.git(root, "init", "-q")
+            for name in ("kept.txt", "edited.txt", "deleted.txt"):
+                with open(os.path.join(root, name), "w") as fh:
+                    fh.write("x\n")
+            with open(os.path.join(root, ".gitignore"), "w") as fh:
+                fh.write("ignored.txt\n")
+            self.git(root, "add", "-A")
+            self.git(root, "commit", "-qm", "base")
+            self.git(root, "tag", "base")
+            with open(os.path.join(root, "committed.txt"), "w") as fh:
+                fh.write("x\n")
+            self.git(root, "add", "committed.txt")
+            self.git(root, "commit", "-qm", "change")
+            with open(os.path.join(root, "edited.txt"), "a") as fh:
+                fh.write("y\n")
+            os.remove(os.path.join(root, "deleted.txt"))
+            for name in ("untracked.txt", "ignored.txt"):
+                with open(os.path.join(root, name), "w") as fh:
+                    fh.write("x\n")
+            self.assertEqual(ts.changed_paths(root, "base"), ["committed.txt"])
+            self.assertEqual(
+                ts.changed_paths(root, "base", worktree=True),
+                ["committed.txt", "deleted.txt", "edited.txt", "untracked.txt"],
+            )
+
+    def test_only_a_local_run_diffs_the_working_tree(self):
+        from unittest import mock
+
+        root, pkgs, shards = workspace()
+        seen = []
+
+        def fake(_root, base, worktree=False):
+            seen.append((base, worktree))
+            return ["docs/deploy.md"]
+
+        with mock.patch.object(ts, "changed_paths", side_effect=fake), mock.patch.object(
+            ts, "head_is_merge", return_value=True
+        ):
+            ts.decide(root, pkgs, shards, {"GITHUB_EVENT_NAME": "pull_request", "DIFF_BASE": "HEAD^1"}, reads=[])
+            ts.decide(
+                root,
+                pkgs,
+                shards,
+                {"GITHUB_EVENT_NAME": "pull_request", "DIFF_BASE": "origin/main", "DIFF_WORKTREE": "1"},
+                reads=[],
+            )
+        self.assertEqual(seen, [("HEAD^1", False), ("origin/main", True)])
+
+    def test_affected_prints_the_matrix_on_stdout_and_the_reasons_on_stderr(self):
+        import subprocess
+        import sys
+
+        root, _pkgs, shards = workspace()
+        for argv in (["affected", "HEAD"], ["affected", "--base", "HEAD"], ["matrix", "--base", "HEAD"]):
+            out = subprocess.run([sys.executable, SCRIPT, *argv], cwd=root, capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr[-400:])
+            include = json.loads(out.stdout)["include"]
+            self.assertLessEqual({e["shard"] for e in include}, set(shards) | {ts.SCANS}, argv)
+            if argv[0] == "affected":
+                self.assertIn("mode: ", out.stderr, argv)
+        out = subprocess.run([sys.executable, SCRIPT, "affected"], cwd=root, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2)
+
+
 class EventPolicy(unittest.TestCase):
     def test_non_pull_request_events_run_the_full_set(self):
         for event in ("push", "merge_group", "workflow_dispatch", "schedule", "something_new"):
