@@ -16,7 +16,12 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))
-import run_assessment_worker as worker  # noqa: E402
+# The worker checks at import that its read and admin DSNs name one database.
+# Pin both to one placeholder (nothing connects: the queue read is stubbed), so
+# the test does not depend on the shell's DATABASE_URL or on DSN defaults.
+_DSN = "postgres://worker:worker@localhost:5432/assessment_worker_test"
+with mock.patch.dict(os.environ, {"DATABASE_URL": _DSN, "MAINTENANCE_DATABASE_URL": _DSN}):
+    import run_assessment_worker as worker  # noqa: E402
 from lib import tiered_enrichment as te  # noqa: E402
 
 
