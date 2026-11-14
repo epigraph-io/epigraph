@@ -1404,9 +1404,12 @@ review red flag, not a compile error.
 resolution as `decompose_claims`. The server then decides the token's scopes
 (the request intersected with the client's grants) and its `agent_id` (the
 client's own agent). The client **exits at construction** when it has neither,
-when the endpoint refuses, or when the client was not granted every scope the
-job requests, rather than dying on a 401 or 403 partway through a run. That
-covers `anchor_papers_to_themes.py`, `classify_paper_document_type.py`,
+when the endpoint refuses, or, on the exchange, when the client was not granted
+every scope the job requests, rather than dying on a 401 or 403 partway through
+a run. `EPIGRAPH_TOKEN` is used without a scope check: a token missing a scope
+the job needs fails with a 403 at the first request that needs it. A job that
+had both `EPIGRAPH_TOKEN` and `EPIGRAPH_JWT_SECRET` set used to ignore the
+token and sign its own; it now runs on the token. That covers `anchor_papers_to_themes.py`, `classify_paper_document_type.py`,
 `update_theme_workflow_steps.py` and `lib/nli_stance.py`.
 `EPIGRAPH_JWT_SECRET` and `EPIGRAPH_AGENT_ID` are no longer read: an earlier
 helper signed HS256 tokens from the server's secret with any scope and

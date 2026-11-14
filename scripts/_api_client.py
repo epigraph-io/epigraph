@@ -4,7 +4,8 @@ Provides a tiny `EpiGraphClient` that wraps `requests` with bearer auth and the
 API base URL. The bearer token comes from OAuth, never from this process:
 
   1. `EPIGRAPH_TOKEN`, when set and non-empty, is used as given (an operator
-     minted it through /oauth/token);
+     minted it through /oauth/token). Its scopes are NOT checked here: a token
+     missing one the job needs fails with a 403 at the request that needs it;
   2. otherwise `EPIGRAPH_SERVICE_CLIENT_ID` + `EPIGRAPH_SERVICE_SECRET` are
      exchanged at the token endpoint with the `client_credentials` grant, the
      same resolution `decompose_claims` uses;
@@ -108,7 +109,12 @@ def fetch_service_token(
 
 
 def resolve_bearer_token(scopes: list[str], base: Optional[str] = None) -> str:
-    """EPIGRAPH_TOKEN as given, else a client_credentials exchange, else exit."""
+    """EPIGRAPH_TOKEN as given, else a client_credentials exchange, else exit.
+
+    Only the exchange checks `scopes` (fetch_service_token exits when one was
+    not granted). EPIGRAPH_TOKEN is opaque to this helper and is used without
+    a scope check.
+    """
     token = _env("EPIGRAPH_TOKEN")
     if token:
         return token
