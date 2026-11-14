@@ -24,9 +24,12 @@
 //!    is left or `--max-runtime` (default 50min) has elapsed.
 //!
 //! Exit codes: 0 drained (or locked); 1 a job failed in this run (retryable
-//! or terminal; a failure outranks running out of time), or the run could not
-//! start; 3 out of time with work still pending. The report is JSON on
-//! stdout. It writes no audit event of its own.
+//! or terminal; a failure outranks every other code), or the run could not
+//! start; 4 pending jobs of a type this run has no handler for are waiting
+//! (`pending_unregistered` in the report, per type; for example
+//! `embedding_generation` on an instance whose provider may not write
+//! `claims.embedding`; it outranks 3); 3 out of time with work still pending.
+//! The report is JSON on stdout. It writes no audit event of its own.
 //!
 //! Usage: `drain_jobs [--max-runtime <DURATION>]`, where DURATION is seconds
 //! or a number with `s`, `m`/`min` or `h`. `DATABASE_URL` and

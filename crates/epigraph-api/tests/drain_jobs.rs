@@ -450,6 +450,10 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
 /// handler is not registered, and a pending `embedding_generation` job at the
 /// HEAD of the queue neither wedges the run nor is touched; the job behind it
 /// runs. With the owning provider the handler is registered.
+///
+/// It is not silent either (backlog f5448fed): the report counts it per type in
+/// `pending_unregistered` and the run exits 4, not 0. Once a run that has the
+/// handler drains it, the count is gone and the exit is 0 again.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unregistered_job_type_at_the_head_of_the_queue_does_not_wedge_the_drain(pool: PgPool) {
     let head = enqueue(
@@ -493,6 +497,28 @@ async fn an_unregistered_job_type_at_the_head_of_the_queue_does_not_wedge_the_dr
         job_state(&pool, head).await,
         ("pending".to_string(), None),
         "the drain claimed a job it has no handler for"
+    );
+    assert_eq!(
+        report.pending_unregistered,
+        std::collections::BTreeMap::from([("embedding_generation".to_string(), 1_i64)]),
+        "the run did not report the pending job it cannot claim: {report:?}"
+    );
+    assert_eq!(
+        report.exit_code(),
+        jobs_drain::EXIT_PENDING_UNREGISTERED,
+        "a run that leaves unclaimable work pending exited as if it had drained: {report:?}"
+    );
+    assert_eq!(jobs_drain::EXIT_PENDING_UNREGISTERED, 4);
+
+    // The owning provider's run registers the type: it claims the job (its
+    // claim does not exist, so it fails transiently and goes back to pending),
+    // and reports nothing unregistered.
+    let owned = jobs_drain::drain(&owning_runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the owning drain ran");
+    assert!(
+        owned.pending_unregistered.is_empty(),
+        "a type this run registers was reported unregistered: {owned:?}"
     );
 }
 
@@ -666,6 +692,33 @@ fn a_failed_job_outranks_running_out_of_time_in_the_exit_code() {
         ..jobs_drain::DrainReport::default()
     };
     assert_eq!(late.exit_code(), 3);
+    let unregistered = || std::collections::BTreeMap::from([("embedding_generation".to_string(), 2)]);
+    let stranded = jobs_drain::DrainReport {
+        pending_unregistered: unregistered(),
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(stranded.exit_code(), 4, "unclaimable pending work exited 0");
+    let stranded_and_late = jobs_drain::DrainReport {
+        pending_unregistered: unregistered(),
+        out_of_time: true,
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(
+        stranded_and_late.exit_code(),
+        4,
+        "unclaimable pending work in a run that also ran out of time exited as the unit's \
+         success code"
+    );
+    let failed_and_stranded = jobs_drain::DrainReport {
+        failures: vec![failure(true)],
+        pending_unregistered: unregistered(),
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(
+        failed_and_stranded.exit_code(),
+        1,
+        "a job failure was hidden behind unregistered pending work"
+    );
     for terminal in [false, true] {
         let failed = jobs_drain::DrainReport {
             failures: vec![failure(terminal)],

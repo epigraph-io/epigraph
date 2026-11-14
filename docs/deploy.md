@@ -327,7 +327,7 @@ reads it from the environment only:
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
-| Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 3 out of time with work pending. |
+| Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs or the rows are cancelled; `epigraph-cli reembed` restores the vectors meanwhile), 3 out of time with work pending. Treat 4 as a failure (do not add it to `SuccessExitStatus=`). |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY` (or `--allow-mock` for a non-production smoke run). |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 

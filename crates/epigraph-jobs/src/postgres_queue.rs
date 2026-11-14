@@ -655,6 +655,31 @@ impl PostgresJobQueue {
         })
     }
 
+    /// How many `pending` jobs there are of each type NOT in `job_types`: the
+    /// work a drain registered for `job_types` will never claim (one
+    /// `GROUP BY`). Types with no pending job are absent.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self))]
+    pub async fn count_pending_by_type_outside(
+        &self,
+        job_types: &[String],
+    ) -> Result<std::collections::BTreeMap<String, i64>, JobError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT job_type, count(*) FROM jobs \
+              WHERE state = 'pending' AND NOT (job_type = ANY($1)) \
+              GROUP BY job_type",
+        )
+        .bind(job_types)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to count pending jobs of unregistered types: {e}"),
+        })?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The drain timer's reaper (`drain_jobs`, operator decision D9): reset
     /// every `running` row whose `started_at` is older than `stale_threshold`,
     /// COUNTING the reap as a used attempt, and fail the row outright once its

@@ -23,6 +23,7 @@
 //! `[[bin]]` exports nothing: the drain's behaviour is tested by driving
 //! [`drain`] directly on a maintenance login.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -164,12 +165,23 @@ pub struct DrainReport {
     /// `true` when the run stopped claiming jobs because `max_runtime` ran out
     /// with work still pending.
     pub out_of_time: bool,
+    /// Pending jobs of a type this run has NO handler for, counted per type at
+    /// the end of the run. The drain never claims them, so they wait until a
+    /// run registers their type (an `embedding_generation` job on an instance
+    /// whose embedding provider may not write `claims.embedding`, or a type no
+    /// handler exists for at all). Empty when there are none.
+    pub pending_unregistered: BTreeMap<String, i64>,
 }
+
+/// The exit code of a run that left pending jobs no handler of this run can
+/// claim (and had no job failure): see [`DrainReport::exit_code`].
+pub const EXIT_PENDING_UNREGISTERED: i32 = 4;
 
 impl DrainReport {
     /// The process exit code: 1 when any job failed in this run, retryable or
-    /// terminal; otherwise 3 when the run ran out of time with work pending;
-    /// otherwise 0 (drained, or locked).
+    /// terminal; otherwise 4 ([`EXIT_PENDING_UNREGISTERED`]) when pending jobs
+    /// of an unregistered type are waiting; otherwise 3 when the run ran out of
+    /// time with work pending; otherwise 0 (drained, or locked).
     ///
     /// A retryable failure is a failed run: the job is back to `pending` and
     /// the next run retries it, but an operator hears about it the first time
@@ -177,10 +189,17 @@ impl DrainReport {
     /// A failure outranks running out of time because the unit treats exit 3
     /// as success (`SuccessExitStatus=3`): a failure in a long run must not be
     /// reported as a clean continuation.
+    ///
+    /// Unregistered pending work is its own code, not 0: before it the run
+    /// exited 0 while those jobs sat in the queue for ever, which reads as
+    /// "drained" (backlog f5448fed). It outranks 3 for the same reason a
+    /// failure does, and ranks below 1 so a job failure is never hidden.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         if !self.failures.is_empty() {
             1
+        } else if !self.pending_unregistered.is_empty() {
+            EXIT_PENDING_UNREGISTERED
         } else if self.out_of_time {
             3
         } else {
@@ -283,6 +302,15 @@ pub async fn drain(
                 });
             }
         }
+    }
+    report.pending_unregistered = queue
+        .count_pending_by_type_outside(&report.registered)
+        .await?;
+    if !report.pending_unregistered.is_empty() {
+        tracing::warn!(
+            pending_unregistered = ?report.pending_unregistered,
+            "drain: pending jobs of a type this run has no handler for are waiting"
+        );
     }
     Ok(report)
 }
