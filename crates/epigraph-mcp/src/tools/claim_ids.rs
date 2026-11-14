@@ -99,37 +99,36 @@ pub async fn resolve_claim_id_prefix(
 }
 
 /// The claim-id citations in `text`, distinct, lower-cased, in order of first
-/// appearance: every full hyphenated uuid, and every standalone run of exactly
-/// eight hex digits (the abbreviated form). A token is a maximal run of ASCII
-/// letters, digits, `-` and `_`, so `a1b2c3d4` inside `xa1b2c3d4` or a longer
-/// hex string (a 9-digit commit sha, a content hash) is not a citation; the
-/// first eight digits of a hyphenated uuid are cited once, as the uuid.
+/// appearance. A token is a maximal run of ASCII letters, digits, `-` and `_`;
+/// it cites the longest run of leading uuid-shaped groups it starts with (an
+/// 8-hex group, then whole 4-, 4-, 4- and 12-hex groups, hyphen-separated), so
+/// a full uuid is cited whole, a partial one such as `30d8b667-0ca4` keeps the
+/// more specific prefix the text gave, and `30d8b667-fixed` cites `30d8b667`.
+/// `a1b2c3d4` inside `xa1b2c3d4` or a longer hex string (a 9-digit commit sha,
+/// a content hash) is not a citation.
+///
+/// A hyphenated 4-letter hex WORD after an id (`30d8b667-face`) is read as a
+/// group and narrows the prefix; a citation written that way can come back
+/// `unresolved`. Partial groups (`30d8b667-0c`) are never kept.
 #[must_use]
 pub fn cited_id_tokens(text: &str) -> Vec<String> {
-    fn is_uuid(tok: &str) -> bool {
-        tok.len() == 36
-            && tok.char_indices().all(|(i, c)| match i {
-                8 | 13 | 18 | 23 => c == '-',
-                _ => c.is_ascii_hexdigit(),
-            })
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    fn uuid_prefix(tok: &str) -> Option<String> {
+        let mut kept: Vec<&str> = Vec::new();
+        for (seg, want) in tok.split('-').zip(GROUPS) {
+            if seg.len() == want && seg.chars().all(|c| c.is_ascii_hexdigit()) {
+                kept.push(seg);
+            } else {
+                break;
+            }
+        }
+        (!kept.is_empty()).then(|| kept.join("-").to_ascii_lowercase())
     }
     let mut out: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
     let bytes_ok = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
     for raw in text.split(|c: char| !bytes_ok(c)) {
-        let tok = raw.trim_matches('-');
-        let cited =
-            if is_uuid(tok) || (tok.len() == 8 && tok.chars().all(|c| c.is_ascii_hexdigit())) {
-                Some(tok.to_ascii_lowercase())
-            } else {
-                // A hyphenated run that starts with an 8-hex segment followed by
-                // a non-uuid tail (`30d8b667-fixed`) still cites the prefix.
-                tok.split_once('-').and_then(|(head, _)| {
-                    (head.len() == 8 && head.chars().all(|c| c.is_ascii_hexdigit()))
-                        .then(|| head.to_ascii_lowercase())
-                })
-            };
-        if let Some(t) = cited {
+        if let Some(t) = uuid_prefix(raw.trim_matches('-')) {
             if seen.insert(t.clone()) {
                 out.push(t);
             }
@@ -260,6 +259,21 @@ mod tests {
             cited_id_tokens(text).is_empty(),
             "{:?}",
             cited_id_tokens(text)
+        );
+    }
+
+    #[test]
+    fn a_partial_hyphenated_uuid_keeps_its_whole_groups() {
+        // Review finding: `30d8b667-0ca4` names more than `30d8b667`; cutting
+        // it to the 8-hex head turned a unique citation into an ambiguous one.
+        assert_eq!(
+            cited_id_tokens("see 30d8b667-0CA4, 30d8b667-0ca4-4b7f and 30d8b667-0c"),
+            vec!["30d8b667-0ca4", "30d8b667-0ca4-4b7f", "30d8b667"]
+        );
+        // A full uuid with a trailing word is cited as the uuid.
+        assert_eq!(
+            cited_id_tokens("1a2b3c4d-0ca4-4b7f-aa85-000000000001-old"),
+            vec!["1a2b3c4d-0ca4-4b7f-aa85-000000000001"]
         );
     }
 

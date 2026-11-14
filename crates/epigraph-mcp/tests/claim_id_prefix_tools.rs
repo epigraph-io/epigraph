@@ -113,8 +113,19 @@ async fn resolve(
 }
 
 async fn lint(server: &EpiGraphMcpFull, pool: &PgPool, caller: Uuid, claim: Uuid) -> Value {
+    lint_result(server, pool, caller, claim)
+        .await
+        .expect("lint")
+}
+
+async fn lint_result(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    caller: Uuid,
+    claim: Uuid,
+) -> Result<Value, epigraph_mcp::errors::McpError> {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
-    let out = lint_claim_id_citations(
+    lint_claim_id_citations(
         server,
         &viewer,
         LintClaimIdCitationsParams {
@@ -122,8 +133,7 @@ async fn lint(server: &EpiGraphMcpFull, pool: &PgPool, caller: Uuid, claim: Uuid
         },
     )
     .await
-    .expect("lint");
-    first_text(&out)
+    .map(|out| first_text(&out))
 }
 
 fn match_ids(doc: &Value) -> Vec<String> {
@@ -245,4 +255,63 @@ async fn the_lint_classifies_each_citation_per_viewer(pool: PgPool) {
     assert_eq!(status_of(&doc, "b41c0de0"), "wired");
     let doc = lint(&server, &pool, w.stranger, w.linted).await;
     assert_eq!(status_of(&doc, "b41c0de0"), "unresolved");
+}
+
+/// Review finding: a lint of a claim the caller cannot read is refused exactly
+/// like a lint of an id that names nothing, so the refusal cannot be used to
+/// learn that a hidden claim exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_lint_root_is_refused_exactly_like_an_absent_one(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed(&pool).await;
+
+    // The member may lint its own private claim...
+    lint(&server, &pool, w.member, w.private).await;
+    // ...the stranger gets the absent-id refusal for it.
+    let hidden = lint_result(&server, &pool, w.stranger, w.private)
+        .await
+        .expect_err("a hidden root is refused");
+    let absent_id = Uuid::new_v4();
+    let absent = lint_result(&server, &pool, w.stranger, absent_id)
+        .await
+        .expect_err("an absent root is refused");
+    assert_eq!(hidden.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert_eq!(hidden.code, absent.code);
+    assert_eq!(
+        hidden.message.replace(&w.private.to_string(), "<id>"),
+        absent.message.replace(&absent_id.to_string(), "<id>"),
+        "hidden and absent must be indistinguishable"
+    );
+}
+
+const EDGE_FROM: &str = "b41ed9e0-0000-4000-8000-000000000007";
+const EDGE_TO: &str = "b41ed9e1-0000-4000-8000-000000000008";
+
+/// Review finding: both endpoints PUBLIC, the edge between them group-private
+/// (forced past the tenancy trigger, which would otherwise widen it to the
+/// endpoints' meet). Only the EDGE predicate can hide it, so this is the case
+/// that pins `wired_to`'s edge visibility: wiring for a member of the edge's
+/// group, not wiring for a stranger.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_edge_between_readable_claims_is_not_wiring(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "b41ids-edge").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "b41ids-edge-stranger").await;
+    let from = claim_with_id(&pool, EDGE_FROM, member, "Builds on b41ed9e1.").await;
+    let to = claim_with_id(&pool, EDGE_TO, member, "the cited public claim").await;
+    fixture::seed_edge_owned_by(&pool, from, to, "group", group).await;
+
+    let doc = lint(&server, &pool, member, from).await;
+    assert_eq!(
+        status_of(&doc, "b41ed9e1"),
+        "wired",
+        "the member sees the edge"
+    );
+    let doc = lint(&server, &pool, stranger, from).await;
+    assert_eq!(
+        status_of(&doc, "b41ed9e1"),
+        "unwired",
+        "a hidden edge is not wiring: {doc}"
+    );
+    assert_eq!(doc["unwired"], serde_json::json!(["b41ed9e1"]));
 }
