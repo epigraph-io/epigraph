@@ -11,11 +11,13 @@
 //! # Reasoning
 //! - PostgreSQL WITH RECURSIVE provides efficient graph traversal
 //! - Topological order ensures ancestors always precede descendants
-//! - Diamond dependencies require proper deduplication. Every walk that
-//!   reports a claim's SHORTEST depth deduplicates INSIDE the recursion
-//!   (`UNION` over narrow `(id, depth)` rows), so its work is bounded by
-//!   claims x depth rather than by the number of paths (backlog f889c86f);
-//!   the shortest depth is then `MIN(depth)` per claim
+//! - Diamond dependencies and cycles require proper deduplication. Every walk
+//!   that reports a claim's SHORTEST depth is a breadth-first search with a
+//!   visited set INSIDE one recursive statement (one row per layer: the
+//!   frontier and every claim visited so far), so each claim enters once, at
+//!   its shortest depth, a cycle ends the walk, and the work is bounded by the
+//!   claims and edges reached rather than by the number of paths (backlog
+//!   f889c86f)
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
@@ -195,11 +197,11 @@ fn probe_depth(max_depth: i32) -> i32 {
 /// Split a walk's rows (fetched to [`probe_depth`]) into the rows within
 /// `max_depth` and whether any visible claim lay beyond it.
 ///
-/// The walk returns each claim once, at its SHORTEST depth (`MIN(depth)` over
-/// the deduplicated `(id, depth)` rows), so a row survives past `max_depth`
-/// only when that claim is not reachable within it. Such a row is exactly "the walk stopped before this claim", which
-/// is what `truncated` reports; a complete walk that ends exactly at
-/// `max_depth` produces none.
+/// The walk returns each claim once, at its SHORTEST depth (the breadth-first
+/// layer it first entered), so a row survives past `max_depth` only when that
+/// claim is not reachable within it. Such a row is exactly "the walk stopped
+/// before this claim", which is what `truncated` reports; a complete walk that
+/// ends exactly at `max_depth` produces none.
 fn drop_probe_layer(rows: Vec<LineageRow>, max_depth: i32) -> (Vec<LineageRow>, bool) {
     let fetched = rows.len();
     let kept: Vec<LineageRow> = rows.into_iter().filter(|r| r.depth <= max_depth).collect();
@@ -293,36 +295,45 @@ impl LineageRepository {
     ///   or `max_nodes` trimmed the result.
     ///
     /// # SQL Pattern
-    /// Uses a PostgreSQL recursive CTE that deduplicates per `(claim, depth)`
-    /// inside the recursion, then hydrates each claim once at its shortest
-    /// depth:
+    /// One recursive statement that is a breadth-first search with a visited
+    /// set: each row is one LAYER, carrying the layer's claims (`frontier`) and
+    /// every claim visited so far. Each claim is then hydrated once, at its
+    /// shortest depth:
     /// ```sql
-    /// WITH RECURSIVE lineage(id, depth) AS (
-    ///     SELECT id, 0 FROM claims WHERE id = $1
-    ///     UNION                                            -- not UNION ALL
-    ///     SELECT c.id, l.depth + 1
-    ///     FROM lineage l
-    ///     JOIN edges e
-    ///       ON e.source_type = 'claim' AND e.target_type = 'claim'
-    ///      AND ( (e.target_id = l.id AND lower(e.relationship) = ANY($3))  -- LINEAGE_INCOMING
-    ///         OR (e.source_id = l.id AND lower(e.relationship) = ANY($4)) ) -- supersedes
-    ///     JOIN claims c
-    ///       ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
-    ///     WHERE l.depth < $2                               -- $2 = max_depth + 1
+    /// WITH RECURSIVE lineage(frontier, visited, depth) AS (
+    ///     SELECT ARRAY[id], ARRAY[id], 0 FROM claims WHERE id = $1
+    ///     UNION ALL
+    ///     SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+    ///     FROM lineage w
+    ///     CROSS JOIN LATERAL (SELECT ARRAY(
+    ///         SELECT c.id
+    ///         FROM unnest(w.frontier) AS l(id)
+    ///         JOIN edges e
+    ///           ON e.source_type = 'claim' AND e.target_type = 'claim'
+    ///          AND ( (e.target_id = l.id AND lower(e.relationship) = ANY($3))  -- LINEAGE_INCOMING
+    ///             OR (e.source_id = l.id AND lower(e.relationship) = ANY($4)) ) -- supersedes
+    ///         JOIN claims c
+    ///           ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
+    ///         EXCEPT SELECT unnest(w.visited)               -- never revisit
+    ///     ) AS ids) nxt
+    ///     WHERE w.depth < $2                                -- $2 = max_depth + 1
+    ///       AND cardinality(nxt.ids) > 0                    -- frontier exhausted
     /// ),
-    /// shortest AS (SELECT id, MIN(depth) AS depth FROM lineage GROUP BY id)
-    /// SELECT c.*, s.depth FROM shortest s JOIN claims c ON c.id = s.id ORDER BY s.id;
+    /// walked AS (SELECT u.id, w.depth FROM lineage w, unnest(w.frontier) AS u(id))
+    /// SELECT c.*, s.depth FROM walked s JOIN claims c ON c.id = s.id ORDER BY s.id;
     /// ```
     ///
-    /// `UNION` discards an `(id, depth)` row already produced, so each
-    /// iteration's working set holds at most one row per claim and the walk
-    /// does at most claims x (`max_depth` + 1) rows of work. The
-    /// path-enumerating form (`UNION ALL` carrying `ARRAY[id] as path`, then
-    /// `DISTINCT ON (id)`) did one row per PATH: on a dense DAG that is
-    /// exponential in depth (backlog f889c86f). The depth bound alone ends the
-    /// walk on a cycle, and the shortest depth per claim is unchanged: a claim
-    /// first reachable at depth k is reached at k from a claim first reachable
-    /// at k - 1.
+    /// A claim enters the visited set in the first layer that reaches it, which
+    /// is its shortest depth, and never re-enters: the walk's work is bounded by
+    /// the claims and edges it reaches, it stops as soon as a layer adds no new
+    /// claim, and a cycle ends it rather than carrying it to the depth bound.
+    /// Two earlier forms were worse (backlog f889c86f): the path-enumerating
+    /// form (`UNION ALL` carrying `ARRAY[id] as path`, then `DISTINCT ON (id)`)
+    /// did one row per PATH, exponential in depth on a dense DAG; a `UNION`
+    /// over `(id, depth)` rows bounded that, but re-emitted every claim on a
+    /// cycle at every depth up to the bound. The set difference is `EXCEPT`
+    /// (hashed or sorted), not `<> ALL(visited)`, which scans the array per
+    /// candidate and is quadratic on a wide layer.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database query fails.
@@ -420,39 +431,56 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE lineage(id, depth) AS (
-                -- Base case: start with the target claim
-                SELECT c.id, 0
+            WITH RECURSIVE lineage(frontier, visited, depth) AS (
+                -- Base case: start with the target claim. One row per BFS
+                -- layer: `frontier` is the layer, `visited` every claim of
+                -- this and the earlier layers (see the SQL pattern on
+                -- `get_lineage`).
+                SELECT ARRAY[c.id], ARRAY[c.id], 0
                 FROM claims c
                 WHERE c.id = $1
                   /* {VISIBILITY:c} */
 
-                -- UNION, not UNION ALL: an (id, depth) row already produced
-                -- is discarded, so the walk is bounded by claims x depth, not
-                -- by the number of paths (see the SQL pattern on
-                -- `get_lineage`). The rows stay narrow so that dedup hashes a
-                -- uuid and an int, never the content.
-                UNION
+                UNION ALL
 
-                -- Recursive case: find parent claims via DERIVATION edges.
+                -- Recursive case: the next layer is the parent claims of the
+                -- frontier via DERIVATION edges, minus every claim already
+                -- visited, so each claim enters once, at its SHORTEST depth,
+                -- and a cycle ends the walk instead of re-entering it.
                 -- Direction is a property of the relationship: an incoming
                 -- derivation edge ($3) names its source as the parent; a
                 -- `supersedes` edge ($4, written new->old) names its target.
-                SELECT c.id, l.depth + 1
-                FROM lineage l
-                JOIN edges e
-                  ON e.source_type = 'claim'
-                 AND e.target_type = 'claim'
-                 AND ( (e.target_id = l.id AND lower(e.relationship) = ANY($3::text[]))
-                    OR (e.source_id = l.id AND lower(e.relationship) = ANY($4::text[])) )
-                JOIN claims c
-                  ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
-                WHERE l.depth < $2
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM lineage w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS l(id)
+                        JOIN edges e
+                          ON e.source_type = 'claim'
+                         AND e.target_type = 'claim'
+                         AND ( (e.target_id = l.id AND lower(e.relationship) = ANY($3::text[]))
+                            OR (e.source_id = l.id AND lower(e.relationship) = ANY($4::text[])) )
+                        JOIN claims c
+                          ON c.id = CASE WHEN e.target_id = l.id THEN e.source_id ELSE e.target_id END
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        -- EXCEPT, not `<> ALL(visited)`: a hashed or sorted
+                        -- set difference, linear in the layer plus the
+                        -- visited set (an array scan per candidate is
+                        -- quadratic on a wide layer). It also dedups the layer.
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $2
+                  AND cardinality(nxt.ids) > 0
             ),
-            -- Each claim once, at its SHORTEST depth.
-            shortest AS (
-                SELECT id, MIN(depth) AS depth FROM lineage GROUP BY id
+            -- Each claim once (the walk never revisits), at its SHORTEST depth.
+            walked AS (
+                SELECT u.id, w.depth
+                FROM lineage w
+                CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             )
             -- Hydrate once per claim. The predicate is redundant with the
             -- walk's (every id passed it) and costs no bind: every marker
@@ -467,7 +495,7 @@ impl LineageRepository {
                 c.created_at,
                 c.trace_id,
                 s.depth
-            FROM shortest s
+            FROM walked s
             JOIN claims c ON c.id = s.id
             WHERE true /* {VISIBILITY:c} */
             ORDER BY s.id
@@ -875,26 +903,38 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE lineage(id, depth) AS (
-                SELECT id, 0
+            WITH RECURSIVE lineage(frontier, visited, depth) AS (
+                SELECT ARRAY[claims.id], ARRAY[claims.id], 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
-                -- UNION, not UNION ALL: per-(id, depth) dedup inside the
-                -- recursion bounds the walk by claims x depth (f889c86f).
-                UNION
+                -- One row per BFS layer; the next layer is the frontier's
+                -- neighbours minus every claim already visited (see the SQL pattern
+                -- on `get_lineage`), so a claim enters once, at its shortest depth,
+                -- and a cycle ends the walk (f889c86f).
+                UNION ALL
 
-                SELECT c.id, l.depth + 1
-                FROM claims c
-                JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-                JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
-                WHERE l.depth < $2
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM lineage w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS l(id)
+                        JOIN edges e ON e.target_id = l.id AND e.target_type = 'claim'
+                        JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $2
+                  AND cardinality(nxt.ids) > 0
             )
-            SELECT id, MIN(depth) AS depth
-            FROM lineage
-            GROUP BY id
-            ORDER BY id
+            SELECT u.id, w.depth
+            FROM lineage w
+            CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
+            ORDER BY u.id
             "#,
             3,
         );
@@ -929,21 +969,26 @@ impl LineageRepository {
     ///   `true` iff a visible descendant lies past `max_depth`.
     ///
     /// # SQL Pattern
-    /// Uses a PostgreSQL recursive CTE traversing edges in the opposite
-    /// direction, deduplicated per `(claim, depth)` inside the recursion as in
-    /// [`Self::get_lineage`]:
+    /// The breadth-first walk of [`Self::get_lineage`] (one row per layer, a
+    /// visited set, each claim at its shortest depth), following edges in the
+    /// opposite direction:
     /// ```sql
-    /// WITH RECURSIVE descendants(id, depth) AS (
-    ///     SELECT id, 0 FROM claims WHERE id = $1
-    ///     UNION                                            -- not UNION ALL
-    ///     SELECT c.id, d.depth + 1
-    ///     FROM claims c
-    ///     JOIN edges e ON e.target_id = c.id AND e.target_type = 'claim'
-    ///     JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
-    ///     WHERE d.depth < $2                               -- $2 = max_depth + 1
+    /// WITH RECURSIVE descendants(frontier, visited, depth) AS (
+    ///     SELECT ARRAY[id], ARRAY[id], 0 FROM claims WHERE id = $1
+    ///     UNION ALL
+    ///     SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+    ///     FROM descendants w
+    ///     CROSS JOIN LATERAL (SELECT ARRAY(
+    ///         SELECT c.id
+    ///         FROM unnest(w.frontier) AS d(id)
+    ///         JOIN edges e ON e.source_id = d.id AND e.source_type = 'claim'
+    ///         JOIN claims c ON e.target_id = c.id AND e.target_type = 'claim'
+    ///         EXCEPT SELECT unnest(w.visited)
+    ///     ) AS ids) nxt
+    ///     WHERE w.depth < $2 AND cardinality(nxt.ids) > 0   -- $2 = max_depth + 1
     /// ),
-    /// shortest AS (SELECT id, MIN(depth) AS depth FROM descendants GROUP BY id)
-    /// SELECT c.*, s.depth FROM shortest s JOIN claims c ON c.id = s.id ORDER BY s.id;
+    /// walked AS (SELECT u.id, w.depth FROM descendants w, unnest(w.frontier) AS u(id))
+    /// SELECT c.*, s.depth FROM walked s JOIN claims c ON c.id = s.id ORDER BY s.id;
     /// ```
     ///
     /// # Errors
@@ -1001,27 +1046,41 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE descendants(id, depth) AS (
+            WITH RECURSIVE descendants(frontier, visited, depth) AS (
                 -- Base case: start with the source claim
-                SELECT c.id, 0
+                SELECT ARRAY[c.id], ARRAY[c.id], 0
                 FROM claims c
                 WHERE c.id = $1
                   /* {VISIBILITY:c} */
 
-                -- UNION, not UNION ALL: per-(id, depth) dedup inside the
-                -- recursion, as in `get_lineage_conn`.
-                UNION
+                -- One row per BFS layer; the next layer is the frontier's
+                -- neighbours minus every claim already visited (see the SQL pattern
+                -- on `get_lineage`), so a claim enters once, at its shortest depth,
+                -- and a cycle ends the walk (f889c86f).
+                UNION ALL
 
-                -- Recursive case: find child claims via edges (reverse direction)
-                SELECT c.id, d.depth + 1
-                FROM claims c
-                JOIN edges e ON e.target_id = c.id AND e.target_type = 'claim'
-                JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
-                WHERE d.depth < $2
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM descendants w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS d(id)
+                        JOIN edges e ON e.source_id = d.id AND e.source_type = 'claim'
+                        JOIN claims c ON e.target_id = c.id AND e.target_type = 'claim'
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $2
+                  AND cardinality(nxt.ids) > 0
             ),
-            shortest AS (
-                SELECT id, MIN(depth) AS depth FROM descendants GROUP BY id
+            -- Each claim once (the walk never revisits), at its SHORTEST depth.
+            walked AS (
+                SELECT u.id, w.depth
+                FROM descendants w
+                CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             )
             SELECT
                 c.id,
@@ -1031,7 +1090,7 @@ impl LineageRepository {
                 c.created_at,
                 c.trace_id,
                 s.depth
-            FROM shortest s
+            FROM walked s
             JOIN claims c ON c.id = s.id
             WHERE true /* {VISIBILITY:c} */
             ORDER BY s.id
@@ -1258,26 +1317,38 @@ impl LineageRepository {
         // present, not where -- would not catch it.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE descendants(id, depth) AS (
-                SELECT id, 0
+            WITH RECURSIVE descendants(frontier, visited, depth) AS (
+                SELECT ARRAY[claims.id], ARRAY[claims.id], 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
-                -- UNION, not UNION ALL: per-(id, depth) dedup inside the
-                -- recursion bounds the walk by claims x depth (f889c86f).
-                UNION
+                -- One row per BFS layer; the next layer is the frontier's
+                -- neighbours minus every claim already visited (see the SQL pattern
+                -- on `get_lineage`), so a claim enters once, at its shortest depth,
+                -- and a cycle ends the walk (f889c86f).
+                UNION ALL
 
-                SELECT c.id, d.depth + 1
-                FROM claims c
-                JOIN edges e ON e.target_id = c.id AND e.target_type = 'claim'
-                JOIN descendants d ON e.source_id = d.id AND e.source_type = 'claim'
-                WHERE d.depth < $2
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM descendants w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS d(id)
+                        JOIN edges e ON e.source_id = d.id AND e.source_type = 'claim'
+                        JOIN claims c ON e.target_id = c.id AND e.target_type = 'claim'
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $2
+                  AND cardinality(nxt.ids) > 0
             )
-            SELECT id, MIN(depth) AS depth
-            FROM descendants
-            GROUP BY id
-            ORDER BY id
+            SELECT u.id, w.depth
+            FROM descendants w
+            CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
+            ORDER BY u.id
             "#,
             3,
         );
@@ -1341,46 +1412,82 @@ impl LineageRepository {
         // TWO recursive CTEs: six markers, all resolving to the same bind.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE ancestors_a(id, depth) AS (
+            WITH RECURSIVE ancestors_a(frontier, visited, depth) AS (
                 -- Ancestor set for claim A
-                SELECT id, 0
+                SELECT ARRAY[claims.id], ARRAY[claims.id], 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
-                -- UNION, not UNION ALL: per-(id, depth) dedup (f889c86f).
-                UNION
+                -- One row per BFS layer; the next layer is the frontier's
+                -- neighbours minus every claim already visited (see the SQL pattern
+                -- on `get_lineage`), so a claim enters once, at its shortest depth,
+                -- and a cycle ends the walk (f889c86f).
+                UNION ALL
 
-                SELECT c.id, a.depth + 1
-                FROM claims c
-                JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-                JOIN ancestors_a a ON e.target_id = a.id AND e.target_type = 'claim'
-                WHERE a.depth < $3
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM ancestors_a w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS f(id)
+                        JOIN edges e ON e.target_id = f.id AND e.target_type = 'claim'
+                        JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $3
+                  AND cardinality(nxt.ids) > 0
             ),
-            ancestors_b(id, depth) AS (
+            ancestors_b(frontier, visited, depth) AS (
                 -- Ancestor set for claim B
-                SELECT id, 0
+                SELECT ARRAY[claims.id], ARRAY[claims.id], 0
                 FROM claims WHERE id = $2
                   /* {VISIBILITY:claims} */
 
-                -- UNION, not UNION ALL: per-(id, depth) dedup (f889c86f).
-                UNION
+                -- One row per BFS layer; the next layer is the frontier's
+                -- neighbours minus every claim already visited (see the SQL pattern
+                -- on `get_lineage`), so a claim enters once, at its shortest depth,
+                -- and a cycle ends the walk (f889c86f).
+                UNION ALL
 
-                SELECT c.id, b.depth + 1
-                FROM claims c
-                JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-                JOIN ancestors_b b ON e.target_id = b.id AND e.target_type = 'claim'
-                WHERE b.depth < $3
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM ancestors_b w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS f(id)
+                        JOIN edges e ON e.target_id = f.id AND e.target_type = 'claim'
+                        JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $3
+                  AND cardinality(nxt.ids) > 0
+            ),
+            -- Each ancestor once, at its shortest depth from A (resp. B).
+            reach_a AS (
+                SELECT u.id, w.depth
+                FROM ancestors_a w
+                CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
+            ),
+            reach_b AS (
+                SELECT u.id, w.depth
+                FROM ancestors_b w
+                CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             )
             SELECT
                 a.id AS ancestor_id,
                 a.depth AS depth_a,
                 b.depth AS depth_b,
                 (a.depth + b.depth) AS total_depth
-            FROM (SELECT id, MIN(depth) AS depth FROM ancestors_a GROUP BY id) a
-            INNER JOIN (SELECT id, MIN(depth) AS depth FROM ancestors_b GROUP BY id) b
-                ON a.id = b.id
+            FROM reach_a a
+            INNER JOIN reach_b b ON a.id = b.id
             ORDER BY total_depth ASC
             LIMIT 1
             "#,
