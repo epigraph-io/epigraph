@@ -249,6 +249,34 @@ impl TaskRepository {
         Ok(rows)
     }
 
+    /// List tasks in exactly `state`, ordered by priority descending then
+    /// creation time ascending (the order of [`Self::list_pending`]), up to
+    /// `limit` rows.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn list_by_state(
+        pool: &PgPool,
+        state: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskRow>, DbError> {
+        let rows: Vec<TaskRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM tasks
+            WHERE state = $1
+            ORDER BY priority DESC, created_at ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(state)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// List all tasks belonging to a workflow.
     ///
     /// # Errors
@@ -270,8 +298,73 @@ impl TaskRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_task_placeholder(_pool: sqlx::PgPool) {
         // Integration tests live in tests/task_tests.rs once the DB fixture is ready.
+    }
+
+    fn task(state: &str, priority: i32) -> TaskRow {
+        let now = Utc::now();
+        TaskRow {
+            id: Uuid::new_v4(),
+            description: format!("a {state} task"),
+            task_type: "test".to_string(),
+            input: serde_json::json!({}),
+            output_schema: None,
+            assigned_agent: None,
+            priority,
+            state: state.to_string(),
+            parent_task_id: None,
+            workflow_id: None,
+            timeout_seconds: None,
+            retry_max: 3,
+            retry_count: 0,
+            result: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    /// `list_by_state` returns the requested state only (the route used to
+    /// answer `?state=completed` with the pending list), highest priority
+    /// first, and no more than `limit` rows.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_by_state_returns_only_that_state_up_to_the_limit(pool: sqlx::PgPool) {
+        for (state, priority) in [
+            ("created", 9),
+            ("completed", 1),
+            ("completed", 5),
+            ("completed", 3),
+            ("failed", 7),
+        ] {
+            TaskRepository::create(&pool, task(state, priority))
+                .await
+                .expect("seed a task");
+        }
+
+        let completed = TaskRepository::list_by_state(&pool, "completed", 100)
+            .await
+            .expect("list completed");
+        assert_eq!(completed.len(), 3, "{completed:?}");
+        assert!(completed.iter().all(|t| t.state == "completed"));
+        assert_eq!(
+            completed.iter().map(|t| t.priority).collect::<Vec<_>>(),
+            vec![5, 3, 1]
+        );
+
+        let capped = TaskRepository::list_by_state(&pool, "completed", 2)
+            .await
+            .expect("list completed, capped");
+        assert_eq!(capped.len(), 2);
+
+        let none = TaskRepository::list_by_state(&pool, "no-such-state", 100)
+            .await
+            .expect("list an unknown state");
+        assert!(none.is_empty());
     }
 }

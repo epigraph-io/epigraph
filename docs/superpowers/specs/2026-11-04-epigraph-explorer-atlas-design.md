@@ -337,13 +337,16 @@ Shown as stored; no cleanup in this work:
 
 ## 10. Phasing
 
-| Phase | Delivers | Needs |
-|---|---|---|
-| P3a | Topics: regions, themes, claims, claim rings, cross-theme bundles, search, deep links | backlog `f9b4a488`, `2b5bd83e`, `4321ae80`, `57917c13`, `7f359a86`, `cadfc550`, `864368a8` |
-| P3b | Provenance panel and Sources view | backlog `fe75ef36`, `da4a8bc1`, `48421526`, `b7354adc` |
-| P3c | Timeline | backlog `ea26d7aa`; history route already on `main` |
-| P3d | Notion: guest surface, link cards, tours | backlog `1deb9dbf`; a Notion OAuth client for the Explorer |
-| P3e | Neighbourhood level | backlog `01e0b839` |
+| Phase | Delivers | Needs | Status (tree checked 2026-11-14) |
+|---|---|---|---|
+| P3a | Topics: regions, themes, claims, claim rings, cross-theme bundles, search, deep links | backlog `f9b4a488`, `2b5bd83e`, `4321ae80`, `57917c13`, `7f359a86`, `cadfc550`, `864368a8` | In the tree: `services/explorer` registers `/atlas` and `/bff/atlas/layout`, `/theme/{id}/claims`, `/claim/{id}`, `/links`, `/search`, `/resolve/{key}` |
+| P3b | Provenance panel and Sources view | backlog `fe75ef36`, `da4a8bc1`, `48421526`, `b7354adc` | Sources view not in the tree: no `/bff/atlas/sources` route, and `ClaimContext` deliberately has no `papers` field (`src/upstream/atlas.rs`). Provenance panel: not checked |
+| P3c | Timeline | backlog `ea26d7aa`; history route already on `main` | Not in the tree: no `/bff/atlas/timeline` route, nothing named timeline in `static/atlas.js` |
+| P3d | Notion: guest surface, link cards, tours | backlog `1deb9dbf`; a Notion OAuth client for the Explorer | Not in the tree: no `/bff/atlas/tour/{id}` route, nothing named tour or Notion in `static/atlas.js` |
+| P3e | Neighbourhood level | backlog `01e0b839` | Not found in `static/atlas.js` |
+
+Update the Status column in the PR that merges each phase. It records what is
+in the repository, not what is deployed.
 
 P3a can start before the layout route exists by packing themes by size, as the
 prototype first did, and switch once positions ship.

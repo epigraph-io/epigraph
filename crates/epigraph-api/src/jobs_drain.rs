@@ -139,8 +139,9 @@ pub struct DrainFailure {
     pub job_type: String,
     /// The handler's error.
     pub error: String,
-    /// `true`: it used its last retry and is now `failed`. `false`: it is back
-    /// to `pending` and the next run retries it.
+    /// `true`: it is now `failed`, because it used its last retry or because
+    /// its error is one a retry cannot fix (see [`failure_is_terminal`]).
+    /// `false`: it is back to `pending` and the next run retries it.
     pub terminal: bool,
 }
 
@@ -188,6 +189,20 @@ impl DrainReport {
     }
 }
 
+/// Whether a handler failure ends the job (`failed`) instead of sending it back
+/// to `pending` for the next run.
+///
+/// Two ways to be terminal: the retries are used up, or the error says a retry
+/// cannot help ([`JobError::should_retry`] is false: a payload that does not
+/// parse, a handler's refusal, a blocked address). The second used to be
+/// ignored, so such a job was re-run on every drain until its retries were
+/// spent, failing the unit each time for a failure known to be permanent on
+/// the first.
+#[must_use]
+pub const fn failure_is_terminal(error: &JobError, retry_count: u32, max_retries: u32) -> bool {
+    !error.should_retry() || retry_count >= max_retries
+}
+
 /// Drain the queue once: reap stale `running` rows (a counted attempt, see
 /// [`STALE_AFTER`]), then claim and run the oldest pending job of a registered
 /// type, one at a time, until none is left or `max_runtime` has elapsed.
@@ -195,7 +210,8 @@ impl DrainReport {
 /// Each job's final state is written back with `JobQueue::update`:
 /// `completed`; or, on a handler error, `pending` again with the retry counted
 /// (not retried in this run: the next run is the backoff), or `failed` once
-/// its retries are used up.
+/// its retries are used up or at once when the error is not retryable
+/// ([`failure_is_terminal`]).
 ///
 /// # Errors
 /// A database error reading or claiming from the queue (the run stops; the
@@ -251,7 +267,7 @@ pub async fn drain(
                 report.completed += 1;
             }
             Err(e) => {
-                let terminal = job.retry_count >= job.max_retries;
+                let terminal = failure_is_terminal(&e, job.retry_count, job.max_retries);
                 job.error_message = Some(e.to_string());
                 job.updated_at = chrono::Utc::now();
                 if terminal {
@@ -280,4 +296,56 @@ pub async fn drain(
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An error that `should_retry()` calls permanent is terminal on the first
+    /// failure, with retries left; a transient one is terminal only once the
+    /// retries are used up.
+    #[test]
+    fn a_non_retryable_error_is_terminal_with_retries_left() {
+        let permanent = [
+            JobError::PermanentFailure {
+                message: "refused".into(),
+            },
+            JobError::PayloadError {
+                message: "not json".into(),
+            },
+            JobError::SsrfBlocked {
+                address: "127.0.0.1".into(),
+            },
+            JobError::Cancelled,
+        ];
+        for e in &permanent {
+            assert!(
+                failure_is_terminal(e, 1, 3),
+                "{e} is not retryable but was sent back to pending"
+            );
+        }
+
+        let transient = [
+            JobError::ProcessingFailed {
+                message: "db down".into(),
+            },
+            JobError::Timeout {
+                timeout: Duration::from_secs(1),
+            },
+            JobError::RateLimited {
+                retry_after_secs: 5,
+            },
+        ];
+        for e in &transient {
+            assert!(
+                !failure_is_terminal(e, 1, 3),
+                "{e} is retryable and has retries left"
+            );
+            assert!(
+                failure_is_terminal(e, 3, 3),
+                "{e} has no retries left but was sent back to pending"
+            );
+        }
+    }
 }
