@@ -678,17 +678,32 @@ impl AgentRateLimiter {
     /// before hitting their limit.
     #[must_use]
     pub fn remaining_quota(&self, agent_id: &AgentId) -> u32 {
-        let mut buckets = self
+        // Limit first, bucket lock second: the order `check_agent` uses. Taking
+        // the limits lock while holding the bucket lock inverts
+        // `set_agent_limit`'s order and can deadlock against it.
+        let limit = self.get_agent_limit(agent_id);
+        let mut guard = self
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let buckets = &mut *guard;
 
         if let Some(bucket) = buckets.map.get_mut(agent_id) {
             bucket.refill();
             bucket.tokens as u32
+        } else if buckets.map.len() >= self.max_tracked_keys {
+            // An untracked key at the cap is charged to the shared overflow
+            // bucket (`check_agent`), so that bucket's tokens are its quota.
+            match buckets.overflow.as_mut() {
+                Some(bucket) => {
+                    bucket.refill();
+                    bucket.tokens as u32
+                }
+                None => self.config.default_rpm,
+            }
         } else {
-            // Agent hasn't made any requests yet, they have their full quota
-            self.get_agent_limit(agent_id)
+            // Not tracked and room to be: its first request gets a full bucket.
+            limit
         }
     }
 
@@ -881,6 +896,54 @@ mod tests {
             limiter.check(&key(0)).is_err(),
             "a tracked, throttled key keeps its debt"
         );
+    }
+
+    /// The middleware reports `remaining_quota` on every served response. For
+    /// a key charged to the overflow bucket that is the overflow bucket's
+    /// balance, not a fresh key's full quota.
+    #[test]
+    fn an_overflow_charged_key_reports_the_overflow_balance() {
+        let limiter = per_key(2).with_max_tracked_keys(1);
+        limiter.check(&key(0)).unwrap();
+        // Two newcomers at the cap spend the shared overflow bucket (2).
+        limiter.check(&key(100)).unwrap();
+        limiter.check(&key(101)).unwrap();
+        assert_eq!(
+            limiter.remaining_quota(&key(101)),
+            0,
+            "an overflow-charged key whose shared bucket is spent has no quota left"
+        );
+    }
+
+    /// `set_agent_limit` takes the limits lock, then the bucket lock.
+    /// `remaining_quota` for an untracked key must not take them the other
+    /// way round, or the two deadlock and every later request blocks on the
+    /// limiter. Two threads race the pair; a deadlock shows as a timeout.
+    #[test]
+    fn remaining_quota_does_not_deadlock_against_set_agent_limit() {
+        let limiter = per_key(2).with_max_tracked_keys(1);
+        limiter.check(&key(0)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let quota = limiter.clone();
+        let setter = limiter.clone();
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            for _ in 0..200_000 {
+                // Untracked key: the branch that reads the limit.
+                let _ = quota.remaining_quota(&key(7));
+            }
+            let _ = tx.send(());
+        });
+        std::thread::spawn(move || {
+            for n in 0..200_000u32 {
+                setter.set_agent_limit(key(7), 2 + n % 3);
+            }
+            let _ = tx2.send(());
+        });
+        for _ in 0..2 {
+            rx.recv_timeout(std::time::Duration::from_secs(60))
+                .expect("remaining_quota and set_agent_limit deadlocked");
+        }
     }
 
     /// A request the per-key limit refuses must not spend a global token.
