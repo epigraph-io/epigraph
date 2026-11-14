@@ -382,81 +382,33 @@ pub async fn do_report_hierarchical_outcome_as(
         .await
         .map_err(crate::errors::db_caller_error)?;
 
-    // 1. Confirm hierarchical workflow exists, and lock its row for the
-    //    read-modify-write of the counters below.
-    //
-    // VISIBILITY-EXEMPT: this statement and the counter `UPDATE` touch only
-    // `workflows` by primary key, on this transaction stamped with the viewer:
-    // since migration 183 that row carries its plan's tenancy under FORCEd
-    // row security, so a row the viewer does not read is absent here and
-    // reported as an unknown id. The viewer is ALSO spent in the plan reads
-    // below (`viewer_reads_plan_structure`, which requires the row through
-    // `{VISIBILITY:w}` and a readable step, and `plan_step_claim_ids`), which
-    // splice the row, edge and claim predicates.
-    let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
-            .bind(workflow_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(internal_error)?;
-    let mut metadata = match row {
-        Some((m,)) => m,
-        None => return Err(not_found(workflow_id)),
-    };
-    // A reporter that reads none of the plan's STEP `executes` edges is
-    // refused exactly like a missing id, before any write.
-    if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, viewer, workflow_id)
-        .await
-        .map_err(internal_error)?
-    {
-        return Err(not_found(workflow_id));
-    }
-
-    // 2. Compute deltas.
-    let variance = if step_executions.is_empty() {
-        0.0
-    } else {
-        let dev = step_executions.iter().filter(|s| s.deviated).count();
-        dev as f64 / step_executions.len() as f64
-    };
+    // 1-3. Lock the workflow row, refuse a reporter that reads none of the
+    //      plan's STEP `executes` edges exactly like a missing id (before any
+    //      write), and move the rolling counters. One repository function,
+    //      shared with the HTTP route (backlog c34a0643): the lock read and the
+    //      plan check splice the viewer's predicates on this stamped
+    //      transaction, which `workflows`' row security (migration 183) agrees
+    //      with.
+    let variance = epigraph_db::repos::hierarchical_outcome_variance(
+        step_executions.iter().map(|s| s.deviated),
+    );
+    let counters = epigraph_db::WorkflowRepository::record_hierarchical_outcome(
+        &mut tx,
+        viewer,
+        workflow_id,
+        success,
+        variance,
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| not_found(workflow_id))?;
+    let epigraph_db::HierarchicalOutcomeCounters {
+        use_count,
+        success_count,
+        failure_count,
+        avg_variance,
+    } = counters;
     let quality = quality.unwrap_or(if success { 1.0 } else { 0.0 });
-
-    // 3. Update rolling counters in metadata.
-    let use_count = metadata
-        .get("use_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + 1;
-    let success_count = metadata
-        .get("success_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + i64::from(success);
-    let failure_count = metadata
-        .get("failure_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + i64::from(!success);
-    let prev_avg_var = metadata
-        .get("avg_variance")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
-    let avg_variance = if use_count > 0 {
-        (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64
-    } else {
-        variance
-    };
-    metadata["use_count"] = serde_json::json!(use_count);
-    metadata["success_count"] = serde_json::json!(success_count);
-    metadata["failure_count"] = serde_json::json!(failure_count);
-    metadata["avg_variance"] = serde_json::json!(avg_variance);
-
-    sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
-        .bind(&metadata)
-        .bind(workflow_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal_error)?;
 
     // 4. Resolve step_index → step_claim_id via this workflow's `executes`
     //    edges, restricted to level=2 (steps), in PLAN order, through the

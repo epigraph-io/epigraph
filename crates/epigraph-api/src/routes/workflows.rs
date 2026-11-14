@@ -1563,89 +1563,39 @@ pub async fn report_hierarchical_outcome(
         .write_as(&viewer, "report_hierarchical_outcome")
         .await?;
 
-    // 1. Confirm this is a hierarchical workflow root, and lock its row so two
-    //    concurrent reports cannot both read `use_count = n` and write `n + 1`.
-    let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
-            .bind(workflow_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("workflows lookup failed: {e}"),
-            })?;
-    let not_found = || ApiError::NotFound {
+    // 1-3. Lock the workflow row so two concurrent reports cannot both read
+    //      `use_count = n` and write `n + 1`, answer a caller that does not
+    //      read the PLAN (its `workflows` row, which carries the plan's tenancy
+    //      since migration 183, and at least one STEP `executes` edge; a
+    //      visible thesis, phase or shared atom does not count) 404 exactly
+    //      like a missing id before any write, and move the counters. One
+    //      repository function, shared with MCP (backlog c34a0643).
+    let success = request.success;
+    let variance = epigraph_db::repos::hierarchical_outcome_variance(
+        request.step_executions.iter().flatten().map(|s| s.deviated),
+    );
+    let counters = epigraph_db::WorkflowRepository::record_hierarchical_outcome(
+        &mut tx,
+        &viewer,
+        workflow_id,
+        success,
+        variance,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("workflow outcome counters failed: {e}"),
+    })?
+    .ok_or_else(|| ApiError::NotFound {
         entity: "hierarchical workflow".into(),
         id: workflow_id.to_string(),
-    };
-    let mut metadata = match row {
-        Some((m,)) => m,
-        None => return Err(not_found()),
-    };
-    // A caller that does not read the PLAN (its `workflows` row, which
-    // carries the plan's tenancy since migration 183, and at least one STEP
-    // `executes` edge; a visible thesis, phase or shared atom does not count)
-    // is answered 404 exactly like a missing id, before any write. Shared with
-    // MCP. On this stamped transaction the row lookup above already hides a
-    // row the caller does not read; the predicate states the rule itself.
-    if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, &viewer, workflow_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("workflow visibility check failed: {e}"),
-        })?
-    {
-        return Err(not_found());
-    }
-
-    // 2. Compute deltas
-    let success = request.success;
-    let variance = request.step_executions.as_ref().map_or(0.0, |steps| {
-        if steps.is_empty() {
-            0.0
-        } else {
-            let dev = steps.iter().filter(|s| s.deviated).count();
-            dev as f64 / steps.len() as f64
-        }
-    });
+    })?;
+    let epigraph_db::HierarchicalOutcomeCounters {
+        use_count,
+        success_count,
+        failure_count,
+        ..
+    } = counters;
     let quality = request.quality.unwrap_or(if success { 1.0 } else { 0.0 });
-
-    // 3. Update metadata counters
-    let use_count = metadata
-        .get("use_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + 1;
-    let success_count = metadata
-        .get("success_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + i64::from(success);
-    let failure_count = metadata
-        .get("failure_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + i64::from(!success);
-    let prev_avg_var = metadata
-        .get("avg_variance")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let avg_variance = if use_count > 0 {
-        (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64
-    } else {
-        variance
-    };
-    metadata["use_count"] = serde_json::json!(use_count);
-    metadata["success_count"] = serde_json::json!(success_count);
-    metadata["failure_count"] = serde_json::json!(failure_count);
-    metadata["avg_variance"] = serde_json::json!(avg_variance);
-
-    sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
-        .bind(&metadata)
-        .bind(workflow_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("metadata update failed: {e}"),
-        })?;
 
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
     //    restricted to level=2 (steps), in PLAN order, through the caller's

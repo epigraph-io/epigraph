@@ -60,16 +60,10 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str)] = &[
     // at the site. The `claim_themes` one explicitly records that §2.4's stated
     // control — viewer-scoped clustering — is NOT delivered by PR-09.
     ("recall.rs", "compute_corpus_scope"),
-    // The hierarchical outcome report's own SQL is the `workflows` counter
-    // read-modify-write by primary key, on a transaction stamped with the
-    // viewer (row security on `workflows` since migration 183 hides a row the
-    // viewer does not read). It spends the viewer in the repository plan reads
-    // (`WorkflowRepository::viewer_reads_plan_structure` and
-    // `plan_step_claim_ids`, which splice); this scan sees only the inline SQL.
-    (
-        "workflow_hierarchical.rs",
-        "do_report_hierarchical_outcome_as",
-    ),
+    // (`workflow_hierarchical.rs::do_report_hierarchical_outcome_as` left this
+    // set with backlog c34a0643: its `workflows` counter read-modify-write
+    // moved to `WorkflowRepository::record_hierarchical_outcome`, which
+    // splices the viewer, so the tool runs no inline SQL to exempt.)
 ];
 
 // Four sites that were NOT exempted, recorded because the alternative was

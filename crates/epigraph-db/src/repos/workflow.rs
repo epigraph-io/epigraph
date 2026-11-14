@@ -148,6 +148,73 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
                                     AND properties->>'plan_index' ~ '^[0-9]{1,9}$' \
                                THEN (properties->>'plan_index')::bigint END)";
 
+/// The rolling counters a hierarchical outcome report keeps on
+/// `workflows.metadata` (`use_count`, `success_count`, `failure_count`,
+/// `avg_variance`), as [`WorkflowRepository::record_hierarchical_outcome`]
+/// leaves them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HierarchicalOutcomeCounters {
+    pub use_count: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    /// Running mean of the per-report `variance`.
+    pub avg_variance: f64,
+}
+
+impl HierarchicalOutcomeCounters {
+    /// The counters after one more report on a row whose metadata is
+    /// `metadata`: a missing or non-numeric counter counts as zero.
+    #[must_use]
+    pub fn after_report(metadata: &serde_json::Value, success: bool, variance: f64) -> Self {
+        let int = |k: &str| {
+            metadata
+                .get(k)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
+        let use_count = int("use_count") + 1;
+        let prev_avg_var = metadata
+            .get("avg_variance")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        #[allow(clippy::cast_precision_loss)]
+        let avg_variance = (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64;
+        Self {
+            use_count,
+            success_count: int("success_count") + i64::from(success),
+            failure_count: int("failure_count") + i64::from(!success),
+            avg_variance,
+        }
+    }
+
+    /// Write these counters into `metadata`, leaving every other key alone.
+    pub fn write_into(&self, metadata: &mut serde_json::Value) {
+        if !metadata.is_object() {
+            *metadata = serde_json::json!({});
+        }
+        metadata["use_count"] = serde_json::json!(self.use_count);
+        metadata["success_count"] = serde_json::json!(self.success_count);
+        metadata["failure_count"] = serde_json::json!(self.failure_count);
+        metadata["avg_variance"] = serde_json::json!(self.avg_variance);
+    }
+}
+
+/// A hierarchical outcome report's `variance`: the fraction of its step rows
+/// marked `deviated`, `0.0` for a report with no step rows.
+#[must_use]
+pub fn hierarchical_outcome_variance(deviated: impl IntoIterator<Item = bool>) -> f64 {
+    let (n, dev) = deviated
+        .into_iter()
+        .fold((0_usize, 0_usize), |(n, d), x| (n + 1, d + usize::from(x)));
+    if n == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let v = dev as f64 / n as f64;
+        v
+    }
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -1168,6 +1235,69 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_one(&mut *conn).await?)
+    }
+
+    /// Record one hierarchical outcome report's COUNTERS on `workflows.metadata`:
+    /// lock the row, check that `viewer` reads the plan, recompute the rolling
+    /// counters and write them back. `Ok(None)` (and nothing written) when no
+    /// row with this id is readable or the viewer reads none of the plan's
+    /// steps; both transports answer that exactly like an unknown id.
+    ///
+    /// The one implementation of the counter half of `report_hierarchical_outcome`,
+    /// shared by the MCP tool and the HTTP route (backlog c34a0643), which each
+    /// used to carry their own copy of this SQL.
+    ///
+    /// # Serialized by the row lock
+    ///
+    /// The read takes `FOR UPDATE`, so two concurrent reports on one workflow
+    /// serialize: the second waits for the first to commit and then reads ITS
+    /// counters, instead of both reading `use_count = n` and writing `n + 1`.
+    /// The lock is held until the caller's transaction ends, so a caller that
+    /// writes the run's step rows on the same transaction keeps the report all
+    /// or nothing.
+    ///
+    /// # Visibility
+    ///
+    /// Run it on the caller's STAMPED transaction. The lock read carries the
+    /// row predicate (`{VISIBILITY:w}`), which agrees with `workflows`' own row
+    /// security (migration 183); [`Self::viewer_reads_plan_structure`] then
+    /// requires a readable STEP. The `UPDATE` is by primary key on the row the
+    /// predicate just admitted.
+    ///
+    /// # Errors
+    /// Returns `DbError` if a query fails.
+    pub async fn record_hierarchical_outcome(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+        success: bool,
+        variance: f64,
+    ) -> Result<Option<HierarchicalOutcomeCounters>, DbError> {
+        let sql = viewer.splice(
+            "SELECT w.metadata FROM workflows w \
+             WHERE w.id = $1 /* {VISIBILITY:w} */ \
+             FOR UPDATE OF w",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, serde_json::Value>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let Some(mut metadata) = q.fetch_optional(&mut *conn).await? else {
+            return Ok(None);
+        };
+        if !Self::viewer_reads_plan_structure(conn, viewer, workflow_id).await? {
+            return Ok(None);
+        }
+
+        let counters = HierarchicalOutcomeCounters::after_report(&metadata, success, variance);
+        counters.write_into(&mut metadata);
+        sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
+            .bind(&metadata)
+            .bind(workflow_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(Some(counters))
     }
 
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
@@ -2747,6 +2877,47 @@ impl WorkflowRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counter arithmetic both transports used to carry inline (backlog
+    /// c34a0643): a missing counter starts at zero, success and failure are
+    /// mutually exclusive increments, `avg_variance` is the running mean, and
+    /// every other metadata key survives the write.
+    #[test]
+    fn hierarchical_outcome_counters_accumulate_and_keep_other_keys() {
+        let mut meta = serde_json::json!({"prerequisites": ["x"]});
+        let first = HierarchicalOutcomeCounters::after_report(&meta, true, 0.5);
+        assert_eq!(
+            first,
+            HierarchicalOutcomeCounters {
+                use_count: 1,
+                success_count: 1,
+                failure_count: 0,
+                avg_variance: 0.5,
+            }
+        );
+        first.write_into(&mut meta);
+        let second = HierarchicalOutcomeCounters::after_report(&meta, false, 0.0);
+        assert_eq!(second.use_count, 2);
+        assert_eq!(second.success_count, 1);
+        assert_eq!(second.failure_count, 1);
+        assert!((second.avg_variance - 0.25).abs() < 1e-12);
+        second.write_into(&mut meta);
+        assert_eq!(meta["prerequisites"], serde_json::json!(["x"]));
+        assert_eq!(meta["use_count"], serde_json::json!(2));
+
+        // A NULL metadata column counts from zero and becomes an object.
+        let mut null = serde_json::Value::Null;
+        let c = HierarchicalOutcomeCounters::after_report(&null, false, 1.0);
+        c.write_into(&mut null);
+        assert_eq!(null["failure_count"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn hierarchical_outcome_variance_is_the_deviated_fraction() {
+        assert!(hierarchical_outcome_variance(std::iter::empty()).abs() < f64::EPSILON);
+        assert!((hierarchical_outcome_variance([true, false, false, true]) - 0.5).abs() < 1e-12);
+        assert!((hierarchical_outcome_variance([true]) - 1.0).abs() < 1e-12);
+    }
 
     fn row(level: &str, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
         (Uuid::new_v4(), Some(level.to_string()), plan_index)

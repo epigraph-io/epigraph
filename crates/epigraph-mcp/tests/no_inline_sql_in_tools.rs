@@ -67,17 +67,13 @@ use std::path::{Path, PathBuf};
 ///   because `sqlx::query!` needs a compile-time literal of fixed arity and so
 ///   cannot take a `Viewer::splice` result. Relocation to the repo layer is
 ///   outstanding; the leak is not.
-/// * **`workflow_hierarchical.rs` (2 production).** One read and one `UPDATE
-///   workflows` on the `report_hierarchical_outcome` write path, both on a
-///   table with no row security. (Was 3: the `edges ⨝ claims` step lookup
-///   moved to `WorkflowRepository::plan_step_claim_ids`, with its viewer
-///   predicates, when the report moved onto a transaction stamped with the
-///   caller's viewer.) Write paths are PR-16's, so
-///   PR-09 left them alone rather than half-converting a write. (PR-16
-///   correction: the parenthetical here used to read "`viewer.writable_bind()`,
-///   which does not exist yet". It has existed since PR-04 and is consumed by
-///   `pool.rs::apply_session_gucs`; what is missing is the SQL half — the
-///   write-side predicate and `WITH CHECK` — and PR-16a does not add it.)
+/// * **`workflow_hierarchical.rs` (0 production).** The
+///   `report_hierarchical_outcome` write path had two (the `FOR UPDATE` counter
+///   read and the `UPDATE workflows`), copied verbatim in the HTTP route. Both
+///   moved to `WorkflowRepository::record_hierarchical_outcome`, which both
+///   transports call (backlog c34a0643). (Was 3 before that: the `edges ⨝
+///   claims` step lookup had already moved to
+///   `WorkflowRepository::plan_step_claim_ids`.)
 /// * **One-line read-backs (`ds.rs`, `ds_auto.rs`, `link_epistemic.rs`,
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
@@ -114,7 +110,9 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // failure to the injected trigger through a sequence the trigger advances
     // (CREATE SEQUENCE, and one read-back), because the driver text it used to
     // read from the error message no longer reaches the caller. Fixture SQL.
-    ("workflow_hierarchical.rs", 2, 14),
+    // 2 -> 0 production (backlog c34a0643): the counter lock read and UPDATE
+    // moved to `WorkflowRepository::record_hierarchical_outcome`.
+    ("workflow_hierarchical.rs", 0, 14),
     ("workflow_ingest.rs", 0, 10),
     // 2 -> 1 (ruling R-74, migration 183): `report_workflow_outcome`'s
     // routing probe moved to the repo layer

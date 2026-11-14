@@ -1178,20 +1178,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "ingest_workflow",
         &["record_api_authorship"],
     ),
-    // stamped: the `workflows` row is locked (SELECT .. FOR UPDATE) and its
-    // counters updated on the caller's stamped write transaction, where row
-    // security (migration 183, ruling R-74) hides a row the caller does not
-    // read, so it takes the missing-id 404; `viewer_reads_plan_structure`
-    // (viewed) then requires a readable step before any write. untenanted:
-    // behavioral_executions. write.
+    // The `workflows` row lock, the plan check and the counter UPDATE are
+    // one viewed call, `WorkflowRepository::record_hierarchical_outcome`
+    // (backlog c34a0643; it used to be two inline statements here).
+    // untenanted: behavioral_executions. write.
     (
         "workflows.rs",
         "report_hierarchical_outcome",
-        &[
-            "BehavioralExecutionRepository::create",
-            "sqlx::query(UPDATE).execute",
-            "sqlx::query_as(SELECT).fetch_optional",
-        ],
+        &["BehavioralExecutionRepository::create"],
     ),
     // gated (`get_by_id_with_labels`) then write on the stamped transaction.
     (
