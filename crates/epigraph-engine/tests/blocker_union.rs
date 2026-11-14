@@ -498,3 +498,55 @@ async fn decompose_atoms_of_one_paper_are_filtered_out(pool: PgPool) {
         pairs
     );
 }
+
+/// a04248cf: the recall stage reports what it retrieved and what each filter
+/// dropped, so a low sweep yield can be attributed to "few pairs retrieved"
+/// versus "retrieved, then filtered". Three shared-hash pairs are emitted:
+/// one ineligible (an endpoint carries an excluded label), one same-source
+/// (same-agent non-paper restatement) and one genuine cross-source pair.
+#[sqlx::test(migrations = "../../migrations")]
+async fn union_block_reports_recall_stage_drops(pool: PgPool) {
+    use epigraph_engine::matching::blocker::{union_block_with_stats, BlockStats};
+
+    let a1 = insert_agent(&pool).await;
+    let a2 = insert_agent(&pool).await;
+    let (h_inel, h_same, h_cross) = ([61u8; 32], [62u8; 32], [63u8; 32]);
+    let inel_l = insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &h_inel).await;
+    let inel_r = insert_claim_with_props_and_hash(&pool, a2, serde_json::json!({}), &h_inel).await;
+    let same_l = insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &h_same).await;
+    let _same_r = insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &h_same).await;
+    let cross_l =
+        insert_claim_with_props_and_hash(&pool, a1, serde_json::json!({}), &h_cross).await;
+    let cross_r =
+        insert_claim_with_props_and_hash(&pool, a2, serde_json::json!({}), &h_cross).await;
+    sqlx::query("UPDATE claims SET labels = ARRAY['b43-excluded'] WHERE id = $1")
+        .bind(inel_r)
+        .execute(&pool)
+        .await
+        .expect("label ineligible claim");
+
+    let blockers: Vec<Box<dyn Blocker>> = vec![Box::new(ContentHashBlocker)];
+    let eligibility = EligibilityConfig {
+        exclude_labels: vec!["b43-excluded".to_string()],
+    };
+    let (pairs, stats) = union_block_with_stats(
+        &pool,
+        &blockers,
+        &[inel_l, same_l, cross_l],
+        SourceFilterConfig::default(),
+        &eligibility,
+    )
+    .await
+    .expect("union_block_with_stats");
+
+    assert_eq!(pairs, vec![canonical(cross_l, cross_r).unwrap()]);
+    assert_eq!(
+        stats,
+        BlockStats {
+            retrieved: 3,
+            ineligible_dropped: 1,
+            same_source_dropped: 1,
+        },
+        "each recall-stage filter's drop must be counted separately"
+    );
+}
