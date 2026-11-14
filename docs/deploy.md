@@ -3135,11 +3135,20 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     those confirmed, and so on, attested ones included. It never touches
     another person's passkeys. Every elevation any of them confirmed ends
     (`passkey_revoked`), and every unexecuted act they confirmed is voided,
-    as for any revoke. It first locks the person's passkeys, so an
-    enrollment completing at that moment on one of their acts is waited
-    for and then revoked with the rest, and one that starts later is
-    refused. It prints one line per passkey reached (`depth=` 0 for the
-    passkey named) and, without `--apply`, rolls everything back.
+    as for any revoke. It first locks the person's passkeys, waiting for
+    any enrollment completing at that moment on one of their acts, and
+    then walks the lineage; it locks and walks again until every passkey
+    it reached is locked (migration 214), so a passkey that completed
+    during the wait is revoked with the rest, and so is anything that
+    completed under it meanwhile. A completion that starts later is
+    refused. This holds only under READ COMMITTED, where each statement
+    sees what committed before it: since migration 214 the revoke refuses
+    to run under any other isolation level (SQLSTATE 25000, nothing
+    revoked). `epigraph-operator` runs it at the connection's default
+    level, so keep the maintenance DSN, role and database at READ
+    COMMITTED (the PostgreSQL default). It prints one line per passkey
+    reached (`depth=` 0 for the passkey named) and, without `--apply`,
+    rolls everything back.
     It also works on a passkey already revoked: revoked passkeys are walked
     through, not revoked again, and anything still live below them is
     revoked. Afterwards the person enrolls a replacement on a
@@ -3223,6 +3232,12 @@ which revokes it.
    `verify` checks the four functions' owner, the reader's grant to
    `epigraph_app` and that `epigraph_app` cannot call the compromised
    revoke. The guard and the cascade apply whatever the settings say.
+   **Migrate 214** after it (any time; no binary depends on it). It
+   re-states the compromised revoke to refuse any isolation level but READ
+   COMMITTED and to lock every passkey it walks. Before it, confirm the
+   maintenance DSN runs READ COMMITTED: `SHOW transaction_isolation` on
+   that DSN prints `read committed`. Otherwise `revoke-passkey
+   --compromised` is refused (25000) until the setting is fixed.
 2. **The status list.** Install the refresh job and its timer with the
    `OnFailure=` alert, and the age check under your monitoring (both above).
    Run the job once, then run the age check: it must print `android
@@ -3300,6 +3315,9 @@ which revokes it.
   removed from the allowlist or a root replaced: every anchor whose own chain
   or lineage depends on it stops anchoring. Synced passkeys already anchored
   stay live; revoke them, or their anchors, to remove them.
+- **Migration 214.** `docs/runbooks/214-undo.sql` on the migration DSN
+  restores 200's body of the compromised revoke (no binary to roll back
+  first). Run it BEFORE `200-undo.sql`.
 - **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
   only after no unit runs with the anchored setting on and `epigraph-operator`
   is rolled back to a build without `--compromised`. It drops the reader, the

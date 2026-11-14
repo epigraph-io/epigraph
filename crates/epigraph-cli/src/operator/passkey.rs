@@ -125,7 +125,9 @@ pub async fn revoke(
 /// reached, nearest first, with the row as it stands.
 ///
 /// # Errors
-/// The passkey does not exist, the reason is blank, or a statement failed.
+/// The passkey does not exist, the reason is blank, the connection's
+/// transaction is not READ COMMITTED (`25000`, migration 214: keep the
+/// maintenance DSN at the default level), or a statement failed.
 pub async fn revoke_compromised(
     conn: &mut PgConnection,
     passkey: Uuid,
