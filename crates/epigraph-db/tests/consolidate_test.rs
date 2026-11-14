@@ -675,6 +675,90 @@ async fn abstract_mode_retires_nothing_and_writes_generalizes_edges(pool: PgPool
     );
 }
 
+/// An abstraction takes its default confidence from its sources, so its
+/// `generalizes` edges must not feed that belief back into them. The act marks
+/// each edge `"moves_belief": false`, and both sheaf reads skip a marked edge
+/// while still reading an ordinary edge between the same claims (backlog
+/// 22602dd8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn abstract_edges_are_marked_and_skipped_by_the_sheaf_reads(pool: PgPool) {
+    use epigraph_db::repos::sheaf::SheafRepository;
+    use epigraph_db::visibility::Viewer;
+
+    let author = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "sheaf abstract source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "sheaf abstract source two", &[]).await;
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "the pattern both sheaf sources share",
+        0.6,
+        ConsolidateMode::Abstract,
+        "generalisation",
+        author,
+    )
+    .await
+    .expect("abstract consolidation");
+    let a = res.merged_id;
+
+    let marks: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT properties->>'moves_belief' FROM edges
+          WHERE source_id = $1 AND relationship = 'generalizes' ORDER BY target_id",
+    )
+    .bind(a)
+    .fetch_all(&pool)
+    .await
+    .expect("read abstraction edges");
+    assert_eq!(
+        marks,
+        vec![Some("false".to_string()), Some("false".to_string())],
+        "every abstraction edge is marked as moving no belief"
+    );
+
+    // Control: an ordinary, unmarked generalizes edge from the abstraction to
+    // s1, which the sheaf reads must still see.
+    seed_edge(&pool, a, s1, "GENERALIZES").await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.6, plausibility = 0.9, pignistic_prob = 0.75
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![a, s1, s2])
+    .execute(&pool)
+    .await
+    .expect("give the claims a belief interval");
+
+    let viewer = Viewer::resolve(&pool, Uuid::nil()).await.expect("viewer");
+    let pairs = SheafRepository::get_epistemic_edge_pairs(&pool, &viewer, None)
+        .await
+        .expect("edge pairs");
+    let mut from_a: Vec<(Uuid, String)> = pairs
+        .iter()
+        .filter(|p| p.source_id == a)
+        .map(|p| (p.target_id, p.relationship.clone()))
+        .collect();
+    from_a.sort();
+    assert_eq!(
+        from_a,
+        vec![(s1, "GENERALIZES".to_string())],
+        "the edge-pair read sees only the unmarked control edge"
+    );
+
+    let neighbours = SheafRepository::get_claim_neighbor_betp_pairs(&pool, &viewer, None)
+        .await
+        .expect("neighbour pairs");
+    let mut of_a: Vec<Uuid> = neighbours
+        .iter()
+        .filter(|r| r.claim_id == a)
+        .map(|r| r.neighbor_id)
+        .collect();
+    of_a.sort();
+    assert_eq!(
+        of_a,
+        vec![s1],
+        "the neighbour read sees the abstraction only through the control edge"
+    );
+}
+
 /// `identity` writes no new claim: it is the dedup act, run per source by the
 /// tool layer. The merge act refuses it as an input error, before it writes
 /// anything (backlog 22602dd8).

@@ -12069,6 +12069,18 @@ impl ClaimRepository {
         } else {
             "generalizes"
         };
+        let mut edge_props = serde_json::json!({
+            "reason": reason,
+            "mode": mode.as_str(),
+            "merged_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if !mode.retires_sources() {
+            // An abstraction's default confidence is derived from its sources,
+            // so its `generalizes` edge must not feed that belief back into
+            // them: the belief readers (the factor backfill, the sheaf) skip
+            // an edge marked this way.
+            edge_props[crate::repos::edge::MOVES_BELIEF_PROPERTY] = serde_json::Value::Bool(false);
+        }
         for src in source_ids {
             sqlx::query(
                 r#"
@@ -12080,11 +12092,7 @@ impl ClaimRepository {
             .bind(merged_id)
             .bind(src)
             .bind(relationship)
-            .bind(serde_json::json!({
-                "reason": reason,
-                "mode": mode.as_str(),
-                "merged_at": chrono::Utc::now().to_rfc3339(),
-            }))
+            .bind(&edge_props)
             .execute(&mut *tx)
             .await?;
         }
