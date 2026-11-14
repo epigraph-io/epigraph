@@ -1087,6 +1087,50 @@ impl AtlasLeafRepository {
         assemble_leaf(&rows, claim_ids, cap)
     }
 
+    /// The claim-to-claim edges among `claim_ids` that `map` may draw, as
+    /// `(source, target, relationship as stored)`, one per stored row, in
+    /// edge-id order: the input of the nightly's cross-group links (group
+    /// `bundles` and `targets`, leaf `outgoing`). Both ends must be in
+    /// `claim_ids` (the claims the map's run draws), the edge must be in
+    /// force, and the edge row must pass the MAP edge rule of
+    /// [`Self::read_leaf_rows`]: public, or owned by the team with no
+    /// co-owner. A co-owned edge is never returned, so a link hidden from a
+    /// leaf never reappears between leaves. Which relationships count as a
+    /// link is the caller's rule (W5's), not this read's.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn map_claim_links(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Uuid, String)>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT e.source_id, e.target_id, e.relationship::text \
+               FROM edges e \
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
+                AND e.source_id = ANY($1) AND e.target_id = ANY($1) \
+                AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                AND (e.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND e.visibility = 'group' \
+                         AND e.owner_group_id = $2 AND e.co_owner_group_id IS NULL)) \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.id",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String)>(&sql)
+            .bind(claim_ids)
+            .bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
     /// The raw label text of a leaf's agent and evidence nodes (Atlas W9's
     /// real leaves): each agent's `display_name`, and each evidence row's
     /// `raw_content`, else its `evidence_type`, for the rows `map` may draw.

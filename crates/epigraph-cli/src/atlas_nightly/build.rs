@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use super::incremental::{to_wire, update_links, update_meaning, Shape};
 use super::leaves::{fill_leaf, leaf_claims, leaf_shape, node_set};
+use super::links::{fill_cross_links, LinksReport};
 use super::previous::{by_theme, prev_tree};
 use crate::atlas_layout::fill::{fill_positions, LayoutRecord, PreviousRun};
 use crate::atlas_links::graph::{
@@ -396,6 +397,7 @@ struct MapBuild {
     mirrors: Vec<Uuid>,
     themes: Value,
     unembedded: i64,
+    links: LinksReport,
     texts: BTreeMap<Uuid, String>,
     names: crate::atlas_naming::name::Previous,
 }
@@ -495,6 +497,25 @@ async fn read_and_build(
             }
         }
     }
+    // The cross-group links, once every theme is final (built or carried)
+    // and before the layout, which pulls linked children together from the
+    // sibling bundles. Recomputed for every level from the snapshot's edges:
+    // a carried level's targets may name a group whose id has changed, and
+    // its counts must follow the map's edge rule as it stands now. The
+    // result is deterministic, so only levels a changed link or group passes
+    // through change.
+    let drawn: Vec<Uuid> = docs
+        .iter()
+        .filter_map(|d| match d {
+            LevelDocument::Leaf(l) => Some(leaf_claims(l)),
+            LevelDocument::Group(_) => None,
+        })
+        .flatten()
+        .collect::<BTreeSet<Uuid>>()
+        .into_iter()
+        .collect();
+    let raw = AtlasLeafRepository::map_claim_links(&mut tx, viewer, map, &drawn).await?;
+    let links = fill_cross_links(&mut docs, &raw)?;
     // Every theme's, also one with no embedded member (no tree, so not in
     // `themes` above) and one carried, dropped or unbuilt.
     let unembedded =
@@ -512,6 +533,7 @@ async fn read_and_build(
         mirrors,
         themes: json!({"built": built, "carried": carried, "dropped": dropped, "unbuilt": unbuilt}),
         unembedded,
+        links,
         texts,
         names,
     }))
@@ -545,6 +567,7 @@ pub async fn night_for_map(
         mirrors,
         themes,
         unembedded,
+        links,
         texts,
         names,
     } = b;
@@ -605,6 +628,7 @@ pub async fn night_for_map(
         "levels": docs.len(),
         "themes": themes,
         "unembedded_members": unembedded,
+        "links": links,
         "layout": {"computed": fill.computed, "warm_started": fill.warm_started,
                    "reused": fill.reused, "relaid": relaid},
         "naming": {"report": naming_report, "renamed": renamed},
@@ -627,6 +651,7 @@ pub async fn night_for_map(
         "nightly_from_run": prev.id,
         "themes": report["themes"].clone(),
         "unembedded_members": unembedded,
+        "links": links,
         MIRRORS_KEY: mirrors,
     });
     // Errors stay in the report (the journal), not in a row the map's

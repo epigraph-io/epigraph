@@ -1143,3 +1143,80 @@ async fn node_labels_label_only_the_evidence_the_map_may_draw(pool: PgPool) {
         "the public map labels public evidence only"
     );
 }
+
+/// Atlas W9's cross-group links read: only claim-to-claim edges in force
+/// between two of the claims asked for, under the MAP edge rule. Team T's map
+/// gets T's own edges and public ones, never one co-owned with another team
+/// (the co-owner's members alone cannot read it), never another team's, and
+/// never a retracted one or one that touches evidence; the public map gets
+/// public edges only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn map_claim_links_return_only_claim_edges_the_map_may_draw(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let u = team(&pool, "team-u").await;
+    let world = fixture::world_group(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let filer = agent(&pool).await;
+    let tc = claims(&pool, filer, "group", t, 3).await;
+    let uc = claims(&pool, filer, "group", u, 1).await[0];
+    let pc = claims(&pool, filer, "public", world, 1).await[0];
+    let c = LeafNode::claim;
+    // In: T's own edge (070 stamps it T's from its endpoints).
+    edge(&pool, c(tc[0]), c(tc[1]), "supports").await;
+    // In on both maps: a public edge.
+    let public = edge(&pool, c(tc[0]), c(pc), "elaborates").await;
+    sqlx::query("UPDATE edges SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+        .bind(public)
+        .bind(world)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Out: co-owned by T and U.
+    let co = edge(&pool, c(tc[1]), c(tc[2]), "refutes").await;
+    force_edge(&pool, co, t, Some(u)).await;
+    // Out: owned by U, between two of T's claims.
+    let other = edge(&pool, c(tc[2]), c(tc[0]), "supports").await;
+    force_edge(&pool, other, u, None).await;
+    // Out: retracted.
+    let gone = edge(&pool, c(tc[1]), c(tc[0]), "cites").await;
+    retract_edge(&pool, gone).await;
+    // Out: evidence to a claim, and a claim edge to a claim not asked for.
+    evidence(&pool, tc[0], 1).await;
+    edge(&pool, c(tc[0]), c(uc), "supports").await;
+
+    let ids = [tc[0], tc[1], tc[2], pc];
+    let mut conn = pool.acquire().await.unwrap();
+    let mut team_links =
+        AtlasLeafRepository::map_claim_links(&mut conn, &system, AtlasMap::Team(t), &ids)
+            .await
+            .expect("map_claim_links");
+    team_links.sort();
+    let mut want = vec![
+        (tc[0], tc[1], "supports".to_string()),
+        (tc[0], pc, "elaborates".to_string()),
+    ];
+    want.sort();
+    assert_eq!(
+        team_links, want,
+        "team T's map: its own and public edges only"
+    );
+    let public_links =
+        AtlasLeafRepository::map_claim_links(&mut conn, &system, AtlasMap::Public, &ids)
+            .await
+            .expect("map_claim_links");
+    assert_eq!(
+        public_links,
+        vec![(tc[0], pc, "elaborates".to_string())],
+        "the public map: public edges only"
+    );
+    // Team U's map, asked about T's claims, gets U's edge but never the
+    // co-owned one: U's members alone cannot read it either.
+    let u_links = AtlasLeafRepository::map_claim_links(&mut conn, &system, AtlasMap::Team(u), &ids)
+        .await
+        .expect("map_claim_links");
+    assert!(
+        u_links.iter().all(|(s, tg, _)| (*s, *tg) != (tc[1], tc[2])),
+        "a co-owned edge on the co-owner's map: {u_links:?}"
+    );
+    assert!(u_links.contains(&(tc[2], tc[0], "supports".to_string())));
+}

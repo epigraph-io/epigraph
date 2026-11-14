@@ -15,7 +15,9 @@
 //!    neighbours, W5b mirrors, a leaf over the node cap or the contract's
 //!    1,024 edges split by W3's on-box fallback), checks them with W4's
 //!    and W5's checks, builds REAL leaves ([`leaves`]: W3 nodes, W7
-//!    weights), then, outside the snapshot, lays
+//!    weights), then, once every theme is final, the cross-group links of
+//!    the whole map ([`links`]: group bundles and targets, leaf outgoing,
+//!    over the same edge set and map rule), then, outside the snapshot, lays
 //!    out the changed levels (W6, warm-started) and names the changed groups
 //!    (W8, under a call budget, with no transaction open);
 //! 3. writes ONE new run per map holding both hierarchies, with the
@@ -37,4 +39,5 @@ const _: () = assert!(
 pub mod build;
 pub mod incremental;
 pub mod leaves;
+pub mod links;
 pub mod previous;

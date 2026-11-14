@@ -14,6 +14,7 @@ mod fixture;
 use std::collections::{BTreeMap, BTreeSet};
 
 use epigraph_atlas_contract::{parse_and_validate, LevelDocument, Node};
+use epigraph_cli::atlas_layout::force::{layout_group, GroupInput};
 use epigraph_cli::atlas_links::build::apply_hierarchies;
 use epigraph_cli::atlas_links::files::{LinksComputeVersions, LinksResultDoc, LinksResultTheme};
 use epigraph_cli::atlas_meaning::files::{ComputeVersions, ResultDoc, ResultTheme};
@@ -319,6 +320,23 @@ async fn operator_build(
     map: AtlasMap,
     themes: &[ThemeParts],
 ) -> Uuid {
+    let trees: Vec<ThemeTrees> = themes
+        .iter()
+        .map(|(t, m, l)| (*t, flat(map, M, *t, m), flat(map, L, *t, l)))
+        .collect();
+    operator_build_trees(pool, viewer, map, &trees).await
+}
+
+/// One theme of an operator build as wire trees: (theme, meaning, links).
+type ThemeTrees = (Uuid, Vec<WireGroup>, Vec<WireGroup>);
+
+/// [`operator_build`] with any tree shape.
+async fn operator_build_trees(
+    pool: &PgPool,
+    viewer: &Viewer,
+    map: AtlasMap,
+    themes: &[ThemeTrees],
+) -> Uuid {
     let meaning = ResultDoc {
         format: "atlas-meaning-result/1".to_string(),
         map: map_key(map),
@@ -331,7 +349,7 @@ async fn operator_build(
             .map(|(t, m, _)| ResultTheme {
                 theme_id: *t,
                 id_chunk_cuts: 0,
-                groups: flat(map, M, *t, m),
+                groups: m.clone(),
             })
             .collect(),
     };
@@ -348,7 +366,7 @@ async fn operator_build(
                 theme_id: *t,
                 id_chunk_cuts: 0,
                 embedding_splits: 0,
-                groups: flat(map, L, *t, l),
+                groups: l.clone(),
             })
             .collect(),
     };
@@ -1178,4 +1196,672 @@ async fn unembedded_members_are_counted_in_every_theme_of_the_map(pool: PgPool) 
     assert_eq!(a["unembedded_members"], 3, "{a:#}");
     let b = map_report(&summary, AtlasMap::Team(c.b_team));
     assert_eq!(b["unembedded_members"], 1, "{b:#}");
+}
+
+// ── cross-group links ───────────────────────────────────────────────────────
+
+/// A stored claim-to-claim edge; returns its id.
+async fn link_id(pool: &PgPool, source: Uuid, target: Uuid, rel: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', $3) RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(rel)
+    .fetch_one(pool)
+    .await
+    .expect("seed edge")
+}
+
+/// Force an edge's tenancy (070 stamps it from the endpoints on insert).
+async fn force_edge(pool: &PgPool, id: Uuid, visibility: &str, owner: Uuid, co: Option<Uuid>) {
+    let n = sqlx::query(
+        "UPDATE edges SET visibility = $2, owner_group_id = $3, \
+                          co_owner_group_id = $4 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(visibility)
+    .bind(owner)
+    .bind(co)
+    .execute(pool)
+    .await
+    .expect("force edge tenancy")
+    .rows_affected();
+    assert_eq!(n, 1);
+}
+
+/// [`claims`] of team `owner` in `theme`, with the given ids.
+async fn claims_with_ids(
+    pool: &PgPool,
+    theme: Uuid,
+    filer: Uuid,
+    owner: Uuid,
+    ids: &[Uuid],
+    axis: usize,
+) -> Vec<Uuid> {
+    for (i, id) in ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                                 visibility, owner_group_id, theme_id, embedding) \
+             VALUES ($1, 'nightly claim ' || $1::text, \
+                     decode(md5($1::text) || md5($1::text), 'hex'), 0.7, $2, true, 'group', $3, \
+                     $4, $5::vector)",
+        )
+        .bind(id)
+        .bind(filer)
+        .bind(owner)
+        .bind(theme)
+        .bind(vector(axis, u32::try_from(i).unwrap()))
+        .execute(pool)
+        .await
+        .expect("seed claim");
+    }
+    ids.to_vec()
+}
+
+async fn chain(pool: &PgPool, claims: &[Uuid]) {
+    for w in claims.windows(2) {
+        link(pool, w[0], "claim", w[1], "supports").await;
+    }
+}
+
+/// A map with links across groups, leaves and themes. Team T:
+/// * theme `x1`: leaves `a`, `b`, `c`, `d` of 25 claims each, each chained by
+///   `supports` and filed by its own agent (104 nodes, so not one leaf; every
+///   claim linked, so no mirror), built as `root -> {A, G -> {B, C}, D}` in
+///   both hierarchies;
+/// * theme `x2`: 3 claims `t`, one root leaf.
+///
+/// The links between leaves:
+/// * `a1 -> b1` supports (also stored as `SUPPORTS`: one link), `a2 -> b2`
+///   refutes, `b4 -> c4` contradicts, `c5 -> a5` elaborates, `d9 -> a9`
+///   decomposes_to, `a3 -> t0` cites (another theme);
+/// * `d6 -> b6` corroborates, a PUBLIC edge (it counts);
+/// * `a6 -> b6` supports, co-owned with team O (never counts);
+/// * `a7 -> d7` supports, owned by team O (never counts).
+struct Linked {
+    team: Uuid,
+    x1: Uuid,
+    x2: Uuid,
+    a: Vec<Uuid>,
+    b: Vec<Uuid>,
+    c: Vec<Uuid>,
+    d: Vec<Uuid>,
+    t: Vec<Uuid>,
+}
+
+/// The level ids of [`Linked`] in one hierarchy.
+struct LinkedIds {
+    root: Uuid,
+    g: Uuid,
+    a: Uuid,
+    b: Uuid,
+    c: Uuid,
+    d: Uuid,
+    rt: Uuid,
+}
+
+impl Linked {
+    async fn new(pool: &PgPool) -> Self {
+        let t_team = team(pool, "links team t").await;
+        let o_team = team(pool, "links team o").await;
+        let x1 = theme(pool, "links x1", 600).await;
+        let x2 = theme(pool, "links x2", 900).await;
+        let mut parts = Vec::new();
+        for (i, name) in ["Filer LA", "Filer LB", "Filer LC", "Filer LD"]
+            .into_iter()
+            .enumerate()
+        {
+            let f = agent(pool, name).await;
+            let cl = claims(pool, Some(x1), f, Some(t_team), 25, 600 + i * 10).await;
+            chain(pool, &cl).await;
+            parts.push(cl);
+        }
+        let ft = agent(pool, "Filer LT").await;
+        let t = claims(pool, Some(x2), ft, Some(t_team), 3, 900).await;
+        let d = parts.pop().unwrap();
+        let c = parts.pop().unwrap();
+        let b = parts.pop().unwrap();
+        let a = parts.pop().unwrap();
+        link(pool, a[1], "claim", b[1], "supports").await;
+        link(pool, a[1], "claim", b[1], "SUPPORTS").await;
+        link(pool, a[2], "claim", b[2], "refutes").await;
+        link(pool, b[4], "claim", c[4], "contradicts").await;
+        link(pool, c[5], "claim", a[5], "elaborates").await;
+        link(pool, d[9], "claim", a[9], "decomposes_to").await;
+        link(pool, a[3], "claim", t[0], "cites").await;
+        let public = link_id(pool, d[6], b[6], "corroborates").await;
+        force_edge(pool, public, "public", WORLD, None).await;
+        let co = link_id(pool, a[6], b[6], "supports").await;
+        force_edge(pool, co, "group", t_team, Some(o_team)).await;
+        let other = link_id(pool, a[7], d[7], "supports").await;
+        force_edge(pool, other, "group", o_team, None).await;
+        Self {
+            team: t_team,
+            x1,
+            x2,
+            a,
+            b,
+            c,
+            d,
+            t,
+        }
+    }
+
+    fn map(&self) -> AtlasMap {
+        AtlasMap::Team(self.team)
+    }
+
+    fn ids(&self, h: AtlasHierarchy) -> LinkedIds {
+        let m = self.map();
+        let bc: BTreeSet<Uuid> = self.b.iter().chain(&self.c).copied().collect();
+        LinkedIds {
+            root: root_id(m, h, self.x1),
+            g: group_id(m, h, self.x1, &bc),
+            a: group_id(m, h, self.x1, &set(&self.a)),
+            b: group_id(m, h, self.x1, &set(&self.b)),
+            c: group_id(m, h, self.x1, &set(&self.c)),
+            d: group_id(m, h, self.x1, &set(&self.d)),
+            rt: root_id(m, h, self.x2),
+        }
+    }
+
+    /// `root -> {A, G -> {B, C}, D}` as a wire tree.
+    fn tree(&self, h: AtlasHierarchy) -> Vec<WireGroup> {
+        let i = self.ids(h);
+        let group = |id, parent, depth, children: Vec<Uuid>| WireGroup {
+            id,
+            parent,
+            depth,
+            kind: WireKind::Group,
+            claim_count: 0,
+            weight: 0,
+            members: None,
+            children: Some(children),
+        };
+        vec![
+            group(i.root, None, 0, vec![i.a, i.g, i.d]),
+            wire_leaf(i.a, Some(i.root), 1, &set(&self.a)),
+            group(i.g, Some(i.root), 1, vec![i.b, i.c]),
+            wire_leaf(i.b, Some(i.g), 2, &set(&self.b)),
+            wire_leaf(i.c, Some(i.g), 2, &set(&self.c)),
+            wire_leaf(i.d, Some(i.root), 1, &set(&self.d)),
+        ]
+    }
+
+    async fn build(&self, pool: &PgPool, viewer: &Viewer) {
+        let t = set(&self.t);
+        operator_build_trees(
+            pool,
+            viewer,
+            self.map(),
+            &[
+                (self.x1, self.tree(M), self.tree(L)),
+                (
+                    self.x2,
+                    flat(self.map(), M, self.x2, std::slice::from_ref(&t)),
+                    flat(self.map(), L, self.x2, std::slice::from_ref(&t)),
+                ),
+            ],
+        )
+        .await;
+    }
+}
+
+type BundleRow = (Uuid, Uuid, u32, i8);
+type OutRow = (Uuid, u32, i8, Vec<Uuid>);
+
+/// A stored run's documents of one hierarchy, by level id.
+async fn docs_of(pool: &PgPool, run: Uuid, h: AtlasHierarchy) -> BTreeMap<Uuid, LevelDocument> {
+    levels(pool, run)
+        .await
+        .into_iter()
+        .filter(|((hh, _), _)| hh == h.as_str())
+        .map(|((_, id), (_, p))| (id, parse(&p)))
+        .collect()
+}
+
+fn bundles_of(docs: &BTreeMap<Uuid, LevelDocument>, id: Uuid) -> BTreeSet<BundleRow> {
+    let LevelDocument::Group(g) = &docs[&id] else {
+        panic!("{id} is not a group")
+    };
+    g.bundles
+        .iter()
+        .map(|b| (b.source, b.target, b.count, b.net_sign))
+        .collect()
+}
+
+fn targets_of(docs: &BTreeMap<Uuid, LevelDocument>, id: Uuid) -> BTreeSet<(Uuid, Uuid, u8)> {
+    let LevelDocument::Group(g) = &docs[&id] else {
+        panic!("{id} is not a group")
+    };
+    g.targets
+        .iter()
+        .map(|t| (t.level_id, t.theme_id, t.depth))
+        .collect()
+}
+
+fn outgoing_of(docs: &BTreeMap<Uuid, LevelDocument>, id: Uuid) -> BTreeSet<OutRow> {
+    let LevelDocument::Leaf(l) = &docs[&id] else {
+        panic!("{id} is not a leaf")
+    };
+    l.outgoing
+        .iter()
+        .map(|o| {
+            let mut s = o.sources.clone();
+            s.sort();
+            (o.target.level_id, o.count, o.net_sign, s)
+        })
+        .collect()
+}
+
+fn name_of(doc: &LevelDocument) -> Option<String> {
+    match doc {
+        LevelDocument::Group(g) => g.name.clone(),
+        LevelDocument::Leaf(l) => l.name.clone(),
+    }
+}
+
+/// The run's documents with `run_id` taken out, serialised: what must stay
+/// byte-identical for a level the night did not change.
+async fn bodies(pool: &PgPool, run: Uuid) -> BTreeMap<(String, Uuid), Vec<u8>> {
+    levels(pool, run)
+        .await
+        .into_iter()
+        .map(|(k, (_, mut p))| {
+            p.as_object_mut().unwrap().remove("run_id");
+            (k, serde_json::to_vec(&p).unwrap())
+        })
+        .collect()
+}
+
+fn built_ids(r: &Value) -> BTreeSet<Uuid> {
+    r["themes"]["built"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| serde_json::from_value(t["theme_id"].clone()).unwrap())
+        .collect()
+}
+
+/// Done when: a two-theme map with links across groups, leaves and themes
+/// stores the expected bundles, targets and outgoing links in both
+/// hierarchies. Each outside link points at the shallowest level the viewer
+/// can navigate to: the group under the common ancestor in the same theme,
+/// the other theme's root (depth 0) across themes. Counts and net signs
+/// follow W7's sign rule, and every target carries its own level's name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn links_across_groups_leaves_and_themes_fill_bundles_targets_and_outgoing(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let l = Linked::new(&pool).await;
+    l.build(&pool, &viewer).await;
+    let summary = night(&pool, &viewer, &namer(), &opts()).await;
+    let r = map_report(&summary, l.map());
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(built_ids(r), [l.x1, l.x2].into(), "{r:#}");
+    assert_eq!(r["links"]["dropped_outgoing"], 0, "{r:#}");
+    let run = latest(&pool, l.map()).await;
+    for h in [M, L] {
+        let i = l.ids(h);
+        let docs = docs_of(&pool, run, h).await;
+        assert_eq!(
+            bundles_of(&docs, i.root),
+            [
+                (i.a, i.g, 2, 0),
+                (i.g, i.a, 1, 1),
+                (i.a, i.rt, 1, 0),
+                (i.d, i.a, 1, 0),
+                (i.d, i.g, 1, 1),
+            ]
+            .into(),
+            "{} root",
+            h.as_str()
+        );
+        assert_eq!(targets_of(&docs, i.root), [(i.rt, l.x2, 0)].into());
+        assert_eq!(
+            bundles_of(&docs, i.g),
+            [
+                (i.b, i.a, 2, 0),
+                (i.b, i.c, 1, -1),
+                (i.c, i.a, 1, 1),
+                (i.b, i.d, 1, 1),
+            ]
+            .into(),
+            "{} G",
+            h.as_str()
+        );
+        assert_eq!(
+            targets_of(&docs, i.g),
+            [(i.a, l.x1, 1), (i.d, l.x1, 1)].into()
+        );
+        let sorted = |v: &[Uuid]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        let (a, b, c, d) = (&l.a, &l.b, &l.c, &l.d);
+        assert_eq!(
+            outgoing_of(&docs, i.a),
+            [
+                (i.g, 3, 1, sorted(&[a[1], a[2], a[5]])),
+                (i.rt, 1, 0, vec![a[3]]),
+                (i.d, 1, 0, vec![a[9]]),
+            ]
+            .into(),
+            "{} A",
+            h.as_str()
+        );
+        assert_eq!(
+            outgoing_of(&docs, i.b),
+            [
+                (i.a, 2, 0, sorted(&[b[1], b[2]])),
+                (i.c, 1, -1, vec![b[4]]),
+                (i.d, 1, 1, vec![b[6]]),
+            ]
+            .into()
+        );
+        assert_eq!(
+            outgoing_of(&docs, i.c),
+            [(i.b, 1, -1, vec![c[4]]), (i.a, 1, 1, vec![c[5]])].into()
+        );
+        assert_eq!(
+            outgoing_of(&docs, i.d),
+            [(i.a, 1, 0, vec![d[9]]), (i.g, 1, 1, vec![d[6]])].into()
+        );
+        assert_eq!(
+            outgoing_of(&docs, i.rt),
+            [(i.root, 1, 0, vec![l.t[0]])].into()
+        );
+        // Every link target is named as its own level is.
+        for doc in docs.values() {
+            let named: Vec<&epigraph_atlas_contract::LinkTarget> = match doc {
+                LevelDocument::Group(g) => g.targets.iter().collect(),
+                LevelDocument::Leaf(x) => x.outgoing.iter().map(|o| &o.target).collect(),
+            };
+            for t in named {
+                assert!(t.name.is_some());
+                assert_eq!(t.name, name_of(&docs[&t.level_id]));
+            }
+        }
+    }
+}
+
+/// Done when: a co-owned edge, or one another team owns, never contributes
+/// to a bundle, a target or an outgoing link, even between two of the team's
+/// own claims; a public edge between them does (the positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_co_owned_or_other_teams_edge_never_makes_a_link_but_a_public_one_does(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let l = Linked::new(&pool).await;
+    l.build(&pool, &viewer).await;
+    night(&pool, &viewer, &namer(), &opts()).await;
+    let run = latest(&pool, l.map()).await;
+    for h in [M, L] {
+        let i = l.ids(h);
+        let docs = docs_of(&pool, run, h).await;
+        let mut sources = BTreeSet::new();
+        for doc in docs.values() {
+            if let LevelDocument::Leaf(x) = doc {
+                for o in &x.outgoing {
+                    sources.extend(o.sources.iter().copied());
+                }
+            }
+        }
+        // a6 and a7 have only the co-owned and the other team's edge across
+        // leaves; d7 only the other team's.
+        for (who, id) in [("a6", l.a[6]), ("a7", l.a[7]), ("d7", l.d[7])] {
+            assert!(
+                !sources.contains(&id),
+                "{}: {who} is a link source",
+                h.as_str()
+            );
+        }
+        // The public edge d6 -> b6 counts.
+        assert!(sources.contains(&l.d[6]) && sources.contains(&l.b[6]));
+        let root = bundles_of(&docs, i.root);
+        assert!(
+            root.contains(&(i.a, i.g, 2, 0)),
+            "{}: the co-owned edge counted: {root:?}",
+            h.as_str()
+        );
+        assert!(
+            !root.iter().any(|b| (b.0, b.1) == (i.a, i.d)),
+            "{}: the other team's edge counted: {root:?}",
+            h.as_str()
+        );
+        assert!(
+            root.contains(&(i.d, i.g, 1, 1)),
+            "the public edge is missing"
+        );
+    }
+}
+
+/// Done when: a second night over unchanged input, links included, is still
+/// unchanged (no run written, so every stored byte stays) with zero model
+/// calls; and one new link changes only the levels it passes through, every
+/// other level byte-identical, with no model call and only its group
+/// re-laid.
+#[sqlx::test(migrations = "../../migrations")]
+async fn links_stay_byte_identical_until_a_link_changes_and_then_only_where_it_passes(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let l = Linked::new(&pool).await;
+    l.build(&pool, &viewer).await;
+    let backend = namer();
+    night(&pool, &viewer, &backend, &opts()).await;
+    let first = latest(&pool, l.map()).await;
+    let before = bodies(&pool, first).await;
+    let calls = backend.calls();
+
+    let second = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&second, l.map());
+    assert_eq!(r["status"], "unchanged", "{r:#}");
+    assert_eq!(backend.calls(), calls, "the second night called the model");
+    assert_eq!(latest(&pool, l.map()).await, first);
+
+    // One more link inside G: B -> C.
+    link(&pool, l.b[10], "claim", l.c[10], "supports").await;
+    let third = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&third, l.map());
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(backend.calls(), calls, "a new link called the model");
+    let after = bodies(&pool, latest(&pool, l.map()).await).await;
+    assert_eq!(
+        after.keys().collect::<BTreeSet<_>>(),
+        before.keys().collect::<BTreeSet<_>>()
+    );
+    let mut changed = BTreeSet::new();
+    for (k, body) in &after {
+        if before[k] != *body {
+            changed.insert(format!("{}/{}", k.0, k.1));
+        }
+    }
+    let mut want = BTreeSet::new();
+    let mut relay = BTreeSet::new();
+    for h in [M, L] {
+        let i = l.ids(h);
+        for id in [i.g, i.b, i.c] {
+            want.insert(format!("{}/{id}", h.as_str()));
+        }
+        relay.insert(format!("{}/{}", h.as_str(), i.g));
+    }
+    assert_eq!(changed, want);
+    assert_eq!(relaid(r), relay, "{r:#}");
+}
+
+/// Done when: positions pull linked children together. Twelve equal leaves
+/// under one root, in two families of six densely linked to each other (as
+/// W6's own layout test): the root's linked children sit closer on average
+/// than its unlinked ones, in both hierarchies, and closer than W6 places
+/// the same children with no bundles (same seed, same sizes).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_group_layout_pulls_linked_children_together(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // Fixed team, theme and claim ids, so every group id (UUIDv5 of the map,
+    // the theme and the members) and with them the layout's seeds are the
+    // same on every run.
+    let t_team = Uuid::from_u128(0x6c61_796f_7574_0001_0000_0000_0000_0001);
+    let key: Vec<u8> = t_team.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind) \
+         VALUES ($1, 'layout team', 'did:epigraph:test-team:' || $1::text, $2, 'team')",
+    )
+    .bind(t_team)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let y = Uuid::from_u128(0x6c61_796f_7574_0002_0000_0000_0000_0001);
+    sqlx::query(
+        "INSERT INTO claim_themes (id, label, centroid) VALUES ($1, 'layout y', $2::vector)",
+    )
+    .bind(y)
+    .bind(vector(1000, 0))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut kids = Vec::new();
+    for i in 0..12_u32 {
+        let f = agent(&pool, &format!("Filer K{i}")).await;
+        let ids: Vec<Uuid> = (0..10_u32)
+            .map(|j| {
+                Uuid::from_u128(0x6c61_796f_7574_0000_0000_0000_0000_0000 | u128::from(i * 100 + j))
+            })
+            .collect();
+        let cl = claims_with_ids(&pool, y, f, t_team, &ids, 1000 + i as usize * 10).await;
+        chain(&pool, &cl).await;
+        kids.push(cl);
+    }
+    for fam in 0..2 {
+        for x in 0..6 {
+            for z in (x + 1)..6 {
+                for k in 0..8 {
+                    link(
+                        &pool,
+                        kids[fam * 6 + x][k],
+                        "claim",
+                        kids[fam * 6 + z][k],
+                        "supports",
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    let map = AtlasMap::Team(t_team);
+    let parts: Vec<BTreeSet<Uuid>> = kids.iter().map(|k| set(k)).collect();
+    operator_build(&pool, &viewer, map, &[(y, parts.clone(), parts.clone())]).await;
+    night(&pool, &viewer, &namer(), &opts()).await;
+    let run = latest(&pool, map).await;
+    for h in [M, L] {
+        let docs = docs_of(&pool, run, h).await;
+        let LevelDocument::Group(root) = &docs[&root_id(map, h, y)] else {
+            panic!("the root is not a group")
+        };
+        let ids: Vec<Uuid> = parts.iter().map(|p| group_id(map, h, y, p)).collect();
+        // The ratio of the linked pairs' mean distance to the unlinked
+        // pairs'.
+        let ratio = |at: &BTreeMap<Uuid, (f64, f64)>| {
+            let (mut on, mut non, mut off, mut noff) = (0.0, 0.0, 0.0, 0.0);
+            for i in 0..12 {
+                for j in (i + 1)..12 {
+                    let (p, q) = (at[&ids[i]], at[&ids[j]]);
+                    let d = ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt();
+                    if i / 6 == j / 6 {
+                        on += d;
+                        non += 1.0;
+                    } else {
+                        off += d;
+                        noff += 1.0;
+                    }
+                }
+            }
+            (on / non) / (off / noff)
+        };
+        let stored: BTreeMap<Uuid, (f64, f64)> =
+            root.children.iter().map(|c| (c.id, (c.x, c.y))).collect();
+        // The same level laid out by W6 with the same seed and sizes but no
+        // bundles: what the night stored before the links were built.
+        let unlinked = layout_group(
+            root.level_id,
+            &GroupInput::new(
+                root.children
+                    .iter()
+                    .map(|c| (c.id, u64::from(c.claim_count))),
+                std::iter::empty(),
+            )
+            .unwrap(),
+        );
+        let without: BTreeMap<Uuid, (f64, f64)> = unlinked
+            .into_iter()
+            .map(|(id, c)| (id, (c.x, c.y)))
+            .collect();
+        let (with_links, no_links) = (ratio(&stored), ratio(&without));
+        assert!(
+            with_links < 1.0,
+            "{}: linked children sit no closer than unlinked ones ({with_links})",
+            h.as_str()
+        );
+        assert!(
+            with_links < no_links - 0.05,
+            "{}: the links did not pull their children together ({with_links} against \
+             {no_links} without them)",
+            h.as_str()
+        );
+    }
+}
+
+/// Done when: over-cap truncation keeps the heaviest and reports the rest.
+/// One leaf linked into 65 other themes' root leaves (the contract allows a
+/// leaf 64 outgoing targets): 64 targets carry two links, one carries one.
+/// The night completes, the light target is the one cut, and the run summary
+/// and the run's params count it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_leaf_over_the_outgoing_cap_keeps_its_heaviest_targets_and_the_night_reports_the_rest(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let t_team = team(&pool, "cap team").await;
+    let f = agent(&pool, "Filer Z").await;
+    let z0 = theme(&pool, "cap z0", 1100).await;
+    let hub = claims(&pool, Some(z0), f, Some(t_team), 1, 1100).await[0];
+    let n = epigraph_atlas_contract::MAX_LEAF_OUTGOING + 1;
+    let mut themes = Vec::new();
+    // A run is the whole map, so the operator build holds every theme.
+    let mut parts: Vec<ThemeParts> = vec![(z0, vec![set(&[hub])], vec![set(&[hub])])];
+    for i in 0..n {
+        let z = theme(&pool, &format!("cap z{}", i + 1), 1200 + i).await;
+        let k = if i == 0 { 1 } else { 2 };
+        let cl = claims(&pool, Some(z), f, Some(t_team), k, 1200 + i).await;
+        for c in &cl {
+            link(&pool, hub, "claim", *c, "supports").await;
+        }
+        parts.push((z, vec![set(&cl)], vec![set(&cl)]));
+        themes.push(z);
+    }
+    let map = AtlasMap::Team(t_team);
+    operator_build(&pool, &viewer, map, &parts).await;
+    let summary = night(&pool, &viewer, &namer(), &opts()).await;
+    let r = map_report(&summary, map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(built_ids(r).len(), n + 1, "{r:#}");
+    // One cut per hierarchy.
+    assert_eq!(r["links"]["dropped_outgoing"], 2, "{r:#}");
+    assert_eq!(r["links"]["dropped_links"], 2, "{r:#}");
+    let run = latest(&pool, map).await;
+    let params: Value = sqlx::query_scalar("SELECT params FROM atlas_map_runs WHERE id = $1")
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(params["links"], r["links"]);
+    for h in [M, L] {
+        let docs = docs_of(&pool, run, h).await;
+        let out = outgoing_of(&docs, root_id(map, h, z0));
+        assert_eq!(out.len(), epigraph_atlas_contract::MAX_LEAF_OUTGOING);
+        assert!(out.iter().all(|o| o.1 == 2), "a light target was kept");
+        assert!(!out.iter().any(|o| o.0 == root_id(map, h, themes[0])));
+    }
 }
