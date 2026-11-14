@@ -1998,7 +1998,7 @@
       "why_not_here": "A new file under migrations/ is a blocking finding for this batch by the brief's own terms, and which number is free is an operator decision rather than a batch's. Reported with the measurement rather than worked around. The statement-level half is complete as of this batch: every writer of a claim vector in the workspace now carries the predicate, and the two CLI-side selections that could reach a sealed row now exclude it.",
       "hazard_if_ignored": "Enforcement stays a convention across a growing set of writers, so a future writer added without the predicate would be caught only by review or by CLAUDE.md's sealed_with_embedding audit -- which is a detector, after the fact, not a preventer.",
       "noted_in_code": "crates/epigraph-db/src/repos/claim.rs::store_embedding doc comment; CLAUDE.md embedding-policy audit",
-      "status": "discharged in place by migration 212 (backlog f78526ad, 2026-11-14)",
+      "status": "discharged in tree by migration 212 (backlog f78526ad, 2026-11-14); PENDING DEPLOY: until 212 is applied to a deployed database, that database still relies on the statement-level predicates alone",
       "disposition": "CLOSED",
       "discharged_by": "migrations/212_sealed_row_vector_guard.sql: BEFORE UPDATE OF embedding, embedding_3072 triggers on claims and evidence, keyed on each row's own encryption row, SECURITY DEFINER owned by epigraph_maintenance. Pinned by crates/epigraph-db/tests/sealed_row_vector_guard.rs. The same branch fixed or deleted the four writers that lacked the statement-level predicate."
     }
