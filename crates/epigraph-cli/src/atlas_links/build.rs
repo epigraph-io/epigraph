@@ -397,10 +397,34 @@ pub async fn write_meaning_levels_switched(
 /// transaction. Without `write` it builds every document of both and writes
 /// nothing. On any refusal nothing is written.
 ///
+/// With `write`, the whole build holds the map's publish lock
+/// (`AtlasMapRepository::lock_map_for_build`, taken before the snapshot), so
+/// a nightly that built from an older run cannot publish over this one.
+///
 /// # Errors
 /// Any refusal of W4's `resolve_result`, [`resolve_links_result`] or the
 /// document builders, or a database error.
 pub async fn apply_hierarchies(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    meaning: &ResultDoc,
+    links: &LinksResultDoc,
+    cap: usize,
+    write: bool,
+) -> anyhow::Result<serde_json::Value> {
+    if !write {
+        return build_hierarchies(conn, viewer, map, meaning, links, cap, false).await;
+    }
+    AtlasMapRepository::lock_map_for_build(conn, map).await?;
+    let built = build_hierarchies(conn, viewer, map, meaning, links, cap, true).await;
+    let unlocked = AtlasMapRepository::unlock_map_for_build(conn, map).await;
+    let report = built?;
+    unlocked?;
+    Ok(report)
+}
+
+async fn build_hierarchies(
     conn: &mut PgConnection,
     viewer: &Viewer,
     map: AtlasMap,

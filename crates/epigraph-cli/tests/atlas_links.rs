@@ -931,3 +931,123 @@ async fn a_meaning_only_apply_refuses_to_hide_a_links_run(pool: PgPool) {
     .unwrap();
     assert_eq!(latest, run, "nothing was written");
 }
+
+/// Whether another session starts waiting on an advisory lock within 10 s.
+async fn an_advisory_waiter_appears(pool: &PgPool) -> bool {
+    for _ in 0..100 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Review finding (W9 #2): an operator apply takes the map's publish lock,
+/// and takes it BEFORE its build snapshot. While another session holds the
+/// lock (as the nightly does while it publishes), a meaning-only apply
+/// waits; that session publishes a links run and lets go; the apply's
+/// snapshot, taken only now, sees the links run, and it refuses to hide it.
+/// A lock taken late (inside the snapshot) or not at all lets the apply
+/// write a meaning-only run instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_meaning_only_apply_waits_for_a_publish_and_then_sees_it(pool: PgPool) {
+    use sqlx::Connection;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let run = run_id(
+        &apply(&pool, &viewer, &c, &links_result(&c))
+            .await
+            .expect("apply"),
+    );
+    // Unpublish it: no run is served, so nothing is hidden yet.
+    sqlx::query("UPDATE atlas_map_runs SET finished_at = NULL, level_count = NULL WHERE id = $1")
+        .bind(run)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut holder = pool.acquire().await.unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    AtlasMapRepository::lock_map_for_publish(&mut tx, map)
+        .await
+        .unwrap();
+    let watcher = pool.clone();
+    let publish = async move {
+        let waited = an_advisory_waiter_appears(&watcher).await;
+        AtlasMapRepository::finish_run(&mut tx, run).await.unwrap();
+        tx.commit().await.unwrap();
+        waited
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let meaning = meaning_result(&c);
+    let (applied, waited) = tokio::join!(
+        epigraph_cli::atlas_meaning::build::apply_result(
+            &mut conn, &viewer, map, &meaning, CAP, true
+        ),
+        publish
+    );
+    assert!(waited, "the apply never waited for the publish lock");
+    let err = applied.expect_err("the apply must see the links run published meanwhile");
+    assert!(format!("{err:#}").contains("links"), "{err:#}");
+    let latest: Uuid = sqlx::query_scalar(
+        "SELECT id FROM atlas_map_runs WHERE finished_at IS NOT NULL \
+          ORDER BY finished_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(latest, run, "nothing was written over the links run");
+    // The build lock was released: the session can take it again at once.
+    let mut again = pool.acquire().await.unwrap();
+    let mut tx = again.begin().await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        AtlasMapRepository::lock_map_for_publish(&mut tx, map),
+    )
+    .await
+    .expect("the apply left the lock held")
+    .unwrap();
+}
+
+/// Review finding (W9 #2): `atlas_links apply` waits for the map's publish
+/// lock too, so a nightly that checked "my previous run is still the
+/// latest" cannot then publish over the rebuild; the apply's run, finished
+/// after the lock is released, is the one served.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_both_hierarchies_apply_waits_for_the_publish_lock(pool: PgPool) {
+    use sqlx::Connection;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let mut holder = pool.acquire().await.unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    AtlasMapRepository::lock_map_for_publish(&mut tx, map)
+        .await
+        .unwrap();
+    let watcher = pool.clone();
+    let release = async move {
+        let waited = an_advisory_waiter_appears(&watcher).await;
+        tx.commit().await.unwrap();
+        waited
+    };
+    let links = links_result(&c);
+    let (applied, waited) = tokio::join!(apply(&pool, &viewer, &c, &links), release);
+    assert!(waited, "the apply never waited for the publish lock");
+    let run = run_id(&applied.expect("the apply runs once the lock is free"));
+    let latest: Uuid = sqlx::query_scalar(
+        "SELECT id FROM atlas_map_runs WHERE finished_at IS NOT NULL \
+          ORDER BY finished_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(latest, run);
+}

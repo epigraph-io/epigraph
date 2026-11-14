@@ -1079,3 +1079,73 @@ async fn the_nightly_prunes_its_map_to_keep_runs(pool: PgPool) {
         "exactly the two newest runs are kept"
     );
 }
+
+/// The nightly's "a newer run was published meanwhile" path: another
+/// session holds team A's publish lock while the nightly builds, publishes a
+/// newer run of the map and lets go. The nightly, which built from the
+/// older run, writes nothing over it ("superseded"); the newer run stays
+/// served.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_night_that_finds_a_newer_run_at_publish_writes_nothing(pool: PgPool) {
+    use sqlx::Connection;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let backend = namer();
+    night(&pool, &viewer, &backend, &opts()).await;
+    claims(&pool, None, c.fa, Some(c.a_team), 1, 0).await;
+
+    let mut holder = pool.acquire().await.unwrap();
+    let mut tx = holder.begin().await.unwrap();
+    AtlasMapRepository::lock_map_for_publish(&mut tx, a_map)
+        .await
+        .unwrap();
+    let watcher = pool.clone();
+    let publish = async move {
+        let mut waited = false;
+        for _ in 0..600 {
+            waited = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks \
+                   WHERE locktype = 'advisory' AND NOT granted)",
+            )
+            .fetch_one(&watcher)
+            .await
+            .unwrap();
+            if waited {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let newer = AtlasMapRepository::write_run(
+            &mut tx,
+            &NewMapRun {
+                map: a_map,
+                algo: "operator-rebuild-test".to_string(),
+                params: serde_json::json!({}),
+                epochs: MapEpochs::default(),
+            },
+        )
+        .await
+        .unwrap();
+        AtlasMapRepository::finish_run(&mut tx, newer)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        (waited, newer)
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let o = opts();
+    let (ran, (waited, newer)) = tokio::join!(run_night(&mut conn, &viewer, &backend, &o), publish);
+    assert!(waited, "the nightly never waited for the publish lock");
+    let (summary, ok) = ran.expect("the night runs");
+    assert!(ok, "{summary:#}");
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "superseded", "{r:#}");
+    assert!(r.get("run_id").is_none(), "{r:#}");
+    assert_eq!(
+        latest(&pool, a_map).await,
+        newer,
+        "the newer run stays served"
+    );
+}

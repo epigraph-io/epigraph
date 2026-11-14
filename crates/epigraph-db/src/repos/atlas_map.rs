@@ -441,7 +441,9 @@ impl AtlasMapRepository {
     /// ends: a transaction-level advisory lock keyed by the map. Every writer
     /// that checks "is the run I built from still the latest?" before it
     /// publishes takes it first (the nightly and the naming step's write), so
-    /// the check and the publish cannot interleave with another's.
+    /// the check and the publish cannot interleave with another's. The
+    /// operator builds take the same key for their whole build
+    /// ([`Self::lock_map_for_build`]).
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the statement fails.
@@ -458,6 +460,57 @@ impl AtlasMapRepository {
         .bind(visibility)
         .execute(&mut *conn)
         .await?;
+        Ok(())
+    }
+
+    /// Hold the publish lock of `map` ([`Self::lock_map_for_publish`]'s key)
+    /// for the SESSION, until [`Self::unlock_map_for_build`]: an operator
+    /// build (`atlas_meaning apply`, `atlas_links apply`) takes it BEFORE its
+    /// build transaction opens, so its snapshot is taken after every
+    /// publish that finished first (a meaning-only apply then sees a links
+    /// run the nightly published meanwhile, and refuses), and a nightly
+    /// publish waits for the build to commit and then finds a newer run than
+    /// the one it built from (it writes nothing). Call it outside any
+    /// transaction, and release it on every exit.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn lock_map_for_build(conn: &mut PgConnection, map: AtlasMap) -> Result<(), DbError> {
+        let (owner, visibility) = map.tenancy();
+        sqlx::query(
+            "SELECT pg_advisory_lock(hashtextextended( \
+                 'atlas-map-publish|' || $1::text || '|' || $2, 0))",
+        )
+        .bind(owner)
+        .bind(visibility)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Release [`Self::lock_map_for_build`]'s session lock of `map`.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails, `DbError::InvalidData`
+    /// when this session did not hold the lock.
+    pub async fn unlock_map_for_build(
+        conn: &mut PgConnection,
+        map: AtlasMap,
+    ) -> Result<(), DbError> {
+        let (owner, visibility) = map.tenancy();
+        let held: bool = sqlx::query_scalar(
+            "SELECT pg_advisory_unlock(hashtextextended( \
+                 'atlas-map-publish|' || $1::text || '|' || $2, 0))",
+        )
+        .bind(owner)
+        .bind(visibility)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !held {
+            return Err(DbError::InvalidData {
+                reason: "this session did not hold the map's build lock".to_string(),
+            });
+        }
         Ok(())
     }
 

@@ -301,10 +301,34 @@ pub async fn write_meaning_levels(
 /// latest finished run of a map, so it hides any earlier run's links
 /// hierarchy. The report says so.
 ///
+/// With `write`, the whole build holds the map's publish lock
+/// (`AtlasMapRepository::lock_map_for_build`, taken before the snapshot), so
+/// [`refuse_to_hide_links`] sees every run published before this one, and a
+/// nightly that built from an older run cannot publish over it.
+///
 /// # Errors
 /// Any refusal of [`resolve_result`] or [`write_meaning_levels`], or a
 /// database error.
 pub async fn apply_result(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    result: &ResultDoc,
+    cap: usize,
+    write: bool,
+) -> anyhow::Result<serde_json::Value> {
+    if !write {
+        return build_result(conn, viewer, map, result, cap, false).await;
+    }
+    AtlasMapRepository::lock_map_for_build(conn, map).await?;
+    let built = build_result(conn, viewer, map, result, cap, true).await;
+    let unlocked = AtlasMapRepository::unlock_map_for_build(conn, map).await;
+    let report = built?;
+    unlocked?;
+    Ok(report)
+}
+
+async fn build_result(
     conn: &mut PgConnection,
     viewer: &Viewer,
     map: AtlasMap,

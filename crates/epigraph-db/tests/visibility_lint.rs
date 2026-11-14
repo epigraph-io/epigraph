@@ -2796,6 +2796,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          nightly and the naming step's write serialise their publish of one map; it touches no \
          table.",
     ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_build",
+        "NO ROW READ. Takes the session-level `pg_advisory_lock` on the same key as \
+         lock_map_for_publish, so an operator build and the nightly's publish of one map \
+         serialise; it touches no table.",
+    ),
+    (
+        "atlas_map.rs",
+        "unlock_map_for_build",
+        "NO ROW READ. Releases lock_map_for_build's session advisory lock; it touches no table.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
