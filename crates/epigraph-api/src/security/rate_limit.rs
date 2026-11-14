@@ -497,7 +497,7 @@ impl AgentRateLimiter {
                     None => buckets
                         .overflow
                         .as_mut()
-                        .map_or(true, |bucket| bucket.take_record_slot(now)),
+                        .is_none_or(|bucket| bucket.take_record_slot(now)),
                 }
             }
             RateLimitError::GlobalLimitExceeded { .. } => self
