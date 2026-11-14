@@ -1051,6 +1051,60 @@ async fn an_evidence_edge_with_no_readable_mass_is_none_and_the_leaf_validates(p
         .expect("the leaf with a none evidence edge validates and encodes");
 }
 
+/// A `refutes` evidence edge with no mass the map's audience can read keeps
+/// its direction in its relationship: it is served `refutes`, lower-cased
+/// from the legacy `REFUTES` spelling, with basis `none`, sign 0 and weight
+/// 0, so a reader can style refuting evidence that carries no mass. The leaf
+/// validates. Control: on the map of the team that owns the evidence's mass
+/// row, the same edge is `exact` with sign -1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refutes_evidence_edge_with_no_readable_mass_is_served_refutes_with_basis_none(
+    pool: PgPool,
+) {
+    let u = team(&pool, "flow-u").await;
+    let world = fixture::world_group(&pool).await;
+    let f = agent(&pool).await;
+    let x = agent(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let binary = frame(&pool, 2).await;
+
+    let p = claim(&pool, f, "public", world).await;
+    let ev = evidence_row(&pool, p).await;
+    force_evidence_public(&pool, ev, world).await;
+    evidence_edge(&pool, ev, p, "REFUTES").await;
+    let of_u = bba(
+        &pool,
+        p,
+        binary,
+        x,
+        None,
+        Some(ev),
+        json!({"1": 0.6, "0,1": 0.4}),
+    )
+    .await;
+    force_bba_owner(&pool, of_u, u).await;
+
+    let (set, public) = build(&pool, &system, AtlasMap::Public, &[p]).await;
+    let served: Vec<&Edge> = public.iter().filter(|e| e.source == ev).collect();
+    assert_eq!(served.len(), 1, "one evidence edge, in {public:#?}");
+    let e = served[0];
+    assert_eq!(
+        (e.target, e.relationship.as_str()),
+        (p, "refutes"),
+        "the direction is served in the lower-cased relationship"
+    );
+    assert_eq!(swb(e), (0, 0.0, FlowBasis::None));
+    document(&set, public, AtlasMap::Public)
+        .to_stored_json()
+        .expect("the leaf with a none refutes edge validates and encodes");
+
+    let (_, on_u) = build(&pool, &system, AtlasMap::Team(u), &[p]).await;
+    assert_eq!(
+        swb(find(&on_u, ev, p, "refutes")),
+        (-1, 0.6, FlowBasis::Exact)
+    );
+}
+
 /// Force a co-owned edge: owner `owner`, co-owner `co_owner`.
 async fn force_edge_co_owned(pool: &PgPool, id: Uuid, owner: Uuid, co_owner: Uuid) {
     let n = sqlx::query(
