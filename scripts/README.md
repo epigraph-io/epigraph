@@ -186,3 +186,46 @@ find-or-create / idempotency path). Until then, run the reconciler
 **only with `--dry-run`**. Enabling the live cron against a server that
 predates Plan 2.5 risks duplicate or malformed claim writes.
 
+
+## check_sensitive.py (pre-commit sensitive-data check)
+
+epigraph is a public repository. The `secrets` CI job (gitleaks) catches
+credentials; this check catches the other class of leak: infrastructure
+identifiers and organisation-specific names. `.githooks/pre-commit` (and
+`.githooks/pre-merge-commit`, which git runs instead when `git merge` records a
+merge commit) runs `scripts/check_sensitive.py` over the **staged** content and
+file paths of each commit and blocks it on:
+
+- AWS resource ids (`i-`, `vol-`, `sg-`, `vpc-`, ... with 8 or 17 hex digits),
+  EC2 public/private hostnames (`ec2-A-B-C-D...`, `ip-A-B-C-D...`) and the
+  account id inside an ARN or a private ECR registry host. These rules are
+  built in and always on. A bare 12-digit account id is NOT matched (too many
+  false positives); list account ids in the local file if they must be caught.
+- Org-specific terms and regexes from `.check_sensitive_local.yaml` at the
+  checkout root. That file is **gitignored** because the list of terms is
+  itself sensitive; `.check_sensitive_local.example.yaml` is the committed
+  template (placeholders only). Linked worktrees use the main checkout's copy.
+  Local entries starting with `example-` are template placeholders and are
+  ignored. The template gets no exemption: a real term typed into it blocks
+  the commit like anywhere else.
+
+The hook is opt-in per clone:
+
+```bash
+git config core.hooksPath .githooks
+cp .check_sensitive_local.example.yaml .check_sensitive_local.yaml   # then edit
+```
+
+Without the local file, or with one that lists no terms or patterns, the hook
+warns and applies the generic rules only; a local file it cannot parse blocks
+the commit (exit 2). Findings print `path:line` and the rule or entry number,
+never the matched text; a path that itself matches is shown as
+`<path redacted, blob <id>>` (find it with `git ls-files -s`). Audit the whole
+tracked tree with `python3 scripts/check_sensitive.py --all-files`, and clean up
+its hits before enabling the hook: it scans whole staged files, so any commit
+touching a file that already contains a listed term is blocked.
+
+`scripts/tests/test_check_sensitive.py` drives real `git commit`s through the
+hooks in throwaway repositories, and its last test runs the `--all-files` audit
+over this checkout. It runs in the CI `python` job with the generic rules only
+(no local list exists there).
