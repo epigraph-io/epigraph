@@ -178,6 +178,7 @@ fn db_router(limiter: AgentRateLimiter) -> (Router, AppState) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
+        .acquire_timeout(std::time::Duration::from_secs(10))
         .connect_lazy(&url)
         .expect("lazy pool");
     let state = AppState::with_db(pool, ApiConfig::default()).with_rate_limiter(limiter);
@@ -237,10 +238,10 @@ async fn authenticated_requests_are_charged_to_their_principal() {
                 StatusCode::TOO_MANY_REQUESTS,
                 "{method} {uri}: request {i} of principal A is within the limit"
             );
-            assert_ne!(
-                status,
-                StatusCode::UNAUTHORIZED,
-                "{method} {uri}: the token must authenticate"
+            assert!(
+                status != StatusCode::UNAUTHORIZED && status != StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {uri}: the token must authenticate (got {status}; 503 means the \
+                 revocation lookup could not reach DATABASE_URL)"
             );
         }
         assert_eq!(
