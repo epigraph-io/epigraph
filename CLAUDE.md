@@ -421,7 +421,9 @@ security(crypto): use constant-time comparison in signature verification
 - cargo test passes; manual review confirms no early returns in the verify path
 ```
 
-### Commit-message lint
+<!-- END epistemic-commit-protocol -->
+
+## Commit-message lint (this repository)
 
 CI (`.github/scripts/commit-message-lint.py`, job `Commit message lint`) reads
 only the non-merge commits a change adds, and refuses three things: an e-mail
@@ -435,5 +437,3 @@ says "Not run", "CI to confirm" or "to be run", a subject outside
 commit whose Verification records something that was not run should say so with
 a line starting `Unverified:`, which silences that warning. Output is redacted,
 never the offending value.
-
-<!-- END epistemic-commit-protocol -->
