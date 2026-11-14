@@ -3522,7 +3522,7 @@ impl PrivatizationRepository {
     /// no-op rather than a second, differently-keyed seal over a row whose
     /// plaintext is already gone.
     ///
-    /// # Nine statements, one transaction, no partial seal
+    /// # Every statement in one transaction, no partial seal
     ///
     /// The caller opens the transaction and the caller commits it. Every
     /// statement below is bounded to the ids the first one actually inserted,
@@ -3547,7 +3547,12 @@ impl PrivatizationRepository {
     ///    a plaintext-derived vector on a sealed claim, which is the exact
     ///    defect the plan's own audit clause was written to catch one column
     ///    over. `content_tsv` needs no statement — it is `GENERATED ALWAYS` and
-    ///    follows `content`.
+    ///    follows `content`. Step 2b then takes the claim out of its theme
+    ///    (`claims.theme_id`) and recomputes each theme it left
+    ///    (`claim_themes.centroid`, `claim_count`) from the remaining
+    ///    embedded members (backlog f43ef0a6): a centroid is an aggregate of
+    ///    member vectors, so nulling the claim's vector without recomputing
+    ///    it leaves the sealed vector folded into the theme.
     /// 3. `claim_version_encryption` + 4. `claim_versions` — the complete
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
@@ -3640,6 +3645,66 @@ impl PrivatizationRepository {
         .execute(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
+
+        // 2b. The theme channel (backlog f43ef0a6). `claim_themes.centroid` is
+        //     an average OVER MEMBER EMBEDDINGS and `claim_count` a count of
+        //     embedded members, both denormalised and recomputed only by an
+        //     explicit maintenance call; a theme's label is itself a summary
+        //     of what its members say. Statement 2 removes the sealed vector
+        //     from the row but not from the aggregate it was folded into, so
+        //     without this a theme the sealed claim belonged to kept a
+        //     centroid that still averaged that vector, and a ONE-member
+        //     theme's centroid WAS that vector. The membership is dropped and
+        //     each affected theme recomputed here, in the seal's transaction,
+        //     with `recompute_centroid_for_theme`'s definitions. Written
+        //     unconditionally, so a theme left with no embedded member gets a
+        //     NULL centroid and a zero count rather than keeping the sealed
+        //     vector (it is unassignable until re-seeded, which the
+        //     alternative would not be, and the alternative is the leak).
+        //     `centroid_3072` is not touched: no code path averages members
+        //     into it; it is only ever seeded from outside the corpus.
+        //     An unseal does not restore `theme_id`; the unthemed-assignment
+        //     sweep re-themes the claim once it is re-embedded.
+        let themes: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            r"
+            WITH prior AS (
+                SELECT c.id, c.theme_id
+                  FROM public.claims c
+                 WHERE c.id = ANY($1) AND c.theme_id IS NOT NULL
+            ),
+            cleared AS (
+                UPDATE public.claims c
+                   SET theme_id = NULL
+                  FROM prior
+                 WHERE c.id = prior.id
+                RETURNING prior.theme_id
+            )
+            SELECT DISTINCT theme_id FROM cleared
+            ",
+        )
+        .bind(&sealed)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        if !themes.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE public.claim_themes t
+                   SET centroid = (SELECT avg(c.embedding)::vector(1536)
+                                     FROM public.claims c
+                                    WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       claim_count = (SELECT count(*)::int4
+                                        FROM public.claims c
+                                       WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       updated_at = now()
+                 WHERE t.id = ANY($1)
+                ",
+            )
+            .bind(&themes)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
 
         // 3/4. Version history.
         let (version_ids, version_cts): (Vec<Uuid>, Vec<Vec<u8>>) = items
