@@ -424,12 +424,18 @@ jobs:
           -- --include-ignored --test-threads=1
 
   # The one required check for the Rust suite. `needs` lists every job whose
-  # failure must block a merge; `if: always()` makes this job report even when
-  # one of them failed or was cancelled (a skipped required check would read as
-  # "pending" forever). Anything but `success` from any of them fails it.
+  # failure must block a merge. Without an `if`, a job whose dependency failed
+  # is SKIPPED, and a skipped required check reads as "pending" forever; so
+  # this job runs whenever the RUN was not cancelled, and fails on anything
+  # but `success` from any dependency (a shard that hit its own timeout
+  # reports `cancelled` and fails it, as it should).
+  #
+  # `!cancelled()`, not `always()`: when a new push supersedes this run the
+  # `concurrency` rule above cancels it, and with `always()` this job then ran
+  # anyway and posted a red `test` on the superseded commit.
   test:
     name: test
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [plan, test-shard, test-extra, lint-features]
     runs-on: ubuntu-latest
     timeout-minutes: 5
