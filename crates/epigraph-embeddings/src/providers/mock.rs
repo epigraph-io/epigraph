@@ -4,17 +4,13 @@
 //! useful for unit testing without external API dependencies.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-use uuid::Uuid;
+use std::sync::{Arc, Mutex};
 
 use crate::cache::EmbeddingCache;
 use crate::config::EmbeddingConfig;
 use crate::errors::EmbeddingError;
 use crate::normalizer::Normalizer;
-use crate::service::{
-    EmbeddingService, MultimodalEmbeddingService, MultimodalInput, SimilarClaim, TokenUsage,
-};
+use crate::service::{EmbeddingService, MultimodalEmbeddingService, MultimodalInput, TokenUsage};
 use crate::tokenizer::Tokenizer;
 
 /// Mock embedding provider for testing
@@ -28,8 +24,6 @@ pub struct MockProvider {
     tokenizer: Tokenizer,
     /// Cache for embeddings
     cache: EmbeddingCache,
-    /// In-memory storage for embeddings (simulates database)
-    storage: RwLock<HashMap<Uuid, Vec<f32>>>,
     /// Token usage tracking
     token_usage: Mutex<TokenUsage>,
     /// Whether to simulate API failures
@@ -51,7 +45,6 @@ impl MockProvider {
             config,
             tokenizer,
             cache,
-            storage: RwLock::new(HashMap::new()),
             token_usage: Mutex::new(TokenUsage::default()),
             simulate_failures: false,
             call_count: Mutex::new(0),
@@ -182,69 +175,6 @@ impl EmbeddingService for MockProvider {
         Ok(results)
     }
 
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        if embedding.len() != self.config.dimension {
-            return Err(EmbeddingError::DimensionMismatch {
-                expected: self.config.dimension,
-                actual: embedding.len(),
-            });
-        }
-
-        let mut storage = self
-            .storage
-            .write()
-            .map_err(|e| EmbeddingError::DatabaseError(format!("Lock error: {e}")))?;
-
-        storage.insert(claim_id, embedding.to_vec());
-        Ok(())
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        let storage = self
-            .storage
-            .read()
-            .map_err(|e| EmbeddingError::DatabaseError(format!("Lock error: {e}")))?;
-
-        storage
-            .get(&claim_id)
-            .cloned()
-            .ok_or(EmbeddingError::NotFound { claim_id })
-    }
-
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        if embedding.len() != self.config.dimension {
-            return Err(EmbeddingError::DimensionMismatch {
-                expected: self.config.dimension,
-                actual: embedding.len(),
-            });
-        }
-
-        let storage = self
-            .storage
-            .read()
-            .map_err(|e| EmbeddingError::DatabaseError(format!("Lock error: {e}")))?;
-
-        let mut similarities: Vec<SimilarClaim> = storage
-            .iter()
-            .map(|(claim_id, stored_embedding)| {
-                let similarity = Normalizer::cosine_similarity(embedding, stored_embedding);
-                SimilarClaim::new(*claim_id, similarity)
-            })
-            .filter(|s| s.similarity >= min_similarity)
-            .collect();
-
-        // Sort by similarity descending and take top k
-        similarities.sort_unstable_by(|a, b| b.similarity.total_cmp(&a.similarity));
-        similarities.truncate(k);
-
-        Ok(similarities)
-    }
-
     fn dimension(&self) -> usize {
         self.config.dimension
     }
@@ -312,23 +242,6 @@ impl EmbeddingService for MockProviderWithFallback {
         }
     }
 
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.primary.store(claim_id, embedding).await
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.primary.get(claim_id).await
-    }
-
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.primary.similar(embedding, k, min_similarity).await
-    }
-
     fn dimension(&self) -> usize {
         self.primary.dimension()
     }
@@ -385,23 +298,6 @@ impl EmbeddingService for MockMultimodalProvider {
 
     async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         self.inner.batch_generate(texts).await
-    }
-
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.inner.store(claim_id, embedding).await
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.inner.get(claim_id).await
-    }
-
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.inner.similar(embedding, k, min_similarity).await
     }
 
     fn dimension(&self) -> usize {

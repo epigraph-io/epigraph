@@ -2081,6 +2081,7 @@ pub async fn submit_packet(
     // event as a signed claim for tamper-evidence; embedding sentence-shaped
     // operational events like "Container X exited code 0 after Yms" has no
     // semantic value and costs an OpenAI call per event).
+    #[cfg(feature = "db")]
     let is_host_telemetry = packet
         .claim
         .properties
@@ -2165,28 +2166,10 @@ pub async fn submit_packet(
             }
         }
     } // end `if !was_duplicate` (skip claim re-embed on dedup)
-    #[cfg(not(feature = "db"))]
-    if !was_duplicate {
-        if let Some(ref embedding_service) = state.embedding_service {
-            if is_host_telemetry {
-                tracing::debug!(
-                    claim_id = %claim_id,
-                    "Skipping embedding for host-provenance telemetry claim"
-                );
-            } else {
-                match embedding_service.generate(&packet.claim.content).await {
-                    Ok(embedding) => {
-                        if let Err(e) = embedding_service.store(claim_id, &embedding).await {
-                            tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
-                    }
-                }
-            }
-        }
-    } // end `if !was_duplicate` (skip claim re-embed on dedup, non-db twin)
+      // No non-`db` twin: without a database there is nowhere to store a claim
+      // vector, and generating one only to drop it would be a paid no-op. (It
+      // used to call `EmbeddingService::store`, which no real provider
+      // implemented; backlog ccc588d4.)
 
     // 8a. Generate and store embeddings for figure evidence
     //

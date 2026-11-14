@@ -15,7 +15,7 @@
 //! (`embed::StorePath`), the default declares nothing, and stores route through
 //! the claim AUTHOR's stamped connection.
 //!
-//! So the original arm — `McpEmbedder::new(pool, None)` then `store` — now
+//! So the original arm — `McpEmbedder::new(pool, None)` then `store_vector` — now
 //! measures the refusal rather than the column, and the column assertion needs a
 //! `ScopedPool`-declared embedder over a claim whose author has a writable group.
 //! Both arms are kept: the first is the one that would have caught the silent
@@ -33,8 +33,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_embeddings::EmbeddingService;
-use epigraph_mcp::embed::McpEmbedder;
+use epigraph_mcp::embed::{format_pgvector, McpEmbedder};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -72,9 +71,11 @@ async fn mcp_embedder_store_writes_to_claims_embedding(pool: PgPool) {
         McpEmbedder::new(pool.clone(), None).with_scoped_pool(fixture::scoped_pool(&pool).await);
     let fake_vec = vec![0.1_f32; 1536];
 
-    EmbeddingService::store(&embedder, claim_id, &fake_vec)
+    let stored = embedder
+        .store_vector(claim_id, &format_pgvector(&fake_vec))
         .await
         .expect("store should succeed on a declared author-stamped embedder");
+    assert!(stored, "the store must match the seeded row");
 
     let (claim_has_emb,): (bool,) =
         sqlx::query_as("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
@@ -84,7 +85,7 @@ async fn mcp_embedder_store_writes_to_claims_embedding(pool: PgPool) {
             .expect("query claim");
     assert!(
         claim_has_emb,
-        "claims.embedding must be populated after McpEmbedder::store(); \
+        "claims.embedding must be populated after McpEmbedder::store_vector(); \
          the storage target is `claims`, not `evidence` (see CLAUDE.md embedding policy)"
     );
 
@@ -113,7 +114,8 @@ async fn an_undeclared_embedder_refuses_to_store_rather_than_using_its_pool(pool
     let embedder = McpEmbedder::new(pool.clone(), None);
     let fake_vec = vec![0.2_f32; 1536];
 
-    let err = EmbeddingService::store(&embedder, claim_id, &fake_vec)
+    let err = embedder
+        .store_vector(claim_id, &format_pgvector(&fake_vec))
         .await
         .expect_err(
             "an embedder that declared no StorePath must refuse. If this now succeeds it is \
@@ -121,7 +123,7 @@ async fn an_undeclared_embedder_refuses_to_store_rather_than_using_its_pool(pool
              swallows the refusal — the silent `live_missing` shape this type was changed to \
              make impossible.",
         );
-    let msg = err.to_string();
+    let msg = err;
     assert!(
         msg.contains("StorePath"),
         "the refusal must name the missing declaration so an operator can act on it: {msg}"

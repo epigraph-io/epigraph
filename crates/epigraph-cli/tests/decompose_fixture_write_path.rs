@@ -115,7 +115,6 @@ async fn fixture_provider_writes_atoms_and_decomposes_to_edges(pool: PgPool) {
         &llm,
         10,
         None,
-        None,
         move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();
             async move { Ok(insert_min_claim(&pool_c, parent.agent_id, &atom_text).await) }
@@ -185,7 +184,6 @@ async fn atoms_follow_claim_text_not_batch_position(pool: PgPool) {
         &llm,
         10,
         None,
-        None,
         move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();
             async move { Ok(insert_min_claim(&pool_c, parent.agent_id, &atom_text).await) }
@@ -239,7 +237,6 @@ async fn claims_missing_from_the_fixture_are_left_untouched(pool: PgPool) {
         &llm,
         10,
         None,
-        None,
         move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();
             async move { Ok(insert_min_claim(&pool_c, parent.agent_id, &atom_text).await) }
@@ -281,7 +278,6 @@ async fn mock_provider_writes_nothing(pool: PgPool) {
         &claims,
         &llm,
         10,
-        None,
         None,
         move |_t, _g, _a| {
             submitted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -348,7 +344,6 @@ async fn submit_closure_receives_each_atoms_own_parent_id(pool: PgPool) {
         &claims,
         &llm,
         10,
-        None,
         None,
         move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();

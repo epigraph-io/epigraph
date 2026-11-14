@@ -130,3 +130,50 @@ fn no_local_provider_is_exported() {
          {offenders:?}"
     );
 }
+
+/// `EmbeddingService` generates vectors; it does not store or search them.
+///
+/// Its `store`/`get`/`similar` were refused by both real providers with a
+/// `ConfigError` pointing at `EmbeddingRepository`, and that repository wrote
+/// `claims.embedding` with no seal or tenancy check from outside `epigraph-db`.
+/// A caller holding the trait therefore had a store method that silently
+/// stored nothing in production: `decompose_claims` discarded the error with
+/// `let _ = e.store(...)` (backlog ccc588d4). Vectors are stored through
+/// `epigraph-db` (`ClaimRepository::store_embedding_if_unsealed` and friends).
+#[test]
+fn the_generation_trait_has_no_storage_methods() {
+    let service =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service.rs"))
+            .expect("service.rs");
+    let start = service
+        .find("pub trait EmbeddingService:")
+        .expect("the trait is defined in service.rs");
+    let body = &service[start..];
+    let end = body.find("\n}\n").expect("end of the trait body");
+    let trait_body = &body[..end];
+    assert!(
+        trait_body.contains("async fn generate("),
+        "CALIBRATION: did not isolate the EmbeddingService trait body"
+    );
+    let storage: Vec<&str> = ["fn store(", "fn get(", "fn similar("]
+        .into_iter()
+        .filter(|m| trait_body.contains(m))
+        .collect();
+    assert!(
+        storage.is_empty(),
+        "EmbeddingService declares storage methods {storage:?}; store vectors through epigraph-db"
+    );
+
+    let offenders: Vec<String> = production_sources()
+        .into_iter()
+        .filter(|(_, text)| {
+            text.contains("EmbeddingRepository") || text.contains("EmbeddingServiceExt")
+        })
+        .map(|(path, _)| path)
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "the unscoped embedding repository or its generate_and_store extension is back: \
+         {offenders:?}"
+    );
+}

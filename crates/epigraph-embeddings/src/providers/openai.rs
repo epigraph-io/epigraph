@@ -14,14 +14,13 @@ use async_trait::async_trait;
 use std::sync::Mutex;
 #[cfg(feature = "openai")]
 use std::time::Duration;
-use uuid::Uuid;
 
 use crate::cache::EmbeddingCache;
 use crate::config::EmbeddingConfig;
 use crate::errors::EmbeddingError;
 use crate::normalizer::Normalizer;
 use crate::rate_limiter::RateLimiter;
-use crate::service::{EmbeddingService, SimilarClaim, TokenUsage};
+use crate::service::{EmbeddingService, TokenUsage};
 use crate::tokenizer::Tokenizer;
 
 // ============================================================================
@@ -321,32 +320,6 @@ impl EmbeddingService for OpenAiProvider {
                 })
             })
             .collect()
-    }
-
-    async fn store(&self, _claim_id: Uuid, _embedding: &[f32]) -> Result<(), EmbeddingError> {
-        // OpenAI provider doesn't handle storage directly
-        // Use EmbeddingRepository for database operations
-        Err(EmbeddingError::ConfigError(
-            "OpenAiProvider doesn't support storage. Use EmbeddingRepository.".to_string(),
-        ))
-    }
-
-    async fn get(&self, _claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Err(EmbeddingError::ConfigError(
-            "OpenAiProvider doesn't support retrieval. Use EmbeddingRepository.".to_string(),
-        ))
-    }
-
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Err(EmbeddingError::ConfigError(
-            "OpenAiProvider doesn't support similarity search. Use EmbeddingRepository."
-                .to_string(),
-        ))
     }
 
     fn dimension(&self) -> usize {

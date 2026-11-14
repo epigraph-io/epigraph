@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use epigraph_cli::reembed::{run, ReembedConfig, ReembedTarget};
 use epigraph_embeddings::{
-    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, SimilarClaim, TokenUsage,
+    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, TokenUsage,
 };
 
 const EPOCH: i32 = 0;
@@ -252,23 +252,6 @@ impl EmbeddingService for SealingProvider {
             .expect("seal the victim mid-batch");
         }
         self.inner.batch_generate(texts).await
-    }
-
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.inner.store(claim_id, embedding).await
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.inner.get(claim_id).await
-    }
-
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.inner.similar(embedding, k, min_similarity).await
     }
 
     fn dimension(&self) -> usize {

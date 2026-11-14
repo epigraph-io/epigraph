@@ -4,7 +4,6 @@
 //! and clear error messages that aid debugging.
 
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Errors that can occur during embedding operations
 #[derive(Error, Debug)]
@@ -51,13 +50,6 @@ pub enum EmbeddingError {
     #[error("Network error: {0}")]
     NetworkError(String),
 
-    /// The embedding was not found in the database
-    #[error("Embedding not found for claim {claim_id}")]
-    NotFound {
-        /// The claim ID that was not found
-        claim_id: Uuid,
-    },
-
     /// Database error
     #[error("Database error: {0}")]
     DatabaseError(String),
@@ -98,13 +90,6 @@ pub enum EmbeddingError {
         /// Indices of failed items
         failed_indices: Vec<usize>,
     },
-}
-
-#[cfg(feature = "db")]
-impl From<sqlx::Error> for EmbeddingError {
-    fn from(err: sqlx::Error) -> Self {
-        Self::DatabaseError(err.to_string())
-    }
 }
 
 #[cfg(any(feature = "openai", feature = "jina"))]

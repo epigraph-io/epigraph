@@ -1,10 +1,11 @@
 //! Core embedding service trait and types
 //!
-//! Defines the main interface for embedding generation and storage.
+//! Defines the interface for embedding generation. Storing and searching
+//! vectors is `epigraph-db`'s job (`ClaimRepository::store_embedding_if_unsealed`
+//! and the viewer-scoped search functions), never this trait's.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::errors::EmbeddingError;
 
@@ -35,35 +36,11 @@ impl TokenUsage {
     }
 }
 
-/// Result of a similarity search
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimilarClaim {
-    /// The claim ID
-    pub claim_id: Uuid,
-
-    /// Cosine similarity score (0.0 to 1.0)
-    pub similarity: f32,
-
-    /// Distance (1.0 - similarity for cosine distance)
-    pub distance: f32,
-}
-
-impl SimilarClaim {
-    /// Create a new similar claim result
-    #[must_use]
-    pub fn new(claim_id: Uuid, similarity: f32) -> Self {
-        Self {
-            claim_id,
-            similarity,
-            distance: 1.0 - similarity,
-        }
-    }
-}
-
-/// Main trait for embedding generation and storage
+/// Main trait for embedding generation
 ///
-/// This trait defines the complete interface for working with embeddings
-/// in the `EpiGraph` system. Implementations may use different backends
+/// This trait turns text into vectors and nothing else: it has no storage
+/// methods, because a generation provider has no database session, viewer or
+/// seal check to store with (backlog ccc588d4). Implementations may use different backends
 /// (`OpenAI`, Jina, the test mock) but must conform to this interface.
 #[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
 #[async_trait]
@@ -96,45 +73,6 @@ pub trait EmbeddingService: Send + Sync {
     ///
     /// Implementations should optimize batch calls to minimize API requests.
     async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
-
-    /// Store an embedding for a claim in the database
-    ///
-    /// # Arguments
-    /// * `claim_id` - The claim's UUID
-    /// * `embedding` - The embedding vector to store
-    ///
-    /// # Returns
-    /// * `Ok(())` - Successfully stored
-    /// * `Err(EmbeddingError::DimensionMismatch)` - If embedding has wrong dimension
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError>;
-
-    /// Retrieve a stored embedding for a claim
-    ///
-    /// # Arguments
-    /// * `claim_id` - The claim's UUID
-    ///
-    /// # Returns
-    /// * `Ok(Vec<f32>)` - The stored embedding
-    /// * `Err(EmbeddingError::NotFound)` - If no embedding exists for this claim
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError>;
-
-    /// Find claims with similar embeddings
-    ///
-    /// Uses cosine similarity to find the k most similar claims.
-    ///
-    /// # Arguments
-    /// * `embedding` - The query embedding
-    /// * `k` - Maximum number of results to return
-    /// * `min_similarity` - Minimum similarity threshold (0.0 to 1.0)
-    ///
-    /// # Returns
-    /// * `Ok(Vec<SimilarClaim>)` - Similar claims sorted by similarity (descending)
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError>;
 
     /// Get the configured embedding dimension
     fn dimension(&self) -> usize;
@@ -216,30 +154,6 @@ pub trait MultimodalEmbeddingService: EmbeddingService {
         &self,
         inputs: &[MultimodalInput<'_>],
     ) -> Result<Vec<Vec<f32>>, EmbeddingError>;
-}
-
-/// Extension trait for embedding service utilities
-pub trait EmbeddingServiceExt: EmbeddingService {
-    /// Generate and store an embedding for a claim in one operation
-    ///
-    /// This is a convenience method that combines `generate` and `store`.
-    fn generate_and_store(
-        &self,
-        claim_id: Uuid,
-        text: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<f32>, EmbeddingError>> + Send;
-}
-
-impl<T: EmbeddingService> EmbeddingServiceExt for T {
-    async fn generate_and_store(
-        &self,
-        claim_id: Uuid,
-        text: &str,
-    ) -> Result<Vec<f32>, EmbeddingError> {
-        let embedding = self.generate(text).await?;
-        self.store(claim_id, &embedding).await?;
-        Ok(embedding)
-    }
 }
 
 #[cfg(test)]

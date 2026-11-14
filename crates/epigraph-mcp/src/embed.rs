@@ -1,8 +1,5 @@
 use async_trait::async_trait;
-use epigraph_embeddings::{
-    service::{SimilarClaim, TokenUsage},
-    EmbeddingError, EmbeddingService,
-};
+use epigraph_embeddings::{service::TokenUsage, EmbeddingError, EmbeddingService};
 use sqlx::PgPool;
 
 /// Per-leg candidate pool size before RRF fusion in hybrid recall.
@@ -516,9 +513,9 @@ impl std::ops::DerefMut for SearchConn<'_> {
 // This impl exposes it through the canonical trait so callers — including the
 // library `recall` function in `epigraph-engine` — only need `&dyn EmbeddingService`.
 //
-// Methods that have no natural delegation in `McpEmbedder` (token tracking,
-// in-memory retrieval) return honest no-op / not-found values rather than
-// `unimplemented!()` panics.  None of these are on the hot path for `recall`.
+// Token tracking has no natural delegation in `McpEmbedder` and returns honest
+// no-op values rather than `unimplemented!()` panics. Storing goes through the
+// inherent `store_vector` / `embed_and_store` (the trait has no store method).
 
 #[async_trait]
 impl EmbeddingService for McpEmbedder {
@@ -549,68 +546,6 @@ impl EmbeddingService for McpEmbedder {
             results.push(embedding);
         }
         Ok(results)
-    }
-
-    /// Store an embedding on `claims.embedding` through
-    /// [`McpEmbedder::store_vector`].
-    ///
-    /// Per the embedding-policy contract in CLAUDE.md, the canonical storage
-    /// site for claim embeddings is `claims.embedding`. An earlier impl wrote
-    /// to `evidence.embedding` keyed by `claim_id`, which silently no-op'd
-    /// because evidence rows have their own ids.
-    ///
-    /// # This was the same unstamped write a THIRD time
-    ///
-    /// It used to call `ClaimRepository::store_embedding(&self.pool, …)` directly,
-    /// so it carried the refusal `embed_and_store` carried and the six converted
-    /// call sites did not cover it. It now shares the one declared
-    /// [`StorePath`], which also means it stamps from the claim's author rather
-    /// than from nothing.
-    ///
-    /// It has no production caller — the MCP paths use the inherent
-    /// `embed_and_store`, and `epigraph-api`'s `embedding_service` is one of the
-    /// `epigraph-embeddings` providers, never this type — but routing it was
-    /// cheaper than proving that property stays true.
-    async fn store(&self, claim_id: uuid::Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        let pgvec = format_pgvector(embedding);
-        self.store_vector(claim_id, &pgvec)
-            .await
-            .map(|_| ())
-            .map_err(EmbeddingError::DatabaseError)
-    }
-
-    /// `McpEmbedder` does not expose a point-query for stored embeddings.
-    ///
-    /// Returns `EmbeddingError::NotFound` unconditionally.  Nothing in the
-    /// `recall` path calls `get`, so this is an honest gap, not a silent lie.
-    async fn get(&self, claim_id: uuid::Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        Err(EmbeddingError::NotFound { claim_id })
-    }
-
-    /// **Unimplemented as of PR-06, deliberately.**
-    ///
-    /// `EmbeddingService` lives in `epigraph-interfaces`, which does not depend
-    /// on `epigraph-db` and therefore cannot name a `Viewer`. PR-06 makes
-    /// `EvidenceRepository::search_by_embedding` require one, so this method has
-    /// no way to be tenancy-correct through this trait, and returning unfiltered
-    /// rows through a trait object would be the exact fail-open the PR exists to
-    /// close. It has no production caller — the MCP novelty and recall paths go
-    /// through [`McpEmbedder::search_scoped`] and
-    /// [`McpEmbedder::search_hybrid_scoped`], both of which take a viewer.
-    ///
-    /// Widening the trait is PR-09's call, when `mcp_viewer` gives every tool a
-    /// viewer to hand down.
-    async fn similar(
-        &self,
-        _embedding: &[f32],
-        _k: usize,
-        _min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        Err(EmbeddingError::DatabaseError(
-            "McpEmbedder::similar is not tenancy-aware: EmbeddingService cannot carry a \
-             Viewer. Use McpEmbedder::search_scoped or ::search_hybrid_scoped."
-                .to_string(),
-        ))
     }
 
     /// `text-embedding-3-small` outputs 1536-dimensional vectors.

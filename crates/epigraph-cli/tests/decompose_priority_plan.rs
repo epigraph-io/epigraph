@@ -443,7 +443,7 @@ async fn plan_then_apply_plan_persists_the_reviewed_atoms_with_no_second_llm_cal
         let pool_c = pool_c.clone();
         async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
     };
-    let totals = persist_planned(&pool, &viewer, &ok, None, None, &submit)
+    let totals = persist_planned(&pool, &viewer, &ok, None, &submit)
         .await
         .unwrap();
     assert_eq!(llm.call_count(), 1, "--apply-plan makes no LLM call");
@@ -550,7 +550,7 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
         }
     };
     let (ok, _) = verify_plan(&pool, &viewer, plan.clone()).await.unwrap();
-    let totals = persist_planned(&pool, &viewer, &ok, None, None, &flaky)
+    let totals = persist_planned(&pool, &viewer, &ok, None, &flaky)
         .await
         .unwrap();
 
@@ -582,7 +582,7 @@ async fn a_submit_failure_mid_parent_leaves_it_reapplicable(pool: PgPool) {
         let pool_h = pool_h.clone();
         async move { Ok(get_or_insert_atom(&pool_h, a, &t).await) }
     };
-    let totals2 = persist_planned(&pool, &viewer, &ok2, None, None, &healthy)
+    let totals2 = persist_planned(&pool, &viewer, &ok2, None, &healthy)
         .await
         .unwrap();
     assert!(totals2.failed.is_empty(), "{totals2:?}");
@@ -771,7 +771,6 @@ async fn llm_singleton_parent_is_not_reselected_by_the_next_run(pool: PgPool) {
         &claims,
         &llm,
         10,
-        None,
         Some(&mut ledger),
         move |t: String, _g: i64, p: AtomParent| {
             let pool_c = pool_c.clone();
@@ -913,7 +912,7 @@ async fn apply_plan_records_singletons_and_an_edited_parent_requalifies(pool: Pg
     let submit = |_t: String, _g: i64, _p: AtomParent| async move {
         Err::<Uuid, Box<dyn std::error::Error>>("a singleton must submit nothing".into())
     };
-    let totals = persist_planned(&pool, &viewer, &ok, None, Some(&mut ledger), &submit)
+    let totals = persist_planned(&pool, &viewer, &ok, Some(&mut ledger), &submit)
         .await
         .unwrap();
     assert_eq!(totals.singletons, vec![s]);
@@ -985,7 +984,7 @@ async fn a_ledger_append_failure_fails_its_line_and_the_plan_goes_on(pool: PgPoo
         let pool_c = pool_c.clone();
         async move { Ok(insert_atom(&pool_c, p.agent_id, &t).await) }
     };
-    let totals = persist_planned(&pool, &viewer, &ok, None, Some(&mut ledger), &submit)
+    let totals = persist_planned(&pool, &viewer, &ok, Some(&mut ledger), &submit)
         .await
         .expect("a ledger append failure must not abort the whole plan");
     assert_eq!(totals.failed.len(), 1, "{:?}", totals.failed);
@@ -1038,7 +1037,7 @@ async fn an_empty_answer_is_not_recorded_as_judged_atomic(pool: PgPool) {
     let submit = |_t: String, _g: i64, _p: AtomParent| async move {
         Err::<Uuid, Box<dyn std::error::Error>>("nothing is submitted here".into())
     };
-    let totals = persist_planned(&pool, &viewer, &planned, None, Some(&mut ledger), &submit)
+    let totals = persist_planned(&pool, &viewer, &planned, Some(&mut ledger), &submit)
         .await
         .unwrap();
     assert!(totals.failed.is_empty(), "{:?}", totals.failed);
@@ -1128,7 +1127,6 @@ async fn a_run_that_aborts_later_keeps_the_verdicts_of_earlier_chunks(pool: PgPo
         &claims,
         &llm,
         1,
-        None,
         Some(&mut ledger),
         |_t: String, _g: i64, _p: AtomParent| async move {
             Err::<Uuid, Box<dyn std::error::Error>>("API down".into())

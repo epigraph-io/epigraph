@@ -658,7 +658,6 @@ mod db_writes {
     use epigraph_db::visibility::Viewer;
     use epigraph_db::{ClaimRepository, DbError, EdgeRepository};
     use sqlx::{PgConnection, PgPool};
-    use std::sync::Arc;
     use uuid::Uuid;
 
     /// Where a decomposition run's statements go, and as whom.
@@ -838,7 +837,7 @@ mod db_writes {
     /// binary this closure POSTs to the local API `/api/v1/claims` (or calls
     /// the in-process submit helper); in tests it is a fake that inserts a
     /// minimal claim row, letting us verify the edge/label wiring WITHOUT an
-    /// LLM or an embedder.
+    /// LLM.
     ///
     /// Single-atom decompositions are SKIPPED (a claim that decomposes to
     /// exactly itself is already atomic — writing a self-equivalent child +
@@ -848,7 +847,6 @@ mod db_writes {
         viewer: &epigraph_db::visibility::Viewer,
         parent_id: Uuid,
         decomp: &Decomposition,
-        embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
         submit_via: F,
     ) -> Result<PersistOutcome, Box<dyn std::error::Error>>
     where
@@ -890,14 +888,10 @@ mod db_writes {
                     decomp.atoms.len()
                 )
             })?;
-            // Best-effort embed-on-write when the caller passes a live embedder
-            // and the submit path did not already embed (API path embeds; the
-            // direct-insert test fake does not).
-            if let Some(ref e) = embedder {
-                if let Ok(vec) = e.generate(atom).await {
-                    let _ = e.store(atom_id, &vec).await;
-                }
-            }
+            // No embed here: `submit_via` is `POST /api/v1/claims`, whose
+            // `create_claim` embeds the atom inline on create. The embed this
+            // loop used to do called `EmbeddingService::store`, which the
+            // OpenAI provider refused, and dropped the error (backlog ccc588d4).
             atom_ids.push(atom_id);
             gens.push(gen);
         }
@@ -983,7 +977,6 @@ mod db_writes {
         claims: &[BatchClaim],
         llm: &dyn epigraph_interfaces::LlmProvider,
         batch_size: usize,
-        embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
         mut ledger: Option<&mut super::SingletonLedger>,
         submit_via: F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
@@ -997,15 +990,8 @@ mod db_writes {
             totals.gaps.extend(gaps);
             // Verdicts are appended per chunk, so a run that aborts later
             // keeps the ones it already paid for.
-            let chunk_totals = persist_planned(
-                db,
-                viewer,
-                &planned,
-                embedder.clone(),
-                ledger.as_deref_mut(),
-                &submit_via,
-            )
-            .await?;
+            let chunk_totals =
+                persist_planned(db, viewer, &planned, ledger.as_deref_mut(), &submit_via).await?;
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
             totals.singletons.extend(chunk_totals.singletons);
@@ -1168,7 +1154,6 @@ mod db_writes {
         db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         planned: &[super::PlannedDecomposition],
-        embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
         mut ledger: Option<&mut super::SingletonLedger>,
         submit_via: &F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
@@ -1187,7 +1172,6 @@ mod db_writes {
                 viewer,
                 plan.claim_id,
                 &plan.decomposition(),
-                embedder.clone(),
                 move |atom_text, generality| submit_via(atom_text, generality, parent),
             )
             .await
