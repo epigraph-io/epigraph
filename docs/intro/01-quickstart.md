@@ -29,7 +29,7 @@ The commands assume Linux or macOS with a POSIX shell. On Windows, use WSL2.
 |---|---|---|
 | **Rust 1.88 or newer** | The locked dependency graph needs 1.88. `rust-version = "1.75"` in `Cargo.toml` is advisory, for clippy only. CI builds on `stable`. | `rustc --version` |
 | **A C toolchain, `pkg-config`, and the OpenSSL development headers** | Several dependencies link OpenSSL (`openssl-sys`, through `native-tls` and `webauthn-rs`). Without them the build stops before it compiles any EpiGraph code. Typical packages: `build-essential pkg-config libssl-dev` (Debian/Ubuntu), `gcc pkgconf openssl-devel` (Fedora), `pkg-config openssl@3` (Homebrew). | `pkg-config --modversion openssl` |
-| **PostgreSQL 16 with pgvector** | The schema uses the `vector`, `pg_trgm` and `uuid-ossp` extensions. The easiest route is Docker with the image CI uses, `pgvector/pgvector:pg16`. | `docker --version`, or `psql --version` |
+| **PostgreSQL 16 with pgvector 0.8.0 or newer** | The schema uses the `vector`, `pg_trgm` and `uuid-ossp` extensions, and semantic search needs pgvector 0.8.0 (`hnsw.iterative_scan`). Distribution packages often ship an older pgvector. The easiest route is Docker with the image CI uses, `pgvector/pgvector:pg16`, which ships a current one. | `docker --version`, or `psql --version` |
 | **`openssl` and `curl`** | Generating secrets and calling the API. | `openssl version`, `curl --version` |
 | **Claude Code** (optional) | The MCP client used in step 6. Any MCP client that can launch a stdio server works. | `claude --version` |
 | **An OpenAI API key** (optional) | Semantic search. Without a key, the flat `recall` tool falls back to lexical search, and `recall_with_context` refuses. The [keyless path](#step-7--first-mcp-calls) covers this. | — |
@@ -65,8 +65,10 @@ docker exec epigraph-db psql -U epigraph -d epigraph -tAc \
 
 ### Option B: a PostgreSQL 16 server you already run
 
-You need pgvector installed on the server
-(<https://github.com/pgvector/pgvector#installation>). For a trial, create a
+You need pgvector 0.8.0 or newer installed on the server
+(<https://github.com/pgvector/pgvector#installation>); `epigraph-migrate`
+refuses an older one. `SELECT default_version FROM pg_available_extensions
+WHERE name = 'vector';` shows what the server has. For a trial, create a
 superuser login and a database it owns:
 
 ```bash
@@ -447,6 +449,8 @@ If the claim comes back, your install works end to end.
 | The build dies while linking (`SIGBUS`, killed, out of memory), or `No space left on device` | Set `CARGO_BUILD_JOBS=2` and free disk. |
 | `Connection refused (os error 111)` on port 5432 | PostgreSQL is not running. `docker start epigraph-db`, or start your server, and check with `pg_isready`. |
 | `extension "vector" is not available` | pgvector is not installed on the server. Use the `pgvector/pgvector:pg16` image, or see <https://github.com/pgvector/pgvector#installation>. |
+| `migrations: FAILED: REFUSING: this PostgreSQL server's pgvector is 0.6.0 (the version CREATE EXTENSION would install); EpiGraph needs pgvector >= 0.8.0 ...` (or another version below 0.8.0) | The server's pgvector is too old for semantic search. Use the `pgvector/pgvector:pg16` image, or install pgvector 0.8.0 or newer, and migrate again. Nothing was applied. |
+| `migrations: FAILED: REFUSING: pgvector 0.6.0 is installed in this database; EpiGraph needs pgvector >= 0.8.0 ...` | An existing database with an old pgvector. Install pgvector 0.8.0 or newer on the server, run `ALTER EXTENSION vector UPDATE;` in the database as a superuser, and migrate again. |
 | `permission denied to create extension`, or a migration NOTICE `Cannot CREATE ROLE ...: provision it out of band` | The migration login is not a superuser. Use a superuser for `MIGRATION_DATABASE_URL` (step 1), or provision the extensions and roles in advance (`docs/deploy.md`). |
 | `migrations: FAILED: sqlx::migrate failed: ...` mentioning a checksum or a previously applied migration | An applied migration file was edited. Migrations are append-only (`migrations/README.md`). Check out the file as it was when it was applied, or start from a fresh database. |
 | `migrations: FAILED: REFUSING: the database has N applied migration version(s) this binary does not embed: ...` | A newer build migrated this database. Build from that revision. For a deliberate rollback only, re-run with `--allow-db-ahead` or `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1`. |

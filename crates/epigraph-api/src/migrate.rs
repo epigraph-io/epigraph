@@ -185,6 +185,11 @@ pub enum MigrationError {
         binary_head: i64,
         missing: Vec<i64>,
     },
+    /// Reading pgvector's version failed.
+    PgvectorQuery(sqlx::Error),
+    /// The server's pgvector is below the kernel's floor (backlog e30316ae).
+    /// Raised before the run, so nothing was applied.
+    Pgvector(epigraph_db::pgvector::Refusal),
 }
 
 impl fmt::Display for MigrationError {
@@ -221,6 +226,8 @@ impl fmt::Display for MigrationError {
                 db = db_head.map_or_else(|| "<none>".to_string(), |v| v.to_string()),
                 n = missing.len(),
             ),
+            Self::PgvectorQuery(e) => write!(f, "reading the pgvector version failed: {e}"),
+            Self::Pgvector(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -230,6 +237,8 @@ impl std::error::Error for MigrationError {
         match self {
             Self::Query(e) => Some(e),
             Self::Migrate(e) => Some(e),
+            Self::PgvectorQuery(e) => Some(e),
+            Self::Pgvector(refusal) => Some(refusal),
             _ => None,
         }
     }
@@ -406,6 +415,20 @@ pub async fn run_migrator(
     pool: &epigraph_db::PgPool,
     opts: MigrateOptions,
 ) -> Result<MigrationReport, MigrationError> {
+    run_migrator_with_pgvector_floor(migrator, pool, opts, epigraph_db::pgvector::PGVECTOR_FLOOR)
+        .await
+}
+
+/// [`run_migrator`] against an arbitrary pgvector floor. Hidden: exists so a
+/// test can drive the refusal through the production code path on a server
+/// whose pgvector meets the real floor (no test database can be downgraded).
+#[doc(hidden)]
+pub async fn run_migrator_with_pgvector_floor(
+    migrator: &sqlx::migrate::Migrator,
+    pool: &epigraph_db::PgPool,
+    opts: MigrateOptions,
+    pgvector_floor: epigraph_db::pgvector::Version,
+) -> Result<MigrationReport, MigrationError> {
     // Detached: a connection holding a session-level advisory lock must never
     // go back into the pool, where the next borrower would silently inherit it.
     let mut conn = pool
@@ -413,7 +436,7 @@ pub async fn run_migrator(
         .await
         .map_err(MigrationError::Query)?
         .detach();
-    let result = run_locked(migrator, &mut conn, opts).await;
+    let result = run_locked(migrator, &mut conn, opts, pgvector_floor).await;
     // Ending the session releases every advisory lock it holds, including the
     // extra re-entrant hold sqlx's `run` leaves behind when it errors.
     if let Err(e) = conn.close().await {
@@ -426,8 +449,22 @@ async fn run_locked(
     migrator: &sqlx::migrate::Migrator,
     conn: &mut sqlx::PgConnection,
     opts: MigrateOptions,
+    pgvector_floor: epigraph_db::pgvector::Version,
 ) -> Result<MigrationReport, MigrationError> {
     conn.lock().await.map_err(MigrationError::Migrate)?;
+
+    // The pgvector floor (backlog e30316ae), before anything is applied: an
+    // installed extension at its version, otherwise the version migration
+    // 001's CREATE EXTENSION would install.
+    let pgvector = epigraph_db::pgvector::read_state(&mut *conn)
+        .await
+        .map_err(MigrationError::PgvectorQuery)?;
+    epigraph_db::pgvector::check(
+        &pgvector,
+        epigraph_db::pgvector::Phase::BeforeMigrating,
+        pgvector_floor,
+    )
+    .map_err(MigrationError::Pgvector)?;
 
     let embedded = versions_of(migrator);
     let applied_before = applied_versions(conn)

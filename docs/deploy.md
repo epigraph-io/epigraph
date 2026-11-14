@@ -108,7 +108,8 @@ deploy from the same commit. Several deploy orders below depend on it.
 
 ### Step 2 — Create the database and the migration login
 
-As a PostgreSQL superuser, on PostgreSQL 16 with pgvector installed:
+As a PostgreSQL superuser, on PostgreSQL 16 with **pgvector 0.8.0 or newer**
+installed:
 
 ```sql
 CREATE ROLE <migration_login> LOGIN SUPERUSER PASSWORD '<secret>';  -- or a schema owner; see below
@@ -126,6 +127,21 @@ roles `epigraph_app`, `epigraph_maintenance` and `epigraph_seed` (all
 only raise a NOTICE ("Cannot CREATE ROLE ...: provision it out of band"),
 and 161 then skips the attestor grant (section 9 has the recipe). That path
 is not exercised by CI.
+
+**pgvector must be 0.8.0 or newer.** The semantic-search readers set
+`hnsw.iterative_scan`, which pgvector added in 0.8.0; on an older pgvector
+every semantic search fails with SQLSTATE 42602. Distribution packages often
+ship 0.6. `epigraph-migrate` refuses below the floor before applying anything,
+and the server refuses to start. To see what you have:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'vector';             -- installed in this database
+SELECT default_version FROM pg_available_extensions WHERE name = 'vector'; -- what the server can install
+```
+
+If the installed version is older, install pgvector 0.8.0 or newer on the
+server, then run `ALTER EXTENSION vector UPDATE;` in the database as its owner
+or a superuser, and restart the API.
 
 **Check:** `psql "<migration DSN>" -c 'SELECT 1'` connects.
 
@@ -4463,6 +4479,9 @@ Do not improvise it against a live database without that entry's context.
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
+| `REFUSING: pgvector X is installed in this database; EpiGraph needs pgvector >= 0.8.0 ...` (from `epigraph-migrate` or the server) | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2). |
+| `REFUSING: this PostgreSQL server's pgvector is X (the version CREATE EXTENSION would install) ...` / `REFUSING: this PostgreSQL server has no pgvector extension ...` | A fresh database on a server whose pgvector is missing or older than 0.8.0. Install a current pgvector and migrate again; nothing was applied. |
+| `ERROR: REFUSING: the pgvector extension is not installed in this database ...` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
 | `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
 | `refusing to serve: RLS posture assertion failed` | The API connects as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |

@@ -40,7 +40,8 @@ epigraph-io stack is built on it.
 | `epigraph-mcp-full` | `crates/epigraph-mcp` | The MCP server. It speaks stdio by default and HTTP with `--listen`. |
 | `bootstrap_clients`, `epigraph-operator` and other CLIs | `crates/epigraph-cli` | Setup and maintenance tools. `bootstrap_clients` creates the first OAuth clients. |
 
-All of them use one PostgreSQL 16 database with the `pgvector` extension.
+All of them use one PostgreSQL 16 database with the `pgvector` extension,
+version 0.8.0 or newer (`epigraph-migrate` and the server refuse an older one).
 
 ## Quickstart (local trial)
 
@@ -53,7 +54,7 @@ check it worked, and what to do when it fails.
 
 You need:
 
-- Docker (or your own PostgreSQL 16 with pgvector)
+- Docker (or your own PostgreSQL 16 with pgvector 0.8.0 or newer)
 - Rust 1.88 or newer
 - a C toolchain, `pkg-config` and the OpenSSL development headers
 - `openssl` and `curl` on your `PATH`

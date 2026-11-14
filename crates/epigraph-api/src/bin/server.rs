@@ -474,6 +474,27 @@ async fn main() {
             );
         }
 
+        // The pgvector floor (backlog e30316ae): below 0.8.0 every semantic
+        // search fails (SQLSTATE 42602 on `hnsw.iterative_scan`), so refuse to
+        // serve rather than serve a corpus that cannot be searched.
+        match epigraph_db::pgvector::read_state(&pool).await {
+            Ok(pgvector) => {
+                if let Err(refusal) = epigraph_db::pgvector::check(
+                    &pgvector,
+                    epigraph_db::pgvector::Phase::Serving,
+                    epigraph_db::pgvector::PGVECTOR_FLOOR,
+                ) {
+                    eprintln!("ERROR: {refusal}");
+                    std::process::exit(1);
+                }
+                tracing::info!(pgvector = ?pgvector, "pgvector meets the floor");
+            }
+            Err(e) => {
+                eprintln!("ERROR: cannot read the pgvector version: {e}");
+                std::process::exit(1);
+            }
+        }
+
         // Operator decision D9: no maintenance pool, no job pool, no job runner
         // and no reaper in this process, and the administrative cascade is
         // never enabled here. Every cascade a request triggers is deferred and
