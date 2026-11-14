@@ -20,8 +20,11 @@
 -- Measured on a fresh database (`pending_admin_acts.rs`'s
 -- `the_compromised_revoke_runs_only_under_read_committed` against 200's
 -- body): READ COMMITTED reaches 3 passkeys, REPEATABLE READ and
--- SERIALIZABLE reach 2 and commit. 123, 130, 148 and 166
--- guard their lock-then-read definers the same way; 200's had no guard.
+-- SERIALIZABLE reach 2 and commit. 166 guards its lock-then-read definers
+-- the same way (`<> 'read committed'`). 123, 130 and 148 refuse only
+-- REPEATABLE READ and let SERIALIZABLE through, which is NOT enough here
+-- (SERIALIZABLE misses the passkey too, as measured above); do not copy
+-- their guard onto this function. 200's had no guard at all.
 -- Minor while the maintenance role runs READ COMMITTED (the default); major
 -- if that ever changes.
 --
