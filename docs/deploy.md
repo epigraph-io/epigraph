@@ -268,8 +268,11 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   untrusted clients can connect from: whatever they write in the header is
   then believed. A request to a protected route without a valid token is
   refused 401 before the limiter. A 429 carries `Retry-After`, and one
-  refusal per bucket per minute is recorded as a `rate_limit_exceeded`
-  security event.
+  refusal per bucket per minute is recorded as a `rate_limit_exceeded` event
+  in the in-memory security audit log. Its database copy is best-effort:
+  `security_events.agent_id` references `agents`, so a refusal keyed on a
+  client address (or on an agentless token's client) is not persisted and
+  logs `Failed to persist security event` instead.
 - **Metrics** are served only on the internal listener
   `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`), never on the
   application port. See section 7.
