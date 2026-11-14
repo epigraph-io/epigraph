@@ -4,6 +4,8 @@
 pytest==9.0.2
 psycopg2-binary==2.9.11
 httpx==0.28.1
+# scripts/_api_client.py (scripts/tests/test_api_client.py)
+requests==2.32.5
 # tests/theme (scripts/theme_lib.py, refine_clusters.py, split_theme.py)
 numpy==1.26.4
 scikit-learn==1.8.0

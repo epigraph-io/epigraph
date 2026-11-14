@@ -42,21 +42,17 @@ import httpx
 # 401s. Failing loudly at startup beats a run that reports zero backlog items
 # because it could not read any.
 #
-# Mint with `scripts/_api_client.py::mint_bearer_token` (there is no
-# `scripts/mint_epigraph_token.py`; it never existed in this repo). The token
-# must carry a non-null `agent_id` claim — set EPIGRAPH_AGENT_ID before minting
-# — because the API resolves the caller's read authority from it and refuses a
-# principal-less token with 401 `invalid_token`.
+# Mint it through the token endpoint, e.g. with `python3 scripts/_api_client.py`
+# (a client_credentials exchange for a service client), never by signing one
+# locally. The API derives the token's `agent_id` (the caller's read authority)
+# from the OAuth client.
 TOKEN = os.environ.get("EPIGRAPH_TOKEN")
 if not TOKEN:
     sys.exit(
         "EPIGRAPH_TOKEN is required.\n"
-        "  Mint one with scripts/_api_client.py::mint_bearer_token, e.g.\n"
-        "    EPIGRAPH_AGENT_ID=<agents.id> python3 -c \\\n"
-        "      \"import sys; sys.path.insert(0,'scripts'); from _api_client \\\n"
-        "        import mint_bearer_token; \\\n"
-        "        print(mint_bearer_token(['claims:read','claims:write']))\"\n"
-        "  The token must carry a non-null agent_id claim."
+        "  Mint one through the token endpoint, e.g.\n"
+        "    EPIGRAPH_SERVICE_CLIENT_ID=<client_id> EPIGRAPH_SERVICE_SECRET=<secret> \\\n"
+        "      python3 scripts/_api_client.py claims:read claims:write"
     )
 AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 

@@ -138,10 +138,11 @@ Two flows mint different tokens, and it is easy to confuse them:
   from, and it stays the same for years.
 - **Bearer tokens for the HTTP API** — short-lived JWTs (or
   OAuth-issued tokens from `/oauth/token`) that authorise a
-  *request*. For bootstrap scripts, the dev helper is
-  [`scripts/_api_client.py::mint_bearer_token`](../../scripts/_api_client.py)
-  (HS256 JWT with `EPIGRAPH_JWT_SECRET`); for production clients the
-  canonical mint flow is the `/oauth/token` endpoint mounted in
+  *request*. Bootstrap scripts get theirs from the `/oauth/token` endpoint
+  too, through
+  [`scripts/_api_client.py`](../../scripts/_api_client.py)
+  (`EPIGRAPH_TOKEN`, or a service client's `client_credentials` exchange);
+  for agent clients the canonical mint flow is the `/oauth/token` endpoint mounted in
   `crates/epigraph-api/src/routes/mod.rs`, using an Ed25519 client
   assertion of `ts(8B BE) || nonce(16B) || sig(64B)`.
 

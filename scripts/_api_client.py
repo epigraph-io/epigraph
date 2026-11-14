@@ -1,112 +1,138 @@
 """Shared helper for EpiGraph bootstrap scripts to call the HTTP API.
 
-Mints a short-lived HS256 JWT using EPIGRAPH_JWT_SECRET (matches the test
-helper `test_bearer_token_with_scopes` in
-crates/epigraph-api/tests/common/mod.rs) and provides a tiny `EpiGraphClient`
-that wraps `requests` with automatic bearer auth + URL prefix.
+Provides a tiny `EpiGraphClient` that wraps `requests` with bearer auth and the
+API base URL. The bearer token comes from OAuth, never from this process:
+
+  1. `EPIGRAPH_TOKEN`, when set and non-empty, is used as given (an operator
+     minted it through /oauth/token);
+  2. otherwise `EPIGRAPH_SERVICE_CLIENT_ID` + `EPIGRAPH_SERVICE_SECRET` are
+     exchanged at the token endpoint with the `client_credentials` grant, the
+     same resolution `decompose_claims` uses;
+  3. otherwise the client refuses to start.
+
+It deliberately does not sign tokens itself. Signing with the server's HS256
+secret made every script holding that secret a universal principal: any scope,
+any `agent_id`, outside the per-client grants (backlog 3e927af3). Through the
+token endpoint the server decides the scopes (the request intersected with the
+client's grants) and the `agent_id` (the client's own agent), so a script can
+do only what its OAuth client was granted.
 
 Per feedback_no_raw_sql.md: bootstrap scripts should call the API, not write
 raw SQL.
 
 Environment:
-    EPIGRAPH_API_BASE       e.g. "http://127.0.0.1:8080"
-    EPIGRAPH_JWT_SECRET     shared HS256 secret; falls back to the dev default
-                            ("epigraph-dev-secret-change-in-production!!")
-    EPIGRAPH_CLIENT_ID      oauth_clients.id used as the JWT `sub`
-    EPIGRAPH_AGENT_ID       agents.id used as the JWT `agent_id` claim
-
-EPIGRAPH_AGENT_ID is new and it matters. Every route that returns claim
-content moved behind Bearer auth, and the `Viewer` a read path derives is
-resolved FROM `agent_id` — a token whose `agent_id` claim is null is
-structurally deficient and is refused with 401 `invalid_token`, not 403. Set
-EPIGRAPH_AGENT_ID to the `agents.id` the script should act as, or pass
-`agent_id=` explicitly.
+    EPIGRAPH_API_BASE           e.g. "http://127.0.0.1:8080"
+    EPIGRAPH_TOKEN              a bearer token, used verbatim
+    EPIGRAPH_SERVICE_CLIENT_ID  a service client's client_id, and
+    EPIGRAPH_SERVICE_SECRET     its secret, exchanged when EPIGRAPH_TOKEN is unset
+    EPIGRAPH_OAUTH_TOKEN_URL    the token endpoint; default <API base>/oauth/token
 
 Usage:
     from _api_client import EpiGraphClient
-    c = EpiGraphClient(scopes=["claims:admin"])
+    c = EpiGraphClient(scopes=["claims:write"])
     r = c.patch("/api/v1/claims/<uuid>", json={"properties": {"x": 1}})
     r.raise_for_status()
+
+    # Print a token for a script that reads EPIGRAPH_TOKEN:
+    EPIGRAPH_SERVICE_CLIENT_ID=... EPIGRAPH_SERVICE_SECRET=... \\
+        python3 scripts/_api_client.py claims:read claims:write
 """
 
 from __future__ import annotations
 
 import os
-import time
-import uuid
+import sys
 from typing import Any, Optional
 
-import jwt
 import requests
 
 DEFAULT_API_BASE = "http://127.0.0.1:8080"
-DEFAULT_JWT_SECRET = "epigraph-dev-secret-change-in-production!!"
-# provenance_log.principal_id has an FK to oauth_clients(id), so the JWT
-# `sub` (= auth.client_id = recorded principal_id) must be a real client row.
-# Default to the existing `epigraph-admin` service client (has claims:admin
-# + all needed scopes granted). Override via EPIGRAPH_CLIENT_ID env var.
-DEFAULT_CLIENT_ID = "5997f752-5d79-48bc-b876-cb77498066a6"
-# There is deliberately no DEFAULT_AGENT_ID. `sub` can have a sensible default
-# because it names a *client* row that exists in every deployment; `agent_id`
-# names the PRINCIPAL whose group membership decides what the token can read,
-# and defaulting that to somebody would hand every script one identity's view
-# of the corpus by accident.
 
 
-def mint_bearer_token(
+def _env(name: str) -> Optional[str]:
+    value = os.environ.get(name)
+    return value if value else None
+
+
+def resolve_api_base(base: Optional[str] = None) -> str:
+    return (base or _env("EPIGRAPH_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+
+
+def fetch_service_token(
+    client_id: str,
+    client_secret: str,
+    token_url: str,
     scopes: list[str],
-    client_id: Optional[uuid.UUID] = None,
-    ttl_seconds: int = 3600,
-    client_type: str = "service",
-    agent_id: Optional[uuid.UUID] = None,
-    owner_id: Optional[uuid.UUID] = None,
+    timeout: float = 30.0,
 ) -> str:
-    """Issue an HS256 JWT matching the shape produced by epigraph_auth::JwtConfig.
+    """Exchange service-client credentials for a bearer token
+    (`grant_type=client_credentials`, form-encoded, as decompose_claims sends).
 
-    Mirror of epigraph-auth/src/lib.rs::JwtConfig::issue_access_token:
-      claims: {sub, iss="epigraph", aud="epigraph-api", exp, iat, nbf, jti,
-               scopes, client_type, owner_id?, agent_id?}
-      algorithm: HS256
-
-    `sub` defaults to the epigraph-admin oauth_clients row (via
-    EPIGRAPH_CLIENT_ID env var or DEFAULT_CLIENT_ID) so the provenance FK
-    is satisfied. A random `sub` would 500 on every write.
-
-    `agent_id` falls back to EPIGRAPH_AGENT_ID. The claim was always emitted
-    here, but no caller ever supplied a value, so it was always null — which is
-    exactly the token shape the API now refuses on every read path. There is no
-    hardcoded default: an unset EPIGRAPH_AGENT_ID yields a null claim, and the
-    401 that follows is the correct, legible outcome.
+    Exits when the endpoint refuses, answers without an `access_token`, or
+    grants fewer scopes than requested: the server drops ungranted scopes
+    silently, and a job that needs one should stop here rather than 403
+    partway through. No message includes the secret.
     """
-    secret = os.environ.get("EPIGRAPH_JWT_SECRET", DEFAULT_JWT_SECRET)
-    if client_id is None:
-        client_id = uuid.UUID(os.environ.get("EPIGRAPH_CLIENT_ID", DEFAULT_CLIENT_ID))
-    if agent_id is None:
-        env_agent_id = os.environ.get("EPIGRAPH_AGENT_ID")
-        if env_agent_id:
-            agent_id = uuid.UUID(env_agent_id)
-    now = int(time.time())
-    claims: dict[str, Any] = {
-        "sub": str(client_id),
-        "iss": "epigraph",
-        "aud": "epigraph-api",
-        "exp": now + ttl_seconds,
-        "iat": now,
-        "nbf": now,
-        "jti": str(uuid.uuid4()),
-        "scopes": scopes,
-        "client_type": client_type,
-        "owner_id": str(owner_id) if owner_id else None,
-        "agent_id": str(agent_id) if agent_id else None,
-    }
-    return jwt.encode(claims, secret, algorithm="HS256")
+    try:
+        resp = requests.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": " ".join(scopes),
+            },
+            timeout=timeout,
+        )
+    except requests.RequestException as e:
+        raise SystemExit(f"token endpoint {token_url} unreachable: {type(e).__name__}")
+    if not resp.ok:
+        raise SystemExit(
+            f"token endpoint {token_url} refused client {client_id!r}: HTTP {resp.status_code}"
+        )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    token = body.get("access_token") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        raise SystemExit(f"token endpoint {token_url} returned no access_token")
+    granted = set(str(body.get("scope") or "").split())
+    missing = [s for s in scopes if s not in granted]
+    if missing:
+        raise SystemExit(
+            f"client {client_id!r} was not granted {' '.join(missing)} "
+            f"(granted: {' '.join(sorted(granted)) or 'none'})"
+        )
+    return token
+
+
+def resolve_bearer_token(scopes: list[str], base: Optional[str] = None) -> str:
+    """EPIGRAPH_TOKEN as given, else a client_credentials exchange, else exit."""
+    token = _env("EPIGRAPH_TOKEN")
+    if token:
+        return token
+    client_id = _env("EPIGRAPH_SERVICE_CLIENT_ID")
+    client_secret = _env("EPIGRAPH_SERVICE_SECRET")
+    if not (client_id and client_secret):
+        raise SystemExit(
+            "No API credentials.\n"
+            "Set EPIGRAPH_TOKEN to a token minted through /oauth/token, or set\n"
+            "EPIGRAPH_SERVICE_CLIENT_ID and EPIGRAPH_SERVICE_SECRET to a service\n"
+            "client granted the scopes this job needs; the token is then exchanged\n"
+            "at EPIGRAPH_OAUTH_TOKEN_URL (default <API base>/oauth/token).\n"
+            "This helper no longer signs its own tokens from EPIGRAPH_JWT_SECRET."
+        )
+    token_url = _env("EPIGRAPH_OAUTH_TOKEN_URL") or f"{resolve_api_base(base)}/oauth/token"
+    return fetch_service_token(client_id, client_secret, token_url, scopes)
 
 
 class EpiGraphClient:
     """Thin requests wrapper with automatic bearer auth + API base URL.
 
-    Raises HTTPError on non-2xx responses (caller can choose to ignore via
-    response.status_code check before raise_for_status()).
+    The token is resolved at construction (`resolve_bearer_token`), so a job
+    without credentials exits before it does any work. Raises HTTPError on
+    non-2xx responses only when the caller calls raise_for_status().
     """
 
     def __init__(
@@ -114,34 +140,9 @@ class EpiGraphClient:
         scopes: Optional[list[str]] = None,
         base: Optional[str] = None,
         timeout: float = 60.0,
-        agent_id: Optional[uuid.UUID] = None,
     ):
-        self.base = (base or os.environ.get("EPIGRAPH_API_BASE", DEFAULT_API_BASE)).rstrip("/")
-        # agent_id threads through to the JWT `agent_id` claim; when None it
-        # falls back to EPIGRAPH_AGENT_ID.
-        #
-        # Fail here rather than at the first request. mint_bearer_token is a raw
-        # token helper and will happily emit a null `agent_id` claim -- a caller
-        # exercising the 401 path is a legitimate use of it. EpiGraphClient is
-        # not that: its callers are batch jobs
-        # (anchor_papers_to_themes.py, classify_paper_document_type.py,
-        # update_theme_workflow_steps.py, lib/nli_stance.py) that would
-        # otherwise run their setup, issue a request, and die on an opaque 401
-        # whose cause is an unset environment variable several files away.
-        if agent_id is None:
-            env_agent_id = os.environ.get("EPIGRAPH_AGENT_ID")
-            if not env_agent_id:
-                raise SystemExit(
-                    "EPIGRAPH_AGENT_ID is not set.\n"
-                    "Since the PR-03 router inversion, a token whose `agent_id` claim is\n"
-                    "null is refused 401 invalid_token on every route this client uses.\n"
-                    "Set EPIGRAPH_AGENT_ID to the agents.id this job should act as, or\n"
-                    "pass agent_id= explicitly. There is deliberately no default: agent_id\n"
-                    "names the principal whose group membership decides what the token can\n"
-                    "read."
-                )
-            agent_id = uuid.UUID(env_agent_id)
-        self.token = mint_bearer_token(scopes or ["claims:read"], agent_id=agent_id)
+        self.base = resolve_api_base(base)
+        self.token = resolve_bearer_token(scopes or ["claims:read"], self.base)
         self.timeout = timeout
 
     def _headers(self) -> dict[str, str]:
@@ -161,3 +162,15 @@ class EpiGraphClient:
 
     def delete(self, path: str, **kw: Any) -> requests.Response:
         return requests.delete(self.base + path, headers=self._headers(), timeout=self.timeout, **kw)
+
+
+if __name__ == "__main__":
+    # Prints a client_credentials token for the scopes named on the command
+    # line, for scripts that read EPIGRAPH_TOKEN. Never from EPIGRAPH_TOKEN
+    # itself: that would only echo it back.
+    _scopes = sys.argv[1:] or ["claims:read"]
+    _id, _secret = _env("EPIGRAPH_SERVICE_CLIENT_ID"), _env("EPIGRAPH_SERVICE_SECRET")
+    if not (_id and _secret):
+        raise SystemExit("Set EPIGRAPH_SERVICE_CLIENT_ID and EPIGRAPH_SERVICE_SECRET.")
+    _url = _env("EPIGRAPH_OAUTH_TOKEN_URL") or f"{resolve_api_base()}/oauth/token"
+    print(fetch_service_token(_id, _secret, _url, _scopes))

@@ -20,11 +20,10 @@ Environment:
     EPIGRAPH_API_URL  - API base URL (default: http://127.0.0.1:8080)
     EPIGRAPH_TOKEN    - Bearer token. REQUIRED (PR-03). Needs claims:write, and
                         claims:admin for reassign flows that cross owners.
-    EPIGRAPH_AGENT_ID - agents.id to mint the token's `agent_id` claim from.
 
-    Mint with `scripts/_api_client.py::mint_bearer_token`. (Earlier revisions of
-    this docstring pointed at `scripts/mint_epigraph_token.py`, which does not
-    exist in this repo.)
+    Mint it through the token endpoint, e.g. with `python3 scripts/_api_client.py
+    claims:write claims:admin` (a client_credentials exchange for a service
+    client), never by signing one locally.
 
     The token is no longer optional. Every theme endpoint this script reads —
     `/api/v1/clusters/boundary-claims`, `/api/v1/themes/split-candidates`,
@@ -58,12 +57,9 @@ if not TOKEN:
     sys.exit(
         "EPIGRAPH_TOKEN is required.\n"
         "  Every theme endpoint this script uses is authenticated (PR-03).\n"
-        "  Mint one with scripts/_api_client.py::mint_bearer_token, e.g.\n"
-        "    EPIGRAPH_AGENT_ID=<agents.id> python3 -c \\\n"
-        "      \"import sys; sys.path.insert(0,'scripts'); from _api_client \\\n"
-        "        import mint_bearer_token; \\\n"
-        "        print(mint_bearer_token(['claims:write','claims:admin']))\"\n"
-        "  The token must carry a non-null agent_id claim."
+        "  Mint one through the token endpoint, e.g.\n"
+        "    EPIGRAPH_SERVICE_CLIENT_ID=<client_id> EPIGRAPH_SERVICE_SECRET=<secret> \\\n"
+        "      python3 scripts/_api_client.py claims:write claims:admin"
     )
 
 
