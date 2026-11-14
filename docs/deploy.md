@@ -2390,6 +2390,14 @@ epigraph-operator restrict-claims ... --manifest-out restrict-1.jsonl --apply \
 epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 ```
 
+- **A crashed run's manifest**: a run that crashed mid-append can leave a torn
+  final line, which `reown-reverse` refuses unless `--allow-truncated-tail`
+  (on any manifest it reads). Every record of the torn batch
+  is phantom, because its batch never committed. First prove from the
+  database that that batch rolled back. Then reverse the crashed manifest
+  TOGETHER with every manifest a resumed run wrote, in one `reown-reverse`
+  call, dry run first and then `--apply`: it applies them newest first, so the
+  crashed manifest cannot restore rows a later run moved again.
 - **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
   public owners). The target must be an existing `active` group, not world or
   seed, administered by `--operator`. A claim whose move would make another
@@ -2763,12 +2771,37 @@ the flags.
 | Area | Verbs |
 |---|---|
 | Humans and links | `register-human-operator`, `revoke-human-operator`, `link`, `retire-link`, `link-retired`, `link-legacy-authors`, `arm-operator-binding`, `register-system-agent`, `allow-author-binding-client`, `revoke-author-binding-client` |
-| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse` |
+| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse`, `set-workflow-submitter` (and its `--reverse`) |
 | Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede` |
 | Groups | `create-group`, `group-member add\|remove\|set-role`, `define-group-role`, `bind-group-role`, `end-group-role-binding`, `group-roster` |
 | Passkeys and elevation | `passkey-enroll`, `list-passkeys`, `revoke-passkey`, `end-elevation`, `list-elevations`, `verify-confirmations` |
-| OAuth clients and scopes | `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
+| OAuth clients and scopes | `approve-client`, `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
 | Data hygiene | `delete-frames` |
+
+**`grant-role`: measure, then pick the variant.** The database decides which
+flags a grant needs, and a runbook cannot know in advance:
+
+1. `epigraph-operator list-role-assignments --role role:platform-custodian`.
+   With no live custodian, the grant is the BOOTSTRAP: omit `--granted-by`.
+   Naming a grantor then fails `CUS03`, because the grantor holds no live
+   custodian assignment.
+2. With a live custodian, `--granted-by <a live custodian's agent>` is
+   required. Without it the grant fails `CUS03`.
+3. `epigraph-operator list-passkeys --person <the grantor>`. A grantor with a
+   live passkey (migration 130) also needs `--act <id>`: a confirmed
+   `role.grant` act whose arguments are exactly the grant's flags. Without it
+   the grant fails `ELV10` (see "Pending admin acts (migration 130)").
+
+**`approve-client`.** `/oauth/register` returns the `client_id` string, while
+the operator verbs take the `oauth_clients.id` row uuid. `approve-client`
+accepts either one (`--client-id <string>` or `--client <uuid>`), maps the
+string to the row, and prints both. It approves a `pending` client only, with
+exactly the `--scope`s given, and audits the approval. Since migration 188,
+the REST approval route answers 501 and names this verb.
+
+`group-roster` prints role-binding members on `MEMBER` lines. It prints the
+group's live direct `group_memberships` rows on `DIRECT` lines (with
+`source=direct`) and counts them on a final `direct=` line.
 
 ## 10. Elevation (migrations 124–132)
 

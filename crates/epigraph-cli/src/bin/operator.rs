@@ -38,7 +38,8 @@
 //!         [--attest-shared-signer <uuid,...>] [--apply]
 //!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
-//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
+//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl \
+//!         [--allow-truncated-tail] [--apply]
 //!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
@@ -58,6 +59,11 @@
 //!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
 //!         --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest reown-wf-1.jsonl [--apply]
+//!     epigraph-operator set-workflow-submitter (--ids-file F | --canonical-names-file F | \
+//!         --without-submitter) --submitter <agent> --operator <uuid> [--force-reassign] \
+//!         [--apply --confirm-count N --manifest-out wf-sub-1.jsonl --ruling TEXT --reason TEXT]
+//!     epigraph-operator set-workflow-submitter --reverse wf-sub-1.jsonl --operator <uuid> \
+//!         [--apply --reason TEXT]
 //!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
 //!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
 //!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
@@ -116,6 +122,8 @@
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
+//!     epigraph-operator approve-client (--client <uuid> | --client-id <string>) \
+//!         --scope S [--scope S ...] [--approved-by <uuid>] --reason TEXT [--apply]
 //!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
@@ -123,10 +131,10 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
-    confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation, group_role, hide,
-    human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows, restrict,
-    retire_link, reverse, system_agent, team_group,
+    self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
+    client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
+    group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows,
+    restrict, retire_link, reverse, system_agent, team_group, workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -146,8 +154,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Grant a platform role (migration 123) to a REGISTERED HUMAN for an
-    /// explicit window. Agents never hold a role (CUS01); once a custodian
-    /// exists every grant names a live custodian as --granted-by (CUS03).
+    /// explicit window. Agents never hold a role (CUS01).
+    ///
+    /// Which variant applies is decided by the database's state, so measure
+    /// first (`list-role-assignments --role role:platform-custodian`, and
+    /// `list-passkeys --person <grantor>`):
+    ///
+    /// * no live custodian: the BOOTSTRAP grant, with no --granted-by
+    ///   (giving one fails CUS03, the grantor holds no live custodian
+    ///   assignment);
+    /// * a live custodian exists: --granted-by <a live custodian> is required
+    ///   (CUS03 without it);
+    /// * the grantor holds a live passkey (migration 130): also --act <a
+    ///   CONFIRMED role.grant act with exactly these flags> (ELV10 without
+    ///   it).
     GrantRole {
         /// A catalog role: `role:platform-custodian`, `role:auditor`, or one
         /// `define-group-role` added (migration 165).
@@ -443,8 +463,10 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Who holds a group through its role bindings at an instant (migration
-    /// 165): each role holder and each agent registered to one. Read-only.
+    /// Who holds a group at an instant: each role-binding member (migration
+    /// 165: a role holder, or an agent registered to one) on a `MEMBER` line,
+    /// then each DIRECT member (a `group_memberships` row live at that
+    /// instant, migration 060) on a `DIRECT` line. Read-only.
     GroupRoster {
         /// The group.
         #[arg(long)]
@@ -576,6 +598,36 @@ enum Command {
         #[arg(long)]
         revoke_membership: bool,
         /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Approve ONE PENDING OAuth client (migration 188 made approval a
+    /// maintenance act): `epigraph_oauth_client_approve` sets it `active` with
+    /// exactly the `--scope`s given, and this verb writes its own audit row
+    /// beside the definer's, in one transaction. Refused for a client that is
+    /// not `pending`, for `platform:admin`, and for an admin-only scope while
+    /// migration 128 is armed.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["client", "client_id"])))]
+    ApproveClient {
+        /// The client's `oauth_clients.id` row uuid.
+        #[arg(long)]
+        client: Option<Uuid>,
+        /// The client's `client_id` string (what `/oauth/register` returns),
+        /// mapped to its row.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// A scope to grant (repeatable; at least one). Exactly these become
+        /// the client's `granted_scopes`.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        /// The approving client's `oauth_clients.id`, recorded by the definer
+        /// as the client's `created_by` (the prior value is in the audit row).
+        #[arg(long)]
+        approved_by: Option<Uuid>,
+        /// Recorded in the audit row. Required, not blank.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the approval and its audit rows roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -1158,6 +1210,55 @@ enum Command {
     /// arrays, with a `security_events` row. A live access token keeps the
     /// scope until it expires; the next refresh drops it.
     RevokeClientScope(ScopeArgs),
+    /// Set or correct the recorded SUBMITTER (`metadata.epigraph_submitted_by`)
+    /// of selected `workflows` rows, audited; or reverse such a run
+    /// (`--reverse <manifest>`). Select with exactly one of --ids-file,
+    /// --canonical-names-file, --without-submitter. A row recording another
+    /// submitter is HELD unless --force-reassign. A dry run unless --apply,
+    /// which needs --confirm-count (the dry run's ELIGIBLE-WORKFLOW-ROWS),
+    /// --ruling, --reason and --manifest-out; one transaction and one
+    /// security_events row per run. Exits 3 when an --apply (or an applied
+    /// reversal) left a selected row unwritten.
+    #[command(group(
+        clap::ArgGroup::new("selector")
+            .required(true)
+            .args(["ids_file", "canonical_names_file", "without_submitter", "reverse"])
+    ))]
+    SetWorkflowSubmitter {
+        /// Workflow ids, one per line.
+        #[arg(long)]
+        ids_file: Option<PathBuf>,
+        /// Canonical names, one per line: every generation of each lineage.
+        #[arg(long)]
+        canonical_names_file: Option<PathBuf>,
+        /// Every workflow that records no submitter.
+        #[arg(long)]
+        without_submitter: bool,
+        /// Reverse a manifest an applied run wrote (compare-and-swap per row).
+        #[arg(long)]
+        reverse: Option<PathBuf>,
+        /// The agent to record as submitter.
+        #[arg(long, required_unless_present = "reverse", conflicts_with = "reverse")]
+        submitter: Option<Uuid>,
+        /// The registered human operator this act (or this reversal) is
+        /// made under, checked live and named in the audit row.
+        #[arg(long)]
+        operator: Uuid,
+        /// Replace a submitter another agent is recorded as.
+        #[arg(long, conflicts_with = "reverse")]
+        force_reassign: bool,
+        /// Where the undo record is written (create_new) under --apply.
+        #[arg(long, conflicts_with = "reverse")]
+        manifest_out: Option<PathBuf>,
+        #[arg(long, conflicts_with = "reverse")]
+        confirm_count: Option<usize>,
+        #[arg(long, default_value = "", conflicts_with = "reverse")]
+        ruling: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Restore every row a manifest's run moved to the owner it recorded.
     ReownReverse {
         /// A manifest to reverse. Repeatable: several are applied newest-first
@@ -1170,6 +1271,15 @@ enum Command {
         batch_size: usize,
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
+        /// Tolerate ONE torn final line per manifest (no trailing newline,
+        /// not JSON): what a run that crashed mid-append leaves. It is
+        /// dropped and printed as a WARN line; every other malformed line is
+        /// still refused. Prove first, from the database, that the batch the
+        /// torn record belongs to rolled back, and dry-run on a copy. Pass
+        /// the crashed manifest together with every manifest a resumed run
+        /// wrote, so they are reversed newest first.
+        #[arg(long)]
+        allow_truncated_tail: bool,
     },
 }
 
@@ -1283,6 +1393,11 @@ async fn main_inner() -> anyhow::Result<i32> {
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
+    }
+    // approve-client: platform:admin, a blank or repeated scope, or a blank
+    // reason, before any connection is made.
+    if let Command::ApproveClient { scopes, reason, .. } = &cli.command {
+        approve_client::validate(scopes, reason)?;
     }
     // A grant names its window explicitly; refused before any connection.
     let window = if let Command::GrantRole {
@@ -2013,11 +2128,18 @@ async fn main_inner() -> anyhow::Result<i32> {
                     row.agent, row.role, row.holder
                 );
             }
-            println!(
-                "members={}\tgroup={group}\tat={}",
-                rows.len(),
-                at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339())
-            );
+            let at_text = at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339());
+            println!("members={}\tgroup={group}\tat={at_text}", rows.len());
+            let direct = group_role::direct_members(&mut conn, group, at).await?;
+            for d in &direct {
+                println!(
+                    "DIRECT\tagent={}\trole={}\tsource=direct\tjoined={}",
+                    d.agent,
+                    d.role,
+                    d.joined_at.to_rfc3339()
+                );
+            }
+            println!("direct={}\tgroup={group}\tat={at_text}", direct.len());
             Ok(0)
         }
         Command::GroupMember { action } => {
@@ -2235,6 +2357,35 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the retire and its audit row were rolled back.");
             }
             Ok(outcome.exit_code())
+        }
+        Command::ApproveClient {
+            client,
+            client_id,
+            scopes,
+            approved_by,
+            reason,
+            apply,
+        } => {
+            let which = match (client, client_id) {
+                (Some(id), None) => approve_client::ClientRef::Row(id),
+                (None, Some(s)) => approve_client::ClientRef::ClientId(s),
+                _ => unreachable!("clap requires exactly one of --client / --client-id"),
+            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome = approve_client::run(
+                &mut conn,
+                &which,
+                &scopes,
+                approved_by,
+                &reason,
+                apply,
+                &who,
+            )
+            .await?;
+            for line in approve_client::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
         }
         cmd @ (Command::SuspendClient(_) | Command::RevokeClient(_)) => {
             let (act, a) = match cmd {
@@ -2646,17 +2797,69 @@ async fn main_inner() -> anyhow::Result<i32> {
             println!("{}", client_scope::describe(&outcome));
             Ok(0)
         }
+        Command::SetWorkflowSubmitter {
+            ids_file,
+            canonical_names_file,
+            without_submitter,
+            reverse: reverse_manifest,
+            submitter,
+            operator: op,
+            force_reassign,
+            manifest_out,
+            confirm_count,
+            ruling,
+            reason,
+            apply,
+        } => {
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            if let Some(path) = reverse_manifest {
+                let r = workflow_submitter::reverse(
+                    &mut conn,
+                    &path,
+                    op,
+                    apply,
+                    &reason,
+                    &who,
+                    &mut stdout,
+                )
+                .await?;
+                return Ok(if apply && r.held > 0 { 3 } else { 0 });
+            }
+            let selection = if let Some(f) = ids_file {
+                workflow_submitter::Selection::Ids(workflow_submitter::read_ids_file(&f)?)
+            } else if let Some(f) = canonical_names_file {
+                workflow_submitter::Selection::CanonicalNames(reown_workflows::read_names_file(&f)?)
+            } else {
+                debug_assert!(without_submitter);
+                workflow_submitter::Selection::WithoutSubmitter
+            };
+            let opts = workflow_submitter::Options {
+                selection,
+                submitter: submitter.expect("clap requires --submitter"),
+                operator: op,
+                force_reassign,
+                apply,
+                confirm_count,
+                ruling,
+                reason,
+                manifest_out,
+            };
+            let report = workflow_submitter::run(&mut conn, &opts, &who, &mut stdout).await?;
+            Ok(workflow_submitter::exit_code(&report, &opts))
+        }
         Command::ReownReverse {
             manifest,
             apply,
             batch_size,
             lock_timeout,
+            allow_truncated_tail,
         } => {
             let opts = reverse::Options {
                 manifests: manifest,
                 apply,
                 batch_size,
                 lock_timeout,
+                allow_truncated_tail,
             };
             let report = reverse::run(&mut conn, &opts, &mut stdout).await?;
             Ok(if !report.batch_failures.is_empty() {

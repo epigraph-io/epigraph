@@ -453,3 +453,95 @@ async fn the_agent_mode_flag_binds_each_mode_and_refuses_the_rest(pool: PgPool) 
     );
     drop_login(&pool, &login).await;
 }
+
+/// Backlog f33bb29f (2): `group-roster` lists the group's DIRECT members, the
+/// live `group_memberships` rows, on `DIRECT` lines with their role, so a
+/// roster check can verify a direct reader or writer. A revoked member is not
+/// listed, nor is a member at an instant before it joined; the role-binding
+/// `MEMBER` lines and their `members=` count are unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_roster_lists_live_direct_members(pool: PgPool) {
+    let (owner, _) = fixture::seed_human_operator(&pool, "cli-direct-owner").await;
+    let (reader, _) = fixture::seed_human_operator(&pool, "cli-direct-reader").await;
+    let (gone, _) = fixture::seed_human_operator(&pool, "cli-direct-gone").await;
+    let group = team_group(&pool, "Synthetic CLI Direct Team", owner).await;
+    let (login, dsn) = maintenance_login(&pool).await;
+    let g = group.to_string();
+    let member = |verb: &str, agent: Uuid, role: Option<&str>| {
+        let a = agent.to_string();
+        let mut args = vec!["group-member", verb, "--group", &g, "--agent", &a];
+        if let Some(r) = role {
+            args.extend(["--role", r]);
+        }
+        args.extend(["--reason", "cli test", "--apply"]);
+        run_with(&args, Some(&dsn))
+    };
+    for (agent, role) in [(reader, "reader"), (gone, "writer")] {
+        let add = member("add", agent, Some(role));
+        assert_eq!(add.code, 0, "{}", add.show());
+    }
+    let removed = member("remove", gone, None);
+    assert_eq!(removed.code, 0, "{}", removed.show());
+
+    let roster = run_with(&["group-roster", "--group", &g], Some(&dsn));
+    assert_eq!(roster.code, 0, "{}", roster.show());
+    let direct: Vec<&str> = roster
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("DIRECT\t"))
+        .collect();
+    assert_eq!(
+        direct.len(),
+        2,
+        "the admin and the reader: {}",
+        roster.show()
+    );
+    assert!(
+        direct
+            .iter()
+            .any(|l| l.contains(&format!("agent={owner}\trole=admin\tsource=direct"))),
+        "{}",
+        roster.show()
+    );
+    assert!(
+        direct
+            .iter()
+            .any(|l| l.contains(&format!("agent={reader}\trole=reader\tsource=direct"))),
+        "{}",
+        roster.show()
+    );
+    assert!(
+        !roster.stdout.contains(&format!("agent={gone}")),
+        "a revoked member is not live: {}",
+        roster.show()
+    );
+    assert!(
+        roster.stdout.contains(&format!("members=0\tgroup={g}")),
+        "no role-binding member, and the MEMBER count is unchanged: {}",
+        roster.show()
+    );
+    assert!(
+        roster.stdout.contains(&format!("direct=2\tgroup={g}")),
+        "{}",
+        roster.show()
+    );
+
+    let before = run_with(
+        &[
+            "group-roster",
+            "--group",
+            &g,
+            "--at",
+            "2000-01-01T00:00:00Z",
+        ],
+        Some(&dsn),
+    );
+    assert_eq!(before.code, 0, "{}", before.show());
+    assert!(
+        !before.stdout.contains("DIRECT\t") && before.stdout.contains("direct=0"),
+        "nobody had joined in 2000: {}",
+        before.show()
+    );
+
+    drop_login(&pool, &login).await;
+}
