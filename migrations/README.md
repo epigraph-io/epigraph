@@ -2654,6 +2654,27 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **229**: public `evidence_type_dataset` (backlog c8beb101). Re-creates
+  `evidence_type_valid` on `evidence` with migration 001's seven values plus
+  `dataset`, the stored name of `epigraph_core::EvidenceType::Dataset`
+  (evidence committing to a multi-file dataset by its manifest digest; its
+  fields live in `properties`, as every variant's do). One `ALTER TABLE` (drop
+  and add), under `lock_timeout = 5s`; the re-validation scans `evidence`
+  under the ALTER's ACCESS EXCLUSIVE lock. No table, column, function,
+  trigger, policy, index or grant; no tenancy surface. The vocabulary's one
+  Rust copy is `epigraph_core::STORED_EVIDENCE_TYPES`. Pinned by
+  `epigraph-db/tests/evidence_type_dataset.rs` (the CHECK's names equal
+  `STORED_EVIDENCE_TYPES`; the repository round trip; the undo).
+  Undo: `docs/runbooks/229-undo.sql` (tested: run twice, it returns the
+  constraint to 001's definition byte for byte; it refuses, changing
+  nothing, while any `dataset` row exists). Slot 229 was assigned by the
+  2026-11-14 backlog wave; checked before claiming: no origin branch carries
+  a `229`. **Deploy order:** migrate before rolling out a binary that writes
+  dataset evidence (each such write is refused 23514 on an unmigrated
+  database); a pre-229 binary reads a `dataset` row as an
+  `application/octet-stream` Document. Undo only after rolling every 229
+  binary back. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 
