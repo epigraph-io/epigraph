@@ -1586,6 +1586,41 @@ pub struct SubmitClaimResponse {
     /// of another visibility was returned unchanged (D-V4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility_note: Option<String>,
+    /// Present ONLY when the submitted text screens compound. A warning: the
+    /// claim was handled exactly as without it. See [`AtomicityWarning`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomicity: Option<AtomicityWarning>,
+}
+
+/// The warn-only atomicity gate on `submit_claim`, `batch_submit_claims` and
+/// `memorize` (backlog `72850d43`): the submitted text appears to assert
+/// several independent things (`epigraph_core::atomicity::conjunct_screen`).
+/// Nothing is refused on it, because narrative protocol and postmortem claims
+/// are legitimately long; it tells the caller that a partial dispute of this
+/// claim would have no atomic target to attach to.
+#[derive(Debug, Clone, Serialize)]
+pub struct AtomicityWarning {
+    #[serde(flatten)]
+    pub screen: epigraph_core::atomicity::ConjunctScreen,
+    pub note: &'static str,
+}
+
+/// The [`AtomicityWarning::note`] every warning carries.
+pub const ATOMICITY_WARNING_NOTE: &str =
+    "This text appears to assert several independent things (conjunct_count >= 2). It was \
+     written as submitted; nothing was refused. Consider submitting each assertion as its own \
+     claim, so a later dispute can target the one it disputes.";
+
+impl AtomicityWarning {
+    /// The warning for `content`, or `None` when it does not screen compound.
+    #[must_use]
+    pub fn for_content(content: &str) -> Option<Self> {
+        let screen = epigraph_core::atomicity::conjunct_screen(content);
+        screen.is_compound().then_some(Self {
+            screen,
+            note: ATOMICITY_WARNING_NOTE,
+        })
+    }
 }
 
 /// Which dedup path answered a write with an EXISTING claim.
@@ -1884,6 +1919,9 @@ pub struct MemorizeResponse {
     /// of another visibility was returned unchanged (D-V4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility_note: Option<String>,
+    /// See [`SubmitClaimResponse::atomicity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomicity: Option<AtomicityWarning>,
 }
 
 #[derive(Debug, Serialize)]

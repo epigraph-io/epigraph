@@ -136,6 +136,7 @@ pub async fn memorize(
                     visibility: None,
                     owner_group_id: None,
                     visibility_note: None,
+                    atomicity: crate::types::AtomicityWarning::for_content(&params.content),
                 });
             }
             pending_embedding = Some(pgvec);
@@ -390,6 +391,8 @@ pub async fn memorize(
         visibility: Some(tenancy_report.visibility.to_string()),
         owner_group_id: Some(tenancy_report.owner_group_id.to_string()),
         visibility_note: tenancy_report.note,
+        // Warn-only (backlog 72850d43): the claim above is already committed.
+        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
     })
 }
 
