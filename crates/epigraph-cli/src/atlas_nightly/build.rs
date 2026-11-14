@@ -78,7 +78,6 @@ struct BuiltTheme {
     docs: Vec<LevelDocument>,
     mirrors: Vec<Uuid>,
     stats: Value,
-    unembedded: usize,
 }
 
 enum ThemeOutcome {
@@ -280,9 +279,9 @@ async fn build_theme(
     Ok(ThemeOutcome::Built(BuiltTheme {
         docs,
         mirrors,
-        unembedded: members.unembedded,
         stats: json!({
             "members": ids.len(),
+            "unembedded": members.unembedded,
             "added": added,
             "removed": removed,
             "meaning": {"leaves": m_stats.leaves, "inner": inner(&m_tree),
@@ -396,7 +395,7 @@ struct MapBuild {
     docs: Vec<LevelDocument>,
     mirrors: Vec<Uuid>,
     themes: Value,
-    unembedded: usize,
+    unembedded: i64,
     texts: BTreeMap<Uuid, String>,
     names: crate::atlas_naming::name::Previous,
 }
@@ -442,7 +441,6 @@ async fn read_and_build(
 
     let mut docs = Vec::new();
     let mut mirrors = Vec::new();
-    let mut unembedded = 0;
     let (mut built, mut carried, mut dropped, mut unbuilt) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let empty: Vec<&RunLevel> = Vec::new();
@@ -464,7 +462,6 @@ async fn read_and_build(
                 sp.commit().await.context("release a theme savepoint")?;
                 docs.extend(b.docs);
                 mirrors.extend(b.mirrors);
-                unembedded += b.unembedded;
                 built.push(json!({"theme_id": theme, "stats": b.stats}));
             }
             Ok(ThemeOutcome::Unbuilt(n)) => {
@@ -498,6 +495,10 @@ async fn read_and_build(
             }
         }
     }
+    // Every theme's, also one with no embedded member (no tree, so not in
+    // `themes` above) and one carried, dropped or unbuilt.
+    let unembedded =
+        AtlasMeaningRepository::unembedded_members_on_map(&mut tx, viewer, map).await?;
     let plan = plan_samples(&docs)?;
     let texts = read_member_texts(&mut tx, viewer, map, &plan).await?;
     let names = read_previous(&mut tx, viewer, map).await?;

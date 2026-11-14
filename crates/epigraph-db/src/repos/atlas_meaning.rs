@@ -158,9 +158,41 @@ impl AtlasMeaningRepository {
         Ok(out)
     }
 
-    /// How many current claims with an embedding have no theme, as `viewer`
-    /// may read them: what the nightly's theme assignment
-    /// (`ClaimThemeRepository::assign_unthemed_batch`) would place. A dry run
+    /// How many current, themed claims `map` may draw have no embedding, in
+    /// EVERY theme (also one with no embedded member, which has no tree): the
+    /// claims no leaf of the map holds. Atlas W9's per-map
+    /// `unembedded_members`.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn unembedded_members_on_map(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*)::int8 \
+               FROM claims c \
+              WHERE c.theme_id IS NOT NULL \
+                AND c.embedding IS NULL \
+                AND COALESCE(c.is_current, true) \
+                AND (c.visibility = 'public' \
+                     OR ($1::uuid IS NOT NULL AND c.visibility = 'group' \
+                         AND c.owner_group_id = $1)) \
+                /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
+    /// How many claims with an embedding have no theme, as `viewer` may read
+    /// them: exactly what the nightly's theme assignment
+    /// (`ClaimThemeRepository::assign_unthemed_batch`) would place, which
+    /// assigns superseded claims too (no `is_current` filter, as there). A dry run
     /// reports this instead of assigning. Corpus-wide, not per map: theme
     /// membership is one column for every map.
     ///
@@ -173,7 +205,6 @@ impl AtlasMeaningRepository {
         let sql = viewer.splice(
             "SELECT COUNT(*)::int8 FROM claims c \
               WHERE c.theme_id IS NULL AND c.embedding IS NOT NULL \
-                AND COALESCE(c.is_current, true) \
                 /* {VISIBILITY:c} */",
             1,
         );

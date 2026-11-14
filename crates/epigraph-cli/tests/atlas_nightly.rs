@@ -1149,3 +1149,33 @@ async fn a_night_that_finds_a_newer_run_at_publish_writes_nothing(pool: PgPool) 
         "the newer run stays served"
     );
 }
+
+/// Claims with no embedding are in no leaf; the map's summary counts them
+/// in EVERY theme (review finding: a theme with no embedded member, which
+/// has no tree, was not counted). Team A: one unembedded claim in `t1` and
+/// two in a theme with no embedded member at all; team B's unembedded claim
+/// in that theme is not on A's map.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unembedded_members_are_counted_in_every_theme_of_the_map(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let t4 = theme(&pool, "nightly t4", 500).await;
+    let mut bare = claims(&pool, Some(c.t1), c.fa, Some(c.a_team), 1, 0).await;
+    bare.extend(claims(&pool, Some(t4), c.fa, Some(c.a_team), 2, 500).await);
+    bare.extend(claims(&pool, Some(t4), c.fa, Some(c.b_team), 1, 500).await);
+    sqlx::query("UPDATE claims SET embedding = NULL WHERE id = ANY($1)")
+        .bind(&bare)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let dry = NightOptions {
+        apply: false,
+        ..opts()
+    };
+    let summary = night(&pool, &viewer, &namer(), &dry).await;
+    let a = map_report(&summary, AtlasMap::Team(c.a_team));
+    assert_eq!(a["unembedded_members"], 3, "{a:#}");
+    let b = map_report(&summary, AtlasMap::Team(c.b_team));
+    assert_eq!(b["unembedded_members"], 1, "{b:#}");
+}
