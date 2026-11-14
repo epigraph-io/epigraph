@@ -111,18 +111,34 @@ async fn each_assessment_records_its_writer_and_any_contest_durably(pool: PgPool
     let (human, _) = seed_human_operator(&pool, "assess-writer-human").await;
     let (one, _) = seed_agent_with_group(&pool, "assess-writer-one").await;
     let (two, _) = seed_agent_with_group(&pool, "assess-writer-two").await;
+    // An agent with no human: its own owner, so its own slot row on the claim.
+    let (other, _) = seed_agent_with_group(&pool, "assess-writer-other").await;
     link(&pool, one, human).await;
     link(&pool, two, human).await;
     let claim = seed_public_claim(&pool, author, "assess writer record").await;
 
     let first = assess(&pool, one, claim, request(true, 0.9)).await;
     let second = assess(&pool, two, claim, request(false, 0.6)).await;
+    // Interleaved on ANOTHER slot of the same claim, between the human's
+    // second and third writes: it is the latest record naming the claim when
+    // the third call lands, so a prior-writer rule that ignored
+    // `mass_function_id` would credit it with the masses the third call
+    // replaced.
+    let interleaved = assess(&pool, other, claim, request(true, 0.8)).await;
     let third = assess(&pool, one, claim, request(false, 0.7)).await;
     assert_eq!(
         first.mass_function_id, second.mass_function_id,
         "PREMISE: one human, one slot row"
     );
     assert_eq!(second.mass_function_id, third.mass_function_id);
+    assert_ne!(
+        interleaved.mass_function_id, third.mass_function_id,
+        "PREMISE: the interleaved call writes a different slot row"
+    );
+    assert!(
+        interleaved.replaced_assessments.is_empty(),
+        "PREMISE: the interleaved call is its slot's first write"
+    );
     assert_eq!(
         first.owner_agent_id,
         Some(human),
@@ -140,7 +156,7 @@ async fn each_assessment_records_its_writer_and_any_contest_durably(pool: PgPool
     let events = assessment_events(&pool, claim).await;
     assert_eq!(
         events.len(),
-        3,
+        4,
         "one durable record per assessment call, got {events:?}"
     );
 
@@ -148,17 +164,17 @@ async fn each_assessment_records_its_writer_and_any_contest_durably(pool: PgPool
     let writers: Vec<Option<Uuid>> = events.iter().map(|(actor, _)| *actor).collect();
     assert_eq!(
         writers,
-        vec![Some(one), Some(two), Some(one)],
+        vec![Some(one), Some(two), Some(other), Some(one)],
         "each record's actor is the calling agent (human {human})"
     );
 
-    for ((_, payload), resp) in events.iter().zip([&first, &second, &third]) {
+    for ((_, payload), resp) in events.iter().zip([&first, &second, &interleaved, &third]) {
         assert_eq!(
             uuid_at(payload, "mass_function_id"),
             Some(resp.mass_function_id)
         );
         assert_eq!(uuid_at(payload, "frame_id"), Some(resp.frame_id));
-        assert_eq!(uuid_at(payload, "owner_agent_id"), Some(human));
+        assert_eq!(uuid_at(payload, "owner_agent_id"), resp.owner_agent_id);
         assert_eq!(uuid_at(payload, "assessed_by"), resp.assessed_by);
         assert_eq!(
             bool_at(payload, "replaced"),
@@ -171,21 +187,42 @@ async fn each_assessment_records_its_writer_and_any_contest_durably(pool: PgPool
             "the record and the response must agree on the contest: {payload}"
         );
     }
+    for (_, payload) in [&events[0], &events[1], &events[3]] {
+        assert_eq!(uuid_at(payload, "owner_agent_id"), Some(human));
+    }
+    assert_eq!(uuid_at(&events[2].1, "owner_agent_id"), Some(other));
     assert!(!bool_at(&events[0].1, "replaced"));
     assert!(bool_at(&events[1].1, "replaced"));
     assert!(bool_at(&events[1].1, "contested"));
-    assert!(bool_at(&events[2].1, "replaced"));
-    assert!(!bool_at(&events[2].1, "contested"));
+    assert!(!bool_at(&events[2].1, "replaced"));
+    assert!(bool_at(&events[3].1, "replaced"));
+    assert!(!bool_at(&events[3].1, "contested"));
 
-    // The prior writer of the masses the second call overwrote is the actor
-    // of the record before it on the same slot row: agent one, not the human.
-    let slot = second.mass_function_id;
-    let prior = events[..1]
+    // The documented rule, applied to the log alone: the writer of the masses
+    // a record replaced is the actor of the latest EARLIER record with the
+    // same `mass_function_id`. The second call overwrote agent one's
+    // support; the third overwrote agent two's refutation, not the
+    // interleaved agent's write on the other slot.
+    let prior_writers: Vec<(usize, Option<Uuid>)> = events
         .iter()
-        .rev()
-        .find(|(_, p)| uuid_at(p, "mass_function_id") == Some(slot))
-        .map(|(actor, _)| *actor);
-    assert_eq!(prior, Some(Some(one)), "the contested assessment's writer");
+        .enumerate()
+        .filter(|(_, (_, p))| bool_at(p, "replaced"))
+        .map(|(i, (_, p))| {
+            let slot = uuid_at(p, "mass_function_id");
+            let prior = events[..i]
+                .iter()
+                .rev()
+                .find(|(_, q)| uuid_at(q, "mass_function_id") == slot)
+                .unwrap_or_else(|| panic!("record {i} replaced masses with no earlier record"))
+                .0;
+            (i, prior)
+        })
+        .collect();
+    assert_eq!(
+        prior_writers,
+        vec![(1, Some(one)), (3, Some(two))],
+        "the replaced masses' writers, read from the log"
+    );
 }
 
 /// `claim.assessed` is the server's own record, so neither caller-typed
