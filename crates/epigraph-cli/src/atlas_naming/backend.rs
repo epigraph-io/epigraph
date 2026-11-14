@@ -7,8 +7,9 @@
 //! environment. Claim text leaves the box only to the model, through that
 //! CLI. Tests use [`RecordingBackend`], which never calls a model.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -45,8 +46,151 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// `CLAUDECODE` marks a nested session.
 pub const REMOVED_ENV: &[&str] = &["ANTHROPIC_API_KEY", "CLAUDECODE"];
 
-/// `claude -p --output-format json --max-turns 1 --model M`, the prompt on
-/// stdin, run in an empty owner-only directory and killed at the timeout.
+/// What the CLI is told to leave out, after `-p --output-format json
+/// --max-turns 1 --model M`. The prompt carries claim text, which is
+/// untrusted, and the call needs no tool, setting or memory:
+///
+/// * `--safe-mode`: no CLAUDE.md or memory discovery, skills, plugins, hooks
+///   or MCP servers, while the CLI's own sign-in still serves the call
+///   (`--bare` would turn the sign-in off and require an API key);
+/// * `--restricted`: no command-running tools or WebFetch, and no user,
+///   project or local settings files;
+/// * `--tools ""`: no tool at all;
+/// * `--strict-mcp-config` with no `--mcp-config`: no MCP server;
+/// * `--setting-sources ""`: no settings source;
+/// * `--disable-slash-commands`: no skill;
+/// * `--no-session-persistence`: no session written to disk.
+///
+/// A CLI that does not know one of these flags fails the call, so the group
+/// keeps its placeholder: it never runs with fewer guards.
+pub const LOCKDOWN_FLAGS: &[&str] = &[
+    "--safe-mode",
+    "--restricted",
+    "--tools",
+    "",
+    "--strict-mcp-config",
+    "--setting-sources",
+    "",
+    "--disable-slash-commands",
+    "--no-session-persistence",
+];
+
+/// The arguments one call runs the CLI with; the prompt goes on stdin.
+#[must_use]
+pub fn cli_args(model: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-p",
+        "--output-format",
+        "json",
+        "--max-turns",
+        "1",
+        "--model",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    args.push(model.to_string());
+    args.extend(LOCKDOWN_FLAGS.iter().map(|s| (*s).to_string()));
+    args
+}
+
+fn refuse(msg: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)
+}
+
+/// Where the working directories live: `$XDG_RUNTIME_DIR/atlas-naming` when
+/// that is set, otherwise `$HOME/.cache/epigraph/atlas-naming`. Never the
+/// system temp dir: the CLI may look for instruction files in the working
+/// directory's ancestors, and anyone can write to a temp dir.
+///
+/// # Errors
+/// Neither variable names an absolute directory.
+pub fn workdir_base(
+    xdg_runtime_dir: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> std::io::Result<PathBuf> {
+    let absolute = |v: Option<&OsStr>| {
+        v.filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    if let Some(x) = absolute(xdg_runtime_dir) {
+        return Ok(x.join("atlas-naming"));
+    }
+    if let Some(h) = absolute(home) {
+        return Ok(h.join(".cache").join("epigraph").join("atlas-naming"));
+    }
+    Err(refuse(
+        "neither XDG_RUNTIME_DIR nor HOME names an absolute directory for the Claude CLI's \
+         working directory"
+            .into(),
+    ))
+}
+
+/// `dir` is a real directory (not a link) owned by this process's user with
+/// no group or other permission bits.
+fn check_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(refuse(format!("{} is not a directory", dir.display())));
+    }
+    let me = rustix::process::geteuid().as_raw();
+    if meta.uid() != me {
+        return Err(refuse(format!(
+            "{} is owned by uid {}, not this user ({me})",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(refuse(format!(
+            "{} has mode {:o}; it must be 0700",
+            dir.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// No ancestor of `dir` may be writable by anyone but this user or root: an
+/// instruction file planted in one would reach every call.
+fn check_ancestors(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let me = rustix::process::geteuid().as_raw();
+    for a in dir.ancestors().skip(1) {
+        let meta = std::fs::metadata(a)?;
+        if (meta.uid() != me && meta.uid() != 0) || meta.mode() & 0o022 != 0 {
+            return Err(refuse(format!(
+                "{} (uid {}, mode {:o}) is writable by another user; the Claude CLI's working \
+                 directory must not sit under it",
+                a.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Create `base` (0700) if it is missing and check it is private: owned by
+/// this user with no group or other bits, and under no directory another
+/// user may write.
+///
+/// # Errors
+/// It could not be created, or a check failed.
+pub fn ensure_private_base(base: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(base)?;
+    check_private(base)?;
+    check_ancestors(base)
+}
+
+/// `claude -p` (see [`cli_args`]), the prompt on stdin, run in an empty
+/// owner-only directory and killed at the timeout.
 #[derive(Debug)]
 pub struct ClaudeCliBackend {
     program: PathBuf,
@@ -57,13 +201,38 @@ pub struct ClaudeCliBackend {
 }
 
 impl ClaudeCliBackend {
-    /// A backend running `program` (normally `claude` on `PATH`).
+    /// A backend running `program` (normally `claude` on `PATH`), its
+    /// working directory under [`workdir_base`] of this process's
+    /// environment, checked by [`ensure_private_base`].
     ///
     /// # Errors
-    /// The empty working directory could not be created.
+    /// No private base directory, or the working directory could not be
+    /// created.
     pub fn new(program: PathBuf, model: String, timeout: Duration) -> std::io::Result<Self> {
+        let base = workdir_base(
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )?;
+        ensure_private_base(&base)?;
+        Self::in_base(&base, program, model, timeout)
+    }
+
+    /// A backend whose working directory is a fresh 0700 directory in
+    /// `base`, which must exist and be private ([`check_private`]: owned by
+    /// this user, no group or other bits). [`ClaudeCliBackend::new`] also
+    /// checks `base`'s ancestors.
+    ///
+    /// # Errors
+    /// `base` is not private, or the working directory could not be created.
+    pub fn in_base(
+        base: &Path,
+        program: PathBuf,
+        model: String,
+        timeout: Duration,
+    ) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let workdir = std::env::temp_dir().join(format!("atlas-naming-{}", uuid::Uuid::new_v4()));
+        check_private(base)?;
+        let workdir = base.join(format!("atlas-naming-{}", uuid::Uuid::new_v4()));
         std::fs::DirBuilder::new().mode(0o700).create(&workdir)?;
         Ok(Self {
             program,
@@ -72,6 +241,12 @@ impl ClaudeCliBackend {
             workdir,
             env: Vec::new(),
         })
+    }
+
+    /// The directory the CLI runs in.
+    #[must_use]
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
     }
 
     /// Set `key` on the child. [`REMOVED_ENV`] is applied after, so a removed
@@ -113,19 +288,11 @@ fn envelope_result(stdout: &str) -> Result<String, BackendError> {
 impl NameBackend for ClaudeCliBackend {
     fn complete(&self, prompt: &str) -> Result<String, BackendError> {
         let mut cmd = Command::new(&self.program);
-        cmd.args([
-            "-p",
-            "--output-format",
-            "json",
-            "--max-turns",
-            "1",
-            "--model",
-            &self.model,
-        ])
-        .current_dir(&self.workdir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        cmd.args(cli_args(&self.model))
+            .current_dir(&self.workdir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -219,47 +386,161 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A stub `claude`: prints `body` as its envelope only if it was called
-    /// with `-p` and neither removed variable reached it.
-    fn stub(dir: &std::path::Path, body: &str) -> PathBuf {
+    /// A stub `claude`: records its argument count, each argument on its own
+    /// line and its working directory in `<dir>/argv`, then prints `body` as
+    /// its envelope only if it was called with `-p` and neither removed
+    /// variable reached it.
+    fn stub(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("claude");
+        let rec = dir.join("argv");
         let script = format!(
             "#!/bin/sh\n\
              cat > /dev/null\n\
+             {{ echo \"$#\"; for a in \"$@\"; do printf '%s\\n' \"$a\"; done; pwd; }} > '{rec}'\n\
              if [ -n \"${{ANTHROPIC_API_KEY+x}}\" ]; then echo '{{\"is_error\":true,\"result\":\"api key seen\"}}'; exit 0; fi\n\
              if [ -n \"${{CLAUDECODE+x}}\" ]; then echo '{{\"is_error\":true,\"result\":\"nested\"}}'; exit 0; fi\n\
              if [ \"$1\" != \"-p\" ]; then echo '{{\"is_error\":true,\"result\":\"no -p\"}}'; exit 0; fi\n\
-             {body}\n"
+             {body}\n",
+            rec = rec.display()
         );
         std::fs::write(&p, script).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
         p
     }
 
+    /// A fresh 0700 directory for one test (it holds the stub and is the
+    /// backend's base).
     fn dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("atlas-naming-stub-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&d).unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
         d
     }
 
-    fn backend(program: PathBuf, timeout: Duration) -> ClaudeCliBackend {
-        ClaudeCliBackend::new(program, DEFAULT_MODEL.into(), timeout).unwrap()
+    fn backend(d: &Path, program: PathBuf, timeout: Duration) -> ClaudeCliBackend {
+        ClaudeCliBackend::in_base(d, program, DEFAULT_MODEL.into(), timeout).unwrap()
     }
+
+    const OK_BODY: &str =
+        r#"echo '{"type":"result","is_error":false,"result":"{\"name\": \"Stub name\"}"}'"#;
 
     /// The CLI runs without an API key or the nested-session marker, even
     /// when both are set for it, and the envelope's result comes back.
     #[test]
     fn the_cli_runs_without_an_api_key() {
         let d = dir();
-        let p = stub(
-            &d,
-            r#"echo '{"type":"result","is_error":false,"result":"{\"name\": \"Stub name\"}"}'"#,
-        );
-        let got = backend(p, Duration::from_secs(10))
+        let p = stub(&d, OK_BODY);
+        let got = backend(&d, p, Duration::from_secs(10))
             .with_env("ANTHROPIC_API_KEY", "sk-test-not-a-key")
             .with_env("CLAUDECODE", "1")
             .complete("prompt");
         assert_eq!(got, Ok("{\"name\": \"Stub name\"}".to_string()));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The exact argv, written out here rather than read from the constants
+    /// the backend builds it from: every tool, setting source, MCP server,
+    /// skill and instruction file is switched off, and the CLI runs in the
+    /// backend's private working directory.
+    #[test]
+    fn the_cli_is_called_with_every_guard() {
+        let d = dir();
+        let p = stub(&d, OK_BODY);
+        let b = backend(&d, p, Duration::from_secs(10));
+        assert_eq!(
+            b.complete("prompt"),
+            Ok("{\"name\": \"Stub name\"}".to_string())
+        );
+        let rec = std::fs::read_to_string(d.join("argv")).unwrap();
+        let lines: Vec<&str> = rec.lines().collect();
+        let expected = [
+            "16",
+            "-p",
+            "--output-format",
+            "json",
+            "--max-turns",
+            "1",
+            "--model",
+            "claude-haiku-4-5-20251001",
+            "--safe-mode",
+            "--restricted",
+            "--tools",
+            "",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+        ];
+        assert_eq!(&lines[..lines.len() - 1], &expected[..]);
+        let cwd = PathBuf::from(lines[lines.len() - 1]);
+        assert_eq!(
+            std::fs::canonicalize(&cwd).unwrap(),
+            std::fs::canonicalize(b.workdir()).unwrap()
+        );
+        assert_eq!(cwd.parent(), Some(d.as_path()), "{}", cwd.display());
+        drop(b);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The working directory's base comes from XDG_RUNTIME_DIR, else HOME,
+    /// and never from the system temp dir.
+    #[test]
+    fn the_workdir_base_is_the_users_own() {
+        let os = |s: &str| std::ffi::OsString::from(s);
+        assert_eq!(
+            workdir_base(Some(&os("/run/user/1000")), Some(&os("/home/u"))).unwrap(),
+            PathBuf::from("/run/user/1000/atlas-naming")
+        );
+        for xdg in [None, Some(os("")), Some(os("relative/dir"))] {
+            assert_eq!(
+                workdir_base(xdg.as_deref(), Some(&os("/home/u"))).unwrap(),
+                PathBuf::from("/home/u/.cache/epigraph/atlas-naming")
+            );
+        }
+        assert!(workdir_base(None, None).is_err());
+        assert!(workdir_base(Some(&os("")), Some(&os("rel"))).is_err());
+        let tmp = std::env::temp_dir();
+        assert!(!workdir_base(None, Some(&os("/home/u")))
+            .unwrap()
+            .starts_with(&tmp));
+    }
+
+    /// A base with group or other bits is refused, and so is a base under a
+    /// directory another user may write, even when the base itself is 0700.
+    #[test]
+    fn a_shared_base_or_ancestor_is_refused() {
+        let d = dir();
+        let p = stub(&d, OK_BODY);
+        let open = d.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = ClaudeCliBackend::in_base(
+            &open,
+            p.clone(),
+            DEFAULT_MODEL.into(),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert!(ensure_private_base(&open).is_err());
+
+        let shared = d.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let base = shared.join("base");
+        let err = ensure_private_base(&base).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        // The nearest offending ancestor is the one named.
+        assert!(
+            err.to_string().contains(&shared.display().to_string()),
+            "{err}"
+        );
+        // The base itself was made 0700 and passes the base check alone.
+        assert!(
+            ClaudeCliBackend::in_base(&base, p, DEFAULT_MODEL.into(), Duration::from_secs(1))
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -274,7 +555,7 @@ mod tests {
         ] {
             let p = stub(&d, body);
             assert!(
-                backend(p, Duration::from_secs(10))
+                backend(&d, p, Duration::from_secs(10))
                     .complete("prompt")
                     .is_err(),
                 "{body}"
@@ -288,7 +569,7 @@ mod tests {
         let d = dir();
         let p = stub(&d, "exec sleep 30");
         let t = Instant::now();
-        let got = backend(p, Duration::from_millis(500)).complete("prompt");
+        let got = backend(&d, p, Duration::from_millis(500)).complete("prompt");
         assert!(got.is_err());
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         let _ = std::fs::remove_dir_all(d);
