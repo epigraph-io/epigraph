@@ -8,9 +8,9 @@ whose commits follow the Epistemic Commit Protocol (`type(scope): claim` plus
 pull request into a `repo → PR → commit` claim tree. The reconciler,
 `scripts/git_ingest_reconciler.py`, runs it for each newly merged PR.
 
-The dry-run output below was captured against this repository. The live write
-in step 2 of the end-to-end task was **not** captured for this page. Its
-description comes from the code.
+The dry-run output below was captured against this repository's `main`. The
+live write in step 2 of the end-to-end task has **not** been run for this
+page. Its description comes from the code.
 
 ## Config keys
 
@@ -55,22 +55,24 @@ Each commit becomes one claim with the content `[type][scope] claim`:
   evidence row. A wrapped bullet counts once per line, and trailer lines after
   **Verification** (`Co-Authored-By:` and the like) count as Verification.
 - **Reasoning** becomes the reasoning trace.
-- The type sets the methodology and the initial truth.
+- The type sets the methodology and the initial truth. For `feat` and `perf`
+  the initial truth is 0.6 with a **Verification** section and 0.4 without.
 - Confidence is 85% when all three sections are present.
 
 To dry-run one commit, run `ingest_git --repo <clone> --dry-run --limit 1`
-with that commit checked out as `HEAD`. This is captured output, with the
-`Author:` lines removed:
+with that commit checked out as `HEAD`. This is captured output, trimmed to
+the packet lines (the progress, `Author:`, `Date:` and `Files changed:` lines
+are cut). The `fix` commit is the only commit of PR #825, used again below:
 
 ```
-Packet 1: "[feat][api] log every response at INFO and a timed-out one at WARN"
-  Hash: 0eb89ac83c05
-  Evidence: 5 item(s), Verification: 4 item(s)
+Packet 1: "[feat][api] refuse pgvector below 0.8.0 in epigraph-migrate"
+  Hash: fc76a8c95f58
+  Evidence: 5 item(s), Verification: 15 item(s)
   Methodology: extraction, confidence: 85%, initial_truth: 0.6
 
-Packet 1: "[fix][api] print each pgvector refusal as one line, as the docs quote it"
-  Hash: 182da231749e
-  Evidence: 5 item(s), Verification: 5 item(s)
+Packet 1: "[fix][mcp] map verify_claim, reconcile_sheaf and stage_claims to claims:read"
+  Hash: 430d3816bf29
+  Evidence: 14 item(s), Verification: 12 item(s)
   Methodology: deductive, confidence: 85%, initial_truth: 0.7
 
 Packet 1: "[docs][readme,intro,deploy] state the minimum pgvector version (0.8.0)"
@@ -79,8 +81,8 @@ Packet 1: "[docs][readme,intro,deploy] state the minimum pgvector version (0.8.0
   Methodology: heuristic, confidence: 85%, initial_truth: 0.4
 ```
 
-The idempotency key of each claim is `git:<full sha>`, and its properties
-include `source`, `commit_hash`, `commit_type`, `scope` and `files_changed`.
+Each commit packet carries the idempotency key `git:<full sha>`, and its
+properties include `source`, `commit_hash`, `commit_type`, `scope` and `files_changed`.
 
 ## End to end: one merged PR
 
@@ -101,22 +103,39 @@ include `source`, `commit_hash`, `commit_type`, `scope` and `files_changed`.
    #   [dry-run] repo=epigraph-io/epigraph pr=#825 commits=1 refs=References { claim_uuids: [], pr_numbers: [] }
    ```
 
-2. **Live run.** Drop `--dry-run` and add `--token "$TOKEN"`. The token comes
-   from the `epigraph-wo` client, as in
+2. **Live run (untested).** Drop `--dry-run` and add `--token "$TOKEN"`.
+   The token comes from the `epigraph-wo` client, as in
    [quickstart step 5](01-quickstart.md#step-5--get-an-api-token). Also add
    `--orchestrator-id <uuid>`. The packets carry an all-zero placeholder
    signature, so the server must run with `EPIGRAPH_REQUIRE_SIGNATURES` unset
-   or false. Running it again is safe: every node is found again by its
-   idempotency key, and every edge is posted with `if_not_exists`. The
-   packets send no `visibility`, so each claim gets the default that
-   [claim visibility controls](../tenancy/claim-visibility-controls.md)
-   gives a CLI write (team or private).
+   or false.
 
-   | Node | Idempotency key | Labels | Author |
-   |---|---|---|---|
-   | repository | `repo:<slug>` | `source:git-history`, `node:repo`, `repo:<slug>` | one fixed system agent |
-   | pull request | `pr:<slug>#<n>` | `source:git-history`, `node:pr`, `repo:<slug>` | the orchestrator |
-   | commit | `git:<sha>` | `source:git-history`, `node:commit`, `repo:<slug>` | an agent derived from the author's email |
+   This step has not been run end to end, and it may be refused. The
+   token's principal is never an author of these packets: the authors are
+   the agents in the table below. A deployment that checks whether a caller
+   may write on an author's behalf can refuse the run at the first packet,
+   the repository node. Where the run is allowed, the packets send no
+   `visibility`, so each claim takes its author's default under
+   [claim visibility controls](../tenancy/claim-visibility-controls.md)
+   (team or private), and step 3 from another principal may find nothing.
+
+   | Node | Labels | Author |
+   |---|---|---|
+   | repository | `source:git-history`, `node:repo`, `repo:<slug>` | one fixed system agent |
+   | pull request | `source:git-history`, `node:pr`, `repo:<slug>` | the orchestrator |
+   | commit | `source:git-history`, `node:commit`, `repo:<slug>` | an agent derived from the author's email |
+
+   **Re-runs.** The packets carry the idempotency keys `repo:<slug>`,
+   `pr:<slug>#<n>` and `git:<sha>`, but the server checks those keys only
+   in an in-process cache, which a restart empties. What holds across
+   restarts is the claim store's dedup on content and author agent, and
+   every edge is posted with `if_not_exists`. So a re-run with the same
+   inputs makes nothing new, with two exceptions:
+
+   - a re-run under a different orchestrator makes a second PR claim and a
+     second `repo decomposes_to PR` edge;
+   - two commits by one author with the same header (`[chore][deps] bump
+     lockfile`, say) become one commit claim.
 
    The edges are `repo decomposes_to PR`, dated at the merge time, and
    `PR decomposes_to commit`, dated at the commit time. A UUID in the PR body
@@ -142,6 +161,11 @@ re-run finds the same node again instead of making a new one.
 
 Newest first.
 
+- 2026-11-14 (review of backlog 2c2b335d): the worked `feat` and `fix`
+  entries are now commits on `main`; step 2 is marked untested and says why
+  the live write can be refused; re-runs are described by the dedup that
+  survives a restart, with its two exceptions; the `feat`/`perf` truth
+  depends on **Verification**.
 - 2026-11-14 (backlog 2c2b335d): first version. It is a domain instantiation
   recipe for `ingest_git --pr-ingest`, in place of the transcripts that the
   onboarding spec planned for this number.
