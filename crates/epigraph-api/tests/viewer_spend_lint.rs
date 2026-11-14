@@ -207,13 +207,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "unretract_bba",
         &["MassFunctionRepository::unretract_conn"],
     ),
-    // open finding: F-aggregate-existence-oracles (the frame's conflict
-    // aggregate over mass_functions).
-    (
-        "belief.rs",
-        "frame_conflict",
-        &["sqlx::query_as(SELECT).fetch_one"],
-    ),
     // gated (parent frame) then write.
     (
         "belief.rs",

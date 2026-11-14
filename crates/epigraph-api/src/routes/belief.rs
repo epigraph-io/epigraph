@@ -901,43 +901,13 @@ pub async fn frame_conflict(
             id: frame_id.to_string(),
         })?;
 
-    // The aggregate below stays inline and carries no `/* {VISIBILITY:…} */`
-    // marker, because a route handler cannot carry one. It binds only
-    // `frame_id` and calls no `Viewer::splice`, so it is the ONE site this
-    // shard converted that has a single control layer where the other eighteen
-    // have two. Registered as `F-SHARD4-A5`, because no existing register can
-    // see it: `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` scans
-    // `CONTENT_TABLES`, and `mass_functions` is not one.
-    //
-    // WHICH DIRECTION THE CONVERSION MOVED IT, stated because the obvious
-    // reading is backwards. UNSTAMPED, `epigraph_session_groups()` is empty, so
-    // once `mass_functions`' policies are live this statement already counted
-    // PUBLIC rows only. Stamping it WIDENS the aggregate to public plus the
-    // viewer's own groups. That is the correct direction — it removes
-    // over-suppression — but it is not a leak being closed, and a later reader
-    // must not cite it as one.
-    //
-    // And the narrowing half is CONDITIONAL, unlike the spliced sites: with no
-    // in-query predicate, whether this aggregate describes the caller's corpus
-    // at all depends on the reading session being subject to `mass_functions`'
-    // row-level policies. On a deployment whose connecting role bypasses them
-    // it is unchanged. That is precisely why the site stays owned by
-    // `F-aggregate-existence-oracles`, whose own disposition prescribes
-    // repo-layer relocation — a DIFFERENT mechanism from this executor swap,
-    // and the actual fix.
-    let row: (i64, Option<f64>, Option<f64>) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k)
-        FROM mass_functions
-        WHERE frame_id = $1 AND conflict_k IS NOT NULL AND retracted_at IS NULL
-        "#,
-    )
-    .bind(frame_id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: e.to_string(),
-    })?;
+    // The aggregate counts only the BBAs this viewer can read: the repo
+    // statement splices `{VISIBILITY:mass_functions}` on the stamped
+    // connection, so it does not depend on the session being subject to row
+    // security (`F-aggregate-existence-oracles`, `F-SHARD4-A5`).
+    let row =
+        epigraph_db::MassFunctionRepository::frame_conflict_summary(&mut *read, &viewer, frame_id)
+            .await?;
 
     crate::routes::finish_scoped_read(read, "frame_conflict").await?;
 

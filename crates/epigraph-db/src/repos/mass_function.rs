@@ -1610,6 +1610,41 @@ impl MassFunctionRepository {
         Ok(row.0)
     }
 
+    /// `(count, avg(conflict_k), max(conflict_k))` over the live mass functions
+    /// in `frame_id` that carry a `conflict_k`, for
+    /// `GET /api/v1/frames/:id/conflict`.
+    ///
+    /// The aggregate is the reader's, not the corpus's: a mass function the
+    /// viewer cannot see contributes to none of the three numbers. It used to
+    /// run inline in the handler with no in-query predicate, so on a session
+    /// that bypasses row security it described every tenant's BBAs in the frame
+    /// (`F-aggregate-existence-oracles`), the cardinality-oracle shape
+    /// [`Self::count_for_claim`] documents.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn frame_conflict_summary<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frame_id: Uuid,
+    ) -> Result<(i64, Option<f64>, Option<f64>), DbError> {
+        let sql = viewer.splice(
+            &with_retracted_excluded(
+                "SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k) FROM mass_functions \
+                 WHERE frame_id = $1 AND conflict_k IS NOT NULL \
+                 /* {NOT_RETRACTED} */ /* {VISIBILITY:mass_functions} */",
+                "",
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(frame_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Count the mass functions attached to `claim_id` across ALL frames.
     ///
     /// The unframed counterpart to [`Self::count_for_claim_frame`], used by

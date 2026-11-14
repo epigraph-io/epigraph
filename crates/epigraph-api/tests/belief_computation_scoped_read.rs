@@ -97,7 +97,8 @@ mod viewer_fixture;
 use axum::extract::{Path, Query, State};
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::belief::{
-    claims_by_belief, frame_claims_sorted, get_frame, BeliefFilterQuery, FrameClaimsQuery,
+    claims_by_belief, frame_claims_sorted, frame_conflict, get_frame, BeliefFilterQuery,
+    FrameClaimsQuery,
 };
 use epigraph_api::routes::computation::{belief_at_time, BeliefAtQuery};
 use epigraph_api::state::{ApiConfig, AppState};
@@ -473,5 +474,76 @@ async fn belief_at_time_replays_only_the_evidence_the_viewer_can_see(pool: PgPoo
         stranger["evidence_count"], 1,
         "a stranger replays only the public control row; the group-private evidence must \
          not contribute to the reconstructed belief"
+    );
+}
+
+/// `GET /api/v1/frames/:id/conflict` aggregates only the mass functions the
+/// viewer can read (`F-aggregate-existence-oracles`).
+///
+/// The frame is public, so the stranger's BBA sits in a frame the viewer may
+/// read, on a claim it may not. Its `conflict_k` is the largest, so an
+/// unfiltered aggregate moves BOTH the count and the max. The scoped pool is a
+/// superuser session, so only an in-query predicate can withhold it. The
+/// calibration BBA is on a claim private to the viewer's own group and must be
+/// counted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn frame_conflict_aggregates_only_the_mass_functions_the_viewer_can_read(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "fc-agg-mine").await;
+    let (stranger, stranger_group) = seed_agent_with_group(&pool, "fc-agg-theirs").await;
+
+    let open = seed_public_claim(&pool, agent, "fc agg: public claim").await;
+    let mine = seed_group_claim(&pool, agent, group, "fc agg: my claim").await;
+    let theirs = seed_group_claim(&pool, stranger, stranger_group, "fc agg: their claim").await;
+    let frame = common::seed_frame_with_claim(&pool, open).await;
+
+    for (claim, source, k) in [(open, agent, 0.1_f64), (mine, agent, 0.3), (theirs, stranger, 0.9)] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, conflict_k) \
+             VALUES ($1, $2, $3, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb, $4) RETURNING id",
+        )
+        .bind(claim)
+        .bind(frame)
+        .bind(source)
+        .bind(k)
+        .fetch_one(&pool)
+        .await
+        .expect("seed bba");
+        let (mv, cv): (String, String) = sqlx::query_as(
+            "SELECT mf.visibility::text, c.visibility::text FROM mass_functions mf \
+             JOIN claims c ON c.id = mf.claim_id WHERE mf.id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back bba tenancy");
+        assert_eq!(
+            mv, cv,
+            "CALIBRATION: a BBA must inherit its claim's visibility, or the arm below \
+             tests the wrong row"
+        );
+    }
+
+    let out = frame_conflict(
+        ViewerExtractor(viewer_for(&pool, agent).await),
+        State(split_state(&pool).await),
+        Path(frame),
+    )
+    .await
+    .expect("the frame is public, so this must SERVE")
+    .0;
+
+    assert_eq!(
+        out.source_count, 2,
+        "the public BBA and the viewer's own group-private BBA, and not the stranger's"
+    );
+    let max = out.max_conflict_k.expect("two BBAs carry conflict_k");
+    assert!(
+        (max - 0.3).abs() < 1e-9,
+        "max_conflict_k must not reflect a BBA the viewer cannot read; got {max}"
+    );
+    let avg = out.avg_conflict_k.expect("two BBAs carry conflict_k");
+    assert!(
+        (avg - 0.2).abs() < 1e-9,
+        "avg_conflict_k over the two readable BBAs; got {avg}"
     );
 }
