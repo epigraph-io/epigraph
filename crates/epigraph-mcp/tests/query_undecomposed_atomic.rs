@@ -94,6 +94,37 @@ async fn query_undecomposed_claims_flags_looks_atomic_rows(pool: PgPool) {
         "a single sentence over the 160-char cap must not be flagged atomic: {long_row}"
     );
 
+    // The advisory conjunct estimate (backlog 72850d43) rides on every row and
+    // does not follow `looks_atomic`: one assertion reads 1 with no signal,
+    // two sentences read 2 with the rule named.
+    assert_eq!(
+        atomic_row["conjunct_estimate"],
+        serde_json::json!(1),
+        "{atomic_row}"
+    );
+    assert_eq!(
+        atomic_row["conjunct_signals"],
+        serde_json::json!([]),
+        "{atomic_row}"
+    );
+    assert_eq!(
+        two_row["conjunct_estimate"],
+        serde_json::json!(2),
+        "{two_row}"
+    );
+    assert_eq!(
+        two_row["conjunct_signals"],
+        serde_json::json!(["sentences"]),
+        "{two_row}"
+    );
+    // The long single sentence is not atomic by length, and has one clause:
+    // the estimate must not be derived from `looks_atomic`.
+    assert_eq!(
+        long_row["conjunct_estimate"],
+        serde_json::json!(1),
+        "{long_row}"
+    );
+
     // The wrapper must not drop the claim fields the other tools serve.
     assert_eq!(
         atomic_row["content"].as_str(),
@@ -131,6 +162,8 @@ fn query_undecomposed_claims_description_says_atomic_rows_are_terminal() {
         "they are NOT a backlog or a defect",
         "Feed only looks_atomic=false claim_ids to the decompose_claims CLI",
         "row count is not a progress measure",
+        "conjunct_estimate",
+        "a looks_atomic=true row stays terminal whatever its estimate",
     ] {
         assert!(
             description.contains(needle),
