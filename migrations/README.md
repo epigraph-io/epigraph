@@ -2672,9 +2672,15 @@ restart.
   function to its definition below 216); it RE-OPENS the defect. **Deploy
   precondition:** applying 216 turns a superuser-DSN writer's undeclared write
   from a silent seed stamp into a 23502 write failure. Before applying, measure
-  `owner_group_id = '00000000-0000-0000-0000-00000000dead'` rows per tier-A
-  table by `created_at` (recent ones name the writers still relying on the
-  hatch), move those writers onto a role that declares tenancy, and confirm no
+  `owner_group_id = '00000000-0000-0000-0000-00000000dead'` rows by
+  `created_at` on EVERY table that carries one of the three triggers, not only
+  074's lists (183's `workflows` and 173's `harvester_sources` carry them too,
+  and later migrations may add more); build the list from the catalog with
+  `SELECT DISTINCT t.tgrelid::regclass FROM pg_trigger t JOIN pg_proc p ON
+  p.oid = t.tgfoid WHERE p.proname IN ('epigraph_claims_require_tenancy',
+  'epigraph_derived_require_tenancy', 'epigraph_root_require_tenancy') AND
+  NOT t.tgisinternal`. Recent rows name the writers still relying on the
+  hatch; move those writers onto a role that declares tenancy, and confirm no
   deployed login holds a grant of `epigraph_seed` (`SELECT member::regrole FROM
   pg_auth_members WHERE roleid = 'epigraph_seed'::regrole` returns no rows).
   Never set `EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF` on a deployed migrator.
