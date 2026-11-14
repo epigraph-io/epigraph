@@ -83,6 +83,17 @@ pub async fn consolidate_claims(
         )));
     }
 
+    // merge and abstract write a new claim, so they need its text. Refused
+    // here as a parameter error: the field is optional on the wire (identity
+    // takes none), and the act's own empty-content refusal would surface as
+    // an internal error an agent retries.
+    if params.merged_content.trim().is_empty() {
+        return Err(invalid_params(format!(
+            "mode '{}' writes a new claim and needs merged_content",
+            mode.as_str()
+        )));
+    }
+
     // The merged claim is a claim like any other: the same content cap as
     // `submit_claim` and its HTTP twins, checked before anything is resolved,
     // embedded or written (backlog b76e284b).

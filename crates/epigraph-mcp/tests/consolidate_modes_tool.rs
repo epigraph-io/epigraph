@@ -228,8 +228,9 @@ async fn identity_mode_refuses_before_marking_any_source(pool: PgPool) {
 }
 
 /// Identity's parameters: it needs a survivor among the sources and takes no
-/// merged content; the other modes take no survivor. Each refusal writes
-/// nothing.
+/// merged content; the other modes take no survivor and need merged content
+/// (an omitted one is a parameter error, not an internal one). Each refusal
+/// writes nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn identity_and_survivor_parameters_are_checked(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
@@ -259,6 +260,11 @@ async fn identity_and_survivor_parameters_are_checked(pool: PgPool) {
         (
             params("abstract", &[s1, s2], "a general text", Some(s1)),
             "applies to mode 'identity' only",
+        ),
+        (params("merge", &[s1, s2], "", None), "needs merged_content"),
+        (
+            params("abstract", &[s1, s2], "  ", None),
+            "needs merged_content",
         ),
     ] {
         let mode = p.mode.clone();
