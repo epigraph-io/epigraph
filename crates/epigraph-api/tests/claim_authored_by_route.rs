@@ -704,6 +704,207 @@ async fn the_papers_route_lists_authors_and_counts_the_callers_claims(pool: PgPo
     );
 }
 
+/// One entry of the first listed paper's `ingests`: the one `by` ingested, or
+/// `null` when the caller is shown none.
+fn ingest_of(body: &Value, by: Uuid) -> Value {
+    body["items"][0]["ingests"]
+        .as_array()
+        .and_then(|a| a.iter().find(|i| i["ingested_by"] == json!(by)))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// Backlog b7354adc (owner ruling A5). Each entry of a paper's `ingests`
+/// names the ingesting agent and the human it was bound to when it ingested,
+/// for every reader; the model and snapshot it ran then, under the claim
+/// read's own audience (`PROMPT_SNAPSHOT_AUDIENCE`): the agent's human and an
+/// admin see them, a stranger only when the setting is every reader. An
+/// ingester bound to no human has `human: null`. The entry is marked derived,
+/// carries no prompt text, and keeps `ingested_by` and `first_written_at`. An
+/// ingest whose edge the caller cannot read is not listed at all, so its
+/// agent and human are not named to that caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_papers_route_names_each_ingests_agent_human_and_model_by_audience(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let operator = human(&pool, "Operator Fixture").await;
+    let custodian = human(&pool, "Custodian Fixture").await;
+    viewer_fixture::make_custodian(&pool, custodian).await;
+    let other_operator = human(&pool, "Other Operator Fixture").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (member, group) = viewer_fixture::seed_agent_with_group(&pool, "member").await;
+    let (agent, snapshot) = registered_agent(&pool, operator).await;
+    let (unlinked, _) = viewer_fixture::seed_agent_with_group(&pool, "unlinked").await;
+    named(&pool, unlinked, "unlinked-ingester").await;
+    let (hidden, _) = viewer_fixture::seed_agent_with_group(&pool, "hidden").await;
+    named(&pool, hidden, "hidden-ingester").await;
+    link(&pool, hidden, other_operator).await;
+
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title) VALUES ('10.0000/fixture.ingest', 'Ingested Paper') \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("paper");
+    // Three ingests of the one paper, oldest first: the registered agent
+    // (linked, with a snapshot), an agent bound to no human, and one whose
+    // only edge on the paper is private to the member's group.
+    let first = viewer_fixture::seed_public_claim(&pool, agent, "the linked ingest's claim").await;
+    ingest_record(&pool, doc, first, agent, true, &[]).await;
+    let second =
+        viewer_fixture::seed_public_claim(&pool, unlinked, "the unlinked ingest's claim").await;
+    ingest_record(&pool, doc, second, unlinked, true, &[]).await;
+    let third = viewer_fixture::seed_public_claim(&pool, hidden, "the hidden ingest's claim").await;
+    let hidden_edge = ingest_record(&pool, doc, third, hidden, true, &[]).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(hidden_edge)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("make the hidden ingest's asserts edge group-private");
+
+    let query = "doi=10.0000/fixture.ingest";
+
+    // The agent's own human: the whole entry.
+    let (status, mine_body) = get_papers(&state, operator, query).await;
+    assert_eq!(status, StatusCode::OK, "{mine_body}");
+    let mine = ingest_of(&mine_body, agent);
+    assert_eq!(mine["ingested_by"], json!(agent), "{mine_body}");
+    assert_eq!(
+        mine["agent"],
+        json!({"id": agent, "display_name": "fixture-agent-7"}),
+        "{mine}"
+    );
+    assert_eq!(
+        mine["human"],
+        json!({"id": operator, "display_name": "Operator Fixture"}),
+        "{mine}"
+    );
+    let snap = &mine["prompt_snapshot"];
+    assert_eq!(snap["snapshot_id"], json!(snapshot), "{mine}");
+    assert_eq!(snap["model"], json!("test-model-7"), "{mine}");
+    assert_eq!(
+        snap["prompt_hash"].as_str().map(str::len),
+        Some(64),
+        "{mine}"
+    );
+    assert!(snap["started_at"].is_string(), "{mine}");
+    assert!(snap.get("text").is_none(), "no prompt text: {mine}");
+    assert!(mine["first_written_at"].is_string(), "{mine}");
+    assert_eq!(
+        mine["ingested_at"], mine["first_written_at"],
+        "ingested_at is the first write: {mine}"
+    );
+    assert_eq!(mine["derived"], json!(true), "{mine}");
+    let mut keys: Vec<&str> = mine
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "agent",
+            "derived",
+            "first_written_at",
+            "human",
+            "ingested_at",
+            "ingested_by",
+            "prompt_snapshot"
+        ],
+        "{mine}"
+    );
+
+    // An admin sees the snapshot too.
+    let (_, admin_body) = get_papers(&state, custodian, query).await;
+    let admin = ingest_of(&admin_body, agent);
+    assert_eq!(
+        &admin["prompt_snapshot"], snap,
+        "an admin sees the snapshot: {admin}"
+    );
+
+    // A stranger: the agent and its human, and the snapshot only when the
+    // audience is every reader.
+    let (_, their_body) = get_papers(&state, stranger, query).await;
+    let theirs = ingest_of(&their_body, agent);
+    assert_eq!(theirs["agent"], mine["agent"], "{theirs}");
+    assert_eq!(
+        theirs["human"], mine["human"],
+        "every reader sees the human: {theirs}"
+    );
+    assert_eq!(theirs["ingested_at"], mine["ingested_at"], "{theirs}");
+    assert_eq!(theirs["derived"], json!(true), "{theirs}");
+    match PROMPT_SNAPSHOT_AUDIENCE {
+        PromptSnapshotAudience::OperatorAndAdmins => assert_eq!(
+            theirs["prompt_snapshot"],
+            Value::Null,
+            "gated: a stranger does not see the model or the snapshot: {theirs}"
+        ),
+        PromptSnapshotAudience::ClaimReaders => assert_eq!(
+            &theirs["prompt_snapshot"], snap,
+            "open: every reader of the paper sees the snapshot"
+        ),
+    }
+    assert!(
+        theirs
+            .as_object()
+            .is_some_and(|o| o.contains_key("prompt_snapshot")),
+        "a gated snapshot is null, not a missing key: {theirs}"
+    );
+
+    // An ingester bound to no human, with no snapshot: both null, for its
+    // readers alike.
+    for body in [&mine_body, &their_body] {
+        let entry = ingest_of(body, unlinked);
+        assert_eq!(
+            entry["agent"],
+            json!({"id": unlinked, "display_name": "unlinked-ingester"}),
+            "{entry}"
+        );
+        assert_eq!(entry["human"], Value::Null, "no linked human: {entry}");
+        assert!(
+            entry.as_object().is_some_and(|o| o.contains_key("human")),
+            "null, not a missing key: {entry}"
+        );
+        assert_eq!(entry["prompt_snapshot"], Value::Null, "{entry}");
+        assert_eq!(entry["derived"], json!(true), "{entry}");
+    }
+
+    // The ingest whose edge is private to the member's group: a stranger is
+    // shown no entry for it (so neither its agent nor its human), a member is.
+    assert_eq!(
+        their_body["items"][0]["ingests"]
+            .as_array()
+            .expect("ingests")
+            .iter()
+            .map(|i| i["ingested_by"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(agent), json!(unlinked)],
+        "oldest first, and the hidden ingest is not listed: {their_body}"
+    );
+    assert!(
+        !their_body.to_string().contains(&hidden.to_string())
+            && !their_body.to_string().contains(&other_operator.to_string()),
+        "nothing names the hidden ingest or its human: {their_body}"
+    );
+    let (_, member_body) = get_papers(&state, member, query).await;
+    let seen = ingest_of(&member_body, hidden);
+    assert_eq!(
+        seen["agent"],
+        json!({"id": hidden, "display_name": "hidden-ingester"}),
+        "CONTROL: a member of the edge's group is shown the ingest: {member_body}"
+    );
+    assert_eq!(
+        seen["human"],
+        json!({"id": other_operator, "display_name": "Other Operator Fixture"}),
+        "{seen}"
+    );
+    assert_eq!(seen["prompt_snapshot"], Value::Null, "{seen}");
+}
+
 /// The ingest's `asserts` edge and its record (with the authors it resolved),
 /// written with the walk's own primitives (ingest-written, by `by`). Returns
 /// the asserts edge.

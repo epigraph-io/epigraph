@@ -125,11 +125,45 @@ pub struct PaperAuthorView {
     pub pending_countersign: bool,
 }
 
-/// One ingest of a paper: the principal whose document ingest wrote it.
+/// One ingest of a paper: the principal whose document ingest wrote it, with
+/// the human it acted for and the model it ran (backlog b7354adc, owner
+/// ruling A5), so a reader can show "ingested by <human> using <model> on
+/// <date>".
+///
+/// `agent`, `human` and `prompt_snapshot` are the parts
+/// `GET /api/v1/claims/:id` gives a claim's filer in `authored_by`, read by
+/// the same repo code (`epigraph_db::AuthoredByRepository`) for the pair
+/// (this principal, `ingested_at`), each under the caller's viewer:
+///
+/// * `agent`: every reader of the ingest;
+/// * `human`: every reader of the ingest; the human the agent was bound to at
+///   `ingested_at` (its binding record), `null` when it was bound to nobody
+///   then and on a human's own ingest (`agent` is that human);
+/// * `prompt_snapshot`: the audience `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE`
+///   names (ruled: the agent's linked human and admins), otherwise `null`,
+///   exactly as when no snapshot was recorded. Never any prompt text.
 #[derive(Serialize, Debug)]
 pub struct PaperIngestView {
+    /// The ingesting agent's id (the same id as `agent.id`).
     pub ingested_by: Uuid,
+    /// The principal's oldest ingest-written edge on the paper that the
+    /// caller may read (the same instant as `ingested_at`).
     pub first_written_at: chrono::DateTime<chrono::Utc>,
+    /// The ingesting agent.
+    pub agent: crate::routes::claims::AuthorRefView,
+    /// The human the agent was bound to at `ingested_at`.
+    pub human: Option<crate::routes::claims::AuthorRefView>,
+    /// The prompt snapshot (model, identity prompt hash, start) the agent was
+    /// running at `ingested_at`, for a caller the snapshot gate admits.
+    pub prompt_snapshot: Option<crate::routes::claims::PromptSnapshotView>,
+    /// When the paper was ingested by this principal: `first_written_at`.
+    pub ingested_at: chrono::DateTime<chrono::Utc>,
+    /// Always `true`: nothing records an ingest's human or model when it
+    /// runs, so this entry is DERIVED from the paper's first ingest activity
+    /// (the principal's oldest readable ingest-written edge, and the binding
+    /// and snapshot history at that instant). A recorded entry, when ingests
+    /// start writing one, will say `false`.
+    pub derived: bool,
 }
 
 /// Most authors listed per paper.
@@ -157,11 +191,15 @@ async fn paper_listings(
         let labelled = PaperRepository::count_claims_by_doi_label(&mut *read, viewer, doi)
             .await
             .map_err(db)?;
-        let mut principals = PaperRepository::ingest_principals(
+        // Each ingest the caller may read, with its agent, the human it was
+        // bound to and the snapshot it ran at its first write: the claim
+        // read's own repo code and snapshot gate, for (principal, instant).
+        let mut principals = epigraph_db::AuthoredByRepository::for_paper_ingests(
             &mut *read,
             viewer,
             *paper_id,
             MAX_LISTED_INGESTS + 1,
+            epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
         )
         .await
         .map_err(db)?;
@@ -175,7 +213,7 @@ async fn paper_listings(
                     &mut *read,
                     viewer,
                     *paper_id,
-                    first.ingested_by,
+                    first.ingested_by.agent.id,
                     MAX_LISTED_AUTHORS + 1,
                 )
                 .await
@@ -202,9 +240,17 @@ async fn paper_listings(
             claim_count: asserted.max(labelled),
             ingests: principals
                 .into_iter()
-                .map(|p| PaperIngestView {
-                    ingested_by: p.ingested_by,
-                    first_written_at: p.first_written_at,
+                .map(|p| {
+                    let by = crate::routes::claims::FilerView::from(p.ingested_by);
+                    PaperIngestView {
+                        ingested_by: by.agent.id,
+                        first_written_at: p.first_written_at,
+                        agent: by.agent,
+                        human: by.human,
+                        prompt_snapshot: by.prompt_snapshot,
+                        ingested_at: p.first_written_at,
+                        derived: true,
+                    }
                 })
                 .collect(),
             ingests_truncated,
@@ -371,7 +417,9 @@ pub async fn create_paper(
 /// GET /api/v1/papers?doi=10.1234/example&limit=20&offset=0
 ///
 /// Each item carries its authors, its claim count and its ingests
-/// ([`PaperListing`]) as the caller may read them. The registry row itself
+/// ([`PaperListing`]) as the caller may read them; each ingest names its
+/// agent, that agent's human and, for a caller the prompt-history gate admits,
+/// the model it ran ([`PaperIngestView`]). The registry row itself
 /// (`papers` has no row security: it is keyed on the document) is read from
 /// the pool; everything derived from claims and edges is read on the caller's
 /// stamped connection.

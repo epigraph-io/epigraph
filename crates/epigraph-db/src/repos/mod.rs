@@ -134,7 +134,7 @@ pub use atlas_layout::{
 };
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
-    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperIngest, PaperRef, PromptSnapshotAt,
     PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
