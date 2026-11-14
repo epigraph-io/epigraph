@@ -281,3 +281,104 @@ async fn an_empty_corpus_is_not_insufficient_confidence(pool: PgPool) {
         "got {body}"
     );
 }
+
+// ── 4e856a99 ────────────────────────────────────────────────────────────────
+
+struct Family {
+    a1: Uuid,
+    a2: Uuid,
+    a3: Uuid,
+    a4: Uuid,
+    p: Uuid,
+    q: Uuid,
+}
+
+/// Two unembedded compound parents P and Q; four embedded atom hits whose
+/// flat (distance) order interleaves the parents: A1(P), A2(Q), A3(P), A4(no
+/// parent).
+async fn family(pool: &PgPool) -> Family {
+    let agent = seed_agent(pool).await;
+    let p = seed_claim(pool, agent, "b29 compound parent P", 0.8, None).await;
+    let q = seed_claim(pool, agent, "b29 compound parent Q", 0.8, None).await;
+    let a1 = seed_claim(pool, agent, "b29 atom one of P", 0.8, Some(1.0)).await;
+    let a2 = seed_claim(pool, agent, "b29 atom one of Q", 0.8, Some(2.0)).await;
+    let a3 = seed_claim(pool, agent, "b29 atom two of P", 0.8, Some(3.0)).await;
+    let a4 = seed_claim(pool, agent, "b29 parentless claim", 0.8, Some(4.0)).await;
+    decomposes_to(pool, p, a1).await;
+    decomposes_to(pool, q, a2).await;
+    decomposes_to(pool, p, a3).await;
+    Family {
+        a1,
+        a2,
+        a3,
+        a4,
+        p,
+        q,
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn group_by_parent_puts_co_parent_hits_together(pool: PgPool) {
+    let f = family(&pool).await;
+    let s = |u: Uuid| u.to_string();
+
+    // Default: flat distance order, no parent key on any hit.
+    let flat = recall(&pool, json!({ "min_truth": 0.0 }))
+        .await
+        .expect("recall");
+    assert_eq!(
+        hit_ids(&flat["results"]),
+        vec![s(f.a1), s(f.a2), s(f.a3), s(f.a4)],
+        "calibration: the flat order interleaves the two parents"
+    );
+    assert!(
+        flat["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h.get("parent_claim_id").is_none()),
+        "without group_by_parent the hit shape is unchanged: {flat}"
+    );
+
+    let grouped = recall(&pool, json!({ "min_truth": 0.0, "group_by_parent": true }))
+        .await
+        .expect("recall grouped");
+    assert_eq!(
+        hit_ids(&grouped["results"]),
+        vec![s(f.a1), s(f.a3), s(f.a2), s(f.a4)],
+        "group_by_parent must pull A3 up next to its co-parent A1, keep each group at its \
+         best member's rank, and leave the parentless hit in place: {grouped}"
+    );
+    let parent_of = |id: Uuid| -> Option<String> {
+        grouped["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["paragraph_id"] == json!(s(id)))
+            .and_then(|h| h.get("parent_claim_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    };
+    assert_eq!(parent_of(f.a1), Some(s(f.p)));
+    assert_eq!(parent_of(f.a3), Some(s(f.p)));
+    assert_eq!(parent_of(f.a2), Some(s(f.q)));
+    assert_eq!(
+        parent_of(f.a4),
+        None,
+        "a parentless hit carries no parent key"
+    );
+
+    // Composes with epistemic_partition: the buckets keep the grouped order
+    // (all four hits are 0.8, uncontested: `confirmed`).
+    let parted = recall(
+        &pool,
+        json!({ "min_truth": 0.0, "group_by_parent": true, "epistemic_partition": true }),
+    )
+    .await
+    .expect("recall grouped + partitioned");
+    assert_eq!(
+        hit_ids(&parted["epistemic_partition"]["confirmed"]),
+        vec![s(f.a1), s(f.a3), s(f.a2), s(f.a4)],
+        "the partition must carry the grouped order: {parted}"
+    );
+}

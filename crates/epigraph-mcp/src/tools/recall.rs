@@ -442,6 +442,22 @@ pub struct RecallWithContextParams {
     /// diversity filtering.
     #[serde(default)]
     pub diversity_radius: Option<f64>,
+    /// When `true`, REORDER the page so hits that share a `decomposes_to`
+    /// parent (the atoms of one compound claim, the paragraphs of one
+    /// section) come back adjacent, each group at the rank of its
+    /// best-ranked member and in rank order within it (backlog 4e856a99).
+    /// Each hit with a visible parent then carries `parent_claim_id`; a hit
+    /// with none keeps its own rank. A hit with several parents is grouped
+    /// under its first by `(created_at, id)`.
+    ///
+    /// Regroups, never filters: the returned SET is identical with and
+    /// without it. Runs after every post-filter (`min_truth`,
+    /// `exclude_contested`, `diversity_radius`), so grouping cannot change
+    /// which hits survive, and before `epistemic_partition`, whose buckets
+    /// keep the grouped order. Default `false`: hit order and shape are
+    /// unchanged.
+    #[serde(default)]
+    pub group_by_parent: bool,
 }
 
 /// Why a recall audit row has no owner — and therefore must not be written.
@@ -788,6 +804,11 @@ pub struct RecallHit {
     /// even when it did not ask for a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `decomposes_to` parent this hit was grouped under. Present only
+    /// with `group_by_parent=true` and only for a hit with a visible parent;
+    /// omitted otherwise, so a default page keeps its shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_claim_id: Option<Uuid>,
 }
 
 impl crate::types::RecallGatedSignals for RecallHit {
@@ -1644,6 +1665,8 @@ async fn recall_with_context_post_embed(
             is_contested: false,
             contesting_claim_ids: Vec::new(),
             created_at: Some(core.created_at),
+            // Filled by the `group_by_parent` pass below, when requested.
+            parent_claim_id: None,
         });
     }
     // Read here, straight after the floor and before any later filter, so the
@@ -1824,6 +1847,31 @@ async fn recall_with_context_post_embed(
         }
     }
 
+    // Parent grouping (backlog 4e856a99): after every filter, so it cannot
+    // change which hits survive; before the audit spawn, so
+    // `returned_claim_ids` is in the order served; before the partition, whose
+    // buckets keep the flat order they are handed. One batched parent lookup
+    // per page. Degrade-not-fail, like the post-passes above: a failed lookup
+    // serves the page in rank order rather than losing it.
+    if params.group_by_parent {
+        let ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_db::ClaimContextRepository::first_parent_ids(&mut read, viewer, &ids).await
+        {
+            Ok(parents) => {
+                for hit in &mut results {
+                    hit.parent_claim_id = parents.get(&hit.paragraph_id).copied();
+                }
+                results = group_hits_by_parent(results);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "parent lookup failed; serving the page without group_by_parent"
+                );
+            }
+        }
+    }
+
     let corpus_scope = compute_corpus_scope(&mut *read, viewer)
         .await
         .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
@@ -1852,9 +1900,9 @@ async fn recall_with_context_post_embed(
             "since": params.since,
             // Same argument: the radius changes WHICH paragraphs came back, so
             // a retrieval whose diversity cut cannot be reconstructed from its
-            // audit row is an unauditable retrieval. `epistemic_partition` is
-            // deliberately absent — it regroups the response without changing
-            // the set.
+            // audit row is an unauditable retrieval. `epistemic_partition` and
+            // `group_by_parent` are deliberately absent — they regroup the
+            // response without changing the set.
             "diversity_radius": params.diversity_radius,
         }),
         results.iter().map(|h| h.paragraph_id).collect(),
@@ -1884,6 +1932,27 @@ async fn recall_with_context_post_embed(
         insufficient_confidence,
         recall_event_id: Some(event_id.to_string()),
     })
+}
+
+/// Stable regrouping for `group_by_parent`: hits sharing a group key come back
+/// adjacent, each group at the position of its best-ranked (first) member and
+/// in rank order within it. The key is the hit's `parent_claim_id`, or its own
+/// id when it has none, so a parent that is itself a hit joins the group of
+/// its own child hits. Pure reordering: same hits, same count.
+fn group_hits_by_parent(hits: Vec<RecallHit>) -> Vec<RecallHit> {
+    let mut groups: Vec<Vec<RecallHit>> = Vec::new();
+    let mut slot: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+    for hit in hits {
+        let key = hit.parent_claim_id.unwrap_or(hit.paragraph_id);
+        match slot.get(&key) {
+            Some(&i) => groups[i].push(hit),
+            None => {
+                slot.insert(key, groups.len());
+                groups.push(vec![hit]);
+            }
+        }
+    }
+    groups.into_iter().flatten().collect()
 }
 
 pub struct ParagraphCore {
