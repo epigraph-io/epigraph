@@ -1805,30 +1805,41 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Consolidate 2..=20 near-duplicate claims into ONE caller-synthesized \
-                       claim. Each source is retired with a forwarding pointer to the merged \
-                       claim and lineage recorded as supersedes edges plus properties.merge. \
-                       The sources' live edges are then migrated onto the merged claim \
-                       (cross-source duplicates retracted so Dempster-Shafer mass is not \
-                       double-counted) by the server's administrative cascade on its \
-                       maintenance connection, audited; the result's `cascade` says applied, \
-                       deferred (no maintenance connection: the merge committed and the edge \
-                       migration is recorded for replay) or failed. The caller supplies \
+        description = "Consolidate 2..=20 claims in one of three explicit modes. \
+                       mode=identity: the sources restate one of them, named by \
+                       survivor_claim_id; every other source is marked a duplicate of the \
+                       survivor exactly as mark_duplicate does (same_as identity edge, belief \
+                       inputs pooled onto the survivor, edges moved by the dedup cascade), and \
+                       each can be un-marked with unmark_duplicate. No claim is written and \
+                       merged_content and confidence are refused. Every source's state and \
+                       your authority over every pair are checked before any source is \
+                       marked. mode=merge (rewrite is accepted as merge): the sources are \
+                       complementary, not duplicates; ONE caller-synthesized claim is written, \
+                       each source is retired with a forwarding pointer to it, lineage is \
+                       recorded as supersedes edges plus properties.merge, and the sources' \
+                       live edges are migrated onto it (cross-source duplicates retracted so \
+                       Dempster-Shafer mass is not double-counted) by the server's \
+                       administrative cascade on its maintenance connection, audited; the \
+                       result's `cascade` says applied, deferred (no maintenance connection: \
+                       the merge committed and the edge migration is recorded for replay) or \
+                       failed. A merge carries no belief inputs over and has no un-mark. \
+                       mode=abstract: ONE caller-synthesized, more general claim is written \
+                       and linked to each source by a generalizes edge; no source is retired \
+                       and no edge moves. For merge and abstract the caller supplies \
                        merged_content; the server never calls an LLM. ALL-OR-NOTHING: on any \
-                       error no merged claim is written and no source is retired, so retrying \
-                       a failed call is safe. The merged claim is authored by the calling agent \
+                       error no new claim is written and no source is retired, so retrying a \
+                       failed call is safe. The new claim is authored by the calling agent \
                        (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio). \
                        A source owned by a group the calling agent cannot write, or sources \
                        spanning two owner groups, is refused \
                        permanently (sometimes as INTERNAL_ERROR); do not retry it. After a \
-                       success the sources are no longer current, so repeating the call fails \
-                       with 'source ... is not current', which means the first call landed. If \
-                       this agent already holds a claim with identical merged_content, that \
-                       claim is returned with already_existed=true and nothing changes. \
-                       Unlike mark_duplicate, it writes no same_as identity edge, carries no \
-                       belief inputs over to the merged claim, and has no un-mark: when one \
-                       existing claim already says it all, mark the others duplicates of it \
-                       instead (docs/conventions/duplicates-and-index-hygiene.md)."
+                       merge or an identity call the retired sources are no longer current, so \
+                       repeating the call fails with 'source ... is not current', which means \
+                       the first call landed. If this agent already holds a claim with \
+                       identical merged_content, that claim is returned with \
+                       already_existed=true and nothing changes. When one existing claim \
+                       already says it all, use mode=identity \
+                       (docs/conventions/duplicates-and-index-hygiene.md)."
     )]
     async fn consolidate_claims(
         &self,

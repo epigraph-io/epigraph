@@ -397,6 +397,7 @@ async fn a_consolidated_team_claim_is_embedded(pool: PgPool) {
             mode: "merge".to_string(),
             reason: "test".to_string(),
             confidence: Some(0.8),
+            survivor_claim_id: None,
         },
         None,
     )

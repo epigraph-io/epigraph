@@ -1,6 +1,17 @@
 //! `consolidate_claims` MCP tool (backlog 44b19521 / design F1).
 //!
-//! N→1 memory consolidation. The caller supplies the synthesized content —
+//! N→1 memory consolidation, in one of three explicit modes (backlog
+//! 22602dd8, [`ConsolidateMode`]):
+//!
+//! - `identity`: the sources restate one of them, the caller-named survivor.
+//!   Each other source goes through the dedup act onto it, exactly as
+//!   `mark_duplicate` would, so it can be un-marked. No new claim.
+//! - `merge` (alias `rewrite`): a new merged claim; the sources are retired
+//!   into it and their edges move to it.
+//! - `abstract`: a new generalisation linked to each source by a
+//!   `generalizes` edge; no source is retired and no edge moves.
+//!
+//! For `merge` and `abstract` the caller supplies the synthesized content —
 //! the server never invokes an LLM, matching `epigraph-ingest-executor`'s
 //! division of labour (agent-side synthesis, server-side storage).
 
@@ -11,10 +22,14 @@ use crate::errors::{internal_error, internal_error_logged, invalid_params, parse
 use crate::server::EpiGraphMcpFull;
 use crate::types::ConsolidateClaimsParams;
 
+use epigraph_db::repos::claim::{CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES};
 use epigraph_db::{ClaimRepository, ConsolidateMode};
 
 #[derive(Debug, Serialize)]
 struct ConsolidateResponse {
+    /// `merge` or `abstract` (an `identity` call answers with
+    /// [`IdentityResponse`]).
+    mode: &'static str,
     merged_claim_id: String,
     superseded_ids: Vec<String>,
     edges_migrated: u64,
@@ -25,9 +40,19 @@ struct ConsolidateResponse {
     already_existed: bool,
     /// The administrative cascade that moved the sources' edges (migration
     /// 117): applied, deferred or failed, with its `security_events` row. Absent
-    /// on the idempotent return, which wrote nothing.
+    /// on the idempotent return, which wrote nothing, and on an abstraction,
+    /// which moves no edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     cascade: Option<epigraph_engine::admin_cascade::CascadeStatus>,
+}
+
+/// What `consolidate_claims(mode='identity')` did: one `mark_duplicate`
+/// answer per non-survivor source, in the order given.
+#[derive(Debug, Serialize)]
+struct IdentityResponse {
+    mode: &'static str,
+    survivor_claim_id: String,
+    marked: Vec<serde_json::Value>,
 }
 
 pub async fn consolidate_claims(
@@ -36,22 +61,34 @@ pub async fn consolidate_claims(
     params: ConsolidateClaimsParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    // The merged claim is a claim like any other: the same content cap as
-    // `submit_claim` and its HTTP twins, checked before anything is resolved,
-    // embedded or written (backlog b76e284b).
-    crate::tools::claims::check_claim_content_length(&params.merged_content)?;
-    let acting = server.write_identity(auth, viewer).await?;
-    let acting_agent_id = acting.agent_id();
-
+    let mode = ConsolidateMode::parse(&params.mode).map_err(|bad| {
+        invalid_params(format!(
+            "unknown mode {bad:?}; want identity|merge|abstract (rewrite is accepted as merge)"
+        ))
+    })?;
     let source_ids = params
         .source_claim_ids
         .iter()
         .map(|s| parse_uuid(s))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mode = ConsolidateMode::parse(&params.mode).map_err(|bad| {
-        invalid_params(format!("unknown mode {bad:?}; want merge|abstract|rewrite"))
-    })?;
+    if mode == ConsolidateMode::Identity {
+        return consolidate_identity(server, viewer, params, auth, &source_ids).await;
+    }
+    if params.survivor_claim_id.is_some() {
+        return Err(invalid_params(format!(
+            "survivor_claim_id applies to mode 'identity' only; mode '{}' writes a new claim \
+             and has no survivor",
+            mode.as_str()
+        )));
+    }
+
+    // The merged claim is a claim like any other: the same content cap as
+    // `submit_claim` and its HTTP twins, checked before anything is resolved,
+    // embedded or written (backlog b76e284b).
+    crate::tools::claims::check_claim_content_length(&params.merged_content)?;
+    let acting = server.write_identity(auth, viewer).await?;
+    let acting_agent_id = acting.agent_id();
 
     // Default confidence: the strongest source discounted slightly, so a merge
     // never claims more certainty than its best input.
@@ -153,7 +190,10 @@ pub async fn consolidate_claims(
     })?;
     // The cascade's trigger, and its administrative session acquired BEFORE
     // the act commits (or the deferral recorded in the act's own transaction).
-    // The idempotent return wrote nothing, so it has no cascade.
+    // The idempotent return wrote nothing, so it has no cascade; nor has an
+    // abstraction, which retires no source and so has no edge to move (the
+    // consolidate cascade and its deferral both verify retired sources, and
+    // would refuse one).
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger {
         sources: source_ids.clone(),
         ..epigraph_engine::admin_cascade::CascadeTrigger::new(
@@ -164,7 +204,7 @@ pub async fn consolidate_claims(
             None,
         )
     };
-    let (mut session, deferred) = if result.already_existed {
+    let (mut session, deferred) = if result.already_existed || !mode.retires_sources() {
         (None, None)
     } else {
         let (session, status) =
@@ -221,6 +261,7 @@ pub async fn consolidate_claims(
     };
 
     let response = ConsolidateResponse {
+        mode: mode.as_str(),
         merged_claim_id: result.merged_id.to_string(),
         superseded_ids: result.superseded.iter().map(ToString::to_string).collect(),
         edges_migrated: touched_count("edges_migrated"),
@@ -230,6 +271,135 @@ pub async fn consolidate_claims(
         cascade,
     };
 
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&response).map_err(internal_error)?,
+    )]))
+}
+
+/// `consolidate_claims(mode='identity')`: every non-survivor source is marked
+/// a duplicate of the survivor through the dedup act, as `mark_duplicate`
+/// does, so each gets the identity edge, its belief inputs pool onto the
+/// survivor, and each can be un-marked (`unmark_duplicate`). No claim is
+/// written.
+///
+/// All-or-nothing up to the first act: every source's state and the caller's
+/// authority over every pair are checked before any source is marked. A
+/// source that changes between that check and its own act (a concurrent
+/// writer) is refused by the act, and the sources marked before it stay
+/// marked; each can be un-marked.
+async fn consolidate_identity(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: ConsolidateClaimsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
+    source_ids: &[uuid::Uuid],
+) -> Result<CallToolResult, McpError> {
+    const TOOL: &str = "consolidate_claims";
+    if !params.merged_content.trim().is_empty() {
+        return Err(invalid_params(
+            "mode 'identity' writes no new claim, so it takes no merged_content: the \
+             survivor's text stands. Omit merged_content, or use mode 'merge'.",
+        ));
+    }
+    if params.confidence.is_some() {
+        return Err(invalid_params(
+            "mode 'identity' writes no new claim, so it takes no confidence",
+        ));
+    }
+    let survivor = match params.survivor_claim_id.as_deref() {
+        Some(s) => parse_uuid(s)?,
+        None => {
+            return Err(invalid_params(
+                "mode 'identity' needs survivor_claim_id: the source every other source is \
+                 marked a duplicate of",
+            ))
+        }
+    };
+    if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES {
+        return Err(invalid_params(format!(
+            "consolidate: need {CONSOLIDATE_MIN_SOURCES}..={CONSOLIDATE_MAX_SOURCES} sources, got {}",
+            source_ids.len()
+        )));
+    }
+    let unique: std::collections::HashSet<uuid::Uuid> = source_ids.iter().copied().collect();
+    if unique.len() != source_ids.len() {
+        return Err(invalid_params("consolidate: duplicate source ids"));
+    }
+    if !unique.contains(&survivor) {
+        return Err(invalid_params(format!(
+            "survivor_claim_id {survivor} is not one of source_claim_ids"
+        )));
+    }
+    let duplicates: Vec<uuid::Uuid> = source_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != survivor)
+        .collect();
+
+    // Every source's state, read through the CALLER: one it cannot read is
+    // not found, exactly as `mark_duplicate` reports it. The survivor must be
+    // current; every other source current and not already a successor or a
+    // marked duplicate (the dedup act's own refusals, asked first so that one
+    // bad source refuses the call before any source is marked).
+    {
+        let mut read = server.read_as(viewer, TOOL).await?;
+        for id in source_ids {
+            let claim = ClaimRepository::get_by_id(
+                &mut *read,
+                viewer,
+                epigraph_core::ClaimId::from_uuid(*id),
+            )
+            .await
+            .map_err(|e| {
+                internal_error_logged(
+                    format!(
+                        "consolidate_claims: could not read source claim {id}; nothing was written"
+                    ),
+                    e,
+                )
+            })?
+            .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+            if !claim.is_current {
+                return Err(invalid_params(format!(
+                    "consolidate: source {id} is not current; nothing was written"
+                )));
+            }
+            if *id != survivor && claim.supersedes.is_some() {
+                return Err(invalid_params(format!(
+                    "consolidate: source {id} already supersedes a claim; marking it a \
+                     duplicate would overwrite that pointer. Nothing was written."
+                )));
+            }
+        }
+    }
+    for dup in &duplicates {
+        crate::tools::supersede::mark_duplicate_preflight(
+            server, viewer, auth, *dup, survivor, TOOL,
+        )
+        .await?;
+    }
+
+    let mut marked = Vec::with_capacity(duplicates.len());
+    for dup in duplicates {
+        marked.push(
+            crate::tools::supersede::mark_duplicate_pair(
+                server,
+                viewer,
+                auth,
+                dup,
+                survivor,
+                Some(params.reason.as_str()),
+                TOOL,
+            )
+            .await?,
+        );
+    }
+
+    let response = IdentityResponse {
+        mode: ConsolidateMode::Identity.as_str(),
+        survivor_claim_id: survivor.to_string(),
+        marked,
+    };
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&response).map_err(internal_error)?,
     )]))

@@ -1517,6 +1517,7 @@ fn consolidate_params(ids: &[Uuid], content: &str) -> epigraph_mcp::types::Conso
         mode: "merge".to_string(),
         reason: "w10 consolidation".to_string(),
         confidence: Some(0.7),
+        survivor_claim_id: None,
     }
 }
 

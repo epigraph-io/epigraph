@@ -435,6 +435,62 @@ pub async fn mark_duplicate(
 ) -> Result<CallToolResult, McpError> {
     let dup = parse_uuid(&params.claim_id)?;
     let canon = parse_uuid(&params.canonical_id)?;
+    let out = mark_duplicate_pair(
+        server,
+        viewer,
+        auth,
+        dup,
+        canon,
+        params.reason.as_deref(),
+        "mark_duplicate",
+    )
+    .await?;
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&out).map_err(internal_error)?,
+    )]))
+}
+
+/// The gate `mark_duplicate` applies before it writes `dup` onto `canon`,
+/// and nothing else: the caller's authority over both claims, read through
+/// the caller ([`begin_claim_act`]). The transaction it opens is rolled back.
+/// `consolidate_claims(mode='identity')` asks it for every source before it
+/// marks any, so a source the caller may not mark refuses the whole call with
+/// nothing written.
+pub(crate) async fn mark_duplicate_preflight(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    dup: uuid::Uuid,
+    canon: uuid::Uuid,
+    tool: &'static str,
+) -> Result<(), McpError> {
+    let (tx, _, _) = begin_claim_act(
+        server,
+        viewer,
+        auth,
+        dup,
+        Some(canon),
+        tool,
+        "mark as a duplicate",
+    )
+    .await?;
+    drop(tx);
+    Ok(())
+}
+
+/// One dedup act, `dup` onto `canon`, and its cascade: the whole of
+/// `mark_duplicate`, shared with `consolidate_claims(mode='identity')`, which
+/// runs it once per non-survivor source. `tool` is recorded in the identity
+/// edge's provenance.
+pub(crate) async fn mark_duplicate_pair(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    dup: uuid::Uuid,
+    canon: uuid::Uuid,
+    reason: Option<&str>,
+    tool: &'static str,
+) -> Result<serde_json::Value, McpError> {
     let dup_claim_id = ClaimId::from_uuid(dup);
 
     // THE ACT's gate and stamp (batch OA1), as `supersede_claim` above: the
@@ -450,15 +506,14 @@ pub async fn mark_duplicate(
         auth,
         dup,
         Some(canon),
-        "mark_duplicate",
+        tool,
         "mark as a duplicate",
     )
     .await?;
 
-    let provenance =
-        DuplicateProvenance::new("mark_duplicate", DuplicateProvenance::RULE_CALLER_ASSERTED)
-            .marked_by(Some(actor))
-            .reason(params.reason.as_deref());
+    let provenance = DuplicateProvenance::new(tool, DuplicateProvenance::RULE_CALLER_ASSERTED)
+        .marked_by(Some(actor))
+        .reason(reason);
     ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
         dup_claim_id,
@@ -492,16 +547,13 @@ pub async fn mark_duplicate(
         (None, status) => (status, CascadeReport::default()),
     };
 
-    Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&serde_json::json!({
-            "duplicate_id": dup,
-            "canonical_id": canon,
-            "mode": "mark_duplicate",
-            "cascade": cascade,
-            "belief_cascade": belief_cascade,
-        }))
-        .map_err(internal_error)?,
-    )]))
+    Ok(serde_json::json!({
+        "duplicate_id": dup,
+        "canonical_id": canon,
+        "mode": "mark_duplicate",
+        "cascade": cascade,
+        "belief_cascade": belief_cascade,
+    }))
 }
 
 /// The refusal an un-mark gets on a server without the administrative

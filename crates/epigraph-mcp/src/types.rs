@@ -473,27 +473,47 @@ pub struct SweepSemanticDuplicatesParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConsolidateClaimsParams {
     #[schemars(
-        description = "UUIDs of the 2..=20 is_current claims to merge. Each is retired with a \
-                       forwarding pointer to the merged claim."
+        description = "UUIDs of the 2..=20 is_current claims to consolidate. What happens to \
+                       each depends on mode."
     )]
     pub source_claim_ids: Vec<String>,
 
     #[schemars(
-        description = "The synthesized replacement text. The CALLER synthesizes this — the \
-                       server never invokes an LLM."
+        description = "The synthesized text of the new claim, for mode merge or abstract. The \
+                       CALLER synthesizes this — the server never invokes an LLM. Omit it for \
+                       mode identity, which writes no new claim."
     )]
+    #[serde(default)]
     pub merged_content: String,
 
-    #[schemars(description = "One of: merge | abstract | rewrite.")]
+    #[schemars(
+        description = "One of: identity | merge | abstract. identity: the sources restate one \
+                       of them (survivor_claim_id); every other source is marked a duplicate \
+                       of it, exactly as mark_duplicate does, and can be un-marked. merge: \
+                       the sources are complementary; a new claim is written and every \
+                       source is retired into it. abstract: a new, more general claim is \
+                       linked to each source by a generalizes edge; nothing is retired. \
+                       rewrite is accepted as merge."
+    )]
     pub mode: String,
 
-    #[schemars(description = "Why these claims were consolidated; recorded on the lineage edges.")]
+    #[schemars(
+        description = "Mode identity only: the source that stays current; every other source \
+                       is marked a duplicate of it. Refused for the other modes."
+    )]
+    #[serde(default)]
+    pub survivor_claim_id: Option<String>,
+
+    #[schemars(
+        description = "Why these claims were consolidated; recorded on the lineage, \
+                       generalizes or identity edges."
+    )]
     pub reason: String,
 
     #[schemars(
-        description = "Confidence for the merged claim. Defaults to the highest source \
-                       truth_value * 0.95, so a merge never claims more certainty than its \
-                       best input."
+        description = "Confidence for the new claim (merge or abstract). Defaults to the \
+                       highest source truth_value * 0.95, so a new claim never claims more \
+                       certainty than its best input. Refused for mode identity."
     )]
     #[serde(default)]
     pub confidence: Option<f64>,
