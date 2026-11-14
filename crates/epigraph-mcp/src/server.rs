@@ -49,6 +49,11 @@ pub struct EpiGraphMcpFull {
     /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
     /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
     pub(crate) privileged_pool: Option<&'static str>,
+    /// The tasks tools detach and answer ahead of (a queued document walk, a
+    /// post-commit embedding loop), counted so the stdio entry point can wait
+    /// for them before the process exits. Shared by every clone of the server.
+    /// See [`crate::background`].
+    pub(crate) background: crate::background::BackgroundTasks,
     /// The key every signature this server makes is by. In the legacy modes
     /// it is also the agent's identity (`agents.public_key`); in the
     /// separate-signing-key mode (agent identity lineage design D2) it is the
@@ -1148,6 +1153,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer: Arc::new(signer),
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1193,6 +1199,14 @@ impl EpiGraphMcpFull {
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
         self
+    }
+
+    /// The set of detached tasks this server (and every clone of it) has
+    /// running. `main` takes it before handing the server to the stdio
+    /// transport, and waits on it after the client disconnects.
+    #[must_use]
+    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
+        self.background.clone()
     }
 
     /// Switch connector-mode elevation on or off (see the field's doc; OFF is
@@ -1288,6 +1302,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer,
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),

@@ -246,7 +246,9 @@ pub async fn ingest_document(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, so a stdio process waits for the walk before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -385,7 +387,9 @@ pub async fn ingest_document_inline(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, so a stdio process waits for the walk before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -1074,7 +1078,9 @@ fn spawn_ingest_embeds(
     // its `ScopedPool` and its embedder, and reaches the pool only inside
     // `claim_helper`, where every author-stamped store already does.
     let bg = server.clone();
-    tokio::spawn(async move {
+    // Tracked, so a stdio process waits for the vectors before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         let (mut stored, total) = (0usize, embed_queue.len());
         for (id, content) in embed_queue {
             let embedded = if bg.scoped.is_some() {
