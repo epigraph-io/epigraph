@@ -1114,14 +1114,12 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     theta_key: mass_theta,
                 });
 
-                // `mass_functions` has no source_type/source_label columns; the
-                // bootstrap origin is recorded as its combination method.
                 let inserted = sqlx::query(
                     r#"
-                    INSERT INTO mass_functions (claim_id, frame_id, masses, combination_method)
-                    VALUES ($1, $2, $3, 'bootstrap')
+                    INSERT INTO mass_functions (claim_id, frame_id, masses, source_type, source_label)
+                    VALUES ($1, $2, $3, 'bootstrap', 'dekg migrate bootstrap-masses')
                     ON CONFLICT DO NOTHING
-                    "#,
+                    "#
                 )
                 .bind(claim_id)
                 .bind(frame_id)
