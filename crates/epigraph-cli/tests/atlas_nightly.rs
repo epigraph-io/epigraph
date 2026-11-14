@@ -729,9 +729,10 @@ async fn a_new_claim_relays_and_renames_only_its_leaf_and_ancestors(pool: PgPool
 }
 
 /// 26 new team-A claims in `t1`, near `u` (so they join meaning leaf `u+p`),
-/// linked to each other twice over: 1,300 edges, past the contract's 1,024
-/// per leaf, so theme `t1`'s update fails. One more claim joins `t2`.
-async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
+/// linked to each other twice over: 1,300 edges among 26 claims, past the
+/// contract's 1,024 per leaf, so the leaf that takes them must split on
+/// edges. Returns the clique.
+async fn grow_t1_by_a_clique(pool: &PgPool, c: &Corpus) -> Vec<Uuid> {
     let fx = agent(pool, "Filer X").await;
     let clique = claims(pool, Some(c.t1), fx, Some(c.a_team), 26, 200).await;
     sqlx::query(
@@ -745,7 +746,87 @@ async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
     .execute(pool)
     .await
     .expect("seed the clique");
+    clique
+}
+
+/// One new team-A claim in `t1`, near `u`, with 33 evidence rows of its own
+/// that all cite each other: 33 + 1,056 + 1 edges among its own 35 nodes.
+/// No split can bring ONE claim under the contract's 1,024 edges, so theme
+/// `t1`'s update fails. One more claim joins `t2`.
+async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
+    let fx = agent(pool, "Filer X").await;
+    let dense = claims(pool, Some(c.t1), fx, Some(c.a_team), 1, 200).await;
+    let ev = evidence_on_each(pool, &vec![dense[0]; 33]).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            visibility, owner_group_id) \
+         SELECT s, 'evidence', t, 'evidence', 'cites', 'group', $2 \
+           FROM unnest($1::uuid[]) s, unnest($1::uuid[]) t \
+          WHERE s <> t",
+    )
+    .bind(&ev)
+    .bind(c.a_team)
+    .execute(pool)
+    .await
+    .expect("seed the dense evidence");
     claims(pool, Some(c.t2), c.fa, Some(c.a_team), 1, 300).await[0]
+}
+
+/// The edge limit splits, it does not freeze (review finding: a leaf over
+/// 1,024 edges used to fail its theme on every night, carried forever). The
+/// clique joins leaf `u+p`; the nightly splits that leaf on edges, builds
+/// theme `t1` (nothing carried or dropped), every stored level validates and
+/// every clique claim is drawn in both hierarchies. The next night over the
+/// same input writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_leaf_over_the_edge_limit_is_split_not_frozen(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let backend = namer();
+    night(&pool, &viewer, &backend, &opts()).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let clique = grow_t1_by_a_clique(&pool, &c).await;
+
+    let summary = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    for k in ["carried", "dropped", "unbuilt"] {
+        assert!(r["themes"][k].as_array().unwrap().is_empty(), "{k}: {r:#}");
+    }
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    let mut drawn: BTreeMap<String, BTreeSet<Uuid>> = BTreeMap::new();
+    for ((h, _), (theme, payload)) in &after {
+        if let LevelDocument::Leaf(l) = parse(payload) {
+            if *theme == c.t1 {
+                for n in &l.nodes {
+                    if let Node::Claim(cl) = n {
+                        drawn.entry(h.clone()).or_default().insert(cl.id);
+                    }
+                }
+            }
+        }
+    }
+    for h in ["meaning", "links"] {
+        let got = drawn.get(h).cloned().unwrap_or_default();
+        assert!(
+            set(&clique).is_subset(&got),
+            "{h}: a clique claim is not drawn"
+        );
+    }
+
+    let calls = backend.calls();
+    let again = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(
+        map_report(&again, a_map)["status"],
+        "unchanged",
+        "{again:#}"
+    );
+    assert_eq!(
+        backend.calls(),
+        calls,
+        "an unchanged night called the model"
+    );
 }
 
 /// Done when: a drifted theme does not fail the night. Theme `t1` fails;

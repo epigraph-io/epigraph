@@ -12,9 +12,10 @@
 //! 2. per map with a finished run, in one REPEATABLE READ snapshot: rebuilds
 //!    the previous run's trees ([`previous`]), updates them incrementally
 //!    ([`incremental`]: new claims by nearest centroid and by linked
-//!    neighbours, W5b mirrors, a leaf over the cap split by W3's on-box
-//!    fallback), checks them with W4's and W5's checks, builds REAL leaves
-//!    ([`leaves`]: W3 nodes, W7 weights), then, outside the snapshot, lays
+//!    neighbours, W5b mirrors, a leaf over the node cap or the contract's
+//!    1,024 edges split by W3's on-box fallback), checks them with W4's
+//!    and W5's checks, builds REAL leaves ([`leaves`]: W3 nodes, W7
+//!    weights), then, outside the snapshot, lays
 //!    out the changed levels (W6, warm-started) and names the changed groups
 //!    (W8, under a call budget, with no transaction open);
 //! 3. writes ONE new run per map holding both hierarchies, with the
@@ -24,6 +25,12 @@
 //! A theme whose update fails is carried from the previous run (both
 //! hierarchies, only if its leaves re-assemble identically) or dropped, and
 //! reported; it never fails the night.
+
+// W3's leaf assembly splits on the contract's edge limit without depending
+// on the contract crate; keep the two numbers one.
+const _: () = assert!(
+    epigraph_db::repos::atlas_leaf::ATLAS_LEAF_EDGE_CAP == epigraph_atlas_contract::MAX_LEAF_EDGES
+);
 
 pub mod build;
 pub mod incremental;
