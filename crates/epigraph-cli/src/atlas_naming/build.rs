@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use anyhow::{ensure, Context};
 use epigraph_atlas_contract::{LevelDocument, SCHEMA_VERSION};
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, LevelDoc, NewMapRun};
+use epigraph_db::repos::atlas_naming::FinishedRun;
 use epigraph_db::{AtlasMapRepository, AtlasMeaningRepository, AtlasNamingRepository, Viewer};
 use serde_json::json;
 use sqlx::{Connection, PgConnection};
@@ -90,29 +91,30 @@ pub struct NameMapOptions {
     pub max_calls: Option<usize>,
 }
 
-/// Name the latest finished run of `opts.map` and, with `opts.write`, store
-/// it as a NEW finished run (a finished run cannot be changed): every level
-/// of both hierarchies copied with its `run_id` rewritten and its names
-/// filled, the source run's `params` kept whole with the naming record added
-/// under `naming`, and the SOURCE run's epochs, because the documents
-/// describe that run's snapshot.
-///
-/// Three steps, and no transaction is open while the model runs: one read
-/// transaction (the source run, its levels, the previous names, the member
-/// texts through the map-scoped read), then the naming, then one write
-/// transaction. When every name was copied and the source already carries
-/// the same record, nothing is written.
+/// What [`read_for_naming`] read: the run to name, its documents, each
+/// group's sample candidates and their readable texts, and the names an
+/// earlier run may lend.
+#[derive(Debug, Clone)]
+pub struct NamingInput {
+    pub source: FinishedRun,
+    pub docs: Vec<LevelDocument>,
+    rows: Vec<(AtlasHierarchy, Uuid, Option<Uuid>, Uuid, i32)>,
+    pub plan: SamplePlan,
+    pub texts: BTreeMap<Uuid, String>,
+    pub previous: Previous,
+}
+
+/// The read half of [`name_map`]: in one snapshot transaction, ended before
+/// it returns, the latest finished run of `map`, its levels, the names an
+/// earlier run may lend and the member texts through the map-scoped read.
 ///
 /// # Errors
-/// No finished run, a level of another schema version, documents the
-/// contract refuses, or a database error.
-pub async fn name_map(
+/// No finished run, a level of another schema version, or a database error.
+pub async fn read_for_naming(
     conn: &mut PgConnection,
     viewer: &Viewer,
-    backend: &dyn NameBackend,
-    opts: NameMapOptions,
-) -> anyhow::Result<serde_json::Value> {
-    let map = opts.map;
+    map: AtlasMap,
+) -> anyhow::Result<NamingInput> {
     let mut tx = conn.begin().await.context("begin the naming read")?;
     AtlasMapRepository::begin_build_snapshot(&mut tx, viewer, map).await?;
     let source = AtlasNamingRepository::latest_finished_run(&mut tx, viewer, map, false)
@@ -148,7 +150,64 @@ pub async fn name_map(
     let plan = plan_samples(&docs)?;
     let texts = read_member_texts(&mut tx, viewer, map, &plan).await?;
     tx.rollback().await.context("end the naming read")?;
+    Ok(NamingInput {
+        source,
+        docs,
+        rows,
+        plan,
+        texts,
+        previous,
+    })
+}
 
+/// Name the latest finished run of `opts.map` and, with `opts.write`, store
+/// it as a NEW finished run (a finished run cannot be changed): every level
+/// of both hierarchies copied with its `run_id` rewritten and its names
+/// filled, the source run's `params` kept whole with the naming record added
+/// under `naming`, and the SOURCE run's epochs, because the documents
+/// describe that run's snapshot.
+///
+/// Three steps, and no transaction is open while the model runs: one read
+/// transaction ([`read_for_naming`]), then the naming, then one write
+/// transaction ([`name_and_write`]). When every name was copied and the
+/// source already carries the same record, nothing is written.
+///
+/// # Errors
+/// What [`read_for_naming`] or [`name_and_write`] refuses.
+pub async fn name_map(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    backend: &dyn NameBackend,
+    opts: NameMapOptions,
+) -> anyhow::Result<serde_json::Value> {
+    let input = read_for_naming(conn, viewer, opts.map).await?;
+    name_and_write(conn, viewer, backend, input, opts).await
+}
+
+/// The naming and the write half of [`name_map`]. The write refuses when
+/// the map's latest finished run is no longer the one that was read: a
+/// build that finished while the model ran is newer, and a copy of the older
+/// run, finished after it, would be served in its place.
+///
+/// # Errors
+/// A newer run of the map, documents the contract refuses, or a database
+/// error.
+pub async fn name_and_write(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    backend: &dyn NameBackend,
+    input: NamingInput,
+    opts: NameMapOptions,
+) -> anyhow::Result<serde_json::Value> {
+    let map = opts.map;
+    let NamingInput {
+        source,
+        mut docs,
+        rows,
+        plan,
+        texts,
+        previous,
+    } = input;
     let (record, report) = name_levels(
         &mut docs,
         &plan,
@@ -185,6 +244,16 @@ pub async fn name_map(
     params["naming"] = serde_json::to_value(&record)?;
     params["named_from_run"] = json!(source.id);
     let mut tx = conn.begin().await.context("begin the naming write")?;
+    let latest = AtlasNamingRepository::latest_finished_run(&mut tx, viewer, map, false)
+        .await?
+        .map(|r| r.id);
+    ensure!(
+        latest == Some(source.id),
+        "a newer run of map {} was published since the read (latest {latest:?}, read {}); \
+         nothing was written, rerun to name the newer run",
+        map_key(map),
+        source.id
+    );
     let run_id = AtlasMapRepository::write_run(
         &mut tx,
         &NewMapRun {

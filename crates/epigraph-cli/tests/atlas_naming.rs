@@ -26,7 +26,9 @@ use epigraph_cli::atlas_meaning::tree::{
     check_tree, group_id, map_key, root_id, WireGroup, WireKind,
 };
 use epigraph_cli::atlas_naming::backend::RecordingBackend;
-use epigraph_cli::atlas_naming::build::{name_map, NameMapOptions};
+use epigraph_cli::atlas_naming::build::{
+    name_and_write, name_map, read_for_naming, NameMapOptions,
+};
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, NewMapRun};
 use epigraph_db::{AtlasMapRepository, AtlasMeaningRepository, Viewer};
 use serde_json::json;
@@ -690,6 +692,43 @@ async fn stored_named_documents_validate_and_agree(pool: PgPool) {
     .expect("served");
     assert_eq!(served.run_id, run);
     assert!(!served.current, "stale, as the source run would be");
+}
+
+/// A build that finishes while the model runs is not hidden: the write
+/// refuses when the map's latest finished run is no longer the one that was
+/// read, and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_published_during_naming_is_not_hidden(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = AtlasMap::Team(c.a);
+    let read_run = build(&pool, &viewer, map, &[team_a_shape(&c)]).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let input = read_for_naming(&mut conn, &viewer, map).await.unwrap();
+    assert_eq!(input.source.id, read_run);
+    let newer = build(&pool, &viewer, map, &[team_a_shape(&c)]).await;
+    let err = name_and_write(
+        &mut conn,
+        &viewer,
+        &echo(),
+        input,
+        NameMapOptions {
+            map,
+            write: true,
+            max_calls: None,
+        },
+    )
+    .await
+    .expect_err("a newer run was published");
+    assert!(err.to_string().contains("newer run"), "{err}");
+    let runs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM atlas_map_runs WHERE owner_group_id = $1 ORDER BY finished_at DESC",
+    )
+    .bind(c.a)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(runs, vec![newer, read_run], "nothing was written");
 }
 
 /// The binary refuses a malformed map or budget before it connects anywhere.
