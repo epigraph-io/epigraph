@@ -14,6 +14,7 @@ pub mod agent_key;
 pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
+pub mod atlas_flow;
 pub mod atlas_layout;
 pub mod atlas_leaf;
 pub mod atlas_map;
@@ -126,6 +127,7 @@ pub use agent_lookup::{
 };
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
+pub use atlas_flow::{AtlasFlowRepository, EvidenceMassRow, FlowInputs};
 pub use atlas_layout::{
     AtlasLayoutRepository, DetailPart, LayoutBuild, LayoutLinkCursor, LayoutLinkOut, LayoutLinkRow,
     LayoutOverview, LayoutRegionOut, LayoutRunRow, LayoutThemeOut, LinkPage, LinkPairCursor,
