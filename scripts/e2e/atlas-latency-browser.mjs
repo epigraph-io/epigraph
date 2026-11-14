@@ -17,7 +17,8 @@
 //      groups) until a leaf is drawn;
 //   3. flips the meaning/links switch and back.
 //
-// What it times: atlas.js marks `atlas:want:<level>` when the viewer needs a
+// What it times: with `window.__ATLAS_TIMING__` set by an init script (the
+// marks are off otherwise), atlas.js marks `atlas:want:<level>` when the viewer needs a
 // level (a zoom reaching it, the switch, a link) and
 // `atlas:drawn:<kind>:<level>` after the first frame that draws it. Each
 // level's sample is drawn minus want: the fetch from the preview server,
@@ -143,7 +144,12 @@ const flips = [];
 let error = null;
 try {
   for (let r = 0; r < rounds && !error; r++) {
-    const page = await (await browser.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
+    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+    // atlas.js marks levels only when this is set before it runs.
+    await context.addInitScript(() => {
+      window.__ATLAS_TIMING__ = true;
+    });
+    const page = await context.newPage();
     await page.goto(new URL('/atlas/preview', base).href, { waitUntil: 'load' });
     await page.waitForSelector('[data-role="hierarchy"]', { state: 'attached', timeout: STEP_MS });
     // Let the map's own first frames settle before the first want.

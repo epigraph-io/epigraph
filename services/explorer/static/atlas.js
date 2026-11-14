@@ -900,14 +900,31 @@
   // frame that draws it, and the stage's `data-atlas-drawn-level`. A level
   // re-attached without being asked for (a breadcrumb ancestor from the cache)
   // gets no drawn mark. They are what scripts/e2e/atlas-latency-browser.mjs
-  // times; nothing here reads them.
+  // times; nothing here reads them. OFF unless the page was opened with
+  // `window.__ATLAS_TIMING__ === true` set before this script runs (the
+  // browser script sets it with an init script): User Timing marks are never
+  // evicted, so a real /atlas session must not accumulate one per level.
+  const TIMING = (() => {
+    try {
+      return window.__ATLAS_TIMING__ === true;
+    } catch (e) {
+      return false;
+    }
+  })();
+
   function markWanted(id) {
+    if (!TIMING) return;
     NS.wanted.add(id);
     try {
       performance.mark('atlas:want:' + id);
     } catch (e) {
       /* no User Timing: nothing to mark */
     }
+  }
+
+  /** A wanted level whose fetch failed is no longer wanted. */
+  function unmarkWanted(id) {
+    NS.wanted.delete(id);
   }
 
   function markDrawn() {
@@ -974,7 +991,7 @@
 
   /** Hang a fetched level's children under `node` (a theme, group or leaf). */
   function attachLevel(node, doc) {
-    NS.drawnPending.push(doc);
+    if (TIMING) NS.drawnPending.push(doc);
     node.doc = doc;
     node.levelId = doc.level_id;
     node.next = null;
@@ -1046,6 +1063,7 @@
     try {
       attachLevel(theme, await fetchLevel(id, 'group', NS.hierarchy));
     } catch (e) {
+      unmarkWanted(id);
       theme.state = isAbort(e) ? 'idle' : 'error';
       theme.error = e.message;
     }
@@ -1061,6 +1079,7 @@
     try {
       attachLevel(node, await fetchLevel(node.levelId, node.kind, node.hierarchy));
     } catch (e) {
+      unmarkWanted(node.levelId);
       node.state = isAbort(e) ? 'idle' : 'error';
       node.error = e.message;
     }
@@ -1132,6 +1151,7 @@
     try {
       doc = await fetchLevel(target.level_id, null, hierarchy);
     } catch (e) {
+      unmarkWanted(target.level_id);
       if (!isAbort(e)) setNotice(e.message);
       return;
     }
@@ -1171,6 +1191,7 @@
     try {
       doc = await fetchLevel(target.level_id, null, target.hierarchy);
     } catch (e) {
+      unmarkWanted(target.level_id);
       if (!isAbort(e)) setNotice(e.message);
       return;
     }
