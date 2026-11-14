@@ -1511,6 +1511,39 @@ async fn the_oauth_family_resolves_in_pg_catalog_only(pool: PgPool) {
         Some("23503"),
         "link to a missing agent is refused OC01 (its plpgsql body resolved): {r:?}"
     );
+
+    // The link definer's success path: its plpgsql UPDATE of
+    // `public.oauth_clients` (with `pg_catalog.now()`) resolves only when it
+    // runs, which the refusal above never reaches. The mint path provisions a
+    // derived agent and links it through this definer.
+    let before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM public.oauth_clients WHERE id = $1")
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("updated_at before the link");
+    let mut tx = pool.begin().await.expect("begin");
+    let agent = epigraph_db::repos::agent::AgentRepository::ensure_for_client(&mut tx, client)
+        .await
+        .expect("the mint path links the client through the pinned link definer")
+        .as_uuid();
+    tx.commit().await.expect("commit the link");
+    let (linked, after): (Option<uuid::Uuid>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT agent_id, updated_at FROM public.oauth_clients WHERE id = $1")
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("the linked row");
+    assert_eq!(linked, Some(agent), "the link definer wrote agent_id");
+    assert!(after > before, "the link definer stamped updated_at");
+    let relinked: bool =
+        sqlx::query_scalar("SELECT public.epigraph_oauth_client_link_agent($1, $2)")
+            .bind(client)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("a second link runs on its pinned path");
+    assert!(!relinked, "the link is write-once");
 }
 
 /// The resolution 224 closes. On a path that lists `public`, a
