@@ -702,14 +702,14 @@ impl PostgresJobQueue {
     ///
     /// The row's own attempt budget decides, not a list of job types. A row
     /// enqueued with one attempt (`PrivatizationRepository::enqueue_job_conn`
-    /// writes `max_retries = 1` for every type it enqueues: the privatization
-    /// apply, revert and reseal jobs AND the unseal's `embedding_generation`
-    /// jobs) is built around ONE attempt plus re-delivery: a worker that died
-    /// mid-job is re-delivered, and the handler's own state check makes a
-    /// re-delivery after its terminal write a no-op refusal. A counted reap
-    /// would compute `0 + 1 >= 1` and fail such a job before its handler ever
-    /// runs (a privatization plan left mid-flight; a restored claim left with no
-    /// embedding). So those rows keep [`Self::recover_stale_jobs`]' behaviour.
+    /// writes `max_retries = 1` for the privatization apply, revert and reseal
+    /// jobs; the unseal's `embedding_generation` jobs get a retry budget since
+    /// backlog 1320b4e3) is built around ONE attempt plus re-delivery: a worker
+    /// that died mid-job is re-delivered, and the handler's own state check
+    /// makes a re-delivery after its terminal write a no-op refusal. A counted
+    /// reap would compute `0 + 1 >= 1` and fail such a job before its handler
+    /// ever runs (a privatization plan left mid-flight). So those rows keep
+    /// [`Self::recover_stale_jobs`]' behaviour.
     ///
     /// Deciding by the row means a new one-attempt enqueuer is covered without
     /// editing a list here. The cost: a one-attempt job that is killed on EVERY

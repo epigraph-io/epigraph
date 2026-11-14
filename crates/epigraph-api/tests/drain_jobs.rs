@@ -329,13 +329,16 @@ async fn the_drain_reaps_a_stale_running_job_and_leaves_a_fresh_one(pool: PgPool
 /// The drain's reaper counts the attempt: a stale job on its LAST attempt is
 /// failed by the reaper (never run again, never left pending), which is a
 /// failure of the run (exit 1). A stale ONE-ATTEMPT job (`max_retries = 1`, as
-/// the privatization repository enqueues every job it writes) is reset
-/// uncounted instead, whatever its type:
-/// * a privatization job is re-delivered to its handler, which records its own
-///   verdict (here a refusal: its plan does not exist) instead of the reaper's;
-/// * an `embedding_generation` job from an unseal (review W12a-D7) goes back to
-///   `pending` with its one attempt intact, for the drain that registers its
-///   handler; it is neither failed by the reaper nor counted as a failure.
+/// the privatization repository enqueues its apply, revert and reseal jobs) is
+/// reset uncounted instead: it is re-delivered to its handler, which records
+/// its own verdict (here a refusal: its plan does not exist) instead of the
+/// reaper's.
+///
+/// An `embedding_generation` job from an unseal (review W12a-D7) is enqueued
+/// with a retry budget (`EMBEDDING_RESTORE_JOB_ATTEMPTS`, backlog 1320b4e3), so
+/// its reap is counted like any multi-attempt row's: it goes back to `pending`
+/// with one attempt used, for the drain that registers its handler, and is not
+/// a failure of the run.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool: PgPool) {
     let spent = enqueue(
@@ -381,13 +384,14 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
         },
     )
     .await;
-    // One attempt, as `PrivatizationRepository::enqueue_job_conn` enqueues the
-    // unseal's re-embedding job.
+    // The budget `PrivatizationRepository::enqueue_job_conn` gives the unseal's
+    // re-embedding job.
     sqlx::query(
         "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
-                retry_count = 0, max_retries = 1 WHERE id = $1",
+                retry_count = 0, max_retries = $2 WHERE id = $1",
     )
     .bind(embedding)
+    .bind(epigraph_db::repos::privatization::EMBEDDING_RESTORE_JOB_ATTEMPTS)
     .execute(&pool)
     .await
     .expect("age the embedding job");
@@ -406,9 +410,9 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
             .expect("the embedding job row");
     assert_eq!(
         (state.as_str(), retries, err),
-        ("pending", 0, None),
-        "a stale one-attempt embedding_generation job was failed or counted by the reaper: a \
-         restored claim would be left with no embedding and no further attempt"
+        ("pending", 1, None),
+        "a stale embedding_generation job on its first attempt must go back to pending with \
+         that attempt counted, neither failed nor reset for free"
     );
     assert!(
         report.failures.iter().all(|f| f.job_id != embedding),
@@ -441,7 +445,8 @@ async fn the_reaper_counts_the_attempt_but_re_delivers_a_privatization_job(pool:
     );
     assert_eq!(
         report.recovered_stale, 2,
-        "the two one-attempt jobs, and only they, go back to pending: {report:?}"
+        "the one-attempt privatization job and the embedding job with attempts left, and only \
+         they, go back to pending: {report:?}"
     );
 }
 

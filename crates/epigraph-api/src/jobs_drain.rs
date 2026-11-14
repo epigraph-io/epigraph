@@ -48,8 +48,9 @@ use crate::embedding_restore::{ClaimEmbeddingJobService, EmbeddingProviderKind};
 /// uncounted reset would re-run it and have it killed again forever. The
 /// counted reset bounds that loop by the job's `max_retries`, then fails the
 /// row (a failure of the run: exit 1). A one-attempt row (`max_retries <= 1`:
-/// the privatization jobs and the unseal's `embedding_generation` jobs) is
-/// reset uncounted and re-delivered to its handler instead.
+/// the privatization apply, revert and reseal jobs) is reset uncounted and
+/// re-delivered to its handler instead. (The unseal's `embedding_generation`
+/// jobs carry a retry budget since backlog 1320b4e3, so their reaps count.)
 pub const STALE_AFTER: Duration = Duration::from_secs(90 * 60);
 
 /// The per-connection statement timeout of the drain's pool, unless

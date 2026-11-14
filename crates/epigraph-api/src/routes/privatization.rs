@@ -2493,8 +2493,13 @@ pub async fn seal_commit(
                 message: "Failed to encode the reseal check job".to_string(),
             }
         })?;
-        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
-            .await
+        PrivatizationRepository::enqueue_job_conn(
+            &mut tx,
+            job.job_type(),
+            &payload,
+            epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+        )
+        .await
             .map_err(plan_write_error)?;
     }
 
@@ -2858,8 +2863,13 @@ pub async fn unseal_commit(
                 message: "Failed to encode the re-embedding job".to_string(),
             }
         })?;
-        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
-            .await
+        PrivatizationRepository::enqueue_job_conn(
+            &mut tx,
+            job.job_type(),
+            &payload,
+            epigraph_db::repos::privatization::EMBEDDING_RESTORE_JOB_ATTEMPTS,
+        )
+        .await
             .map_err(plan_write_error)?;
     }
 
@@ -2882,8 +2892,13 @@ pub async fn unseal_commit(
                 message: "Failed to encode the reseal check job".to_string(),
             }
         })?;
-        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
-            .await
+        PrivatizationRepository::enqueue_job_conn(
+            &mut tx,
+            job.job_type(),
+            &payload,
+            epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+        )
+        .await
             .map_err(plan_write_error)?;
     }
 
@@ -3489,8 +3504,13 @@ async fn dispatch(
     )
     .await?;
 
-    let job_id = PrivatizationRepository::enqueue_job_conn(&mut tx, &job_type, &payload)
-        .await
+    let job_id = PrivatizationRepository::enqueue_job_conn(
+        &mut tx,
+        &job_type,
+        &payload,
+        epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+    )
+    .await
         .map_err(plan_write_error)?;
 
     tx.commit()
