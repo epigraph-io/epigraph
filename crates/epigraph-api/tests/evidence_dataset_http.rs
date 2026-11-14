@@ -133,6 +133,50 @@ async fn a_malformed_manifest_digest_is_refused_and_nothing_is_written(
     assert_eq!(n, 0);
 }
 
+/// This route signs nothing, so a body may not carry a dataset `attestation`
+/// (a server's signature over the fields): stored, it would read as a signed
+/// dataset to anyone who trusts the field without verifying it. Refused as a
+/// validation error naming the field, and nothing is written. Before the
+/// field existed serde ignored it and the row was stored (201).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_supplied_attestation_is_refused_and_nothing_is_written(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts.connect_with(conn_opts.clone()).await.unwrap();
+    let agent = seed_agent(&pool).await;
+    let claim = seed_claim(&pool, agent, "c8beb101: http planted attestation").await;
+    let (addr, _shutdown) = spawn_app(pool.clone(), &conn_opts).await;
+    let token = common::mint_token_with_agent(&["evidence:write"], agent);
+
+    let mut body = dataset_body(agent, claim, &format!("blake3:{B3_HEX}"));
+    body["evidence_type"]["attestation"] = json!({
+        "scheme": "v1",
+        "digest": "0".repeat(64),
+        "signature": "0".repeat(128),
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/evidence"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["details"]["field"], "evidence_type.attestation",
+        "{body}"
+    );
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
 async fn spawn_app(
     pool: PgPool,
     conn_opts: &PgConnectOptions,

@@ -313,6 +313,24 @@ pub async fn create_evidence(
             field: format!("evidence_type.{}", e.field),
             reason: e.reason,
         })?;
+    // A dataset's attestation is a server's signature over its fields, written
+    // by the MCP writer that signs the row. This route signs nothing, so a
+    // body's attestation would be a caller-planted claim of a signature: a
+    // reader verifying it against the row's signer would be misled, or, if
+    // the caller copied a real one from another row, at best refused.
+    if matches!(
+        &evidence_type,
+        EvidenceType::Dataset {
+            attestation: Some(_),
+            ..
+        }
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "evidence_type.attestation".to_string(),
+            reason: "is written by the server that signs a dataset; a request may not supply one"
+                .to_string(),
+        });
+    }
 
     // Compute content hash from raw_content (or use provided hash).
     //
