@@ -10,7 +10,8 @@ when a fresh DB has no cluster_centroids rows or when you want to
 rebuild the coordinate frame from scratch.
 
 Phase 1 (seed): Sample 5K atomic claims, fit UMAP(32) + k-means(12).
-                Store centroids in cluster_centroids table.
+                Store centroids in cluster_centroids.umap_centroid
+                (vector(32), migration 222).
                 Persist fitted UMAP reducer to disk for future transforms.
 
 Phase 2 (assign): Load all claims in batches of --batch-size (default 100K),
@@ -72,6 +73,7 @@ psycopg2.extras.register_uuid()
 
 DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 REDUCER_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "umap_reducer.pkl")
+UMAP_DIM = 32  # n_components of the UMAP fit; cluster_centroids.umap_centroid is vector(32)
 
 
 # ── Phase 1: Seed ───────────────────────────────────────────────────────
@@ -151,7 +153,7 @@ def seed_phase(conn, sample_size, k, run_id, all_claims=False):
 
     # Fit UMAP
     print("Fitting UMAP(32, cosine)...", file=sys.stderr)
-    reducer = umap.UMAP(n_components=32, metric="cosine", n_neighbors=30,
+    reducer = umap.UMAP(n_components=UMAP_DIM, metric="cosine", n_neighbors=30,
                         min_dist=0.0, random_state=42)
     reduced = reducer.fit_transform(embs).astype(np.float32)
     reduced_norm = normalize(reduced, norm="l2")
@@ -177,19 +179,7 @@ def seed_phase(conn, sample_size, k, run_id, all_claims=False):
     print(f"  Saved UMAP reducer to {REDUCER_PATH} "
           f"({os.path.getsize(REDUCER_PATH) / 1024 / 1024:.1f} MB)", file=sys.stderr)
 
-    # Store centroids in DB (32-dim UMAP vectors, padded to 1536 for vector column)
-    with conn.cursor() as cur:
-        for cluster_id, centroid in enumerate(centroids):
-            # Pad 32-dim centroid to 1536 with zeros for the vector(1536) column
-            padded = np.zeros(1536, dtype=np.float32)
-            padded[:len(centroid)] = centroid
-            cur.execute("""
-                INSERT INTO cluster_centroids (cluster_run_id, cluster_id, centroid, claim_count)
-                VALUES (%s, %s, %s::vector, 0)
-                ON CONFLICT (cluster_run_id, cluster_id) DO UPDATE SET
-                    centroid = EXCLUDED.centroid
-            """, (run_id, cluster_id, json.dumps(padded.tolist())))
-    conn.commit()
+    store_centroids(conn, run_id, centroids)
     print(f"  Stored {k} centroids (run_id={run_id})", file=sys.stderr)
 
     # Label clusters
@@ -200,6 +190,25 @@ def seed_phase(conn, sample_size, k, run_id, all_claims=False):
     gc.collect()
 
     return reducer, centroids, k
+
+
+def store_centroids(conn, run_id, centroids):
+    """Store the (k, UMAP_DIM) k-means centroids of `run_id` in
+    cluster_centroids.umap_centroid (vector(32), migration 222), one row per
+    cluster id. The legacy zero-padded `centroid` column is not written."""
+    centroids = np.asarray(centroids, dtype=np.float32)
+    if centroids.ndim != 2 or centroids.shape[1] != UMAP_DIM:
+        raise ValueError(f"expected (k, {UMAP_DIM}) centroids, got {centroids.shape}")
+    with conn.cursor() as cur:
+        for cluster_id, centroid in enumerate(centroids):
+            cur.execute("""
+                INSERT INTO cluster_centroids
+                    (cluster_run_id, cluster_id, umap_centroid, claim_count)
+                VALUES (%s, %s, %s::vector, 0)
+                ON CONFLICT (cluster_run_id, cluster_id) DO UPDATE SET
+                    umap_centroid = EXCLUDED.umap_centroid
+            """, (run_id, cluster_id, json.dumps(centroid.tolist())))
+    conn.commit()
 
 
 def label_clusters(conn, ids, reduced, labels, centroids, k, run_id):
@@ -251,20 +260,21 @@ def load_reducer():
 
 
 def load_centroids_from_db(conn, run_id=None):
-    """Load centroids from cluster_centroids table.
-
-    Returns the 32-dim UMAP centroids (first 32 elements of the padded 1536-dim vector).
+    """Load a run's (k, UMAP_DIM) UMAP centroids from
+    cluster_centroids.umap_centroid (migration 222; it backfilled pre-222
+    padded rows). Exits on a run with a row 222 could not backfill (its
+    legacy `centroid` had a non-zero tail, so it is no padded UMAP centroid).
     """
     with conn.cursor() as cur:
         if run_id:
             cur.execute("""
-                SELECT cluster_id, centroid::text, cluster_run_id::text
+                SELECT cluster_id, umap_centroid::text, cluster_run_id::text
                 FROM cluster_centroids WHERE cluster_run_id = %s
                 ORDER BY cluster_id
             """, (run_id,))
         else:
             cur.execute("""
-                SELECT cluster_id, centroid::text, cluster_run_id::text
+                SELECT cluster_id, umap_centroid::text, cluster_run_id::text
                 FROM cluster_centroids
                 WHERE cluster_run_id = (
                     SELECT cluster_run_id FROM cluster_centroids
@@ -278,9 +288,14 @@ def load_centroids_from_db(conn, run_id=None):
         print("ERROR: No centroids found in DB.", file=sys.stderr)
         sys.exit(1)
 
-    # Extract first 32 dims (UMAP space) from padded 1536-dim vectors
-    centroids = np.array([json.loads(r[1])[:32] for r in rows], dtype=np.float32)
     actual_run_id = rows[0][2]
+    missing = [r[0] for r in rows if r[1] is None]
+    if missing:
+        print(f"ERROR: run {actual_run_id} has no umap_centroid for cluster(s) {missing} "
+              f"(migration 222 backfills only zero-padded 32-d centroids); re-seed the run.",
+              file=sys.stderr)
+        sys.exit(1)
+    centroids = np.array([json.loads(r[1]) for r in rows], dtype=np.float32)
     print(f"  Loaded {len(centroids)} centroids (run_id={actual_run_id})", file=sys.stderr)
     return centroids, actual_run_id
 

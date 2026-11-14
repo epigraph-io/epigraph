@@ -2645,6 +2645,24 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **222**: public `cluster_centroids_umap_centroid` (backlog 58452334; slot
+  assigned to backlog batch B38). `scripts/cluster_claims.py` stored its 32-d
+  UMAP k-means centroids zero-padded into `cluster_centroids.centroid
+  vector(1536)`. Adds `umap_centroid vector(32)`, backfills it from every row
+  whose elements 33..1536 are zero (a row with a non-zero tail is left NULL,
+  not truncated; the script refuses to load its run), drops NOT NULL on the
+  legacy `centroid` (no writer after this change; kept for the undo and a later
+  drop) and adds CHECK `cluster_centroids_has_a_centroid`. No index, policy,
+  grant or tenancy change (not tier-A; 118's table-level grants cover the
+  column). Idempotent. The header carries a read-only census. Pinned by
+  `epigraph-db/tests/cluster_centroids_umap_undo.rs` and
+  `tests/theme/test_cluster_centroids_umap.py`. Undo:
+  `docs/runbooks/222-undo.sql` (tested: run twice, it returns the
+  `cluster_centroids` catalog to below 222 and re-pads rows written after 222
+  so `centroid` can be NOT NULL again); it leaves the `_sqlx_migrations` row.
+  **Deploy order:** migrate before running the 222 `cluster_claims.py` (it
+  writes and reads only `umap_centroid`); undo only after rolling the script
+  back. **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
