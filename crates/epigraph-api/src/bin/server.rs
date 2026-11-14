@@ -829,7 +829,10 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
-    tracing::info!("Server listening on {}", addr);
+    // The bound address, not the requested one: with EPIGRAPH_PORT=0 the
+    // kernel picks the port, and this line is how a caller learns it.
+    let bound = listener.local_addr().unwrap_or(addr);
+    tracing::info!("Server listening on {}", bound);
 
     // With connect info: the rate limiter keys an anonymous request on its
     // TCP peer, and without it every such request shares one bucket.
