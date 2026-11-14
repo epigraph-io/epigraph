@@ -582,38 +582,12 @@ pub struct ReasoningTraceResponse {
     pub created_at: String,
 }
 
-/// The author a reasoning trace is recorded under: the authenticated caller
-/// (backlog f64cf9c6; the rule `experiment_loop.rs::caller_author` follows).
-///
-/// The trace and its response took the body's `agent_id`, so
-/// any caller holding `claims:write` could file reasoning in another agent's
-/// name. Omitted, the author is the caller; named, it must be the caller.
-/// Checked after the scope and before anything is read or written.
-#[cfg(feature = "db")]
-fn trace_author(
-    viewer: &epigraph_db::visibility::Viewer,
-    named: Option<Uuid>,
-) -> Result<Uuid, ApiError> {
-    let Some(caller) = viewer.principal() else {
-        return Err(ApiError::Forbidden {
-            reason: "a reasoning trace needs an authenticated author".to_string(),
-        });
-    };
-    if named.is_some_and(|n| n != caller) {
-        return Err(ApiError::Forbidden {
-            reason: "agent_id must be the authenticated caller's own agent id, or omitted"
-                .to_string(),
-        });
-    }
-    Ok(caller)
-}
-
 /// Create a new reasoning trace
 ///
 /// POST /api/v1/reasoning-traces
 ///
 /// The author is the authenticated caller (backlog f64cf9c6,
-/// [`trace_author`]): an omitted `agent_id` is the caller's
+/// `experiment_loop.rs::caller_author`): an omitted `agent_id` is the caller's
 /// own, a named one that is not the caller is `403`, and an absent
 /// `AuthContext` is a refusal, not a pass. The trace and its `HAS_TRACE` edge
 /// are written on ONE transaction stamped with the caller's viewer
@@ -642,7 +616,11 @@ pub async fn create_reasoning_trace(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    let author = trace_author(&viewer, request.agent_id)?;
+    let author = crate::routes::experiment_loop::caller_author(
+        &viewer,
+        request.agent_id,
+        "a reasoning trace",
+    )?;
 
     // Validate confidence
     if !(0.0..=1.0).contains(&request.confidence) {
