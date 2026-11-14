@@ -2812,7 +2812,7 @@ impl PrivatizationRepository {
         if moved_claim_ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_as::<_, WorkflowMove>(
+        let moves = sqlx::query_as::<_, WorkflowMove>(
             r#"
             WITH completed AS (
                 SELECT w.id,
@@ -2852,7 +2852,15 @@ impl PrivatizationRepository {
         .bind(target_group_id)
         .fetch_all(&mut *conn)
         .await
-        .map_err(|source| DbError::QueryFailed { source })
+        .map_err(|source| DbError::QueryFailed { source })?;
+        // Migration 219: a workflow endpoint contributes its row's tenancy to
+        // an edge's meet, and no trigger re-meets an edge when only its
+        // workflow row changes. So the moved rows' own edges (`variant_of`,
+        // `AUTHORED`, `executes` onto a claim the plan leaves public) are
+        // re-met here, on this transaction.
+        let moved: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
+        Self::recompute_boundary_meet_conn(conn, &moved).await?;
+        Ok(moves)
     }
 
     /// Record the `workflows` rows an apply batch moved
@@ -2927,7 +2935,7 @@ impl PrivatizationRepository {
         correlation_id: Option<&str>,
         target_group_id: Uuid,
     ) -> Result<u64, DbError> {
-        sqlx::query(
+        let restored: Vec<Uuid> = sqlx::query_scalar(
             r#"
             WITH recorded AS (
                 SELECT DISTINCT ON (a.entity_id)
@@ -2960,16 +2968,21 @@ impl PrivatizationRepository {
             SELECT $1, $3, 'item.revert', 'workflow', r.id, 'group', $2,
                    r.before_visibility, r.before_owner_group_id, $4
               FROM restored r
+            RETURNING entity_id
             "#,
         )
         .bind(plan_id)
         .bind(target_group_id)
         .bind(actor_agent_id)
         .bind(correlation_id)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await
-        .map(|r| r.rows_affected())
-        .map_err(|source| DbError::QueryFailed { source })
+        .map_err(|source| DbError::QueryFailed { source })?;
+        // Migration 219: the claims went back first, and their re-meet still
+        // read these rows as private, so every edge on a restored row is re-met
+        // now that the row is back (widening allowed, as for the claims').
+        Self::recompute_boundary_meet_conn(conn, &restored).await?;
+        Ok(restored.len() as u64)
     }
 
     /// Restore a batch of claims to the tenancy the freeze recorded.
