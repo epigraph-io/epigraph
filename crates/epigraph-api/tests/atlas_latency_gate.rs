@@ -44,6 +44,13 @@
 //!   EVERY sample (no pooled HTTP connection, an empty statement cache), and
 //!   a level not asked for before. Not a fresh process: see the plan.
 //!
+//! # The scaling rule
+//!
+//! Beside the absolute budget, warm claim to leaf may cost at most
+//! [`CLAIM_LEAF_OVER_LEAF`] times a warm leaf at p95. Both sides are timed on
+//! the same machine in the same run, so a lookup whose cost grows with the
+//! whole run turns the per-PR gate red however fast the runner is.
+//!
 //! The JSON report goes to `ATLAS_LATENCY_REPORT` (a path) when it is set,
 //! and is written BEFORE the gate asserts, so a red run keeps its numbers.
 
@@ -92,6 +99,18 @@ const KERNEL_COLD: Duration = COLD_TOTAL
 /// The page-load routes (maps, themes): once per `/atlas` load, held to the
 /// cold server share.
 const PAGE_LOAD: Duration = COLD_TOTAL.saturating_sub(CLIENT_ALLOWANCE);
+
+/// Claim to leaf, warm, at p95, may cost at most this many times a leaf.
+///
+/// The route is a leaf read plus one lookup of the claim's leaf, so its cost
+/// should track a leaf's, whatever the run's size; a lookup whose cost grows
+/// with the whole run (the scan W12 found: every level of the run detoasted
+/// before the theme narrowed anything) breaks the ratio long before it breaks
+/// the absolute budget on a fast machine. Both sides are measured on the
+/// same machine in the same run, so the rule does not depend on its speed.
+/// Measured: 1.04 to 1.2 at the per-PR scale in debug, 1.7 at full scale in
+/// release; the old scan was about 9 at the per-PR scale and 118 at full.
+const CLAIM_LEAF_OVER_LEAF: f64 = 3.0;
 
 /// Claims per theme: about 366k current claims over about 210 themes.
 const CLAIMS_PER_THEME: usize = 1_743;
@@ -220,6 +239,34 @@ fn verdict(
         .collect()
 }
 
+/// Warm claim to leaf over `max_ratio` times the warm leaf, at p95.
+#[derive(Debug, Clone, PartialEq)]
+struct ScalingBreach {
+    claim_leaf_p95: Duration,
+    leaf_p95: Duration,
+    ratio: f64,
+    max_ratio: f64,
+}
+
+/// The scaling rule ([`CLAIM_LEAF_OVER_LEAF`]): `Some` when warm claim to
+/// leaf costs more than `max_ratio` warm leaves at p95. `None` when either
+/// side measured nothing: [`verdict`] already reports that as a breach.
+fn scaling_verdict(samples: &Samples, max_ratio: f64) -> Option<ScalingBreach> {
+    let p95 = |k| {
+        samples
+            .get(&(k, Temp::Warm))
+            .and_then(|xs| quantile(xs, 0.95))
+    };
+    let (claim_leaf_p95, leaf_p95) = (p95(Kind::ClaimLeaf)?, p95(Kind::Leaf)?);
+    let ratio = claim_leaf_p95.as_secs_f64() / leaf_p95.as_secs_f64().max(1e-9);
+    (ratio > max_ratio).then_some(ScalingBreach {
+        claim_leaf_p95,
+        leaf_p95,
+        ratio,
+        max_ratio,
+    })
+}
+
 fn all_expected() -> Vec<(Kind, Temp)> {
     KINDS
         .iter()
@@ -275,6 +322,30 @@ fn the_verdict_is_p95_against_the_budget() {
     );
     assert_eq!(quantile(&[d(3), d(1), d(2)], 0.5), Some(d(2)));
     assert_eq!(quantile(&[], 0.5), None);
+}
+
+#[test]
+fn claim_to_leaf_is_held_to_a_multiple_of_a_leaf() {
+    let d = Duration::from_millis;
+    let with = |claim_leaf: u64, leaf: u64| -> Samples {
+        let mut s: Samples = BTreeMap::new();
+        s.insert((Kind::ClaimLeaf, Temp::Warm), vec![d(claim_leaf); 20]);
+        s.insert((Kind::Leaf, Temp::Warm), vec![d(leaf); 20]);
+        // Cold is not held to the ratio: connection setup dominates it.
+        s.insert((Kind::ClaimLeaf, Temp::Cold), vec![d(900); 20]);
+        s.insert((Kind::Leaf, Temp::Cold), vec![d(10); 20]);
+        s
+    };
+    // Both well inside the absolute budget, but claim to leaf costs nine
+    // leaves: the old whole-run scan at the per-PR scale.
+    let got = scaling_verdict(&with(90, 10), 3.0).expect("a breach");
+    assert_eq!((got.claim_leaf_p95, got.leaf_p95), (d(90), d(10)));
+    assert!((got.ratio - 9.0).abs() < 1e-9, "{got:?}");
+    // At the bound, and under it: no breach.
+    assert_eq!(scaling_verdict(&with(30, 10), 3.0), None);
+    assert_eq!(scaling_verdict(&with(12, 10), 3.0), None);
+    // Nothing measured is left to `verdict`.
+    assert_eq!(scaling_verdict(&BTreeMap::new(), 3.0), None);
 }
 
 #[test]
@@ -888,7 +959,13 @@ async fn measure(pool: &PgPool, s: &Seeded, scale: Scale, delay: Option<&Delay>)
 
 // ---- the report -------------------------------------------------------------------
 
-fn report(scale: Scale, s: &Seeded, samples: &Samples, breaches: &[Breach]) -> Value {
+fn report(
+    scale: Scale,
+    s: &Seeded,
+    samples: &Samples,
+    breaches: &[Breach],
+    scaling: Option<&ScalingBreach>,
+) -> Value {
     let rows: Vec<Value> = all_expected()
         .into_iter()
         .map(|(kind, temp)| {
@@ -930,6 +1007,17 @@ fn report(scale: Scale, s: &Seeded, samples: &Samples, breaches: &[Breach]) -> V
             "page_load": ms(PAGE_LOAD),
         },
         "results": rows,
+        "scaling_rule": {
+            "rule": "claim_leaf warm p95 <= max_ratio x leaf warm p95",
+            "max_ratio": CLAIM_LEAF_OVER_LEAF,
+        },
+        "scaling_breaches": scaling.map(|b| json!({
+            "rule": "claim_leaf_over_leaf",
+            "claim_leaf_warm_p95_ms": ms(b.claim_leaf_p95),
+            "leaf_warm_p95_ms": ms(b.leaf_p95),
+            "ratio": (b.ratio * 100.0).round() / 100.0,
+            "max_ratio": b.max_ratio,
+        })).into_iter().collect::<Vec<_>>(),
         "breaches": breaches.iter().map(|b| json!({
             "type": b.kind.name(),
             "temp": b.temp.name(),
@@ -965,6 +1053,28 @@ fn print_table(r: &Value) {
             }
         );
     }
+    let warm_p95 = |t: &str| {
+        r["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|row| {
+                (row["type"] == json!(t) && row["temp"] == json!("warm"))
+                    .then(|| row["p95_ms"].as_f64())
+                    .flatten()
+            })
+    };
+    if let (Some(c), Some(l)) = (warm_p95("claim_leaf"), warm_p95("leaf")) {
+        eprintln!(
+            "  claim_leaf / leaf, warm p95: {:.2} (max {CLAIM_LEAF_OVER_LEAF}) {}",
+            c / l.max(1e-9),
+            if r["scaling_breaches"].as_array().is_some_and(Vec::is_empty) {
+                "ok"
+            } else {
+                "OVER"
+            }
+        );
+    }
 }
 
 // ---- the gate ---------------------------------------------------------------------
@@ -989,7 +1099,8 @@ async fn the_kernel_meets_the_latency_budget(pool: PgPool) {
     let s = seed(&pool, scale).await;
     let samples = measure(&pool, &s, scale, None).await;
     let breaches = verdict(&samples, &all_expected(), budget);
-    let r = report(scale, &s, &samples, &breaches);
+    let scaling = scaling_verdict(&samples, CLAIM_LEAF_OVER_LEAF);
+    let r = report(scale, &s, &samples, &breaches, scaling.as_ref());
     print_table(&r);
     if let Ok(path) = std::env::var("ATLAS_LATENCY_REPORT") {
         if !path.is_empty() {
@@ -998,9 +1109,10 @@ async fn the_kernel_meets_the_latency_budget(pool: PgPool) {
         }
     }
     assert!(
-        breaches.is_empty(),
-        "the Atlas latency budget is exceeded: {}",
-        serde_json::to_string(&r["breaches"]).unwrap_or_default()
+        breaches.is_empty() && scaling.is_none(),
+        "the Atlas latency budget is exceeded: budget {} scaling {}",
+        serde_json::to_string(&r["breaches"]).unwrap_or_default(),
+        serde_json::to_string(&r["scaling_breaches"]).unwrap_or_default()
     );
 }
 
