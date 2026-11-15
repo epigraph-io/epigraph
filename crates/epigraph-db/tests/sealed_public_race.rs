@@ -19,9 +19,10 @@
 //! `pg_stat_activity` waiting on a lock (bounded), then awaits B. No sleep
 //! decides the order: A's write is done before B's starts.
 //!
-//! Both sides run as `epigraph_maintenance`, the role the shipped seal
-//! (`seal_claims_conn`, on a maintenance connection) and 206's publicize body
-//! write as.
+//! The seal and the raw publicize run as `epigraph_maintenance`, the role the
+//! shipped seal (`seal_claims_conn`, on a maintenance connection) and 206's
+//! publicize body write as. The shipped publicize is called as `epigraph_app`
+//! with the admin's session GUCs, as the route calls it.
 //!
 //! # What is pinned
 //!
@@ -32,11 +33,19 @@
 //! publicize-first by PRV01, seal-first by 074's SEALED refusal (074 is not
 //! changed; its EXISTS takes a fresh snapshot after the row wait).
 //!
-//! [`every_role_that_may_seal_may_lock_the_claim_row`]: a locking read needs
+//! [`the_shipped_publicize_races_at_176_and_is_serialized_at_227`]: the same
+//! race through 206's `epigraph_publicize_claims` (as `epigraph_app`, the
+//! route's caller). At 226 both orderings commit a public sealed claim; at 227
+//! seal-first returns the `refused_sealed` outcome after waiting, and
+//! publicize-first refuses the seal by PRV01.
+//!
+//! [`every_role_that_may_seal_may_lock_the_claim_row`] (a precondition guard
+//! that passes at 226 too): a locking read needs
 //! UPDATE on `claims`, so a role that may write `claim_encryption` without it
 //! would have every seal turned into a permission error.
 //!
-//! [`the_app_role_seal_check_refuses_what_176_refused`]: on the application
+//! [`the_app_role_seal_check_refuses_what_176_refused`] (a non-regression
+//! check that passes at 226 by design): on the application
 //! role (row security on), sealing its own group claim succeeds and sealing a
 //! public claim is refused with PRV01, at 226 and at 227 alike.
 //!
@@ -54,8 +63,10 @@
 //!
 //! # Verified to fail
 //!
-//! - `FOR NO KEY UPDATE OF c` removed from 227's locked read: the 227 half of
-//!   the race test fails (B never waits; both writes commit).
+//! - `FOR NO KEY UPDATE OF c` removed from 227's locked read: the 227 halves
+//!   of both race tests fail (B never waits; both writes commit).
+//! - `REVOKE UPDATE ON public.claims FROM epigraph_app` appended to 227: the
+//!   precondition guard fails.
 //! - `FOR SHARE OF c` in its place: the redelivered-seal test fails at 227
 //!   with `deadlock detected`.
 //! - The `IF NOT FOUND` fallback removed: the hidden-row test fails (the seal
@@ -147,72 +158,123 @@ const SEAL: &str = "INSERT INTO claim_encryption \
 const ARM_DECLASSIFY: &str = "SELECT set_config('epigraph.allow_declassify', 'yes', true)";
 const PUBLICIZE: &str = "UPDATE claims SET visibility = 'public' WHERE id = $1";
 
+/// 206's shipped publicize, as `ClaimVisibilityRepository::publicize_conn`
+/// calls it. It arms the declassify GUC itself.
+const SHIPPED_PUBLICIZE: &str =
+    "SELECT outcome FROM public.epigraph_publicize_claims(ARRAY[$1]::uuid[], 'race test')";
+
+/// One write of the race.
 #[derive(Clone, Copy, Debug)]
-enum First {
-    Publicize,
+enum Op {
+    /// The seal's INSERT, as `epigraph_maintenance` (the shipped seal's role).
     Seal,
+    /// A raw `UPDATE claims SET visibility = 'public'`, as
+    /// `epigraph_maintenance` (the role 206's publicize body writes as).
+    RawPublicize,
+    /// 206's `epigraph_publicize_claims`, called as `epigraph_app` by the
+    /// group's admin, as the route calls it.
+    ShippedPublicize,
 }
 
-/// Run one write (`seal` or publicize) inside `conn`'s open transaction.
+impl Op {
+    fn role(self) -> &'static str {
+        match self {
+            Op::Seal | Op::RawPublicize => MAINTENANCE,
+            Op::ShippedPublicize => "epigraph_app",
+        }
+    }
+}
+
+/// Run one write inside `conn`'s open transaction. `Some(outcome)` is the
+/// shipped publicize's per-claim outcome.
 async fn write(
     conn: &mut sqlx::PgConnection,
-    seal: bool,
+    op: Op,
     claim: Uuid,
     group: Uuid,
-) -> Result<(), sqlx::Error> {
-    if seal {
-        sqlx::query(SEAL)
-            .bind(claim)
-            .bind(group)
+    author: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    match op {
+        Op::Seal => {
+            sqlx::query(SEAL)
+                .bind(claim)
+                .bind(group)
+                .execute(&mut *conn)
+                .await?;
+            Ok(None)
+        }
+        Op::RawPublicize => {
+            sqlx::query(ARM_DECLASSIFY).execute(&mut *conn).await?;
+            sqlx::query(PUBLICIZE)
+                .bind(claim)
+                .execute(&mut *conn)
+                .await?;
+            Ok(None)
+        }
+        Op::ShippedPublicize => {
+            sqlx::query(
+                "SELECT set_config('epigraph.principal_id', $1, true), \
+                        set_config('epigraph.group_ids', $2, true), \
+                        set_config('epigraph.writable_group_ids', $2, true)",
+            )
+            .bind(author.to_string())
+            .bind(group.to_string())
             .execute(&mut *conn)
             .await?;
-    } else {
-        sqlx::query(ARM_DECLASSIFY).execute(&mut *conn).await?;
-        sqlx::query(PUBLICIZE)
-            .bind(claim)
-            .execute(&mut *conn)
-            .await?;
+            let outcome: String = sqlx::query_scalar(SHIPPED_PUBLICIZE)
+                .bind(claim)
+                .fetch_one(&mut *conn)
+                .await?;
+            Ok(Some(outcome))
+        }
     }
-    Ok(())
 }
 
 struct Outcome {
     /// B was observed waiting on a lock before A committed.
     waited: bool,
-    /// B's write and commit, as the error text on failure.
-    second: Result<(), String>,
+    /// B's write and commit: the shipped publicize's outcome, or the error
+    /// text on failure.
+    second: Result<Option<String>, String>,
     /// The end state: the claim is public AND carries a ciphertext row.
     public_and_sealed: bool,
 }
 
-/// A: the `first` write, left open. B: the other write in its own transaction,
-/// in a task. Commit A once B finished or is seen waiting on a lock.
-async fn race(pool: &PgPool, first: First, claim: Uuid, group: Uuid) -> Outcome {
+/// A: the `first` write, left open. B: the `second` write in its own
+/// transaction, in a task. Commit A once B finished or is seen waiting on a
+/// lock.
+async fn race(
+    pool: &PgPool,
+    first: Op,
+    second: Op,
+    claim: Uuid,
+    group: Uuid,
+    author: Uuid,
+) -> Outcome {
     let mut a = pool.acquire().await.expect("acquire A");
-    a.execute(format!("SET SESSION AUTHORIZATION {MAINTENANCE}").as_str())
+    a.execute(format!("SET SESSION AUTHORIZATION {}", first.role()).as_str())
         .await
-        .expect("A as maintenance");
+        .expect("A's role");
     a.execute("BEGIN").await.expect("begin A");
-    write(&mut a, matches!(first, First::Seal), claim, group)
+    write(&mut a, first, claim, group, author)
         .await
         .unwrap_or_else(|e| panic!("A ({first:?}) applies on its own: {e}"));
 
     let mut b = pool.acquire().await.expect("acquire B");
-    b.execute(format!("SET SESSION AUTHORIZATION {MAINTENANCE}").as_str())
+    b.execute(format!("SET SESSION AUTHORIZATION {}", second.role()).as_str())
         .await
-        .expect("B as maintenance");
+        .expect("B's role");
     let b_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *b)
         .await
         .expect("B's pid");
-    let second_is_seal = matches!(first, First::Publicize);
     let task = tokio::spawn(async move {
         let run = async {
             b.execute("BEGIN").await?;
             b.execute("SET LOCAL lock_timeout = '30s'").await?;
-            write(&mut b, second_is_seal, claim, group).await?;
+            let outcome = write(&mut b, second, claim, group, author).await?;
             b.execute("COMMIT").await?;
-            Ok::<(), sqlx::Error>(())
+            Ok::<Option<String>, sqlx::Error>(outcome)
         };
         let out = run.await.map_err(|e| e.to_string());
         if out.is_err() {
@@ -270,9 +332,9 @@ async fn the_seal_and_publicize_race_commits_at_176_and_is_refused_at_227(pool: 
     let (author, group) = seal_group(&pool).await;
 
     // CALIBRATION, 176's body: both orderings commit a public sealed claim.
-    for first in [First::Publicize, First::Seal] {
+    for (first, second) in [(Op::RawPublicize, Op::Seal), (Op::Seal, Op::RawPublicize)] {
         let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
-        let out = race(&pool, first, claim, group).await;
+        let out = race(&pool, first, second, claim, group, author).await;
         assert!(
             out.second.is_ok(),
             "CALIBRATION ({first:?} first, 176): the second write commits: {:?}",
@@ -286,12 +348,16 @@ async fn the_seal_and_publicize_race_commits_at_176_and_is_refused_at_227(pool: 
 
     migrate(&pool, &MIGRATOR).await;
 
-    for (first, refusal) in [
-        (First::Publicize, "PRV01:"),
-        (First::Seal, "is SEALED and cannot be made public"),
+    for (first, second, refusal) in [
+        (Op::RawPublicize, Op::Seal, "PRV01:"),
+        (
+            Op::Seal,
+            Op::RawPublicize,
+            "is SEALED and cannot be made public",
+        ),
     ] {
         let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
-        let out = race(&pool, first, claim, group).await;
+        let out = race(&pool, first, second, claim, group, author).await;
         assert!(
             out.waited,
             "({first:?} first, 227): the second write never waited on the claim row's \
@@ -312,6 +378,91 @@ async fn the_seal_and_publicize_race_commits_at_176_and_is_refused_at_227(pool: 
     }
 }
 
+/// The race through 206's SHIPPED publicize (`epigraph_publicize_claims`,
+/// called as `epigraph_app` by the group's admin), which guest routes rely on.
+/// Its `ORDER BY c.id FOR NO KEY UPDATE` pre-lock does not conflict with the
+/// KEY SHARE a seal's FK check takes, and its classification EXISTS does not
+/// see an uncommitted ciphertext row, so at 226 it races exactly as the raw
+/// UPDATE does. At 227, seal first: the pre-lock waits on the seal trigger's
+/// row lock and the classification then answers `refused_sealed` (a result
+/// row, not 074's exception). Publicize first: the seal waits on the
+/// function's row lock and PRV01 refuses it.
+#[sqlx::test(migrations = false)]
+async fn the_shipped_publicize_races_at_176_and_is_serialized_at_227(pool: PgPool) {
+    migrate(&pool, &up_to(226)).await;
+    let (author, group) = seal_group(&pool).await;
+
+    // CALIBRATION, 176's body: the shipped publicize commits a public sealed
+    // claim in both orderings.
+    let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
+    let out = race(&pool, Op::Seal, Op::ShippedPublicize, claim, group, author).await;
+    assert_eq!(
+        out.second,
+        Ok(Some("publicized".to_string())),
+        "CALIBRATION (seal first, 176): the shipped publicize classifies the claim \
+         publicizable and commits"
+    );
+    assert!(
+        out.public_and_sealed,
+        "CALIBRATION (seal first, 176): the race leaves a public sealed claim"
+    );
+    let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
+    let out = race(&pool, Op::ShippedPublicize, Op::Seal, claim, group, author).await;
+    assert_eq!(
+        out.second,
+        Ok(None),
+        "CALIBRATION (shipped publicize first, 176): the seal commits"
+    );
+    assert!(
+        out.public_and_sealed,
+        "CALIBRATION (shipped publicize first, 176): the race leaves a public sealed claim"
+    );
+
+    migrate(&pool, &MIGRATOR).await;
+
+    let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
+    let out = race(&pool, Op::Seal, Op::ShippedPublicize, claim, group, author).await;
+    assert!(
+        out.waited,
+        "(seal first, 227): the shipped publicize never waited on the seal's row lock \
+         (second: {:?})",
+        out.second
+    );
+    assert_eq!(
+        out.second,
+        Ok(Some("refused_sealed".to_string())),
+        "(seal first, 227): the shipped publicize classifies the claim refused_sealed"
+    );
+    assert!(
+        !out.public_and_sealed,
+        "(seal first, 227): a public sealed claim committed"
+    );
+
+    let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
+    let out = race(&pool, Op::ShippedPublicize, Op::Seal, claim, group, author).await;
+    assert!(
+        out.waited,
+        "(shipped publicize first, 227): the seal never waited on the publicize's row lock \
+         (second: {:?})",
+        out.second
+    );
+    let err = out
+        .second
+        .expect_err("(shipped publicize first, 227): the seal must be refused");
+    assert!(
+        err.contains("PRV01:"),
+        "(shipped publicize first, 227): refused by PRV01, got: {err}"
+    );
+    assert!(
+        !out.public_and_sealed,
+        "(shipped publicize first, 227): a public sealed claim committed"
+    );
+}
+
+/// PRECONDITION GUARD, not a proof of 227's change: it passes at 226 as well.
+/// It pins the grant 227 newly depends on. Mutation: `REVOKE UPDATE ON
+/// public.claims FROM epigraph_app` -> this fails (and every app-role seal at
+/// 227 would become a permission error).
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_role_that_may_seal_may_lock_the_claim_row(pool: PgPool) {
     let sealers: Vec<(String, bool)> = sqlx::query_as(
@@ -374,6 +525,10 @@ async fn app_seal(pool: &PgPool, author: Uuid, group: Uuid, claim: Uuid) -> Resu
     .await
 }
 
+/// NON-REGRESSION CHECK, not a proof of 227's change: it passes at 226 by
+/// design and pins that the locking read refuses and admits what 176's did
+/// under row security (the app role's seal path, `ClaimEncryptionRepository::
+/// insert_conn`, runs under it). It is not counted as a fail-on-old-code test.
 #[sqlx::test(migrations = false)]
 async fn the_app_role_seal_check_refuses_what_176_refused(pool: PgPool) {
     for (at, migrator) in [("226", up_to(226)), ("227", up_to(227))] {
