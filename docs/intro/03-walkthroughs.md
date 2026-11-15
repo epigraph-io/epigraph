@@ -19,7 +19,17 @@ page. Its description comes from the code.
 `--rev-range` (the PR's own commits, `A..B`). These are optional: `--pr-body`,
 `--pr-author`, `--repo` (the clone, default `.`), `--endpoint` (default
 `http://localhost:8080`), `--token` (else `EPIGRAPH_TOKEN`),
+`--author-key-file` (else `EPIGRAPH_GIT_AUTHOR_KEY_FILE`),
 `--orchestrator-id` and `--dry-run`.
+
+A live run also needs the author key file: 64 hex characters (32 bytes,
+`openssl rand -hex 32`, kept private to the ingest host). Every author's
+agent key is derived from that secret and the author's email, and the
+repository node's system agent from the secret alone. Without the secret the
+key would be a function of the email, which anyone can read in `git log`,
+and the server gives each newly registered agent a login, so `ingest_git`
+refuses a live run without it. A dry run without one uses a random secret.
+Changing the secret changes every author agent.
 
 The PR claim is authored by an *orchestrator* agent, which must already be
 registered. `ingest_git` takes the first of these that is set:
@@ -27,7 +37,9 @@ registered. `ingest_git` takes the first of these that is set:
 1. `--orchestrator-id`;
 2. an `Epigraph-Orchestrator-Id: <uuid>` line in the PR body;
 3. that trailer in a commit message's trailer block (the last paragraph,
-   when every line of it is `Key: value`), oldest commit first;
+   when every line of it is `Key: value` with a hyphenated key or one of
+   `Fixes`, `Closes`, `Resolves`, `Refs`, `References`, `Cc`, `Link` and
+   `Bug`), oldest commit first;
 4. `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID`.
 
 The reconciler reads a TOML file. Every key is optional and has a default
@@ -40,6 +52,7 @@ window_minutes = 240                       # look back this far for merges
 state_dir = "<a directory the reconciler owns>"
 ingest_git_bin = "<path to the built ingest_git>"
 token_file = "<a file holding an API Bearer token>"
+author_key_file = "<the author key file above>"
 default_orchestrator_id = "<uuid of a registered agent>"
 ```
 
@@ -54,15 +67,20 @@ trailer in the PR body or a commit wins over it. The reconciler does not
 mint or refresh the token. Whatever writes `token_file` has to keep it
 current, or the writes are refused once the token expires.
 
+`author_key_file` (else the reconciler's own `EPIGRAPH_GIT_AUTHOR_KEY_FILE`)
+is passed as `--author-key-file`; the path is not secret, the file is. A
+live run without one fails before any PR is ingested. A dry run reads
+neither the key file nor `token_file`.
+
 ## Three worked entries
 
 Each commit becomes one claim with the content `[type][scope] claim`:
 
 - Every item under **Evidence** or **Verification** becomes one evidence
-  row. An item starts at a list marker (`- `, `* `, `+ `, `1. `); a wrapped
-  line with no blank line before it, nested bullets included, joins the item
-  above it. The trailer block (`Co-Authored-By:` and the like) is in no
-  section.
+  row. An item starts at a list marker (`- `, `* `, `+ `, `1. `), at any
+  indent, so a nested bullet is an item of its own. A wrapped line with no
+  list marker and no blank line before it joins the item above it. The
+  trailer block (`Co-Authored-By:` and the like) is in no section.
 - **Reasoning** becomes the reasoning trace.
 - The type sets the methodology and the initial truth. For `feat` and `perf`
   the initial truth is 0.6 with a **Verification** section and 0.4 without.
@@ -112,7 +130,8 @@ properties include `source`, `commit_hash`, `commit_type`, `scope` and `files_ch
    #   [dry-run] repo=epigraph-io/epigraph pr=#825 commits=1 refs=References { claim_uuids: [], pr_numbers: [] }
    ```
 
-2. **Live run (untested).** Drop `--dry-run` and export the token as
+2. **Live run (untested).** Drop `--dry-run`, add
+   `--author-key-file <path>`, and export the token as
    `EPIGRAPH_TOKEN` (or pass `--token "$TOKEN"`, which puts it in the
    process list). The token comes from the `epigraph-wo` client, as in
    [quickstart step 5](01-quickstart.md#step-5--get-an-api-token). Also add
@@ -134,7 +153,7 @@ properties include `source`, `commit_hash`, `commit_type`, `scope` and `files_ch
    |---|---|---|
    | repository | `source:git-history`, `node:repo`, `repo:<slug>` | one fixed system agent |
    | pull request | `source:git-history`, `node:pr`, `repo:<slug>` | the orchestrator |
-   | commit | `source:git-history`, `node:commit`, `repo:<slug>` | an agent derived from the author's email |
+   | commit | `source:git-history`, `node:commit`, `repo:<slug>` | an agent keyed by the author key file and the author's email |
 
    **Re-runs.** The packets carry the idempotency keys `repo:<slug>`,
    `pr:<slug>#<n>` and `git:<sha>`, but the server checks those keys only
@@ -152,7 +171,7 @@ properties include `source`, `commit_hash`, `commit_type`, `scope` and `files_ch
    `PR decomposes_to commit`, dated at the commit time. A UUID in the PR body
    or in a commit header adds `<that claim> RESOLVED_BY PR`, if the claim
    exists. A `#N` token does the same for the current claims that cite
-   exactly `PR #N` (`PR #80` does not count for `#8`). The server's search
+   exactly `PR #N` (`PR #80` and `SPR #8` do not count for `#8`). The server's search
    is a substring match that returns up to 25 current claims, and the exact
    match is applied to those 25, so with many `PR #8…` claims an exact one
    can fall outside them.
@@ -174,6 +193,12 @@ re-run finds the same node again instead of making a new one.
 ## Change log
 
 Newest first.
+
+- 2026-11-15 (review of backlog 7d9e60c6): a live run needs the author key
+  file, which keys every author agent; the bare email-derived key was
+  computable by anyone. A dry run reads neither the key file nor the token.
+  A trailer key is hyphenated or a listed single word. `SPR #8` no longer
+  counts as `PR #8`. Nested bullets are described as the code parses them.
 
 - 2026-11-15 (backlog 7d9e60c6): the tool's defects that this page
   described are fixed. A commit's orchestrator trailer is read (step 3 of
