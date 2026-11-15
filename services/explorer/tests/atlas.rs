@@ -153,18 +153,14 @@ fn walk<'v>(v: &'v Value, f: &mut dyn FnMut(Option<&'v str>, &'v Value)) {
     }
 }
 
+/// The region and theme routes carry no belief value. The list is shared
+/// with the nested-level contract tests (`tests/atlas_contract.rs`), whose
+/// documents carry none either: a leaf claim node has no `betp`.
 fn assert_no_belief_keys(v: &Value) {
     walk(v, &mut |k, _| {
         if let Some(k) = k {
             assert!(
-                ![
-                    "belief",
-                    "plausibility",
-                    "pignistic_prob",
-                    "epistemic",
-                    "mean_betp"
-                ]
-                .contains(&k),
+                !common::atlas_contract::BELIEF_KEYS.contains(&k),
                 "a body carries `{k}`"
             );
         }
@@ -459,6 +455,22 @@ async fn atlas_page_signed_in_is_a_shell_without_inline_script_or_style() {
     assert!(body.contains(r#"data-layout-url="/explorer/bff/atlas/layout""#));
     assert!(body.contains(r#"data-resolve-prefix="/explorer/bff/atlas/resolve/""#));
     assert!(body.contains(r#"data-themes-url="/explorer/bff/themes""#));
+    // With no map list the page lays out as before: the nested leaf legend
+    // takes no row (hidden, not just invisible) and the controls are hidden.
+    assert!(!body.contains("data-atlas-maps"));
+    let legend = body
+        .find(r#"data-role="leaf-legend""#)
+        .expect("the leaf legend is in the page");
+    let tag = &body[body[..legend].rfind('<').unwrap()..legend + body[legend..].find('>').unwrap()];
+    assert!(
+        tag.contains(" hidden"),
+        "the leaf legend takes no row: {tag}"
+    );
+    for role in ["map-picker", "hierarchy-switch"] {
+        let at = body.find(&format!(r#"data-role="{role}""#)).unwrap();
+        let end = at + body[at..].find('>').unwrap();
+        assert!(body[at..end].contains(" hidden"), "{role} is hidden");
+    }
     assert!(res
         .header("content-security-policy")
         .unwrap()
@@ -2469,6 +2481,188 @@ fn atlas_js_never_parses_strings_as_code_or_html() {
     }
     assert!(calls > 0, "selection writes the hash with replaceState");
     assert!(!include_str!("../static/atlas.css").trim().is_empty());
+}
+
+/// The nested-level rendering rules are pure: no DOM, no fetch, no code or
+/// markup parsing, no belief figure, so `js-tests/` can run them under
+/// node:test and the canvas reads them as data only.
+#[test]
+fn atlas_nested_js_is_pure_and_safe() {
+    let js = include_str!("../static/atlas_nested.js");
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.",
+        "window.",
+        "fetch(",
+        "XMLHttpRequest",
+        "eval(",
+        "new Function",
+        ".style.",
+        ".belief",
+        "pignistic",
+        "betp",
+    ] {
+        assert!(
+            !js.contains(banned),
+            "atlas_nested.js must not use {banned}"
+        );
+    }
+    assert!(js.contains("'use strict'"));
+    assert!(epigraph_explorer::assets::find("atlas_nested.js").is_some());
+}
+
+/// The nested levels draw the served positions: their code in atlas.js runs
+/// no force simulation or collision pass (design §6 allows at most a 300 ms
+/// settle; it uses none), and takes placement and edge styles from the tested
+/// rules in atlas_nested.js rather than computing its own.
+#[test]
+fn atlas_js_nested_levels_run_no_layout() {
+    let js = include_str!("../static/atlas.js");
+    let start = js
+        .find("// ---- nested levels (W11)")
+        .expect("the nested section");
+    let end = start
+        + js[start..]
+            .find("// ---- drawing ----")
+            .expect("the drawing section follows");
+    let nested = &js[start..end];
+    for banned in ["forceSimulation", "collide(", ".tick("] {
+        assert!(
+            !nested.contains(banned),
+            "nested code must not use {banned}"
+        );
+    }
+    for needed in [
+        "NESTED.leafPositions(",
+        "NESTED.placeChildren(",
+        "NESTED.edgeStyle(",
+        "NESTED.particleFractions(",
+        "NESTED.switchTarget(",
+        "NESTED.levelProblem(",
+    ] {
+        assert!(nested.contains(needed), "nested code uses {needed}");
+    }
+}
+
+/// The canvas draws a leaf edge with exactly the style atlas_nested.js
+/// returns (tested under node:test): its width, dash and opacity, with an
+/// arrow and particles only for a flow, and edgeStyle always gets the kinds of
+/// both ends, so only evidence to a claim can read as "no stored mass". The
+/// leaf help text agrees with the legend that some solid evidence lines carry
+/// no stored mass.
+#[test]
+fn atlas_js_draws_leaf_edges_with_the_tested_style() {
+    let js = include_str!("../static/atlas.js");
+    let body_of = |name: &str| {
+        let start = js.find(name).unwrap_or_else(|| panic!("{name}"));
+        &js[start..start + js[start..].find("\n  }\n").expect("its end")]
+    };
+    let draw = body_of("function drawLeafFlows(");
+    for needed in [
+        "NESTED.edgeStyle(e, leafEnds(node, e))",
+        "ctx.lineWidth = style.width * zoom;",
+        "ctx.setLineDash(style.dash);",
+        "ctx.globalAlpha = style.alpha;",
+    ] {
+        assert!(draw.contains(needed), "drawLeafFlows must use {needed}");
+    }
+    assert!(
+        !draw.contains("style.flows ?"),
+        "the stroke opacity is the style's, not re-derived from whether it flows"
+    );
+    let gate = draw.find("if (style.flows) {").expect("a flow gate");
+    for flow_only in ["arrowHead(", "NESTED.particleFractions("] {
+        let at = draw
+            .find(flow_only)
+            .unwrap_or_else(|| panic!("{flow_only}"));
+        assert!(at > gate, "{flow_only} is drawn only for a flow");
+    }
+    let ends = body_of("function leafEnds(");
+    assert!(ends.contains("source: s ? s.sub : null") && ends.contains("target: t ? t.sub : null"));
+    let panel = body_of("function showLeafNodePanel(");
+    assert!(panel.contains("NESTED.edgeStyle(e, leafEnds(leaf, e))"));
+    assert_eq!(
+        js.matches("NESTED.edgeStyle(e)").count(),
+        0,
+        "every edgeStyle call names the edge's ends"
+    );
+    let help = body_of("function showLevelPanel(");
+    assert!(
+        help.contains("no stored mass")
+            && !help.contains("Solid links from evidence carry its stored mass."),
+        "the leaf help text says some solid evidence lines carry no stored mass"
+    );
+}
+
+/// With a map list (`data-atlas-maps`), no theme opens onto the viewer's own
+/// claim list: every read of the theme-claims route sits in a function that
+/// first asks `themeOpens` (or `NS.on`), so the picked map, not the viewer's
+/// layout, decides what a theme shows.
+#[test]
+fn atlas_js_theme_claim_reads_are_gated_by_the_map_list() {
+    let js = include_str!("../static/atlas.js");
+    let mut reads = 0;
+    for (at, _) in js.match_indices("cfg.themeClaims +") {
+        let start = js[..at].rfind("function ").expect("inside a function");
+        let head = &js[start..at];
+        let name = &head[..head.find('(').unwrap_or(head.len())];
+        assert!(
+            head.contains("NESTED.themeOpens(") || head.contains("if (NS.on)"),
+            "{name} reads a theme's claims without asking the map list first"
+        );
+        reads += 1;
+    }
+    assert!(reads >= 2, "loadTheme and followThemeKey read theme claims");
+}
+
+/// A search hit or `#c-` link inside a nested theme never lands on the old
+/// stand-in claim node ("Not among the closest N" at the theme's rim): with a
+/// map list, `goToResolved` hands off to `goToNestedClaim` first, which flies
+/// to the fetched leaf that draws the claim or frames the theme and says so.
+#[test]
+fn atlas_js_nested_claim_links_never_invent_a_node() {
+    let js = include_str!("../static/atlas.js");
+    let start = js
+        .find("async function goToResolved(")
+        .expect("goToResolved");
+    let body = &js[start..start + js[start..].find("\n  }\n").expect("its end")];
+    let gate = body
+        .find("if (NS.on)")
+        .expect("goToResolved checks for nesting");
+    let hand = body.find("goToNestedClaim(").expect("and hands off");
+    let stand_in = body
+        .find("Not among the closest")
+        .expect("the old stand-in path");
+    assert!(
+        gate < hand && hand < stand_in,
+        "the nested hand-off comes first"
+    );
+    let start = js
+        .find("async function goToNestedClaim(")
+        .expect("goToNestedClaim");
+    let nested = &js[start..start + js[start..].find("\n  }\n").expect("its end")];
+    assert!(nested.contains("NESTED.findClaimLeaf("));
+    assert!(!nested.contains("makeNode("), "no stand-in node");
+    assert!(!nested.contains("cfg.themeClaims"), "no claim-list read");
+}
+
+/// The leaf legend is un-hidden only once the page has a map list, and in
+/// the leaf view the theme-level "dashed" key steps aside, so the two legends
+/// never say different things about a dashed line.
+#[test]
+fn atlas_js_leaf_legend_rows_only_with_a_map_list() {
+    let js = include_str!("../static/atlas.js");
+    let start = js.find("function initNested(").expect("initNested");
+    let init = &js[start..start + js[start..].find("\n  }\n").unwrap()];
+    let gate = init.find("if (!NS.on) return;").expect("the map-list gate");
+    let shown = init
+        .find("dom.leafLegend.hidden = false")
+        .expect("initNested un-hides the leaf legend");
+    assert!(gate < shown, "only after the map-list gate");
+    assert_eq!(js.matches("leafLegend.hidden = false").count(), 1);
+    assert!(js.contains("dom.themeDashKey.classList.toggle('atlas__key--off', NS.leafShown)"));
 }
 
 /// A `--token: #rrggbb;` from a stylesheet, in the light or the dark theme.
