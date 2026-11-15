@@ -877,6 +877,14 @@ fn bp_config_from_request(
     }
     Ok(epigraph_engine::BpConfig {
         max_iterations,
+        convergence_threshold: unit_interval(
+            "convergence_threshold",
+            request.convergence_threshold.unwrap_or(0.01),
+        )?,
+        damping: unit_interval("damping", request.damping.unwrap_or(0.5))?,
+    })
+}
+
 /// Run a BP engine on the blocking pool, off the async runtime's workers
 /// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
 /// sweeps of the factor graph.
@@ -891,14 +899,6 @@ where
         .map_err(|e| ApiError::InternalError {
             message: format!("belief propagation did not complete: {e}"),
         })
-}
-
-        convergence_threshold: unit_interval(
-            "convergence_threshold",
-            request.convergence_threshold.unwrap_or(0.01),
-        )?,
-        damping: unit_interval("damping", request.damping.unwrap_or(0.5))?,
-    })
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
