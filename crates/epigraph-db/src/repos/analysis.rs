@@ -174,8 +174,8 @@ impl AnalysisRepository {
 
     /// Atomic: insert analysis + create all `concludes` and `interpreted_by` edges.
     ///
-    /// Every edge is attested at INSERT by `key` (backlog `dae795f8`, ruling
-    /// R-50): the request transport's own key (the API's), never the
+    /// Every edge is attested at INSERT by `key` (backlog `dae795f8`): the
+    /// request transport's own key (the API's), never the
     /// analysis' agent; unsigned with `key = None`. No unique index of `edges`
     /// covers these two relationships (migrations 091, 175), so the old
     /// `ON CONFLICT DO NOTHING` could not fire and is not carried over.

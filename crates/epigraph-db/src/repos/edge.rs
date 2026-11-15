@@ -1135,10 +1135,10 @@ impl EdgeRepository {
     }
 
     /// [`Self::create_symmetric_if_absent_conn`], with the edge it INSERTS
-    /// attested at INSERT by `key` (ruling R-50; see
-    /// [`Self::create_signed_conn`]). The same ANY-STATE dedup and the same
-    /// bare `ON CONFLICT DO NOTHING` (migration 090's index) as the unsigned
-    /// form; a dedup hit writes nothing and returns `false`.
+    /// attested at INSERT by `key` (see [`Self::create_signed_conn`]). The
+    /// same ANY-STATE dedup and the same bare `ON CONFLICT DO NOTHING`
+    /// (migration 090's index) as the unsigned form; a dedup hit writes
+    /// nothing and returns `false`.
     ///
     /// # Errors
     /// As [`Self::create_symmetric_if_absent_conn`], and

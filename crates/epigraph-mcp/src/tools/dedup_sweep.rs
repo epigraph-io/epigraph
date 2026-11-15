@@ -109,7 +109,7 @@ pub async fn collapse_pair_act(
     )
     .marked_by(Some(acting_agent));
     // Unsigned (`None`): the sweep runs on the maintenance DSN from its
-    // operator CLI (a request-serving server refuses it, D9), which holds no
+    // operator CLI (a request-serving server refuses it), which holds no
     // entity signer (backlog dae795f8; an open ruling).
     ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,

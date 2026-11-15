@@ -7019,8 +7019,8 @@ impl ClaimRepository {
     /// must run this in a transaction.
     ///
     /// The act's two edges (`supersedes` and the actor's `AUTHORED`) are
-    /// attested at INSERT by `key` (backlog `dae795f8`, ruling R-50): the
-    /// request transport's own key (the MCP server's, the API's), never the
+    /// attested at INSERT by `key` (backlog `dae795f8`): the request
+    /// transport's own key (the MCP server's, the API's), never the
     /// actor's. With `key = None` they are written unsigned (an operator CLI
     /// with no entity signer).
     ///
@@ -8661,8 +8661,8 @@ impl ClaimRepository {
     ///   matching zero rows.
     ///
     /// The step edge (`supersedes` / `revises`, new step -> parent) is attested
-    /// at INSERT by `key` (backlog `dae795f8`, ruling R-50): the request
-    /// transport's own key, never the author's; unsigned with `key = None`.
+    /// at INSERT by `key` (backlog `dae795f8`): the request transport's own
+    /// key, never the author's; unsigned with `key = None`.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip(conn, key))]
     pub async fn evolve_step_conn(
@@ -9052,9 +9052,9 @@ impl ClaimRepository {
     /// [`DuplicateProvenance`]. Returns the id of the `same_as` identity edge
     /// the act wrote.
     ///
-    /// The identity edge is attested at INSERT by `key` (backlog `dae795f8`,
-    /// ruling R-50): the request transport's own key (the MCP server's, the
-    /// API's), never the marking agent's; unsigned with `key = None`.
+    /// The identity edge is attested at INSERT by `key` (backlog `dae795f8`):
+    /// the request transport's own key (the MCP server's, the API's), never
+    /// the marking agent's; unsigned with `key = None`.
     ///
     /// # Errors
     /// As [`Self::mark_duplicate_act_conn`], and `DbError::InvalidData` if the
@@ -11683,8 +11683,8 @@ impl ClaimRepository {
     /// returned counts of migrated and deduped edges are therefore zero.
     ///
     /// The `supersedes` edges are attested at INSERT by `key` (backlog
-    /// `dae795f8`, ruling R-50): the request transport's own key, never the
-    /// acting agent's; unsigned with `key = None`.
+    /// `dae795f8`): the request transport's own key, never the acting agent's;
+    /// unsigned with `key = None`.
     ///
     /// # Errors
     /// As [`Self::consolidate`], and `DbError::InvalidData` if a stored edge
