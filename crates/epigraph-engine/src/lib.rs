@@ -31,7 +31,6 @@ pub mod bp;
 pub mod calibration;
 pub mod cdst_bp;
 pub mod cdst_sheaf;
-pub mod claim_context;
 pub mod classifier;
 pub mod compound_belief;
 pub mod confidence;
