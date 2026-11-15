@@ -158,7 +158,9 @@ WALKERS = {
     "crates/epigraph-db/tests/unstamped_http_edge_writes.rs": (),
     # Every file of that name anywhere in the tree.
     "crates/epigraph-db/tests/viewer_fixture_single_source.rs": ("*viewer_fixture.rs",),
-    "crates/epigraph-engine/tests/calibration_single_loader_ratchet.rs": (
+    # The shared walker behind calibration_single_loader_ratchet.rs and
+    # belief_mode_readers.rs (both `#[path]`-include it).
+    "crates/epigraph-engine/tests/support/rust_sources.rs": (
         "crates/*/src/*",
         "crates/*/build.rs",
     ),
