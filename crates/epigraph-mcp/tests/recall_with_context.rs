@@ -1894,6 +1894,159 @@ async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
     );
 }
 
+/// Call `claim_context` for `claim` as `viewer` and return the parsed
+/// `{claim_id, context}` object, or the tool's error message.
+async fn claim_context_as(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim: Uuid,
+) -> Result<serde_json::Value, String> {
+    use epigraph_mcp::tools::recall::{claim_context, ClaimContextParams};
+    let server = build_test_server(pool.clone());
+    let params: ClaimContextParams =
+        serde_json::from_value(serde_json::json!({ "claim_id": claim.to_string() }))
+            .expect("ClaimContextParams");
+    match claim_context(&server, viewer, params).await {
+        Ok(result) => {
+            let text = result
+                .content
+                .iter()
+                .find_map(|c| c.as_text().map(|t| t.text.clone()))
+                .expect("text content");
+            Ok(serde_json::from_str(&text).expect("parse claim_context JSON"))
+        }
+        Err(e) => Err(e.message.to_string()),
+    }
+}
+
+/// Backlog 0720d208. `claim_context` returns, for a claim id, the block
+/// `recall_with_context` returns for that claim as a search hit: every key
+/// and value the same, minus `similarity` (nothing was searched).
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_context_is_the_claims_own_recall_hit(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/ctx-by-id", "Context by id").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para = diverse_fixture::seed_paragraph(&pool, agent, paper, "ctx para", &pgvec, None).await;
+    let _sibling =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "ctx sibling", &pgvec, None).await;
+    let refuter = seed_neighbour_claim(&pool, agent, "a refutation of ctx para", 0.9).await;
+    seed_claim_edge(&pool, refuter, para, "refutes").await;
+
+    let mut hit = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
+    hit.as_object_mut()
+        .expect("hit is an object")
+        .remove("similarity");
+
+    let viewer = viewerfx::public_viewer(&pool).await;
+    let got = claim_context_as(&pool, &viewer, para)
+        .await
+        .expect("claim_context ok");
+    assert_eq!(got["claim_id"], para.to_string());
+    assert!(
+        got["context"].get("similarity").is_none(),
+        "a lookup by id has no similarity to report"
+    );
+    assert_eq!(
+        got["context"], hit,
+        "claim_context must return exactly the claim's recall_with_context hit"
+    );
+    assert!(
+        has_edge(
+            &epistemic_edges_of(&got["context"]),
+            refuter,
+            "refutes",
+            "incoming"
+        ),
+        "the context carries the claim's epistemic edges"
+    );
+}
+
+/// The two failures the backlog item measured: a search for a claim's own text
+/// returned a near-duplicate first, and a claim with no embedding was never
+/// returned at all. By id, the answer is the claim asked for in both cases, and
+/// the lookup writes no recall audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_context_never_returns_another_claim(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/ctx-dup", "Near duplicates").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    // Two paragraphs with the SAME vector: a kNN cannot tell them apart.
+    let first =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "dup para", &pgvec, None).await;
+    let second =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "dup para.", &pgvec, None).await;
+    // A current claim with no embedding: no search can return it.
+    let unembedded = seed_neighbour_claim(&pool, agent, "a claim nobody embedded", 0.2).await;
+
+    let viewer = viewerfx::public_viewer(&pool).await;
+    for claim in [first, second, unembedded] {
+        let got = claim_context_as(&pool, &viewer, claim)
+            .await
+            .unwrap_or_else(|e| panic!("claim_context({claim}): {e}"));
+        assert_eq!(got["claim_id"], claim.to_string());
+        assert_eq!(
+            got["context"]["paragraph_id"],
+            claim.to_string(),
+            "the context is the claim asked for, not a neighbour of it"
+        );
+    }
+    let unembedded_ctx = claim_context_as(&pool, &viewer, unembedded).await.unwrap();
+    assert_eq!(
+        unembedded_ctx["context"]["paragraph_content"],
+        "a claim nobody embedded"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let audit_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM recall_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count recall_events");
+    assert_eq!(
+        audit_rows, 0,
+        "a lookup by id is not a recall and audits nothing"
+    );
+}
+
+/// A claim the viewer cannot read is reported exactly as a claim that does not
+/// exist: same error, with only the id differing. A member of the owning group
+/// gets the context.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_context_answers_an_unreadable_claim_as_a_missing_one(pool: PgPool) {
+    let (owner, group) = viewerfx::seed_agent_with_group(&pool, "claim-context-owner").await;
+    let hidden =
+        viewerfx::seed_group_claim(&pool, owner, group, "group-private context target").await;
+    let missing = Uuid::new_v4();
+
+    let public = viewerfx::public_viewer(&pool).await;
+    let refused = claim_context_as(&pool, &public, hidden)
+        .await
+        .expect_err("a non-member must not get the context");
+    let absent = claim_context_as(&pool, &public, missing)
+        .await
+        .expect_err("a missing claim has no context");
+    assert_eq!(
+        refused.replace(&hidden.to_string(), "<id>"),
+        absent.replace(&missing.to_string(), "<id>"),
+        "an unreadable claim and a missing claim must be indistinguishable"
+    );
+    assert!(
+        !refused.contains("group-private context target"),
+        "the refusal must not carry the claim's content: {refused}"
+    );
+
+    let member = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("member viewer");
+    let got = claim_context_as(&pool, &member, hidden)
+        .await
+        .expect("a member reads its group's claim");
+    assert_eq!(
+        got["context"]["paragraph_content"],
+        "group-private context target"
+    );
+}
+
 /// A claim's scope caveats travel with it (backlog 99582af7, design note 3): a
 /// `qualifies` edge ("A bounds the conditions under which B applies") is
 /// returned among the hit's epistemic neighbours, with direction, so a caller
