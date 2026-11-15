@@ -190,7 +190,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
-            "sqlx::query(UPDATE).execute",
         ],
     ),
     // stamped (backlog 8a168dd6): the read runs on `AppState::read_as` with the

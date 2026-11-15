@@ -21,13 +21,17 @@
 //! re-embedded: the two predicates are not the same set, and an exclusion keyed
 //! on the parent claim would skip rows whose plaintext is real.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use epigraph_cli::reembed::{run, ReembedConfig, ReembedTarget};
-use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+use epigraph_embeddings::{
+    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, SimilarClaim, TokenUsage,
+};
 
 const EPOCH: i32 = 0;
 
@@ -212,5 +216,158 @@ async fn a_reembed_run_writes_no_vector_onto_a_sealed_row(pool: PgPool) {
     assert!(
         !has_vector(&pool, "evidence", corpus.sealed_evidence).await,
         "a sealed evidence row must not be given a vector derived from its seal sentinel"
+    );
+}
+
+/// A `MockProvider` that SEALS one claim the first time it is asked for
+/// vectors: inside the window between `fetch_batch` selecting the row and the
+/// UPDATE writing its vector (the provider round trip on every batch), where a
+/// concurrent privatization seal can land.
+struct SealingProvider {
+    inner: MockProvider,
+    pool: PgPool,
+    victim: Uuid,
+    group: Uuid,
+    fired: AtomicBool,
+}
+
+#[async_trait]
+impl EmbeddingService for SealingProvider {
+    async fn generate(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.generate(text).await
+    }
+
+    async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            sqlx::query(
+                "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                               encrypted_content) \
+                 VALUES ($1, $2, $3, 'fully_private', ''::bytea)",
+            )
+            .bind(self.victim)
+            .bind(self.group)
+            .bind(EPOCH)
+            .execute(&self.pool)
+            .await
+            .expect("seal the victim mid-batch");
+        }
+        self.inner.batch_generate(texts).await
+    }
+
+    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
+        self.inner.store(claim_id, embedding).await
+    }
+
+    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.get(claim_id).await
+    }
+
+    async fn similar(
+        &self,
+        embedding: &[f32],
+        k: usize,
+        min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        self.inner.similar(embedding, k, min_similarity).await
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    fn token_usage(&self) -> TokenUsage {
+        self.inner.token_usage()
+    }
+
+    fn reset_token_usage(&self) {
+        self.inner.reset_token_usage();
+    }
+
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        self.inner.health_check().await
+    }
+}
+
+/// A claim sealed AFTER `fetch_batch` selected it must neither get a vector
+/// nor abort the run. Without the write-time seal re-check, migration 212's
+/// row trigger refuses the UPDATE (42501) and `run` returns Err, stopping the
+/// whole corpus pass; before 212 the same UPDATE wrote a plaintext-derived
+/// vector onto the now-sealed row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_sealed_mid_batch_is_skipped_not_fatal(pool: PgPool) {
+    let agent: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'reembed-seal-race', 'system', \
+                 ARRAY['test']) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('reembed seal race', 'did:epigraph:personal:' || $1::text, ''::bytea, \
+                 'personal', $1) \
+         RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed group");
+    sqlx::query("INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, $2, 'active')")
+        .bind(group)
+        .bind(EPOCH)
+        .execute(&pool)
+        .await
+        .expect("seed active key epoch");
+    let live = seed_claim(&pool, agent, group, "reembed-seal-race live claim").await;
+    let victim = seed_claim(&pool, agent, group, "reembed-seal-race sealed mid-batch").await;
+
+    let provider = Arc::new(SealingProvider {
+        inner: MockProvider::new(EmbeddingConfig::openai(3072)),
+        pool: pool.clone(),
+        victim,
+        group,
+        fired: AtomicBool::new(false),
+    });
+    let summary = run(
+        &pool,
+        ReembedConfig {
+            target: ReembedTarget::Claims,
+            batch_size: 10,
+            embedding_provider: provider.clone(),
+            checkpoint_path: None,
+        },
+    )
+    .await
+    .expect("a claim sealed between fetch and update must not abort the run");
+
+    assert!(
+        provider.fired.load(Ordering::SeqCst),
+        "calibration: the seal really ran inside the batch window"
+    );
+    let has_3072 = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT embedding_3072 IS NOT NULL FROM claims WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read embedding_3072")
+        }
+    };
+    assert!(
+        has_3072(live).await,
+        "calibration: the claim still unsealed at update time is re-embedded"
+    );
+    assert!(
+        !has_3072(victim).await,
+        "a claim sealed mid-batch must not be given a 3072 vector"
+    );
+    assert_eq!(
+        summary.rows_written, 1,
+        "rows_written counts rows actually written, not rows fetched"
     );
 }
