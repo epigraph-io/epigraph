@@ -14,6 +14,7 @@ pub mod agent_key;
 pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
+pub mod assertion_nonce;
 pub mod atlas_layout;
 pub mod atom_axiom;
 pub mod authored_by;
@@ -86,6 +87,7 @@ pub mod revoked_access_token;
 pub mod role_assignment;
 pub mod scoped_belief;
 pub mod security_event;
+pub mod seed_posture;
 pub mod semantic_link;
 pub mod sheaf;
 pub mod sources;
@@ -263,6 +265,7 @@ pub use workflow::{
 };
 
 // Privacy / encryption repositories
+pub use assertion_nonce::{AssertionNonceRepository, NonceConsumption};
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};

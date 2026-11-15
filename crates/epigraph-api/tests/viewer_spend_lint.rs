@@ -283,17 +283,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "resolve_challenge",
         &["ChallengeRepository::resolve_as_claim_owner"],
     ),
-    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md)
-    // runs each act on `AppState::write_as`, the transaction stamped with this
-    // viewer, and calls a migration-206 SECURITY DEFINER that reads the caller
-    // from that stamp (`epigraph_principal_id()`) and makes the authority
-    // decision itself; a claim the caller cannot read is answered not-found by
-    // the definer. `writable_teams` reports the caller's own teams back.
-    (
-        "claim_visibility.rs",
-        "publicize_claims",
-        &["ClaimRepository::publicize_conn"],
-    ),
+    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md).
+    // The publicize and share handlers hand their viewer to
+    // `epigraph_engine::visibility_act` (the act plus the moved claims'
+    // cached-belief refold, migration 215), so they have no unviewed call.
     // The two default-group handlers (206's `me`, 209's `:id`) pass their
     // viewer to `set_default_for`, which spends it on `write_as` and calls 209's
     // setter definer on that stamped transaction; the definer decides whether
@@ -306,11 +299,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::set_agent_default_conn",
             "ClaimRepository::writable_teams",
         ],
-    ),
-    (
-        "claim_visibility.rs",
-        "share_claims_with_team",
-        &["ClaimRepository::share_with_team_conn"],
     ),
     // untenanted: the caller's own membership, and the seal record of a claim
     // already read through the viewer.
