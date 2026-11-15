@@ -1797,6 +1797,38 @@ async fn claim_exists(client: &reqwest::Client, endpoint: &str, id: Uuid) -> boo
     )
 }
 
+/// Does `content` cite exactly `PR #<n>`? The server's `content_contains` is a
+/// case-insensitive substring match, so `PR #8` also returns claims citing
+/// `PR #80` or `PR #812`; a digit right after the number rules those out.
+fn content_cites_pr(content: &str, n: u64) -> bool {
+    let haystack = content.to_ascii_lowercase();
+    let needle = format!("pr #{n}");
+    haystack.match_indices(&needle).any(|(i, _)| {
+        !haystack[i + needle.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// The ids in a `GET /api/v1/claims` response whose content cites exactly
+/// `PR #<n>` (see `content_cites_pr`).
+fn claim_ids_citing_pr(v: &serde_json::Value, n: u64) -> Vec<Uuid> {
+    v["claims"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|c| {
+                    c["content"]
+                        .as_str()
+                        .is_some_and(|t| content_cites_pr(t, n))
+                })
+                .filter_map(|c| c["id"].as_str()?.parse::<Uuid>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Find existing resolution/backlog claims whose CONTENT cites "PR #<n>".
 #[allow(dead_code)]
 async fn find_claims_citing_pr(client: &reqwest::Client, endpoint: &str, n: u64) -> Vec<Uuid> {
@@ -1819,14 +1851,7 @@ async fn find_claims_citing_pr(client: &reqwest::Client, endpoint: &str, n: u64)
     let Ok(v) = resp.json::<serde_json::Value>().await else {
         return vec![];
     };
-    v["claims"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| c["id"].as_str()?.parse::<Uuid>().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    claim_ids_citing_pr(&v, n)
 }
 
 /// For each resolved target, create `target --RESOLVED_BY--> PR`, datestamped at
@@ -3201,6 +3226,28 @@ mod tests {
         assert!(r(None, "", &[], Some("  ")).is_err());
         let bad = r(None, "", &[], Some("not-a-uuid")).unwrap_err();
         assert!(bad.contains("must be a UUID"), "{bad}");
+    }
+
+    // Backlog 7d9e60c6 (4): `#8` resolves only claims citing PR #8, not #80.
+    #[test]
+    fn pr_citation_matches_the_exact_number() {
+        assert!(content_cites_pr("Fixed in PR #8.", 8));
+        assert!(content_cites_pr("fixed in pr #8", 8));
+        assert!(content_cites_pr("PR #80 and PR #8", 8));
+        assert!(content_cites_pr("PR #8", 8));
+        assert!(!content_cites_pr("Fixed in PR #80", 8));
+        assert!(!content_cites_pr("PR #812 merged", 8));
+        assert!(!content_cites_pr("no citation", 8));
+        let resp = serde_json::json!({"claims": [
+            {"id": "00000000-0000-4000-8000-000000000001", "content": "landed in PR #80"},
+            {"id": "00000000-0000-4000-8000-000000000002", "content": "landed in PR #8"},
+            {"id": "00000000-0000-4000-8000-000000000003", "content": "PR #812"},
+            {"id": "00000000-0000-4000-8000-000000000004"}
+        ]});
+        assert_eq!(
+            claim_ids_citing_pr(&resp, 8),
+            vec![Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap()]
+        );
     }
 
     #[test]
