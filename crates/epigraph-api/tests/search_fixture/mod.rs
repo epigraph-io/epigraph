@@ -155,10 +155,10 @@ pub async fn attach_theme(pool: &PgPool, claim: Uuid, theme: Uuid) {
         .expect("attach theme");
 }
 
-/// Resolved on the SUPERUSER pool, never the downgraded one: `Viewer::resolve`
-/// reads `group_memberships`, and on a filtered unstamped session it resolves to
-/// an EMPTY group set — which would satisfy every "a stranger is absent"
-/// assertion for entirely the wrong reason.
+/// Resolved on the SUPERUSER pool. A resolve on the downgraded pool would
+/// give the same viewer (`Viewer::resolve` reads memberships through a
+/// SECURITY DEFINER; `epigraph-db/tests/downgraded_pool_viewer_resolve.rs`
+/// pins it), but the superuser pool keeps this helper independent of that.
 pub async fn viewer_for(pool: &PgPool, agent: Uuid) -> epigraph_db::visibility::Viewer {
     epigraph_db::visibility::Viewer::resolve(pool, agent)
         .await

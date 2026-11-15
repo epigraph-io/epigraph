@@ -190,15 +190,10 @@ async fn a_rate_limited_oauth_response_is_not_cacheable() {
 
 // ── DB-backed authorization_code redeem tests ────────────────────────────────
 //
-// These run against a real Postgres test DB (migrations 001-049 applied,
-// oauth_authorization_codes + oauth_clients present) and are #[ignore]'d so the
-// default `cargo test` (which has no DB) stays green. Run them with:
-//   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/epigraph_mcp_oauth_test \
-//   cargo test -p epigraph-api --test oauth_authorization_code -- --ignored
-//
-// Each test seeds its own active 'human' oauth_client and a single authorization
-// code with a UNIQUE client_id + raw code (UUID-suffixed) so concurrent runs and
-// reruns never collide.
+// Each is a `#[sqlx::test]`: it gets its own database, migrated from empty, so
+// it runs in the default `cargo test -p epigraph-api` and touches no shared
+// database. Each test seeds its own active 'human' oauth_client and a single
+// authorization code (UUID-suffixed client_id + raw code).
 
 use base64::Engine as _;
 use chrono::{Duration, Utc};
@@ -220,10 +215,7 @@ fn pkce_challenge(verifier: &str) -> String {
 
 /// Build the app with a REAL pool and capture the issuer's jwt_config so token
 /// validation cannot drift from the secret the issuing AppState actually used.
-async fn db_app() -> (axum::Router, PgPool, Arc<JwtConfig>) {
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
+async fn db_app(pool: PgPool) -> (axum::Router, PgPool, Arc<JwtConfig>) {
     let state = AppState::with_db(pool.clone(), config())
         .with_providers(Arc::new(ProviderRegistry::default()));
     let jwt = state.jwt_config.clone();
@@ -309,11 +301,10 @@ fn token_body_no_client_id(grant_code: &str, verifier: &str) -> String {
     )
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_happy_path_issues_valid_jwt() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_happy_path_issues_valid_jwt(pool: PgPool) {
     let scopes = vec!["claims:read".to_string(), "claims:write".to_string()];
-    let (app, pool, jwt) = db_app().await;
+    let (app, pool, jwt) = db_app(pool).await;
     let (client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
@@ -344,11 +335,10 @@ async fn db_authorization_code_happy_path_issues_valid_jwt() {
     assert_eq!(body["scope"], "claims:read claims:write");
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_wrong_verifier_is_rejected() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_wrong_verifier_is_rejected(pool: PgPool) {
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
@@ -360,11 +350,10 @@ async fn db_authorization_code_wrong_verifier_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_is_single_use() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_is_single_use(pool: PgPool) {
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
@@ -395,11 +384,10 @@ async fn db_authorization_code_is_single_use() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_expired_is_rejected() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_expired_is_rejected(pool: PgPool) {
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     // expires_at in the past → consume's `expires_at > now()` guard rejects it.
     let (client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() - Duration::hours(1), "active").await;
@@ -418,9 +406,8 @@ async fn db_authorization_code_expired_is_rejected() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_suspended_client_is_forbidden() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_suspended_client_is_forbidden(pool: PgPool) {
     // A valid, unexpired code with the correct PKCE verifier + redirect_uri +
     // client_id — the ONLY varied factor vs the happy path is that the per-user
     // oauth_client is 'suspended', not 'active'. Without the status gate the
@@ -428,7 +415,7 @@ async fn db_authorization_code_suspended_client_is_forbidden() {
     // suspended client (a 30-day blast radius). With the gate it must 403, like
     // the sibling client_credentials/refresh_token handlers.
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "suspended").await;
 
@@ -446,9 +433,8 @@ async fn db_authorization_code_suspended_client_is_forbidden() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_omitted_client_id_is_rejected() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_omitted_client_id_is_rejected(pool: PgPool) {
     // Identical to the happy path in EVERY factor except one: the token request
     // OMITS `client_id`. The code is valid + unexpired, the PKCE verifier is
     // correct, the redirect_uri matches, and the client is 'active' — so the ONLY
@@ -460,7 +446,7 @@ async fn db_authorization_code_omitted_client_id_is_rejected() {
     // caller that simply leaves client_id out). RFC 9700 §4.1.3 makes client_id
     // validation in the authorization_code grant a MUST → this must be 4xx.
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (_client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
@@ -478,9 +464,8 @@ async fn db_authorization_code_omitted_client_id_is_rejected() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --ignored"]
-async fn db_authorization_code_wrong_client_id_is_rejected() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn db_authorization_code_wrong_client_id_is_rejected(pool: PgPool) {
     // Regression coverage for the cross-client binding path: a code minted for
     // client A is redeemed with a present-but-wrong client_id (B). This path was
     // already rejected (the `if let Some(cid)` mismatch branch), so it is NOT the
@@ -488,7 +473,7 @@ async fn db_authorization_code_wrong_client_id_is_rejected() {
     // future regression that weakens the value-vs-row comparison. One factor
     // varied vs the happy path: client_id is wrong.
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (_client_id, code) =
         seed_client_and_code(&pool, &scopes, Utc::now() + Duration::hours(1), "active").await;
 
@@ -661,7 +646,7 @@ fn google_cfg(jwks_url: &str) -> ProviderConfig {
 /// db_app variant whose ProviderRegistry has a real 'google' redirect provider, so
 /// the authorize handler's `redirect_flow("google")` resolves. Returns the fixture
 /// too (its wiremock server must outlive the app).
-async fn db_app_with_google() -> (axum::Router, PgPool, ProviderFixture) {
+async fn db_app_with_google(pool: PgPool) -> (axum::Router, PgPool, ProviderFixture) {
     let fx = ProviderFixture::new().await;
     let provider = Arc::new(
         GoogleProvider::from_config(&google_cfg(&fx.jwks_url), JwksCache::new())
@@ -674,9 +659,6 @@ async fn db_app_with_google() -> (axum::Router, PgPool, ProviderFixture) {
             Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
         )
         .expect("register google");
-    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-        .await
-        .unwrap();
     let state = AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry));
     let app = create_router(state);
     (app, pool, fx)
@@ -797,11 +779,10 @@ fn parse_redirect_params(loc: &str) -> std::collections::HashMap<String, String>
         .collect()
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
-async fn authorize_redirects_to_google() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_redirects_to_google(pool: PgPool) {
     // An active client whose redirect_uris contains exactly the claude callback.
-    let (app, pool, _fx) = db_app_with_google().await;
+    let (app, pool, _fx) = db_app_with_google(pool).await;
     let scopes = vec!["claims:read".to_string()];
     let (client_id, _uuid) = seed_active_human_client(&pool, &scopes).await;
     // seed_active_human_client passes None for redirect_uris, so seed the column
@@ -848,13 +829,12 @@ async fn authorize_redirects_to_google() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
-async fn consent_allow_mints_redeemable_code() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_allow_mints_redeemable_code(pool: PgPool) {
     // End-to-end without Google: seed an active human client + an already-consented
     // session, POST Allow, follow the redirect's code, then redeem it at /oauth/token.
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, jwt) = db_app().await;
+    let (app, pool, jwt) = db_app(pool).await;
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     let claude_state = "claude-roundtrip-state-xyz";
     let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, claude_state).await;
@@ -919,11 +899,10 @@ async fn consent_allow_mints_redeemable_code() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
-async fn consent_deny_redirects_with_error() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_deny_redirects_with_error(pool: PgPool) {
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     let ticket = seed_consent_session(&pool, &client_id, client_uuid, &scopes, "deny-state").await;
 
@@ -952,9 +931,8 @@ async fn consent_deny_redirects_with_error() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
-async fn consent_control_byte_state_does_not_panic() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_control_byte_state_does_not_panic(pool: PgPool) {
     // Regression for the panic-on-attacker-input finding: axum's Query extractor
     // percent-DECODES the OAuth `state` before it lands in `claude_state`, so a client
     // that began /oauth/authorize with `state=%0A` makes the stored value a literal
@@ -963,7 +941,7 @@ async fn consent_control_byte_state_does_not_panic() {
     // directly (it is the exact row state the authorize step would leave) and assert a
     // clean 303 whose Location percent-encodes the byte instead of panicking.
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     // A literal newline (0x0A) — the post-percent-decode value of `state=%0A`.
     let evil_state = "before\nafter";
@@ -994,12 +972,11 @@ async fn consent_control_byte_state_does_not_panic() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
-async fn consent_ticket_is_single_use() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_ticket_is_single_use(pool: PgPool) {
     // take() deletes the session row, so a replayed ticket cannot mint a second code.
     let scopes = vec!["claims:read".to_string()];
-    let (app, pool, _jwt) = db_app().await;
+    let (app, pool, _jwt) = db_app(pool).await;
     let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
     let ticket =
         seed_consent_session(&pool, &client_id, client_uuid, &scopes, "single-use-state").await;
@@ -1037,13 +1014,12 @@ async fn post_json2(app: axum::Router, uri: &str, body: serde_json::Value) -> (S
     )
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL test DB; run with --include-ignored"]
-async fn dcr_registration_returns_client_id_and_locks_redirect() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_registration_returns_client_id_and_locks_redirect(pool: PgPool) {
     // A claude.ai-shaped DCR request (redirect_uris + response_types=[code], no
     // client_type) must create an ACTIVE public client and echo back the locked
     // redirect_uri verbatim per RFC 7591.
-    let (app, _pool, _jwt) = db_app().await;
+    let (app, _pool, _jwt) = db_app(pool).await;
     let (status, body) = post_json2(
         app,
         "/oauth/register",
