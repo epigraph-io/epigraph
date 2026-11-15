@@ -173,6 +173,27 @@ const EXCLUDED: &[(&str, &str)] = &[
         "harvester pipeline (173): the application writes no row (118 section 6), and no \
          elevated read arm is added, so an elevated session reads only what its tenancy admits",
     ),
+    (
+        "atlas_map_epochs",
+        "Atlas team maps (210): the application role holds SELECT only (the nightly writes on \
+         the maintenance connection, the staleness epochs are written by a maintenance-owned \
+         definer trigger), and no elevated read arm is added, so an elevated session reads only \
+         what its tenancy admits",
+    ),
+    (
+        "atlas_map_runs",
+        "Atlas team maps (210): the application role holds SELECT only (the nightly writes on \
+         the maintenance connection, the staleness epochs are written by a maintenance-owned \
+         definer trigger), and no elevated read arm is added, so an elevated session reads only \
+         what its tenancy admits",
+    ),
+    (
+        "atlas_map_levels",
+        "Atlas team maps (210): the application role holds SELECT only (the nightly writes on \
+         the maintenance connection, the staleness epochs are written by a maintenance-owned \
+         definer trigger), and no elevated read arm is added, so an elevated session reads only \
+         what its tenancy admits",
+    ),
 ];
 
 /// THE READ-PATH WRITE CENSUS (plan §1.5), checked in. An elevated READ breaks

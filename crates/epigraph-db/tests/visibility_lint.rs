@@ -2800,6 +2800,38 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
          column to name (the shape of claim_theme.rs `delete_all_conn`).",
     ),
+    // Atlas W2 (migration 210): the nightly's writes of a team or public map.
+    (
+        "atlas_map.rs",
+        "write_run",
+        "WRITE. Opens one unfinished `atlas_map_runs` row of one map, declared ('group', T) for a \
+         team map or ('public', world) for the public map; the nightly calls it on the \
+         maintenance connection, the application role holds SELECT only on the table, and its \
+         `atlas_map_runs_tenancy` WITH CHECK would hold any other writer to its writable groups. \
+         The one read is the `groups` kind check of the declared owner.",
+    ),
+    (
+        "atlas_map.rs",
+        "put_level",
+        "WRITE. Upserts one `atlas_map_levels` document into an unfinished run, copying the \
+         run's own tenancy columns (pinned by the composite FK); the nightly calls it on the \
+         maintenance connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "finish_run",
+        "WRITE. Stamps one unfinished `atlas_map_runs` row finished with its level count, \
+         counted over the run's own documents; the nightly calls it on the maintenance \
+         connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "fix_repeatable_read",
+        "NO ROW READ. Private first half of `begin_build_snapshot`: runs `SET TRANSACTION \
+         ISOLATION LEVEL REPEATABLE READ` and reads back `current_setting('transaction_isolation')`; \
+         it touches no table. `begin_build_snapshot` then reads the epochs through `map_epochs`, \
+         which splices the viewer.",
+    ),
     // Backlog b7354adc: the three reads `AuthoredByRepository::for_claim` ran inline, split
     // out unchanged so `for_paper_ingests` (which takes the viewer and spends it on
     // `PaperRepository::ingest_principals`) shares them instead of copying them.

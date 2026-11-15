@@ -138,7 +138,10 @@ DECLARE t text;
           'harvester_sources','harvester_audit_reports',
           -- ---- workflow rows (183) ---------------------------------------
           -- FORCEd by 183 with its tenancy columns, same precedent and reason.
-          'workflows'];
+          'workflows',
+          -- ---- Atlas team maps (210) -------------------------------------
+          -- FORCEd by 210 at creation, same precedent and reason.
+          'atlas_map_epochs','atlas_map_runs','atlas_map_levels'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

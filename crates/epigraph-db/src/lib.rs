@@ -188,6 +188,7 @@ pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BIND
 pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 // The Atlas layout reads and the operator build (migration 197).
 pub use repos::AtlasLayoutRepository;
+pub use repos::AtlasMapRepository;
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
