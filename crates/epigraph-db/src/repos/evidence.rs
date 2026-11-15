@@ -1282,35 +1282,13 @@ impl EvidenceRepository {
         }
     }
 
-    /// Store an embedding vector for an evidence item
-    ///
-    /// Accepts a pgvector-formatted string (e.g., "[0.1,0.2,...]") and stores
-    /// it in the evidence embedding column.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, embedding_pgvector))]
-    pub async fn store_embedding(
-        pool: &PgPool,
-        id: EvidenceId,
-        embedding_pgvector: &str,
-    ) -> Result<bool, DbError> {
-        let uuid: Uuid = id.into();
-
-        let result = sqlx::query("UPDATE evidence SET embedding = $1::vector WHERE id = $2")
-            .bind(embedding_pgvector)
-            .bind(uuid)
-            .execute(pool)
-            .await?;
-
-        Ok(result.rows_affected() > 0)
-    }
-
     /// Store an embedding vector on an evidence row `viewer` may write, and
     /// only while the row carries no ciphertext.
     ///
-    /// The request-path twin of [`Self::store_embedding`], for a caller that
-    /// holds a connection stamped with `viewer`
+    /// The one evidence-vector writer. Its unguarded pool-form sibling
+    /// `store_embedding` (`UPDATE evidence SET embedding = $1::vector WHERE id =
+    /// $2`, no seal predicate, no caller) was deleted (backlog f78526ad). For a
+    /// caller that holds a connection stamped with `viewer`
     /// (`AppState::store_evidence_embedding_as`). `evidence` is under the
     /// generic tenancy policy, whose `WITH CHECK` refuses this UPDATE on an
     /// unstamped connection; the `{WRITABLE:e}` splice keeps the statement's

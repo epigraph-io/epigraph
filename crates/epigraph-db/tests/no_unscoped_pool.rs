@@ -787,7 +787,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// transaction (`routes/crud.rs`, keeping sites), and `query_security_events`
 /// reads on the caller's `AppState::read_as` (`routes/audit.rs` reached zero
 /// and its key was DELETED; `HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 200;
+/// 200 -> 198 (backlog 9bef22f3, merged on staging after the line above):
+/// `PUT /api/v1/claims/:id/embedding` and `PUT /api/v1/evidence/:id/embedding`
+/// were deleted with their handlers; `routes/rag.rs` 2 -> 0, key DELETED.
+/// Each side lowered from 204 on its own branch; the merge keeps both drops.
+const HIGH_WATER: usize = 198;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -857,7 +861,9 @@ const HIGH_WATER: usize = 200;
 /// caller's stamped transaction; merged with the line above on staging).
 /// 38 -> 37 when `routes/isomorphism.rs` was deleted (see [`HIGH_WATER`]).
 /// 37 -> 36 when `routes/audit.rs` reached zero (backlog 8a168dd6).
-const HIGH_WATER_FILES: usize = 36;
+/// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
+/// staging after the line above).
+const HIGH_WATER_FILES: usize = 35;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1122,7 +1128,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
     ("routes/political.rs", 5),
-    ("routes/rag.rs", 2),
+    // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
+    // its two writers, `generate_claim_embedding` and
+    // `generate_evidence_embedding` (the `PUT …/embedding` routes).
     // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
     // loader moved onto `AppState::read_as` and
     // `EdgeRepository::claim_edges_for_reasoning` ({EDGE_VISIBILITY:e}), and the

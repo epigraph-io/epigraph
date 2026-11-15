@@ -132,9 +132,14 @@ async fn run(
         "max_iterations": 10,
     }))
     .expect("request");
-    let Json(body) = propagate_beliefs(ViewerExtractor(viewer), State(state), Json(request))
-        .await
-        .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
+    let Json(body) = propagate_beliefs(
+        ViewerExtractor(viewer),
+        bearer(caller, &["claims:write"]),
+        State(state),
+        Json(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
     body
 }
 
@@ -402,4 +407,24 @@ async fn a_bp_seed_folds_only_binary_truth_bbas_each_discounted(pool: PgPool) {
         "a BP seed ignored its row's reliability: {w}, expected the discounted {d} (full \
          strength gives {p})"
     );
+
+/// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
+/// f00d75ab: `apply_updates: true` needs `claims:write`).
+fn bearer(
+    agent: Uuid,
+    scopes: &[&str],
+) -> axum::Extension<epigraph_api::middleware::bearer::AuthContext> {
+    axum::Extension(epigraph_api::middleware::bearer::AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Service,
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    })
 }
