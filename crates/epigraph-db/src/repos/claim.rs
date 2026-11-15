@@ -8547,6 +8547,79 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Add `(d_alpha, d_beta)` to the claim's Beta-Bernoulli parameters
+    /// (`claims.beta_alpha` / `beta_beta`) and return the parameters it stored.
+    ///
+    /// # One statement, so no increment is lost
+    ///
+    /// The addition happens in the `UPDATE` itself (`beta_alpha = beta_alpha +
+    /// $2`), not as a read followed by a write of the sum. Two concurrent
+    /// evidence writes on one claim then serialize on the row lock, and the
+    /// second adds to the first's committed value instead of overwriting it
+    /// with a sum computed from a stale read. A `NULL` parameter counts as the
+    /// `Beta(1, 1)` prior (`COALESCE`), the column default.
+    ///
+    /// # Gated on the claim's group
+    ///
+    /// The statement splices `{WRITABLE:c}`, so it touches the row only when
+    /// the claim's `owner_group_id` is one the viewer writes. `None` covers no
+    /// such claim and a claim the viewer may not write; read the stored
+    /// parameters with [`Self::get_beta_params`] when the caller needs them.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn add_beta_increments(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        d_alpha: f64,
+        d_beta: f64,
+    ) -> Result<Option<(f64, f64)>, DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c \
+                SET beta_alpha = COALESCE(c.beta_alpha, 1.0) + $2, \
+                    beta_beta = COALESCE(c.beta_beta, 1.0) + $3, \
+                    updated_at = NOW() \
+              WHERE c.id = $1 /* {WRITABLE:c} */ \
+          RETURNING c.beta_alpha, c.beta_beta",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (f64, f64)>(&sql)
+            .bind(id)
+            .bind(d_alpha)
+            .bind(d_beta);
+        // Conditional: a `Bypass` viewer renders `" "` and has no `$4`.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
+    /// The claim's stored Beta-Bernoulli parameters `(beta_alpha, beta_beta)`,
+    /// a `NULL` read as the `Beta(1, 1)` prior. `None` when the claim does not
+    /// exist or the viewer cannot see it.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn get_beta_params(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(f64, f64)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT COALESCE(c.beta_alpha, 1.0), COALESCE(c.beta_beta, 1.0) \
+               FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (f64, f64)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
     /// Maximum number of claim IDs accepted by [`pairwise_cosine_distance`](Self::pairwise_cosine_distance).
     /// At N=1000 the O(N²) cross-join produces ~500 k pair comparisons in Postgres; beyond
     /// this threshold query time becomes unreasonable and the result set itself is huge.
