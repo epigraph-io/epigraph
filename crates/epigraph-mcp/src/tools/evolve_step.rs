@@ -263,6 +263,18 @@ pub async fn evolve_step(
         (r, None, None)
     };
 
+    // The new step is a current claim with no vector: embed it post-commit,
+    // best-effort, as `add_step` does (CLAUDE.md "Embedding policy"; backlog
+    // 7628ab2c). Stored through the caller, which authored it: a step of a
+    // group plan is not readable as public, so the embedder's own store path
+    // would store nothing for it.
+    crate::tools::workflow_ingest::embed_created_workflow_claims(
+        server,
+        identity,
+        &[(result.new_claim_id, params.content.clone())],
+    )
+    .await;
+
     success_json(&EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,

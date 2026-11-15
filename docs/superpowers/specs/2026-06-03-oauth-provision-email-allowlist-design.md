@@ -24,7 +24,7 @@ auto_provision=true + write scopes → any Google acct gets graph write").
 ### Current blast radius (verified against prod `epigraph` DB, 2026-06-03)
 
 Exactly one external client is provisioned:
-`google:107485523387294236292` = `jeremy.barton@gmail.com`, `status=active`,
+`google:<subject-id>` = `owner@example.com`, `status=active`,
 full scope set. That is the legitimate owner. **No rogue clients exist**, so no
 revocation/cleanup migration is required — the fix is purely preventive.
 
@@ -57,7 +57,7 @@ allowed_emails, allowed_domains) -> bool`:
   suffix attacks (`evilbaros.associates`, `baros.associates.attacker.com`) are
   rejected because comparison is whole-label equality, not suffix.
 
-Initial prod config: `allowed_emails = ["jeremy.barton@gmail.com"]`.
+Initial prod config: `allowed_emails = ["owner@example.com"]`.
 
 ### 2. Provision-time gate (`provision.rs::provision_external_user_client`)
 

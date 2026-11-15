@@ -78,7 +78,7 @@ impl Rng {
 }
 
 /// Rounded to 4 decimals, as a builder storing compact documents would.
-fn r4(x: f64) -> f64 {
+pub(crate) fn r4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
@@ -102,7 +102,7 @@ fn capitalised(s: &str) -> String {
 }
 
 /// A synthetic group name of a few pseudo-words.
-fn group_name(rng: &mut Rng) -> String {
+pub(crate) fn group_name(rng: &mut Rng) -> String {
     let n = rng.range(2, 5);
     let words: Vec<String> = (0..n).map(|_| word(rng)).collect();
     capitalised(&words.join(" "))
@@ -139,7 +139,7 @@ fn naming(rng: &mut Rng) -> (Option<String>, bool) {
 }
 
 /// -1, 0 or 1, mostly supporting.
-fn net_sign(rng: &mut Rng) -> i8 {
+pub(crate) fn net_sign(rng: &mut Rng) -> i8 {
     let roll = rng.unit();
     if roll < 0.6 {
         1
@@ -151,18 +151,18 @@ fn net_sign(rng: &mut Rng) -> i8 {
 }
 
 /// The envelope fields shared by every fixture.
-struct Frame {
-    map_scope: MapScope,
-    map_group_id: Option<Uuid>,
-    hierarchy: Hierarchy,
-    theme_id: Uuid,
-    run_id: Uuid,
-    level_id: Uuid,
-    depth: u8,
-    name: Option<String>,
-    needs_naming: bool,
-    breadcrumbs: Vec<Breadcrumb>,
-    switch: Switch,
+pub(crate) struct Frame {
+    pub(crate) map_scope: MapScope,
+    pub(crate) map_group_id: Option<Uuid>,
+    pub(crate) hierarchy: Hierarchy,
+    pub(crate) theme_id: Uuid,
+    pub(crate) run_id: Uuid,
+    pub(crate) level_id: Uuid,
+    pub(crate) depth: u8,
+    pub(crate) name: Option<String>,
+    pub(crate) needs_naming: bool,
+    pub(crate) breadcrumbs: Vec<Breadcrumb>,
+    pub(crate) switch: Switch,
 }
 
 fn frame(rng: &mut Rng, map_scope: MapScope, hierarchy: Hierarchy, depth: u8) -> Frame {
@@ -345,7 +345,7 @@ impl ClaimValues {
 /// show that no edge weight depends on it.
 ///
 /// Returns the leaf and each claim's belief, in claim order.
-fn leaf_level(
+pub(crate) fn leaf_level(
     rng: &mut Rng,
     f: Frame,
     (n_claims, n_agents, n_evidence): (usize, usize, usize),
