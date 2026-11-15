@@ -1399,6 +1399,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::{get, post};
         use axum::Router;
+        use epigraph_core::Claim;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -2065,6 +2066,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::post;
         use axum::Router;
+        use epigraph_core::Claim;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 

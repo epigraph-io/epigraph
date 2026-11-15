@@ -2364,6 +2364,39 @@ mod tests {
     }
 }
 
+/// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
+/// the bearer middleware installs in production. Test routers built from a
+/// bare `Router::new()` carry none, so they 401 before reaching the handler.
+///
+/// File-level so both feature arms reach it: `event_tests` (not(db)) and
+/// `signature_verification_tests` (db) each build such routers. It used to
+/// live inside the db module only, which left the not(db) lib-test target
+/// unable to resolve it.
+#[cfg(test)]
+fn test_auth() -> crate::middleware::bearer::AuthContext {
+    let id = uuid::Uuid::new_v4();
+    crate::middleware::bearer::AuthContext {
+        client_id: id,
+        agent_id: Some(id),
+        owner_id: Some(id),
+        client_type: crate::middleware::bearer::ClientType::Service,
+        scopes: vec![
+            "claims:read".to_string(),
+            "claims:write".to_string(),
+            "edges:read".to_string(),
+            "edges:write".to_string(),
+            "workflows:read".to_string(),
+            "workflows:write".to_string(),
+        ],
+        jti: uuid::Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    }
+}
+
 #[cfg(all(test, not(feature = "db")))]
 mod event_tests {
     use super::*;
@@ -2637,33 +2670,6 @@ mod event_tests {
 
 #[cfg(all(test, feature = "db"))]
 mod signature_verification_tests {
-
-    /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
-    /// the bearer middleware installs in production. Test routers built from a
-    /// bare `Router::new()` carry none, so they 401 before reaching the handler.
-    fn test_auth() -> crate::middleware::bearer::AuthContext {
-        let id = uuid::Uuid::new_v4();
-        crate::middleware::bearer::AuthContext {
-            client_id: id,
-            agent_id: Some(id),
-            owner_id: Some(id),
-            client_type: crate::middleware::bearer::ClientType::Service,
-            scopes: vec![
-                "claims:read".to_string(),
-                "claims:write".to_string(),
-                "edges:read".to_string(),
-                "edges:write".to_string(),
-                "workflows:read".to_string(),
-                "workflows:write".to_string(),
-            ],
-            jti: uuid::Uuid::new_v4(),
-            family_id: None,
-            elevation_claim: None,
-            elevation: None,
-            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
-            delegated_by: None,
-        }
-    }
     use super::*;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
