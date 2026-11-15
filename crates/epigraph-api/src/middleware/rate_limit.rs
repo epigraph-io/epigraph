@@ -541,19 +541,19 @@ mod tests {
         let agent = Uuid::new_v4();
         let client = Uuid::new_v4();
         let mut r = req(Some("203.0.113.5:1"), &[]);
-        let jwt = crate::oauth::JwtConfig::from_secret(b"0123456789abcdef0123456789abcdef");
-        let (tok, _) = jwt
-            .issue_access_token(
-                client,
-                vec![],
-                "agent",
-                None,
-                Some(agent),
-                chrono::Duration::minutes(1),
-                epigraph_auth::AccessTokenBinding::NONE,
-            )
-            .unwrap();
-        let ctx: AuthContext = jwt.validate_token(&tok).unwrap().into();
+        let ctx = AuthContext {
+            client_id: client,
+            agent_id: Some(agent),
+            owner_id: None,
+            client_type: crate::middleware::ClientType::Service,
+            scopes: vec![],
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        };
         r.extensions_mut().insert(ctx.clone());
         assert_eq!(
             rate_limit_key(&r, &TrustedProxies::none()),

@@ -4,6 +4,7 @@
 
 pub mod blocker;
 pub mod calibration;
+pub mod contamination;
 pub mod pipeline;
 pub mod policy;
 pub mod scorer;
