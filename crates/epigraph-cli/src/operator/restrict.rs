@@ -12,12 +12,12 @@
 //! # What is eligible
 //!
 //! A listed claim that is `public` and owned by the WORLD group. With
-//! `--allow-non-world-owner`, any public claim, including one the target
-//! already owns: that one is narrowed IN PLACE, `('public', target)` to
-//! `('group', target)`, and its rows follow it exactly as for a move. Every
-//! other listed claim is HELD with its reason; a claim already
-//! `('group', target)` counts as done, so a re-run resumes where the last one
-//! stopped.
+//! `--allow-non-world-owner`, any public claim, including one the TARGET
+//! already owns: that one is narrowed in place (`public` -> `group`, owner
+//! unchanged), which is how a claim created through MCP/HTTP into its
+//! author's personal group is made private there. Every other listed claim is
+//! HELD with its reason; a claim already `('group', target)` counts as done, so
+//! a re-run resumes where the last one stopped.
 //!
 //! A claim is also HELD when a row it would carry is NOT public and NOT already
 //! the target's: a derived row, a harvester fragment, or an edge touching it
@@ -1257,12 +1257,13 @@ async fn run_batch(
     // transaction (migration 197); whether this batch is that first narrowing.
     let epoch_bump_due = tables::layout_epoch_bump_due(conn).await?;
 
-    // `visibility = 'public'` alone keeps a finished claim out. No owner
-    // filter: a public claim the target ALREADY owns is narrowed in place
-    // (owner unchanged), and the cascade narrows its rows as for a move
-    // (backlog 57e9be7a: an owner filter here moved 0 rows of a claim the plan
-    // counted eligible, and the batch rolled back).
     let moved = sqlx::query(
+        // No `owner_group_id IS DISTINCT FROM $2`: a public claim the target
+        // already owns is narrowed IN PLACE (owner unchanged). `classify_claim`
+        // counts it eligible, and the trigger's firing gate is the
+        // (owner, visibility) pair, so the cascade runs on the visibility
+        // change alone. With that predicate the UPDATE skipped the claim the
+        // plan had counted and the batch rolled back (backlog 57e9be7a).
         "UPDATE claims SET visibility = 'group', owner_group_id = $2 \
           WHERE id = ANY($1) AND visibility = 'public'",
     )

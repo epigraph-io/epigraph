@@ -1,7 +1,6 @@
 //! `define-group-role`, `bind-group-role`, `end-group-role-binding` and
 //! `group-roster`: a group whose membership FOLLOWS a platform role
-//! (migration 165), on the maintenance DSN. `group-roster` also lists the
-//! group's DIRECT members (`group_memberships`), on their own lines.
+//! (migration 165), on the maintenance DSN.
 //!
 //! A binding makes every registered human holding a live assignment of the
 //! role (its `grant-role` window) a `reader` or `writer` of the group, and,
@@ -12,6 +11,11 @@
 //! human holds it. Nothing is written to the group's roster: the membership
 //! is computed when a viewer is resolved, so it lapses at the window's end
 //! with no job.
+//!
+//! `group-roster` therefore prints two kinds of line: `MEMBER` for what the
+//! bindings derive, and `DIRECT` for the rows of the group's own roster
+//! (`group_memberships`, what `group-member add` writes), so one read answers
+//! "can this agent read or write the group, and through what".
 //!
 //! Each write calls ONE maintenance-only definer in one transaction,
 //! committed under `--apply` and rolled back otherwise (the audit row with
@@ -255,21 +259,23 @@ pub async fn roster(
         .collect())
 }
 
-/// One DIRECT member of a group: a `group_memberships` row (migration 060),
-/// added by `group-member add` or the group's own creation, not derived from
-/// a role binding.
+/// One DIRECT member row of a group (`group_memberships`): a membership
+/// written to the roster itself, which no role binding derives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectRow {
+    /// The member.
     pub agent: Uuid,
-    /// `reader`, `writer` or `admin`.
+    /// `admin`, `writer` or `reader`.
     pub role: String,
+    /// When the row was written.
     pub joined_at: DateTime<Utc>,
 }
 
-/// The direct members of `group` live at `at` (now when `None`): joined at or
-/// before it, and not revoked by then. Read-only. A role binding's derived
-/// members are [`roster`]'s; a check that a person can read or write the group
-/// needs both.
+/// The direct member rows of `group` live at `at` (now when `None`): joined
+/// by then and not revoked by then. [`roster`] cannot show these: it lists
+/// only what the group's role bindings derive, so a roster check could not
+/// confirm a member added with `group-member add` (backlog f33bb29f).
+/// Read-only.
 ///
 /// # Errors
 /// A statement failed.
@@ -279,11 +285,7 @@ pub async fn direct_members(
     at: Option<DateTime<Utc>>,
 ) -> anyhow::Result<Vec<DirectRow>> {
     let rows: Vec<(Uuid, String, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT agent_id, role::text, joined_at FROM group_memberships \
-          WHERE group_id = $1 \
-            AND joined_at <= COALESCE($2, now()) \
-            AND (revoked_at IS NULL OR revoked_at > COALESCE($2, now())) \
-          ORDER BY joined_at, agent_id",
+        "SELECT agent_id, role::text, joined_at FROM group_memberships           WHERE group_id = $1             AND joined_at <= COALESCE($2, now())             AND (revoked_at IS NULL OR revoked_at > COALESCE($2, now()))           ORDER BY role, agent_id",
     )
     .bind(group)
     .bind(at)

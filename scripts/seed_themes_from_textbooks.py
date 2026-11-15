@@ -5,7 +5,11 @@ For each textbook L1 claim:
   1. Compute centroid as mean of L1 + decomposes_to descendants' embeddings
      (1536d and 3072d if populated).
   2. Use claude -p to emit a short label (<=60 chars) and description
-     (<=250 chars) from the L1 content + descendant atom samples.
+     (<=250 chars) from the L1 content + descendant atom samples. Only
+     public, non-intake text is sent (theme_lib.public_label_source): the
+     stored label is shown to every viewer who can read one member. An L1
+     section that is not public gets theme_lib.NO_PUBLIC_MEMBER_LABEL and no
+     LLM call; label_themes_llm names it later from its public members.
   3. INSERT into claim_themes with properties.source_textbook_claim_id.
   4. Backfill claims.theme_id on the L1 and all decomposes_to descendants.
 
@@ -59,6 +63,7 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
+import theme_lib
 from maintenance_dsn import maintenance_dsn
 
 DEFAULT_DATABASE_URL = (
@@ -86,18 +91,21 @@ Do not include any other text.\
 
 def fetch_textbook_l1_claims(conn, limit: Optional[int]) -> list[dict]:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # `label_source` says whether the section's own text may go into the
+    # stored label (theme_lib.public_label_source).
     q = (
-        "SELECT id, content "
-        "FROM claims "
-        "WHERE is_current = true "
-        "  AND properties->>'source_type' = 'Textbook' "
-        "  AND properties->>'level' = '1' "
-        "  AND id NOT IN ( "
-        "    SELECT (properties->>'source_textbook_claim_id')::uuid "
-        "    FROM claim_themes "
-        "    WHERE properties ? 'source_textbook_claim_id' "
+        "SELECT c.id, c.content, "
+        f"  {theme_lib.public_label_source('c')} AS label_source "
+        "FROM claims c "
+        "WHERE c.is_current = true "
+        "  AND c.properties->>'source_type' = 'Textbook' "
+        "  AND c.properties->>'level' = '1' "
+        "  AND c.id NOT IN ( "
+        "    SELECT (ct.properties->>'source_textbook_claim_id')::uuid "
+        "    FROM claim_themes ct "
+        "    WHERE ct.properties ? 'source_textbook_claim_id' "
         "  ) "
-        "ORDER BY created_at ASC"
+        "ORDER BY c.created_at ASC"
     )
     if limit:
         q += f" LIMIT {int(limit)}"
@@ -151,6 +159,8 @@ def mean_vector(vecs: list[list[float]]) -> Optional[list[float]]:
 
 
 def fetch_sample_atoms(conn, root_id: str, k: int = 3) -> list[str]:
+    """Up to `k` level-3 atoms under `root_id` whose text may go into a stored
+    label (theme_lib.public_label_source)."""
     cur = conn.cursor()
     cur.execute(
         "WITH RECURSIVE walk(id) AS ( "
@@ -160,6 +170,7 @@ def fetch_sample_atoms(conn, root_id: str, k: int = 3) -> list[str]:
         "  WHERE e.relationship = 'decomposes_to' "
         ") SELECT c.content FROM walk JOIN claims c ON c.id = walk.id "
         "WHERE c.properties->>'level' = '3' "
+        f"  AND {theme_lib.public_label_source('c')} "
         "ORDER BY random() LIMIT %s",
         (root_id, k),
     )
@@ -243,13 +254,21 @@ def seed_one(section: dict, args: argparse.Namespace) -> dict:
         emb_3072 = mean_vector(fetch_embeddings(conn, descendants, 3072))
         if not emb_1536 and not emb_3072:
             return {"status": "skip", "sid": sid, "reason": "no descendants with embeddings"}
-        atoms = fetch_sample_atoms(conn, sid)
-        try:
-            label_obj = label_via_claude(content, atoms)
-        except Exception as e:
-            return {"status": "err", "sid": sid, "error": str(e)}
-        label = label_obj["label"]
-        description = label_obj["description"]
+        if section.get("label_source"):
+            atoms = fetch_sample_atoms(conn, sid)
+            try:
+                label_obj = label_via_claude(content, atoms)
+            except Exception as e:
+                return {"status": "err", "sid": sid, "error": str(e)}
+            label = label_obj["label"]
+            description = label_obj["description"]
+        else:
+            # The section is not public: its text, and so any summary of it,
+            # may not go into a label every viewer reads. Seed the theme with
+            # the placeholder (decided before any LLM call, so --dry-run sends
+            # nothing either); label_themes_llm names it from public members.
+            label = theme_lib.NO_PUBLIC_MEMBER_LABEL
+            description = ""
         if args.dry_run:
             return {"status": "dry", "sid": sid, "label": label}
         theme_id = insert_theme(conn, label, description, emb_1536, emb_3072, sid)

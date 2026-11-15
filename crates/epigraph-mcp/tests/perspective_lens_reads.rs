@@ -273,6 +273,7 @@ fn rwc_params(
         since: None,
         epistemic_partition: false,
         diversity_radius: None,
+        group_by_parent: false,
     }
 }
 
