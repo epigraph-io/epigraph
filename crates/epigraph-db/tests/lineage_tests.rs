@@ -2000,3 +2000,141 @@ async fn lineage_walks_end_on_a_cycle_at_exact_depths(pool: PgPool) {
         "kid_1 <- root (1) and end <- tail <- kid_0 <- root (3)"
     );
 }
+
+// ============================================================================
+// `get_depth` and `detect_cycles`: bounded by the claims and edges reached
+// ============================================================================
+
+/// Backlog c07884a9: `get_depth` and `detect_cycles` finish on the dense
+/// lattice, and answer exactly: every path from `bottom` to `top` has
+/// `LATTICE_LAYERS + 1` hops, and the lattice has no cycle.
+///
+/// The path-enumerating forms (`UNION ALL` plus a path array, guarded only by
+/// `NOT c.id = ANY(path)`) walk all 4^12 paths, and each call here exceeds the
+/// 5 s statement timeout (SQLSTATE 57014).
+#[sqlx::test(migrations = "../../migrations")]
+async fn depth_and_cycle_check_finish_on_a_dense_dag(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (top, layers, bottom) = create_lattice(&pool, "dense", LATTICE_WIDTH, LATTICE_LAYERS).await;
+    let d = LATTICE_LAYERS as i32;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    let depth = LineageRepository::get_depth(&mut *conn, &viewer, bottom)
+        .await
+        .expect("get_depth over the lattice must finish inside the statement timeout");
+    assert_eq!(depth, d + 1, "bottom -> L1 -> ... -> L12 -> top");
+    let depth = LineageRepository::get_depth(&mut *conn, &viewer, layers[0][0])
+        .await
+        .expect("get_depth from an L1 claim");
+    assert_eq!(depth, d, "L1 -> ... -> L12 -> top");
+    let depth = LineageRepository::get_depth(&mut *conn, &viewer, top)
+        .await
+        .expect("get_depth from the top");
+    assert_eq!(depth, 0, "top has no parents");
+
+    // Every claim of the lattice is reached many times over, so a check that
+    // calls "reached an already-visited claim" a cycle answers `true` here.
+    let has_cycle = LineageRepository::detect_cycles(&mut *conn, &viewer, bottom)
+        .await
+        .expect("detect_cycles over the lattice must finish inside the statement timeout");
+    assert!(!has_cycle, "a dense DAG has no cycle");
+}
+
+/// Backlog c07884a9: `get_depth` is the LONGEST chain of parents, not the
+/// shortest. `root`'s ancestors are the chain `root <- a <- b <- c` plus the
+/// shortcut `root <- c`: `c` is one hop away by the shortcut and three by the
+/// chain, so the depth is 3 (a walk that reports its deepest SHORTEST depth
+/// answers 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_depth_is_the_longest_chain_past_a_shortcut(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let root = create_test_claim(&pool, "depth root", 0.5).await;
+    let a = create_test_claim(&pool, "depth a", 0.5).await;
+    let b = create_test_claim(&pool, "depth b", 0.5).await;
+    let c = create_test_claim(&pool, "depth c", 0.5).await;
+    create_claim_edge(&pool, a, root, "supports").await;
+    create_claim_edge(&pool, b, a, "supports").await;
+    create_claim_edge(&pool, c, b, "supports").await;
+    create_claim_edge(&pool, c, root, "supports").await;
+    // A second edge on the same pair must not count twice.
+    create_claim_edge(&pool, c, root, "elaborates").await;
+
+    let depth = LineageRepository::get_depth(&pool, &viewer, root)
+        .await
+        .expect("get_depth");
+    assert_eq!(depth, 3, "root <- a <- b <- c, past the shortcut root <- c");
+    assert!(!LineageRepository::detect_cycles(&pool, &viewer, root)
+        .await
+        .expect("detect_cycles"));
+
+    // A claim that does not exist has no lineage.
+    let depth = LineageRepository::get_depth(&pool, &viewer, Uuid::new_v4())
+        .await
+        .expect("get_depth of a missing claim");
+    assert_eq!(depth, 0);
+}
+
+/// Backlog c07884a9: on a cycle that does NOT pass through the start,
+/// `detect_cycles` answers `true` and `get_depth` counts the cycle as one
+/// step. `root <- a <- {b <-> c} <- d`: the chain of parents is root, a, the
+/// cycle {b, c}, d, so the depth is 3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cycle_behind_the_start_is_detected_and_counted_once(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let root = create_test_claim(&pool, "cyc root", 0.5).await;
+    let a = create_test_claim(&pool, "cyc a", 0.5).await;
+    let b = create_test_claim(&pool, "cyc b", 0.5).await;
+    let c = create_test_claim(&pool, "cyc c", 0.5).await;
+    let d = create_test_claim(&pool, "cyc d", 0.5).await;
+    create_claim_edge(&pool, a, root, "supports").await;
+    create_claim_edge(&pool, b, a, "supports").await;
+    create_claim_edge(&pool, c, b, "supports").await;
+    create_claim_edge(&pool, b, c, "supports").await;
+    create_claim_edge(&pool, d, c, "supports").await;
+
+    assert!(LineageRepository::detect_cycles(&pool, &viewer, root)
+        .await
+        .expect("detect_cycles"));
+    assert_eq!(
+        LineageRepository::get_depth(&pool, &viewer, root)
+            .await
+            .expect("get_depth"),
+        3,
+        "root, a, the cycle {{b, c}} as one step, d"
+    );
+    // From `d`, which nothing derives from, there is neither.
+    assert!(!LineageRepository::detect_cycles(&pool, &viewer, d)
+        .await
+        .expect("detect_cycles from d"));
+}
+
+/// Backlog c07884a9: an edge the viewer cannot read cannot close a cycle.
+/// `a -> b` is public; the back edge `b -> a` belongs to a group, so only a
+/// member sees the cycle, and for anyone else the answer reveals nothing
+/// about the private edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cycle_closed_by_an_unreadable_edge_is_not_reported(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "cycle-edge-owner").await;
+    let public = fixture::public_viewer(&pool).await;
+    let member = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve member");
+    let a = fixture::seed_public_claim(&pool, owner, "vis a").await;
+    let b = fixture::seed_public_claim(&pool, owner, "vis b").await;
+    create_claim_edge(&pool, a, b, "supports").await;
+    fixture::seed_edge_owned_by(&pool, b, a, "group", group).await;
+
+    assert!(LineageRepository::detect_cycles(&pool, &member, b)
+        .await
+        .expect("detect_cycles, member"));
+    assert!(!LineageRepository::detect_cycles(&pool, &public, b)
+        .await
+        .expect("detect_cycles, public"));
+    assert_eq!(
+        LineageRepository::get_depth(&pool, &public, b)
+            .await
+            .expect("get_depth, public"),
+        1,
+        "b <- a over the public edge only"
+    );
+}
