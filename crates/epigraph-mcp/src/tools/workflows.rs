@@ -581,20 +581,14 @@ async fn matching_workflow(
     qvec: &[f32],
 ) -> Result<Option<WorkflowMatch>, McpError> {
     let caller = server.write_identity(auth, viewer).await?;
-    let resolved;
-    let caller_viewer = if viewer.principal() == Some(caller.agent_id()) {
-        viewer
-    } else {
-        resolved = epigraph_db::visibility::Viewer::resolve(&server.pool, caller.agent_id())
-            .await
-            .map_err(|e| {
-                crate::errors::internal_error_logged(
-                    "store_workflow: could not resolve the caller's viewer",
-                    e,
-                )
-            })?;
-        &resolved
-    };
+    let resolved = crate::tools::workflow_ingest::caller_viewer(
+        server,
+        viewer,
+        caller.agent_id(),
+        "store_workflow",
+    )
+    .await?;
+    let caller_viewer = resolved.as_ref().unwrap_or(viewer);
     let mut tx =
         crate::claim_helper::begin_caller_workflow_tx(server, caller, "store_workflow").await?;
     let target = match declared {
