@@ -6,15 +6,14 @@
 use engine_integration_tests::harness::*;
 use epigraph_engine::sheaf::RestrictionProfile;
 use epigraph_engine::{compute_expected_betp, restriction_kind, RestrictionKind};
+use sqlx::PgPool;
 use sqlx::Row;
 
 const PREFIX: &str = "[test-sheaf-db]";
 
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn sheaf_consistency_from_db_neighborhood() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn sheaf_consistency_from_db_neighborhood(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
     let agent = create_test_agent(&db.pool).await;
 
     // Create center claim + 3 neighbors

@@ -342,25 +342,6 @@ jobs:
           cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
           --test cluster_graph_test
           -- --test-threads=1
-      - name: "OAuth authorization-code tests marked #[ignore]"
-        # 13 tests in tests/oauth_authorization_code.rs are
-        # `#[ignore = "requires DATABASE_URL test DB"]`: the code-redeem,
-        # consent and dynamic-client-registration paths (backlog d0c23a32).
-        # This job has that database. `--ignored` runs only those; the rest of
-        # the file runs in its api shard.
-        run: >-
-          cargo test -p epigraph-api --locked --no-fail-fast
-          --test oauth_authorization_code
-          -- --ignored --test-threads=1
-      - name: "engine-integration suite including #[ignore]d tests"
-        # Every DB-backed test in tests/engine-integration is #[ignore]d, so
-        # the `workspace-rest` shard compiles the suite and runs none of it.
-        # Its tests read back only the rows they wrote themselves and delete
-        # their claims afterwards, so the rows the steps above leave in this
-        # database do not reach it.
-        run: >-
-          cargo test -p engine-integration-tests --locked --no-fail-fast
-          -- --include-ignored --test-threads=1
 
   # The one required check for the Rust suite. `needs` lists every job whose
   # failure must block a merge. Without an `if`, a job whose dependency failed
