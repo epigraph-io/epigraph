@@ -14,6 +14,12 @@
 //! `screen_claim_atomicity` and `query_compound_claims` MCP tools, the
 //! `atomicity_sweep` label and `decompose_claims --redecompose`). A claim can
 //! look atomic and still screen compound ("X rose, but Y fell.").
+//!
+//! [`conjunct_estimate`] (backlog `72850d43`) is a second, independent count
+//! with its own rules (finite-verb coordination, enumerations,
+//! `respectively`); it feeds only `query_undecomposed_claims`'
+//! `conjunct_estimate` / `conjunct_signals` fields. The two counters can
+//! disagree on the same text; neither changes what [`looks_atomic`] decides.
 
 /// Longest claim, in Unicode scalar values, that [`looks_atomic`] may call
 /// atomic. Chosen by the operator brief (2026-09-24): "one sentence and ≤ 160
