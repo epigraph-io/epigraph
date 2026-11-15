@@ -16,6 +16,15 @@ from maintenance_dsn import maintenance_dsn as _maintenance_dsn
 
 DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
+# The label stored for a theme no public member can name (`public_label_source`):
+# there is no text every viewer may read. label_themes_llm.is_placeholder_label
+# matches it, so a later labelling run names the theme once a public member
+# joins. Its prefix is deliberately NOT `auto-`: seed_themes_from_textbooks
+# --drop-auto-after deletes every `auto-%` theme and unassigns its members,
+# which would discard this theme (and, for a seeded one, its
+# source_textbook_claim_id, so the next seed run would label the section again).
+NO_PUBLIC_MEMBER_LABEL = "unnamed-no-public-member"
+
 
 def maintenance_dsn(default=DEFAULT_DATABASE_URL):
     """Resolve the DSN a corpus-wide script should connect on.
@@ -47,30 +56,55 @@ def not_intake_owned(alias="c"):
 
     Migration 207's intake files private bug reports, written by agents that
     are not members of the group that triages them, as claims owned by the
-    group `bug_report_intake_settings` names. They carry an embedding, so they
-    join clustering and theme assignment like any claim. A stored label
-    (`cluster_labels.label`, which project_to_themes copies onto a theme, and
-    `claim_themes.label` / `description` from label_themes_llm) is shown to
-    every viewer who can read one member of the theme, so a label built from a
-    report's text would publish wording only the intake group may read.
+    group `bug_report_intake_settings` names. It is keyed on the CURRENTLY
+    configured intake group: a report triage moves out of that group (or every
+    report, once the operator names another group) is no longer matched. With
+    no settings row it matches nothing.
+
+    Not used on its own by any label path: `public_label_source` conjoins it
+    with the public-visibility test, so a report the intake group made public
+    is still never quoted in a stored label.
+    """
+    return (
+        "NOT EXISTS (SELECT 1 FROM bug_report_intake_settings bri "
+        f"WHERE bri.intake_group_id = {alias}.owner_group_id)"
+    )
+
+
+def public_label_source(alias="c"):
+    """SQL predicate: claim `alias`'s text may be quoted in a STORED label.
+
+    A stored label (`cluster_labels.label`, which project_to_themes copies onto
+    a theme, and `claim_themes.label` / `description` from label_themes_llm and
+    seed_themes_from_textbooks) is
+    not viewer-derived: it is shown to every viewer who can read one member of
+    the theme. So only text EVERY viewer may read can go into one, which is a
+    `visibility = 'public'` claim. A group-private member's text, summarised
+    or excerpted, would publish wording only its owner group may read. An
+    intake-owned claim (`not_intake_owned`) is excluded even when public.
 
     Every path that turns member CONTENT into a stored label applies it, to
     the label samples only (membership, sizes and centroids are unchanged):
       * label_themes_llm.load_themes_with_samples (claim_themes.label and
-        description, LLM);
+        description, LLM); a theme with no public member gets the placeholder
+        NO_PUBLIC_MEMBER_LABEL and no LLM call;
+      * seed_themes_from_textbooks (claim_themes.label and description, LLM
+        over a textbook level-1 section and sampled level-3 atoms): the
+        section is sent only when it passes this predicate, else the theme is
+        seeded with NO_PUBLIC_MEMBER_LABEL and no LLM call; the atoms are
+        filtered by it;
       * cluster_claims.label_clusters and evidential_clustering.store_results
         (cluster_labels, member-text excerpts);
       * refine_clusters.auto_refine (cluster_labels, LLM), the split step of
-        theme_pipeline's grow loop: a sub-cluster with no other member keeps
+        theme_pipeline's grow loop: a sub-cluster with no public member keeps
         its `cluster-<id>` placeholder;
       * refine_clusters.interactive_label (cluster_labels via
         train_and_apply): the operator who types the sub-label names is shown
-        no intake member's text.
+        only public members' text.
     Checked and NOT routed through it, each for its stated reason:
-      * seed_themes_from_textbooks and anchor_papers_to_themes read only
-        claims whose properties carry source_type 'Textbook' or 'Paper' or a
-        decomposition `level`, none of which the intake definer writes (a
-        report's properties hold only `bug_report`);
+      * anchor_papers_to_themes writes no theme row: its LLM-derived
+        `refined_anchor_label` is stored as an edge property through the API,
+        so it is outside theme labels (a separate question);
       * project_to_themes copies cluster_labels (filtered above);
         split_theme, maintain_themes.auto_split_theme and the
         create-with-centroid route write placeholder or derived labels;
@@ -84,15 +118,13 @@ def not_intake_owned(alias="c"):
       * the API's experiment `centroid_summary` is computed per request from
         a viewer-scoped neighborhood, so it shows only claims the caller can
         already read.
-    It is keyed on the CURRENTLY configured intake group: a report triage
-    moves out of that group (or every report, once the operator names another
-    group) is sampled again, under the same rule as any other claim of its new
-    owner. With no settings row it excludes nothing.
+    Labels stored before this rule existed are not rewritten by it: re-run
+    label_themes_llm with --relabel-all (and re-label cluster runs) to replace
+    them. That run reads only themes with a 1536-d `centroid`; a seeded theme
+    whose section had only 3072-d embeddings has none and needs a separate
+    relabel.
     """
-    return (
-        "NOT EXISTS (SELECT 1 FROM bug_report_intake_settings bri "
-        f"WHERE bri.intake_group_id = {alias}.owner_group_id)"
-    )
+    return f"({alias}.visibility = 'public' AND {not_intake_owned(alias)})"
 
 
 def connect(database_url=None):

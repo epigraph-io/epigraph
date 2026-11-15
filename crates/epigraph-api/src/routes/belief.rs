@@ -1103,6 +1103,14 @@ pub async fn create_frame(
             reason: "Frame must have at least 2 hypotheses".to_string(),
         });
     }
+    if let Some(dup) =
+        epigraph_ds::FrameOfDiscernment::first_duplicate_hypothesis(&request.hypotheses)
+    {
+        return Err(ApiError::ValidationError {
+            field: "hypotheses".to_string(),
+            reason: format!("Hypotheses must be distinct: `{dup}` appears more than once"),
+        });
+    }
 
     if request.name.is_empty() || request.name.len() > 200 {
         return Err(ApiError::ValidationError {
@@ -2920,6 +2928,14 @@ pub async fn refine_frame(
             reason: "Refinement must have at least 2 hypotheses".to_string(),
         });
     }
+    if let Some(dup) =
+        epigraph_ds::FrameOfDiscernment::first_duplicate_hypothesis(&request.hypotheses)
+    {
+        return Err(ApiError::ValidationError {
+            field: "hypotheses".to_string(),
+            reason: format!("Hypotheses must be distinct: `{dup}` appears more than once"),
+        });
+    }
 
     if request.name.is_empty() || request.name.len() > 200 {
         return Err(ApiError::ValidationError {
@@ -3066,6 +3082,14 @@ pub async fn create_frame(
         return Err(ApiError::ValidationError {
             field: "hypotheses".to_string(),
             reason: "Frame must have at least 2 hypotheses".to_string(),
+        });
+    }
+    if let Some(dup) =
+        epigraph_ds::FrameOfDiscernment::first_duplicate_hypothesis(&request.hypotheses)
+    {
+        return Err(ApiError::ValidationError {
+            field: "hypotheses".to_string(),
+            reason: format!("Hypotheses must be distinct: `{dup}` appears more than once"),
         });
     }
 

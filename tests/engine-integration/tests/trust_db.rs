@@ -9,6 +9,7 @@
 use engine_integration_tests::harness::*;
 use epigraph_engine::reputation::{ClaimOutcome, ReputationCalculator};
 use epigraph_engine::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
+use sqlx::PgPool;
 use sqlx::Row;
 
 const PREFIX: &str = "[test-trust-db]";
@@ -30,11 +31,9 @@ const PREFIX: &str = "[test-trust-db]";
 ///
 /// This locks the result; any change to ReputationConfig defaults or the
 /// reputation algorithm trips this assertion.
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn trust_computed_from_db_claims() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn trust_computed_from_db_claims(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
     let agent = create_test_agent(&db.pool).await;
 
     let mut claim_ids = Vec::new();
@@ -80,11 +79,9 @@ async fn trust_computed_from_db_claims() {
 
 /// CONTRADICTS edge in DB produces a Contradiction record that names the
 /// specific supporting + refuting claims and the shared target.
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn conflict_classified_from_db_contradicts_edge() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn conflict_classified_from_db_contradicts_edge(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
     let agent = create_test_agent(&db.pool).await;
 
     let claim_a = create_test_claim(&db.pool, agent, &format!("{PREFIX} strong"), 0.9).await;
