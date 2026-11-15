@@ -19,7 +19,7 @@
 //!
 //! `--apply` requires `--manifest <PATH>`, a file that must not exist yet.
 //! Each batch's records (the parameters found and written, bit-exact) are
-//! flushed to it before the batch commits. `--reverse <PATH>` reads such a
+//! written and synced to disk before the batch commits. `--reverse <PATH>` reads such a
 //! manifest and, with `--apply`, puts the found parameters back on every claim
 //! that still holds exactly what was written; claims a live write has moved
 //! since are reported and left alone. Without `--apply` it only counts.
@@ -96,6 +96,22 @@ struct Cli {
     exclude_method: Vec<String>,
 }
 
+/// The manifest file. `flush`, which the replay calls once per batch before
+/// it commits, also syncs the file to disk, so a host crash after a commit
+/// cannot lose that batch's records.
+struct SyncedManifest(std::io::BufWriter<std::fs::File>);
+
+impl std::io::Write for SyncedManifest {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.0, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)?;
+        self.0.get_ref().sync_data()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -114,13 +130,13 @@ async fn main() -> anyhow::Result<()> {
     // touches the database, and a later write cannot clobber an older run's
     // manifest.
     let mut manifest_file = match (&cli.manifest, cli.apply) {
-        (Some(path), true) => Some(std::io::BufWriter::new(
+        (Some(path), true) => Some(SyncedManifest(std::io::BufWriter::new(
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(path)
                 .with_context(|| format!("create the manifest {}", path.display()))?,
-        )),
+        ))),
         _ => None,
     };
 

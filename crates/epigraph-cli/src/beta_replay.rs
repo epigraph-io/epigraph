@@ -81,8 +81,8 @@
 //! Without `apply` nothing is written: the report gives the counts and a
 //! sample. With `apply`, each batch's manifest records ([`ManifestRecord`]:
 //! the parameters found and the parameters written, bit-exact) are written and
-//! flushed BEFORE the batch commits, so every committed write is in the
-//! manifest; a record whose batch then failed restores nothing (its claim
+//! flushed BEFORE the batch commits (the binary's writer syncs the file on
+//! flush), so every committed write is in the manifest; a record whose batch then failed restores nothing (its claim
 //! does not hold `written`). [`reverse`] puts `before` back only where the
 //! claim still holds exactly `written`, and reports the rest: a claim a live
 //! write has moved since is not reset, because that would drop the live
