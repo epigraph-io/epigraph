@@ -45,8 +45,10 @@ pub enum DsError {
     #[error("Expected a two-hypothesis frame (got n={n})")]
     NotBinaryFrame { n: usize },
 
-    /// Frame has too many hypotheses for full power-set enumeration
-    #[error("Frame too large for power-set enumeration (n={n}, max=20)")]
+    /// Frame has too many hypotheses for full power-set enumeration: above 20
+    /// for `FrameOfDiscernment::power_set`, above
+    /// `combination::CAUTIOUS_RULE_MAX_HYPOTHESES` for `cautious_combine`
+    #[error("Frame too large for power-set enumeration (n={n})")]
     FrameTooLarge { n: usize },
 
     /// A conjunction query or item is malformed (an atom repeated, an empty
