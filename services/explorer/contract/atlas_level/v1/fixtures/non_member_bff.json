@@ -1,0 +1,7 @@
+{
+  "body": {
+    "error": "not_found",
+    "message": "We could not find that atlas level."
+  },
+  "status": 404
+}

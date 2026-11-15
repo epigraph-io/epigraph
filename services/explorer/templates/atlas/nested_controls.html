@@ -1,0 +1,9 @@
+{#- The nested-level controls, shared by the Atlas and its fixture preview.
+    atlas.js shows them only when the page carries data-atlas-maps. -#}
+<label class="atlas__map small" data-role="map-picker" hidden>Map
+  <select data-role="map" aria-label="Which map to show"></select>
+</label>
+<div class="atlas__switch small" role="group" aria-label="Group claims by" data-role="hierarchy-switch" hidden>
+  <button type="button" class="atlas__switch-btn" data-role="hierarchy" data-hierarchy="meaning" aria-pressed="true">By meaning</button>
+  <button type="button" class="atlas__switch-btn" data-role="hierarchy" data-hierarchy="links" aria-pressed="false">By links</button>
+</div>
