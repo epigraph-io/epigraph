@@ -462,11 +462,22 @@ def scan_reads(root, pkgs, dirs, files, read=None, gone=()):
             stem = rest[: -len("/mod.rs")] if rest.endswith("/mod.rs") else rest[: -len(".rs")]
             if "/" not in stem:
                 decl = re.compile(r"\bmod\s+" + re.escape(stem) + r"\s*;")
-                users = sorted(
-                    t for src, (p, t) in roots.items() if p == name and decl.search(text_of(src))
-                )
-                if users:
-                    return TARGETS, tuple(users)
+                top_only = False
+            else:
+                # A helper in a subdirectory, pulled in by a target at the top
+                # of tests/ with `#[path = "<dir>/<file>.rs"] mod <name>;`
+                # (the path is relative to that target's directory).
+                decl = re.compile(r'#\[\s*path\s*=\s*"' + re.escape(rest) + r'"\s*\]')
+                top_only = True
+            users = sorted(
+                t
+                for src, (p, t) in roots.items()
+                if p == name
+                and (not top_only or src.rsplit("/", 1)[0] == d + "/tests")
+                and decl.search(text_of(src))
+            )
+            if users:
+                return TARGETS, tuple(users)
         return PACKAGE, ()
 
     reads, walkers = [], set()
