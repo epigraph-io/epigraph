@@ -4742,7 +4742,17 @@ impl ClaimRepository {
     /// offset/limit.
     pub const MAX_AGENT_CLAIMS: i64 = 500;
 
-    /// Get all claims by an agent
+    /// Get an agent's CURRENT claims, newest first, at most
+    /// [`MAX_AGENT_CLAIMS`](Self::MAX_AGENT_CLAIMS).
+    ///
+    /// Retired rows (`is_current = false`) are excluded. Both callers are the
+    /// reputation calculators, which read `truth_value < 0.2` as "refuted";
+    /// retirement is operational, not epistemic. `deprecate_claim` writes
+    /// `truth_value = 0.05` in the statement that retires a row, and a
+    /// superseded version keeps whatever truth it had beside its successor, so
+    /// counting retired rows scored a workflow deprecation as a refutation and
+    /// counted one claim once per version (backlog 0f22d7b7). A current claim
+    /// whose belief has fallen below the threshold is still returned.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -4759,6 +4769,7 @@ impl ClaimRepository {
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE agent_id = $1
+              AND is_current = true
               /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
             LIMIT $2
