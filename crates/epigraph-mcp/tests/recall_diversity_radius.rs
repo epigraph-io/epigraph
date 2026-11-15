@@ -448,6 +448,7 @@ fn ctx_params(diversity_radius: Option<f64>) -> RecallWithContextParams {
         since: None,
         epistemic_partition: false,
         diversity_radius,
+        group_by_parent: false,
     }
 }
 

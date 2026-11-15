@@ -247,6 +247,5 @@ async fn evolve_step_embeds_the_new_step_on_supersedes_and_revises(pool: PgPool)
             (true, true),
             "{edge_type}: the new step is current AND embedded: {body}"
         );
-        assert_eq!(body["embedded"], true, "{edge_type}: {body}");
     }
 }

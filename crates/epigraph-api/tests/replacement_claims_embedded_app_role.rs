@@ -15,9 +15,10 @@
 //!
 //! # Verified to fail
 //!
-//! With the two `embed_committed_claim_as` calls removed
-//! (`routes/versioning.rs::supersede_claim`, `routes/workflows.rs::evolve_step`),
-//! every arm fails on its `embedding IS NOT NULL` assertion.
+//! With the two post-commit embed calls removed (`state.embed_claim_as` in
+//! `routes/versioning.rs::supersede_claim`, `embed_inserted_workflow_claims` in
+//! `routes/workflows.rs::evolve_step`), every arm fails on its
+//! `embedding IS NOT NULL` assertion.
 
 mod viewer_fixture;
 
@@ -193,6 +194,5 @@ async fn http_evolve_step_embeds_the_new_step_on_supersedes_and_revises(pool: Pg
             (true, true),
             "{edge_type}: the new step is current AND embedded: {body}"
         );
-        assert_eq!(body["embedded"], true, "{edge_type}: {body}");
     }
 }

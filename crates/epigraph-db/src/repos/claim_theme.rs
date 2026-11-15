@@ -75,13 +75,12 @@ pub const THEME_OVERVIEW_PAGE_MAX: i64 = 200;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThemeOverviewRow {
     pub id: Uuid,
-    /// Stored label. NOT viewer-derived: for a theme with members the viewer
-    /// cannot read it may summarise their text (the theme scripts that name
-    /// themes and clusters sample members with no visibility predicate,
-    /// except claims the bug-report intake group owns, which none of them
-    /// samples: `scripts/theme_lib.py::not_intake_owned` lists every such
-    /// path; the label residual on `D-PR16-theme-cluster-viewer-scope`). Cut
-    /// to 200 characters.
+    /// Stored label. NOT viewer-derived. The theme scripts that name themes
+    /// and clusters sample public, non-intake members only
+    /// (`scripts/theme_lib.py::public_label_source` lists every such path),
+    /// but a label stored before that rule, until an operator relabels, may
+    /// summarise text the viewer cannot read (the label residual on
+    /// `D-PR16-theme-cluster-viewer-scope`). Cut to 200 characters.
     pub label: String,
     /// Current claims assigned to this theme that the viewer can read. `>= 1`.
     pub member_count: i64,
@@ -212,6 +211,41 @@ pub struct RecomputedThemeRow {
     pub id: Uuid,
     pub label: String,
     pub claim_count: i32,
+}
+
+/// Open a transaction on `conn` (a savepoint when `conn` is already in one)
+/// that runs the next statement as a pgvector ITERATIVE HNSW scan: sets,
+/// transaction-local, `hnsw.iterative_scan = strict_order` and
+/// `hnsw.ef_search = clamp(limit, 40, 1000)`.
+///
+/// Backlog a507966d. A plain HNSW scan yields at most `ef_search` rows
+/// (pgvector default 40) BEFORE the predicates the index does not encode —
+/// the visibility splice among them — run, so rows a viewer cannot read
+/// sitting nearer the query than its own displace the viewer's rows from the
+/// result, and the size of the shortfall tells the viewer how many hidden rows
+/// sit near the query. `strict_order` keeps scanning, in exact distance order,
+/// until `LIMIT` matching rows are found (bounded by `hnsw.max_scan_tuples`,
+/// default 20,000). Same settings as `ClaimRepository::search_by_embedding_scoped`
+/// and `ClaimRepository::search_by_embedding_since_conn`.
+///
+/// The caller MUST roll the returned transaction back, never commit it: a
+/// committed savepoint would carry the `SET LOCAL` values into the caller's
+/// enclosing transaction and every later read in it. Both callers are
+/// read-only, so rolling back loses nothing. Harmless when the planner picks a
+/// non-HNSW plan (the 3072-d column has no HNSW index).
+async fn begin_iterative_hnsw(
+    conn: &mut sqlx::PgConnection,
+    limit: i64,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DbError> {
+    let mut tx = sqlx::Connection::begin(conn).await?;
+    sqlx::query(
+        "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                set_config('hnsw.ef_search', $1, true)",
+    )
+    .bind(limit.clamp(40, 1000).to_string())
+    .execute(&mut *tx)
+    .await?;
+    Ok(tx)
 }
 
 /// Validate `centroid_dim` and return the `(theme_centroid_col,
@@ -726,8 +760,9 @@ impl ClaimThemeRepository {
         centroid_dim: u32,
         paragraph_only: bool,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
+        let mut conn = pool.acquire().await?;
         Self::claims_in_themes_at_dim_since(
-            pool,
+            &mut conn,
             viewer,
             theme_ids,
             query_vec,
@@ -746,11 +781,23 @@ impl ClaimThemeRepository {
     /// `ClaimRepository::search_by_embedding` entirely — so a `since` wired
     /// only into the flat ANN would be silently ignored whenever
     /// `diverse=true`. That is precisely the bug class the existing
-    /// `paper_doi_filter` `TODO(diverse-recall)` already exhibits on this
-    /// path; the window must not become the second instance of it.
+    /// `paper_doi_filter` path exhibited (the MCP tool now rejects that
+    /// combination, backlog a2991ea6); the window must not become the second
+    /// instance of it.
+    ///
+    /// Current claims only, by its own `is_current` predicate, as are
+    /// [`Self::claims_in_theme_exact_at_dim`] and
+    /// [`Self::nearest_theme_coverage_since`]: like the flat seed query
+    /// (`ClaimRepository::search_by_embedding_since_conn`, backlog 7720cb7a),
+    /// the diverse reads no longer rely on `chk_deprecated_no_embedding`
+    /// alone to keep a retired claim out of recall.
+    ///
+    /// Runs with an iterative HNSW scan (backlog a507966d): see
+    /// [`begin_iterative_hnsw`]. Takes a connection rather than an executor
+    /// because the scan settings need a (rolled-back) transaction.
     #[allow(clippy::too_many_arguments)]
-    pub async fn claims_in_themes_at_dim_since<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn claims_in_themes_at_dim_since(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         theme_ids: &[Uuid],
         query_vec: &str,
@@ -775,6 +822,7 @@ impl ClaimThemeRepository {
              FROM claims c \
              WHERE c.theme_id = ANY($1) \
                AND c.{claim_col} IS NOT NULL \
+               AND c.is_current \
                AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz)\
                {level_clause} \
                /* {{VISIBILITY:c}} */ \
@@ -793,7 +841,10 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
+        let mut tx = begin_iterative_hnsw(conn, i64::from(limit)).await?;
+        let fetched = vq.fetch_all(&mut *tx).await;
+        tx.rollback().await?;
+        let rows = fetched?;
 
         let results = rows
             .iter()
@@ -812,9 +863,9 @@ impl ClaimThemeRepository {
     ///
     /// Exact because the member set is materialized before ordering: the
     /// `members` CTE is `MATERIALIZED` and carries no `ORDER BY`, so no HNSW
-    /// scan (and its post-filter under-fill, which makes
-    /// [`Self::claims_in_themes_at_dim_since`] lossy for a large theme at 1536)
-    /// can serve it. `min_similarity` and `since` are applied in SQL, inside
+    /// scan (whose post-filter under-fill [`Self::claims_in_themes_at_dim_since`]
+    /// has to counter with an iterative scan, bounded by
+    /// `hnsw.max_scan_tuples`) can serve it. `min_similarity` and `since` are applied in SQL, inside
     /// the candidate set and above the `LIMIT`.
     ///
     /// Returns `(claim_id, content, similarity)` ordered by descending
@@ -844,6 +895,7 @@ impl ClaimThemeRepository {
                  FROM claims c \
                  WHERE c.theme_id = $1 \
                    AND c.{claim_col} IS NOT NULL \
+                   AND c.is_current \
                    AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz) \
                    /* {{VISIBILITY:c}} */ \
              ), \
@@ -913,11 +965,16 @@ impl ClaimThemeRepository {
     /// vice versa. It is also tenancy-neutral — it counts only rows the viewer
     /// can see — and data-independent (no stored statistic to go stale).
     ///
-    /// Generic over [`sqlx::PgExecutor`] so the REST route can run it on its
-    /// viewer-stamped connection, like the two theme reads above.
+    /// Takes the caller's viewer-stamped connection (the REST route's and the
+    /// MCP pipeline's), and runs with an iterative HNSW scan (backlog
+    /// a507966d, see [`begin_iterative_hnsw`]): without it, `k` rows the viewer
+    /// cannot read sitting nearer the query exhausted the plain scan's
+    /// `ef_search` window before the visibility predicate ran, so `probed`
+    /// fell (to 0 at 40 such rows) and the guard's diverse-or-flat decision
+    /// was made by rows the viewer cannot see.
     #[allow(clippy::too_many_arguments)]
-    pub async fn nearest_theme_coverage_since<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn nearest_theme_coverage_since(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_vec: &str,
         neighbourhood_dim: u32,
@@ -952,6 +1009,7 @@ impl ClaimThemeRepository {
                  SELECT (c.theme_id = ANY($4::uuid[]) AND c.{reach_col} IS NOT NULL) AS reachable \
                  FROM claims c \
                  WHERE c.{nn_col} IS NOT NULL \
+                   AND c.is_current \
                    AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)\
                    {level_clause} \
                    /* {{VISIBILITY:c}} */ \
@@ -969,7 +1027,10 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row = q.fetch_one(executor).await.map_err(DbError::from)?;
+        let mut tx = begin_iterative_hnsw(conn, i64::from(k)).await?;
+        let fetched = q.fetch_one(&mut *tx).await;
+        tx.rollback().await?;
+        let row = fetched?;
         Ok(NeighbourhoodThemeCoverage {
             probed: row.get("probed"),
             reachable: row.get("reachable"),
@@ -1254,9 +1315,10 @@ impl ClaimThemeRepository {
     /// a zero row would publish the id and label of an all-private theme. The
     /// stale `claim_themes.claim_count` column is not read, under any name.
     /// `claim_themes` is not a tenancy table; only the counts, and through them
-    /// which theme rows appear, narrow. The LABEL is not narrowed and may be
-    /// derived from members the viewer cannot read (the label residual on
-    /// `D-PR16-theme-cluster-viewer-scope`).
+    /// which theme rows appear, narrow. The LABEL is not narrowed; the theme
+    /// scripts build it from public members only, but one stored before that
+    /// rule may be derived from members the viewer cannot read (the label
+    /// residual on `D-PR16-theme-cluster-viewer-scope`).
     ///
     /// `limit` is clamped to `1..=THEME_OVERVIEW_PAGE_MAX`. `after` is a pure
     /// keyset position: one naming a count or id that no longer exists returns

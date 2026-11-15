@@ -428,7 +428,7 @@ pub async fn store_workflow(
     let embedder = if result.already_ingested {
         None
     } else {
-        state.embedding_service()
+        state.storing_embedding_service()
     };
     if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
@@ -1752,9 +1752,6 @@ pub struct EvolveStepResponse {
     pub step_lineage_id: uuid::Uuid,
     pub edge_type: String,
     pub edge_id: uuid::Uuid,
-    /// Whether the new step got its embedding (best-effort; the maintenance
-    /// backfill reaches it otherwise).
-    pub embedded: bool,
     /// `supersedes` only: the Supersede admin cascade (migration 117) that
     /// carries the retired step's edges onto the new one, as
     /// `POST /api/v1/claims/:id/supersede` reports it (`applied`, `deferred`
@@ -1981,26 +1978,25 @@ pub async fn evolve_step(
         None => (None, None),
     };
 
-    // The new step is a CURRENT claim (on `supersedes` and `revises` alike), so
-    // it is embedded post-commit, best-effort (CLAUDE.md's write-path rule;
-    // backlog 7628ab2c): without a vector it is invisible to recall. On the
-    // caller's stamp, which authored and wrote the row; the maintenance
-    // session was released with its match arm above.
-    let embedded = state
-        .embed_committed_claim_as(
+    // The new step is a current claim with no vector: embed it post-commit,
+    // best-effort, on the caller's stamp, as the ingest routes above embed
+    // theirs (CLAUDE.md "Embedding policy"; backlog 7628ab2c).
+    if let Some(embedder) = state.embedding_service() {
+        embed_inserted_workflow_claims(
+            &state,
             &viewer,
-            result.new_claim_id,
-            &req.content,
-            "evolve_step.embed",
+            embedder.as_ref(),
+            "workflows/steps/evolve",
+            &[(result.new_claim_id, req.content.clone())],
         )
         .await;
+    }
 
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_type: result.edge_type,
         edge_id: result.edge_id,
-        embedded,
         cascade,
         belief_cascade,
     }))
@@ -2474,7 +2470,7 @@ pub async fn ingest_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     // `embed: false` (OD-6) sends no text to the embedder at all.
     let embedder = if embed.unwrap_or(true) && !result.already_ingested {
-        state.embedding_service()
+        state.storing_embedding_service()
     } else {
         None
     };

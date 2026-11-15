@@ -49,6 +49,11 @@ pub struct EpiGraphMcpFull {
     /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
     /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
     pub(crate) privileged_pool: Option<&'static str>,
+    /// The tasks tools detach and answer ahead of (a queued document walk, a
+    /// post-commit embedding loop), counted so the stdio entry point can wait
+    /// for them before the process exits. Shared by every clone of the server.
+    /// See [`crate::background`].
+    pub(crate) background: crate::background::BackgroundTasks,
     /// The key every signature this server makes is by. In the legacy modes
     /// it is also the agent's identity (`agents.public_key`); in the
     /// separate-signing-key mode (agent identity lineage design D2) it is the
@@ -1154,6 +1159,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer: Arc::new(signer),
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1199,6 +1205,14 @@ impl EpiGraphMcpFull {
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
         self
+    }
+
+    /// The set of detached tasks this server (and every clone of it) has
+    /// running. `main` takes it before handing the server to the stdio
+    /// transport, and waits on it after the client disconnects.
+    #[must_use]
+    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
+        self.background.clone()
     }
 
     /// Switch connector-mode elevation on or off (see the field's doc; OFF is
@@ -1294,6 +1308,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer,
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1406,7 +1421,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is."
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is. Each row also carries conjunct_estimate (a deterministic estimate of how many independent assertions the text makes) and conjunct_signals (the rules behind an estimate above 1: sentences, semicolon, coordination, enumeration, respectively). Both are advisory: they change neither looks_atomic nor what decompose_claims selects, and a looks_atomic=true row stays terminal whatever its estimate."
     )]
     async fn query_undecomposed_claims(
         &self,
@@ -1900,7 +1915,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Semantic search over every embedded claim in the graph (paragraphs, atoms, sections, workflow steps, submit_claim / memorize claims) with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges; each atom carries its authored truth_value and its belief_score, the effective belief on the same scale as the hit's own belief_score), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, CORROBORATES neighbors, and epistemic-edge neighbours (epistemic_edges: supports / refutes / contradicts / specializes / elaborates / cites, each with relationship, direction incoming|outgoing, truth_value; capped per relationship by epistemic_limit, default 4; epistemic_edges_total / _truncated report the full count). Parentage is enrichment, not eligibility: a hit with no paper attribution omits `paper` and has `section: null`. atoms, siblings and neighbor_paragraphs are built from the paper hierarchy, so only level-2 paragraph hits get them filled (an atom or section hit still carries `paper`, with those lists empty); corroborates and epistemic_edges come from the hit's own edges at any level, with or without a paper. `paragraph_id` is the hit's claim id whatever its level. Auto-detects centroid_dim (1536 vs 3072) from all embedded claims by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest claims belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. diverse=true is rejected alongside paper_doi_filter: the theme candidate pool cannot be restricted to one paper. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 paragraph with a live refutation lands in open_question."
+        description = "Semantic search over every embedded claim in the graph (paragraphs, atoms, sections, workflow steps, submit_claim / memorize claims) with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges; each atom carries its authored truth_value and its belief_score, the effective belief on the same scale as the hit's own belief_score), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, CORROBORATES neighbors, and epistemic-edge neighbours (epistemic_edges: supports / refutes / contradicts / specializes / elaborates / cites, each with relationship, direction incoming|outgoing, truth_value; capped per relationship by epistemic_limit, default 4; epistemic_edges_total / _truncated report the full count). Parentage is enrichment, not eligibility: a hit with no paper attribution omits `paper` and has `section: null`. atoms, siblings and neighbor_paragraphs are built from the paper hierarchy, so only level-2 paragraph hits get them filled (an atom or section hit still carries `paper`, with those lists empty); corroborates and epistemic_edges come from the hit's own edges at any level, with or without a paper. `paragraph_id` is the hit's claim id whatever its level. Auto-detects centroid_dim (1536 vs 3072) from all embedded claims by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest claims belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. diverse=true is rejected alongside paper_doi_filter: the theme candidate pool cannot be restricted to one paper. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 paragraph with a live refutation lands in open_question. Every response reports below_confidence_floor (candidates the min_truth floor dropped) and insufficient_confidence (true when candidates were retrieved but none cleared the floor, as opposed to nothing relevant). group_by_parent=true reorders the page so hits sharing a decomposes_to parent (the atoms of one compound claim) come back adjacent at their best member's rank, each tagged parent_claim_id; it changes order only, never the set."
     )]
     async fn recall_with_context(
         &self,
@@ -1910,6 +1925,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::recall::recall_with_context(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "The document context of ONE claim, looked up by id: its paper, section, atoms, sibling paragraphs and epistemic edges, with belief fields. Returns {claim_id, context}, where context is exactly the block recall_with_context returns per hit (minus similarity). Use it when you already hold a claim id: searching for the claim's own text can return a near-duplicate instead, and never returns a claim that has no embedding. A claim that is absent or that you cannot read is reported as not found. Read-only; writes no recall audit row."
+    )]
+    async fn claim_context(
+        &self,
+        Parameters(params): Parameters<crate::tools::recall::ClaimContextParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::recall::claim_context(self, viewer, params).await
     }
 
     #[tool(
@@ -2341,7 +2369,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only. Edges are only those between returned nodes; edges_omitted counts the edges followed to nodes not returned (node limit reached or min_truth filtered), so a positive edges_omitted with limit nodes returned means the node limit clipped the walk: raise limit if it is below its maximum of 100, otherwise narrow the walk with relationship or max_depth (limit cannot exceed 100)."
+        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label, its authored truth_value, and belief_score: the effective Dempster-Shafer belief, the same value recall and recall_with_context report as belief_score, falling back to truth_value for a claim with no DS state), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only, on belief_score. Edges are only those between returned nodes; edges_omitted counts the edges followed to nodes not returned (node limit reached or min_truth filtered), so a positive edges_omitted with limit nodes returned means the node limit clipped the walk: raise limit if it is below its maximum of 100, otherwise narrow the walk with relationship or max_depth (limit cannot exceed 100)."
     )]
     async fn traverse(
         &self,
@@ -3126,14 +3154,17 @@ impl ServerHandler for EpiGraphMcpFull {
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
                 // (d) proxy to the downstream on a fresh caller-token session.
-                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
-                // handler's error type directly (no further conversion).
+                // A failure is answered as what it is (backlog 7ea4bd74): the
+                // downstream's own JSON-RPC error unchanged, and a designed
+                // message for an extension that is down or did not answer.
+                // Every one of these used to reach the caller as the same
+                // redacted "internal error".
                 return self
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map(rmcp::model::CallToolResponse::from)
-                    .map_err(crate::errors::internal_error);
+                    .map_err(|e| crate::errors::federated_call_error(&ext_name, &request.name, e));
             }
 
             // Neither a kernel tool nor a federated route: a ROUTING failure.
