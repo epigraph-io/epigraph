@@ -6,7 +6,9 @@
 //!
 //! The REST path is `POST /api/v1/edges`' dependent propagation
 //! (`routes/edges.rs::propagate_to_dependents` -> `recompute_claim_belief` ->
-//! `edge_factor::recompute_claim_belief_binary`): an epistemic edge into T
+//! `edge_factor::recompute_claim_cached_belief`, the owner-rule fold, which on
+//! a claim whose only frame is `binary_truth` is `recompute_claim_belief_binary`):
+//! an epistemic edge into T
 //! recomputes every claim whose reasoning trace takes T as an input. That
 //! recompute runs on an UNSTAMPED connection from the raw pool, a session
 //! state neither MCP twin (a viewer-stamped application session, the
@@ -329,8 +331,9 @@ async fn an_edge_write_vacates_a_dependent_whose_every_bba_is_inadmissible(pool:
     assert_served_ignorance(&state, &pool, w.stranger, dependent).await;
 }
 
-/// The propagation's own recompute (`recompute_claim_belief_binary`, as
-/// `routes/edges.rs::recompute_claim_belief` calls it) on an UNSTAMPED
+/// The propagation's fold (`recompute_claim_belief_binary`, the fold
+/// `routes/edges.rs::recompute_claim_belief` reaches through the owner rule
+/// for a claim whose only frame is `binary_truth`) on an UNSTAMPED
 /// application-role connection, where row security hides the narrowed
 /// evidence from the session altogether. The R-80 decision reads run under
 /// that session state and decide to vacate: the write-free preview, which

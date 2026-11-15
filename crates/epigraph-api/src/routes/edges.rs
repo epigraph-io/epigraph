@@ -583,12 +583,17 @@ async fn propagate_to_dependents(
     Ok(recomputed)
 }
 
-/// Recompute a single claim's combined belief from its `binary_truth` BBAs.
+/// Refresh a single claim's cached belief through the cache-owner rule.
 ///
 /// Used by `propagate_to_dependents` to refresh dependent claims whose
-/// reasoning-trace inputs changed. Delegates to the engine's canonical
-/// CDST cascade (discount-by-source_strength → combine_multiple → write
-/// Bel/Pl/BetP).
+/// reasoning-trace inputs changed. Delegates to the engine's
+/// `recompute_claim_cached_belief`, which folds the frame
+/// `cache_owner_frame_for_claim` names (discount-by-source_strength →
+/// combine_multiple → write Bel/Pl/BetP) and leaves a claim with no owner
+/// as it was. It used to fold `binary_truth` unconditionally (backlog
+/// d33a5c9f): that wrote a COMPOUND dependent's cache, whose belief is a
+/// query over its leaves, from its own `binary_truth` inputs, and re-pointed
+/// a cache another frame owns to `binary_truth`.
 #[cfg(feature = "db")]
 async fn recompute_claim_belief(
     conn: &mut sqlx::PgConnection,
@@ -596,7 +601,7 @@ async fn recompute_claim_belief(
     claim_id: Uuid,
 ) -> Result<(), crate::errors::ApiError> {
     // On the caller's stamped transaction, as `trigger_edge_ds_recomputation`.
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(conn, viewer, claim_id)
+    epigraph_engine::edge_factor::recompute_claim_cached_belief(conn, viewer, claim_id)
         .await
         .map(|recomputed| {
             if recomputed {
