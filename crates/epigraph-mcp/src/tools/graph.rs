@@ -169,18 +169,12 @@ pub async fn traverse(
         // refreshes `truth_value`, so a node thoroughly refuted by epistemic
         // edges kept clearing a caller's gate at its pre-edge authored value.
         //
-        // Resolved per node rather than batched while a gate is set, because
-        // the walk is a BFS: whether a node is admitted (and so expanded)
-        // depends on its score, and the frontier is not known until the node
-        // ahead of it has been expanded. This is the same shape as the
-        // `get_by_id` above, so it adds at most one query per visited node
-        // (capped at `node_limit` = 100).
-        //
-        // With no gate (`min_truth <= 0.0`, the default) the score cannot drop
-        // anything, so it is NOT looked up here: those nodes keep
-        // `truth_value` as a placeholder and are resolved after the walk in
-        // ONE batch (backlog 1574d9b4), so every reported `belief_score` is
-        // the effective belief `recall` reports for the same claim.
+        // Resolved per node rather than batched because the walk is a BFS: the
+        // frontier is not known until the node ahead of it has been expanded.
+        // This is the same shape as the `get_by_id` above, so it adds at most
+        // one query per visited node (capped at `node_limit` = 100) — and it is
+        // skipped entirely on the DEFAULT path, where `min_truth` is 0.0 and
+        // the comparison cannot drop anything whichever column it reads.
         let belief_score = match truth {
             Some(tv) if min_truth > 0.0 => {
                 let resolved = ClaimRepository::effective_belief_batch(
@@ -221,9 +215,10 @@ pub async fn traverse(
             },
             label,
             truth_value: truth,
-            // The DS pignistic probability, or `truth_value` when the node
-            // carries no DS cache. On the ungated path this is a placeholder
-            // until the post-walk batch below overwrites it.
+            // What `min_truth` was compared against: the DS pignistic
+            // probability, or `truth_value` when the node carries no DS cache.
+            // On the default `min_truth = 0.0` path this is `truth_value` for
+            // now and is resolved in one batch after the walk.
             belief_score,
             depth,
         });
@@ -260,29 +255,36 @@ pub async fn traverse(
         }
     }
 
-    // Backlog 1574d9b4: on the ungated path no score was looked up during the
-    // walk, and the placeholder above is the authored `truth_value`, which
-    // `recall` does not report as `belief_score`. Resolve every admitted claim
-    // node in one batch. Degrade-not-fail, as on the gated path: a failed
-    // lookup (or a node absent from the map: invisible / deleted mid-walk)
-    // keeps the `truth_value` fall-back.
+    // On the default path (`min_truth` 0.0) the per-node lookup above is
+    // skipped, because it cannot change which nodes are admitted. It used to
+    // leave `belief_score` holding the AUTHORED `truth_value`, so the same
+    // claim read 0.40 here and 0.62 from `recall` (backlog 1574d9b4). One
+    // batched read after the walk fills in the score `recall` reports: the DS
+    // pignistic probability when the claim has DS state, else `truth_value`.
+    // A claim absent from the map keeps the `truth_value` already in hand
+    // (`effective_belief_batch`'s fall-back contract), as does every node if
+    // the read fails: the walk itself has succeeded.
     if min_truth <= 0.0 {
         let claim_ids: Vec<uuid::Uuid> = nodes
             .iter()
             .filter(|n| n.truth_value.is_some())
-            .filter_map(|n| uuid::Uuid::parse_str(&n.id).ok())
+            .filter_map(|n| n.id.parse().ok())
             .collect();
-        let resolved = ClaimRepository::effective_belief_batch(&mut *read, viewer, &claim_ids)
-            .await
-            .unwrap_or_default();
-        for n in &mut nodes {
-            if n.truth_value.is_some() {
-                if let Some(score) = uuid::Uuid::parse_str(&n.id)
-                    .ok()
-                    .and_then(|id| resolved.get(&id).copied())
-                {
-                    n.belief_score = Some(score);
+        match ClaimRepository::effective_belief_batch(&mut *read, viewer, &claim_ids).await {
+            Ok(beliefs) => {
+                for node in &mut nodes {
+                    let resolved = node
+                        .id
+                        .parse::<uuid::Uuid>()
+                        .ok()
+                        .and_then(|id| beliefs.get(&id));
+                    if let (Some(_), Some(score)) = (node.truth_value, resolved) {
+                        node.belief_score = Some(*score);
+                    }
                 }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "traverse: belief lookup failed; belief_score falls back to truth_value");
             }
         }
     }

@@ -53,20 +53,11 @@ pub async fn list_network_policies(
     Query(params): Query<ListPoliciesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let min_truth = params.min_truth.clamp(0.0, 1.0);
-    let rows: Vec<(Uuid, f64, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, truth_value, properties \
-         FROM claims \
-         WHERE 'policy:active' = ANY(labels) \
-           AND 'policy:network' = ANY(labels) \
-           AND truth_value >= $1 \
-         ORDER BY truth_value DESC",
-    )
-    .bind(min_truth)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to list policies: {e}"),
-    })?;
+    let rows = epigraph_db::PolicyRepository::list_active_network(&state.db_pool, min_truth)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to list policies: {e}"),
+        })?;
 
     let policies: Vec<serde_json::Value> = rows
         .into_iter()
@@ -211,55 +202,43 @@ pub async fn create_challenge(
     // its text into the linked human's group under the system identity.
     let mut tx = state.begin_claim_write(&viewer, "create_challenge").await?;
 
-    sqlx::query(
-        "SELECT pg_advisory_xact_lock(hashtext('epigraph.policy_challenge'), hashtext($1))",
-    )
-    .bind(&content)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create challenge: {e}"),
-    })?;
+    epigraph_db::PolicyRepository::lock_challenge_create(&mut tx, &content)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to create challenge: {e}"),
+        })?;
 
     // Taken AFTER the lock, as its own statement, so under READ COMMITTED it
     // reads a snapshot that includes a racing request's committed insert.
     // Ordered because production already holds duplicates from before this
     // lookup existed; the oldest is the one every repeat keeps answering with.
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM claims \
-         WHERE content_hash = $1 AND agent_id = $2 \
-           AND 'policy:challenge' = ANY(labels) \
-         ORDER BY created_at, id \
-         LIMIT 1",
+    let existing: Option<Uuid> = epigraph_db::PolicyRepository::find_challenge_by_hash(
+        &mut tx,
+        content_hash.as_slice(),
+        sys_agent_id,
     )
-    .bind(content_hash.as_slice())
-    .bind(sys_agent_id)
-    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to look up existing challenge: {e}"),
     })?;
 
+    let created = existing.is_none();
     let id = match existing {
         Some(id) => id,
-        None => sqlx::query_scalar(
-            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, \
-                                 visibility, owner_group_id) \
-             VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4, $5, $6) \
-             RETURNING id",
+        None => epigraph_db::PolicyRepository::insert_challenge(
+            &mut tx,
+            &content,
+            content_hash.as_slice(),
+            sys_agent_id,
+            &serde_json::json!({
+                "host": req.host,
+                "port": req.port,
+                "protocol": protocol,
+                "status": "pending",
+            }),
+            decl.visibility_bind(),
+            decl.owner_group_bind(),
         )
-        .bind(&content)
-        .bind(content_hash.as_slice())
-        .bind(sys_agent_id)
-        .bind(serde_json::json!({
-            "host": req.host,
-            "port": req.port,
-            "protocol": protocol,
-            "status": "pending",
-        }))
-        .bind(decl.visibility_bind())
-        .bind(decl.owner_group_bind())
-        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             let e = epigraph_db::DbError::from(e);
@@ -277,7 +256,59 @@ pub async fn create_challenge(
         message: format!("Failed to create challenge: {e}"),
     })?;
 
+    // Embed the new challenge, post-commit and best-effort (CLAUDE.md
+    // "Embedding policy"), as `create_claim` does: generated with no
+    // transaction held, stored on the caller's stamp, the authority that just
+    // wrote the row. A repeat request created nothing and embeds nothing.
+    if created {
+        embed_new_challenge(&state, &viewer, id, &content).await;
+    }
+
     Ok(Json(serde_json::json!({ "id": id })))
+}
+
+/// The post-commit embed of a challenge `create_challenge` just inserted.
+/// Every failure is logged and swallowed: the challenge is stored either way.
+#[cfg(feature = "db")]
+async fn embed_new_challenge(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+    content: &str,
+) {
+    let Some(embedder) = state.embedding_service() else {
+        tracing::debug!(claim_id = %id, "no embedding service; challenge not embedded");
+        return;
+    };
+    let embedding = match embedder.generate(content).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(claim_id = %id, error = %e, "Failed to generate challenge embedding");
+            return;
+        }
+    };
+    let pgvector = format!(
+        "[{}]",
+        embedding
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    match state
+        .store_claim_embedding_as(viewer, id, &pgvector, "create_challenge.embed")
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            claim_id = %id,
+            "challenge embedding matched no row (claim missing, sealed, superseded, or not \
+             writable by the caller); no vector stored"
+        ),
+        Err(e) => {
+            tracing::warn!(claim_id = %id, error = %e, "Failed to store challenge embedding");
+        }
+    }
 }
 
 /// GET /api/v1/policy-challenges/:id — fetch a challenge by ID.
@@ -286,16 +317,11 @@ pub async fn get_challenge(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, properties FROM claims \
-         WHERE id = $1 AND 'policy:challenge' = ANY(labels)",
-    )
-    .bind(id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch challenge: {e}"),
-    })?;
+    let row = epigraph_db::PolicyRepository::get_challenge(&state.db_pool, id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch challenge: {e}"),
+        })?;
 
     let (id, properties) = row.ok_or(ApiError::NotFound {
         entity: "policy-challenge".to_string(),

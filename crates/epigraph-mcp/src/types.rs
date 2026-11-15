@@ -1395,6 +1395,14 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
+    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
+    /// estimated number of independent assertions (backlog `72850d43`).
+    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
+    /// selects, and the two can disagree on a short coordinated sentence.
+    pub conjunct_estimate: usize,
+    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
+    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    pub conjunct_signals: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2897,10 +2905,8 @@ pub struct TraverseNode {
     /// Dempster–Shafer pignistic probability when the node carries a DS cache,
     /// else `truth_value`. `None` for a non-claim node.
     ///
-    /// The same value on every path, the default `min_truth = 0.0` one
-    /// included (backlog 1574d9b4), and the same value `recall` and
-    /// `recall_with_context` report as `belief_score` for the same claim and
-    /// caller.
+    /// The same value whatever `min_truth` was (backlog `1574d9b4`), and the
+    /// one `recall` reports as `belief_score` for the same claim and caller.
     pub belief_score: Option<f64>,
     pub depth: i32,
 }
