@@ -30,9 +30,36 @@ async fn run(pool: &PgPool, body: serde_json::Value) -> Result<serde_json::Value
     let state = AppState::with_scoped_pool(scoped_pool(pool).await, ApiConfig::default());
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
     let request: PropagateRequest = serde_json::from_value(body).expect("request");
-    propagate_beliefs(ViewerExtractor(viewer), State(state), Json(request))
-        .await
-        .map(|Json(v)| v)
+    propagate_beliefs(
+        ViewerExtractor(viewer),
+        bearer(agent, &["claims:read"]),
+        State(state),
+        Json(request),
+    )
+    .await
+    .map(|Json(v)| v)
+}
+
+/// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
+/// f00d75ab: only `apply_updates: true` needs `claims:write`; every run here
+/// is read-only).
+fn bearer(
+    agent: uuid::Uuid,
+    scopes: &[&str],
+) -> axum::Extension<epigraph_api::middleware::bearer::AuthContext> {
+    axum::Extension(epigraph_api::middleware::bearer::AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Service,
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        jti: uuid::Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    })
 }
 
 fn refused_on(res: Result<serde_json::Value, ApiError>, field: &str, what: &str) {
