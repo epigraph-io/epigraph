@@ -364,9 +364,9 @@ def store_results(conn, atom_ids, beliefs, conflicts, n_clusters, parent_cluster
         # Label clusters by sampling top-belief members' content
         for c in range(n_clusters):
             top = sorted(atom_ids, key=lambda a: -beliefs[a][c]["belief"])[:5]
-            # Never a bug report's text (theme_lib.not_intake_owned).
+            # Public members' text only (theme_lib.public_label_source).
             cur.execute("SELECT substring(c.content for 100) FROM claims c "
-                        "WHERE c.id = ANY(%s::uuid[]) AND " + theme_lib.not_intake_owned("c"),
+                        "WHERE c.id = ANY(%s::uuid[]) AND " + theme_lib.public_label_source("c"),
                         (top,))
             texts = [r[0] for r in cur.fetchall()]
             size = sum(1 for a in atom_ids
