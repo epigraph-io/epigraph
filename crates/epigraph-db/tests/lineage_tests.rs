@@ -658,6 +658,12 @@ async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
         lineage.claims.len() <= 3,
         "Lineage should not have duplicates despite cycle"
     );
+    // ...and report the cycle it walked (backlog c07884a9).
+    assert_eq!(lineage.claims.len(), 3);
+    assert!(
+        lineage.cycle_detected,
+        "A -> B -> C -> A is among the claims"
+    );
 }
 
 /// Test 10: Lineage returns results in topological order
@@ -2038,6 +2044,16 @@ async fn depth_and_cycle_check_finish_on_a_dense_dag(pool: PgPool) {
         .await
         .expect("detect_cycles over the lattice must finish inside the statement timeout");
     assert!(!has_cycle, "a dense DAG has no cycle");
+
+    // The full walk over the same DAG carries the same answer.
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, bottom, None, None)
+        .await
+        .expect("get_lineage over the lattice");
+    assert!(!up.cycle_detected, "a dense DAG has no cycle");
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None)
+        .await
+        .expect("get_descendants over the lattice");
+    assert!(!down.cycle_detected, "a dense DAG has no cycle");
 }
 
 /// Backlog c07884a9: `get_depth` is the LONGEST chain of parents, not the
@@ -2106,6 +2122,69 @@ async fn cycle_behind_the_start_is_detected_and_counted_once(pool: PgPool) {
     assert!(!LineageRepository::detect_cycles(&pool, &viewer, d)
         .await
         .expect("detect_cycles from d"));
+
+    let up = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
+        .await
+        .expect("get_lineage");
+    assert_eq!(up.claims.len(), 5);
+    assert!(up.cycle_detected, "b <-> c lies among the returned claims");
+    // Capped to the target and its nearest ancestor, the cycle is gone.
+    let capped = LineageRepository::get_lineage(&pool, &viewer, root, None, Some(2))
+        .await
+        .expect("get_lineage, capped");
+    assert!(capped.truncated);
+    assert!(
+        !capped.cycle_detected,
+        "the flag describes the returned claims, and {{root, a}} has no cycle"
+    );
+}
+
+/// Backlog c07884a9: `cycle_detected` and `detect_cycles` are real on the hub
+/// cycle (every kid on a 2-cycle through the root, reached from `end`, which
+/// is on no cycle), and both finish inside the statement timeout.
+///
+/// Before this fix `cycle_detected` was `false` by construction on every
+/// walk.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cycle_detected_is_set_on_the_hub_cycle(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (root, _kids, tail, end) = create_hub_cycle(&pool, "hub", HUB_KIDS).await;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    assert!(LineageRepository::detect_cycles(&mut *conn, &viewer, end)
+        .await
+        .expect("detect_cycles on the hub cycle"));
+    // end <- tail <- {root and every kid, kid_0 included}: the cycle is one
+    // step, so the depth is 2.
+    assert_eq!(
+        LineageRepository::get_depth(&mut *conn, &viewer, end)
+            .await
+            .expect("get_depth on the hub cycle"),
+        2
+    );
+
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, end, Some(UNBOUNDED), None)
+        .await
+        .expect("get_lineage on the hub cycle");
+    assert!(up.cycle_detected, "every kid is on a 2-cycle through root");
+    // Stopped before the root, the walk returns end, tail and kid_0 only.
+    let short = LineageRepository::get_lineage_conn(&mut conn, &viewer, end, Some(2), None)
+        .await
+        .expect("get_lineage before the root");
+    assert_eq!(short.claims.len(), 3);
+    assert!(!short.cycle_detected, "no cycle among end, tail and kid_0");
+
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED))
+        .await
+        .expect("get_descendants on the hub cycle");
+    assert!(
+        down.cycle_detected,
+        "every kid is on a 2-cycle through root"
+    );
+    let below = LineageRepository::get_descendants_conn(&mut conn, &viewer, tail, Some(UNBOUNDED))
+        .await
+        .expect("get_descendants below the cycle");
+    assert!(!below.cycle_detected, "tail -> end is a chain");
 }
 
 /// Backlog c07884a9: an edge the viewer cannot read cannot close a cycle.

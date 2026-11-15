@@ -58,11 +58,15 @@ pub struct LineageResult {
     pub traces: HashMap<Uuid, LineageTrace>,
     /// Nodes in topological order (ancestors first)
     pub topological_order: Vec<Uuid>,
-    /// Whether a cycle was detected. Always `false` from
-    /// [`LineageRepository::get_lineage`] and
-    /// [`LineageRepository::get_descendants`]: their walks never could set it
-    /// (see `get_lineage_conn`), and [`LineageRepository::detect_cycles`] is
-    /// the cycle check.
+    /// Whether the RETURNED claims contain a cycle through their
+    /// `parent_ids`: the claims after the `max_depth` bound and any
+    /// `max_nodes` cap, linked by the edges the walk follows (derivation edges
+    /// for [`LineageRepository::get_lineage`], every claim-to-claim edge for
+    /// [`LineageRepository::get_descendants`]) that the viewer can read. A
+    /// cycle that lies partly past the cut is not reported; a walk still ends
+    /// on a cycle and lists each claim once. For a check over the whole
+    /// reachable ancestor graph and every relationship, see
+    /// [`LineageRepository::detect_cycles`].
     pub cycle_detected: bool,
     /// Maximum depth reached
     pub max_depth_reached: i32,
@@ -367,6 +371,19 @@ fn tarjan_scc(adj: &[Vec<usize>]) -> (Vec<usize>, usize) {
         }
     }
     (comp, comp_count)
+}
+
+/// Whether the `child -> parent_ids` links of a walk's returned claims
+/// contain a cycle: what [`LineageResult::cycle_detected`] reports. Every
+/// parent named is itself a returned claim (the parent-edge query constrains
+/// both ends to them), so this is a cycle among the returned claims.
+fn parent_links_have_cycle(parent_map: &HashMap<Uuid, Vec<Uuid>>) -> bool {
+    ClaimDigraph::new(
+        parent_map
+            .iter()
+            .flat_map(|(child, parents)| parents.iter().map(move |p| (*child, *p))),
+    )
+    .has_cycle()
 }
 
 // ============================================================================
@@ -676,15 +693,9 @@ impl LineageRepository {
         // the same rows as before and only `truncated` learns about the probe.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // Both of these describe the WALK, so they are measured before the
-        // node cap below trims it.
-        //
-        // `cycle_detected` is `false` by construction, as it always was: the
-        // path-enumerating walk computed it as `c.id = ANY(path)` on rows its
-        // own `NOT c.id = ANY(path)` guard had already excluded, so no row
-        // could set it. The deduplicated walk keeps no path to test against.
-        // `Self::detect_cycles` is the cycle check.
-        let cycle_detected = false;
+        // This describes the WALK, so it is measured before the node cap
+        // below trims it. `cycle_detected`, by contrast, describes the
+        // RETURNED claims and is computed from their `parent_ids` below.
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
         // Depth-based truncation is exact: the probe layer found a visible
@@ -723,9 +734,10 @@ impl LineageRepository {
 
         if claim_ids.is_empty() {
             // No row at all (an invisible or missing root) or a cap of zero:
-            // the walk's own measurements still stand.
+            // the walk's own measurements still stand, and no claim means no
+            // cycle.
             return Ok(LineageResult {
-                cycle_detected,
+                cycle_detected: false,
                 max_depth_reached,
                 truncated,
                 ..LineageResult::default()
@@ -769,6 +781,7 @@ impl LineageRepository {
             };
             parent_map.entry(child).or_default().push(parent);
         }
+        let cycle_detected = parent_links_have_cycle(&parent_map);
 
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
@@ -1288,8 +1301,6 @@ impl LineageRepository {
         // The probe layer goes first, as in `get_lineage_conn`.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // `false` by construction, as in `get_lineage_conn`.
-        let cycle_detected = false;
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
         // Collect claim IDs for subsequent queries
@@ -1326,6 +1337,7 @@ impl LineageRepository {
                 .or_default()
                 .push(edge.source_id);
         }
+        let cycle_detected = parent_links_have_cycle(&parent_map);
 
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
@@ -1764,6 +1776,18 @@ mod tests {
         let g = graph(&v, &ring);
         assert!(g.has_cycle());
         assert_eq!(g.longest_chain_from(v[0]), 0);
+    }
+
+    #[test]
+    fn parent_links_cycle_follows_the_links() {
+        let v = ids(3);
+        let mut links: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        links.insert(v[0], vec![v[1], v[2]]);
+        links.insert(v[1], vec![v[2]]);
+        assert!(!parent_links_have_cycle(&links));
+        links.insert(v[2], vec![v[0]]);
+        assert!(parent_links_have_cycle(&links));
+        assert!(!parent_links_have_cycle(&HashMap::new()));
     }
 
     /// Create a test agent in the database and return its UUID.
