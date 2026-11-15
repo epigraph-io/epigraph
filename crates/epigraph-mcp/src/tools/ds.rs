@@ -420,8 +420,9 @@ pub async fn submit_ds_evidence(
              owned by the caller's group and public. The claim's frame assignment keeps the \
              hypothesis_index its owner set (a missing binary_truth assignment can only be \
              created at index 0), and the claim's cached belief (the belief returned here) is \
-             refreshed only when it already carries this frame, or seeded on binary_truth when \
-             the claim has no cache at all; a non-owner never re-points it to another frame."
+             refreshed only when this frame is the claim's cache-owner frame and the cache already \
+             carries it, or seeded on binary_truth when the claim has no cache at all; a \
+             non-owner never re-points it to another frame."
         ));
     }
 
@@ -566,11 +567,30 @@ pub async fn submit_ds_evidence(
     // committed and the claim's cached belief still describing the evidence
     // before it — success-shaped state behind a failure-shaped response. Now the
     // BBA and the belief it implies are one unit.
-    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-        &mut tx, viewer, claim_id, frame_id,
-    )
-    .await
-    .map_err(internal_error)?;
+    //
+    // ONLY WHEN THIS FRAME OWNS THE CACHE (backlog d33a5c9f). A claim's cache
+    // is ONE frame's fold, and `cache_owner_frame_for_claim` names that frame
+    // for every other recomputer (the bulk recomputes, retract, assess). This
+    // path used to fold whatever frame it was handed and, for a session that
+    // may write the claim row, re-point the cache to it: one `claim_validity`
+    // BBA replaced the `binary_truth` fold `update_with_evidence` had built,
+    // and the next owner-rule recompute put it back. The owner is resolved
+    // here, after this call's BBA is stored, so a claim whose only input is
+    // this BBA gets this frame. A compound has no owner, so its cache (a query
+    // over its leaves) is not written from its own BBAs here either.
+    let cache_owner =
+        MassFunctionRepository::cache_owner_frame_for_claim(&mut *tx, viewer, claim_id)
+            .await
+            .map_err(internal_error)?;
+    let cache_written = if cache_owner == Some(frame_id) {
+        epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+            &mut tx, viewer, claim_id, frame_id,
+        )
+        .await
+        .map_err(internal_error)?
+    } else {
+        false
+    };
 
     // Read back exactly what the shared recompute path just wrote, so the
     // response can never drift from what a later `recompute_beliefs` call
@@ -641,17 +661,19 @@ pub async fn submit_ds_evidence(
             })?
     };
 
-    // Migration 114: the claim's cache carries THIS frame's combination only
-    // when the recompute above was allowed to write it. A non-owner of a public
-    // claim refreshes a cache only on the frame it already carries, and seeds
-    // one only on `binary_truth` when the claim has none, so the cache may
-    // still describe another frame (or an older frameless combination), or be
-    // empty. Then the response reports this frame's combination, computed by
-    // the same write-free pipeline, and says the cache was not updated, rather
-    // than presenting another frame's cache as this call's belief (or failing
-    // on an empty one after the BBA was stored).
+    // The claim's cache carries THIS call's combination only when the
+    // recompute above ran AND wrote it. It does not run when another frame owns
+    // the cache, or the claim has no owner (a compound); and migration 114 lets
+    // a non-owner of a public claim refresh a cache only on the frame it
+    // already carries, or seed one only on `binary_truth` when the claim has
+    // none. A cache that already names this frame is not enough: one this path
+    // re-pointed before the owner gate still names it, without this BBA. Then
+    // the response reports this frame's combination, computed by the same
+    // write-free pipeline, and says the cache was not updated, rather than
+    // presenting a cache that does not include this BBA as this call's belief
+    // (or failing on an empty one after the BBA was stored).
     let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing) = match (
-        c_frame == Some(frame_id),
+        cache_written && c_frame == Some(frame_id),
         c_belief,
         c_plausibility,
         c_mass_on_empty,
@@ -665,12 +687,31 @@ pub async fn submit_ds_evidence(
             .await
             .map_err(internal_error)?
             .ok_or_else(|| internal_error("no BBA on this frame after storing one"))?;
-            warnings.push(format!(
-                "claim {claim_id}'s cached belief was NOT updated by this call: it carries another \
-                 frame (or an older cache with no recorded frame, or none on a frame other than \
-                 binary_truth), which a non-owner does not re-point or seed. belief, plausibility \
-                 and pignistic_prob here are this frame's combination, not the claim's cache."
-            ));
+            warnings.push(match cache_owner {
+                Some(owner) if owner != frame_id => format!(
+                    "claim {claim_id}'s cached belief was NOT updated by this call: the claim's \
+                     cache is the fold of its cache-owner frame {owner}, not of frame {frame_id} \
+                     (a frame with an input at least as widely readable as the claim ranks \
+                     first, then binary_truth, then claim_validity, then the frame the cache \
+                     already records, then the frame of the earliest input). This BBA is stored \
+                     on frame {frame_id}. belief, plausibility and pignistic_prob here are this \
+                     frame's combination, not the claim's cache."
+                ),
+                None => format!(
+                    "claim {claim_id}'s cached belief was NOT updated by this call: the claim \
+                     has no cache-owner frame (a compound, whose belief is derived from the \
+                     claims it decomposes into, has none), so no BBA of its own is folded into \
+                     its cache. belief, plausibility and pignistic_prob here are this frame's \
+                     combination, not the claim's cache."
+                ),
+                Some(_) => format!(
+                    "claim {claim_id}'s cached belief was NOT updated by this call: this frame \
+                     owns the cache, but the cache carries another frame (or an older cache \
+                     with no recorded frame, or none on a frame other than binary_truth), which \
+                     a non-owner of the claim does not re-point or seed. belief, plausibility \
+                     and pignistic_prob here are this frame's combination, not the claim's cache."
+                ),
+            });
             (
                 preview.belief,
                 preview.plausibility,

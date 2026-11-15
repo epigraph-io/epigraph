@@ -465,10 +465,13 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// leaves, not a fold of the BBAs that sit on it, so no recompute that
 /// resolves its owner through
 /// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite it.
-/// Writers that fold a named frame directly (for example the post-removal
-/// recompute of `backfill_factors`' edge re-wire, or the per-write
-/// `recompute_claim_belief_on_frame` callers) do not pass through this check;
-/// they are moved onto the single atom-cache writer separately.
+/// MCP `submit_ds_evidence` and `POST /api/v1/frames/:id/evidence` resolve
+/// the owner here too, and refold only when the posted frame is the owner
+/// (backlog d33a5c9f). Other writers that fold a named frame directly (for
+/// example the post-removal recompute of `backfill_factors`' edge re-wire, or
+/// the remaining per-write `recompute_claim_belief_on_frame` callers) do not
+/// pass through this check; they are moved onto the single atom-cache writer
+/// separately.
 ///
 /// A procedural node (every root above it is a workflow thesis authored by the
 /// registered `workflow-ingest` system agent) is no compound and keeps today's
@@ -1812,8 +1815,11 @@ impl MassFunctionRepository {
     /// **A compound has no owner** ([`super::claim_role::IS_COMPOUND_SQL`]):
     /// its belief is a query over its leaves, so no recompute that resolves its
     /// owner here (the three bulk recomputers and the `routes::assess`
-    /// refresh) refolds the BBAs that sit on it into its cache. Writers that
-    /// fold a named frame directly are not covered. A procedural node (one
+    /// refresh, and the two evidence writers, MCP `submit_ds_evidence` and
+    /// `POST /api/v1/frames/:id/evidence`, which refold only when the posted
+    /// frame is the owner) refolds the BBAs that sit on it into its cache.
+    /// Other writers that fold a named frame directly are not covered. A
+    /// procedural node (one
     /// whose every root is a workflow thesis authored by the registered
     /// `workflow-ingest` system agent, [`super::claim_role::IS_PROCEDURAL_SQL`])
     /// keeps the rules below.
