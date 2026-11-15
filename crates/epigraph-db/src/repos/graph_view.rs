@@ -42,27 +42,45 @@
 //!    similar names; `claim_clusters` (tenancy-bearing) is not `graph_clusters`
 //!    (not tenancy-bearing).
 //!
-//! # Residual: the `edges` traversals — narrowed by PR-13, not closed
+//! # The `edges` traversals — filtered
 //!
-//! **Corrected.** This section used to say "the `edges` traversals inside these
-//! projections are unfiltered" without exception. That was already stale:
-//! [`subgraph_edges`] has been filtered since PR-07 (finding M8), and it is now
-//! filtered with [`Viewer::edge_predicate_fragment`] via
-//! `/* {EDGE_VISIBILITY:edges} */`.
-//!
-//! What remains unfiltered is the `edges` joins *inside the node projections* —
+//! [`subgraph_edges`] has been filtered since PR-07 (finding M8), with
+//! [`Viewer::edge_predicate_fragment`] via `/* {EDGE_VISIBILITY:edges} */`
+//! since PR-13. The `edges` joins *inside the node projections* —
 //! [`expand_cluster_nodes`], [`neighborhood_compound_nodes`],
 //! [`neighborhood_atomic_nodes`], [`neighborhood_compound_groups`] and
-//! [`compound_neighbors`]. These have never carried a marker, so PR-13's
-//! conversion (which rewrote the fragment every already-filtered `edges` read
-//! uses) does not reach them: they need a predicate ADDED, with the join-vs-
-//! WHERE placement reasoning each one needs, not a fragment swapped.
+//! [`compound_neighbors`] — carried no marker until backlog batch B08 added one
+//! to each (`F-edges-unfiltered`). They disclosed *structure* (which ids relate
+//! to which, and degree counts), never content, because the returned rows were
+//! already claims-filtered.
 //!
-//! The residual is bounded in the same way it always was: the returned rows are
-//! claims-filtered, so it discloses *structure* (which ids relate to which) and
-//! never content. It stays open finding `F-edges-unfiltered` in
-//! `docs/tenancy/progress.json`, re-scoped there to name these five functions
-//! rather than "all traversals".
+//! The neighborhood expansion's EDGE arrays — [`neighborhood_induced_edges`],
+//! [`neighborhood_direct_edges`], [`neighborhood_structural_edges`] and
+//! [`neighborhood_atomic_edges`] — were inline in `graph_neighborhood.rs` and
+//! moved here in the same batch. Once the node projection walked only readable
+//! edges, the handler's unfiltered statements described a DIFFERENT graph from
+//! `nodes`: they classified compound vs standalone over every edge, so an atom
+//! served as standalone (its only parent edge hidden) lost its readable edges,
+//! and that absence disclosed the hidden edge. Each of them now uses the node
+//! projection's `atoms` CTE and filters every `edges` read, including the one
+//! it returns.
+//!
+//! Each marker's placement follows one rule: the result must equal what the
+//! statement returns on a graph WITHOUT the edges the viewer cannot read.
+//!
+//! * In a `JOIN`'s `WHERE`, or a scalar subquery's `WHERE`, the edge simply is
+//!   not walked.
+//! * In a `LEFT JOIN ... ON` that COUNTS or MAPS (`expand_cluster_nodes`'s
+//!   degree, `compound_neighbors`' projection onto a parent compound), the
+//!   predicate goes in the `ON`: in `WHERE` it would drop the left row, a
+//!   readable claim, whenever every edge it has is hidden.
+//! * Inside a `NOT EXISTS` that CLASSIFIES a readable row (`standalone_nodes`,
+//!   `center_atoms`), the predicate goes inside it. A hidden edge then no
+//!   longer changes the classification, which is the point: the row being
+//!   classified is already readable, so no unreadable row is admitted by the
+//!   suppression failing to fire. This is NOT the fail-open shape the
+//!   `visibility.rs` module doc warns about, where a filtered `LEFT JOIN` is
+//!   used to SUPPRESS a row that must stay suppressed.
 //!
 //! [`subgraph_edges`]: GraphViewRepository::subgraph_edges
 //! [`expand_cluster_nodes`]: GraphViewRepository::expand_cluster_nodes
@@ -70,6 +88,10 @@
 //! [`neighborhood_atomic_nodes`]: GraphViewRepository::neighborhood_atomic_nodes
 //! [`neighborhood_compound_groups`]: GraphViewRepository::neighborhood_compound_groups
 //! [`compound_neighbors`]: GraphViewRepository::compound_neighbors
+//! [`neighborhood_induced_edges`]: GraphViewRepository::neighborhood_induced_edges
+//! [`neighborhood_direct_edges`]: GraphViewRepository::neighborhood_direct_edges
+//! [`neighborhood_structural_edges`]: GraphViewRepository::neighborhood_structural_edges
+//! [`neighborhood_atomic_edges`]: GraphViewRepository::neighborhood_atomic_edges
 //! [`Viewer::edge_predicate_fragment`]: crate::visibility::Viewer::edge_predicate_fragment
 
 use tracing::instrument;
@@ -163,6 +185,37 @@ pub struct CompoundGroupRow {
     pub compound_id: Uuid,
     pub label: String,
     pub member_atom_ids: Vec<Uuid>,
+}
+
+/// An epistemic edge between two nodes of a neighborhood expansion, for
+/// [`GraphViewRepository::neighborhood_direct_edges`] and
+/// [`GraphViewRepository::neighborhood_atomic_edges`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NeighborhoodEdgeRow {
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relationship: String,
+}
+
+/// A compound-to-compound edge induced from atom-level edges, for
+/// [`GraphViewRepository::neighborhood_induced_edges`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InducedEdgeRow {
+    pub source: Uuid,
+    pub target: Uuid,
+    pub relationship: String,
+    pub strength: f64,
+    pub atom_edge_count: i32,
+}
+
+/// A structural link between two compounds, for
+/// [`GraphViewRepository::neighborhood_structural_edges`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct StructuralEdgeRow {
+    pub source: Uuid,
+    pub target: Uuid,
+    pub kind: String,
+    pub atom_count: i64,
 }
 
 /// A neighbouring compound in the compound-neighborhood projection.
@@ -269,6 +322,10 @@ impl GraphViewRepository {
     /// Backs `GET /api/v1/graph/clusters/:id/expand`. `degree_relationships`
     /// is the relationship allowlist used for the degree ordering.
     ///
+    /// The degree counts only edges the viewer can read. The edge predicate is
+    /// in the `LEFT JOIN`'s `ON`, not in `WHERE`: a member whose every edge is
+    /// hidden keeps a degree of 0 instead of being dropped.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, degree_relationships))]
@@ -286,6 +343,7 @@ impl GraphViewRepository {
                 FROM claim_cluster_membership m
                 LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
                                   AND e.relationship = ANY($3)
+                                  /* {EDGE_VISIBILITY:e} */
                 WHERE m.cluster_id = $1 AND m.run_id = $2 /* {VISIBILITY:m} */
                 GROUP BY m.claim_id
             )
@@ -322,6 +380,20 @@ impl GraphViewRepository {
     /// look filtered in review and leak through the other — which is why the
     /// marker is written per-`FROM`, not per-statement.
     ///
+    /// The `atoms` CTE joins `claims` and carries `{VISIBILITY:ac}` as well as
+    /// the membership marker, so `atom_count` counts only atoms the viewer can
+    /// read (`F-atom-count-cardinality`). The membership row normally inherits
+    /// its claim's tenancy, but the count must not depend on that: a bare count
+    /// of unreadable atoms is a cardinality oracle, the shape
+    /// `MassFunctionRepository::count_for_claim` documents.
+    ///
+    /// Every `edges` read carries `{EDGE_VISIBILITY:e}`, including the two
+    /// `NOT EXISTS` probes in `standalone_nodes`: an atom whose only
+    /// `decomposes_to` edge is hidden is served as standalone, exactly as if
+    /// the edge did not exist. Unfiltered, the probe would drop that readable
+    /// atom from the response, and its absence would tell the viewer a hidden
+    /// edge exists.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -335,13 +407,14 @@ impl GraphViewRepository {
             WITH atoms AS (
                 SELECT m.claim_id
                 FROM claim_neighborhood_membership m
-                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */
+                JOIN claims ac ON ac.id = m.claim_id
+                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */ /* {VISIBILITY:ac} */
             ),
             compound_to_atoms AS (
                 SELECT e.source_id AS compound_id, e.target_id AS atom_id
                 FROM edges e
                 JOIN atoms a ON a.claim_id = e.target_id
-                WHERE e.relationship = 'decomposes_to'
+                WHERE e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */
             ),
             compound_nodes AS (
                 SELECT cta.compound_id AS id, COUNT(*)::int AS atom_count
@@ -351,8 +424,8 @@ impl GraphViewRepository {
             standalone_nodes AS (
                 SELECT a.claim_id AS id
                 FROM atoms a
-                WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = a.claim_id AND e.relationship = 'decomposes_to')
-                  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = a.claim_id AND e.relationship = 'decomposes_to')
+                WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = a.claim_id AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
+                  AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = a.claim_id AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
             )
             SELECT c.id, COALESCE(c.content, c.id::text) AS label, 'compound'::text AS kind,
                    cn.atom_count, c.pignistic_prob,
@@ -376,6 +449,9 @@ impl GraphViewRepository {
 
     /// Claim-level nodes belonging to one precomputed neighborhood.
     ///
+    /// `compound_id` is a projected identifier, so its subquery walks only a
+    /// `decomposes_to` edge the viewer can read.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -389,7 +465,9 @@ impl GraphViewRepository {
             SELECT c.id,
                    COALESCE(c.content, c.id::text) AS label,
                    (SELECT e.source_id FROM edges e
-                    WHERE e.target_id = c.id AND e.relationship = 'decomposes_to' LIMIT 1) AS compound_id,
+                    WHERE e.target_id = c.id AND e.relationship = 'decomposes_to'
+                      /* {EDGE_VISIBILITY:e} */
+                    LIMIT 1) AS compound_id,
                    c.pignistic_prob,
                    (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id
             FROM claim_neighborhood_membership m
@@ -430,12 +508,262 @@ impl GraphViewRepository {
             FROM edges e
             JOIN claims c ON c.id = e.source_id
             JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id AND m.neighborhood_id = $1
-            WHERE e.relationship = 'decomposes_to' /* {VISIBILITY:c} */ /* {VISIBILITY:m} */
+            WHERE e.relationship = 'decomposes_to'
+              /* {VISIBILITY:c} */ /* {VISIBILITY:m} */ /* {EDGE_VISIBILITY:e} */
             GROUP BY 1, 2
             "#,
             2,
         );
         let mut q = sqlx::query_as::<_, CompoundGroupRow>(&sql).bind(neighborhood_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Compound-to-compound edges of a compound-mode neighborhood expansion,
+    /// induced from the epistemic edges between the compounds' atoms.
+    ///
+    /// The `atoms` CTE is the one [`Self::neighborhood_compound_nodes`] uses
+    /// (membership and the atom's own `claims` row, both filtered), and every
+    /// `edges` read carries `{EDGE_VISIBILITY:..}`: the atom-to-compound map
+    /// and the atom-level edge alike. So an induced edge, its `strength` and its
+    /// `atom_edge_count` are computed over the graph the node projection
+    /// describes, and an atom-level edge the viewer cannot read induces nothing.
+    ///
+    /// The compound endpoints are NOT claims-filtered here; the handler keeps
+    /// only edges whose endpoints survived the node projection.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_induced_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        neighborhood_id: Uuid,
+    ) -> Result<Vec<InducedEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH atoms AS (
+                SELECT m.claim_id
+                FROM claim_neighborhood_membership m
+                JOIN claims ac ON ac.id = m.claim_id
+                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */ /* {VISIBILITY:ac} */
+            ),
+            atom_to_compound AS (
+                SELECT d.target_id AS atom_id, d.source_id AS compound_id
+                FROM edges d JOIN atoms a ON a.claim_id = d.target_id
+                WHERE d.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:d} */
+            )
+            SELECT a2c_s.compound_id AS source,
+                   a2c_t.compound_id AS target,
+                   e.relationship,
+                   SUM(ft.forward_strength)::double precision AS strength,
+                   COUNT(*)::int AS atom_edge_count
+            FROM edges e
+            JOIN atoms a_s ON a_s.claim_id = e.source_id
+            JOIN atoms a_t ON a_t.claim_id = e.target_id
+            JOIN atom_to_compound a2c_s ON a2c_s.atom_id = e.source_id
+            JOIN atom_to_compound a2c_t ON a2c_t.atom_id = e.target_id
+            LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
+            WHERE a2c_s.compound_id <> a2c_t.compound_id
+              AND e.relationship <> 'decomposes_to'
+              AND ft.forward_strength > 0
+              /* {EDGE_VISIBILITY:e} */
+            GROUP BY 1, 2, 3
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, InducedEdgeRow>(&sql).bind(neighborhood_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Direct edges between the nodes of a compound-mode neighborhood
+    /// expansion: any edge whose two endpoints are both a compound or a
+    /// standalone of the neighborhood.
+    ///
+    /// The compound/standalone classification here MUST be the one
+    /// [`Self::neighborhood_compound_nodes`] makes, so it is written the same
+    /// way: the same `atoms` CTE, a compound is the source of a readable
+    /// `decomposes_to` edge onto a readable atom, and a standalone is a readable
+    /// atom with no readable `decomposes_to` edge either way (the predicate
+    /// sits INSIDE each `NOT EXISTS`, per the module doc). Classified over
+    /// unfiltered `edges`, an atom whose only parent edge is hidden was a
+    /// standalone in `nodes` but in neither set here, so its readable edges
+    /// were dropped and their absence disclosed the hidden parent.
+    ///
+    /// The returned edge itself carries the predicate too, so a hidden edge
+    /// between two served nodes is not returned.
+    ///
+    /// The `neighborhood_compounds` predicate is not observable through the
+    /// handler today: a compound reached only through a hidden edge is not in
+    /// `nodes`, and the handler's endpoint filter drops its edges anyway
+    /// (measured by deleting that marker: every arm stays green). It is kept so
+    /// this classification matches the node projection's without leaning on
+    /// that filter.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_direct_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        neighborhood_id: Uuid,
+    ) -> Result<Vec<NeighborhoodEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH atoms AS (
+                SELECT m.claim_id
+                FROM claim_neighborhood_membership m
+                JOIN claims ac ON ac.id = m.claim_id
+                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */ /* {VISIBILITY:ac} */
+            ),
+            neighborhood_compounds AS (
+                SELECT DISTINCT d.source_id AS id
+                FROM edges d
+                JOIN atoms a ON a.claim_id = d.target_id
+                WHERE d.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:d} */
+            ),
+            neighborhood_standalones AS (
+                SELECT a.claim_id AS id
+                FROM atoms a
+                WHERE NOT EXISTS (SELECT 1 FROM edges p WHERE p.target_id = a.claim_id AND p.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:p} */)
+                  AND NOT EXISTS (SELECT 1 FROM edges ch WHERE ch.source_id = a.claim_id AND ch.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:ch} */)
+            ),
+            compound_universe AS (
+                SELECT id FROM neighborhood_compounds UNION SELECT id FROM neighborhood_standalones
+            )
+            SELECT e.source_id, e.target_id, e.relationship
+            FROM edges e
+            JOIN compound_universe u_s ON u_s.id = e.source_id
+            JOIN compound_universe u_t ON u_t.id = e.target_id
+            -- No relationship filter: if both endpoints are displayed, the edge
+            -- is displayed. Users hide unwanted types via GraphControls toggles.
+            WHERE true /* {EDGE_VISIBILITY:e} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, NeighborhoodEdgeRow>(&sql).bind(neighborhood_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Structural links between the compounds of a compound-mode neighborhood
+    /// expansion: two compounds that parent the same atom (`shared_atom`), or
+    /// that are both `decomposes_to` children of one parent
+    /// (`shared_ancestor`).
+    ///
+    /// Every `edges` read carries `{EDGE_VISIBILITY:..}`, and the atoms are the
+    /// [`Self::neighborhood_compound_nodes`] `atoms` CTE, so a link exists only
+    /// through edges and atoms the viewer can read. The `shared_ancestor`
+    /// count additionally joins the ancestor's `claims` row with its own marker:
+    /// the count is a number of ancestor claims, and a count of claims the
+    /// viewer cannot read is a cardinality oracle (`F-atom-count-cardinality`'s
+    /// shape).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_structural_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        neighborhood_id: Uuid,
+    ) -> Result<Vec<StructuralEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH atoms AS (
+                SELECT m.claim_id
+                FROM claim_neighborhood_membership m
+                JOIN claims ac ON ac.id = m.claim_id
+                WHERE m.neighborhood_id = $1 /* {VISIBILITY:m} */ /* {VISIBILITY:ac} */
+            ),
+            parent_of_atom AS (
+                -- For each atom in the neighborhood: its parent compounds
+                SELECT d.source_id AS parent_id, d.target_id AS atom_id
+                FROM edges d
+                JOIN atoms a ON a.claim_id = d.target_id
+                WHERE d.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:d} */
+            ),
+            nbhd_compounds AS (
+                SELECT DISTINCT parent_id AS id FROM parent_of_atom
+            ),
+            shared_atom_pairs AS (
+                -- Compounds A,B that both parent the same atom in this neighborhood
+                SELECT
+                    LEAST(p1.parent_id, p2.parent_id)    AS source,
+                    GREATEST(p1.parent_id, p2.parent_id) AS target,
+                    'shared_atom'::text                  AS kind,
+                    COUNT(*)::bigint                     AS atom_count
+                FROM parent_of_atom p1
+                JOIN parent_of_atom p2
+                  ON p1.atom_id = p2.atom_id AND p1.parent_id < p2.parent_id
+                GROUP BY 1, 2, 3
+            ),
+            shared_ancestor_pairs AS (
+                -- Compounds A,B in the neighborhood with a common decomposes_to ancestor
+                SELECT
+                    LEAST(c1.id, c2.id)    AS source,
+                    GREATEST(c1.id, c2.id) AS target,
+                    'shared_ancestor'::text AS kind,
+                    COUNT(DISTINCT pa1.source_id)::bigint AS atom_count
+                FROM nbhd_compounds c1
+                JOIN nbhd_compounds c2 ON c1.id < c2.id
+                JOIN edges pa1 ON pa1.target_id = c1.id AND pa1.relationship = 'decomposes_to'
+                JOIN edges pa2 ON pa2.target_id = c2.id AND pa2.relationship = 'decomposes_to'
+                              AND pa1.source_id = pa2.source_id
+                JOIN claims anc ON anc.id = pa1.source_id
+                WHERE true /* {EDGE_VISIBILITY:pa1} */ /* {EDGE_VISIBILITY:pa2} */ /* {VISIBILITY:anc} */
+                GROUP BY 1, 2, 3
+            )
+            SELECT * FROM shared_atom_pairs
+            UNION ALL
+            SELECT * FROM shared_ancestor_pairs
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, StructuralEdgeRow>(&sql).bind(neighborhood_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The epistemic edges between the members of an atomic-mode neighborhood
+    /// expansion (`decomposes_to` excluded, positive `forward_strength` only).
+    ///
+    /// The edge carries `{EDGE_VISIBILITY:e}`, so a hidden edge between two
+    /// served members is not returned. Both membership joins carry
+    /// `{VISIBILITY:..}`; the members' `claims` rows are filtered by the
+    /// handler, which keeps only edges whose endpoints survived
+    /// [`Self::neighborhood_atomic_nodes`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_atomic_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        neighborhood_id: Uuid,
+    ) -> Result<Vec<NeighborhoodEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT e.source_id, e.target_id, e.relationship
+            FROM edges e
+            JOIN claim_neighborhood_membership ms ON ms.claim_id = e.source_id AND ms.neighborhood_id = $1
+            JOIN claim_neighborhood_membership mt ON mt.claim_id = e.target_id AND mt.neighborhood_id = $1
+            LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
+            WHERE e.relationship <> 'decomposes_to'
+              AND ft.forward_strength > 0
+              /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:ms} */ /* {VISIBILITY:mt} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, NeighborhoodEdgeRow>(&sql).bind(neighborhood_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -474,6 +802,14 @@ impl GraphViewRepository {
     /// compound (or themselves if standalone); the centre's own projection is
     /// excluded so the result carries no self-loops.
     ///
+    /// All four `edges` reads are filtered. `center_atoms`' positive arm and
+    /// its `NOT EXISTS` carry the SAME predicate, so the centre is "its
+    /// readable children, or itself when it has none"; and
+    /// [`Self::center_decomposition`] uses that predicate too, so the centre's
+    /// reported kind and the neighbour set describe one graph. The projection
+    /// `LEFT JOIN edges d` carries it in the `ON`: an atom whose parent edge is
+    /// hidden stands as itself rather than projecting onto that parent.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -492,11 +828,12 @@ impl GraphViewRepository {
                 SELECT e.target_id AS atom_id
                 FROM edges e, seed
                 WHERE e.source_id = seed.center AND e.relationship = 'decomposes_to'
+                  /* {EDGE_VISIBILITY:e} */
                 UNION
                 SELECT seed.center FROM seed
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM edges WHERE source_id = (SELECT center FROM seed)
-                    AND relationship = 'decomposes_to'
+                    SELECT 1 FROM edges ce WHERE ce.source_id = (SELECT center FROM seed)
+                    AND ce.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:ce} */
                 )
             ),
             epistemic_edges AS (
@@ -508,7 +845,7 @@ impl GraphViewRepository {
                 JOIN edge_to_factor_type(e.relationship) ft ON ft.forward_strength > 0
                 JOIN center_atoms ca
                     ON ca.atom_id = e.source_id OR ca.atom_id = e.target_id
-                WHERE e.source_id != e.target_id
+                WHERE e.source_id != e.target_id /* {EDGE_VISIBILITY:e} */
             ),
             projected AS (
                 SELECT
@@ -519,6 +856,7 @@ impl GraphViewRepository {
                 LEFT JOIN edges d
                     ON d.target_id = ee.other_atom_id
                     AND d.relationship = 'decomposes_to'
+                    /* {EDGE_VISIBILITY:d} */
             )
             SELECT
                 c.id,
@@ -543,6 +881,40 @@ impl GraphViewRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Whether `claim_id` has a `decomposes_to` child, and whether it has a
+    /// `decomposes_to` parent, counting only edges the viewer can read.
+    ///
+    /// Backs `center_kind` in `GET /api/v1/claims/:id/compound_neighborhood`.
+    /// The handler ran these as two inline `COUNT(*)`s over unfiltered `edges`,
+    /// so a hidden edge between two public claims turned a standalone centre
+    /// into a `compound` or an `atom` (`F-aggregate-existence-oracles`). Two
+    /// `EXISTS` in one statement, each carrying the same edge predicate as
+    /// [`Self::compound_neighbors`]' `center_atoms`, so the reported kind and
+    /// the neighbour set describe one graph.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn center_decomposition<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<(bool, bool), DbError> {
+        let sql = viewer.splice(
+            "SELECT \
+               EXISTS (SELECT 1 FROM edges ch WHERE ch.source_id = $1 \
+                         AND ch.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:ch} */), \
+               EXISTS (SELECT 1 FROM edges pa WHERE pa.target_id = $1 \
+                         AND pa.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:pa} */)",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (bool, bool)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Claim nodes of an arbitrary id set, for `load_subgraph`.
