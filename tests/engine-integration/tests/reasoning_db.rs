@@ -5,15 +5,14 @@
 
 use engine_integration_tests::harness::*;
 use epigraph_engine::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
+use sqlx::PgPool;
 use sqlx::Row;
 
 const PREFIX: &str = "[test-reasoning-db]";
 
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn transitive_support_detected_from_db() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn transitive_support_detected_from_db(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
     let agent = create_test_agent(&db.pool).await;
 
     // Create 3 claims forming a support chain: A → B → C

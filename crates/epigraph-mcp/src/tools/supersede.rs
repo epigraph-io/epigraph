@@ -39,7 +39,7 @@ pub async fn supersede_claim(
     // The act's edges are attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, caller) = begin_claim_act(
+    let (mut tx, actor, caller, author) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -105,11 +105,28 @@ pub async fn supersede_claim(
         (None, status) => (status, CascadeReport::default()),
     };
 
+    // The replacement is a CURRENT claim with new text and no vector (the act
+    // copies none on purpose), so it is embedded here like every other write
+    // path: post-commit and best-effort (CLAUDE.md "Embedding policy"; backlog
+    // 7628ab2c). Without this the claim that replaced a recallable one was
+    // invisible to `recall` until a backfill ran. Stored through the
+    // replacement's author, which it inherits from the retired claim.
+    let embedded = crate::claim_helper::embed_claim_author_stamped(
+        server,
+        author,
+        new_id,
+        &params.content,
+        None,
+        "supersede_claim",
+    )
+    .await;
+
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&serde_json::json!({
             "new_claim_id": new_id,
             "superseded_claim_id": old_id,
             "reason": params.reason,
+            "embedded": embedded,
             "cascade": cascade,
             "belief_cascade": belief_cascade,
         }))
@@ -344,7 +361,15 @@ async fn begin_claim_act<'p>(
     canonical: Option<uuid::Uuid>,
     tool: &'static str,
     action: &str,
-) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid, uuid::Uuid), McpError> {
+) -> Result<
+    (
+        epigraph_db::ScopedTx<'p>,
+        uuid::Uuid,
+        uuid::Uuid,
+        uuid::Uuid,
+    ),
+    McpError,
+> {
     let not_found = |id: uuid::Uuid| invalid_params(format!("claim {id} not found"));
 
     // The write identity (batch H-b, D1): the caller's own agent over HTTP,
@@ -359,7 +384,7 @@ async fn begin_claim_act<'p>(
             .map_err(internal_error)?
             .ok_or_else(|| not_found(claim))?;
         crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
-        return Ok((tx, caller.agent_id(), caller.agent_id()));
+        return Ok((tx, caller.agent_id(), caller.agent_id(), claim_author));
     };
 
     let mut caller_tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
@@ -412,7 +437,7 @@ async fn begin_claim_act<'p>(
     tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
-        return Ok((caller_tx, caller.agent_id(), caller.agent_id()));
+        return Ok((caller_tx, caller.agent_id(), caller.agent_id(), author));
     }
     if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
         // Not reachable through `claim_act_arm` (a non-admin arm requires the
@@ -428,7 +453,7 @@ async fn begin_claim_act<'p>(
         .await?;
     drop(caller_tx);
     let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
-    Ok((tx, server_agent.agent_id(), caller.agent_id()))
+    Ok((tx, server_agent.agent_id(), caller.agent_id(), author))
 }
 
 pub async fn mark_duplicate(
@@ -451,7 +476,7 @@ pub async fn mark_duplicate(
     // The identity edge is attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -625,7 +650,7 @@ pub(crate) async fn unmark_gate(
              written"
         )));
     }
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -652,7 +677,7 @@ pub(crate) async fn unmark_gate(
     // The same gate over each claim that replaced the canonical: the reversal
     // moves the duplicate's rows off it as off the canonical.
     for replacement in chain.iter().flat_map(|c| c.iter().skip(1)) {
-        let (mut tx, _, _) = begin_claim_act(
+        let (mut tx, _, _, _) = begin_claim_act(
             server,
             viewer,
             auth,

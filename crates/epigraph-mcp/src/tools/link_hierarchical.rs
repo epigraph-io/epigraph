@@ -44,7 +44,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
+use crate::errors::{internal_error, internal_error_logged, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::{LinkHierarchicalParams, LinkHierarchicalResponse};
 
@@ -130,9 +130,10 @@ async fn endpoint_exists(
         "workflow" => epigraph_db::WorkflowRepository::viewer_reads_row(&mut *conn, viewer, id)
             .await
             .map_err(internal_error),
-        other => Err(internal_error(format!(
-            "link_hierarchical: no existence check for entity type '{other}'"
-        ))),
+        other => Err(internal_error_logged(
+            "link_hierarchical: no existence check for this entity type",
+            format!("entity type '{other}'"),
+        )),
     }
 }
 
@@ -343,6 +344,67 @@ pub async fn do_link_hierarchical(
                  executes is written to the head only (an older generation's plan is frozen). \
                  Nothing was written."
             )));
+        }
+
+        // The target must already be THIS plan's step: a claim whose step
+        // lineage a generation of this lineage executes (the repair of a
+        // dropped edge; retracted edges count), or one written by the caller
+        // or by the workflow's submitter. Otherwise any workflow owner could
+        // adopt another agent's public claim as a step, and every gate that
+        // takes authority over "the workflows executing this step"
+        // (`evolve_step`, a step-claim `invokes`) would then answer to them.
+        let lineage_name = names.first().cloned().unwrap_or_default();
+        let executing =
+            epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut tx, target_id)
+                .await
+                .map_err(internal_error)?;
+        let executing_names =
+            epigraph_db::WorkflowRepository::canonical_names_of(&mut *tx, &executing)
+                .await
+                .map_err(internal_error)?;
+        let in_lineage = executing_names.contains(&lineage_name);
+        if !in_lineage {
+            let author =
+                ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(target_id))
+                    .await
+                    .map_err(internal_error)?
+                    .map(|c| c.agent_id.as_uuid());
+            let submitter = epigraph_db::WorkflowRepository::submitter_of(&mut *tx, source_id)
+                .await
+                .map_err(internal_error)?;
+            let own = author.is_some_and(|a| a == actor.agent_id() || Some(a) == submitter);
+            if !own {
+                return Err(invalid_params(format!(
+                    "refused: claim {target_id} is not a step of this workflow's lineage, and \
+                     neither the caller nor the workflow's submitter wrote it. executes repairs \
+                     or extends this plan with its own steps; it does not adopt another agent's \
+                     claim. Nothing was written."
+                )));
+            }
+        }
+
+        // A workflow endpoint has no tenancy of its own in the edges trigger
+        // (070), so the edge takes the claim's. From a non-public workflow
+        // that would name the plan in an edge readable more widely than the
+        // plan itself: the target claim must carry the plan's own tenancy,
+        // as the steps `add_step` writes do.
+        let plan = epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut tx, viewer, source_id)
+            .await
+            .map_err(internal_error)?;
+        if let Some((plan_vis, plan_owner)) = plan.filter(|(v, _)| v != "public") {
+            let claim = ClaimRepository::tenancy_of_conn(&mut tx, viewer, &[target_id])
+                .await
+                .map_err(internal_error)?;
+            let matches = claim
+                .first()
+                .is_some_and(|(_, v, g)| *v == plan_vis && *g == plan_owner);
+            if !matches {
+                return Err(invalid_params(format!(
+                    "refused: workflow {source_id} is not public, and claim {target_id} does not \
+                     carry its tenancy. The executes edge would take the claim's tenancy and name \
+                     the plan more widely than the plan itself is readable. Nothing was written."
+                )));
+            }
         }
     }
 

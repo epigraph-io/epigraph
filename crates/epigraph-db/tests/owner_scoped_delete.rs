@@ -2306,12 +2306,6 @@ fn no_application_path_deletes_a_non_tier_a_edge_node() {
              so a non-privileged session deletes nothing",
         ),
         (
-            "epigraph-db/src/repos/claim.rs",
-            "agents",
-            2,
-            "#[cfg(test)] fixture cleanup",
-        ),
-        (
             "epigraph-db/src/repos/recall_event.rs",
             "events",
             1,

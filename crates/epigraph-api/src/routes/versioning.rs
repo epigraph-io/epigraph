@@ -151,6 +151,10 @@ pub struct SupersessionResponse {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
+    /// Whether the replacement got its embedding (best-effort, post-commit; a
+    /// backfill covers a `false`). `#[serde(default)]` as for the two above.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 /// A single version entry in a claim's history
@@ -509,6 +513,15 @@ pub async fn supersede_claim(
         )
         .await;
 
+    // 9a'. Embed the replacement: a current claim with new text and no vector
+    // (the act copies none on purpose). Post-commit and best-effort, on the
+    // caller's stamp, which just wrote the row (CLAUDE.md "Embedding policy";
+    // backlog 7628ab2c). Without it the claim that replaced a recallable one
+    // was invisible to dense recall until a backfill ran.
+    let embedded = state
+        .embed_claim_as(&viewer, new_uuid, &request.content, "supersede_claim.embed")
+        .await;
+
     // 9b. The administrative cascade (backlog 20e9ed83; migration 117): migrate
     // the retired claim's edges onto the replacement, then invalidate the
     // edge-factor BBAs frozen from ITS interval and re-derive them. Those edges
@@ -544,6 +557,7 @@ pub async fn supersede_claim(
             created_at: now,
             cascade,
             belief_cascade,
+            embedded,
         }),
     ))
 }
@@ -1235,7 +1249,7 @@ pub async fn unmark_duplicate(
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule). Stored only if the claim is still current and unsealed.
     let mut embedded = false;
-    if let Some(embedder) = state.embedding_service() {
+    if let Some(embedder) = state.storing_embedding_service() {
         match embedder.generate(&content).await {
             Ok(v) => {
                 let pgvec = format!(
@@ -1391,12 +1405,14 @@ mod tests {
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
     // These need to be rewritten as proper DB integration tests.
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // COMPILED, NOT RUN: CI's "No-db lib-test build check" builds this
+    // module (`--no-run`) so it cannot rot into compile errors again, but its
+    // tests are not executed: in the not(db) arm `supersede_claim` and
+    // `claim_history` are 503 stubs, so the in-memory supersession these tests
+    // exercise no longer exists there. The `OK -> UNAUTHORIZED` flips
+    // inside it are DOCUMENTATION of the intended behaviour;
+    // `tests/public_router_allowlist.rs` is what asserts it, by probing every
+    // route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests_placeholder {
         use super::super::*;
@@ -1405,6 +1421,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::{get, post};
         use axum::Router;
+        use epigraph_core::Claim;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -2057,12 +2074,14 @@ mod tests {
         }
     } // end mod handler_tests
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // COMPILED, NOT RUN: CI's "No-db lib-test build check" builds this
+    // module (`--no-run`) so it cannot rot into compile errors again, but its
+    // tests are not executed: in the not(db) arm `supersede_claim` and
+    // `claim_history` are 503 stubs, so the in-memory supersession these tests
+    // exercise no longer exists there. The `OK -> UNAUTHORIZED` flips
+    // inside it are DOCUMENTATION of the intended behaviour;
+    // `tests/public_router_allowlist.rs` is what asserts it, by probing every
+    // route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;
@@ -2071,6 +2090,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::post;
         use axum::Router;
+        use epigraph_core::Claim;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 

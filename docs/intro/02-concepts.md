@@ -158,10 +158,11 @@ Two flows mint different tokens, and it is easy to confuse them:
   from, and it stays the same for years.
 - **Bearer tokens for the HTTP API** — short-lived JWTs (or
   OAuth-issued tokens from `/oauth/token`) that authorise a
-  *request*. For bootstrap scripts, the dev helper is
-  [`scripts/_api_client.py::mint_bearer_token`](../../scripts/_api_client.py)
-  (HS256 JWT with `EPIGRAPH_JWT_SECRET`); for production clients the
-  canonical mint flow is the `/oauth/token` endpoint mounted in
+  *request*. Bootstrap scripts get theirs from the `/oauth/token` endpoint
+  too, through
+  [`scripts/_api_client.py`](../../scripts/_api_client.py)
+  (`EPIGRAPH_TOKEN`, or a service client's `client_credentials` exchange);
+  for agent clients the canonical mint flow is the `/oauth/token` endpoint mounted in
   `crates/epigraph-api/src/routes/mod.rs`, using an Ed25519 client
   assertion of `ts(8B BE) || nonce(16B) || sig(64B)`.
 
@@ -264,6 +265,8 @@ Three vocabulary words sit close enough together that newcomers conflate them. T
 A **frame** is the hypothesis space a single mass function is defined over — `{H0, H1}`, `{accepts, rejects, undecided}`, or any finite mutually-exclusive set. Frames are stored in their own table and re-used across claims that share a hypothesis space; refinements (one frame nested inside another) are first-class via `parent_frame_id`.
 
 A **perspective** is a *viewpoint*: an agent-owned (or community-owned) lens that selects, weights, or filters claims when computing belief. The same atom can carry different BetP values from different perspectives without one overwriting the other — disagreement stays visible instead of being averaged away. Perspectives have a `perspective_type` ("analytical", "narrative", etc.), an optional list of `frame_ids` they operate over, and a `confidence_calibration` factor in `[0, 1]`.
+
+Two `perspective_type` values are **internal BBA slots, not viewpoints**: `edge` (one row per epistemic edge, whose id is the edge's id, named `edge_factor`) and `evidence` (one row per evidence row, sharing that evidence row's id, named `evidence_grounded`). The belief layer writes them so a mass function can be keyed to its edge or evidence row through the `mass_functions.perspective_id` foreign key. Nobody chooses them as a lens, so `list_perspectives`, `GET /api/v1/perspectives` and `GET /api/v1/agents/:id/perspectives` leave them out; they are still readable by id. Do not create a perspective of either type yourself.
 
 ```json
 // mcp__epigraph__list_perspectives  →

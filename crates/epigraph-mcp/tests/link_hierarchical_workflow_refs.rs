@@ -512,3 +512,97 @@ async fn executes_refuses_a_closing_cycle_and_a_non_head_generation(pool: PgPool
     assert!(err.message.contains("head generation"), "{}", err.message);
     assert_eq!(in_force(&pool, w1, step, "executes").await, 0);
 }
+
+/// `executes` repairs or extends a plan with its OWN steps. A workflow owner
+/// cannot adopt another agent's public claim as a step: that would make the
+/// owner's workflow one of "the workflows executing this step", the set
+/// `evolve_step` and a step-claim `invokes` take authority over, so the
+/// claim's author could no longer evolve or reference their own claim
+/// without the adopter. Refused, with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn executes_refuses_adopting_another_agents_claim(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let workflow = store(&server, &["own step"]).await;
+    let foreign = seed_claim(&pool, "another agent's public claim", 0.5).await;
+
+    let err = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(workflow, "workflow", foreign, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect_err("adopting another agent's claim as a step is refused");
+    assert!(
+        err.message
+            .contains("not a step of this workflow's lineage"),
+        "{}",
+        err.message
+    );
+    assert_eq!(in_force(&pool, workflow, foreign, "executes").await, 0);
+    let mut conn = pool.acquire().await.expect("conn");
+    let executing =
+        epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut conn, foreign)
+            .await
+            .expect("executing set");
+    assert!(executing.is_empty(), "the foreign claim gained no executor");
+}
+
+/// From a non-public workflow, the `executes` edge takes the claim's tenancy
+/// (a workflow endpoint has none in the edges trigger), so a public target
+/// would name the private plan in a public edge. Refused until the claim
+/// carries the plan's own tenancy, then admitted, and the stored edge is no
+/// wider than the plan.
+#[sqlx::test(migrations = "../../migrations")]
+async fn executes_from_a_private_workflow_needs_the_plans_tenancy(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let private = store(&server, &["private step"]).await;
+    let other = store(&server, &["a public step of another plan"]).await;
+    let (_, step) = step_claim(&pool, other, "a public step of another plan").await;
+    let (plan_owner,): (Uuid,) = sqlx::query_as(
+        "UPDATE workflows SET visibility = 'group' WHERE id = $1 RETURNING owner_group_id",
+    )
+    .bind(private)
+    .fetch_one(&pool)
+    .await
+    .expect("make the workflow group-private in its owner group");
+
+    let err = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(private, "workflow", step, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect_err("a private plan's executes to a public claim is refused");
+    assert!(err.message.contains("is not public"), "{}", err.message);
+    assert_eq!(in_force(&pool, private, step, "executes").await, 0);
+
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(step)
+        .bind(plan_owner)
+        .execute(&pool)
+        .await
+        .expect("give the claim the plan's tenancy");
+    do_link_hierarchical(
+        &server,
+        &viewer,
+        link(private, "workflow", step, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect("a claim with the plan's tenancy is admitted");
+    let (vis, owner): (String, Uuid) = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id FROM edges \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes' \
+            AND valid_to IS NULL",
+    )
+    .bind(private)
+    .bind(step)
+    .fetch_one(&pool)
+    .await
+    .expect("the edge");
+    assert_eq!((vis.as_str(), owner), ("group", plan_owner));
+}
