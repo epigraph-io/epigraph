@@ -1155,10 +1155,9 @@ fn repo_root_signer() -> AgentSigner {
 ///
 /// `AgentSigner` is not `Clone` and the key is fully derived from the (normalized)
 /// email, so the cache stores only the `Uuid`; the signer is rebuilt deterministically
-/// via `author_signer` on every call. Per Task 0, agent registration is NOT idempotent
-/// on `public_key` (a UNIQUE constraint makes a repeated POST error), so the in-run cache
-/// is what prevents the duplicate registration; cross-run find-or-create is a server
-/// concern tracked for Task 8.
+/// via `author_signer` on every call. `POST /agents` is find-or-create on
+/// `public_key`, so a later run gets the same id back; the cache only saves the
+/// repeated POSTs within a run.
 #[allow(dead_code)]
 async fn resolve_author_agent(
     client: &reqwest::Client,
@@ -1282,11 +1281,14 @@ impl AgentRegistry {
         }
     }
 
-    /// Get or create an agent for the given author email.
-    /// In dry-run mode, agents are generated locally without API registration.
+    /// Get or create an agent for the given author email. The key is derived
+    /// from the normalized email (`author_signer`), so the same author maps to
+    /// the same agent on every run, as in PR mode; the id is a placeholder until
+    /// registration returns the server's id (live mode).
     fn get_or_create(&mut self, email: &str, display_name: &str) -> &AuthorAgent {
-        self.agents.entry(email.to_string()).or_insert_with(|| {
-            let signer = AgentSigner::generate();
+        let key = email.trim().to_ascii_lowercase();
+        self.agents.entry(key).or_insert_with(|| {
+            let signer = author_signer(display_name, email);
             let agent_id = Uuid::new_v4();
             println!(
                 "  New agent for {email} ({display_name}): {}",
@@ -3248,6 +3250,30 @@ mod tests {
             claim_ids_citing_pr(&resp, 8),
             vec![Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap()]
         );
+    }
+
+    // Backlog 7d9e60c6 (6): per-author keys are derived from the email outside
+    // PR mode too, so a re-run maps an author to the same agent.
+    #[test]
+    fn per_author_registry_keys_are_stable_across_runs() {
+        let mut run1 = AgentRegistry::new();
+        let mut run2 = AgentRegistry::new();
+        let pk1 = run1
+            .get_or_create("alice@example.com", "Alice")
+            .signer
+            .public_key();
+        let pk2 = run2
+            .get_or_create(" Alice@Example.com ", "Alice")
+            .signer
+            .public_key();
+        assert_eq!(pk1, pk2);
+        assert_eq!(
+            pk1,
+            author_signer("Alice", "alice@example.com").public_key()
+        );
+        // Case variants of one email are one author, not two entries.
+        run1.get_or_create("ALICE@example.com", "Alice");
+        assert_eq!(run1.len(), 1);
     }
 
     #[test]
