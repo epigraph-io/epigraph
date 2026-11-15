@@ -77,6 +77,9 @@ struct Args {
     rev_range: Option<String>,
     /// Explicit orchestrator agent id, overriding trailer/env resolution (PR mode)
     orchestrator_id: Option<Uuid>,
+    /// File holding the host secret that keys the author and repo-root agent
+    /// keys (`--author-key-file`, else `EPIGRAPH_GIT_AUTHOR_KEY_FILE`)
+    author_key_file: Option<PathBuf>,
 }
 
 impl Args {
@@ -102,6 +105,7 @@ impl Args {
         let mut pr_author = None;
         let mut rev_range = None;
         let mut orchestrator_id = None;
+        let mut author_key_file = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -236,6 +240,13 @@ impl Args {
                             format!("--orchestrator-id must be a UUID, got: {val}")
                         })?);
                 }
+                "--author-key-file" => {
+                    i += 1;
+                    author_key_file = Some(PathBuf::from(
+                        args.get(i)
+                            .ok_or("--author-key-file requires a path argument")?,
+                    ));
+                }
                 "--help" | "-h" => {
                     return Err(USAGE.to_string());
                 }
@@ -247,6 +258,11 @@ impl Args {
         }
 
         let token = token_or_env(token, std::env::var("EPIGRAPH_TOKEN").ok());
+        let author_key_file = author_key_file.or_else(|| {
+            std::env::var_os("EPIGRAPH_GIT_AUTHOR_KEY_FILE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        });
 
         Ok(Self {
             repo,
@@ -268,6 +284,7 @@ impl Args {
             pr_author,
             rev_range,
             orchestrator_id,
+            author_key_file,
         })
     }
 }
@@ -292,6 +309,10 @@ Options:
       --enricher <MODE>   Enrichment mode: noop (default) or llm
       --embed             Generate and store embeddings for submitted claims
   -t, --token <TOKEN>     Bearer token [default: $EPIGRAPH_TOKEN]
+      --author-key-file <PATH>  File holding the 32-byte host secret (64 hex
+                              characters) that keys every author and repo-root
+                              agent key; required for a live --pr-ingest or
+                              per-author run [default: $EPIGRAPH_GIT_AUTHOR_KEY_FILE]
   -h, --help              Show this help message
 
 PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
@@ -1139,44 +1160,121 @@ struct CreateAgentRequest {
 // AGENT MANAGEMENT
 // =============================================================================
 
-/// Derive a STABLE Ed25519 signer for a git author from their email, so the same
-/// human maps to the same agent identity across every run and repo. Email is
-/// normalized (trimmed + lowercased). This is the interim author-DID scheme
-/// pending the project's real DID system (spec §6.3).
-fn author_signer(_display_name: &str, email: &str) -> AgentSigner {
-    let normalized = email.trim().to_ascii_lowercase();
-    let seed = blake3::hash(format!("epigraph-git-author-v1:{normalized}").as_bytes());
-    let key: [u8; 32] = *seed.as_bytes();
-    AgentSigner::from_bytes(&key).expect("32-byte blake3 hash is a valid Ed25519 seed")
+/// The host secret that keys every git-author and repo-root signing key.
+///
+/// The key for an author is `blake3::keyed_hash(secret, "epigraph-git-author-v2:" +
+/// normalized email)`. Without the secret, that key would be a function of the
+/// email alone, which is public in `git log`. The server gives a newly
+/// registered agent an active OAuth client when the caller is authenticated,
+/// and the client accepts any assertion that verifies under the agent's key, so
+/// a key anyone can compute is a login anyone can use. The secret makes the key
+/// stable on the host that holds it and unguessable everywhere else, the same
+/// pattern as the keyed LLM-agent identity (`keypair_from_llm_agent_keyed`).
+struct GitAuthorKeys {
+    secret: [u8; 32],
 }
 
-/// Derive the STABLE signer for the single repo-root *system* agent, derived from
-/// a constant identity (independent of repo or orchestrator). Every repo-root node
-/// is authored by this agent so that `(content_hash, agent_id)` is constant across
-/// every PR/orchestrator and the server's find-or-create collapses it to one node.
-/// Reuses the `author_signer` derivation so the key is a deterministic Ed25519 seed.
-fn repo_root_signer() -> AgentSigner {
-    author_signer("git-ingester-system", "git-ingester@epigraph.system")
+/// Domain-separation prefixes for the keyed derivation. Changing one changes
+/// every derived agent, so they are versioned.
+const GIT_AUTHOR_KEY_CONTEXT: &str = "epigraph-git-author-v2:";
+const GIT_REPO_ROOT_KEY_CONTEXT: &str = "epigraph-git-repo-root-v2";
+
+impl GitAuthorKeys {
+    /// Parse a key file: exactly 64 hex characters (32 bytes) after trimming,
+    /// not all zero. `openssl rand -hex 32` makes one. The error never echoes
+    /// the content.
+    fn parse(text: &str) -> Result<Self, String> {
+        let t = text.trim();
+        let mut secret = [0u8; 32];
+        if t.len() != 64 || hex::decode_to_slice(t, &mut secret).is_err() {
+            return Err("the author key file must hold exactly 64 hex characters \
+                        (32 bytes), e.g. from `openssl rand -hex 32`"
+                .to_string());
+        }
+        if secret == [0u8; 32] {
+            return Err("the author key file holds an all-zero key".to_string());
+        }
+        Ok(Self { secret })
+    }
+
+    fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read author key file {}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// A random secret for a dry run with no key file. Nothing is registered in
+    /// a dry run, so the keys only need to be distinct per author within it.
+    fn ephemeral() -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret);
+        Self { secret }
+    }
+
+    fn signer_for(&self, input: &str) -> AgentSigner {
+        let seed = blake3::keyed_hash(&self.secret, input.as_bytes());
+        AgentSigner::from_bytes(seed.as_bytes())
+            .expect("32-byte blake3 hash is a valid Ed25519 seed")
+    }
+
+    /// The signer for a git author. The email is normalized (trimmed and
+    /// lowercased) and the display name is not an input, so one human maps to
+    /// one agent across runs and repos on this host. This is the interim
+    /// author-DID scheme pending the project's real DID system (spec §6.3).
+    fn author(&self, email: &str) -> AgentSigner {
+        let normalized = email.trim().to_ascii_lowercase();
+        self.signer_for(&format!("{GIT_AUTHOR_KEY_CONTEXT}{normalized}"))
+    }
+
+    /// The signer for the single repo-root *system* agent. Every repo-root node
+    /// is authored by it, so `(content_hash, agent_id)` is constant across every
+    /// PR and orchestrator and the server's find-or-create collapses it to one
+    /// node. Its input is not an email, so no git author can collide with it.
+    fn repo_root(&self) -> AgentSigner {
+        self.signer_for(GIT_REPO_ROOT_KEY_CONTEXT)
+    }
+}
+
+/// The author keys for a run that derives author keys (`--pr-ingest`, or
+/// `--agent-key per-author`): the key file when one is given; with none, a live
+/// run is refused before any network call and a dry run gets an ephemeral
+/// secret.
+fn author_keys_for_run(
+    key_file: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<GitAuthorKeys, String> {
+    match key_file {
+        Some(path) => GitAuthorKeys::load(path),
+        None if dry_run => Ok(GitAuthorKeys::ephemeral()),
+        None => Err(
+            "a live run needs --author-key-file (or EPIGRAPH_GIT_AUTHOR_KEY_FILE): \
+             without the host secret every author key is computable from the public \
+             git log, and the server provisions a login for each registered agent"
+                .to_string(),
+        ),
+    }
 }
 
 /// Resolve (and register if needed) the stable agent id for a git author.
 /// Caches the resolved agent id per email within a run to avoid duplicate POSTs.
 ///
-/// `AgentSigner` is not `Clone` and the key is fully derived from the (normalized)
-/// email, so the cache stores only the `Uuid`; the signer is rebuilt deterministically
-/// via `author_signer` on every call. `POST /agents` is find-or-create on
+/// `AgentSigner` is not `Clone` and the key is fully derived from the host secret
+/// and the (normalized) email, so the cache stores only the `Uuid`; the signer is
+/// rebuilt deterministically via `GitAuthorKeys::author` on every call. `POST /agents` is find-or-create on
 /// `public_key`, so a later run gets the same id back; the cache only saves the
 /// repeated POSTs within a run.
 #[allow(dead_code)]
 async fn resolve_author_agent(
     client: &reqwest::Client,
     endpoint: &str,
+    keys: &GitAuthorKeys,
     cache: &mut std::collections::HashMap<String, Uuid>,
     display_name: &str,
     email: &str,
 ) -> Result<(AgentSigner, Uuid), String> {
     let key = email.trim().to_ascii_lowercase();
-    let signer = author_signer(display_name, email);
+    let signer = keys.author(email);
     if let Some(&agent_id) = cache.get(&key) {
         return Ok((signer, agent_id));
     }
@@ -1280,24 +1378,28 @@ struct AuthorAgent {
 
 /// Registry mapping author emails to their agent state
 struct AgentRegistry {
+    keys: GitAuthorKeys,
     agents: HashMap<String, AuthorAgent>,
 }
 
 impl AgentRegistry {
-    fn new() -> Self {
+    fn new(keys: GitAuthorKeys) -> Self {
         Self {
+            keys,
             agents: HashMap::new(),
         }
     }
 
     /// Get or create an agent for the given author email. The key is derived
-    /// from the normalized email (`author_signer`), so the same author maps to
-    /// the same agent on every run, as in PR mode; the id is a placeholder until
-    /// registration returns the server's id (live mode).
+    /// from the host secret and the normalized email (`GitAuthorKeys::author`),
+    /// so the same author maps to the same agent on every run, as in PR mode;
+    /// the id is a placeholder until registration returns the server's id (live
+    /// mode).
     fn get_or_create(&mut self, email: &str, display_name: &str) -> &AuthorAgent {
         let key = email.trim().to_ascii_lowercase();
+        let keys = &self.keys;
         self.agents.entry(key).or_insert_with(|| {
-            let signer = author_signer(display_name, email);
+            let signer = keys.author(email);
             let agent_id = Uuid::new_v4();
             println!(
                 "  New agent for {email} ({display_name}): {}",
@@ -2268,6 +2370,10 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
+    // The host secret for the author and repo-root keys, checked before any
+    // network call: a live run without it is refused.
+    let author_keys = author_keys_for_run(args.author_key_file.as_deref(), false)?;
+
     // 1) Resolve the implementing orchestrator agent: explicit flag, then trailer
     //    (PR body, then each commit's trailer block), then
     //    EPIGRAPH_DEFAULT_ORCHESTRATOR_ID as the fallback.
@@ -2287,7 +2393,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     //    use its returned id as the node's author. Registration is now `.await?`
     //    (not best-effort) because create_agent is idempotent on public_key
     //    (Plan 2.5 Tasks 1-2): a re-run returns the same id instead of a 400.
-    let repo_root_signer = repo_root_signer();
+    let repo_root_signer = author_keys.repo_root();
     let repo_root_id = AgentRegistry::register_agent(
         &client,
         &args.endpoint,
@@ -2331,6 +2437,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         let (signer, author_id) = resolve_author_agent(
             &client,
             &args.endpoint,
+            &author_keys,
             &mut author_cache,
             &commit.author_name,
             &commit.author_email,
@@ -2462,8 +2569,23 @@ async fn main() {
         }
     };
 
+    // Per-author keys need the host secret; a live per-author run without it is
+    // refused here, before enrichment or registration makes a network call. The
+    // other modes never derive an author key.
+    let author_keys = if primary_signer.is_none() {
+        match author_keys_for_run(args.author_key_file.as_deref(), args.dry_run) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        GitAuthorKeys::ephemeral()
+    };
+
     // Agent management: single shared agent or per-author agents
-    let mut registry = AgentRegistry::new();
+    let mut registry = AgentRegistry::new(author_keys);
     let mut shared_agent_id = primary_signer.as_ref().map(|_| Uuid::new_v4());
 
     if let Some(id) = shared_agent_id {
@@ -3018,11 +3140,17 @@ mod tests {
     // Deterministic per-author agent identity tests
     // -------------------------------------------------------------------------
 
+    /// A fixed test secret (never a real one).
+    fn test_keys() -> GitAuthorKeys {
+        GitAuthorKeys::parse(&"a5".repeat(32)).expect("64 hex characters")
+    }
+
     #[test]
-    fn author_signer_is_deterministic_per_email() {
-        let a = author_signer("A. Developer", "owner@example.com");
-        let b = author_signer("A. Dev", "owner@example.com"); // name differs, email same
-        let c = author_signer("Someone", "other@example.com");
+    fn author_key_is_deterministic_per_email() {
+        let keys = test_keys();
+        let a = keys.author("owner@example.com");
+        let b = test_keys().author("owner@example.com"); // a second load of the same secret
+        let c = keys.author("other@example.com");
         assert_eq!(a.public_key(), b.public_key(), "same email => same key");
         assert_ne!(
             a.public_key(),
@@ -3033,13 +3161,98 @@ mod tests {
 
     #[test]
     fn author_email_is_normalized() {
-        let a = author_signer("x", "Owner@Example.com  ");
-        let b = author_signer("x", "owner@example.com");
+        let keys = test_keys();
         assert_eq!(
-            a.public_key(),
-            b.public_key(),
+            keys.author("Owner@Example.com  ").public_key(),
+            keys.author("owner@example.com").public_key(),
             "case/space-insensitive email"
         );
+    }
+
+    // Review of backlog 7d9e60c6: a key derived from the email alone is
+    // computable from the public git log, and the server provisions an OAuth
+    // client for a newly registered key, so such a key is a login anyone can
+    // use. The key must depend on the host secret, and must not be the old
+    // public formula.
+    #[test]
+    fn author_key_is_not_computable_from_the_email_alone() {
+        let email = "alice@example.com";
+        let under_a = test_keys().author(email).public_key();
+        let under_b = GitAuthorKeys::parse(&"5a".repeat(32))
+            .unwrap()
+            .author(email)
+            .public_key();
+        assert_ne!(under_a, under_b, "the host secret must be an input");
+
+        let public_seed = blake3::hash(format!("epigraph-git-author-v1:{email}").as_bytes());
+        let public_formula = AgentSigner::from_bytes(public_seed.as_bytes()).unwrap();
+        assert_ne!(under_a, public_formula.public_key());
+        assert_ne!(under_b, public_formula.public_key());
+
+        // The documented derivation, spelled out independently.
+        let expected_seed = blake3::keyed_hash(
+            &[0xa5; 32],
+            format!("epigraph-git-author-v2:{email}").as_bytes(),
+        );
+        assert_eq!(
+            under_a,
+            AgentSigner::from_bytes(expected_seed.as_bytes())
+                .unwrap()
+                .public_key()
+        );
+    }
+
+    #[test]
+    fn repo_root_key_is_keyed_too() {
+        let public_seed = blake3::hash(b"epigraph-git-author-v1:git-ingester@epigraph.system");
+        let public_formula = AgentSigner::from_bytes(public_seed.as_bytes()).unwrap();
+        assert_ne!(
+            test_keys().repo_root().public_key(),
+            public_formula.public_key()
+        );
+        assert_ne!(
+            test_keys().repo_root().public_key(),
+            GitAuthorKeys::parse(&"5a".repeat(32))
+                .unwrap()
+                .repo_root()
+                .public_key(),
+            "the host secret must be an input"
+        );
+    }
+
+    #[test]
+    fn author_key_file_must_be_32_bytes_of_hex_and_not_zero() {
+        assert!(GitAuthorKeys::parse(&format!("  {}\n", "a5".repeat(32))).is_ok());
+        assert!(GitAuthorKeys::parse(&"a5".repeat(31)).is_err(), "too short");
+        assert!(GitAuthorKeys::parse(&"a5".repeat(33)).is_err(), "too long");
+        assert!(GitAuthorKeys::parse(&"zz".repeat(32)).is_err(), "not hex");
+        assert!(GitAuthorKeys::parse(&"00".repeat(32)).is_err(), "all zero");
+        let err = GitAuthorKeys::parse(&"zz".repeat(32)).err().unwrap();
+        assert!(!err.contains("zz"), "the error must not echo the content");
+    }
+
+    #[test]
+    fn a_live_run_without_an_author_key_file_is_refused() {
+        let err = author_keys_for_run(None, false)
+            .err()
+            .expect("live run refused");
+        assert!(err.contains("--author-key-file"), "{err}");
+        assert!(
+            author_keys_for_run(None, true).is_ok(),
+            "a dry run needs no key file"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ingest-git-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("author.key");
+        std::fs::write(&path, format!("{}\n", "a5".repeat(32))).unwrap();
+        let loaded = author_keys_for_run(Some(&path), false).expect("key file loads");
+        assert_eq!(
+            loaded.author("x@example.com").public_key(),
+            test_keys().author("x@example.com").public_key()
+        );
+        assert!(author_keys_for_run(Some(&dir.join("missing")), true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -3053,14 +3266,15 @@ mod tests {
         // `create_or_get` collapses the repo node across every PR/orchestrator.
         // `orchestrator_id` is not even an input to the repo-root signer, so two
         // different orchestrators necessarily resolve the same repo-root key.
+        let keys = test_keys();
         assert_eq!(
-            repo_root_signer().public_key(),
-            repo_root_signer().public_key(),
-            "repo-root signer is deterministic from a constant"
+            keys.repo_root().public_key(),
+            test_keys().repo_root().public_key(),
+            "repo-root signer is deterministic under one host secret"
         );
         assert_ne!(
-            repo_root_signer().public_key(),
-            author_signer("x", "someone@example.com").public_key(),
+            keys.repo_root().public_key(),
+            keys.author("git-ingester@epigraph.system").public_key(),
             "repo-root system agent is distinct from any git author"
         );
     }
@@ -3265,8 +3479,8 @@ mod tests {
     // PR mode too, so a re-run maps an author to the same agent.
     #[test]
     fn per_author_registry_keys_are_stable_across_runs() {
-        let mut run1 = AgentRegistry::new();
-        let mut run2 = AgentRegistry::new();
+        let mut run1 = AgentRegistry::new(test_keys());
+        let mut run2 = AgentRegistry::new(test_keys());
         let pk1 = run1
             .get_or_create("alice@example.com", "Alice")
             .signer
@@ -3276,10 +3490,7 @@ mod tests {
             .signer
             .public_key();
         assert_eq!(pk1, pk2);
-        assert_eq!(
-            pk1,
-            author_signer("Alice", "alice@example.com").public_key()
-        );
+        assert_eq!(pk1, test_keys().author("alice@example.com").public_key());
         // Case variants of one email are one author, not two entries.
         run1.get_or_create("ALICE@example.com", "Alice");
         assert_eq!(run1.len(), 1);
@@ -4033,7 +4244,7 @@ fix(db): prevent SQL injection in claim search
 
     #[test]
     fn test_agent_registry_creates_unique_agents() {
-        let mut registry = AgentRegistry::new();
+        let mut registry = AgentRegistry::new(test_keys());
 
         let a1 = registry.get_or_create("alice@example.com", "Alice");
         let a1_id = a1.agent_id;
@@ -4051,7 +4262,7 @@ fix(db): prevent SQL injection in claim search
 
     #[test]
     fn test_agent_registry_reuses_existing() {
-        let mut registry = AgentRegistry::new();
+        let mut registry = AgentRegistry::new(test_keys());
 
         let first = registry.get_or_create("alice@example.com", "Alice");
         let first_id = first.agent_id;
@@ -4066,7 +4277,7 @@ fix(db): prevent SQL injection in claim search
 
     #[test]
     fn test_agent_registry_empty() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(test_keys());
         assert_eq!(registry.len(), 0);
     }
 
@@ -4606,7 +4817,7 @@ crates/epigraph-core/src/domain/mod.rs",
         let output = realistic_git_log_output();
         let commits = parse_git_log_output(&output).unwrap();
 
-        let mut registry = AgentRegistry::new();
+        let mut registry = AgentRegistry::new(test_keys());
 
         for commit in &commits {
             registry.get_or_create(&commit.author_email, &commit.author_name);
