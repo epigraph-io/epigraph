@@ -2656,20 +2656,23 @@ restart.
   **Applied to throwaway databases only, NOT to any deployed database.**
 - **227**: public `sealed_public_race_lock` (backlog e8f9c07e). Re-states
   176's `epigraph_no_public_sealed()` (the PRV01 trigger body on
-  `claim_encryption`) so its read of `claims.visibility` is `FOR SHARE OF c`,
+  `claim_encryption`) so its read of `claims.visibility` is `FOR NO KEY UPDATE OF c`
+  (the lock the seal's own `UPDATE claims` takes; `FOR SHARE` would deadlock
+  two deliveries of one seal),
   falling back to 176's unlocked read when the locked read finds no row (so
   it never refuses less than 176). Before it, a seal and a publicize of the
   same claim could both commit under READ COMMITTED, leaving a public claim
   whose content is the seal sentinel: neither the PRV01 trigger nor 074's
   `claims_block_widening` waited on the other's uncommitted write. Now the
   seal waits on a publicize's row lock and re-reads the public row, and a
-  publicize waits on the seal's share lock and 074's unchanged EXISTS then
+  publicize waits on the seal's row lock and 074's unchanged EXISTS then
   sees the committed ciphertext row. Guarded: refuses (55000) unless the
   live body is 176's (md5 of `prosrc`). Same owner, ACL, SECURITY INVOKER and
   PRV01 text and SQLSTATE; no table, trigger or policy changes. Pinned by
   `epigraph-db/tests/sealed_public_race.rs` (both orderings commit a public
   sealed claim at 226 and are refused at 227; every role that may write
-  `claim_encryption` holds UPDATE on `claims`, which `FOR SHARE` needs; the
+  `claim_encryption` holds UPDATE on `claims`, which a locking read needs; a redelivered seal is still a no-op;
+  a public claim hidden from the locking read is still refused; the
   app role's PRV01 refusals are the same at 226 and 227). Undo:
   `docs/runbooks/227-undo.sql` (tested: run twice, it returns the `public`
   catalog to below 227); it brings the race back. Checked before claiming:

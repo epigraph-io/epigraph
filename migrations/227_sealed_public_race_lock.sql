@@ -36,13 +36,13 @@
 -- 1. THE FIX: the seal trigger LOCKS the claim row it reads
 -- ===================================================================
 --
--- `SELECT ... FOR SHARE OF c` conflicts with the publicize's row lock (an
--- UPDATE of a non-key column takes FOR NO KEY UPDATE), so:
+-- `SELECT ... FOR NO KEY UPDATE OF c` conflicts with the publicize's row lock
+-- (an UPDATE of a non-key column takes the same FOR NO KEY UPDATE), so:
 --
 --   * PUBLICIZE FIRST: the seal's read waits for the publicize to end. When
 --     it commits, READ COMMITTED re-reads the row's newest version, which is
 --     public, and PRV01 refuses the seal.
---   * SEAL FIRST: the seal holds FOR SHARE on the claim row from its first
+--   * SEAL FIRST: the seal holds the claim row's lock from its first
 --     statement to its commit. The publicize's UPDATE waits for that lock
 --     BEFORE its row trigger fires (PostgreSQL locks the target row and then
 --     runs BEFORE ROW triggers on the version it locked). 074's EXISTS is a
@@ -54,6 +54,18 @@
 -- sealed claim) and against this body (where they are refused), by
 -- crates/epigraph-db/tests/sealed_public_race.rs.
 --
+-- WHY NOT FOR SHARE. FOR SHARE also conflicts with the publicize, but two
+-- deliveries of one seal can BOTH hold it: `seal_claims_conn` makes a
+-- re-delivered commit a no-op with `ON CONFLICT (claim_id) DO NOTHING`, and
+-- the BEFORE trigger fires before the conflict check. The second delivery
+-- would take FOR SHARE, then wait on the first's uncommitted unique-index
+-- entry, while the first's statement 2 (`UPDATE claims`) waits on the
+-- second's FOR SHARE: a deadlock (measured; pinned by
+-- `a_redelivered_seal_is_a_no_op_not_a_deadlock`). FOR NO KEY UPDATE is the
+-- lock statement 2 takes anyway, so the second delivery waits in its trigger
+-- until the first commits, and its INSERT is then the no-op it was before.
+-- It still does not conflict with the KEY SHARE an FK check takes.
+--
 -- THE LOCK UNDER ROW SECURITY. The function stays SECURITY INVOKER, as 081
 -- wrote it, so the read is still the caller's. A locking read applies the
 -- table's UPDATE policies as well as its SELECT policies, and needs UPDATE
@@ -62,7 +74,8 @@
 -- USING for UPDATE as for SELECT; 126's restrictive `claims_elevated_no_update`
 -- hides rows only from an elevated session, which 126 also refuses any
 -- `claim_encryption` write). Every role that may write `claim_encryption`
--- holds UPDATE on `claims` (measured on a fresh database by the test above).
+-- holds UPDATE on `claims` (measured on a fresh database by
+-- `sealed_public_race.rs::every_role_that_may_seal_may_lock_the_claim_row`).
 -- So that no future policy can make this check refuse LESS than 176's, a
 -- locked read that finds no row falls back to 176's unlocked read: the
 -- refusal set is never smaller than before, and is larger only by the race.
@@ -74,9 +87,9 @@
 -- `claim_encryption_no_public_sealed` itself; PRV01's text and SQLSTATE
 -- (42501), so every caller that maps it answers as before.
 --
--- COST: a seal holds FOR SHARE on each claim it seals until it commits. A seal
--- already takes each claim's row lock in its statement 2, so this moves that
--- wait earlier rather than adding one. A multi-claim seal and a multi-claim
+-- COST: a seal holds each claim's row lock from its INSERT until it commits.
+-- A seal already takes that same lock in its statement 2, so this moves the
+-- wait earlier rather than adding a new kind of lock. A multi-claim seal and a multi-claim
 -- publicize that reach the same claims in opposite orders can deadlock; one is
 -- aborted with 40P01 and nothing is half-written.
 --
@@ -113,7 +126,8 @@ BEGIN
     -- 227: lock the claim row, so a concurrent publicize either finishes
     -- first (and this re-reads its public version) or waits for this seal to
     -- commit (and 074's check then sees the ciphertext row).
-    SELECT c.visibility INTO v FROM public.claims c WHERE c.id = NEW.claim_id FOR SHARE OF c;
+    SELECT c.visibility INTO v FROM public.claims c WHERE c.id = NEW.claim_id
+       FOR NO KEY UPDATE OF c;
     IF NOT FOUND THEN
         -- Never refuse less than 176: a row the locking read cannot see
         -- (UPDATE policies, or none) is read as 176 read it.

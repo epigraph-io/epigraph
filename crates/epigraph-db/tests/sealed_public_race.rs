@@ -32,7 +32,7 @@
 //! publicize-first by PRV01, seal-first by 074's SEALED refusal (074 is not
 //! changed; its EXISTS takes a fresh snapshot after the row wait).
 //!
-//! [`every_role_that_may_seal_may_lock_the_claim_row`]: `FOR SHARE` needs
+//! [`every_role_that_may_seal_may_lock_the_claim_row`]: a locking read needs
 //! UPDATE on `claims`, so a role that may write `claim_encryption` without it
 //! would have every seal turned into a permission error.
 //!
@@ -40,13 +40,26 @@
 //! role (row security on), sealing its own group claim succeeds and sealing a
 //! public claim is refused with PRV01, at 226 and at 227 alike.
 //!
+//! [`a_redelivered_seal_is_a_no_op_not_a_deadlock`]: two deliveries of one
+//! seal (`ON CONFLICT DO NOTHING`) still end in one commit and one no-op. A
+//! FOR SHARE lock in the trigger deadlocked them (measured), which is why 227
+//! takes FOR NO KEY UPDATE.
+//!
+//! [`a_claim_hidden_from_the_locking_read_is_still_refused`]: 227's fallback
+//! to the unlocked read, under a test-local policy that hides the row from a
+//! locking read only.
+//!
 //! [`the_227_undo_returns_the_catalog_below_227`]: the undo runbook restores
 //! 176's body (whole definition by md5) and is idempotent.
 //!
 //! # Verified to fail
 //!
-//! With `FOR SHARE OF c` removed from 227's locked read, the 227 half of the
-//! race test fails: B never waits and both writes commit.
+//! - `FOR NO KEY UPDATE OF c` removed from 227's locked read: the 227 half of
+//!   the race test fails (B never waits; both writes commit).
+//! - `FOR SHARE OF c` in its place: the redelivered-seal test fails at 227
+//!   with `deadlock detected`.
+//! - The `IF NOT FOUND` fallback removed: the hidden-row test fails (the seal
+//!   of the public claim is admitted).
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is
 //! not extended.
@@ -325,7 +338,7 @@ async fn every_role_that_may_seal_may_lock_the_claim_row(pool: PgPool) {
     assert!(
         cannot_lock.is_empty(),
         "these roles may write claim_encryption but not lock a claims row \
-         (FOR SHARE needs UPDATE), so 227 would refuse every seal they make: \
+         (a locking read needs UPDATE), so 227 would refuse every seal they make: \
          {cannot_lock:?}"
     );
 }
@@ -381,6 +394,184 @@ async fn the_app_role_seal_check_refuses_what_176_refused(pool: PgPool) {
             "(at {at}) refused by PRV01 under row security, got: {err}"
         );
     }
+}
+
+/// The seal's INSERT, as `seal_claims_conn` writes it: a re-delivered commit
+/// is a no-op through `ON CONFLICT DO NOTHING`.
+const SEAL_REDELIVERABLE: &str = "INSERT INTO claim_encryption \
+                                      (claim_id, group_id, epoch, privacy_tier, encrypted_content) \
+                                  VALUES ($1, $2, 0, 'fully_private', '\\x00'::bytea) \
+                                  ON CONFLICT (claim_id) DO NOTHING";
+/// The seal's statement 2 (the sentinel), which takes the claim row's lock.
+const SEAL_SENTINEL: &str = "UPDATE claims c \
+                             SET content = '[sealed:x' || replace(c.id::text, '-', '') || ']' \
+                             WHERE c.id = $1";
+
+/// Two deliveries of one seal: A runs the INSERT, B runs the same INSERT
+/// (which waits on A's unique-index entry), then A runs its sentinel UPDATE and
+/// commits. Returns (A's result, B's result, B was seen waiting).
+async fn redelivered_seal(
+    pool: &PgPool,
+    claim: Uuid,
+    group: Uuid,
+) -> (Result<(), String>, Result<(), String>, bool) {
+    let mut a = pool.acquire().await.expect("acquire A");
+    a.execute(format!("SET SESSION AUTHORIZATION {MAINTENANCE}").as_str())
+        .await
+        .expect("A as maintenance");
+    a.execute("BEGIN").await.expect("begin A");
+    a.execute("SET LOCAL lock_timeout = '30s'")
+        .await
+        .expect("A lock_timeout");
+    sqlx::query(SEAL_REDELIVERABLE)
+        .bind(claim)
+        .bind(group)
+        .execute(&mut *a)
+        .await
+        .expect("A: the first delivery's INSERT");
+
+    let mut b = pool.acquire().await.expect("acquire B");
+    b.execute(format!("SET SESSION AUTHORIZATION {MAINTENANCE}").as_str())
+        .await
+        .expect("B as maintenance");
+    let b_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *b)
+        .await
+        .expect("B's pid");
+    let task = tokio::spawn(async move {
+        let run = async {
+            b.execute("BEGIN").await?;
+            b.execute("SET LOCAL lock_timeout = '30s'").await?;
+            sqlx::query(SEAL_REDELIVERABLE)
+                .bind(claim)
+                .bind(group)
+                .execute(&mut *b)
+                .await?;
+            b.execute("COMMIT").await?;
+            Ok::<(), sqlx::Error>(())
+        };
+        let out = run.await.map_err(|e| e.to_string());
+        if out.is_err() {
+            let _ = b.execute("ROLLBACK").await;
+        }
+        let _ = b.execute("RESET SESSION AUTHORIZATION").await;
+        out
+    });
+
+    let mut waited = false;
+    for _ in 0..500 {
+        if task.is_finished() {
+            break;
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE pid = $1 AND wait_event_type = 'Lock')",
+        )
+        .bind(b_pid)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if blocked {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let first = async {
+        sqlx::query(SEAL_SENTINEL)
+            .bind(claim)
+            .execute(&mut *a)
+            .await?;
+        a.execute("COMMIT").await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await
+    .map_err(|e| e.to_string());
+    if first.is_err() {
+        let _ = a.execute("ROLLBACK").await;
+    }
+    a.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset A");
+    let second = task.await.expect("B's task");
+    (first, second, waited)
+}
+
+/// A seal delivered twice concurrently must stay what `seal_claims_conn`
+/// documents: the second delivery is a no-op, not an error. A lock in the
+/// trigger that two deliveries can both hold (FOR SHARE) deadlocks them: B
+/// holds it while waiting on A's unique-index entry, and A's sentinel UPDATE
+/// then waits on B. Calibrated at 226, where B takes no row lock.
+#[sqlx::test(migrations = false)]
+async fn a_redelivered_seal_is_a_no_op_not_a_deadlock(pool: PgPool) {
+    for (at, migrator) in [("226", up_to(226)), ("227", up_to(227))] {
+        migrate(&pool, &migrator).await;
+        let (author, group) = seal_group(&pool).await;
+        let claim = viewer_fixture::seed_group_claim(&pool, author, group, "a claim").await;
+        let (first, second, waited) = redelivered_seal(&pool, claim, group).await;
+        assert!(
+            waited,
+            "(at {at}) CALIBRATION: the second delivery waited on the first"
+        );
+        assert!(
+            first.is_ok(),
+            "(at {at}) the first delivery commits: {first:?}"
+        );
+        assert!(
+            second.is_ok(),
+            "(at {at}) the second delivery is a no-op, not an error: {second:?}"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM claim_encryption WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .expect("count ciphertext rows");
+        assert_eq!(rows, 1, "(at {at}) one ciphertext row");
+    }
+}
+
+/// 227's fallback: a locking read applies `claims`' UPDATE policies, so a
+/// policy that hides a row from UPDATE but not from SELECT would make the
+/// locked read find nothing. The check must then still refuse a public claim,
+/// by 176's unlocked read. The policy is test-local; no shipped policy does
+/// this today. Mutation: the `IF NOT FOUND` fallback removed -> the seal of
+/// the public claim is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_hidden_from_the_locking_read_is_still_refused(pool: PgPool) {
+    let (author, group) = seal_group(&pool).await;
+    sqlx::query(
+        "CREATE POLICY test_claims_no_update ON public.claims \
+             AS RESTRICTIVE FOR UPDATE TO epigraph_app USING (false)",
+    )
+    .execute(&pool)
+    .await
+    .expect("test-local policy");
+
+    let public = viewer_fixture::seed_public_claim(&pool, author, "public").await;
+    let err = app_seal(&pool, author, group, public)
+        .await
+        .expect_err("sealing a public claim is refused even when the locking read sees no row");
+    assert!(err.contains("PRV01:"), "refused by PRV01, got: {err}");
+
+    // CALIBRATION: the policy does hide the row from the locking read.
+    let locked: Option<String> =
+        viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let v = sqlx::query_scalar(
+                "SELECT c.visibility::text FROM claims c WHERE c.id = $1 FOR NO KEY UPDATE OF c",
+            )
+            .bind(public)
+            .fetch_optional(&mut *conn)
+            .await
+            .expect("locking read");
+            (conn, v)
+        })
+        .await;
+    assert_eq!(
+        locked, None,
+        "CALIBRATION: the test policy hides the row from a locking read"
+    );
 }
 
 /// The `public` catalog by name: functions (whole definition by md5, owner

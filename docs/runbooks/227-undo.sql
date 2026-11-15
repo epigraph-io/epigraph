@@ -4,8 +4,8 @@
 --
 -- WHAT IT DOES:
 --   * re-states 176's `epigraph_no_public_sealed()` body byte for byte (227
---     re-stated it with `FOR SHARE OF c` and an unlocked fallback read);
---     `CREATE OR REPLACE` keeps its owner, ACL and SECURITY INVOKER.
+--     re-stated it with `FOR NO KEY UPDATE OF c` and an unlocked fallback
+--     read); `CREATE OR REPLACE` keeps its owner, ACL and SECURITY INVOKER.
 --   * refuses (55000) unless the live body is 227's or already 176's, so it
 --     never reverts a later migration's re-statement of the function.
 --
@@ -35,7 +35,7 @@ BEGIN
     SELECT md5(p.prosrc) INTO v_src FROM pg_catalog.pg_proc p
      WHERE p.oid = 'public.epigraph_no_public_sealed()'::regprocedure;
     -- 227's body, or 176's (a second run).
-    IF v_src IS DISTINCT FROM '4e12c122f492eaf14fc3aa5e669c8652'
+    IF v_src IS DISTINCT FROM '706d3eda9209cccb7f6fe7134cc3d686'
        AND v_src IS DISTINCT FROM '0f48e208547eb393e1d4b5565f32571a' THEN
         RAISE EXCEPTION '227-undo: epigraph_no_public_sealed (prosrc md5 %) is neither 227''s '
                         'body nor 176''s. A later migration re-stated it; undo that one first',
