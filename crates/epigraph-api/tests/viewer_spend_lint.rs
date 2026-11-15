@@ -169,6 +169,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
     // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
     // it took the viewer only while it read lineage, and no longer reads any.
+    // write: `insert_on` records the `claim.assessed` writer event inside the
+    // slot transaction (ids and booleans only; the event list hides it from a
+    // reader who cannot read the claim).
     (
         "assess.rs",
         "assess_claim",
@@ -178,6 +181,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
+            "EventRepository::insert_on",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
@@ -190,7 +194,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
-            "sqlx::query(UPDATE).execute",
         ],
     ),
     // stamped (backlog 8a168dd6): the read runs on `AppState::read_as` with the
@@ -214,13 +217,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "bba_retract.rs",
         "unretract_bba",
         &["MassFunctionRepository::unretract_conn"],
-    ),
-    // open finding: F-aggregate-existence-oracles (the frame's conflict
-    // aggregate over mass_functions).
-    (
-        "belief.rs",
-        "frame_conflict",
-        &["sqlx::query_as(SELECT).fetch_one"],
     ),
     // gated (parent frame) then write.
     (
@@ -250,7 +246,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "CommunityRepository::communities_for_perspective",
             "CommunityRepository::member_perspective_ids",
             "ConflictDensityRepository::for_frames",
-            "DivergenceRepository::store",
             "MassFunctionRepository::store_with_perspective",
             "ScopedBeliefRepository::upsert",
             "ScopedBeliefRepository::upsert",
@@ -262,10 +257,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
             "sqlx::query(INSERT).execute",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_scalar(SELECT).fetch_optional",
@@ -291,17 +284,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "resolve_challenge",
         &["ChallengeRepository::resolve_as_claim_owner"],
     ),
-    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md)
-    // runs each act on `AppState::write_as`, the transaction stamped with this
-    // viewer, and calls a migration-206 SECURITY DEFINER that reads the caller
-    // from that stamp (`epigraph_principal_id()`) and makes the authority
-    // decision itself; a claim the caller cannot read is answered not-found by
-    // the definer. `writable_teams` reports the caller's own teams back.
-    (
-        "claim_visibility.rs",
-        "publicize_claims",
-        &["ClaimRepository::publicize_conn"],
-    ),
+    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md).
+    // The publicize and share handlers hand their viewer to
+    // `epigraph_engine::visibility_act` (the act plus the moved claims'
+    // cached-belief refold, migration 215), so they have no unviewed call.
     // The two default-group handlers (206's `me`, 209's `:id`) pass their
     // viewer to `set_default_for`, which spends it on `write_as` and calls 209's
     // setter definer on that stamped transaction; the definer decides whether
@@ -314,11 +300,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::set_agent_default_conn",
             "ClaimRepository::writable_teams",
         ],
-    ),
-    (
-        "claim_visibility.rs",
-        "share_claims_with_team",
-        &["ClaimRepository::share_with_team_conn"],
     ),
     // untenanted: the caller's own membership, and the seal record of a claim
     // already read through the viewer.
@@ -338,8 +319,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupMembershipRepository::is_member",
         ],
     ),
-    // gated (`write_target_of`) then write; the owner read is re-checked by the
-    // in-transaction viewer re-fetch (F-write-authz-reads-unfiltered).
+    // gated (`write_target_of`, for every caller since backlog 4073bbb6: the
+    // unfiltered `sqlx::query_scalar(SELECT)` owner read is gone) then write;
+    // the in-transaction viewer re-fetch still re-checks it
+    // (F-write-authz-reads-unfiltered).
     (
         "claims.rs",
         "patch_claim",
@@ -348,7 +331,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::patch_claim_atomic_conn",
             "ProvenanceRepository::append_conn",
             "db_pool.begin",
-            "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
     // gated (`ClaimRepository::get_by_id`) then write.
@@ -433,6 +415,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
+    // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the
+    // shared copy this request just created. It cannot take the caller's
+    // viewer: the copy is authored by the system agent and owned by that
+    // agent's group, which the sharer does not write, so it is stored where
+    // `ClaimRepository::create` above wrote the row (the raw pool), through
+    // `ClaimRepository::store_embedding` and its "not sealed" predicate.
     (
         "conventions.rs",
         "share_skill",
@@ -442,6 +430,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::create",
             "ClaimRepository::default_decl_for_author_pool",
             "EdgeRepository::create_signed_conn",
+            "embed_created_claim",
             "sqlx::query(UPDATE).execute",
         ],
     ),
@@ -759,16 +748,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AtlasLayoutRepository::run",
         ],
     ),
-    // open finding: F-aggregate-existence-oracles (the two decomposes_to
-    // counts deciding center_kind).
-    (
-        "graph_neighborhood.rs",
-        "claim_compound_neighborhood",
-        &[
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
-        ],
-    ),
     // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
     // with `/claims/:id/placement`) and the neighborhood id in that run.
     (
@@ -873,6 +852,29 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
+    // raw pool: the `papers` registry rows and their count. `papers` carries
+    // no row security (it is keyed on the document, not on a tenant). Every
+    // claim-derived field (authors, claim count, ingests) is read by
+    // `paper_listings` on the caller's stamped connection, with the viewer.
+    (
+        "papers.rs",
+        "list_papers",
+        &[
+            "sqlx::query(SELECT).fetch_all",
+            "sqlx::query(SELECT).fetch_all",
+            "sqlx::query_scalar(SELECT).fetch_one",
+            "sqlx::query_scalar(SELECT).fetch_one",
+        ],
+    ),
+    // gated (`PerspectiveRepository::get_by_id`) then write, on a transaction
+    // stamped with the caller's viewer: `perspectives`' owner-scoped UPDATE
+    // (migration 117) decides write authority, and the repo answers
+    // `WriteRefused` for a row it will not update (backlog 0f2f9ddb).
+    (
+        "perspective.rs",
+        "set_source_reliability",
+        &["PerspectiveRepository::set_source_reliability_conn"],
+    ),
     // write on a transaction stamped with the caller's viewer; the system
     // agent and its declaration are agents reads.
     (
@@ -880,9 +882,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "create_challenge",
         &[
             "ClaimRepository::default_decl_for_author_pool",
-            "sqlx::query(SELECT).execute",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_optional",
+            "PolicyRepository::find_challenge_by_hash",
+            "PolicyRepository::insert_challenge",
+            "PolicyRepository::lock_challenge_create",
             "workflows::get_or_create_system_agent",
         ],
     ),
@@ -1114,16 +1116,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // write: propagation for the claim this request just persisted through
-    // the viewer (`persist_packet`); `validate_packet` runs no tenancy read.
+    // no SQL: `validate_packet` runs no tenancy read. `propagate_from` left
+    // this list with the in-memory orchestrator registration it ran on
+    // (backlog 7b3722b5).
     // The two post-commit embedding UPDATEs (claim, figure evidence) now
     // receive the viewer (`AppState::store_claim_embedding_as` /
     // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
-    (
-        "submit.rs",
-        "submit_packet",
-        &["propagate_from", "validate_packet"],
-    ),
+    ("submit.rs", "submit_packet", &["validate_packet"]),
     // gated (`write_target_of`) then write.
     (
         "versioning.rs",
@@ -1135,15 +1134,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "db_pool.begin",
         ],
     ),
-    // gated (`write_target_of`) then write; the factors SELECT feeds the
-    // write's re-pointing.
+    // gated (`write_target_of`) then write. The detached factors SELECT that
+    // was registered here only logged a count and is deleted (backlog 79e1f75d).
     (
         "versioning.rs",
         "supersede_claim",
         &[
             "ClaimRepository::supersede_act_conn",
             "ClaimVersionRepository::create",
-            "sqlx::query_as(SELECT).fetch_all",
             "supersede_session_or_deferral",
         ],
     ),
@@ -1323,24 +1321,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "db_pool.acquire",
             "sqlx::query_scalar(SELECT).fetch_optional",
-        ],
-    ),
-    // stamped: the neighborhood's edge projections, on the caller's stamped
-    // connection, are constrained in Rust to endpoints that survived the
-    // viewer-filtered node projection (PR-07); the edges' own predicate is
-    // F-edges-unfiltered.
-    (
-        "graph_neighborhood.rs",
-        "atomic_response",
-        &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    (
-        "graph_neighborhood.rs",
-        "compound_response",
-        &[
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
         ],
     ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an

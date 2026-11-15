@@ -5,6 +5,8 @@ pub mod backfill_factors;
 pub mod belief_cache;
 pub mod belief_mode_check;
 #[cfg(feature = "db")]
+pub mod beta_replay;
+#[cfg(feature = "db")]
 pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;

@@ -489,7 +489,7 @@ async fn find_workflow_post_embed(
     let mut read = server.read_as(viewer, "find_workflow").await?;
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
         ClaimRepository::search_by_embedding_scoped(
-            &mut *read,
+            &mut read,
             viewer,
             pgvec,
             limit * 3,

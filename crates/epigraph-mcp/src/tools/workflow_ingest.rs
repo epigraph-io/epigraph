@@ -159,6 +159,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let extraction = &extraction;
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
 
+    // The server's own key attests every edge the walk and the authorship
+    // record write at INSERT, resolved before the caller's transaction.
+    let edge_key = server.edge_signing_key().await?;
     let mut tx =
         crate::claim_helper::begin_caller_workflow_tx(server, caller, "workflow_ingest").await?;
 
@@ -236,7 +239,13 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let mut admitted: Option<uuid::Uuid> = None;
     let result = loop {
         match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-            &mut tx, &plan, extraction, viewer, declared, admitted,
+            &mut tx,
+            Some(edge_key),
+            &plan,
+            extraction,
+            viewer,
+            declared,
+            admitted,
         )
         .await
         {
@@ -276,6 +285,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let created: Vec<uuid::Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
     epigraph_ingest_executor::record_caller_authorship(
         &mut tx,
+        Some(edge_key),
         caller.agent_id(),
         &created,
         "workflow_ingest",
@@ -554,8 +564,10 @@ pub async fn do_ingest_workflow_via_pool(
         let mut unstamped_tx = pool.begin().await.map_err(|e| {
             crate::errors::internal_error_logged("workflow ingest: could not begin", e)
         })?;
+        // No server, so no key: this fixture path writes unsigned edges.
         let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
             &mut unstamped_tx,
+            None,
             &plan,
             extraction,
         )

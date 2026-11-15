@@ -160,6 +160,9 @@ pub async fn evolve_step(
     let identity = server.write_identity(auth, viewer).await?;
     let agent_id = identity.agent_id();
     let parent = epigraph_core::ClaimId::from_uuid(parent_uuid);
+    // The step edge is attested at INSERT with the server's key (backlog
+    // `dae795f8`), resolved before the act's transaction opens.
+    let edge_key = server.edge_signing_key().await?;
     let write_details = |r: &epigraph_db::EvolveStepResult| {
         serde_json::json!({
             "parent_claim_id": parent_uuid,
@@ -184,6 +187,7 @@ pub async fn evolve_step(
             require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
+            Some(edge_key),
             parent,
             &params.content,
             &params.edge_type,
@@ -249,6 +253,7 @@ pub async fn evolve_step(
             require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
+            Some(edge_key),
             parent,
             &params.content,
             &params.edge_type,
@@ -262,6 +267,18 @@ pub async fn evolve_step(
         tx.commit().await.map_err(internal_error)?;
         (r, None, None)
     };
+
+    // The new step is a current claim with no vector: embed it post-commit,
+    // best-effort, as `add_step` does (CLAUDE.md "Embedding policy"; backlog
+    // 7628ab2c). Stored through the caller, which authored it: a step of a
+    // group plan is not readable as public, so the embedder's own store path
+    // would store nothing for it.
+    crate::tools::workflow_ingest::embed_created_workflow_claims(
+        server,
+        identity,
+        &[(result.new_claim_id, params.content.clone())],
+    )
+    .await;
 
     success_json(&EvolveStepResponse {
         claim_id: result.new_claim_id,

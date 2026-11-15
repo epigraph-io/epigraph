@@ -392,6 +392,7 @@ fn ctx_params(epistemic_partition: bool, min_truth: f64) -> RecallWithContextPar
         since: None,
         epistemic_partition,
         diversity_radius: None,
+        group_by_parent: false,
     }
 }
 

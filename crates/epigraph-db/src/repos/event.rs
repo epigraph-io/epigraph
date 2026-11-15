@@ -40,9 +40,54 @@ pub struct EventCursor {
 pub struct EventRepository;
 
 impl EventRepository {
+    /// The assess route's durable writer record (backlog 4a7f90f8): one per
+    /// `POST /api/v1/claims/:id/assess`, written inside that call's slot
+    /// transaction. See `epigraph_api::routes::assess::ASSESSMENT_EVENT_TYPE`.
+    pub const ASSESSMENT_EVENT_TYPE: &'static str = "claim.assessed";
+
+    /// Event types that only a server write path may record. The caller-typed
+    /// publish surfaces (`POST /api/v1/events`, the MCP `publish_event` tool)
+    /// refuse them, because a reader trusts a record of one of these types as
+    /// the server's own account of a write: a caller-filed `claim.assessed`
+    /// would otherwise become "the previous record" of a slot and re-attribute
+    /// the next overwrite to whoever filed it.
+    pub const RESERVED_EVENT_TYPES: &'static [&'static str] = &[Self::ASSESSMENT_EVENT_TYPE];
+
+    /// Whether a caller-supplied `event_type` names a reserved type.
+    ///
+    /// Compared trimmed and ASCII-case-insensitively, so a padded or
+    /// re-cased spelling is refused too: the MCP tool stores the type as
+    /// given, and no caller has a reason to file a near-miss of a reserved
+    /// name.
+    pub fn is_reserved_type(event_type: &str) -> bool {
+        let t = event_type.trim();
+        Self::RESERVED_EVENT_TYPES
+            .iter()
+            .any(|r| t.eq_ignore_ascii_case(r))
+    }
+
     /// Insert a new event, auto-incrementing graph_version.
     pub async fn insert(
         pool: &PgPool,
+        event_type: &str,
+        actor_id: Option<Uuid>,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, sqlx::Error> {
+        Self::insert_on(pool, event_type, actor_id, payload).await
+    }
+
+    /// [`Self::insert`] on any executor, typically the caller's open
+    /// transaction, so the event commits or rolls back with the write it
+    /// records.
+    ///
+    /// Unlike [`Self::publish_or_log_conn`], a failure is the caller's error,
+    /// not a log line. Use it where the event IS the durable record of the
+    /// write (the assess route's writer record): there a swallowed failure
+    /// would leave the write with no trace, which is the defect the event
+    /// exists to close. Inside a transaction a failure aborts it, so the
+    /// caller must propagate the error rather than carry on.
+    pub async fn insert_on<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         event_type: &str,
         actor_id: Option<Uuid>,
         payload: &serde_json::Value,
@@ -56,7 +101,7 @@ impl EventRepository {
         .bind(event_type)
         .bind(actor_id)
         .bind(payload)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(id)
     }

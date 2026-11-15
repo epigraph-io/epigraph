@@ -270,7 +270,6 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
-    ("policies.rs", 2),
     ("political.rs", 1),
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
     // forward-only scan could not see. Its in-code comment argues it is not a
@@ -343,14 +342,39 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 ///
 /// Asserted exactly for the same monotonicity reason as above.
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
-    ("agent_keys.rs", 3),
+    // BACKLOG 3b560cfe converted the MUTATING sites of this register, eleven
+    // of them, to the prescribed
+    // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
+    // shape, so their scope (and self-or-admin) checks run unconditionally:
+    // `agent_keys.rs` rotate/revoke (3 -> 1), `agents.rs` create/update (2 ->
+    // row removed), `crud.rs` create_evidence/create_analysis (6 -> 4),
+    // `papers.rs` create_paper (1 -> row removed) and `tasks.rs`
+    // create/assign/complete/fail (6 -> 2). Rows that reached zero are REMOVED,
+    // not zeroed, for the reason the PR-10 note below gives.
+    // `tests/mutating_handlers_refuse_without_auth_context.rs` drives the
+    // eleven with no `AuthContext` and requires 401.
+    //
+    // The same backlog then converted the READ handlers, six of them:
+    // `agent_keys.rs::list_agent_keys` (1 -> row removed), `tasks.rs` get_task
+    // and list_tasks (2 -> row removed), and `crud.rs` get_boundary_claims,
+    // get_split_candidates and get_distant_claims (4 -> 1).
+    // `tests/read_handlers_refuse_without_auth_context.rs` drives the six with
+    // no `AuthContext` and requires 401. All six are registered on the
+    // `protected` router only, never on `public` (`public_router_allowlist.rs`),
+    // so none is a public read whose conditional is intended. The three `crud.rs`
+    // ones also take `ViewerExtractor`, which already refused an anonymous
+    // request, so for them the change removes a dead conditional rather than
+    // closing a live hole.
+    //
+    // What remains is the single site `crud.rs::create_reasoning_trace`, which
+    // another branch (`fix/backlog-b03`) converts; it is deliberately not
+    // touched here. When that lands the `crud.rs` row is removed.
     // 1 → 2 when the needle set widened from one spelling to four. NOT a new
     // site and NOT a regression: `create_agent`'s `agents:write` check is
     // written `if let Some(axum::Extension(ref auth)) = &auth_ctx` — the same
     // idiom with a trailing `&` on the scrutinee — and the single-spelling
     // needle could not see it. The block was always here; the register could
-    // not count it.
-    ("agents.rs", 2),
+    // not count it. (`("agents.rs", 2)` stood here until backlog 3b560cfe.)
     // `("audit.rs", 1)` REMOVED by PR-18a, on the PR-10 precedent recorded
     // below: `query_security_events` now takes the prescribed
     // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
@@ -383,11 +407,11 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // shape on the way. Its `record_provenance` block is a SEPARATE `if let`
     // and is deliberately untouched — it is still counted, in the other
     // register, where the count stays 4.
-    // 6 -> 5 (backlog f64cf9c6): `create_reasoning_trace` took `ViewerExtractor`
-    // and the prescribed `let Some(..) = auth_ctx else { return
+    // `("crud.rs", 1)` REMOVED (backlog f64cf9c6), on the PR-10 precedent above:
+    // `create_reasoning_trace`, the last fail-open site in the file, took
+    // `ViewerExtractor` and the prescribed `let Some(..) = auth_ctx else { return
     // Err(ApiError::Unauthorized ..) }` shape, and checks `claims:write`
     // unconditionally.
-    ("crud.rs", 5),
     // `("edges.rs", 5)` REMOVED by batch W12b, on the PR-10 precedent above:
     // the five write handlers (`create_edge`, `create_hierarchical_edge`,
     // `patch_edge`, `delete_edge`, `relate_claims`) took `ViewerExtractor`,
@@ -396,8 +420,6 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // `None`. They now take the prescribed `let Some(..) = auth_ctx else {
     // return Err(ApiError::Unauthorized ..) }` shape and check `edges:write`
     // unconditionally.
-    ("papers.rs", 1),
-    ("tasks.rs", 6),
     // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
     // `delete_webhook` to the prescribed
     // `auth_ctx.ok_or(ApiError::Unauthorized { .. })?` shape and made the scope
@@ -540,7 +562,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // `UPDATE claims SET embedding` became
     // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
     // with the caller's viewer (`AppState::store_claim_embedding_as`).
-    ("belief.rs", 1),
+    // 1 -> 0, key removed (backlog f50344c0): `submit_evidence`'s
+    // `UPDATE claims SET beta_alpha, beta_beta` became
+    // `ClaimRepository::add_beta_increments` (spliced `{WRITABLE:c}`), called
+    // through `epigraph_engine::ds_divergence::apply_beta_update`, which the
+    // MCP DS tools share.
     // 4 -> 3 (backlog 1e2315a9): `create_claim_core`'s post-commit
     // `UPDATE claims SET embedding` became
     // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped

@@ -30,21 +30,9 @@ async fn run(pool: &PgPool, body: serde_json::Value) -> Result<serde_json::Value
     let state = AppState::with_scoped_pool(scoped_pool(pool).await, ApiConfig::default());
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
     let request: PropagateRequest = serde_json::from_value(body).expect("request");
-    propagate_beliefs(
-        ViewerExtractor(viewer),
-        bearer(agent),
-        State(state),
-        Json(request),
-    )
-    .await
-    .map(|Json(v)| v)
-}
-
-/// The bearer's `AuthContext` extension `propagate_beliefs` takes (it gates
-/// `apply_updates: true` on `claims:write`). These requests never apply, so a
-/// read scope is enough.
-fn bearer(agent: uuid::Uuid) -> axum::Extension<epigraph_api::middleware::bearer::AuthContext> {
-    axum::Extension(epigraph_api::middleware::bearer::AuthContext {
+    // A read-only bearer: these requests never set `apply_updates`, so the
+    // handler's `claims:write` check (backlog f00d75ab) is not reached.
+    let auth = axum::Extension(epigraph_api::middleware::bearer::AuthContext {
         client_id: agent,
         agent_id: Some(agent),
         owner_id: Some(agent),
@@ -56,7 +44,10 @@ fn bearer(agent: uuid::Uuid) -> axum::Extension<epigraph_api::middleware::bearer
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
         delegated_by: None,
-    })
+    });
+    propagate_beliefs(ViewerExtractor(viewer), auth, State(state), Json(request))
+        .await
+        .map(|Json(v)| v)
 }
 
 fn refused_on(res: Result<serde_json::Value, ApiError>, field: &str, what: &str) {
@@ -88,14 +79,14 @@ async fn out_of_range_run_parameters_are_refused(pool: PgPool) {
         "max_iterations",
         "an effectively unbounded run",
     );
-    for t in [0.0, -0.5] {
+    for t in [-0.01, -0.5, 1.5] {
         refused_on(
             run(&pool, serde_json::json!({ "convergence_threshold": t })).await,
             "convergence_threshold",
             &format!("threshold {t}"),
         );
     }
-    for d in [1.0, 1.5, -0.1] {
+    for d in [1.01, 1.5, -0.1] {
         refused_on(
             run(&pool, serde_json::json!({ "damping": d })).await,
             "damping",
@@ -114,8 +105,8 @@ async fn defaults_and_boundary_run_parameters_are_admitted(pool: PgPool) {
         &pool,
         serde_json::json!({
             "max_iterations": BP_MAX_ITERATIONS,
-            "convergence_threshold": 1e-9,
-            "damping": 0.0,
+            "convergence_threshold": 0.0,
+            "damping": 1.0,
         }),
     )
     .await

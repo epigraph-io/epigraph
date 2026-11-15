@@ -487,7 +487,7 @@ impl McpEmbedder {
         let pgvec = epigraph_db::pgvector_literal(&embedding);
         let mut conn = self.search_conn(viewer).await?;
         let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
-            &mut *conn, viewer, &pgvec, limit, tags, agent_id,
+            &mut conn, viewer, &pgvec, limit, tags, agent_id,
         )
         .await
         .map_err(|e| e.to_string())?;

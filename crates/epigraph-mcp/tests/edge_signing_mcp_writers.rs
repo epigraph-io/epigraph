@@ -271,6 +271,7 @@ async fn the_link_tools_attest_their_edges_and_not_a_dedup_hit(pool: PgPool) {
         target_claim_id: t.to_string(),
         relationship: "decomposes_to".to_string(),
         properties: None,
+        ..Default::default()
     };
     let out = epigraph_mcp::tools::link_hierarchical::do_link_hierarchical(
         &server,
@@ -645,4 +646,441 @@ async fn a_callers_ingest_is_signed_by_the_server_not_the_caller(pool: PgPool) {
     .expect("verify_claim");
     let resp = common::first_text(&out);
     assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
+}
+
+// ── The workflow writers (epigraph-ingest-executor) ─────────────────────────
+
+/// A two-phase, two-steps-per-phase workflow with one named author, so the
+/// walk writes every plan relationship it has: `executes`, `decomposes_to`,
+/// `step_follows`, `phase_follows` and the author's `asserts`.
+fn workflow(canonical: &str, generation: u32) -> epigraph_ingest::workflow::WorkflowExtraction {
+    let step = |s: &str| {
+        serde_json::json!({
+            "compound": format!("dae795f8 {canonical} g{generation}: {s}"),
+            "rationale": "because",
+            "operations": [format!("dae795f8 {canonical} g{generation}: {s} op")],
+            "generality": [1],
+            "confidence": 0.7
+        })
+    };
+    serde_json::from_value(serde_json::json!({
+        "source": {
+            "canonical_name": canonical,
+            "goal": format!("dae795f8 signed workflow {canonical} g{generation}"),
+            "generation": generation,
+            "authors": [{"name": "A Signing Designer"}],
+            "tags": []
+        },
+        "thesis": format!("dae795f8 {canonical} g{generation}: the thesis"),
+        "thesis_derivation": "TopDown",
+        "phases": [
+            {"title": "One", "summary": format!("dae795f8 {canonical} g{generation}: phase one"),
+             "steps": [step("first"), step("second")]},
+            {"title": "Two", "summary": format!("dae795f8 {canonical} g{generation}: phase two"),
+             "steps": [step("third"), step("fourth")]}
+        ],
+        "relationships": []
+    }))
+    .expect("a well-formed workflow extraction")
+}
+
+async fn edge_ids(pool: &PgPool) -> std::collections::HashSet<Uuid> {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM edges")
+        .fetch_all(pool)
+        .await
+        .expect("edge ids")
+        .into_iter()
+        .collect()
+}
+
+/// Every edge written since `before` is attested by the server's signer agent
+/// (and not by `caller`, when there is one); returns their relationships, so
+/// the caller can require the ones it means to cover and the check cannot
+/// pass vacuously.
+async fn assert_new_edges_attested(
+    pool: &PgPool,
+    before: &std::collections::HashSet<Uuid>,
+    caller: Option<Uuid>,
+    what: &str,
+) -> std::collections::BTreeSet<String> {
+    let new: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, relationship::text FROM edges ORDER BY created_at, id")
+            .fetch_all(pool)
+            .await
+            .expect("edges");
+    let mut rels = std::collections::BTreeSet::new();
+    for (id, rel) in new.into_iter().filter(|(id, _)| !before.contains(id)) {
+        let label = format!("{what} {rel}");
+        match caller {
+            Some(c) => assert_server_not_caller(pool, id, c, &label).await,
+            None => assert_server_attested(pool, id, &label).await,
+        }
+        rels.insert(rel);
+    }
+    rels
+}
+
+fn require(rels: &std::collections::BTreeSet<String>, must: &[&str], what: &str) {
+    for rel in must {
+        assert!(
+            rels.contains(*rel),
+            "{what}: no {rel} edge was written: {rels:?}"
+        );
+    }
+}
+
+fn step_claim(out: &rmcp::model::CallToolResult) -> Uuid {
+    uuid_field(&common::first_text(out), "step_claim_id")
+}
+
+async fn add_step_at(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    canonical: &str,
+    text: &str,
+    position: Option<u32>,
+) -> Uuid {
+    let out = epigraph_mcp::tools::step_ops::add_step(
+        server,
+        viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: canonical.to_string(),
+            step_text: text.to_string(),
+            position,
+        },
+        auth,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("add_step {text:?} at {position:?}: {e:?}"));
+    step_claim(&out)
+}
+
+/// The executor's edge writers, over MCP stdio: `store_workflow`'s plan walk
+/// (`execute_plan`: `executes`, the plan edges, a new generation's
+/// `variant_of`), the `AUTHORED` record of every claim it created
+/// (`record_caller_authorship`), and `add_step`'s `executes`, `decomposes_to`
+/// and `step_follows` on all three arms (append, insert at the head, and the
+/// mid-chain rewire that writes two). Every edge each call wrote is attested
+/// at INSERT by the server's key; an idempotent re-ingest writes no edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_workflow_writers_attest_every_edge_they_write(pool: PgPool) {
+    use epigraph_mcp::types::IngestWorkflowParams;
+    let server = server(&pool).await;
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, None)
+        .await
+        .expect("stdio viewer");
+    let ingest = |generation: u32| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            epigraph_mcp::tools::workflow_ingest::ingest_workflow(
+                server,
+                viewer,
+                IngestWorkflowParams {
+                    extraction: workflow("sw-wf", generation),
+                    tenancy: None,
+                    embed: None,
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("ingest generation {generation}: {e:?}"))
+        }
+    };
+
+    let before = edge_ids(&pool).await;
+    ingest(0).await;
+    let rels = assert_new_edges_attested(&pool, &before, None, "ingest g0").await;
+    require(
+        &rels,
+        &[
+            "executes",
+            "decomposes_to",
+            "step_follows",
+            "phase_follows",
+            "asserts",
+            "AUTHORED",
+        ],
+        "ingest g0",
+    );
+
+    // An idempotent re-ingest writes nothing.
+    let before = edge_ids(&pool).await;
+    ingest(0).await;
+    assert_eq!(edge_ids(&pool).await, before, "a re-ingest wrote an edge");
+
+    // A new generation of the lineage: its variant_of edge to generation 0.
+    let before = edge_ids(&pool).await;
+    ingest(1).await;
+    let rels = assert_new_edges_attested(&pool, &before, None, "ingest g1").await;
+    require(&rels, &["variant_of", "executes", "AUTHORED"], "ingest g1");
+
+    // add_step: append, insert at the head, and a mid-chain rewire.
+    for (text, position) in [
+        ("an appended step", None),
+        ("a head step", Some(0)),
+        ("a mid-chain step", Some(2)),
+    ] {
+        let before = edge_ids(&pool).await;
+        add_step_at(&server, &viewer, None, "sw-wf", text, position).await;
+        let what = format!("add_step {text}");
+        let rels = assert_new_edges_attested(&pool, &before, None, &what).await;
+        require(
+            &rels,
+            &["executes", "decomposes_to", "step_follows", "AUTHORED"],
+            &what,
+        );
+    }
+    // The rewire wrote BOTH `prev -> step` and `step -> next`.
+    let mid: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE content = 'a mid-chain step'")
+        .fetch_one(&pool)
+        .await
+        .expect("the mid-chain step");
+    let follows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship = 'step_follows' \
+            AND (source_id = $1 OR target_id = $1)",
+    )
+    .bind(mid)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(follows, 2, "the mid-chain step has both chain edges");
+}
+
+/// The workflow writers' signer is the server: an authenticated caller's
+/// ingest and add_step are authored by the caller, and every edge they write
+/// is signed by the SERVER's signer agent, never by the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_callers_workflow_edges_are_signed_by_the_server_not_the_caller(pool: PgPool) {
+    use epigraph_mcp::types::IngestWorkflowParams;
+    let server = server(&pool).await;
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (caller, token, viewer) =
+        common::seed_caller(&pool, &["claims:read", "claims:write"]).await;
+    assert_ne!(caller, server_agent);
+
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::workflow_ingest::ingest_workflow(
+        &server,
+        &viewer,
+        IngestWorkflowParams {
+            extraction: workflow("sw-wf-caller", 0),
+            tenancy: Some(common::public_tenancy_for(&viewer)),
+            embed: None,
+        },
+        Some(&token),
+    )
+    .await
+    .expect("the caller ingests");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "caller ingest").await;
+    require(&rels, &["executes", "AUTHORED"], "caller ingest");
+
+    let before = edge_ids(&pool).await;
+    let step = add_step_at(
+        &server,
+        &viewer,
+        Some(&token),
+        "sw-wf-caller",
+        "the caller's step",
+        None,
+    )
+    .await;
+    assert_authored_by(&pool, step, caller).await;
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "caller add_step").await;
+    require(
+        &rels,
+        &["executes", "step_follows", "AUTHORED"],
+        "caller add_step",
+    );
+}
+
+/// A public claim authored by the caller (submitted with its token).
+async fn caller_claim(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    token: &epigraph_auth::AuthContext,
+    content: &str,
+) -> Uuid {
+    let out = epigraph_mcp::tools::claims::submit_claim(
+        server,
+        viewer,
+        epigraph_mcp::types::SubmitClaimParams {
+            content: content.into(),
+            methodology: "deductive_logic".into(),
+            evidence_data: format!("evidence for {content}"),
+            evidence_type: "logical".into(),
+            confidence: 0.6,
+            source_url: None,
+            reasoning: Some("because".into()),
+            labels: vec![],
+            novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        Some(token),
+    )
+    .await
+    .expect("submit_claim as the caller");
+    uuid_field(&common::first_text(&out), "claim_id")
+}
+
+fn params<T: serde::de::DeserializeOwned>(v: Value) -> T {
+    serde_json::from_value(v).expect("tool params")
+}
+
+/// A server and an authenticated caller that is not the server's agent.
+async fn server_and_caller(
+    pool: &PgPool,
+) -> (
+    EpiGraphMcpFull,
+    Uuid,
+    epigraph_auth::AuthContext,
+    epigraph_db::visibility::Viewer,
+) {
+    let server = server(pool).await;
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (caller, token, viewer) = common::seed_caller(pool, &["claims:read", "claims:write"]).await;
+    assert_ne!(caller, server_agent);
+    (server, caller, token, viewer)
+}
+
+/// Backlog `dae795f8`: the claim acts' edges, written inside a repository act
+/// on the caller's stamped transaction, are attested at INSERT with the
+/// SERVER's key, never the caller's. supersede_claim: the `supersedes` edge
+/// and the actor's `AUTHORED`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_attests_its_edges_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let old = caller_claim(&server, &viewer, &token, "dae795f8 mcp: to be superseded").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "claim_id": old.to_string(),
+            "content": "dae795f8 mcp: the replacement",
+            "truth_value": 0.7,
+            "reason": "restated",
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("supersede_claim");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "supersede").await;
+    require(&rels, &["supersedes", "AUTHORED"], "supersede");
+}
+
+/// mark_duplicate: the `same_as` identity edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_attests_its_identity_edge_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let dup = caller_claim(&server, &viewer, &token, "dae795f8 mcp: the duplicate").await;
+    let canon = caller_claim(&server, &viewer, &token, "dae795f8 mcp: the canonical").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "claim_id": dup.to_string(),
+            "canonical_id": canon.to_string(),
+            "reason": "same",
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("mark_duplicate");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "mark_duplicate").await;
+    require(&rels, &["same_as"], "mark_duplicate");
+}
+
+/// consolidate_claims: the `supersedes` fan-out, merged -> each source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_claims_attests_its_edges_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let s1 = caller_claim(&server, &viewer, &token, "dae795f8 mcp: source one").await;
+    let s2 = caller_claim(&server, &viewer, &token, "dae795f8 mcp: source two").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "source_claim_ids": [s1.to_string(), s2.to_string()],
+            "merged_content": "dae795f8 mcp: one and two, merged",
+            "mode": "merge",
+            "reason": "the same point twice",
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("consolidate_claims");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "consolidate").await;
+    require(&rels, &["supersedes"], "consolidate");
+    let lineage: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship = 'supersedes' AND target_id = ANY($1)",
+    )
+    .bind(vec![s1, s2])
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(lineage, 2, "one supersedes edge per source");
+}
+
+/// evolve_step: the step edge (`revises`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_attests_its_step_edge_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let parent = caller_claim(&server, &viewer, &token, "dae795f8 mcp: a step").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::evolve_step::evolve_step(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "parent_id": parent.to_string(),
+            "content": "dae795f8 mcp: a revised step",
+            "edge_type": "revises",
+            "rationale": null,
+            "level": null,
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("evolve_step");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "evolve_step").await;
+    require(&rels, &["revises"], "evolve_step");
+}
+
+/// Backlog `dae795f8`: the promote arm of decide_match_candidate writes the
+/// matcher edge (inside `MatchCandidateRepo::promote_if_pending_conn`, on the
+/// caller's stamped transaction) attested with the server's key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_match_promotion_attests_its_edge_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let a = caller_claim(&server, &viewer, &token, "dae795f8 mcp: matched a").await;
+    let b = caller_claim(&server, &viewer, &token, "dae795f8 mcp: matched b").await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let candidate: Uuid = sqlx::query_scalar(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, features, status) \
+         VALUES ($1, $2, 0.95, '{}'::jsonb, 'pending') RETURNING id",
+    )
+    .bind(lo)
+    .bind(hi)
+    .fetch_one(&pool)
+    .await
+    .expect("candidate");
+
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        epigraph_mcp::types::DecideMatchCandidateParams {
+            candidate_id: candidate.to_string(),
+            verdict: "promote".into(),
+        },
+        Some(&token),
+    )
+    .await
+    .expect("promote");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "promote").await;
+    require(&rels, &["corroborates"], "promote");
 }

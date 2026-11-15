@@ -12,8 +12,9 @@
 //! clause a run re-populates every retired claim it meets. Two costs:
 //!
 //! 1. Recall at `centroid_dim = 3072`
-//!    (`ClaimRepository::search_by_embedding_since`) has no `is_current`
-//!    filter, so the retired claim becomes retrievable again.
+//!    (`ClaimRepository::search_by_embedding_since`) had no `is_current`
+//!    filter until backlog 7720cb7a, so the retired claim became retrievable
+//!    again.
 //! 2. `chk_deprecated_no_embedding` covers `embedding_3072` (migration 144),
 //!    so the first retired row in a batch makes the UPDATE raise 23514 and
 //!    the whole run aborts.

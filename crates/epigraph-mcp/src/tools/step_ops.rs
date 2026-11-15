@@ -149,6 +149,9 @@ pub async fn add_step(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let caller = server.write_identity(auth, viewer).await?;
+    // The server's own key attests every edge the step writes at INSERT,
+    // resolved before the caller's transaction begins.
+    let edge_key = server.edge_signing_key().await?;
     let mut tx = crate::claim_helper::begin_caller_workflow_tx(server, caller, "add_step").await?;
     // H3 (batch H-b): the CALLER's authority over the workflow, before the
     // write, on the caller's own stamp.
@@ -163,6 +166,7 @@ pub async fn add_step(
     .await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
+        Some(edge_key),
         caller.agent_id(),
         &params.canonical_name,
         &params.step_text,
@@ -176,6 +180,7 @@ pub async fn add_step(
     if r.claim_created {
         epigraph_ingest_executor::record_caller_authorship(
             &mut tx,
+            Some(edge_key),
             caller.agent_id(),
             &[r.step_claim_id],
             "add_step",

@@ -103,6 +103,10 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   (`crates/epigraph-api/src/routes/`) and MCP tools
   (`crates/epigraph-mcp/src/tools/`) both call the repo layer; do not
   duplicate SQL between them.
+  Neither is at zero yet, so two exact-count ratchet tests pin the residue:
+  `crates/epigraph-mcp/tests/no_inline_sql_in_tools.rs` (MCP tools) and
+  `crates/epigraph-api/tests/no_inline_sql_in_routes.rs` (HTTP routes); the
+  HTTP count can only fall, by moving a statement into the repo layer.
 - After adding or modifying a `sqlx::query!` / `sqlx::query_as!` macro
   call, run `DATABASE_URL=... cargo sqlx prepare --workspace -- --tests`
   and commit `.sqlx/` so `SQLX_OFFLINE=true cargo check --workspace`
@@ -151,10 +155,16 @@ create a FRESH database whose name ends in `_test` and migrate it from empty.
 
 ```bash
 createdb -U epigraph <name>_test
+EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1 \
 MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test \
   cargo run -p epigraph-api --bin epigraph-migrate
 DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test cargo test ...
 ```
+
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1` grants `epigraph_seed` to the migrating
+login (migration 216: the tenancy seed escape hatch the fixtures rely on needs
+an explicit grant, a superuser no longer counts). The grant is cluster-wide, so
+it also covers `#[sqlx::test]` databases. Never set it for a deployed login.
 
 `#[sqlx::test]` suites are unaffected (each test gets its own database, migrated
 from empty); this matters for the suites that read `DATABASE_URL` directly. The
@@ -167,6 +177,31 @@ migrate to head (it used to skip silently).
 ## Workflow
 
 - Feature branches, never land 3+ commits directly on `main`.
+- **Reach `main` through a staging PR, not one feature PR at a time.** Every
+  merge to `main` starts a full CI run on `main` and moves the base under
+  every other open PR, so a backlog merged one by one (dozens of open PRs)
+  queues dozens of full runs. Epiclaw's nightly staging run already works
+  this way on `integration/<YYYYMMDD>` branches; an ad-hoc batch from a
+  session does the same on `staging/<YYYYMMDD>-<tag>`. Use one of those two
+  prefixes: CI runs only the affected shards on other PR heads, and the full
+  plan on `integration/**` and `staging/**`, which is what makes the staging
+  PR the full-suite gate on the combined tree:
+  1. Cut the staging branch from current `main`.
+  2. Bring in each candidate that is green at its head with
+     `git merge --no-ff <head>`, subject `merge(staging): #NNN <its claim>`
+     and an epistemic body (no squash, no rebase). Leave the feature PRs
+     based on `main`: GitHub marks each one merged when its head reaches
+     `main`.
+  3. Open ONE draft PR from the staging branch to `main`. Its body carries a
+     table with one row per included PR (number, one-line claim, result on
+     the combined tree), the excluded PRs with the reason for each, and the
+     combined-tree verification with the head sha it ran on. A body that
+     only lists PR numbers is not enough: the staging PR is the merge record
+     on `main`.
+  4. Merge it with `--merge` once CI on the combined tree is green.
+  5. Keep the number of open staging PRs to the minimum, one per batch. Do
+     not push to a staging branch another session created; put late work in
+     the next batch.
 - `gh pr merge --merge --delete-branch` by default; never `--squash`
   unless explicitly told.
 
@@ -205,11 +240,11 @@ public-reader path cannot resolve a group-private claim's author.
 When adding a new code path that inserts a claim, embed inline post-commit,
 best-effort (warn on failure, never block the write). Current call-sites:
 
-- **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs:217`
-- **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs:103`
+- **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs::finish_submission` (phase 3 of `submit_claim`, after COMMIT), through `claim_helper::embed_claim_author_stamped`
+- **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs::memorize`, through `claim_helper::embed_claim_author_stamped`
 - **MCP `batch_submit_claims`** — delegates to `submit_claim`
-- **MCP `submit_bug_report`** — `crates/epigraph-mcp/src/tools/bug_report.rs::submit_bug_report`. The one exception to post-commit: the vector is computed best-effort BEFORE the transaction and stored by migration 207's definer in the same statement sequence as the row, because the reporter cannot update an intake-owned claim after commit (row security hides it from them). The embed runs only after `epigraph_bug_report_preflight` passes, so a caller the write would refuse for who it is or its limit (not configured, system agent, unbound, a role's agent whose role its own human does not hold, over its limit) costs no provider call. The theme scripts never turn an intake-owned claim's text into a label (`scripts/theme_lib.py::not_intake_owned`)
-- **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs:321`
+- **MCP `submit_bug_report`** — `crates/epigraph-mcp/src/tools/bug_report.rs::submit_bug_report`. The one exception to post-commit: the vector is computed best-effort BEFORE the transaction and stored by migration 207's definer in the same statement sequence as the row, because the reporter cannot update an intake-owned claim after commit (row security hides it from them). The embed runs only after `epigraph_bug_report_preflight` passes, so a caller the write would refuse for who it is or its limit (not configured, system agent, unbound, a role's agent whose role its own human does not hold, over its limit) costs no provider call. The theme scripts never turn an intake-owned claim's text, or any non-public claim's, into a label (`scripts/theme_lib.py::public_label_source`)
+- **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs::do_ingest_document_reporting` (the `embed_queue` drained through `embed_and_store` after the write)
 - **MCP `ingest_document_spine`** — `do_ingest_document_spine` in the same file; phase-1 of the two-phase flow, embeds spine claims (thesis + sections + paragraphs) post-write
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
@@ -217,9 +252,13 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
-- **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
+- **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
+- **HTTP `POST /api/v1/policy-challenges`** — embeds a NEW challenge after `tx.commit()` on the caller's stamp (`AppState::store_claim_embedding_as`); a repeat request creates nothing and embeds nothing; `crates/epigraph-api/src/routes/policies.rs::embed_new_challenge`
+- **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
+- **MCP `supersede_claim`** and **HTTP `POST /api/v1/claims/:id/supersede`** — the act inserts a current replacement with new text and copies no vector, so the replacement is embedded post-commit: MCP through its inherited author (`tools/supersede.rs::supersede_claim`, `embed_claim_author_stamped`), HTTP on the caller's stamp (`routes/versioning.rs::supersede_claim`, `AppState::embed_claim_as`)
+- **MCP `evolve_step`** and **HTTP `POST /api/v1/workflows/steps/:id/evolve`** — the new step, `supersedes` or `revises`, embedded post-commit through the caller that authored it (`tools/evolve_step.rs`, `embed_created_workflow_claims`; `routes/workflows.rs::evolve_step`, `embed_inserted_workflow_claims`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format the vector with `epigraph_db::pgvector_literal` (the one helper; `embedding_stack_ratchet` refuses a hand-written `[v,v,...]`), bind as `$N::vector`)
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
@@ -235,8 +274,11 @@ When superseding or otherwise flipping `is_current` to false, null BOTH
 `is_current = false`. `chk_deprecated_no_embedding` (`CHECK (is_current OR
 (embedding IS NULL AND embedding_3072 IS NULL))`) is checked per statement, so a
 separate `UPDATE ... SET embedding = NULL` afterwards is refused with 23514.
-`embedding_3072` matters as much as `embedding`: recall at centroid_dim=3072
-(`ClaimRepository::search_by_embedding_since`) has no `is_current` filter.
+`embedding_3072` matters as much as `embedding`: it is a second live ANN
+column. Recall at centroid_dim=3072 (`ClaimRepository::search_by_embedding_since`)
+has stated `is_current` itself since backlog 7720cb7a, as do the diverse
+theme reads in `claim_theme.rs`, so the CHECK and the read now both keep a
+retired claim out of recall; neither replaces the other.
 
 The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 
@@ -275,8 +317,12 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- enqueues one embedding_generation job per restored claim.
          --
          -- THE BOUND STAYS AT 24h, AND IT IS NOW A DEPLOYMENT QUESTION RATHER
-         -- THAN A MISSING-CODE ONE. `bin/server.rs` does register a handler for
-         -- that job type, but CONDITIONALLY: only the provider that OWNS this
+         -- THAN A MISSING-CODE ONE. A handler for that job type is registered,
+         -- by `jobs_drain::build_job_runner` (crates/epigraph-api), which only
+         -- the `drain_jobs` timer binary runs: since D9 `bin/server.rs` runs no
+         -- job runner at all, so an instance whose drain timer is not installed
+         -- drains nothing whatever its provider. The registration is
+         -- CONDITIONAL: only the provider that OWNS this
          -- column may write it. That is stricter than "not a mock" -- a real
          -- provider embedding into a different vector space is refused too, and
          -- refused deliberately, because one ANN column holding two spaces
@@ -287,8 +333,10 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- forever on exactly the instances that most need to see it. A
          -- non-zero count of jobs older than the bound now means "this
          -- instance's embedding provider is not the one that owns this
-         -- column", which is a deployment signal rather than a missing-handler
-         -- one; the boot log's own warning says which provider was selected,
+         -- column, or its `drain_jobs` timer is not running", which is a
+         -- deployment signal rather than a missing-handler one; the warning
+         -- in `drain_jobs`'s log (not the server's boot log) says which
+         -- provider was selected,
          -- and `epigraph-cli reembed` remains the recovery path in that case.
          --
          -- Restoration is HALF: the job writes `embedding`, which is the column
@@ -416,3 +464,33 @@ security(crypto): use constant-time comparison in signature verification
 ```
 
 <!-- END epistemic-commit-protocol -->
+
+## Commit-message lint (this repository)
+
+CI (`.github/scripts/commit-message-lint.py`, job `Commit message lint`) reads
+only the non-merge commits a change adds. It refuses:
+
+- **E1** an e-mail address outside a trailer (placeholder domains and
+  `noreply@anthropic.com` excepted; `role@<IPv4>` in a connection string is not
+  an address);
+- **E2** a home-directory path (`/home/<name>/`, `/Users/<name>/`) whose name is
+  not generic (`user`, `runner`, `dev`, `you`, `me`, `USER`);
+- **E3** a wildcard-DNS host that encodes an address, or a bare public IPv4
+  outside the documentation, loopback and private ranges;
+- **E4** a Verification section that says "Not run", "CI to confirm" or "to be
+  run" when the message has no line starting `Unverified:` (a list item,
+  `- Unverified: ...`, counts). Record what was not run on such a line; that is
+  the only thing that clears E4;
+- **E5** a change inside a `SECURITY DEFINER` function (any `*.sql` hunk inside a
+  `CREATE FUNCTION` statement that carries the attribute) whose Verification
+  records no run, or which has no Verification section. `Unverified:` does NOT
+  clear E5: a later commit in the same change that names the first commit's sha
+  (7+ characters) next to the test result does;
+- **E6** a term from the private deny-list (customer and deployment names). The
+  list lives in the repository secret `COMMIT_LINT_DENY_TERMS` (one term per
+  line) and, locally, in a file named by `COMMIT_LINT_DENY_FILE`; it is never
+  committed, because a public deny-list would publish the names it protects.
+
+It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
+message with none of the three sections (W3). Output is redacted, never the
+offending value.

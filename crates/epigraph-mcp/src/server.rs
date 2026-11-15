@@ -49,6 +49,11 @@ pub struct EpiGraphMcpFull {
     /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
     /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
     pub(crate) privileged_pool: Option<&'static str>,
+    /// The tasks tools detach and answer ahead of (a queued document walk, a
+    /// post-commit embedding loop), counted so the stdio entry point can wait
+    /// for them before the process exits. Shared by every clone of the server.
+    /// See [`crate::background`].
+    pub(crate) background: crate::background::BackgroundTasks,
     /// The key every signature this server makes is by. In the legacy modes
     /// it is also the agent's identity (`agents.public_key`); in the
     /// separate-signing-key mode (agent identity lineage design D2) it is the
@@ -117,9 +122,15 @@ pub struct EpiGraphMcpFull {
     /// which made `AppState::with_policy_gate` — the documented seam for a
     /// deployment that installs its own policy — reach the HTTP surface and
     /// silently not the MCP one. The two surfaces would have diverged the first
-    /// time anyone exercised the override, on the transport where the divergence
-    /// matters most: `call_tool` runs `enforce_tool_scope` only for HTTP calls,
-    /// so on stdio this gate is the only authorization that runs at all.
+    /// time anyone exercised the override.
+    ///
+    /// **No tool consults it at present.** PR-14 deleted that helper together
+    /// with the `assign_ownership` / `update_partition` tools it guarded (see
+    /// the note in `tools/perspectives.rs`), and nothing else reads this field:
+    /// it is only assigned, by the constructors and by
+    /// [`Self::with_policy_gate`]. It is therefore not an authorization that
+    /// runs on stdio or on HTTP; a tool's writes are authorized by row
+    /// security and by the tool's own checks.
     ///
     /// Defaults to `GroupPolicyGate` in every constructor;
     /// [`Self::with_policy_gate`] replaces it.
@@ -159,11 +170,6 @@ pub struct EpiGraphMcpFull {
     /// `recall_with_context`'s `frac_3072` auto-detect read, behind a short
     /// per-scope cache shared by every session (backlog be28f3d2).
     pub(crate) centroid_population: Arc<crate::tools::recall::CentroidPopulationCache>,
-    /// The tasks this server's tool calls left running after their response
-    /// (detached document walks, post-commit embedding loops), shared by every
-    /// clone so a process can wait for them before it exits. See
-    /// [`crate::background`].
-    pub(crate) background: crate::background::BackgroundTasks,
 }
 
 impl EpiGraphMcpFull {
@@ -176,15 +182,6 @@ impl EpiGraphMcpFull {
     /// Propagates whatever [`Self::agent_id`] returns.
     pub async fn server_agent_id(&self) -> Result<uuid::Uuid, McpError> {
         self.agent_id().await
-    }
-
-    /// The tasks this server's tool calls left running, shared with every
-    /// clone of it (and so with every HTTP session cloned from one template).
-    /// A process that is about to exit drains them
-    /// ([`crate::background::BackgroundTasks::drain`]).
-    #[must_use]
-    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
-        self.background.clone()
     }
 
     /// The agent a write on this request authors and stamps as (batch H-b, D1).
@@ -1162,6 +1159,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer: Arc::new(signer),
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1178,7 +1176,6 @@ impl EpiGraphMcpFull {
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
             centroid_population: Arc::default(),
-            background: crate::background::BackgroundTasks::default(),
         }
     }
 
@@ -1208,6 +1205,14 @@ impl EpiGraphMcpFull {
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
         self
+    }
+
+    /// The set of detached tasks this server (and every clone of it) has
+    /// running. `main` takes it before handing the server to the stdio
+    /// transport, and waits on it after the client disconnects.
+    #[must_use]
+    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
+        self.background.clone()
     }
 
     /// Switch connector-mode elevation on or off (see the field's doc; OFF is
@@ -1303,6 +1308,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer,
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1319,7 +1325,6 @@ impl EpiGraphMcpFull {
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
             centroid_population: Arc::default(),
-            background: crate::background::BackgroundTasks::default(),
         }
     }
 
@@ -1416,7 +1421,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is."
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is. Each row also carries conjunct_estimate (a deterministic estimate of how many independent assertions the text makes) and conjunct_signals (the rules behind an estimate above 1: sentences, semicolon, coordination, enumeration, respectively). Both are advisory: they change neither looks_atomic nor what decompose_claims selects, and a looks_atomic=true row stays terminal whatever its estimate."
     )]
     async fn query_undecomposed_claims(
         &self,
@@ -1536,7 +1541,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. It also writes a same_as identity edge duplicate -> canonical whose properties.dedup records this tool, the rule and your reason (when given). A mark can be undone: unmark_duplicate (or HTTP POST /api/v1/claims/:id/undedup) reverses the dedup on a server holding the administrative (maintenance) connection; request-serving servers refuse it with nothing written, and there an operator runs the un-mark as the `unmark_duplicate` CLI on the maintenance DSN. Undoing a mark therefore takes an operator: mark only what you are sure of. USE IT when one claim restates another and only one should stay current; the canonical must be CURRENT (a mark onto a retired claim is refused with nothing written). For two claims that should BOTH stay current, link them instead (an EQUIVALENT_TO edge via HTTP POST /api/v1/edges, scope edges:write, or link_epistemic corroborates); for an operational index family (a lead list, a tracker), use plan_label_dedup / apply_label_dedup (docs/conventions/duplicates-and-index-hygiene.md). WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. It also writes a same_as identity edge duplicate -> canonical whose properties.dedup records this tool, the rule and your reason (when given). A mark can be undone: unmark_duplicate (or HTTP POST /api/v1/claims/:id/undedup) reverses the dedup on a server holding the administrative (maintenance) connection; request-serving servers refuse it with nothing written, and there an operator runs the un-mark as the `unmark_duplicate` CLI on the maintenance DSN. Undoing a mark therefore takes an operator: mark only what you are sure of. USE IT when one claim restates another and only one should stay current; the canonical must be CURRENT (a mark onto a retired claim is refused with nothing written). For two claims that should BOTH stay current, link them instead (link_epistemic with EQUIVALENT_TO for a belief-neutral equivalence, or link_epistemic corroborates when one should support the other's belief); for an operational index family (a lead list, a tracker), use plan_label_dedup / apply_label_dedup (docs/conventions/duplicates-and-index-hygiene.md). WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
     )]
     async fn mark_duplicate(
         &self,
@@ -1910,7 +1915,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Semantic search over every embedded claim in the graph (paragraphs, atoms, sections, workflow steps, submit_claim / memorize claims) with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges; each atom carries its authored truth_value and its belief_score, the effective belief on the same scale as the hit's own belief_score), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, CORROBORATES neighbors, and epistemic-edge neighbours (epistemic_edges: supports / refutes / contradicts / specializes / elaborates / cites, each with relationship, direction incoming|outgoing, truth_value; capped per relationship by epistemic_limit, default 4; epistemic_edges_total / _truncated report the full count). Parentage is enrichment, not eligibility: a hit with no paper attribution omits `paper` and has `section: null`. atoms, siblings and neighbor_paragraphs are built from the paper hierarchy, so only level-2 paragraph hits get them filled (an atom or section hit still carries `paper`, with those lists empty); corroborates and epistemic_edges come from the hit's own edges at any level, with or without a paper. `paragraph_id` is the hit's claim id whatever its level. Auto-detects centroid_dim (1536 vs 3072) from all embedded claims by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest claims belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 paragraph with a live refutation lands in open_question."
+        description = "Semantic search over every embedded claim in the graph (paragraphs, atoms, sections, workflow steps, submit_claim / memorize claims) with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges; each atom carries its authored truth_value and its belief_score, the effective belief on the same scale as the hit's own belief_score), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, CORROBORATES neighbors, and epistemic-edge neighbours (epistemic_edges: supports / refutes / contradicts / specializes / elaborates / cites, each with relationship, direction incoming|outgoing, truth_value; capped per relationship by epistemic_limit, default 4; epistemic_edges_total / _truncated report the full count). Parentage is enrichment, not eligibility: a hit with no paper attribution omits `paper` and has `section: null`. atoms, siblings and neighbor_paragraphs are built from the paper hierarchy, so only level-2 paragraph hits get them filled (an atom or section hit still carries `paper`, with those lists empty); corroborates and epistemic_edges come from the hit's own edges at any level, with or without a paper. `paragraph_id` is the hit's claim id whatever its level. Auto-detects centroid_dim (1536 vs 3072) from all embedded claims by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest claims belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. diverse=true is rejected alongside paper_doi_filter: the theme candidate pool cannot be restricted to one paper. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 paragraph with a live refutation lands in open_question. Every response reports below_confidence_floor (candidates the min_truth floor dropped) and insufficient_confidence (true when candidates were retrieved but none cleared the floor, as opposed to nothing relevant). group_by_parent=true reorders the page so hits sharing a decomposes_to parent (the atoms of one compound claim) come back adjacent at their best member's rank, each tagged parent_claim_id; it changes order only, never the set."
     )]
     async fn recall_with_context(
         &self,
@@ -1920,6 +1925,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::recall::recall_with_context(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "The document context of ONE claim, looked up by id: its paper, section, atoms, sibling paragraphs and epistemic edges, with belief fields. Returns {claim_id, context}, where context is exactly the block recall_with_context returns per hit (minus similarity). Use it when you already hold a claim id: searching for the claim's own text can return a near-duplicate instead, and never returns a claim that has no embedding. A claim that is absent or that you cannot read is reported as not found. Read-only; writes no recall audit row."
+    )]
+    async fn claim_context(
+        &self,
+        Parameters(params): Parameters<crate::tools::recall::ClaimContextParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::recall::claim_context(self, viewer, params).await
     }
 
     #[tool(
@@ -2006,7 +2024,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument). Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]). Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer. All-or-nothing, on one transaction with the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)'s write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group the calling agent cannot write (another agent's private claim) is refused with nothing written."
+        description = "Create a cross-tier structural edge between two existing claims (decomposes_to, section_follows, or continues_argument), or a workflow reference: executes (workflow -> step claim; repairs a dropped executes edge), invokes (workflow or step claim -> workflow, a sub-workflow reference; optional at_step) or depends_on (workflow -> workflow, a prerequisite). Endpoints are claims unless source_type / target_type (validated against the entity_types registry) say \"workflow\". executes, invokes and depends_on refuse an edge that would close a cycle; executes writes from the head generation only; invokes and depends_on refuse a non-public workflow endpoint (such an edge would be stored public). A workflow source needs authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes needs it over every workflow executing that step; otherwise it is refused with nothing written. A reference between public workflows is world-owned (owned_by_caller=false), so its writer cannot patch or retract it. None of these move belief. Purpose-built for per-chapter ingest wire-ups (chapter thesis -> book thesis, chapter[N] -> chapter[N+1]) and workflow cross-references. Idempotent on (source, target, relationship): re-runs return the existing edge_id with created=false. Bypasses HTTP and goes straight through the repo layer. All-or-nothing, on one transaction with the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)'s write authority: an edge touching a group-private claim you cannot read is reported as not found, and one touching a group-private claim owned by a group the calling agent cannot write (another agent's private claim) is refused with nothing written."
     )]
     async fn link_hierarchical(
         &self,
@@ -2034,7 +2052,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: positive: supports, corroborates, elaborates, generalizes, specializes (they transmit the source's belief toward the target); negative: contradicts, refutes (they transmit it against the target); cites is also accepted as a structural edge that moves no belief, and so is qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief) — use it instead of contradicts for a caveat that limits where the target holds without saying it is false. For a positive edge polarity is not a guarantee of direction: the edge carries the source's whole belief interval, scaled by the relationship's factor, so the source's doubt travels with its belief, both its disbelief (1 - plausibility) and its open-world (frame-incompleteness) mass. So a positive edge can LOWER the target's belief and pignistic_prob when the source is weakly believed or frame-incomplete (open-world mass hits hardest when the target carries open-world mass of its own); read target_belief rather than assuming a rise. A negative edge means mutual exclusion (source and target cannot both be true): only the source's belief arrives, scaled by the relationship's factor, as disbelief in the target, together with the source's open-world mass; the source's disbelief transfers nothing. So a negative edge puts no mass on the target being true, a weakly believed or disbelieved source barely moves its target, and a negative edge cannot RAISE the target's belief or pignistic_prob (beyond the renormalisation of open-world mass the target already carries, which combining any new mass function causes). Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the source's restricted mass is vacuous (e.g. a contradictor with ~no belief), the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). belief_wired_reason names which, and is omitted when belief_wired is true: source_has_no_belief, vacuous_source_mass, already_wired, structural_relationship, or refused_or_failed (a refused or failed wiring). Two further values are defensive and appear only when the edge or its source changes underneath the call (a concurrent retraction or removal): edge_retracted and source_author_unresolved. target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: positive: supports, corroborates, elaborates, generalizes, specializes (they transmit the source's belief toward the target); negative: contradicts, refutes (they transmit it against the target); cites is also accepted as a structural edge that moves no belief, and so is qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief) — use it instead of contradicts for a caveat that limits where the target holds without saying it is false — and so is EQUIVALENT_TO (the two claims say the same thing and both stay current; moves no belief), in that exact upper-case spelling: use it, not corroborates, for two restatements that should both stay current without one raising the other's belief. For a positive edge polarity is not a guarantee of direction: the edge carries the source's whole belief interval, scaled by the relationship's factor, so the source's doubt travels with its belief, both its disbelief (1 - plausibility) and its open-world (frame-incompleteness) mass. So a positive edge can LOWER the target's belief and pignistic_prob when the source is weakly believed or frame-incomplete (open-world mass hits hardest when the target carries open-world mass of its own); read target_belief rather than assuming a rise. A negative edge means mutual exclusion (source and target cannot both be true): only the source's belief arrives, scaled by the relationship's factor, as disbelief in the target, together with the source's open-world mass; the source's disbelief transfers nothing. So a negative edge puts no mass on the target being true, a weakly believed or disbelieved source barely moves its target, and a negative edge cannot RAISE the target's belief or pignistic_prob (beyond the renormalisation of open-world mass the target already carries, which combining any new mass function causes). Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the source's restricted mass is vacuous (e.g. a contradictor with ~no belief), the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). belief_wired_reason names which, and is omitted when belief_wired is true: source_has_no_belief, vacuous_source_mass, already_wired, structural_relationship, or refused_or_failed (a refused or failed wiring). Two further values are defensive and appear only when the edge or its source changes underneath the call (a concurrent retraction or removal): edge_retracted and source_author_unresolved. target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn link_epistemic(
         &self,
@@ -2351,7 +2369,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label and truth_value), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only. Edges are only those between returned nodes; edges_omitted counts the edges followed to nodes not returned (node limit reached or min_truth filtered), so a positive edges_omitted with limit nodes returned means the node limit clipped the walk: raise limit if it is below its maximum of 100, otherwise narrow the walk with relationship or max_depth (limit cannot exceed 100)."
+        description = "Multi-hop graph walk from a starting node of any entity type. BFS over outgoing edges with optional relationship filter and truth threshold. Each node reports node_type: 'claim' for a claim (with label, its authored truth_value, and belief_score: the effective Dempster-Shafer belief, the same value recall and recall_with_context report as belief_score, falling back to truth_value for a claim with no DS state), otherwise the type recorded on the edge that reached it ('paper', 'workflow', 'agent', ...), and 'unknown' only when no visible edge records one. The walk continues through non-claim nodes (e.g. paper -> asserts -> claim, workflow -> executes -> claim); min_truth filters claim nodes only, on belief_score. Edges are only those between returned nodes; edges_omitted counts the edges followed to nodes not returned (node limit reached or min_truth filtered), so a positive edges_omitted with limit nodes returned means the node limit clipped the walk: raise limit if it is below its maximum of 100, otherwise narrow the walk with relationship or max_depth (limit cannot exceed 100)."
     )]
     async fn traverse(
         &self,
@@ -3136,14 +3154,17 @@ impl ServerHandler for EpiGraphMcpFull {
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
                 // (d) proxy to the downstream on a fresh caller-token session.
-                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
-                // handler's error type directly (no further conversion).
+                // A failure is answered as what it is (backlog 7ea4bd74): the
+                // downstream's own JSON-RPC error unchanged, and a designed
+                // message for an extension that is down or did not answer.
+                // Every one of these used to reach the caller as the same
+                // redacted "internal error".
                 return self
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map(rmcp::model::CallToolResponse::from)
-                    .map_err(crate::errors::internal_error);
+                    .map_err(|e| crate::errors::federated_call_error(&ext_name, &request.name, e));
             }
 
             // Neither a kernel tool nor a federated route: a ROUTING failure.

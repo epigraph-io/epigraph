@@ -31,12 +31,57 @@ fn parse_combination_method(s: &str) -> Result<CombinationMethod, String> {
     }
 }
 
-/// Parse mass JSON into a `MassFunction` using epigraph-ds's built-in parser.
+/// Parse a STORED BBA row into a `MassFunction` using epigraph-ds's lenient
+/// parser. For rows re-read from the database only: caller-supplied masses go
+/// through [`parse_submitted_masses`].
 fn parse_masses_json(
     frame: &FrameOfDiscernment,
     masses_json: &serde_json::Value,
 ) -> Result<MassFunction, McpError> {
     MassFunction::from_json_masses(frame.clone(), masses_json)
+        .map_err(|e| invalid_params(format!("invalid mass function: {e}")))
+}
+
+/// Parse the CALLER-SUPPLIED masses of a write (`submit_ds_evidence`).
+///
+/// Unlike [`parse_masses_json`], which `MassFunction::from_json_masses` backs
+/// for trusted stored rows, nothing here is taken on trust:
+///
+/// - a focal-element key that does not parse is refused. The stored-row parser
+///   turns it into the empty set, i.e. CONFLICT mass, so `{"true": 0.6,
+///   "true,false": 0.4}` was stored as `{"": 0.4}`;
+/// - two keys naming the same focal element (`"0,1"` and `"1,0"`) are refused
+///   rather than the later one silently replacing the earlier;
+/// - the masses are validated by `MassFunction::new`: no negative or NaN
+///   mass, no focal element outside the frame, and a sum of 1. Nothing
+///   downstream checks (there is no constraint on `mass_functions.masses`),
+///   so `{"0": 3.0}` was stored and folded by every later recompute.
+fn parse_submitted_masses(
+    frame: &FrameOfDiscernment,
+    masses_json: &serde_json::Value,
+) -> Result<MassFunction, McpError> {
+    let submitted: std::collections::BTreeMap<String, f64> =
+        serde_json::from_value(masses_json.clone())
+            .map_err(|e| invalid_params(format!("invalid mass function: {e}")))?;
+    let mut masses = std::collections::BTreeMap::new();
+    for (key, mass) in submitted {
+        let focal = epigraph_ds::focal_serde::key_to_focal(&key).map_err(|e| {
+            invalid_params(format!(
+                "invalid mass function: focal element key '{key}' is not a comma-separated \
+                 list of hypothesis indices, optionally ~-prefixed ({e})"
+            ))
+        })?;
+        if masses.insert(focal, mass).is_some() {
+            return Err(invalid_params(format!(
+                "invalid mass function: key '{key}' names the same focal element as an \
+                 earlier key; give each focal element once"
+            )));
+        }
+    }
+    // `MassFunction::new`, as the HTTP twin (`POST /frames/:id/evidence`)
+    // builds it: every mass non-negative and not NaN, every focal element
+    // inside the frame, the masses summing to 1.
+    MassFunction::new(frame.clone(), masses)
         .map_err(|e| invalid_params(format!("invalid mass function: {e}")))
 }
 
@@ -56,6 +101,14 @@ pub async fn create_frame(
 ) -> Result<CallToolResult, McpError> {
     if params.hypotheses.len() < 2 {
         return Err(invalid_params("frame requires at least 2 hypotheses"));
+    }
+    // Refused, not deduplicated (backlog e5da67ef): see
+    // `FrameOfDiscernment::first_duplicate_hypothesis`.
+    if let Some(dup) = FrameOfDiscernment::first_duplicate_hypothesis(&params.hypotheses) {
+        return Err(invalid_params(format!(
+            "frame hypotheses must be distinct: `{dup}` appears more than once. Nothing was \
+             written."
+        )));
     }
 
     // Check if parent is specified and valid
@@ -165,7 +218,7 @@ pub async fn submit_ds_evidence(
     //   `None` and never reaches locality composition, so we fold that case
     //   into the legacy branch too rather than silently accepting a
     //   parameter that couldn't affect anything.
-    let mut mass_fn = parse_masses_json(&frame, &params.masses)?;
+    let mut mass_fn = parse_submitted_masses(&frame, &params.masses)?;
     let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
     // What is STORED is the canonical key (`Testimony` -> `testimonial`), or the
     // caller's own key lowercased when the calibration does not know it
@@ -458,6 +511,29 @@ pub async fn submit_ds_evidence(
             .map_err(internal_error)?
             .len();
 
+    // The claim's Beta-Bernoulli track (backlog f50344c0), kept as
+    // `POST /frames/:id/evidence` keeps it, by the same function: the stored
+    // BBA's mass on the claim's assigned hypothesis goes to alpha, the rest of
+    // its non-conflict mass to beta. An identical resubmission was counted
+    // when it was first stored and is not counted again. Best-effort, under
+    // its own savepoint: a refused statement (a non-owner of a public claim
+    // does not write its row) never aborts this submission.
+    let assigned_index =
+        FrameRepository::get_claim_assignment(&mut *tx, viewer, claim_id, frame_id)
+            .await
+            .map_err(internal_error)?
+            .and_then(|a| a.hypothesis_index);
+    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+        &mut tx,
+        viewer,
+        claim_id,
+        (write_outcome != BbaWriteOutcome::Unchanged)
+            .then(|| epigraph_engine::ds_divergence::beta_increments(&mass_fn, assigned_index)),
+        "submit_ds_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+
     // Combine + persist the claim's cached belief via the SAME code path
     // `recompute_beliefs` uses (`recompute_claim_belief_on_frame` ->
     // `recompute_combined_belief`), instead of re-deriving it here with a
@@ -604,6 +680,27 @@ pub async fn submit_ds_evidence(
             )
         }
     };
+
+    // The DS-vs-Bayesian divergence row `get_divergence` reads (backlog
+    // f50344c0): this call's BetP against the Beta posterior above, on the
+    // frame the BBA was filed on. Only the REST twin used to write it, so
+    // `get_divergence` had no data for a claim whose evidence came in here.
+    // Best-effort, under its own savepoint: the row is claim-derived, and a
+    // writer that does not write the claim's group is refused it without
+    // losing the submission.
+    if let Some(p) = pignistic_prob {
+        epigraph_engine::ds_divergence::record_divergence(
+            &mut tx,
+            claim_id,
+            frame_id,
+            p,
+            bayesian_posterior,
+            Some(frame_row.version),
+            "submit_ds_evidence",
+        )
+        .await
+        .map_err(internal_error)?;
+    }
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -1111,5 +1208,85 @@ fn focal_to_key(fe: &FocalElement) -> String {
         format!("~{}", indices.join(","))
     } else {
         indices.join(",")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binary_frame() -> FrameOfDiscernment {
+        FrameOfDiscernment::new("binary_truth", vec!["true".into(), "false".into()]).expect("frame")
+    }
+
+    fn refusal(masses: serde_json::Value) -> String {
+        let err = parse_submitted_masses(&binary_frame(), &masses)
+            .expect_err(&format!("{masses} must be refused"));
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{masses}");
+        err.message.into_owned()
+    }
+
+    /// Backlog 2fe81d61: on the write path an unparseable focal key became the
+    /// empty set (conflict mass) and colliding keys overwrote each other.
+    #[test]
+    fn submitted_masses_refuse_unparseable_and_colliding_keys() {
+        // Hypothesis NAMES instead of indices (what `scripts/e2e/probe-tools.sh`
+        // sent): both keys used to collapse onto the conflict element.
+        let msg = refusal(serde_json::json!({"true": 0.6, "true,false": 0.4}));
+        assert!(msg.contains("true"), "the error must name the key: {msg}");
+        assert!(refusal(serde_json::json!({"0, 1": 1.0})).contains("0, 1"));
+        assert!(refusal(serde_json::json!({"T": 1.0})).contains("'T'"));
+
+        // "0,1" and "1,0" are the same focal element.
+        let msg = refusal(serde_json::json!({"0,1": 0.3, "1,0": 1.0}));
+        assert!(msg.contains("same focal element"), "{msg}");
+
+        // The documented key forms stay accepted, conflict and open-world
+        // ignorance included.
+        for ok in [
+            serde_json::json!({"0": 0.6, "0,1": 0.4}),
+            serde_json::json!({"0": 0.8, "~": 0.2}),
+            serde_json::json!({"~0": 0.5, "0,1": 0.5}),
+            serde_json::json!({"": 0.1, "0": 0.9}),
+        ] {
+            let parsed = parse_submitted_masses(&binary_frame(), &ok)
+                .unwrap_or_else(|e| panic!("{ok} must be accepted: {}", e.message));
+            assert_eq!(
+                parsed.masses().len(),
+                ok.as_object().expect("object").len(),
+                "{ok}: every key is its own focal element"
+            );
+        }
+    }
+
+    /// Backlog 0b4a135f: the write path stored masses that do not sum to 1,
+    /// are negative or above 1, or sit on a focal element outside the frame.
+    /// The HTTP twin (`POST /frames/:id/evidence`) refuses all of them through
+    /// `MassFunction::new`.
+    #[test]
+    fn submitted_masses_are_validated_like_the_http_twin() {
+        for (masses, needle) in [
+            (serde_json::json!({"0": 3.0}), "sum"),
+            (serde_json::json!({"0": 0.6}), "sum"),
+            (serde_json::json!({"0": 0.6, "0,1": 0.6}), "sum"),
+            (serde_json::json!({"0": -0.2, "0,1": 1.2}), "Negative"),
+            (serde_json::json!({"7": 1.0}), "outside frame"),
+            (serde_json::json!({"~7": 1.0}), "outside frame"),
+            (serde_json::json!({}), "sum"),
+        ] {
+            let msg = refusal(masses.clone());
+            assert!(
+                msg.starts_with("invalid mass function:") && msg.contains(needle),
+                "{masses}: expected a '{needle}' refusal, got: {msg}"
+            );
+        }
+
+        let ok = parse_submitted_masses(
+            &binary_frame(),
+            &serde_json::json!({"0": 0.7, "1": 0.1, "0,1": 0.2}),
+        )
+        .expect("a valid BBA is accepted");
+        let total: f64 = ok.masses().values().sum();
+        assert!((total - 1.0).abs() < 1e-9);
     }
 }

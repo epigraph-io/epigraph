@@ -17,10 +17,9 @@
 //! reads.
 //!
 //! The other 8 sites WRITE — six in `supersede_claim`, two in `mark_duplicate`.
-//! One of the six is blocked a second time at SITE level:
-//! `let pool = state.db_pool.clone()` is moved into a detached `tokio::spawn`,
-//! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
-//! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//! One of the six was a `state.db_pool.clone()` moved into a detached
+//! `tokio::spawn` that only logged a factor count; it is deleted (backlog
+//! 79e1f75d). Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
 //!
 //! `supersede_claim`'s ownership read (`F-write-authz-reads-unfiltered`) is
 //! now viewer-filtered on a stamped connection (batch H6): a caller cannot
@@ -152,6 +151,10 @@ pub struct SupersessionResponse {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub belief_cascade: epigraph_engine::retraction_cascade::CascadeReport,
+    /// Whether the replacement got its embedding (best-effort, post-commit; a
+    /// backfill covers a `false`). `#[serde(default)]` as for the two above.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 /// A single version entry in a claim's history
@@ -394,8 +397,11 @@ pub async fn supersede_claim(
     //    replacement and the `supersedes` edge). Re-pointing the old claim's
     //    other edges belongs to whoever asserted them and runs below as the
     //    administrative cascade.
+    //    Its two edges are attested at INSERT with the API's own key (backlog
+    //    dae795f8), `None` when this API has none configured.
     let (new_uuid, _old_uuid) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        state.edge_signing_key(),
         old_claim_id,
         &request.content,
         truth_value,
@@ -507,6 +513,15 @@ pub async fn supersede_claim(
         )
         .await;
 
+    // 9a'. Embed the replacement: a current claim with new text and no vector
+    // (the act copies none on purpose). Post-commit and best-effort, on the
+    // caller's stamp, which just wrote the row (CLAUDE.md "Embedding policy";
+    // backlog 7628ab2c). Without it the claim that replaced a recallable one
+    // was invisible to dense recall until a backfill ran.
+    let embedded = state
+        .embed_claim_as(&viewer, new_uuid, &request.content, "supersede_claim.embed")
+        .await;
+
     // 9b. The administrative cascade (backlog 20e9ed83; migration 117): migrate
     // the retired claim's edges onto the replacement, then invalidate the
     // edge-factor BBAs frozen from ITS interval and re-derive them. Those edges
@@ -532,47 +547,6 @@ pub async fn supersede_claim(
         (None, status) => (status, Default::default()),
     };
 
-    // 10. Trigger belief propagation for downstream factors (fire-and-forget).
-    //
-    // Supersession creates stale downstream beliefs: any factor that referenced
-    // the old claim via variable_ids now needs its beliefs re-propagated from
-    // the new claim. We identify affected factors here and log them so Task 6
-    // (unified BP dispatcher) can pick them up. The spawn is intentionally
-    // non-blocking — a propagation failure must never abort a supersession.
-    {
-        let pool = state.db_pool.clone();
-        tokio::spawn(async move {
-            let factor_ids: Result<Vec<(Uuid,)>, sqlx::Error> =
-                sqlx::query_as("SELECT id FROM factors WHERE $1 = ANY(variable_ids)")
-                    .bind(new_uuid)
-                    .fetch_all(&pool)
-                    .await;
-
-            match factor_ids {
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %new_uuid,
-                        error = %e,
-                        "BP trigger: failed to query factors for new claim after supersession"
-                    );
-                }
-                Ok(rows) if rows.is_empty() => {
-                    tracing::debug!(
-                        claim_id = %new_uuid,
-                        "BP trigger: no factors reference new claim, skipping propagation"
-                    );
-                }
-                Ok(rows) => {
-                    tracing::info!(
-                        claim_id = %new_uuid,
-                        factor_count = rows.len(),
-                        "BP trigger: supersession requires belief propagation across factors"
-                    );
-                }
-            }
-        });
-    }
-
     Ok((
         StatusCode::CREATED,
         Json(SupersessionResponse {
@@ -583,6 +557,7 @@ pub async fn supersede_claim(
             created_at: now,
             cascade,
             belief_cascade,
+            embedded,
         }),
     ))
 }
@@ -969,8 +944,11 @@ pub async fn mark_duplicate(
     )
     .marked_by(viewer.principal())
     .reason(req.reason.as_deref());
+    // The identity edge is attested at INSERT with the API's own key (backlog
+    // dae795f8), `None` when this API has none configured.
     ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
+        state.edge_signing_key(),
         ClaimId::from_uuid(dup_id),
         ClaimId::from_uuid(req.canonical_id),
         &provenance,
@@ -1271,7 +1249,7 @@ pub async fn unmark_duplicate(
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule). Stored only if the claim is still current and unsealed.
     let mut embedded = false;
-    if let Some(embedder) = state.embedding_service() {
+    if let Some(embedder) = state.storing_embedding_service() {
         match embedder.generate(&content).await {
             Ok(v) => {
                 let pgvec = epigraph_db::pgvector_literal(&v);
@@ -1424,12 +1402,14 @@ mod tests {
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
     // These need to be rewritten as proper DB integration tests.
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // COMPILED, NOT RUN: CI's "No-db lib-test build check" builds this
+    // module (`--no-run`) so it cannot rot into compile errors again, but its
+    // tests are not executed: in the not(db) arm `supersede_claim` and
+    // `claim_history` are 503 stubs, so the in-memory supersession these tests
+    // exercise no longer exists there. The `OK -> UNAUTHORIZED` flips
+    // inside it are DOCUMENTATION of the intended behaviour;
+    // `tests/public_router_allowlist.rs` is what asserts it, by probing every
+    // route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests_placeholder {
         use super::super::*;
@@ -1438,6 +1418,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::{get, post};
         use axum::Router;
+        use epigraph_core::Claim;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
@@ -2090,12 +2071,14 @@ mod tests {
         }
     } // end mod handler_tests
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // COMPILED, NOT RUN: CI's "No-db lib-test build check" builds this
+    // module (`--no-run`) so it cannot rot into compile errors again, but its
+    // tests are not executed: in the not(db) arm `supersede_claim` and
+    // `claim_history` are 503 stubs, so the in-memory supersession these tests
+    // exercise no longer exists there. The `OK -> UNAUTHORIZED` flips
+    // inside it are DOCUMENTATION of the intended behaviour;
+    // `tests/public_router_allowlist.rs` is what asserts it, by probing every
+    // route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;
@@ -2104,6 +2087,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::post;
         use axum::Router;
+        use epigraph_core::Claim;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 

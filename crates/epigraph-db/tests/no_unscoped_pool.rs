@@ -556,7 +556,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        19,
+        20,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -576,7 +576,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          the app that obtained the code (by its `client_id`, any status, as `register` does), \
          and the refresh grant's lookup of the app a chain was issued to (by id), each reading \
          one `oauth_clients` row's status before anything is minted, the same \
-         pre-authentication reason.",
+         pre-authentication reason. The twentieth is migration 213's single-use check of an \
+         agent's assertion (`AssertionNonceRepository::consume`), an app-callable definer keyed \
+         by the verified public key and the assertion's signed nonce, run after the signature and freshness \
+         verify and before anything is minted: the same pre-authentication reason.",
     ),
     (
         "routes/elevate.rs",
@@ -769,23 +772,30 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// so the merged count is 221 - 10 - 1 = 210 and the file count 40 - 2 = 38,
 /// equal to the `UNCONVERTED` table this test sums.
 ///
-/// 210 -> 209 (backlog 0f2f9ddb): `set_source_reliability` holds a `Viewer`
-/// and writes on the caller's stamped transaction
-/// (`set_source_reliability_conn`); `routes/perspective.rs` 2 -> 1. No file
-/// reached zero.
-///
-/// 209 -> 207 (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding` and
-/// `PUT /api/v1/evidence/:id/embedding` were deleted with their handlers;
-/// `routes/rag.rs` 2 -> 0, key DELETED (`HIGH_WATER_FILES` 38 -> 37).
-///
-/// 207 -> 204 (backlog f64cf9c6): `create_reasoning_trace` moved its three
-/// pool sites onto the caller's `AppState::write_as` transaction
-/// (`routes/crud.rs` 30 -> 27, keeping sites).
-///
-/// 204 -> 203 (backlog 8a168dd6): `query_security_events` reads on the
-/// caller's `AppState::read_as`; `routes/audit.rs` reached zero and its key
-/// was DELETED (`HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 203;
+/// 210 -> 207 when `routes/isomorphism.rs` was DELETED (backlog 54db73b5): a
+/// removal of never-compiled code, not a conversion, and its key went with it
+/// (`HIGH_WATER_FILES` falls by one).
+/// 207 -> 206 when `supersede_claim`'s detached factor-count spawn was deleted
+/// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
+/// 206 -> 205 when `patch_claim`'s ownership read moved onto the caller's
+/// viewer (backlog 4073bbb6): `routes/claims.rs` 17 -> 16.
+/// 205 -> 204: `routes/perspective.rs::set_source_reliability` writes on
+/// `AppState::write_as` (backlog 0f2f9ddb); the file keeps one site, so the
+/// file count does not move.
+/// 204 -> 200 on merging backlog f64cf9c6 and 8a168dd6: `create_reasoning_trace`
+/// moved its three pool sites onto the caller's `AppState::write_as`
+/// transaction (`routes/crud.rs`, keeping sites), and `query_security_events`
+/// reads on the caller's `AppState::read_as` (`routes/audit.rs` reached zero
+/// and its key was DELETED; `HIGH_WATER_FILES` falls by one with it).
+/// 200 -> 198 (backlog 9bef22f3, merged on staging after the line above):
+/// `PUT /api/v1/claims/:id/embedding` and `PUT /api/v1/evidence/:id/embedding`
+/// were deleted with their handlers; `routes/rag.rs` 2 -> 0, key DELETED.
+/// Each side lowered from 204 on its own branch; the merge keeps both drops.
+/// 198 -> 197 (backlog dae795f8, merged on staging after the lines above):
+/// `promote_staged_edges`'s two one-statement arms became one transaction on
+/// the same raw pool, `routes/crud.rs` one site fewer. A merge of two sites,
+/// not a conversion.
+const HIGH_WATER: usize = 197;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -853,9 +863,11 @@ const HIGH_WATER: usize = 203;
 /// 40 -> 39 when `routes/graph_query.rs` reached zero (HTTP public-only reads).
 /// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
 /// caller's stamped transaction; merged with the line above on staging).
-/// 38 -> 37 when `routes/rag.rs` reached zero (backlog 9bef22f3).
+/// 38 -> 37 when `routes/isomorphism.rs` was deleted (see [`HIGH_WATER`]).
 /// 37 -> 36 when `routes/audit.rs` reached zero (backlog 8a168dd6).
-const HIGH_WATER_FILES: usize = 36;
+/// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
+/// staging after the line above).
+const HIGH_WATER_FILES: usize = 35;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -907,7 +919,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // UPDATE moved off `state.db_pool` onto `AppState::store_claim_embedding_as`
     // (the caller's stamp). Read off this test's own failure (`recorded 18,
     // measured 17`).
-    ("routes/claims.rs", 17),
+    // 17 -> 16 (backlog 4073bbb6): `patch_claim`'s ownership read moved off
+    // `state.db_pool` onto `AppState::read_as` (`ClaimRepository::write_target_of`
+    // through the caller's viewer), as `update_labels`'s did in batch H6.
+    ("routes/claims.rs", 16),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -996,7 +1011,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
     // transaction. Its provenance append stays on the pool, as every
     // `record_provenance` call does.
-    ("routes/crud.rs", 27),
+    // 27 -> 26 (backlog dae795f8): `promote_staged_edges`'s two arms (one
+    // `&state.db_pool` each) became one transaction begun on it. Still the raw
+    // pool, so not a conversion.
+    ("routes/crud.rs", 26),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
@@ -1056,9 +1074,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 92, row-level security is OFF on both and neither carries a policy, so
     // stamping that connection narrows nothing. The stamp is for the `claims` /
     // `edges` / `claim_neighborhood_membership` reads that follow. (2) The seven
-    // inline edge/membership aggregates in this file remain viewer-less in the
-    // statement; `F-edges-unfiltered` owns that and conversion neither closes
-    // nor worsens it. What DID change beyond the counter is that
+    // inline edge/membership aggregates in this file stayed viewer-less in the
+    // statement at conversion; backlog batch B08 later moved the four edge
+    // statements into `GraphViewRepository` with the edge predicate
+    // (`F-edges-unfiltered`), and conversion neither closed nor worsened it. What DID change beyond the counter is that
     // `compound_response` and `atomic_response` moved from `pool: &PgPool` to
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.
@@ -1072,7 +1091,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 6 since its VOI cache moved onto that same stamped transaction (round 4
     // COR-R4-3).
     ("routes/hypothesis.rs", 6),
-    ("routes/isomorphism.rs", 3),
+    // `routes/isomorphism.rs` was 3 and is GONE, not converted: the file was
+    // DELETED with the `episcience` cargo feature that gated it (backlog
+    // 54db73b5). It imported a crate that is not a dependency, so it was never
+    // compiled and its three sites never ran.
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`
     // only ever emits non-zero entries, so a `0` row could never be satisfied.
@@ -1093,12 +1115,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // and not convertible.
     ("routes/papers.rs", 8),
     // 5 before conversion shard 5, which moved `list_perspectives`,
-    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`; 2
-    // before backlog 0f2f9ddb moved `set_source_reliability` onto
-    // `AppState::write_as` and `set_source_reliability_conn`. The one that
-    // remains WRITES -- `create_perspective` (which also creates a
-    // PERSPECTIVE_OF edge) -- and `PerspectiveRepository::create` takes no
-    // `Viewer`. Same owner as `context.rs`'s residue.
+    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`, and
+    // 2 before `set_source_reliability` (an `UPDATE`) moved onto
+    // `AppState::write_as` (backlog 0f2f9ddb). The one that remains WRITES --
+    // `create_perspective` (which also creates a PERSPECTIVE_OF edge) -- and
+    // `PerspectiveRepository::create` takes no `Viewer`. Same owner as
+    // `context.rs`'s residue.
     ("routes/perspective.rs", 1),
     // 9 before the operator-binding delta review, which moved
     // `create_challenge`'s transaction onto `AppState::begin_claim_write`.
@@ -1165,7 +1187,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (`AppState::admin_cascade_session`). What remains is `supersede_claim`'s
     // detached factor-query spawn and `mark_duplicate`'s best-effort provenance
     // append. Read off this test's failure output.
-    ("routes/versioning.rs", 2),
+    //
+    // 2 -> 1 (backlog 79e1f75d): that detached factor-query spawn only logged a
+    // count and is DELETED, not converted. `mark_duplicate`'s provenance append
+    // is the one site left.
+    ("routes/versioning.rs", 1),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is

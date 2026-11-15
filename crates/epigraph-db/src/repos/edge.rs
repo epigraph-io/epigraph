@@ -243,6 +243,17 @@ fn symmetric_edge_row(r: SymmetricRow) -> EdgeRow {
 /// Repository for Edge operations
 pub struct EdgeRepository;
 
+/// One claim-to-claim link of [`EdgeRepository::links_among_claims`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimLinkRow {
+    /// The edge's id.
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    /// Lower-cased relationship name.
+    pub relationship: String,
+}
+
 impl EdgeRepository {
     /// Create a new edge relationship
     ///
@@ -1130,6 +1141,36 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
+        Self::create_symmetric_if_absent_signed_conn(conn, None, a, b, relationship, properties)
+            .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_conn`], with the edge it INSERTS
+    /// attested at INSERT by `key` (see [`Self::create_signed_conn`]). The
+    /// same ANY-STATE dedup and the same bare `ON CONFLICT DO NOTHING`
+    /// (migration 090's index) as the unsigned form; a dedup hit writes
+    /// nothing and returns `false`.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_conn`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            return Ok(
+                insert_attested_conn(conn, key, att, None, SymmetricGuard::AnyState, true)
+                    .await?
+                    .is_some(),
+            );
+        }
         let result = sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
@@ -2228,6 +2269,63 @@ impl EdgeRepository {
         Ok(found.unwrap_or(false))
     }
 
+    /// Whether `to` is reachable from `from` along IN-FORCE edges whose
+    /// relationship is one of `relationships`, followed source -> target
+    /// (backlog 41d7b27a: the cycle guard for the workflow references
+    /// `invokes` and `depends_on`). `from == to` answers true.
+    ///
+    /// A writer about to add `a -rel-> b` asks `reaches(b, a)`: true means the
+    /// new edge would close a cycle. The walk is a recursive `UNION`, which
+    /// discards a node already reached, so it terminates on a graph that
+    /// already holds a cycle.
+    ///
+    /// Run it on the writer's STAMPED transaction: `edges_tenancy` bounds the
+    /// walk to edges that session reads, so an edge it cannot see does not
+    /// count toward a cycle (a cycle closed only through another group's
+    /// private edge is not refused).
+    ///
+    /// It first takes a transaction-scoped advisory lock keyed on the walked
+    /// relationship set, held until the caller's transaction ends. Two
+    /// concurrent writers of `a -rel-> b` and `b -rel-> a` then check and
+    /// insert one after the other: the second's walk runs on a fresh READ
+    /// COMMITTED snapshot that sees the first's committed edge, so the pair
+    /// cannot both pass and commit a 2-cycle. Call it on the transaction that
+    /// then writes the edge.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn reaches_in_force_conn(
+        conn: &mut sqlx::PgConnection,
+        from: Uuid,
+        to: Uuid,
+        relationships: &[&str],
+    ) -> Result<bool, DbError> {
+        let rels: Vec<String> = relationships.iter().map(|r| (*r).to_string()).collect();
+        let mut key: Vec<&str> = relationships.to_vec();
+        key.sort_unstable();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("edges.reaches:{}", key.join(",")))
+            .execute(&mut *conn)
+            .await?;
+        let reached: bool = sqlx::query_scalar(&format!(
+            "WITH RECURSIVE reach(node) AS ( \
+                 SELECT $1::uuid \
+               UNION \
+                 SELECT e.target_id FROM reach r \
+                   JOIN edges e ON e.source_id = r.node \
+                  WHERE e.relationship = ANY($3) AND {EDGE_IN_FORCE} \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM reach WHERE node = $2)"
+        ))
+        .bind(from)
+        .bind(to)
+        .bind(&rels)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(reached)
+    }
+
     /// Get edges by target entity
     ///
     /// # Errors
@@ -2390,6 +2488,68 @@ impl EdgeRepository {
                 properties: row.properties,
                 valid_from: row.valid_from,
                 valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
+    /// The in-force epistemic edges whose two endpoints are BOTH claims in
+    /// `claim_ids`, as `viewer` may read them: the links among a page of
+    /// claims, for a view that draws the page with its connections (a
+    /// timeline; backlog ea26d7aa).
+    ///
+    /// * relationships: [`crate::CONTEXT_EPISTEMIC_RELATIONSHIPS`], matched
+    ///   case-insensitively (the relationship text is stored in both cases);
+    /// * retracted edges are excluded (`valid_to` set and past);
+    /// * an edge the viewer may not read is absent even when it may read both
+    ///   endpoints (the edge predicate, co-ownership included);
+    /// * oldest first, at most `limit` rows. Ask for one more than the cap to
+    ///   learn whether more exist.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids), fields(id_count = claim_ids.len()))]
+    pub async fn links_among_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<ClaimLinkRow>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let relationships: Vec<String> = crate::CONTEXT_EPISTEMIC_RELATIONSHIPS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.source_id, e.target_id, lower(e.relationship) AS relationship
+            FROM edges e
+            WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+              AND e.source_id = ANY($1) AND e.target_id = ANY($1)
+              AND lower(e.relationship) = ANY($2)
+              AND (e.valid_to IS NULL OR e.valid_to > now())
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at, e.id
+            LIMIT $3
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String)>(&sql)
+            .bind(claim_ids)
+            .bind(&relationships)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, source_id, target_id, relationship)| ClaimLinkRow {
+                id,
+                source_id,
+                target_id,
+                relationship,
             })
             .collect())
     }
