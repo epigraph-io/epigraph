@@ -54,6 +54,73 @@ pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
     }
 }
 
+/// The caller's answer when a federated `tools/call` fails (backlog 7ea4bd74).
+///
+/// `extension` is the configured extension name and `tool` the name the
+/// caller used (the gateway's, prefix included).
+///
+/// - The downstream ANSWERED with a JSON-RPC error: that error is returned
+///   unchanged, code and message. It is the extension's own tool error (an
+///   invalid-params refusal, say) and the federation spec's "surfaced as a
+///   normal MCP tool error"; redacting it left the caller unable to correct
+///   the call.
+/// - The extension could not be reached, or did not answer in time: a designed
+///   message naming the extension and what happened, so "the tool is down"
+///   is told apart from "the gateway is broken".
+/// - Anything else on the session: named as a failed request to that
+///   extension.
+///
+/// The transport detail (the dialled URI, the driver's error text) is
+/// deployment topology and stays in the server log, as for
+/// [`internal_error`].
+pub fn federated_call_error(
+    extension: &str,
+    tool: &str,
+    e: crate::federation::client::FederationError,
+) -> McpError {
+    use crate::federation::client::FederationError as F;
+    let message = match e {
+        F::Downstream(downstream) => {
+            tracing::info!(
+                target: "mcp.federation",
+                extension,
+                tool,
+                code = downstream.code.0,
+                "federated call refused by the extension"
+            );
+            return downstream;
+        }
+        F::CallTimeout { timeout, .. } => {
+            tracing::warn!(target: "mcp.federation", extension, tool, ?timeout, "federated call timed out");
+            format!(
+                "extension `{extension}` did not answer `{tool}` within {}s; the gateway \
+                 abandoned the call. It may still have run in the extension, so check before \
+                 retrying a write.",
+                timeout.as_secs()
+            )
+        }
+        ref unreachable @ (F::Timeout(..) | F::Connect { .. }) => {
+            tracing::warn!(target: "mcp.federation", extension, tool, detail = %unreachable, "federated call could not reach the extension");
+            format!(
+                "extension `{extension}` is unavailable; `{tool}` was not run. The gateway \
+                 re-dials it on a timer and its tools return when it answers."
+            )
+        }
+        F::Request(ref detail) => {
+            tracing::error!(target: "mcp.federation", extension, tool, detail = %detail, "federated call failed");
+            format!(
+                "the request to extension `{extension}` for `{tool}` failed; the detail is in \
+                 the server log"
+            )
+        }
+    };
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: Cow::from(message),
+        data: None,
+    }
+}
+
 /// The caller-facing text of a refusal the codebase authored, or `None`.
 ///
 /// Two shapes qualify:
