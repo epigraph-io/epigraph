@@ -272,31 +272,28 @@ async fn retracting_that_bba_restores_the_owner_frame_fold(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn on_a_compound_neither_the_submit_nor_the_retract_writes_the_cache(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone()).await;
-    let (claim, _binary, validity, before, _out) = world(&pool, &server, &viewer).await;
-    // The claim decomposes into a current leaf: from now on it is a compound.
+/// The claim decomposes into a current leaf: from now on it is a compound,
+/// with no cache owner although it holds `binary_truth` inputs.
+async fn decompose(pool: &PgPool, viewer: &epigraph_db::visibility::Viewer, claim: Uuid) {
     let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
         .bind(claim)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .expect("the claim's author");
-    let leaf = fixture::seed_public_claim(&pool, author, "d33a5c9f compound leaf").await;
+    let leaf = fixture::seed_public_claim(pool, author, "d33a5c9f compound leaf").await;
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
          VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
     )
     .bind(claim)
     .bind(leaf)
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("decompose the claim");
     assert_eq!(
         MassFunctionRepository::cache_owner_frame_for_claim(
             &mut *pool.acquire().await.expect("acquire"),
-            &viewer,
+            viewer,
             claim
         )
         .await
@@ -304,6 +301,14 @@ async fn on_a_compound_neither_the_submit_nor_the_retract_writes_the_cache(pool:
         None,
         "PREMISE: a compound has no cache owner"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_a_compound_neither_the_submit_nor_the_retract_writes_the_cache(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let (claim, _binary, validity, before, _out) = world(&pool, &server, &viewer).await;
+    decompose(&pool, &viewer, claim).await;
     // The agent's claim_validity BBA, re-stated with other masses (it replaces
     // the first one) while the claim is a compound.
     let second = first_text(
@@ -361,5 +366,76 @@ async fn on_a_compound_neither_the_submit_nor_the_retract_writes_the_cache(pool:
         after, before,
         "the compound's cache must hold no fold of the retracted BBA ({after:?}, before \
          {before:?})"
+    );
+}
+
+/// The edge-wire twin of the compound case: `link_epistemic` into a compound
+/// stores the edge's BBA (`belief_wired`) but leaves the compound's cache. The
+/// engine's wire (`edge_factor::auto_wire_ds_for_edge`) used to fold
+/// `binary_truth` unconditionally, writing the compound's cache from its own
+/// inputs, and a retraction of that BBA, which neither refolds nor vacates a
+/// claim with no owner, then left the value cached.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_a_compound_link_epistemic_stores_the_bba_but_leaves_the_cache(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let (claim, binary, _validity, before, _out) = world(&pool, &server, &viewer).await;
+    decompose(&pool, &viewer, claim).await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim's author");
+    let source = fixture::seed_public_claim(&pool, author, "d33a5c9f edge source").await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.8, plausibility = 0.9, pignistic_prob = 0.85 \
+         WHERE id = $1",
+    )
+    .bind(source)
+    .execute(&pool)
+    .await
+    .expect("give the source an interval");
+
+    let out = first_text(
+        &tools::link_epistemic::link_epistemic(
+            &server,
+            &viewer,
+            epigraph_mcp::types::LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: claim.to_string(),
+                relationship: "supports".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("link_epistemic into the compound"),
+    );
+    assert_eq!(
+        out["belief_wired"],
+        serde_json::json!(true),
+        "the edge's BBA is stored on the compound: {out}"
+    );
+    let edge_bbas: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
+           AND perspective_id = $3",
+    )
+    .bind(claim)
+    .bind(binary)
+    .bind(
+        out["edge_id"]
+            .as_str()
+            .expect("edge_id")
+            .parse::<Uuid>()
+            .expect("uuid"),
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count the edge's BBAs");
+    assert_eq!(edge_bbas, 1, "the edge's BBA is on binary_truth: {out}");
+    assert_eq!(
+        cache(&pool, claim).await,
+        before,
+        "the wire must not fold a compound's own binary_truth inputs into its cache ({out})"
     );
 }
