@@ -708,6 +708,31 @@ impl ClaimRepository {
         .map_err(map_vis_error)?;
         outcomes_or_refusal("share_claims_with_team", rows, &["shared"])
     }
+
+    /// Of `claim_ids`, those this SESSION cannot write: the claim is not
+    /// readable under its row security, or its owner group is not in the
+    /// session's writable set (`epigraph_writable_groups()`). Used after a
+    /// widening act, before the moved claims' cached belief is refolded on the
+    /// same session (`epigraph_engine::visibility_act`): a claim listed here
+    /// would take no refold, and keep a value folded for its old audience.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn claims_not_writable_on_session(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, DbError> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "SELECT i.id FROM unnest($1::uuid[]) AS i(id) \
+              WHERE NOT EXISTS (SELECT 1 FROM claims c \
+                                 WHERE c.id = i.id \
+                                   AND c.owner_group_id = ANY(public.epigraph_writable_groups())) \
+              ORDER BY i.id",
+        )
+        .bind(claim_ids)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
 }
 
 #[cfg(test)]
