@@ -1978,6 +1978,20 @@ pub async fn evolve_step(
         None => (None, None),
     };
 
+    // The new step is a current claim with no vector: embed it post-commit,
+    // best-effort, on the caller's stamp, as the ingest routes above embed
+    // theirs (CLAUDE.md "Embedding policy"; backlog 7628ab2c).
+    if let Some(embedder) = state.embedding_service() {
+        embed_inserted_workflow_claims(
+            &state,
+            &viewer,
+            embedder.as_ref(),
+            "workflows/steps/evolve",
+            &[(result.new_claim_id, req.content.clone())],
+        )
+        .await;
+    }
+
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
