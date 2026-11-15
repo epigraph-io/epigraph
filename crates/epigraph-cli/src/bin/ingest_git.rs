@@ -295,7 +295,9 @@ PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
       --merged-at <ISO8601>   Merge timestamp (ISO-8601)
       --pr-author <LOGIN>     GitHub login of the PR author
       --rev-range <A..B>      Git revision range covering the PR's commits
-      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides trailer/env)";
+      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides the
+                              Epigraph-Orchestrator-Id trailer and
+                              $EPIGRAPH_DEFAULT_ORCHESTRATOR_ID)";
 
 // =============================================================================
 // COMMIT TYPES & PARSING
@@ -1190,30 +1192,42 @@ fn parse_orchestrator_trailer(text: &str) -> Option<Uuid> {
         .next_back()
 }
 
-/// Resolve the implementing orchestrator agent id for a PR:
-/// 1) `Epigraph-Orchestrator-Id:` trailer in the PR body or any commit message;
-/// 2) else `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` env var.
+/// Resolve the implementing orchestrator agent id for a PR, first match wins:
+/// 1) `explicit` (`--orchestrator-id`);
+/// 2) an `Epigraph-Orchestrator-Id:` trailer in the PR body;
+/// 3) that trailer in a commit message's trailer block, oldest commit first;
+/// 4) `env_default` (`EPIGRAPH_DEFAULT_ORCHESTRATOR_ID`), a fallback only.
 ///
-/// Returns an error if neither is present (the PR claim MUST have an author).
-/// Existence of the resolved agent is verified by the caller (Task 8 / `run_pr_ingest`)
-/// via the registration route; this resolver only determines the id, never mints one.
-#[allow(dead_code)]
-fn resolve_orchestrator_agent(pr_body: &str, commit_msgs: &[String]) -> Result<Uuid, String> {
+/// Returns an error if none is present (the PR claim MUST have an author), or if
+/// the fallback is set but is not a UUID. The resolver only determines the id,
+/// never mints one; a bogus id surfaces at submit time.
+fn resolve_orchestrator_agent(
+    explicit: Option<Uuid>,
+    pr_body: &str,
+    commits: &[ParsedCommit],
+    env_default: Option<&str>,
+) -> Result<Uuid, String> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
     if let Some(id) = parse_orchestrator_trailer(pr_body) {
         return Ok(id);
     }
-    for m in commit_msgs {
-        if let Some(id) = parse_orchestrator_trailer(m) {
+    for c in commits {
+        if let Some(id) = parse_orchestrator_trailer(&c.trailers.join("\n")) {
             return Ok(id);
         }
     }
-    std::env::var("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
-        .ok()
-        .and_then(|s| s.trim().parse::<Uuid>().ok())
-        .ok_or_else(|| {
-            "no Epigraph-Orchestrator-Id trailer and EPIGRAPH_DEFAULT_ORCHESTRATOR_ID unset"
-                .to_string()
-        })
+    match env_default.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) => v
+            .parse::<Uuid>()
+            .map_err(|_| format!("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID must be a UUID, got: {v}")),
+        None => Err(
+            "no --orchestrator-id, no Epigraph-Orchestrator-Id trailer in the PR body or a \
+             commit, and EPIGRAPH_DEFAULT_ORCHESTRATOR_ID unset"
+                .to_string(),
+        ),
+    }
 }
 
 /// Candidate resolution references extracted from PR body + commit text.
@@ -2193,10 +2207,6 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     };
     let rev_range = args.rev_range.clone().ok_or("--rev-range required")?;
     let commits = parse_git_log_range(&args.repo, &rev_range)?;
-    let commit_msgs: Vec<String> = commits
-        .iter()
-        .map(|c| format!("[{}][{}] {}", c.commit_type, c.scope, c.claim_text))
-        .collect();
 
     // Resolution references (PR-level): UUID refs + PR-number citations from the
     // PR body and commit messages. Computed up front so --dry-run can show the
@@ -2223,12 +2233,16 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     }
 
     // 1) Resolve the implementing orchestrator agent: explicit flag, then trailer
-    //    (PR body / commits), then EPIGRAPH_DEFAULT_ORCHESTRATOR_ID. The resolver
-    //    only reads an id (never mints one); a bogus id surfaces at submit time.
-    let orchestrator_id = match args.orchestrator_id {
-        Some(id) => id,
-        None => resolve_orchestrator_agent(&meta.body, &commit_msgs)?,
-    };
+    //    (PR body, then each commit's trailer block), then
+    //    EPIGRAPH_DEFAULT_ORCHESTRATOR_ID as the fallback.
+    let orchestrator_id = resolve_orchestrator_agent(
+        args.orchestrator_id,
+        &meta.body,
+        &commits,
+        std::env::var("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
+            .ok()
+            .as_deref(),
+    )?;
 
     // 2) Repo root node, attributed to a fixed system agent (NOT the per-PR
     //    orchestrator). Keying on the orchestrator made the repo node's
@@ -3138,6 +3152,55 @@ mod tests {
         assert_eq!(parse_header(&split_trailers("docs: x").0).2, "x");
         // A mixed last paragraph is not a trailer block either.
         assert!(split_trailers("a: b\n\nKey: v\nplain text").1.is_empty());
+    }
+
+    // Backlog 7d9e60c6 (3): an Epigraph-Orchestrator-Id trailer in a commit
+    // message is read (it used to see only the `[type][scope] claim` header).
+    #[test]
+    fn commit_message_orchestrator_trailer_is_read() {
+        let id = Uuid::parse_str("7b3a0c1e-0000-4000-8000-0000000000c1").unwrap();
+        let msg = format!(
+            "feat(x): y\n\n**Verification:**\n- ok\n\nEpigraph-Orchestrator-Id: {id}\n\
+             Co-Authored-By: A <a@b>"
+        );
+        let mut out = git_log_record("h0", "a@b", "chore: earlier commit, no trailer");
+        out.insert_str(0, &git_log_record("h1", "a@b", &msg)); // git log is newest first
+        let commits = parse_git_log_output(&out).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(
+            resolve_orchestrator_agent(None, "PR body without one", &commits, None),
+            Ok(id)
+        );
+        // The trailer is not a Verification row.
+        assert_eq!(commits[1].verification, vec!["ok"]);
+    }
+
+    // Backlog 7d9e60c6 (2): EPIGRAPH_DEFAULT_ORCHESTRATOR_ID is a fallback only.
+    #[test]
+    fn orchestrator_precedence_flag_body_commit_then_default() {
+        let flag = Uuid::parse_str("00000000-0000-4000-8000-0000000000f1").unwrap();
+        let body_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000b1").unwrap();
+        let commit_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000c1").unwrap();
+        let default = "00000000-0000-4000-8000-0000000000d1";
+        let body = format!("text\n\nEpigraph-Orchestrator-Id: {body_id}");
+        let out = git_log_record(
+            "h1",
+            "a@b",
+            &format!("fix: y\n\nEpigraph-Orchestrator-Id: {commit_id}"),
+        );
+        let commits = parse_git_log_output(&out).unwrap();
+        let r = |f, b: &str, c: &[ParsedCommit], d| resolve_orchestrator_agent(f, b, c, d);
+        assert_eq!(r(Some(flag), &body, &commits, Some(default)), Ok(flag));
+        assert_eq!(r(None, &body, &commits, Some(default)), Ok(body_id));
+        assert_eq!(r(None, "", &commits, Some(default)), Ok(commit_id));
+        assert_eq!(
+            r(None, "", &[], Some(default)),
+            Ok(Uuid::parse_str(default).unwrap())
+        );
+        assert!(r(None, "", &[], None).is_err());
+        assert!(r(None, "", &[], Some("  ")).is_err());
+        let bad = r(None, "", &[], Some("not-a-uuid")).unwrap_err();
+        assert!(bad.contains("must be a UUID"), "{bad}");
     }
 
     #[test]
