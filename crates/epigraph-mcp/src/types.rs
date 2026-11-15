@@ -1204,7 +1204,7 @@ pub struct SubmitDsEvidenceParams {
     // permissive as the handler.
     #[schemars(
         with = "std::collections::BTreeMap<String, serde_json::Number>",
-        description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance."
+        description = "Mass assignments: {'0': 0.6, '0,1': 0.3, '~0,1': 0.1}. Keys: comma-separated indices (positive) or ~-prefixed (negative/complement). '' = conflict, '~' = open-world ignorance. Refused unless every key parses, every index is inside the frame, no mass is negative, and the masses sum to 1."
     )]
     pub masses: serde_json::Value,
 
@@ -1395,6 +1395,14 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
+    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
+    /// estimated number of independent assertions (backlog `72850d43`).
+    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
+    /// selects, and the two can disagree on a short coordinated sentence.
+    pub conjunct_estimate: usize,
+    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
+    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    pub conjunct_signals: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2249,6 +2257,9 @@ pub struct IngestDocumentSpineResponse {
     pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
+    /// The number of spine claims QUEUED for background embedding when the
+    /// response was built, not the number embedded (the same meaning as
+    /// `IngestDocumentResponse::claims_embedded`).
     pub paragraphs_embedded: usize,
     /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
     /// as new in this ingest. Atomize exactly these paragraphs, then call
@@ -2581,6 +2592,12 @@ pub struct IngestDocumentResponse {
     /// `authors[].pending_ingested_by`).
     pub ingested_by: String,
     pub claims_ingested: usize,
+    /// The number of claims QUEUED for background embedding when the response
+    /// was built, NOT the number embedded. The embedding loop is spawned and
+    /// the response returns before any embed call has run, so this is non-zero
+    /// even when every embed then fails (for example with no embedding
+    /// provider configured); a failure is only logged. The name is kept
+    /// because it is the wire field.
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
     pub relationships_created: usize,
@@ -2888,9 +2905,8 @@ pub struct TraverseNode {
     /// Dempster–Shafer pignistic probability when the node carries a DS cache,
     /// else `truth_value`. `None` for a non-claim node.
     ///
-    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
-    /// value of it could change which nodes are kept — so this equals
-    /// `truth_value` there.
+    /// The same value whatever `min_truth` was (backlog `1574d9b4`), and the
+    /// one `recall` reports as `belief_score` for the same claim and caller.
     pub belief_score: Option<f64>,
     pub depth: i32,
 }

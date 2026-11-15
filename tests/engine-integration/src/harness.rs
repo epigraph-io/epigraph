@@ -4,20 +4,17 @@
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-/// Wrapper around PgPool for integration tests.
-/// Connects via DATABASE_URL environment variable.
+/// Wrapper around the PgPool a `#[sqlx::test]` hands each test: its own
+/// database, migrated from empty, dropped when the test ends. Nothing a test
+/// writes needs cleaning up, and no test shares rows with another.
 pub struct TestDb {
     pub pool: PgPool,
 }
 
 impl TestDb {
-    /// Connect to the test database. Panics if DATABASE_URL is not set.
-    pub async fn setup() -> Self {
-        let url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
-        let pool = PgPool::connect(&url)
-            .await
-            .expect("Failed to connect to test database");
+    /// Wrap the test's own pool.
+    #[must_use]
+    pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
     }
 }
@@ -109,100 +106,6 @@ pub async fn create_test_factor(
     .expect("Failed to create test factor");
 
     factor_id
-}
-
-/// RAII guard that cleans up test data on drop, even if the test panics.
-///
-/// Stores the content prefix; on `Drop`, opens a fresh DB connection (via
-/// `DATABASE_URL`) on a new OS thread with its own tokio runtime and deletes
-/// all claims/edges/factors whose content starts with the prefix. This avoids
-/// the cross-runtime I/O-driver issue that arises when reusing a pool that was
-/// created on a different runtime.
-///
-/// Tests should construct one at the top of the test body:
-/// `let _guard = PrefixGuard::new(&db.pool, "[test-foo]");`
-///
-/// Note: `Drop` reads `DATABASE_URL` from the environment at drop time.
-/// Tests must not mutate that variable mid-test or cleanup will run against
-/// the wrong database.
-pub struct PrefixGuard {
-    // The pool passed to `new` is kept alive for the test's duration but Drop
-    // opens a fresh connection on its own runtime to avoid cross-runtime I/O
-    // driver issues. Field name prefix _ suppresses the dead_code lint.
-    _pool: PgPool,
-    prefix: String,
-}
-
-impl PrefixGuard {
-    #[must_use]
-    pub fn new(pool: &PgPool, prefix: &str) -> Self {
-        Self {
-            _pool: pool.clone(),
-            prefix: prefix.to_string(),
-        }
-    }
-}
-
-impl Drop for PrefixGuard {
-    fn drop(&mut self) {
-        // We cannot reuse the existing PgPool here: its connections are
-        // registered with the tokio I/O driver of whichever runtime created
-        // the pool, and that runtime may be partially unwound or blocked when
-        // Drop runs. Instead we spawn a fresh OS thread with its own runtime
-        // and a brand-new pool so cleanup always succeeds.
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set (PrefixGuard::drop)");
-        let prefix = self.prefix.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("PrefixGuard::drop tokio runtime");
-            rt.block_on(async move {
-                let pool = sqlx::PgPool::connect(&database_url)
-                    .await
-                    .expect("PrefixGuard::drop db connect");
-                cleanup_test_data(&pool, &prefix).await;
-            });
-        })
-        .join()
-        .expect("PrefixGuard::drop thread");
-    }
-}
-
-/// Clean up test data by prefix. Deletes claims whose content starts with the given prefix
-/// and all edges/factors referencing them.
-pub async fn cleanup_test_data(pool: &PgPool, content_prefix: &str) {
-    // Get claim IDs first
-    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM claims WHERE content LIKE $1")
-        .bind(format!("{content_prefix}%"))
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-
-    if ids.is_empty() {
-        return;
-    }
-
-    // Delete factors referencing these claims
-    for id in &ids {
-        let _ = sqlx::query("DELETE FROM factors WHERE $1 = ANY(variable_ids)")
-            .bind(id)
-            .execute(pool)
-            .await;
-    }
-
-    // Delete edges referencing these claims
-    let _ = sqlx::query("DELETE FROM edges WHERE source_id = ANY($1) OR target_id = ANY($1)")
-        .bind(&ids)
-        .execute(pool)
-        .await;
-
-    // Delete claims
-    let _ = sqlx::query("DELETE FROM claims WHERE id = ANY($1)")
-        .bind(&ids)
-        .execute(pool)
-        .await;
 }
 
 /// Load all claims and edges matching `prefix` into a fresh
@@ -301,42 +204,4 @@ pub async fn load_orchestrator_from_db(
     }
 
     orch
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    #[ignore] // Requires DATABASE_URL
-    async fn prefix_guard_cleans_up_after_panic() {
-        const PREFIX: &str = "[test-prefix-guard]";
-        let db = TestDb::setup().await;
-        let agent = create_test_agent(&db.pool).await;
-
-        // Spawn a task that inserts a marker row then panics.
-        // tokio::spawn catches the panic, unwinds the task (running Drop on
-        // PrefixGuard), then resolves the JoinHandle to Err(JoinError).
-        let pool = db.pool.clone();
-        let handle = tokio::spawn(async move {
-            let _guard = PrefixGuard::new(&pool, PREFIX);
-            create_test_claim(&pool, agent, &format!("{PREFIX} marker"), 0.5).await;
-            panic!("simulated test failure");
-        });
-        let join_result = handle.await;
-        assert!(join_result.is_err(), "task should have panicked");
-
-        // PrefixGuard::drop blocks until cleanup_test_data completes, so by
-        // the time we reach here the rows are gone.
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content LIKE $1")
-            .bind(format!("{PREFIX}%"))
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            count, 0,
-            "PrefixGuard::drop should have cleaned up rows even after panic"
-        );
-    }
 }

@@ -11,15 +11,14 @@
 
 use engine_integration_tests::harness::*;
 use epigraph_core::{ClaimId, TruthValue};
+use sqlx::PgPool;
 use sqlx::Row;
 
 const PREFIX: &str = "[test-prop-db]";
 
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn propagation_persists_updated_truth_values() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn propagation_persists_updated_truth_values(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
 
     // --- Setup: 3-claim chain A → B → C in DB ---
     let agent_uuid = create_test_agent(&db.pool).await;
