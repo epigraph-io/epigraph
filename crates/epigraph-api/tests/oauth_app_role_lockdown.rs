@@ -1070,3 +1070,104 @@ async fn an_unanswerable_revocation_lookup_fails_closed(pool: PgPool) {
         "an unknown revocation state never introspects active"
     );
 }
+
+/// Migration 213 (backlog 950696a1), end to end on the application role: an
+/// agent's `client_credentials` assertion is single use when the token
+/// endpoint runs as `epigraph_app`, which holds no write on
+/// `oauth_assertion_nonces` and records the nonce only through the definer.
+/// Two presentations of one assertion issued together (`tokio::join!`) mint
+/// exactly once. The test pins that exactly-once outcome; it does not force
+/// the two requests to overlap. Whether they race or run one after the other,
+/// the definer's `INSERT .. ON CONFLICT DO NOTHING` decides it. A fresh
+/// assertion still mints afterwards (calibration: the refusals are the
+/// replay, not a broken grant on this role).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_assertion_mints_exactly_once_on_the_app_role(pool: PgPool) {
+    use ed25519_dalek::{Signer, SigningKey};
+    let key = SigningKey::from_bytes(&[0x5a; 32]);
+    let public_key = key.verifying_key().to_bytes();
+    let agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(public_key.to_vec())
+        .execute(&pool)
+        .await
+        .expect("agent row");
+    let owner: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status) \
+         VALUES ($1, 'owner', 'human', ARRAY['claims:read'], ARRAY['claims:read'], 'active') \
+         RETURNING id",
+    )
+    .bind(format!("owner-{agent}"))
+    .fetch_one(&pool)
+    .await
+    .expect("owner client");
+    let client_id = hex::encode(public_key);
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'app-role-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3)",
+    )
+    .bind(&client_id)
+    .bind(agent)
+    .bind(owner)
+    .execute(&pool)
+    .await
+    .expect("agent client");
+
+    let assertion = || {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let mut msg = Vec::with_capacity(88);
+        msg.extend_from_slice(&ts.to_be_bytes());
+        msg.extend_from_slice(Uuid::new_v4().as_bytes());
+        let sig = key.sign(&msg);
+        msg.extend_from_slice(&sig.to_bytes());
+        base64::engine::general_purpose::STANDARD.encode(msg)
+    };
+    let grant = |a: &str| {
+        serde_json::json!({
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_assertion_type": "urn:epigraph:ed25519",
+            "client_assertion": a,
+        })
+    };
+
+    let app = app_router(&pool, 4).await;
+    let captured = assertion();
+    let (a, b) = tokio::join!(
+        post_token(app.clone(), grant(&captured)),
+        post_token(app.clone(), grant(&captured)),
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::UNAUTHORIZED],
+        "two presentations of one assertion issued together mint exactly once: {} / {}",
+        a.1,
+        b.1
+    );
+    let (status, body) = post_token(app.clone(), grant(&captured)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a later replay: {body}");
+
+    let (status, body) = post_token(app.clone(), grant(&assertion())).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a fresh assertion mints on the application role: {body}"
+    );
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM oauth_assertion_nonces WHERE agent_public_key = $1",
+    )
+    .bind(public_key.to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("count nonces");
+    assert_eq!(recorded, 2, "one row per distinct assertion presented");
+}
