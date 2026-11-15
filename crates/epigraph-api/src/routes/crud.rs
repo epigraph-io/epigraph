@@ -671,27 +671,14 @@ pub async fn create_reasoning_trace(
     let mut tx = state.write_as(&viewer, "create_reasoning_trace").await?;
 
     // The claim, read as the caller. Unreadable and nonexistent answer alike.
-    {
-        let sql = viewer.splice(
-            "SELECT c.id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
-            2,
-        );
-        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(request.claim_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        if q.fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?
-            .is_none()
-        {
-            return Err(ApiError::NotFound {
-                entity: "claim".to_string(),
-                id: request.claim_id.to_string(),
-            });
-        }
+    let readable =
+        epigraph_db::ClaimRepository::visible_claim_ids(&mut *tx, &viewer, &[request.claim_id])
+            .await?;
+    if !readable.contains(&request.claim_id) {
+        return Err(ApiError::NotFound {
+            entity: "claim".to_string(),
+            id: request.claim_id.to_string(),
+        });
     }
 
     // `reasoning_traces` stores neither the author nor its key
