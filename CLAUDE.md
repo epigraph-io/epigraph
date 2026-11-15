@@ -171,6 +171,28 @@ migrate to head (it used to skip silently).
 ## Workflow
 
 - Feature branches, never land 3+ commits directly on `main`.
+- **Reach `main` through a staging PR, not one feature PR at a time.** Every
+  merge to `main` starts a full CI run on `main` and moves the base under
+  every other open PR, so a backlog merged one by one (dozens of open PRs)
+  queues dozens of full runs. Epiclaw's nightly staging run already works
+  this way on `integration/<YYYYMMDD>` branches; an ad-hoc batch from a
+  session does the same on a branch in its own namespace:
+  1. Cut the staging branch from current `main`.
+  2. Bring in each candidate that is green at its head with
+     `git merge --no-ff <head>`, subject `merge(staging): #NNN <its claim>`
+     and an epistemic body (no squash, no rebase). Leave the feature PRs
+     based on `main`: GitHub marks each one merged when its head reaches
+     `main`.
+  3. Open ONE draft PR from the staging branch to `main`. Its body carries a
+     table with one row per included PR (number, one-line claim, result on
+     the combined tree), the excluded PRs with the reason for each, and the
+     combined-tree verification with the head sha it ran on. A body that
+     only lists PR numbers is not enough: the staging PR is the merge record
+     on `main`.
+  4. Merge it with `--merge` once CI on the combined tree is green.
+  5. Keep the number of open staging PRs to the minimum, one per batch. Do
+     not push to a staging branch another session created; put late work in
+     the next batch.
 - `gh pr merge --merge --delete-branch` by default; never `--squash`
   unless explicitly told.
 
