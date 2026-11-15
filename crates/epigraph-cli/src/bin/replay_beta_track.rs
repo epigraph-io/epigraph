@@ -206,7 +206,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow!("the replay failed; batches already committed stay written: {e}"))?;
         let mut out = serde_json::to_value(&report).context("serialize the report")?;
         out["excluded_methods"] = serde_json::to_value(&opts.excluded_methods)?;
-        if let Some(path) = &cli.manifest {
+        // Only an applying run creates the file; a dry run never names one.
+        if let (Some(path), true) = (&cli.manifest, cli.apply) {
             out["manifest"] = serde_json::Value::String(path.display().to_string());
         }
         out
