@@ -66,7 +66,15 @@ The four logins:
 | **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). |
 
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
-hatch of migration 074. Nothing connects as it in production.
+hatch of migration 074. Nothing connects as it in production, and no
+production login may be GRANTed it: since migration 216 the hatch is taken only
+on an explicit grant (a superuser no longer counts by implication), so a
+granted service login would have its undeclared writes stamped onto the
+memberless seed group instead of refused. Never set
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF` (the test harness's opt-in to that grant)
+on a deployed `epigraph-migrate`. Audit: `SELECT r.rolname FROM pg_auth_members
+m JOIN pg_roles r ON r.oid = m.member WHERE m.roleid = 'epigraph_seed'::regrole`
+must return no rows.
 
 Six `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
 switches the session to the application role: `reown-claims`,
@@ -489,8 +497,7 @@ not to the API.
 | `EPIGRAPH_API` | `decompose_claims` and the belief-mode check in `recompute_betp`, `backfill_factors` and `refresh_truth_mirrors` (read before `EPIGRAPH_API_URL`); `epigraph-privatize` (the only API variable it reads); `scripts/reconcile_backlog_labels.py` (`--base-url` default) | The API's base URL, explicit override. |
 | `EPIGRAPH_API_URL` | among them `dekg`, `decompose_claims`, `recompute_betp`, `backfill_factors`, `refresh_truth_mirrors`, `scripts/maintain_themes.py`, `scripts/run_assessment_worker.py` | The API's base URL, for CLIs that call the HTTP API. |
 | `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
-| `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims` | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
-| `EPIGRAPH_AGENT_ID` | `scripts/_api_client.py` | The `agent_id` claim of tokens the Python helpers mint (section 7). |
+| `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims`, `scripts/_api_client.py` (section 7) | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
 
 ### Optional LLM, rerank and NLI integrations
@@ -1428,20 +1435,26 @@ review red flag, not a compile error.
 
 ### Tokens for the in-repo Python helpers
 
-`scripts/_api_client.py::mint_bearer_token` takes its `agent_id` claim from
-`EPIGRAPH_AGENT_ID`. There is deliberately no default: `agent_id` names the
-principal whose group membership decides what the token can read, and a
-default would hand every script one identity's view of the corpus by
-accident.
+`scripts/_api_client.py::EpiGraphClient` never signs a token itself. It uses
+`EPIGRAPH_TOKEN` as given, or else exchanges `EPIGRAPH_SERVICE_CLIENT_ID` and
+`EPIGRAPH_SERVICE_SECRET` at `EPIGRAPH_OAUTH_TOKEN_URL` (default
+`<API base>/oauth/token`) with the `client_credentials` grant, the same
+resolution as `decompose_claims`. The server then decides the token's scopes
+(the request intersected with the client's grants) and its `agent_id` (the
+client's own agent). The client **exits at construction** when it has neither,
+when the endpoint refuses, or, on the exchange, when the client was not granted
+every scope the job requests, rather than dying on a 401 or 403 partway through
+a run. `EPIGRAPH_TOKEN` is used without a scope check: a token missing a scope
+the job needs fails with a 403 at the first request that needs it. A job that
+had both `EPIGRAPH_TOKEN` and `EPIGRAPH_JWT_SECRET` set used to ignore the
+token and sign its own; it now runs on the token. That covers `anchor_papers_to_themes.py`, `classify_paper_document_type.py`,
+`update_theme_workflow_steps.py` and `lib/nli_stance.py`.
+`EPIGRAPH_JWT_SECRET` and `EPIGRAPH_AGENT_ID` are no longer read: an earlier
+helper signed HS256 tokens from the server's secret with any scope and
+`agent_id`, which made every script holding the secret a universal principal.
 
-`scripts/_api_client.py::EpiGraphClient` **exits at construction** when
-neither an explicit `agent_id=` nor `EPIGRAPH_AGENT_ID` is available, rather
-than minting a principal-less token and dying on an opaque 401 at the first
-request. That covers `anchor_papers_to_themes.py`,
-`classify_paper_document_type.py`, `update_theme_workflow_steps.py` and
-`lib/nli_stance.py`. The lower-level `mint_bearer_token` is deliberately *not*
-guarded: a caller that exercises the 401 path is a legitimate use of a raw
-token helper.
+`python3 scripts/_api_client.py <scope>...` prints a `client_credentials`
+token for the scripts below.
 
 `scripts/reconcile_backlog_labels.py` (the daily reconciler named in
 `CLAUDE.md`), `scripts/cleanup_backlog_labels.py` and
@@ -3170,11 +3183,20 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     those confirmed, and so on, attested ones included. It never touches
     another person's passkeys. Every elevation any of them confirmed ends
     (`passkey_revoked`), and every unexecuted act they confirmed is voided,
-    as for any revoke. It first locks the person's passkeys, so an
-    enrollment completing at that moment on one of their acts is waited
-    for and then revoked with the rest, and one that starts later is
-    refused. It prints one line per passkey reached (`depth=` 0 for the
-    passkey named) and, without `--apply`, rolls everything back.
+    as for any revoke. It first locks the person's passkeys, waiting for
+    any enrollment completing at that moment on one of their acts, and
+    then walks the lineage; it locks and walks again until every passkey
+    it reached is locked (migration 214), so a passkey that completed
+    during the wait is revoked with the rest, and so is anything that
+    completed under it meanwhile. A completion that starts later is
+    refused. This holds only under READ COMMITTED, where each statement
+    sees what committed before it: since migration 214 the revoke refuses
+    to run under any other isolation level (SQLSTATE 25000, nothing
+    revoked). `epigraph-operator` runs it at the connection's default
+    level, so keep the maintenance DSN, role and database at READ
+    COMMITTED (the PostgreSQL default). It prints one line per passkey
+    reached (`depth=` 0 for the passkey named) and, without `--apply`,
+    rolls everything back.
     It also works on a passkey already revoked: revoked passkeys are walked
     through, not revoked again, and anything still live below them is
     revoked. Afterwards the person enrolls a replacement on a
@@ -3258,6 +3280,12 @@ which revokes it.
    `verify` checks the four functions' owner, the reader's grant to
    `epigraph_app` and that `epigraph_app` cannot call the compromised
    revoke. The guard and the cascade apply whatever the settings say.
+   **Migrate 214** after it (any time; no binary depends on it). It
+   re-states the compromised revoke to refuse any isolation level but READ
+   COMMITTED and to lock every passkey it walks. Before it, confirm the
+   maintenance DSN runs READ COMMITTED: `SHOW transaction_isolation` on
+   that DSN prints `read committed`. Otherwise `revoke-passkey
+   --compromised` is refused (25000) until the setting is fixed.
 2. **The status list.** Install the refresh job and its timer with the
    `OnFailure=` alert, and the age check under your monitoring (both above).
    Run the job once, then run the age check: it must print `android
@@ -3335,6 +3363,9 @@ which revokes it.
   removed from the allowlist or a root replaced: every anchor whose own chain
   or lineage depends on it stops anchoring. Synced passkeys already anchored
   stay live; revoke them, or their anchors, to remove them.
+- **Migration 214.** `docs/runbooks/214-undo.sql` on the migration DSN
+  restores 200's body of the compromised revoke (no binary to roll back
+  first). Run it BEFORE `200-undo.sql`.
 - **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
   only after no unit runs with the anchored setting on and `epigraph-operator`
   is rolled back to a build without `--compromised`. It drops the reader, the
@@ -4550,7 +4581,7 @@ reached `main` through a merge, the PR is given as "landed via #N".
     - "PR-02" §1 (`bootstrap_clients`) and §2 (`EPIGRAPH_ENV`) → section 8;
     - "PR-03" §0 → section 13;
     - "PR-03" §1–§1e, the metrics listener, `EPIGRAPH_RESOURCE_METADATA_URL`,
-      `EPIGRAPH_AGENT_ID` and `EPIGRAPH_REQUIRE_SIGNATURES` → section 7;
+      the Python helpers' tokens and `EPIGRAPH_REQUIRE_SIGNATURES` → section 7;
     - "PR-04" §1 and §1b → section 6;
     - §1c-bis (`MAINTENANCE_DATABASE_URL`) and §1c-ter (roles) → sections 1,
       2 and 5;

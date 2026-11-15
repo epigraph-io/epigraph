@@ -112,6 +112,17 @@ jobs:
       # model, and pretending otherwise with a second identical-privilege role
       # would assert a separation that is not there.
       MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      # Migration 216 (backlog 0512ca33): the tenancy seed escape hatch needs an
+      # EXPLICIT grant of epigraph_seed; a superuser no longer takes it by
+      # implication. The #[sqlx::test] harness connects as this superuser and
+      # its fixtures insert undeclared claims and root rows, so the "Run
+      # migrations" step's epigraph-migrate grants the role to itself. Roles
+      # are cluster-wide, so every per-test database inherits the grant. Local
+      # gates that copy this job's env into their epigraph-migrate run get it
+      # too. NEVER set this for a deployed service login.
+      # tenancy_required.rs::the_harness_role_can_take_the_seed_escape_hatch
+      # names the remedy when the grant is missing.
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
       SQLX_OFFLINE: "true"
       # The claim fixtures in crates/epigraph-mcp/tests/common/mod.rs DROP
       # uq_claims_content_hash_agent and run a table-wide dedup DELETE on
@@ -581,6 +592,14 @@ jobs:
         # it. It needs no database and no API key: it runs the built
         # `cross_source_sweep` binary's argument handling.
         run: cargo test -p epigraph-cli --features genai --locked --test cross_source_sweep_smoke
+      - name: Genai prompt drift guard
+        # `rerank` is `#[cfg(feature = "genai")]`, so its unit tests run in no
+        # other step. rerank::prompt::tests pins the live verifier prompt
+        # against tests/cross_source/prompts_v1.md; without this step an edit
+        # to build_validation_prompt stays green and the pre-registered
+        # protocol silently stops describing the deployed verifier (backlog
+        # ba25c292). Pure string tests: no database, no API key.
+        run: cargo test -p epigraph-cli --features genai --locked --lib rerank::prompt
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
@@ -621,10 +640,14 @@ jobs:
   # tests/ci/pytest_skip_budget.py reads the run's JUnit XML and fails the step
   # on any skip not named in its --allow list, which also covers skips the flag
   # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
-  # cannot find the ingest_git binary built above). The one allowed skip is
-  # test_executed_dedup_removes_the_duplicate_from_recall: it needs a running
-  # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), which this
-  # job does not provide yet, so that arm does not run in CI.
+  # cannot find the ingest_git binary built above). No skip is allowed:
+  # test_executed_dedup_removes_the_duplicate_from_recall needs a running API
+  # and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), and
+  # tests/ci/with_test_api.sh provides both around that step: it serves
+  # epigraph_py_test with the `server` binary built above, mints a per-run
+  # claims:write + claims:admin token, and stops the server when pytest exits,
+  # so it cannot outlive the step into tests/theme's table wipes (backlog
+  # 03fd7e00).
   #
   # The database arms connect as the service container's superuser, so RLS is
   # bypassed: they verify the scripts' logic against the migrated schema, not
@@ -639,7 +662,7 @@ jobs:
     # for the image's system python3 (3.12; numpy 1.26.4 has none past cp312),
     # so a newer default image would turn the install into a source build.
     runs-on: ubuntu-24.04
-    # A cold debug build of the two binaries plus the suites; 60 cuts off a hang.
+    # A cold debug build of the three binaries plus the suites; 60 cuts off a hang.
     timeout-minutes: 60
     continue-on-error: true
     services:
@@ -658,6 +681,9 @@ jobs:
     env:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      # Migration 216: see the `test` job. The Python fixtures write through the
+      # same superuser, so the migrate step grants it epigraph_seed.
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
       SQLX_OFFLINE: "true"
       CARGO_BUILD_JOBS: "2"
     steps:
@@ -672,7 +698,9 @@ jobs:
           # budget the `test` job's (much larger) entry depends on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build epigraph-migrate and ingest_git
-        run: cargo build --locked -p epigraph-api --bin epigraph-migrate -p epigraph-cli --bin ingest_git
+        # Also the API `server`, which tests/ci/with_test_api.sh serves the
+        # test database with for the executed-dedup arm (backlog 03fd7e00).
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate --bin server -p epigraph-cli --bin ingest_git
       - name: Install Python test dependencies
         # A venv, not the system interpreter (PEP 668), from a pinned file, and
         # no extra setup action (the trust surface stays the pinned actions).
@@ -696,10 +724,10 @@ jobs:
       - name: Python tests (scripts/tests, tests/dedup)
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export TEST_API_DATABASE_URL="$DEDUP_TEST_DATABASE_URL"
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
-          python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
-          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml" \
-            --allow tests.dedup.test_fuzzy_dedup_retraction::test_executed_dedup_removes_the_duplicate_from_recall
+          tests/ci/with_test_api.sh python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml"
       - name: Python tests (tests/theme)
         # The theme pipeline's pytest files. Their DB fixture wipes the
         # clustering tables of the database it is given, which here is the

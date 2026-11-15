@@ -155,10 +155,16 @@ create a FRESH database whose name ends in `_test` and migrate it from empty.
 
 ```bash
 createdb -U epigraph <name>_test
+EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1 \
 MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test \
   cargo run -p epigraph-api --bin epigraph-migrate
 DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test cargo test ...
 ```
+
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF=1` grants `epigraph_seed` to the migrating
+login (migration 216: the tenancy seed escape hatch the fixtures rely on needs
+an explicit grant, a superuser no longer counts). The grant is cluster-wide, so
+it also covers `#[sqlx::test]` databases. Never set it for a deployed login.
 
 `#[sqlx::test]` suites are unaffected (each test gets its own database, migrated
 from empty); this matters for the suites that read `DATABASE_URL` directly. The
@@ -234,7 +240,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `submit_claim`** — `crates/epigraph-mcp/src/tools/claims.rs::finish_submission` (phase 3 of `submit_claim`, after COMMIT), through `claim_helper::embed_claim_author_stamped`
 - **MCP `memorize`** — `crates/epigraph-mcp/src/tools/memory.rs::memorize`, through `claim_helper::embed_claim_author_stamped`
 - **MCP `batch_submit_claims`** — delegates to `submit_claim`
-- **MCP `submit_bug_report`** — `crates/epigraph-mcp/src/tools/bug_report.rs::submit_bug_report`. The one exception to post-commit: the vector is computed best-effort BEFORE the transaction and stored by migration 207's definer in the same statement sequence as the row, because the reporter cannot update an intake-owned claim after commit (row security hides it from them). The embed runs only after `epigraph_bug_report_preflight` passes, so a caller the write would refuse for who it is or its limit (not configured, system agent, unbound, a role's agent whose role its own human does not hold, over its limit) costs no provider call. The theme scripts never turn an intake-owned claim's text into a label (`scripts/theme_lib.py::not_intake_owned`)
+- **MCP `submit_bug_report`** — `crates/epigraph-mcp/src/tools/bug_report.rs::submit_bug_report`. The one exception to post-commit: the vector is computed best-effort BEFORE the transaction and stored by migration 207's definer in the same statement sequence as the row, because the reporter cannot update an intake-owned claim after commit (row security hides it from them). The embed runs only after `epigraph_bug_report_preflight` passes, so a caller the write would refuse for who it is or its limit (not configured, system agent, unbound, a role's agent whose role its own human does not hold, over its limit) costs no provider call. The theme scripts never turn an intake-owned claim's text, or any non-public claim's, into a label (`scripts/theme_lib.py::public_label_source`)
 - **MCP `ingest_document`** — `crates/epigraph-mcp/src/tools/ingestion.rs::do_ingest_document_reporting` (the `embed_queue` drained through `embed_and_store` after the write)
 - **MCP `ingest_document_spine`** — `do_ingest_document_spine` in the same file; phase-1 of the two-phase flow, embeds spine claims (thesis + sections + paragraphs) post-write
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
