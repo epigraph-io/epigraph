@@ -3359,21 +3359,17 @@ impl ClaimRepository {
     /// `c`, so an invisible neighbour drops out of the row entirely rather than
     /// appearing with truncated content.
     ///
-    /// # What is NOT filtered — the `edges` alias
+    /// # The `edges` alias is filtered too
     ///
-    /// Only the joined `claims` alias `c` carries a predicate. The `edges`
-    /// alias `e` carries none, and the projection includes `e.source_id`,
-    /// `e.target_id` and `e.relationship` — so this is a member of
-    /// `F-edges-unfiltered` (see `docs/tenancy/progress.json`), and a stronger
-    /// one than `rag_hybrid_context`, whose residual is a scalar `edge_count`.
-    /// PR-13 converted every `edges` read that ALREADY carried a visibility
-    /// predicate; it did not ADD predicates to never-filtered statements,
-    /// because each needs its own JOIN-vs-WHERE placement reasoning rather than
-    /// a fragment swap. Adding `/* {{EDGE_VISIBILITY:e}} */` here is the fix,
-    /// and it is bind-safe (both fragments render to the same `$3`) — it is
-    /// deferred only so the whole class lands with one set of acceptance
-    /// numbers. Bounded meanwhile: the returned rows are claims-filtered, so
-    /// this discloses STRUCTURE, never content.
+    /// The projection includes `e.source_id`, `e.target_id` and
+    /// `e.relationship`, so the edge itself is a disclosure, not only the
+    /// neighbour claim. `/* {{EDGE_VISIBILITY:e}} */` (doubled braces, inside
+    /// `format!`) splices [`Viewer::edge_predicate_fragment`] at the same `$3`
+    /// as the claims predicate, so an edge the viewer cannot read is not walked
+    /// even when both its endpoints are public (`F-edges-unfiltered`, closed
+    /// here by backlog batch B08).
+    ///
+    /// [`Viewer::edge_predicate_fragment`]: crate::visibility::Viewer::edge_predicate_fragment
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails, or
@@ -3411,7 +3407,7 @@ impl ClaimRepository {
                   AND e.relationship IN ('CORROBORATES', 'corroborates', 'supports',
                                          'refines', 'continues_argument',
                                          'contradicts')
-                  /* {{VISIBILITY:c}} */
+                  /* {{VISIBILITY:c}} */ /* {{EDGE_VISIBILITY:e}} */
                 ORDER BY c.{embedding_col} <=> $1::vector
                 LIMIT 50
                 "#
@@ -3566,22 +3562,13 @@ impl ClaimRepository {
     /// in the API precisely because it does not require knowing what to ask
     /// for. The predicate is spliced onto `c` below.
     ///
-    /// `edge_count` is NOT visibility-filtered, and — correcting an earlier
-    /// version of this comment — it **is** returned to the caller.
-    /// `rag::rag_context` maps it to `RagContextResult::edge_count` as
-    /// `Some(row.edge_count)`, which is always `Some`, so the
-    /// `skip_serializing_if = "Option::is_none"` attribute never fires and the
-    /// field is always emitted.
-    ///
-    /// What it discloses is therefore a *degree* over unfiltered `edges` for a
-    /// claim the viewer can already see: a scalar count, never the ids or the
-    /// adjacency. That is a real residual, not a non-issue, and it is the same
-    /// unfiltered-`edges` gap recorded in `repos/graph_view.rs`. PR-13 shipped
-    /// `Viewer::edge_predicate_fragment` and `edges.co_owner_group_id`, so the
-    /// tool to close it now exists — but this statement never carried an `edges`
-    /// marker at all, so it needs a predicate ADDED rather than swapped, and
-    /// PR-13 converted only the reads that already had one. Still open as
-    /// `F-edges-unfiltered` in `docs/tenancy/progress.json`.
+    /// `edge_count` is returned to the caller (`rag::rag_context` maps it to
+    /// `RagContextResult::edge_count` as `Some(..)`), so it counts only edges
+    /// the viewer can read: the subquery carries `/* {EDGE_VISIBILITY:e} */`
+    /// (`F-edges-unfiltered`, closed here by backlog batch B08). The
+    /// `source_id = c.id OR target_id = c.id` test is parenthesized because the
+    /// spliced fragment starts with `AND`, which would otherwise bind only to
+    /// the `target_id` arm.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -3612,7 +3599,8 @@ impl ClaimRepository {
                     COALESCE((
                         SELECT COUNT(*)
                         FROM edges e
-                        WHERE e.source_id = c.id OR e.target_id = c.id
+                        WHERE (e.source_id = c.id OR e.target_id = c.id)
+                          /* {EDGE_VISIBILITY:e} */
                     ), 0) as edge_count
                 FROM claims c, query_vec q
                 WHERE c.embedding IS NOT NULL
