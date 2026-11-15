@@ -191,6 +191,8 @@ pub use repos::AtlasLayoutRepository;
 pub use repos::AtlasMapRepository;
 // The Atlas leaf node sets (Atlas W3).
 pub use repos::AtlasLeafRepository;
+// The Atlas "by meaning" hierarchy's reads (Atlas W4).
+pub use repos::AtlasMeaningRepository;
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
