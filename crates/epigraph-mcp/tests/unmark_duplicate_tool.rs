@@ -648,6 +648,7 @@ async fn unmarking_onto_a_merged_canonical_needs_authority_over_the_merged_claim
     let mut conn = pool.acquire().await.expect("acquire");
     let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
         &mut conn,
+        None,
         &[canonical, partner],
         &format!("r11 merged by another agent {}", Uuid::new_v4()),
         0.5,
@@ -826,6 +827,7 @@ async fn unmarking_onto_its_own_merged_canonical_restores_the_duplicate(pool: Pg
     let mut conn = pool.acquire().await.expect("acquire");
     let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
         &mut conn,
+        None,
         &[canonical, partner],
         &format!("r11 merged by the caller {}", Uuid::new_v4()),
         0.5,

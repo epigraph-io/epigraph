@@ -1965,6 +1965,7 @@ async fn a_strangers_duplicate_never_moves_a_members_dates(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
     epigraph_db::ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         epigraph_core::ClaimId::from_uuid(theirs),
         epigraph_core::ClaimId::from_uuid(member),
         &epigraph_db::DuplicateProvenance::new("mark_duplicate", "caller_asserted"),
@@ -2041,6 +2042,7 @@ async fn a_strangers_duplicate_is_left_out_of_the_index_view(pool: PgPool) {
     for dup in [own, theirs] {
         epigraph_db::ClaimRepository::mark_duplicate_with_repair_attributed_conn(
             &mut conn,
+            None,
             epigraph_core::ClaimId::from_uuid(dup),
             epigraph_core::ClaimId::from_uuid(member),
             &epigraph_db::DuplicateProvenance::new("mark_duplicate", "caller_asserted"),
@@ -2238,6 +2240,7 @@ async fn a_duplicate_chain_deeper_than_the_walk_bound_is_reported_truncated(pool
     for (dup, canon) in marks {
         epigraph_db::ClaimRepository::mark_duplicate_act_attributed_conn(
             &mut conn,
+            None,
             epigraph_core::ClaimId::from_uuid(dup),
             epigraph_core::ClaimId::from_uuid(canon),
             &epigraph_db::DuplicateProvenance::new("test", "strong_id"),
@@ -2569,6 +2572,7 @@ async fn the_index_view_is_the_callers_view(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
     epigraph_db::ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         epigraph_core::ClaimId::from_uuid(private_dup),
         epigraph_core::ClaimId::from_uuid(public_canonical),
         &epigraph_db::DuplicateProvenance::new("test", "strong_id"),
@@ -2758,6 +2762,7 @@ async fn a_revert_after_the_canonical_was_superseded_restores_against_its_replac
             .expect("the superseded claim's author");
     let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut conn,
+        None,
         epigraph_core::ClaimId::from_uuid(a),
         &format!("{PUMP_A} (revised)"),
         epigraph_core::TruthValue::clamped(0.5),

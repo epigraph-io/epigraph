@@ -227,6 +227,8 @@ const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key, an
 const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
      analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
      signing caller must receive the edge id";
+const REPO_FOR_CLI: &str = "a repository act whose only caller is an operator CLI on the \
+     maintenance DSN; it takes no key because that CLI has no entity signer to pass";
 const PRIMITIVE: &str = "the unsigned arm (no key) of an EdgeRepository insert primitive; a \
      writer signs by passing its key to the primitive's _signed_conn twin";
 
@@ -279,7 +281,10 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // 34: the match promotion's matcher edge (`promote_if_pending_conn`), signed
 // with the deciding transport's key through the any-state symmetric twin.
 // Not changed: the matcher pipeline's `write_edge` (NO_KEY_ENGINE).
-const UNSIGNED_SITES_HIGH_WATER: usize = 34;
+// 29: the claim acts (supersede 2, evolve_step 1, consolidate 1, the dedup
+// mark's identity edge 1) sign with the request transport's key. Not
+// changed: the legacy dedup identity backfill (REPO_FOR_CLI).
+const UNSIGNED_SITES_HIGH_WATER: usize = 29;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -523,35 +528,42 @@ const REGISTER: &[Site] = &[
     ),
     // Two sites: the `supersedes` edge and the acting agent's `AUTHORED` edge
     // (ruling R-23, merged from main), both emitted inside the supersede act.
+    // The claim acts below sign with the request transport's key, passed in
+    // (the MCP server's, the API's). NOT COUNTED by this register: an operator
+    // CLI that passes `None` (the custodian supersede; the semantic-duplicate
+    // sweep's marks), which needs the CLI-signer ruling (NO_KEY_CLI).
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "supersede_act_conn",
         2,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "evolve_step_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
+    // The legacy fuzzy-dedup identity backfill: its only caller is the
+    // `backfill_dedup_identity_edges` operator CLI on the maintenance DSN, so
+    // there is no transport key to sign with until operator CLIs get a signer.
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "backfill_legacy_dedup_identity_edges_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Unsigned(REPO_FOR_CLI),
     ),
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "consolidate_act_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "mark_duplicate_act",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",

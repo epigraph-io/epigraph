@@ -108,8 +108,12 @@ pub async fn collapse_pair_act(
         DuplicateProvenance::RULE_EXACT_RESTATEMENT,
     )
     .marked_by(Some(acting_agent));
+    // Unsigned (`None`): the sweep runs on the maintenance DSN from its
+    // operator CLI (a request-serving server refuses it, D9), which holds no
+    // entity signer (backlog dae795f8; an open ruling).
     ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(survivor),
         &provenance,

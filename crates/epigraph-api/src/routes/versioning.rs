@@ -393,8 +393,11 @@ pub async fn supersede_claim(
     //    replacement and the `supersedes` edge). Re-pointing the old claim's
     //    other edges belongs to whoever asserted them and runs below as the
     //    administrative cascade.
+    //    Its two edges are attested at INSERT with the API's own key (backlog
+    //    dae795f8), `None` when this API has none configured.
     let (new_uuid, _old_uuid) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        state.edge_signing_key(),
         old_claim_id,
         &request.content,
         truth_value,
@@ -927,8 +930,11 @@ pub async fn mark_duplicate(
     )
     .marked_by(viewer.principal())
     .reason(req.reason.as_deref());
+    // The identity edge is attested at INSERT with the API's own key (backlog
+    // dae795f8), `None` when this API has none configured.
     ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
+        state.edge_signing_key(),
         ClaimId::from_uuid(dup_id),
         ClaimId::from_uuid(req.canonical_id),
         &provenance,

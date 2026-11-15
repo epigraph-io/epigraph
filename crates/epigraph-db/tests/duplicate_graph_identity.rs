@@ -338,6 +338,7 @@ async fn the_identity_edge_lands_on_the_app_role_and_is_hidden_from_a_stranger(p
             stamp(&mut conn, &p, w).await;
             let edge = ClaimRepository::mark_duplicate_act_attributed_conn(
                 &mut conn,
+                None,
                 ClaimId::from_uuid(dup),
                 ClaimId::from_uuid(canonical),
                 &DuplicateProvenance::unattributed(),
@@ -402,6 +403,7 @@ async fn a_re_mark_is_refused_and_writes_no_second_identity_edge(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
     ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &prov,
@@ -410,6 +412,7 @@ async fn a_re_mark_is_refused_and_writes_no_second_identity_edge(pool: PgPool) {
     .expect("first mark");
     let err = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(other),
         &prov,
@@ -998,6 +1001,7 @@ async fn the_identity_edge_keeps_the_named_agent_and_a_bounded_reason(pool: PgPo
         .expect("a different session principal");
     ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &prov,
@@ -1056,6 +1060,7 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
     let mut conn = pool.acquire().await.expect("acquire");
     let r = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
@@ -1074,6 +1079,7 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
             .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(canonical),
         "canonical, revised",
         epigraph_core::TruthValue::clamped(0.5),
@@ -1160,6 +1166,7 @@ async fn superseding_an_unmarked_duplicate_leaves_its_retracted_identity_edge(po
     let mut conn = pool.acquire().await.expect("acquire");
     let r = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(claim),
         ClaimId::from_uuid(target),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
@@ -1192,6 +1199,7 @@ async fn superseding_an_unmarked_duplicate_leaves_its_retracted_identity_edge(po
             .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(claim),
         "a duplicate, revised",
         epigraph_core::TruthValue::clamped(0.5),
@@ -1232,6 +1240,7 @@ async fn consolidating_a_canonical_leaves_its_duplicates_identity_edge(pool: PgP
     let mut conn = pool.acquire().await.expect("acquire");
     let r = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
@@ -1283,6 +1292,7 @@ async fn supersede_canonical(pool: &PgPool, old: Uuid) -> Uuid {
             .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(old),
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),

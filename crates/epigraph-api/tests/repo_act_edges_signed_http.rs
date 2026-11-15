@@ -1,6 +1,9 @@
 #![cfg(feature = "db")]
 //! Signing at INSERT (backlog `dae795f8`) on the HTTP routes whose edges a
-//! repository act writes: the match promotion of `POST
+//! repository act writes: `POST /api/v1/claims/:id/supersede` (the act's
+//! `supersedes` and the actor's `AUTHORED`), `POST /api/v1/claims/:id/dedup`
+//! (the `same_as` identity edge), `POST /api/v1/workflows/steps/:id/evolve`
+//! (the step edge) and the match promotion of `POST
 //! /api/v1/cross-source/candidates/:id/decide` (the matcher edge).
 //!
 //! Every edge each call wrote is attested at INSERT with the API's own key:
@@ -21,11 +24,14 @@ use epigraph_crypto::{AgentSigner, SignatureScheme};
 use epigraph_db::repos::EdgeSignatureRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
+use serde_json::json;
 use sqlx::PgPool;
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
-use viewer_fixture::{database_url_for, downgraded_pool, seed_agent_with_group, seed_public_claim};
+use viewer_fixture::{
+    database_url_for, downgraded_pool, seed_agent_with_group, seed_group_claim, seed_public_claim,
+};
 
 fn auth(agent: Uuid, scopes: &[&str]) -> Option<Extension<AuthContext>> {
     Some(Extension(AuthContext {
@@ -166,4 +172,85 @@ async fn the_match_promotion_attests_its_edge_with_the_api_key(pool: PgPool) {
     .unwrap_or_else(|e| panic!("promote: {e:?}"));
     let rels = assert_new_edges_attested(&pool, &before, signer, caller, "promote").await;
     require(&rels, &["corroborates"], "promote");
+}
+
+/// The claim acts, each on the caller's own group-private claims. Supersede:
+/// the `supersedes` edge and the actor's `AUTHORED`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_supersede_route_attests_its_edges_with_the_api_key(pool: PgPool) {
+    let (caller, group) = seed_agent_with_group(&pool, "dae795f8-http-acts").await;
+    let (state, signer) = signed_state(&pool).await;
+    assert_ne!(signer, caller);
+
+    let old = seed_group_claim(&pool, caller, group, "dae795f8 http: to be superseded").await;
+    let before = edge_ids(&pool).await;
+    let _written = epigraph_api::routes::versioning::supersede_claim(
+        viewer(&pool, caller).await,
+        State(state.clone()),
+        writer(caller),
+        Path(old),
+        Json(
+            serde_json::from_value(json!({
+                "content": "dae795f8 http: the replacement",
+                "truth_value": 0.7,
+                "reason": "restated",
+            }))
+            .expect("supersede request"),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("supersede: {e:?}"));
+    let rels = assert_new_edges_attested(&pool, &before, signer, caller, "supersede").await;
+    require(&rels, &["supersedes", "AUTHORED"], "supersede");
+}
+
+/// The dedup mark's `same_as` identity edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dedup_route_attests_its_identity_edge_with_the_api_key(pool: PgPool) {
+    let (caller, group) = seed_agent_with_group(&pool, "dae795f8-http-dedup").await;
+    let (state, signer) = signed_state(&pool).await;
+    let dup = seed_group_claim(&pool, caller, group, "dae795f8 http: the duplicate").await;
+    let canon = seed_group_claim(&pool, caller, group, "dae795f8 http: the canonical").await;
+    let before = edge_ids(&pool).await;
+    let _written = epigraph_api::routes::versioning::mark_duplicate(
+        viewer(&pool, caller).await,
+        State(state.clone()),
+        writer(caller),
+        Path(dup),
+        Json(
+            serde_json::from_value(json!({"canonical_id": canon, "reason": "same"}))
+                .expect("dedup request"),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("mark_duplicate: {e:?}"));
+    let rels = assert_new_edges_attested(&pool, &before, signer, caller, "mark_duplicate").await;
+    require(&rels, &["same_as"], "mark_duplicate");
+}
+
+/// evolve_step's step edge (`revises`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_evolve_step_route_attests_its_step_edge_with_the_api_key(pool: PgPool) {
+    let (caller, group) = seed_agent_with_group(&pool, "dae795f8-http-evolve").await;
+    let (state, signer) = signed_state(&pool).await;
+    let parent = seed_group_claim(&pool, caller, group, "dae795f8 http: a step").await;
+    let before = edge_ids(&pool).await;
+    let _written = epigraph_api::routes::workflows::evolve_step(
+        viewer(&pool, caller).await,
+        State(state.clone()),
+        writer(caller),
+        Path(parent),
+        Json(
+            serde_json::from_value(json!({
+                "parent_id": parent,
+                "content": "dae795f8 http: a revised step",
+                "edge_type": "revises",
+            }))
+            .expect("evolve request"),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("evolve_step: {e:?}"));
+    let rels = assert_new_edges_attested(&pool, &before, signer, caller, "evolve_step").await;
+    require(&rels, &["revises"], "evolve_step");
 }

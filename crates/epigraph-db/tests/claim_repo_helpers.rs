@@ -1138,6 +1138,7 @@ async fn write_pair(
         PairWriter::Consolidate => {
             let res = ClaimRepository::consolidate_act_conn(
                 conn,
+                None,
                 sources,
                 &claim.content,
                 0.6,
