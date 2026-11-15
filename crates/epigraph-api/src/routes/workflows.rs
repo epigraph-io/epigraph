@@ -436,7 +436,7 @@ pub async fn store_workflow(
     let embedder = if result.already_ingested {
         None
     } else {
-        state.embedding_service()
+        state.storing_embedding_service()
     };
     if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
@@ -1986,6 +1986,20 @@ pub async fn evolve_step(
         None => (None, None),
     };
 
+    // The new step is a current claim with no vector: embed it post-commit,
+    // best-effort, on the caller's stamp, as the ingest routes above embed
+    // theirs (CLAUDE.md "Embedding policy"; backlog 7628ab2c).
+    if let Some(embedder) = state.embedding_service() {
+        embed_inserted_workflow_claims(
+            &state,
+            &viewer,
+            embedder.as_ref(),
+            "workflows/steps/evolve",
+            &[(result.new_claim_id, req.content.clone())],
+        )
+        .await;
+    }
+
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
@@ -2472,7 +2486,7 @@ pub async fn ingest_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     // `embed: false` (OD-6) sends no text to the embedder at all.
     let embedder = if embed.unwrap_or(true) && !result.already_ingested {
-        state.embedding_service()
+        state.storing_embedding_service()
     } else {
         None
     };
