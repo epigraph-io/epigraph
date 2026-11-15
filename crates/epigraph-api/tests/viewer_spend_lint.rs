@@ -330,8 +330,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupMembershipRepository::is_member",
         ],
     ),
-    // gated (`write_target_of`) then write; the owner read is re-checked by the
-    // in-transaction viewer re-fetch (F-write-authz-reads-unfiltered).
+    // gated (`write_target_of`, for every caller since backlog 4073bbb6: the
+    // unfiltered `sqlx::query_scalar(SELECT)` owner read is gone) then write;
+    // the in-transaction viewer re-fetch still re-checks it
+    // (F-write-authz-reads-unfiltered).
     (
         "claims.rs",
         "patch_claim",
@@ -340,7 +342,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::patch_claim_atomic_conn",
             "ProvenanceRepository::append_conn",
             "db_pool.begin",
-            "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
     // gated (`ClaimRepository::get_by_id`) then write.
@@ -425,6 +426,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
+    // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the
+    // shared copy this request just created. It cannot take the caller's
+    // viewer: the copy is authored by the system agent and owned by that
+    // agent's group, which the sharer does not write, so it is stored where
+    // `ClaimRepository::create` above wrote the row (the raw pool), through
+    // `ClaimRepository::store_embedding` and its "not sealed" predicate.
     (
         "conventions.rs",
         "share_skill",
@@ -434,6 +441,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::create",
             "ClaimRepository::default_decl_for_author_pool",
             "EdgeRepository::create_signed_conn",
+            "embed_created_claim",
             "sqlx::query(UPDATE).execute",
         ],
     ),
