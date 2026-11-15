@@ -378,10 +378,21 @@ pub fn is_lineage_relationship(s: &str) -> bool {
 /// BBA attribution: the source claim's `agent_id` is used as the BBA's
 /// `source_agent_id`, mirroring the legacy semantics ("A's author asserts
 /// A SUPPORTS B").
+///
+/// Every statement runs on `conn`, the CALLER's stamped transaction
+/// (`AppState::write_as`, opened by `create_edge` after the edge commits;
+/// backlog 8d720490 (5)). On the raw pool, which production builds on the
+/// application role, row security admitted public rows only and an unstamped
+/// write sees an empty writable set: the author read found no group-private
+/// source, and the wiring's `claim_frames` / `mass_functions` / `claims`
+/// writes were refused, so an HTTP epistemic edge moved no belief and the
+/// failure was only logged. The MCP twin `link_epistemic` already wires on its
+/// stamped transaction. The propagation runs under its own savepoint, so a
+/// failure there cannot abort the transaction and lose the wire.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn trigger_edge_ds_recomputation(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     was_created: bool,
     edge_id: uuid::Uuid,
@@ -392,34 +403,29 @@ async fn trigger_edge_ds_recomputation(
     relationship: &str,
 ) -> Result<(), crate::errors::ApiError> {
     use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcome};
+    use sqlx::Acquire as _;
 
-    let source_agent_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-            .bind(source_claim_id)
-            .fetch_optional(pool)
+    let source_agent_id: Option<Uuid> = {
+        let sql = viewer.splice(
+            "SELECT c.agent_id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(source_claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(&mut *conn)
             .await
             .map_err(|e| crate::errors::ApiError::DatabaseError {
                 message: format!("Failed to fetch source claim agent: {e}"),
-            })?;
+            })?
+    };
     let Some(agent_id) = source_agent_id else {
-        return Ok(()); // source claim doesn't exist — skip silently
+        return Ok(()); // source claim doesn't exist or is not visible — skip silently
     };
 
-    // STILL UNSTAMPED. This is the HTTP twin of MCP `link_epistemic`, which WAS
-    // stamped in this change, and the asymmetry is deliberate rather than an
-    // omission: `epigraph-api`'s request path is converted shard by shard under
-    // `epigraph-db/tests/no_unscoped_pool.rs`, which counts `routes/edges.rs` at 7
-    // unconverted sites and requires a shard to lower its own row. Converting one
-    // site here out of band would lower that row for a handler whose other six
-    // sites still reach the raw pool, which is the "looks converted" shape this
-    // programme has already paid for. The acquire below is mechanical: it moves N
-    // pool checkouts onto ONE connection, which is what makes the per-edge
-    // savepoint inside the helper meaningful, and carries no tenancy context.
-    let mut wire_conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
-        message: format!("edge auto-wire: could not acquire: {e}"),
-    })?;
     let outcome = auto_wire_edge_if_epistemic(
-        &mut wire_conn,
+        &mut *conn,
         viewer,
         was_created,
         edge_id,
@@ -441,8 +447,19 @@ async fn trigger_edge_ds_recomputation(
 
     let mut visited = std::collections::HashSet::new();
     visited.insert(target_claim_id);
-    match propagate_to_dependents(pool, viewer, target_claim_id, &mut visited).await {
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| crate::errors::ApiError::DatabaseError {
+            message: format!("edge auto-wire: could not open the propagation savepoint: {e}"),
+        })?;
+    match propagate_to_dependents(&mut sp, viewer, target_claim_id, &mut visited).await {
         Ok(recomputed) => {
+            sp.commit()
+                .await
+                .map_err(|e| crate::errors::ApiError::DatabaseError {
+                    message: format!("edge auto-wire: could not release the savepoint: {e}"),
+                })?;
             if !recomputed.is_empty() {
                 tracing::info!(
                     updated_claim = %target_claim_id,
@@ -453,6 +470,11 @@ async fn trigger_edge_ds_recomputation(
             }
         }
         Err(e) => {
+            sp.rollback()
+                .await
+                .map_err(|e| crate::errors::ApiError::DatabaseError {
+                    message: format!("edge auto-wire: could not roll back the savepoint: {e}"),
+                })?;
             tracing::warn!(
                 updated_claim = %target_claim_id,
                 error = %e,
@@ -477,7 +499,7 @@ async fn trigger_edge_ds_recomputation(
 /// - Chain: edge → recompute → propagate(visited) → STOP
 #[cfg(feature = "db")]
 async fn propagate_to_dependents(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     updated_claim_id: Uuid,
     visited: &mut std::collections::HashSet<Uuid>,
@@ -505,7 +527,7 @@ async fn propagate_to_dependents(
     )
     .bind(&updated_id_str)
     .bind(updated_claim_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| crate::errors::ApiError::DatabaseError {
         message: format!("Failed to find dependent claims via reasoning traces: {e}"),
@@ -525,7 +547,23 @@ async fn propagate_to_dependents(
 
         // Recompute this dependent claim's belief using the same DS combination
         // pattern: load all mass functions, combine, compute BetP, update.
-        if let Err(e) = recompute_claim_belief(pool, viewer, dependent_claim_id).await {
+        // Under its own savepoint: one dependent's refused or failed write
+        // must not abort the transaction the wire and the other dependents
+        // are on.
+        let mut sp = {
+            use sqlx::Acquire as _;
+            conn.begin()
+                .await
+                .map_err(|e| crate::errors::ApiError::DatabaseError {
+                    message: format!("Failed to open a dependent's savepoint: {e}"),
+                })?
+        };
+        if let Err(e) = recompute_claim_belief(&mut sp, viewer, dependent_claim_id).await {
+            sp.rollback()
+                .await
+                .map_err(|e| crate::errors::ApiError::DatabaseError {
+                    message: format!("Failed to roll back a dependent's savepoint: {e}"),
+                })?;
             tracing::warn!(
                 dependent = %dependent_claim_id,
                 error = %e,
@@ -533,6 +571,11 @@ async fn propagate_to_dependents(
             );
             continue;
         }
+        sp.commit()
+            .await
+            .map_err(|e| crate::errors::ApiError::DatabaseError {
+                message: format!("Failed to release a dependent's savepoint: {e}"),
+            })?;
 
         recomputed.push(dependent_claim_id);
     }
@@ -548,31 +591,24 @@ async fn propagate_to_dependents(
 /// Bel/Pl/BetP).
 #[cfg(feature = "db")]
 async fn recompute_claim_belief(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<(), crate::errors::ApiError> {
-    // Unstamped for the reason recorded above on `auto_wire_edge_if_epistemic`.
-    let mut recompute_conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
-        message: format!("belief recompute: could not acquire: {e}"),
-    })?;
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(
-        &mut recompute_conn,
-        viewer,
-        claim_id,
-    )
-    .await
-    .map(|recomputed| {
-        if recomputed {
-            tracing::info!(
-                claim = %claim_id,
-                "Dependent claim recomputed via 1-hop propagation"
-            );
-        }
-    })
-    .map_err(|e| crate::errors::ApiError::DatabaseError {
-        message: format!("Failed to recompute dependent claim belief: {e}"),
-    })
+    // On the caller's stamped transaction, as `trigger_edge_ds_recomputation`.
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(conn, viewer, claim_id)
+        .await
+        .map(|recomputed| {
+            if recomputed {
+                tracing::info!(
+                    claim = %claim_id,
+                    "Dependent claim recomputed via 1-hop propagation"
+                );
+            }
+        })
+        .map_err(|e| crate::errors::ApiError::DatabaseError {
+            message: format!("Failed to recompute dependent claim belief: {e}"),
+        })
 }
 
 // =============================================================================
@@ -972,10 +1008,11 @@ pub async fn create_edge(
         message: format!("Failed to commit the edge: {e}"),
     })?;
 
-    // UNSCOPED, deliberately and counted (`no_unscoped_pool.rs`): the DS
-    // recomputation and the provenance row below run after
-    // the commit on the raw pool, as they did before the write moved onto the
-    // stamped transaction. Stamping them is follow-up work.
+    // UNSCOPED, deliberately and counted (`no_unscoped_pool.rs`): the
+    // provenance row below runs after the commit on the raw pool, as it did
+    // before the write moved onto the stamped transaction. Stamping it is
+    // follow-up work. The DS recomputation does not use this pool: it runs on
+    // a second transaction stamped with the caller's viewer.
     let pool = &state.db_pool;
 
     // Build the response from the STORED row. On a dedup hit (was_created=false)
@@ -1014,19 +1051,31 @@ pub async fn create_edge(
     // `edge_id` and encodes "source's interval restricts target", and on a
     // symmetric reverse dedup hit the stored orientation is the opposite of
     // the request's (as `link_epistemic`'s `wire_source` / `wire_target`).
-    if let Err(e) = trigger_edge_ds_recomputation(
-        pool,
-        &viewer,
-        was_created,
-        edge_id,
-        edge_row.source_id,
-        edge_row.target_id,
-        &edge_row.source_type,
-        &edge_row.target_type,
-        &edge_row.relationship,
-    )
-    .await
-    {
+    //
+    // On a transaction stamped with the CALLER's viewer (backlog 8d720490
+    // (5)), opened after the edge commits so a wiring failure never loses the
+    // edge. It used to run on the raw pool, where production's application
+    // role admits public rows only and refuses every unstamped write.
+    let wired = async {
+        let mut wire_tx = state.write_as(&viewer, "create_edge_auto_wire").await?;
+        trigger_edge_ds_recomputation(
+            &mut wire_tx,
+            &viewer,
+            was_created,
+            edge_id,
+            edge_row.source_id,
+            edge_row.target_id,
+            &edge_row.source_type,
+            &edge_row.target_type,
+            &edge_row.relationship,
+        )
+        .await?;
+        wire_tx.commit().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to commit the edge auto-wire: {e}"),
+        })
+    }
+    .await;
+    if let Err(e) = wired {
         tracing::warn!(
             edge_id = %edge_id,
             source_id = %request.source_id,

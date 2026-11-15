@@ -336,11 +336,13 @@ async fn an_edge_write_vacates_a_dependent_whose_every_bba_is_inadmissible(pool:
 /// that session state and decide to vacate: the write-free preview, which
 /// runs the same decision, is full ignorance.
 ///
-/// KNOWN RESIDUAL, pinned as it stands: that session cannot write the cache
-/// at all. `update_claim_belief` is refused by row security there (as it is
-/// for an ordinary fold on that session; `routes/edges.rs` is still
-/// unstamped), the route logs the failure and continues, and the claim keeps
-/// its old cache until a stamped or maintenance recompute vacates it.
+/// KNOWN RESIDUAL of the ENGINE on that session, pinned as it stands: it
+/// cannot write the cache at all. `update_claim_belief` is refused by row
+/// security there (as it is for an ordinary fold on that session), and the
+/// claim keeps its old cache until a stamped or maintenance recompute vacates
+/// it. `routes/edges.rs` no longer reaches this session: its propagation runs
+/// on the caller's stamped transaction (backlog 8d720490 (5),
+/// `edge_auto_wire_stamped_http.rs`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_unstamped_application_session_decides_to_vacate(pool: PgPool) {
     let raw = unstamped_app_pool(&pool).await;

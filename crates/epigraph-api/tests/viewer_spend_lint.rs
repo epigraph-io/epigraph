@@ -1271,24 +1271,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(dynamic).fetch_all",
         ],
     ),
-    // edges.rs's DS recomputation after an edge write: the raw-pool reads (the
-    // source claim's author id, for BBA attribution; the reasoning traces that
-    // name the updated claim) reach no response field, the acquires are
-    // mechanical (no_unscoped_pool.rs counts these edges.rs sites), and the
-    // wiring and recomputation themselves take the viewer.
+    // stamped: edges.rs's DS recomputation after an edge write runs on a
+    // transaction stamped with this viewer (backlog 8d720490 (5)). The one
+    // unviewed read left, the reasoning traces that name the updated claim,
+    // is row security's and reaches no response field; the recompute it feeds
+    // takes the viewer. The source-author read splices the viewer.
     (
         "edges.rs",
         "propagate_to_dependents",
         &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    ("edges.rs", "recompute_claim_belief", &["db_pool.acquire"]),
-    (
-        "edges.rs",
-        "trigger_edge_ds_recomputation",
-        &[
-            "db_pool.acquire",
-            "sqlx::query_scalar(SELECT).fetch_optional",
-        ],
     ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
     // unconverted no_unscoped_pool.rs site); every projection in
