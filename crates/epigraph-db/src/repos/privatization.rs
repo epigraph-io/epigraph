@@ -3535,7 +3535,7 @@ impl PrivatizationRepository {
     /// no-op rather than a second, differently-keyed seal over a row whose
     /// plaintext is already gone.
     ///
-    /// # Nine statements, one transaction, no partial seal
+    /// # Every statement in one transaction, no partial seal
     ///
     /// The caller opens the transaction and the caller commits it. Every
     /// statement below is bounded to the ids the first one actually inserted,
@@ -3560,7 +3560,12 @@ impl PrivatizationRepository {
     ///    a plaintext-derived vector on a sealed claim, which is the exact
     ///    defect the plan's own audit clause was written to catch one column
     ///    over. `content_tsv` needs no statement — it is `GENERATED ALWAYS` and
-    ///    follows `content`.
+    ///    follows `content`. Step 2b then takes the claim out of its theme
+    ///    (`claims.theme_id`) and recomputes each theme it left
+    ///    (`claim_themes.centroid`, `claim_count`) from the remaining
+    ///    embedded members (backlog f43ef0a6): a centroid is an aggregate of
+    ///    member vectors, so nulling the claim's vector without recomputing
+    ///    it leaves the sealed vector folded into the theme.
     /// 3. `claim_version_encryption` + 4. `claim_versions` — the complete
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
@@ -3576,17 +3581,30 @@ impl PrivatizationRepository {
     ///
     /// # Ordering: restrict first, then seal
     ///
-    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081),
-    /// which raises `42501` on sealing a claim that is still
-    /// `visibility='public'`. That is the backstop, not the control: the route
-    /// refuses a plan that has not been applied. It is load-bearing anyway,
-    /// because it is what makes the ordering an invariant of the database
-    /// rather than of this function.
+    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081,
+    /// coded PRV01 by 176, body last re-stated by 227), which raises `42501`
+    /// on sealing a claim that is still `visibility='public'`. That is the
+    /// backstop, not the control: the route refuses a plan that has not been
+    /// applied. It is load-bearing anyway, because it is what makes the
+    /// ordering an invariant of the database rather than of this function.
+    ///
+    /// # Row locks (migration 227)
+    ///
+    /// Since 227 that trigger reads each claim's visibility `FOR NO KEY
+    /// UPDATE`, so statement 1, not statement 2, is where this function first
+    /// takes the claim rows' locks and waits on a concurrent publicize (which
+    /// then either commits first and the seal is refused, or waits for the
+    /// seal and is refused by 074). The rows are locked in the order of
+    /// `items`. Under the route's `lock_timeout` a contended claim therefore
+    /// surfaces as a `55P03` from statement 1, and a lock-order deadlock with a
+    /// multi-claim publicize (possible before 227 at statement 2) as a `40P01`
+    /// from either statement; both abort the transaction with nothing written.
     ///
     /// # Errors
     ///
-    /// [`DbError`] for a query fault. A `42501` from statement 1 is 081's guard
-    /// refusing an unrestricted claim.
+    /// [`DbError`] for a query fault. A `42501` from statement 1 is the PRV01
+    /// guard refusing an unrestricted claim; a `55P03` or `40P01` is a lock
+    /// wait that timed out or deadlocked (above).
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,
@@ -3653,6 +3671,66 @@ impl PrivatizationRepository {
         .execute(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
+
+        // 2b. The theme channel (backlog f43ef0a6). `claim_themes.centroid` is
+        //     an average OVER MEMBER EMBEDDINGS and `claim_count` a count of
+        //     embedded members, both denormalised and recomputed only by an
+        //     explicit maintenance call; a theme's label is itself a summary
+        //     of what its members say. Statement 2 removes the sealed vector
+        //     from the row but not from the aggregate it was folded into, so
+        //     without this a theme the sealed claim belonged to kept a
+        //     centroid that still averaged that vector, and a ONE-member
+        //     theme's centroid WAS that vector. The membership is dropped and
+        //     each affected theme recomputed here, in the seal's transaction,
+        //     with `recompute_centroid_for_theme`'s definitions. Written
+        //     unconditionally, so a theme left with no embedded member gets a
+        //     NULL centroid and a zero count rather than keeping the sealed
+        //     vector (it is unassignable until re-seeded, which the
+        //     alternative would not be, and the alternative is the leak).
+        //     `centroid_3072` is not touched: no code path averages members
+        //     into it; it is only ever seeded from outside the corpus.
+        //     An unseal does not restore `theme_id`; the unthemed-assignment
+        //     sweep re-themes the claim once it is re-embedded.
+        let themes: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            r"
+            WITH prior AS (
+                SELECT c.id, c.theme_id
+                  FROM public.claims c
+                 WHERE c.id = ANY($1) AND c.theme_id IS NOT NULL
+            ),
+            cleared AS (
+                UPDATE public.claims c
+                   SET theme_id = NULL
+                  FROM prior
+                 WHERE c.id = prior.id
+                RETURNING prior.theme_id
+            )
+            SELECT DISTINCT theme_id FROM cleared
+            ",
+        )
+        .bind(&sealed)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        if !themes.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE public.claim_themes t
+                   SET centroid = (SELECT avg(c.embedding)::vector(1536)
+                                     FROM public.claims c
+                                    WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       claim_count = (SELECT count(*)::int4
+                                        FROM public.claims c
+                                       WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       updated_at = now()
+                 WHERE t.id = ANY($1)
+                ",
+            )
+            .bind(&themes)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
 
         // 3/4. Version history.
         let (version_ids, version_cts): (Vec<Uuid>, Vec<Vec<u8>>) = items

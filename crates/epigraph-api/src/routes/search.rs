@@ -786,7 +786,7 @@ async fn probe_theme_coverage_isolated(
             .map_err(bracket_failed)?;
     }
     let probe = epigraph_db::ClaimThemeRepository::nearest_theme_coverage_since(
-        &mut **read,
+        read,
         viewer,
         query_vec_1536,
         /*neighbourhood_dim=*/ 1536,
@@ -1355,7 +1355,7 @@ pub async fn semantic_search(
             } else {
                 Some(
                     epigraph_db::ClaimThemeRepository::claims_in_themes_at_dim_since(
-                        &mut *read,
+                        &mut read,
                         &viewer,
                         &theme_ids,
                         &embedding_str,
