@@ -40,7 +40,9 @@ epigraph-io stack is built on it.
 | `epigraph-mcp-full` | `crates/epigraph-mcp` | The MCP server. It speaks stdio by default and HTTP with `--listen`. |
 | `bootstrap_clients`, `epigraph-operator` and other CLIs | `crates/epigraph-cli` | Setup and maintenance tools. `bootstrap_clients` creates the first OAuth clients. |
 
-All of them use one PostgreSQL 16 database with the `pgvector` extension.
+All of them use one PostgreSQL 16 database with the `pgvector` extension,
+version 0.8.0 or newer: the semantic search and recall queries set
+`hnsw.iterative_scan`, which pgvector 0.8.0 introduced.
 
 ## Quickstart (local trial)
 
@@ -53,7 +55,7 @@ check it worked, and what to do when it fails.
 
 You need:
 
-- Docker (or your own PostgreSQL 16 with pgvector)
+- Docker (or your own PostgreSQL 16 with pgvector 0.8.0 or newer)
 - Rust 1.88 or newer
 - a C toolchain, `pkg-config` and the OpenSSL development headers
 - `openssl` and `curl` on your `PATH`
@@ -117,6 +119,8 @@ Start here:
   verb-edges, agents and signing, Dempster-Shafer beliefs, perspectives,
   hierarchical extraction, and backlog discipline.
 - [`docs/intro/04-glossary.md`](docs/intro/04-glossary.md): vocabulary.
+  (The numbering skips `03`: the walkthroughs page planned under that number
+  was not written.)
 - [`docs/intro/05-next-steps.md`](docs/intro/05-next-steps.md): pointers for
   contributors, operators and downstream projects.
 

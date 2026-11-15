@@ -171,6 +171,7 @@ pub async fn auto_wire_ds_for_edge(
             frame_id,
             &frame,
             crate::belief_profile::overrides_in(&frame_row.properties),
+            VacateGate::ClaimWide,
         )
         .await?;
     } else {
@@ -665,6 +666,7 @@ pub async fn recompute_claim_belief_on_frame(
         frame_id,
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
+        VacateGate::ClaimWide,
     )
     .await
 }
@@ -732,6 +734,7 @@ pub async fn preview_claim_belief_on_frame_vacating(
         frame_id,
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
+        VacateGate::ClaimWide,
     )
     .await
 }
@@ -1548,6 +1551,7 @@ async fn compute_combined_belief(
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
+    gate: VacateGate,
 ) -> Result<Option<(CombinedBeliefPreview, bool)>, String> {
     let rows = MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
         .await
@@ -1567,11 +1571,7 @@ async fn compute_combined_belief(
     // `None` with input on the frame: the scope rule left none of it.
     match folded {
         Some(preview) => Ok(Some((preview, false))),
-        None if had_input
-            && crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id)
-                .await
-                .map_err(|e| format!("derivation scope read: {e}"))? =>
-        {
+        None if had_input && gate.vacates(&mut *conn, viewer, claim_id).await? => {
             let profile = fold_profile(
                 &mut *conn,
                 frame_id,
@@ -1590,6 +1590,45 @@ async fn compute_combined_belief(
             Ok(Some((preview, true)))
         }
         None => Ok(None),
+    }
+}
+
+/// When a fold of the owner frame that the derivation scope rule emptied
+/// replaces the cache with full ignorance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VacateGate {
+    /// Every recompute: only when NO frame of the claim has an admissible
+    /// input ([`crate::derivation_scope::must_vacate_cache`]). An admissible
+    /// input on another frame leaves the cache as it was.
+    ClaimWide,
+    /// A widening act (publicize, share with a team): whenever the claim has a
+    /// fold cache. The act has just widened the audience the cached value is
+    /// served to, and that value was folded from the owner frame's inputs
+    /// under the OLD audience. When none of them may reach the new audience,
+    /// keeping it serves their direction and weight to readers who may not
+    /// see them, whatever another frame holds.
+    OwnerFrame,
+}
+
+impl VacateGate {
+    async fn vacates(
+        self,
+        conn: &mut sqlx::PgConnection,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        match self {
+            Self::ClaimWide => {
+                crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id).await
+            }
+            Self::OwnerFrame => {
+                epigraph_db::repos::derivation_scope::DerivationScopeRepository::claim_has_fold_cache(
+                    &mut *conn, viewer, claim_id,
+                )
+                .await
+            }
+        }
+        .map_err(|e| format!("derivation scope read: {e}"))
     }
 }
 
@@ -1614,6 +1653,7 @@ async fn recompute_combined_belief(
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
+    gate: VacateGate,
 ) -> Result<bool, String> {
     let Some((preview, vacated)) = compute_combined_belief(
         &mut *conn,
@@ -1622,6 +1662,7 @@ async fn recompute_combined_belief(
         frame_id,
         frame,
         frame_overrides,
+        gate,
     )
     .await?
     else {
@@ -1765,6 +1806,57 @@ pub async fn recompute_claim_cached_belief(
     };
 
     recompute_claim_belief_on_frame(&mut *conn, viewer, claim_id, owner).await
+}
+
+/// [`recompute_claim_cached_belief`] for a claim whose audience an act has
+/// just WIDENED (`crate::visibility_act`: publicize, share with a team),
+/// called inside the act's transaction.
+///
+/// The owner frame and the fold are the same. The difference is the vacate:
+/// when the owner frame has inputs and the derivation scope rule admits none
+/// of them for the claim's new audience, the cache is set to full ignorance
+/// (as [`recompute_claim_cached_belief`] does only when no frame of the claim
+/// has an admissible input), provided the claim has a fold cache. Without
+/// this, a claim whose `binary_truth` inputs all stay behind (pinned evidence,
+/// an edge-factor BBA whose edge the new audience cannot read) while its
+/// `claim_validity` keeps an admissible input would serve the old
+/// `binary_truth` fold, and the influence of what stayed behind, to the
+/// wider audience (backlog 31285392). A claim with no cache still gets none,
+/// and a claim with no owner frame (a non-procedural compound, template-only
+/// rows) is left as it was.
+///
+/// Returns whether the cache was written (as [`recompute_claim_cached_belief`]).
+///
+/// # Errors
+/// As [`recompute_claim_cached_belief`].
+pub async fn recompute_widened_claim_cached_belief(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    let Some(owner) =
+        MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?
+    else {
+        return Ok(false);
+    };
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, owner)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {owner} not found"))?;
+    let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
+        .map_err(|e| format!("build frame {}: {e}", row.name))?;
+    recompute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        owner,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+        VacateGate::OwnerFrame,
+    )
+    .await
 }
 
 /// Why the single atom-cache writer is called (SPEC §4.2, "Empty fold").
