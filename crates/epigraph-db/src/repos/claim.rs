@@ -4742,7 +4742,17 @@ impl ClaimRepository {
     /// offset/limit.
     pub const MAX_AGENT_CLAIMS: i64 = 500;
 
-    /// Get all claims by an agent
+    /// Get an agent's CURRENT claims, newest first, at most
+    /// [`MAX_AGENT_CLAIMS`](Self::MAX_AGENT_CLAIMS).
+    ///
+    /// Retired rows (`is_current = false`) are excluded. Both callers are the
+    /// reputation calculators, which read `truth_value < 0.2` as "refuted";
+    /// retirement is operational, not epistemic. `deprecate_claim` writes
+    /// `truth_value = 0.05` in the statement that retires a row, and a
+    /// superseded version keeps whatever truth it had beside its successor, so
+    /// counting retired rows scored a workflow deprecation as a refutation and
+    /// counted one claim once per version (backlog 0f22d7b7). A current claim
+    /// whose belief has fallen below the threshold is still returned.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -4759,6 +4769,7 @@ impl ClaimRepository {
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE agent_id = $1
+              AND is_current = true
               /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
             LIMIT $2
@@ -8079,6 +8090,39 @@ impl ClaimRepository {
             2,
         );
         let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(reasoning_type);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Return the ids of the claims assigned to theme `theme_id`
+    /// (`claims.theme_id`) that `viewer` may read.
+    ///
+    /// The `theme_id` filter of `GET /api/v1/claims` (backlog ea26d7aa):
+    /// resolved once into the `ids` predicate of [`ClaimListFilter`], like
+    /// [`Self::claim_ids_by_methodology`]. A theme the viewer reads nothing in,
+    /// and a uuid that names no theme, both resolve to the empty set.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    pub async fn claim_ids_by_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id
+            FROM claims c
+            WHERE c.theme_id = $1
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(theme_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
