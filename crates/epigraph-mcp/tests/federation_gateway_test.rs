@@ -507,6 +507,340 @@ async fn absent_extensions_yield_empty_registry() {
     assert!(registry.list_federated_tools().is_empty());
 }
 
+// ── Health of a MOUNTED extension, and honest call failures ────────────────
+//
+// Backlog c19cdae0: once an extension had mounted, the gateway never looked at
+// it again. `reconnect_tick` re-dialled only unhealthy extensions, and nothing
+// ever set `healthy` back to false, so the boot-time tool list was advertised
+// for the life of the process whatever the extension did afterwards.
+//
+// Backlog 7ea4bd74: every failure of a proxied call (the extension's own
+// JSON-RPC error, a refused connection, a call that never answers) reached the
+// caller as the same redacted "internal error", and the proxied call itself
+// had no timeout.
+
+/// What a [`DynStub`] does, changed by the test while it is being served.
+#[derive(Clone)]
+struct StubControl {
+    /// The tools `tools/list` advertises right now.
+    tools: Arc<Mutex<Vec<String>>>,
+    /// While set, every HTTP request is answered 503: the extension is "down"
+    /// for a new handshake AND for a request on its existing session.
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StubControl {
+    fn set_tools(&self, names: &[&str]) {
+        *self.tools.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
+    }
+
+    fn set_down(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A downstream whose tool list is read from [`StubControl`] on every
+/// `tools/list`. `refuses` answers a JSON-RPC invalid-params error; `hangs`
+/// never answers; any other tool echoes its name.
+#[derive(Clone)]
+struct DynStub {
+    control: StubControl,
+}
+
+impl ServerHandler for DynStub {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let schema = serde_json::json!({ "type": "object", "properties": {} });
+        let obj = Arc::new(schema.as_object().cloned().unwrap_or_default());
+        let tools = self
+            .control
+            .tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|name| Tool::new(name.clone(), "stub downstream tool", obj.clone()))
+            .collect();
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match request.name.as_ref() {
+            "refuses" => Err(ErrorData::invalid_params(
+                "`depth` must be between 1 and 5",
+                None,
+            )),
+            "hangs" => {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                unreachable!("the gateway abandons the call long before this")
+            }
+            other => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "stub handled `{other}`"
+            ))])
+            .into()),
+        }
+    }
+}
+
+/// Serve a [`DynStub`] advertising `tools` on an ephemeral loopback port.
+async fn spawn_dyn_stub(tools: &[&str]) -> (String, StubControl) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let control = StubControl {
+        tools: Arc::new(Mutex::new(Vec::new())),
+        down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    control.set_tools(tools);
+
+    let for_factory = control.clone();
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(DynStub {
+                control: for_factory.clone(),
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let for_mw = control.clone();
+    let router: Router =
+        Router::new()
+            .nest_service("/mcp", service)
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let down = for_mw.down.clone();
+                    async move {
+                        if down.load(std::sync::atomic::Ordering::SeqCst) {
+                            return axum::response::IntoResponse::into_response(
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            );
+                        }
+                        next.run(req).await
+                    }
+                },
+            ));
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (addr, control)
+}
+
+fn tool_names(federation: &SharedFederation) -> Vec<String> {
+    let mut names: Vec<String> = federation
+        .list_federated_tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A healthy extension's tool list is re-read on every tick: an added tool is
+/// routed, and a removed one stops being advertised AND routed.
+#[tokio::test]
+async fn a_tick_picks_up_a_mounted_extensions_changed_tool_list() {
+    let (addr, control) = spawn_dyn_stub(&["ping", "old_tool"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, Some("es_"))], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(tool_names(&federation), ["es_old_tool", "es_ping"]);
+
+    // The extension is redeployed with one tool added and one removed.
+    control.set_tools(&["ping", "new_tool"]);
+    federation.reconnect_tick().await;
+
+    assert_eq!(
+        tool_names(&federation),
+        ["es_new_tool", "es_ping"],
+        "the gateway must advertise the extension's CURRENT tools, not its boot-time list"
+    );
+    assert!(
+        federation.route_config("es_new_tool").is_some(),
+        "a tool added after mount must be routed, not reported as unknown"
+    );
+    assert!(
+        federation.route_config("es_old_tool").is_none(),
+        "a tool the extension no longer exports must not keep a route"
+    );
+    let result = federation
+        .invoke("es_new_tool", "caller-tok", None)
+        .await
+        .expect("the newly routed tool is callable");
+    assert_eq!(
+        result.content[0].as_text().unwrap().text,
+        "stub handled `new_tool`"
+    );
+}
+
+/// An extension that stops answering is demoted on the next tick (no tools, no
+/// routes, named as an unhealthy candidate) and revived by a later one.
+#[tokio::test]
+async fn a_tick_demotes_an_extension_that_died_and_a_later_one_revives_it() {
+    let (addr, control) = spawn_dyn_stub(&["ping"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, Some("es_"))], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(tool_names(&federation), ["es_ping"]);
+
+    control.set_down(true);
+    federation.reconnect_tick().await;
+    assert!(
+        federation.list_federated_tools().is_empty(),
+        "a dead extension's tools must not stay advertised"
+    );
+    assert!(federation.route_config("es_ping").is_none());
+    assert_eq!(
+        federation.unhealthy_extension_candidates("es_ping"),
+        vec!["episcience".to_string()],
+        "the demoted extension is what the unknown-tool error should name"
+    );
+
+    control.set_down(false);
+    federation.reconnect_tick().await;
+    assert_eq!(
+        tool_names(&federation),
+        ["es_ping"],
+        "the extension is back, so the next tick must route it again"
+    );
+    federation
+        .invoke("es_ping", "caller-tok", None)
+        .await
+        .expect("a revived extension is callable");
+}
+
+/// A call that cannot even reach its extension demotes it immediately, without
+/// waiting for the timer.
+#[tokio::test]
+async fn an_invoke_that_cannot_reach_the_extension_demotes_it() {
+    let (addr, control) = spawn_dyn_stub(&["ping"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+    control.set_down(true);
+
+    let err = federation
+        .invoke("ping", "caller-tok", None)
+        .await
+        .expect_err("the extension is down");
+    assert!(
+        err.is_unreachable(),
+        "a refused handshake is an unreachable extension, got {err:?}"
+    );
+    assert!(
+        federation.route_config("ping").is_none(),
+        "the unreachable extension must stop being routed at once"
+    );
+
+    let answer = epigraph_mcp::errors::federated_call_error("episcience", "ping", err);
+    assert!(
+        answer
+            .message
+            .contains("extension `episcience` is unavailable"),
+        "the caller is told WHICH extension is down: {}",
+        answer.message
+    );
+    assert!(
+        !answer.message.contains(&addr),
+        "the dialled address is deployment topology and stays in the log: {}",
+        answer.message
+    );
+}
+
+/// The extension's own JSON-RPC error reaches the caller unchanged.
+#[tokio::test]
+async fn a_downstream_tool_error_reaches_the_caller_with_its_code_and_message() {
+    let (addr, _control) = spawn_dyn_stub(&["refuses"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+
+    let err = federation
+        .invoke("refuses", "caller-tok", None)
+        .await
+        .expect_err("the stub refuses this tool");
+    assert!(
+        !err.is_unreachable(),
+        "an extension that answered with an error was reached"
+    );
+    assert!(
+        federation.route_config("refuses").is_some(),
+        "a tool error says nothing about the extension's health"
+    );
+
+    let answer = epigraph_mcp::errors::federated_call_error("episcience", "refuses", err);
+    assert_eq!(
+        answer.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "the downstream's own error code, not INTERNAL_ERROR"
+    );
+    assert_eq!(
+        answer.message, "`depth` must be between 1 and 5",
+        "the downstream's own message, which is what lets the caller fix the call"
+    );
+}
+
+/// A downstream that accepts a call and never answers is abandoned at the
+/// configured bound instead of holding the caller's request open.
+#[tokio::test]
+async fn a_call_the_downstream_never_answers_times_out() {
+    let (addr, _control) = spawn_dyn_stub(&["hangs"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .unwrap()
+            .with_call_timeout(std::time::Duration::from_millis(300)),
+    );
+
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        federation.invoke("hangs", "caller-tok", None),
+    )
+    .await
+    .expect("the gateway's own bound must end the call; this outer one is the test's backstop")
+    .expect_err("a call that never answers is an error");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "abandoned near the 300ms bound, not at the backstop"
+    );
+    assert!(
+        matches!(
+            err,
+            epigraph_mcp::federation::client::FederationError::CallTimeout { .. }
+        ),
+        "got {err:?}"
+    );
+    assert!(
+        federation.route_config("hangs").is_some(),
+        "a slow answer is not an unreachable extension"
+    );
+
+    let answer = epigraph_mcp::errors::federated_call_error("episcience", "hangs", err);
+    assert!(
+        answer.message.contains("did not answer `hangs`"),
+        "{}",
+        answer.message
+    );
+}
+
 // ── Unknown/unavailable tool attribution (backlog ee50d10d) ────────────────
 //
 // `attach_blob` is a FEDERATED episcience tool — `grep -rn attach_blob

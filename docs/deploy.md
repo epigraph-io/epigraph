@@ -413,6 +413,8 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
+| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Requests per minute allowed to one client, enforced in-process on every route except the health probes. Unset → the API applies **no** rate limit (logged at boot as `Rate limiting: OFF`); limit at the reverse proxy instead, or set this. The client is its IP, taken from `X-Forwarded-For` / `X-Real-IP` when present, so set it only where a trusted proxy writes those headers, and remember that agents sharing one address share one allowance. An unusable value → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global ceiling) | Requests per minute across all clients together. Read only with `EPIGRAPH_RATE_LIMIT_RPM`, and must not be below it. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |
@@ -444,8 +446,10 @@ For the others, anything else is off.
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | As for the API. |
 | `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error. See `crates/epigraph-mcp/src/federation/`. |
 | `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. |
-| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | How often an unhealthy extension is re-dialled. |
+| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | Period of the federation health timer: an unhealthy extension is re-dialled, a healthy one has its tool list re-read (and is demoted if it no longer answers). |
+| `EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS` | `300` | Longest a proxied federated `tools/call` may take before the gateway abandons it and answers the caller with a timeout. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
+| `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio only. After the client disconnects, how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. `0` exits at once and abandons that work. |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
 | `RUST_LOG` | `epigraph_mcp=info,tenancy=info` | Log filter, to stderr. `rmcp*` is capped at INFO regardless. |
 | `CALIBRATION_PATH`, the belief-mode variables | as for the API | |
@@ -2359,6 +2363,10 @@ epigraph-operator group-roster --group <id> [--at <RFC3339>]
 ```
 
 Without `--apply`, each verb's writes and audit row roll back.
+`group-roster` prints a `MEMBER` line per binding-derived member and a
+`DIRECT` line per live row of the group's own roster (what `group-member add`
+writes, and the admin a team group is created with); the last line counts both
+(`members=<derived> ... direct=<rows>`).
 `define-group-role` and `bind-group-role` bind a NON-ELEVATING catalog role to
 a group. Every registered human holding a live assignment of the role is then
 a member, computed and never written, and the membership lapses at the
@@ -2391,7 +2399,8 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 ```
 
 - **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
-  public owners). The target must be an existing `active` group, not world or
+  public owners, including the target itself: a public claim the target
+  already owns is narrowed in place, owner unchanged). The target must be an existing `active` group, not world or
   seed, administered by `--operator`. A claim whose move would make another
   group's row readable to the target's members (for example an edge declared
   `('group', H)`) is HELD, not widened. Pinned evidence is left as it is.
