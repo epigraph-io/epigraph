@@ -432,6 +432,7 @@ jobs:
       # Same environment as `test-shard`; the reasons for each value are there.
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
       SQLX_OFFLINE: "true"
       EPIGRAPH_TEST_DESTRUCTIVE_DB: "1"
       CARGO_BUILD_JOBS: "2"
