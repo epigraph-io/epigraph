@@ -103,6 +103,10 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   (`crates/epigraph-api/src/routes/`) and MCP tools
   (`crates/epigraph-mcp/src/tools/`) both call the repo layer; do not
   duplicate SQL between them.
+  Neither is at zero yet, so two exact-count ratchet tests pin the residue:
+  `crates/epigraph-mcp/tests/no_inline_sql_in_tools.rs` (MCP tools) and
+  `crates/epigraph-api/tests/no_inline_sql_in_routes.rs` (HTTP routes); the
+  HTTP count can only fall, by moving a statement into the repo layer.
 - After adding or modifying a `sqlx::query!` / `sqlx::query_as!` macro
   call, run `DATABASE_URL=... cargo sqlx prepare --workspace -- --tests`
   and commit `.sqlx/` so `SQLX_OFFLINE=true cargo check --workspace`
@@ -217,9 +221,13 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
+- **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
+- **HTTP `POST /api/v1/policy-challenges`** — embeds a NEW challenge after `tx.commit()` on the caller's stamp (`AppState::store_claim_embedding_as`); a repeat request creates nothing and embeds nothing; `crates/epigraph-api/src/routes/policies.rs::embed_new_challenge`
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
+- **MCP `supersede_claim`** and **HTTP `POST /api/v1/claims/:id/supersede`** — the act inserts a current replacement with new text and copies no vector, so the replacement is embedded post-commit: MCP through its inherited author (`tools/supersede.rs::supersede_claim`, `embed_claim_author_stamped`), HTTP on the caller's stamp (`routes/versioning.rs::supersede_claim`, `AppState::embed_claim_as`)
+- **MCP `evolve_step`** and **HTTP `POST /api/v1/workflows/steps/:id/evolve`** — the new step, `supersedes` or `revises`, embedded post-commit through the caller that authored it (`tools/evolve_step.rs`, `embed_created_workflow_claims`; `routes/workflows.rs::evolve_step`, `embed_inserted_workflow_claims`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format `[v,v,...]`, bind as `$N::vector`)
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
@@ -422,3 +430,18 @@ security(crypto): use constant-time comparison in signature verification
 ```
 
 <!-- END epistemic-commit-protocol -->
+
+## Commit-message lint (this repository)
+
+CI (`.github/scripts/commit-message-lint.py`, job `Commit message lint`) reads
+only the non-merge commits a change adds, and refuses three things: an e-mail
+address outside a trailer (placeholder domains and `noreply@anthropic.com`
+excepted); a home-directory path (`/home/<name>/`, `/Users/<name>/`) whose name
+is not generic (`user`, `runner`, `dev`, `you`, `me`, `USER`); and a wildcard-DNS
+host that encodes an address, or a bare public IPv4 outside the documentation,
+loopback and private ranges. It only warns about a Verification section that
+says "Not run", "CI to confirm" or "to be run", a subject outside
+`<type>(<scope>): <text>`, and a message with none of the three sections. A
+commit whose Verification records something that was not run should say so with
+a line starting `Unverified:`, which silences that warning. Output is redacted,
+never the offending value.

@@ -4,6 +4,7 @@
 //! loads from DB, computes expected BetP, and verifies it is in (0, 1).
 
 use engine_integration_tests::harness::*;
+use epigraph_engine::sheaf::RestrictionProfile;
 use epigraph_engine::{compute_expected_betp, restriction_kind, RestrictionKind};
 use sqlx::Row;
 
@@ -63,6 +64,24 @@ async fn sheaf_consistency_from_db_neighborhood() {
         })
         .collect();
 
+    // `restriction_kind` classifies with the scientific profile. Read the
+    // factors from that profile rather than repeating them here, and check
+    // the stored relationships map to the kinds it defines.
+    let profile = RestrictionProfile::scientific();
+    let supporters = neighbors
+        .iter()
+        .filter(|(_, kind)| *kind == RestrictionKind::Positive(profile.supports))
+        .count();
+    let contradicters = neighbors
+        .iter()
+        .filter(|(_, kind)| *kind == RestrictionKind::Negative(profile.contradicts))
+        .count();
+    assert_eq!(
+        (supporters, contradicters),
+        (2, 1),
+        "2 supports + 1 contradicts at the scientific profile's factors, got: {neighbors:?}"
+    );
+
     let expected_betp = compute_expected_betp(&neighbors);
 
     assert!(
@@ -73,17 +92,20 @@ async fn sheaf_consistency_from_db_neighborhood() {
     let betp = expected_betp.unwrap();
 
     // Expected BetP should be in (0, 1):
-    // supporter_1 (0.8): Positive(0.8) → 0.8 * 0.8 = 0.64
-    // supporter_2 (0.9): Positive(0.8) → 0.9 * 0.8 = 0.72
-    // contradictor (0.75): Negative(0.9) → (1 - 0.75) * 0.9 = 0.225
-    // average: (0.64 + 0.72 + 0.225) / 3 ≈ 0.528
+    // supporter_1 (0.8): Positive(supports) -> 0.8 * supports
+    // supporter_2 (0.9): Positive(supports) -> 0.9 * supports
+    // contradictor (0.75): Negative(contradicts) -> 0. Under mutual exclusion
+    //   a contradicter only caps the node and commits it to nothing; it still
+    //   counts as a neighbour. (The complement law, (1 - 0.75) * contradicts,
+    //   was replaced on purpose in a3a46988d, drain U075.)
+    // average: (0.8 * supports + 0.9 * supports + 0) / 3
     assert!(
         betp > 0.0 && betp < 1.0,
         "Expected BetP should be in (0, 1), got: {betp}"
     );
 
-    // Verify approximate value
-    let expected_approx = (0.8 * 0.8 + 0.9 * 0.8 + 0.25 * 0.9) / 3.0;
+    // Verify approximate value: two supporter terms over three neighbours.
+    let expected_approx = (0.8 * profile.supports + 0.9 * profile.supports) / 3.0;
     assert!(
         (betp - expected_approx).abs() < 1e-9,
         "Expected BetP ≈ {expected_approx}, got: {betp}"

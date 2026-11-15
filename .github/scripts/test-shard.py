@@ -171,8 +171,7 @@ WALKERS = {
 # only when one of its packages is affected. The workflow test checks that
 # every `-p <package>` in these jobs' steps is listed here.
 EXTRA_JOBS = {
-    "test-extra": ("epigraph-api", "epigraph-jobs"),
-    "test-unqualified": ("epigraph-jobs", "engine-integration-tests"),
+    "test-extra": ("epigraph-api", "epigraph-jobs", "engine-integration-tests"),
     "lint-features": ("epigraph-api", "epigraph-cli"),
 }
 
