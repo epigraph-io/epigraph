@@ -400,6 +400,9 @@ struct ParsedCommit {
     verification: Vec<String>,
     parent_hashes: Vec<String>,
     files_changed: Vec<String>,
+    /// The message's trailer block (`Key: value` lines), e.g.
+    /// `Epigraph-Orchestrator-Id: <uuid>`; never part of a section.
+    trailers: Vec<String>,
 }
 
 // =============================================================================
@@ -744,7 +747,69 @@ fn detect_section(line: &str) -> Option<Section> {
     }
 }
 
-/// Parse a raw commit message into structured form
+/// Is `line` a git trailer line (`Key: value`, the key one token of letters,
+/// digits and `-`)? Section headers (`Verification:`) carry no value and are
+/// not trailers; neither is a bullet (`- cargo test: ok`), whose key holds a
+/// space or starts with a marker.
+fn is_trailer_line(line: &str) -> bool {
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && key.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && value.starts_with(char::is_whitespace)
+        && !value.trim().is_empty()
+}
+
+/// Split a commit message into its body and its trailer block, as git does:
+/// the trailer block is the LAST paragraph (after the last blank line), and only
+/// when every line of it is a trailer line and it is not the header paragraph.
+/// `Co-Authored-By:`, `Claude-Session:` and `Epigraph-Orchestrator-Id:` live
+/// there, so they are kept out of the Evidence/Reasoning/Verification sections
+/// and handed to the trailer readers instead.
+fn split_trailers(message: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = message.trim_end().lines().collect();
+    let Some(last_blank) = lines.iter().rposition(|l| l.trim().is_empty()) else {
+        return (message.trim_end().to_string(), Vec::new());
+    };
+    let block = &lines[last_blank + 1..];
+    let first_content = lines.iter().position(|l| !l.trim().is_empty());
+    if block.is_empty()
+        || first_content.is_some_and(|i| i > last_blank)
+        || !block.iter().all(|l| is_trailer_line(l.trim()))
+    {
+        return (message.trim_end().to_string(), Vec::new());
+    }
+    let body = lines[..last_blank].join("\n").trim_end().to_string();
+    let trailers = block.iter().map(|l| l.trim().to_string()).collect();
+    (body, trailers)
+}
+
+/// Strip a list marker (`- `, `* `, `+ `, `1. `, `1) `) from a trimmed line.
+/// Returns `None` when the line does not start a list item.
+fn strip_bullet(trimmed: &str) -> Option<&str> {
+    for m in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(m) {
+            return Some(rest.trim_start());
+        }
+    }
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &trimmed[digits..];
+        if let Some(r) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return Some(r.trim_start());
+        }
+    }
+    None
+}
+
+/// Parse a raw commit message into structured form.
+///
+/// Each list item under a section is one entry: a line that starts with a list
+/// marker opens an item, and a following line with no blank line between (a
+/// wrapped bullet) continues it. The trailer block (`split_trailers`) is not part
+/// of any section.
 fn parse_commit_message(
     message: &str,
 ) -> (
@@ -755,16 +820,19 @@ fn parse_commit_message(
     Vec<String>,
     Vec<String>,
 ) {
-    let mut lines = message.lines();
+    let (body, _trailers) = split_trailers(message);
+    let mut lines = body.lines();
 
     // First line is the header
     let first_line = lines.next().unwrap_or("");
     let (commit_type, scope, claim_text) = parse_header(first_line);
 
-    let mut evidence = Vec::new();
-    let mut reasoning = Vec::new();
-    let mut verification = Vec::new();
+    let mut evidence: Vec<String> = Vec::new();
+    let mut reasoning: Vec<String> = Vec::new();
+    let mut verification: Vec<String> = Vec::new();
     let mut current_section = Section::None;
+    // Whether the previous line belonged to an item that a wrapped line extends.
+    let mut item_open = false;
 
     for line in lines {
         let trimmed = line.trim();
@@ -772,23 +840,31 @@ fn parse_commit_message(
         // Check for section header
         if let Some(section) = detect_section(trimmed) {
             current_section = section;
+            item_open = false;
             continue;
         }
 
-        // Skip empty lines
+        // A blank line closes the open item.
         if trimmed.is_empty() {
+            item_open = false;
             continue;
         }
 
-        // Collect bullet points under current section
-        let bullet_text = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let items = match current_section {
+            Section::Evidence => &mut evidence,
+            Section::Reasoning => &mut reasoning,
+            Section::Verification => &mut verification,
+            Section::None => continue, // Skip lines outside sections
+        };
 
-        match current_section {
-            Section::Evidence => evidence.push(bullet_text.to_string()),
-            Section::Reasoning => reasoning.push(bullet_text.to_string()),
-            Section::Verification => verification.push(bullet_text.to_string()),
-            Section::None => {} // Skip lines outside sections
+        match (strip_bullet(trimmed), items.last_mut()) {
+            (None, Some(last)) if item_open => {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+            (bullet, _) => items.push(bullet.unwrap_or(trimmed).to_string()),
         }
+        item_open = true;
     }
 
     (
@@ -923,6 +999,7 @@ fn parse_git_log_output(output: &str) -> Result<Vec<ParsedCommit>, String> {
 
         let (commit_type, scope, claim_text, evidence, reasoning, verification) =
             parse_commit_message(&message);
+        let (_, trailers) = split_trailers(&message);
 
         commits.push(ParsedCommit {
             hash,
@@ -937,6 +1014,7 @@ fn parse_git_log_output(output: &str) -> Result<Vec<ParsedCommit>, String> {
             verification,
             parent_hashes,
             files_changed,
+            trailers,
         });
     }
 
@@ -2983,6 +3061,85 @@ mod tests {
     // Repo-node find-or-create packet tests
     // -------------------------------------------------------------------------
 
+    /// One `git log --format=<RS>%H<FS>%an<FS>%ae<FS>%aI<FS>%P<FS>%B --name-only`
+    /// record, as `parse_git_log` reads it (`%B` ends with a newline, then
+    /// `--name-only` adds a blank line and the file names).
+    fn git_log_record(hash: &str, email: &str, message: &str) -> String {
+        format!(
+            "{RECORD_SEP}{hash}{FIELD_SEP}A{FIELD_SEP}{email}{FIELD_SEP}2026-11-14T00:00:00Z\
+             {FIELD_SEP}{FIELD_SEP}{message}\n\nsrc/lib.rs\n"
+        )
+    }
+
+    // Backlog 7d9e60c6 (5): trailer lines are not Verification evidence, and a
+    // wrapped bullet is one evidence row, not one per line.
+    #[test]
+    fn trailer_block_is_not_section_evidence() {
+        let msg =
+            "fix(api): x\n\n**Evidence:**\n- e1\n\n**Verification:**\n- cargo test: 3 passed\n\
+                   - clippy clean\n\nCo-Authored-By: A Bot <a@example.com>\n\
+                   Claude-Session: https://example.com/s/1";
+        let out = git_log_record("h1", "a@example.com", msg);
+        let commits = parse_git_log_output(&out).unwrap();
+        assert_eq!(commits.len(), 1);
+        let c = &commits[0];
+        assert_eq!(c.verification, vec!["cargo test: 3 passed", "clippy clean"]);
+        assert_eq!(c.evidence, vec!["e1"]);
+        assert_eq!(
+            c.trailers,
+            vec![
+                "Co-Authored-By: A Bot <a@example.com>",
+                "Claude-Session: https://example.com/s/1"
+            ]
+        );
+        assert_eq!(c.files_changed, vec!["src/lib.rs"]);
+
+        // With no Verification section the trailers would have landed in Reasoning.
+        let (_, _, _, _, reasoning, _) =
+            parse_commit_message("feat: y\n\nReasoning:\n- r1\n\nSigned-off-by: A <a@b>");
+        assert_eq!(reasoning, vec!["r1"]);
+    }
+
+    #[test]
+    fn wrapped_bullets_are_one_item_and_every_list_marker_opens_one() {
+        let msg = "feat(x): y\n\n**Evidence:**\n- first line\n  wrapped onto two\n- second\n\
+                   * star\n+ plus\n1. one\n2) two\n\n**Verification:**\n- passes:\n  3 tests\n\
+                   unindented wrap\n\nseparate paragraph";
+        let (_, _, _, evidence, _, verification) = parse_commit_message(msg);
+        assert_eq!(
+            evidence,
+            vec![
+                "first line wrapped onto two",
+                "second",
+                "star",
+                "plus",
+                "one",
+                "two"
+            ]
+        );
+        assert_eq!(
+            verification,
+            vec!["passes: 3 tests unindented wrap", "separate paragraph"]
+        );
+    }
+
+    #[test]
+    fn last_paragraph_that_is_not_all_trailers_is_kept() {
+        // A Verification section closing the message is not a trailer block,
+        // even when its bullets hold `key: value` text.
+        let msg = "test(x): y\n\nEvidence:\n- e\n\nVerification:\n- cargo test: ok\n- fmt: clean";
+        let (_, _, _, _, _, verification) = parse_commit_message(msg);
+        assert_eq!(verification, vec!["cargo test: ok", "fmt: clean"]);
+        let (body, trailers) = split_trailers(msg);
+        assert!(trailers.is_empty());
+        assert_eq!(body, msg);
+        // A one-paragraph message (`docs: x` looks like a trailer) has no trailers.
+        assert!(split_trailers("docs: x").1.is_empty());
+        assert_eq!(parse_header(&split_trailers("docs: x").0).2, "x");
+        // A mixed last paragraph is not a trailer block either.
+        assert!(split_trailers("a: b\n\nKey: v\nplain text").1.is_empty());
+    }
+
     #[test]
     fn repo_node_packet_has_stable_idempotency_and_label() {
         let signer = AgentSigner::generate();
@@ -3314,6 +3471,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["Chose f64 for precision".to_string()],
             verification: vec!["test_truth_bounds passes".to_string()],
             parent_hashes: vec!["parent123".to_string()],
+            trailers: vec![],
             files_changed: vec!["src/core/claim.rs".to_string()],
         };
 
@@ -3363,6 +3521,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["Cargo.lock".to_string()],
         };
 
@@ -3398,6 +3557,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
 
@@ -3445,6 +3605,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["DRY principle".to_string()],
             verification: vec![],
             parent_hashes: vec!["deadbeef".to_string()],
+            trailers: vec![],
             files_changed: vec![
                 "src/engine/propagation.rs".to_string(),
                 "src/engine/mod.rs".to_string(),
@@ -3488,6 +3649,7 @@ fix(db): prevent SQL injection in claim search
                 reasoning: vec![],
                 verification: vec![],
                 parent_hashes: vec![],
+                trailers: vec![],
                 files_changed: vec![],
             },
             ParsedCommit {
@@ -3502,6 +3664,7 @@ fix(db): prevent SQL injection in claim search
                 reasoning: vec![],
                 verification: vec![],
                 parent_hashes: vec!["aaa".to_string()],
+                trailers: vec![],
                 files_changed: vec![],
             },
         ];
@@ -3617,6 +3780,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["re".into()],
             verification: vec!["ve".into()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3638,6 +3802,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["re".into()],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3659,6 +3824,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3695,6 +3861,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3770,6 +3937,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: parents.into_iter().map(String::from).collect(),
+            trailers: vec![],
             files_changed: vec![],
         }
     }
@@ -4545,6 +4713,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec!["Chose approach A".into()],
             verification: vec!["tests pass".into()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["src/lib.rs".into()],
         };
         let signer = AgentSigner::generate();
@@ -4585,6 +4754,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec!["reasoning".into()],
             verification: vec!["verification".into()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -4622,6 +4792,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -5568,6 +5739,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec!["BLAKE3 chosen over SHA-256 for speed".to_string()],
             verification: vec!["test_hash_deterministic passes".to_string()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["crates/epigraph-crypto/src/hasher.rs".to_string()],
         };
 
@@ -5678,6 +5850,7 @@ crates/epigraph-core/src/domain/mod.rs",
                 "test_claim_rejects_truth_above_one: passes".to_string(),
             ],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["crates/epigraph-core/src/domain/claim.rs".to_string()],
         };
 
