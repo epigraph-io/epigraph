@@ -1096,6 +1096,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement with no row to filter; the SQL is unchanged.",
     ),
     (
+        "claim_theme.rs",
+        "begin_iterative_hnsw",
+        "NO ROW READ. A private helper that opens a savepoint and sets two transaction-local \
+         pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the viewer-spliced theme \
+         read its caller runs next (backlog a507966d); it reads and writes no table, so there is \
+         nothing to filter.",
+    ),
+    (
         "claim.rs",
         "update_labels_conn",
         "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
