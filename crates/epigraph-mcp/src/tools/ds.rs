@@ -823,11 +823,17 @@ fn locality_tag_warning(
     ))
 }
 
+/// The longest `mass_functions.locality_tag` the column stores, in
+/// characters: it is `varchar(20)` (migration 045). A longer tag is a
+/// database error at write time, so write paths refuse it up front. A column
+/// width, not a belief parameter: it lives here, outside the belief fold
+/// modules the literal ratchet scans.
+const LOCALITY_TAG_MAX_CHARS: usize = 20;
+
 /// Refuse a `locality_tag` that would be stored but cannot fit the column
-/// ([`epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS`], counted in
-/// characters as `varchar` does).
+/// ([`LOCALITY_TAG_MAX_CHARS`], counted in characters as `varchar` does).
 fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
-    let max = epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS;
+    let max = LOCALITY_TAG_MAX_CHARS;
     let len = stored.chars().count();
     if len > max {
         return Err(invalid_params(format!(
