@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>Atlas preview (synthetic fixtures) · {{ ctx.product_name() }}</title>
+<link rel="stylesheet" href="{{ ctx.static_url("app.css") }}">
+<link rel="stylesheet" href="{{ ctx.static_url("atlas.css") }}">
+<script src="{{ ctx.static_url("vendor/d3-color.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-interpolate.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-ease.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-hierarchy.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-dispatch.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-timer.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-quadtree.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-force.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("atlas_nested.js") }}" defer></script>
+<script src="{{ ctx.static_url("atlas.js") }}" defer></script>
+</head>
+<body>
+<p class="atlas-preview-banner" data-role="preview-banner" role="status">
+  <strong>Preview: synthetic fixture data.</strong>
+  Nothing here is real or comes from the knowledge graph. This loopback-only server shows {{ level_count }} committed test levels so the nested Atlas can be tried before its routes exist.
+</p>
+<main id="main" class="site-main">
+<div class="atlas" id="atlas" data-atlas-mode="preview"
+     data-atlas-maps="{{ maps_json }}">
+  <div class="atlas__bar">
+    <nav class="atlas__crumbs" aria-label="Breadcrumb"><ol data-role="crumbs"></ol></nav>
+    {% include "atlas/nested_controls.html" %}
+  </div>
+  {% include "atlas/stage.html" %}
+  <noscript><p>The Atlas needs JavaScript.</p></noscript>
+</div>
+</main>
+</body>
+</html>
