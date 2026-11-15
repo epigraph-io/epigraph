@@ -3500,6 +3500,33 @@ mod tests {
         assert!(bad.contains("must be a UUID"), "{bad}");
     }
 
+    // Review of 7d9e60c6: with trailers in several commits, the OLDEST wins.
+    #[test]
+    fn orchestrator_trailer_of_the_oldest_commit_wins() {
+        let older = Uuid::parse_str("00000000-0000-4000-8000-0000000000a1").unwrap();
+        let newer = Uuid::parse_str("00000000-0000-4000-8000-0000000000a2").unwrap();
+        let mut out = git_log_record(
+            "h0",
+            "a@b",
+            &format!("fix: first\n\nEpigraph-Orchestrator-Id: {older}"),
+        );
+        // git log is newest first.
+        out.insert_str(
+            0,
+            &git_log_record(
+                "h1",
+                "a@b",
+                &format!("fix: second\n\nEpigraph-Orchestrator-Id: {newer}"),
+            ),
+        );
+        let commits = parse_git_log_output(&out).unwrap();
+        assert_eq!(commits[0].hash, "h0", "commits are oldest first");
+        assert_eq!(
+            resolve_orchestrator_agent(None, "", &commits, None),
+            Ok(older)
+        );
+    }
+
     // Backlog 7d9e60c6 (4): `#8` resolves only claims citing PR #8, not #80.
     #[test]
     fn pr_citation_matches_the_exact_number() {
