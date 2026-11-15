@@ -1959,94 +1959,15 @@ pub async fn submit_packet(
         (false, Some(trace_id), evidence_ids.clone())
     };
 
-    // 6. Create the claim object and register it for propagation
-    //
-    // This creates an in-memory representation of the claim for the
-    // propagation orchestrator to track truth value updates.
-    //
-    // Skip on a duplicate submit (B5): the canonical claim was inserted by an
-    // earlier submit and is already tracked in the in-memory DAG; re-registering
-    // it (and re-running propagation) would only churn the orchestrator for a
-    // claim that did not change. The in-memory `claim` is built *inside* this
-    // guard so it is never constructed on the dedup path.
-    if !was_duplicate {
-        let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
-        let claim = Claim::with_id(
-            ClaimId::from_uuid(claim_id),
-            packet.claim.content.clone(),
-            AgentId::from_uuid(packet.claim.agent_id),
-            [0u8; 32], // Placeholder public key - actual verification done in middleware
-            content_hash,
-            Some(TraceId::from_uuid(trace_id)),
-            None, // Signature verified in middleware
-            TruthValue::new(truth_value).unwrap_or_else(|_| TruthValue::uncertain()),
-            chrono::Utc::now(),
-            chrono::Utc::now(),
-        );
-
-        // 7. Register claim in the propagation orchestrator and trigger propagation
-        //
-        // This step:
-        //    a. Registers the new claim in the in-memory DAG
-        //    b. Triggers propagation to any dependent claims
-        //    c. Updates truth values throughout the graph
-        //    d. Records audit trail for forensic analysis
-        //
-        // CRITICAL: Propagation NEVER uses agent reputation to influence truth values.
-        // Only evidence strength and source claim truth affect the calculation.
-        {
-            let mut orchestrator = state.propagation_orchestrator.write().await;
-
-            // Register the new claim in the orchestrator
-            if let Err(e) = orchestrator.register_claim(claim) {
-                tracing::warn!(
-                    claim_id = %claim_id,
-                    error = %e,
-                    "Failed to register claim in propagation orchestrator"
-                );
-                // Continue anyway - claim submission shouldn't fail due to propagation issues
-            }
-
-            // Trigger propagation from this claim to any dependents
-            // Note: A newly created claim typically has no dependents yet, but this
-            // sets up the infrastructure for when dependencies are added later.
-            let propagation_result = state.propagator.propagate_from(
-                &mut orchestrator,
-                ClaimId::from_uuid(claim_id),
-                None, // Use the claim's current truth value
-            );
-
-            match propagation_result {
-                Ok(result) => {
-                    if !result.updated_claims.is_empty() {
-                        tracing::info!(
-                            claim_id = %claim_id,
-                            updated_count = result.updated_claims.len(),
-                            depth = result.depth_reached,
-                            converged = result.converged,
-                            depth_limited = result.depth_limited,
-                            "Propagation completed after claim submission"
-                        );
-
-                        // In production with database, persist the updated truth values:
-                        // for updated_id in &result.updated_claims {
-                        //     if let Some(updated_truth) = orchestrator.get_truth(*updated_id) {
-                        //         ClaimRepository::update_truth_value(pool, *updated_id, updated_truth).await?;
-                        //     }
-                        // }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %claim_id,
-                        error = %e,
-                        "Propagation failed after claim submission"
-                    );
-                    // Continue anyway - claim was already created successfully
-                }
-            }
-        }
-    } // end `if !was_duplicate` (skip register + propagation on dedup)
+    // 6-7. (removed) The claim used to be copied, content included, into an
+    // in-memory `PropagationOrchestrator` here, under a process-global write
+    // lock, and "propagated". Nothing in the API ever adds a dependency to
+    // that orchestrator, so the propagation could not reach another claim, the
+    // code that would have persisted a result was commented out, and the map
+    // has no eviction: a long-running server kept every packet-submitted
+    // claim's text (host telemetry included) until it restarted (backlog
+    // 7b3722b5). Belief is computed from stored mass functions on read; this
+    // route writes no in-memory graph.
 
     // 8. Generate and store embedding for the claim content
     //
