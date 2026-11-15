@@ -95,7 +95,7 @@ use std::path::{Path, PathBuf};
 /// `(path relative to crates/epigraph-api/src/routes, count)`, sorted by path.
 const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 2),
-    ("belief.rs", 9),
+    ("belief.rs", 7),
     ("claims.rs", 3),
     ("clusters.rs", 8),
     ("computation.rs", 9),
@@ -132,7 +132,9 @@ const REGISTER: &[(&str, usize)] = &[
 /// into `MassFunctionRepository::frame_conflict_summary` (`belief.rs` 10 -> 9)
 /// and the compound neighbourhood's graph reads into `GraphViewRepository`
 /// (`graph_neighborhood.rs` 7 -> 1).
-const HIGH_WATER: usize = 105;
+/// Lowered to 103 on staging batch 3, where the B08 / B22 / B23 stack meets
+/// the rest of the batch: `belief.rs` measures 7 on the combined tree.
+const HIGH_WATER: usize = 103;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
