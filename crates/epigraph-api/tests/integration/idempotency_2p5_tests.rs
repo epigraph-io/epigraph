@@ -870,8 +870,13 @@ async fn submit_packet_idempotency_cache_holds_canonical_id(pool: PgPool) {
         .expect("first response must carry claim_id")
         .to_string();
 
+    // The cache is per caller (backlog 449bc6c1), so the dedup submit and the
+    // cache-hit submit on router_b come from ONE principal; with a fresh
+    // principal per post the third submit would miss the cache and be served
+    // by the content-hash dedup instead, testing nothing about the cache.
     let router_b = create_test_router(pool.clone());
-    let (status_2, body_2) = post_packet(&router_b, packet.clone()).await;
+    let token_b = submit_bearer_token_for(Uuid::new_v4());
+    let (status_2, body_2) = post_packet_with_token(&router_b, packet.clone(), &token_b).await;
     assert_eq!(
         status_2,
         StatusCode::CREATED,
@@ -887,7 +892,7 @@ async fn submit_packet_idempotency_cache_holds_canonical_id(pool: PgPool) {
 
     // Third submit on router_b: now served from its in-memory cache (cache-hit
     // path). It must echo the canonical id stored on the previous (dedup) write.
-    let (status_3, body_3) = post_packet(&router_b, packet).await;
+    let (status_3, body_3) = post_packet_with_token(&router_b, packet, &token_b).await;
     assert_eq!(
         status_3,
         StatusCode::CREATED,
@@ -903,6 +908,78 @@ async fn submit_packet_idempotency_cache_holds_canonical_id(pool: PgPool) {
     assert_eq!(
         json_3["was_duplicate"], true,
         "a cache-hit must report was_duplicate=true"
+    );
+}
+
+/// **Backlog 449bc6c1 — the idempotency key is the caller's, not the server's.**
+///
+/// Two principals submit DIFFERENT packets under the SAME client
+/// `idempotency_key` on one process. The second must get its own claim, never
+/// the first caller's ids. The first caller replaying its key with different
+/// content is the positive control: the cache still answers it (a fix that
+/// simply disabled the cache would fail there, because content-hash dedup
+/// cannot match different content). A packet that fails validation is
+/// refused even when its key is cached.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_packet_idempotency_key_is_scoped_to_the_caller(pool: PgPool) {
+    let agent_a: Uuid = AgentRepository::create(&pool, &fixed_agent(61, "idem-scope-a"))
+        .await
+        .expect("agent a")
+        .id
+        .into();
+    let agent_b: Uuid = AgentRepository::create(&pool, &fixed_agent(62, "idem-scope-b"))
+        .await
+        .expect("agent b")
+        .id
+        .into();
+    let token_a = submit_bearer_token_for(agent_a);
+    let token_b = submit_bearer_token_for(agent_b);
+    let router = create_test_router(pool.clone());
+    let key = serde_json::json!("idem-449bc6c1-shared-key");
+
+    let mut packet_a = evidence_packet(agent_a, "449bc6c1: the first caller's claim");
+    packet_a["claim"]["idempotency_key"] = key.clone();
+    let (status, body) = post_packet_with_token(&router, packet_a, &token_a).await;
+    assert_eq!(status, StatusCode::CREATED, "first caller: {body}");
+    let json_a: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let claim_a = json_a["claim_id"].as_str().expect("claim_id").to_string();
+
+    // The second caller, same key, its own packet.
+    let mut packet_b = evidence_packet(agent_b, "449bc6c1: the second caller's claim");
+    packet_b["claim"]["idempotency_key"] = key.clone();
+    let (status, body) = post_packet_with_token(&router, packet_b, &token_b).await;
+    assert_eq!(status, StatusCode::CREATED, "second caller: {body}");
+    let json_b: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let claim_b = json_b["claim_id"].as_str().expect("claim_id").to_string();
+    assert_ne!(
+        claim_b, claim_a,
+        "the second caller must not receive the first caller's claim: {body}"
+    );
+    assert_eq!(json_b["was_duplicate"], false, "{body}");
+    let stored: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1::uuid")
+        .bind(&claim_b)
+        .fetch_one(&pool)
+        .await
+        .expect("the second caller's claim is stored");
+    assert_eq!(stored, "449bc6c1: the second caller's claim");
+
+    // Positive control: the first caller's own replay is still a cache hit.
+    let mut replay = evidence_packet(agent_a, "449bc6c1: a different body, same key");
+    replay["claim"]["idempotency_key"] = key.clone();
+    let (status, body) = post_packet_with_token(&router, replay, &token_a).await;
+    assert_eq!(status, StatusCode::CREATED, "replay: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["claim_id"].as_str(), Some(claim_a.as_str()), "{body}");
+    assert_eq!(json["was_duplicate"], true, "{body}");
+
+    // A packet that fails validation is refused even under a cached key.
+    let mut invalid = evidence_packet(agent_a, "   ");
+    invalid["claim"]["idempotency_key"] = key;
+    let (status, body) = post_packet_with_token(&router, invalid, &token_a).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "validation runs before the cache: {body}"
     );
 }
 

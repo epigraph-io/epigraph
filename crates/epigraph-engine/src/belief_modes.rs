@@ -6,9 +6,17 @@
 //! over N processes, not an atomic switch, and a process that was never
 //! restarted keeps running the old mode.
 //!
-//! This module is the one place all seven flags are parsed into one
-//! [`BeliefModes`] REPORT, so every process reports the same modes from the
-//! same environment. In this build the report is read by:
+//! This module is the one place the flags are parsed, so every process
+//! derives the same [`BeliefModes`] from the same environment, and every
+//! reader in a process acts on the same value its `/health` report shows.
+//! Code acts on a flag by reading its field of [`current`]
+//! (`belief_modes::current().<key>`, or the engine's
+//! `atom_items::modes().<key>`, which is [`current`] plus a once-only typo
+//! warning); it never parses the variable again. The
+//! `belief_mode_readers` ratchet in this crate's tests fails on a second
+//! parser, and on a flag read in code while the table below says "no".
+//!
+//! The modes are reported by:
 //!
 //! - the API server and the HTTP and stdio MCP servers, which journal it at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
@@ -19,17 +27,6 @@
 //!   `decompose_claims --retarget`, which compare their own [`current`] with
 //!   the API's report before a writing run ([`BeliefModes::skew`]).
 //!
-//! The job runner (`drain_jobs`) does not read this module.
-//!
-//! **The code that ACTS on a flag does not read [`current`].** Each of the
-//! four flags acted on (table below) is parsed a second time, once per
-//! process, beside the code that acts on it: `atom_items::AtomFoldMode` and
-//! `atom_items::CompoundSourceEdges`, `belief_view::CompoundBeliefMode`, and
-//! the API server's `epigraph_api::state::BpApply`. They read the same
-//! variables and accept the same spellings, with one difference: the acting
-//! `CompoundBeliefMode` knows only `legacy` and `shadow`, so a process set to
-//! `progressive` or `strict` REPORTS that value here and RUNS `legacy`.
-//!
 //! # Defaults, and what this build acts on
 //!
 //! Every default is the mode the rollout starts from. Under the defaults the
@@ -38,19 +35,20 @@
 //!
 //! | flag | values | default | acted on in this build |
 //! |---|---|---|---|
-//! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | yes: the single atom-cache writer (`edge_factor::recompute_atom_cache_with`, reached through `recompute_betp`) folds a standalone with the AEF under `aef_standalone` or `aef` and every atom under `aef`; `backfill_factors` and `sweep_retired_source_bbas` write only the legacy fold and refuse a writing run under any other |
-//! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds a `shadow` view beside the served value (`belief_query::shadow_belief_conn`). `progressive` and `strict` are not wired and run as `legacy` |
+//! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | yes: the single atom-cache writer (`edge_factor::recompute_atom_cache`) folds with the AEF the atoms the mode covers; the CLI wave bins whose writers fold only legacy refuse a writing run under any other fold |
+//! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds the atom-level `shadow` view beside the served values. `progressive` and `strict` are not wired and serve `legacy` (logged once; `/health` still reports the configured mode) |
 //! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | no: a textless BBA write on a compound is neither kept inert nor logged yet |
-//! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: under `excluded` the atom reader (`atom_items::atom_axiom_rows`) reads no edge-factor row whose source is a compound. Reached from the atom-cache writer, from the cache vacate after a BBA retraction (`bba_retract::refresh_cache_after_retract`, HTTP and MCP) and from the shadow derivation |
+//! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: the atom display fold (`atom_items`), the atom-cache writer, BBA retraction's cache vacate and the shadow report keep or drop edge-factor rows whose source is a compound |
 //! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |
 //! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no |
-//! | `EPIGRAPH_BP_APPLY` | `off`, `on` | `off` | yes, by the API server: `POST /api/v1/bp/propagate` with `apply_updates: true` is refused with 409 unless the server was started with `on` (`routes/computation.rs`) |
+//! | `EPIGRAPH_BP_APPLY` | `off`, `on` | `off` | yes: the API server refuses `POST /api/v1/bp/propagate` with `apply_updates: true` (409) unless `on` |
 //!
-//! The value docs below say what each mode means once it is fully wired. For
-//! the three flags marked `no`, a reported mode is configuration, not
-//! behaviour. `bp_apply: off` on the API's `/health` does mean that process
-//! refuses BP apply. This module only guarantees that every process reads
-//! and reports the flags alike.
+//! The value docs below say what each mode means. For a flag (or value) the
+//! table marks as not acted on, a reported mode is configuration, not
+//! behaviour: `compound_write_guard: refuse` on `/health` does not mean such
+//! a write is refused. Each flag is wired into its code path by the change
+//! that introduces the behaviour, which reads [`current`] rather than parsing
+//! the environment again, and updates the table.
 //!
 //! # Parsing
 //!
@@ -149,8 +147,8 @@ belief_mode! {
 
 belief_mode! {
     /// What a textless BBA write aimed at a compound does. Reported only in
-    /// this build (see the module doc); the variants describe the enforced
-    /// meaning.
+    /// this build (see the module doc's table); the variants describe the
+    /// enforced meaning.
     CompoundWriteGuard, env = "EPIGRAPH_COMPOUND_WRITE_GUARD", default = Warn, {
         /// Accepted, kept inert, the caller warned and logged.
         Warn => "warn",
@@ -193,13 +191,13 @@ belief_mode! {
 }
 
 belief_mode! {
-    /// Whether a belief-propagation run may write its results to claims.
-    /// Enforced by the API server through its own parse of the same variable
-    /// (`epigraph_api::state::BpApply`; see the module doc).
+    /// Whether a belief-propagation run may write its results to claims
+    /// (`epigraph_api::state::BpApply`, which gates
+    /// `POST /api/v1/bp/propagate`).
     BpApply, env = "EPIGRAPH_BP_APPLY", default = Off, {
-        /// BP results are not written.
+        /// BP results are not written: `apply_updates: true` is refused.
         Off => "off",
-        /// BP results may be written to atoms.
+        /// BP results may be written to atoms (never to a compound).
         On => "on",
     }
 }

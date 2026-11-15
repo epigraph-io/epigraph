@@ -70,9 +70,34 @@ fn anti_support_mass(betp_y: f64) -> MassFunction {
 }
 
 /// Parse a mass function from the JSON `masses` column in the database.
+///
+/// The masses are read by index on BP's binary frame (0 = supported), so the
+/// row must be on the canonical `binary_truth` frame (index 0 = TRUE). A row
+/// on any other frame means something else at each index; see [`seed_mass`].
 pub fn parse_mass_function_row(masses_json: &serde_json::Value) -> Result<MassFunction, String> {
     MassFunction::from_json_masses(BINARY_FRAME.clone(), masses_json)
         .map_err(|e| format!("Failed to parse mass function: {e}"))
+}
+
+/// A stored BBA as a CDST BP seed: parsed on BP's binary frame, then
+/// discounted by the row's reliability under `profile`, as the served fold
+/// discounts every BBA before combining it (backlog 42be8a60).
+///
+/// The caller passes only rows stored on the canonical `binary_truth` frame,
+/// with `profile` resolved for that frame
+/// ([`crate::edge_factor::frame_fold_profile`]). A row on another frame
+/// (`research_validity`, a three-hypothesis frame, ...) is not a statement
+/// about BP's {supported, unsupported} and must not seed it.
+///
+/// # Errors
+/// The masses do not parse on the binary frame, or the discount fails.
+pub fn seed_mass(
+    row: &epigraph_db::MassFunctionRow,
+    profile: &crate::belief_profile::BeliefProfile,
+) -> Result<MassFunction, String> {
+    let stored = parse_mass_function_row(&row.masses)?;
+    let reliability = crate::edge_factor::effective_source_strength_profiled(row, profile);
+    discount(&stored, reliability).map_err(|e| format!("discount: {e}"))
 }
 
 // -- Factor message computation --------------------------------------------
@@ -300,13 +325,22 @@ pub fn cdst_bp_iteration(
     // groups reduce via combine_alternative_set (max-Bel/max-Pl, the
     // least-restrictive-alternative rule). Singleton groups and untagged
     // messages (e.g., MutualExclusion's anti-support) pass through unchanged.
-    let mut var_incoming: HashMap<Uuid, Vec<(Option<Uuid>, MassFunction)>> = HashMap::new();
+    //
+    // The fold below is the adaptive rule, which is not associative: the
+    // order it meets the messages in changes the result. So the order is
+    // canonical, never a `HashMap`'s (backlog 15582602): each message keeps
+    // its factor id, supporter groups are folded in class-id order, each
+    // group's members and the untagged messages in factor-id order.
+    let mut var_incoming: HashMap<Uuid, Vec<(Uuid, Option<Uuid>, MassFunction)>> = HashMap::new();
     for ((factor_id, var), msg) in messages.iter() {
         let source = message_source.get(&(*factor_id, *var)).copied().flatten();
         var_incoming
             .entry(*var)
             .or_default()
-            .push((source, msg.clone()));
+            .push((*factor_id, source, msg.clone()));
+    }
+    for tagged in var_incoming.values_mut() {
+        tagged.sort_by_key(|(factor_id, _, _)| *factor_id);
     }
 
     // Canonical-class id per claim: the minimum claim_id in the equivalence
@@ -337,9 +371,9 @@ pub fn cdst_bp_iteration(
         // Group supporter messages by canonical alt-set class; untagged
         // messages (source=None) form an "anonymous" bucket that bypasses
         // grouping and feeds the combine loop as singletons.
-        let mut supporter_groups: HashMap<Uuid, Vec<MassFunction>> = HashMap::new();
+        let mut supporter_groups: BTreeMap<Uuid, Vec<MassFunction>> = BTreeMap::new();
         let mut anonymous: Vec<MassFunction> = Vec::new();
-        for (source, msg) in tagged_msgs {
+        for (_factor_id, source, msg) in tagged_msgs {
             match source {
                 Some(src) => supporter_groups
                     .entry(canonical_class(*src))
@@ -415,13 +449,16 @@ fn build_result(
     messages_sent: usize,
     max_conflict: f64,
 ) -> CdstBpResult {
-    let updated_betps: Vec<(Uuid, f64)> = beliefs
+    // In claim-id order, so a run's report is the same list every time.
+    let mut ordered: Vec<(&Uuid, &MassFunction)> = beliefs.iter().collect();
+    ordered.sort_by_key(|(id, _)| **id);
+    let updated_betps: Vec<(Uuid, f64)> = ordered
         .iter()
-        .map(|(id, m)| (*id, pignistic_probability(m, H_SUPPORTED)))
+        .map(|(id, m)| (**id, pignistic_probability(m, H_SUPPORTED)))
         .collect();
-    let updated_intervals: Vec<(Uuid, EpistemicInterval)> = beliefs
+    let updated_intervals: Vec<(Uuid, EpistemicInterval)> = ordered
         .iter()
-        .map(|(id, m)| (*id, mass_to_interval(m)))
+        .map(|(id, m)| (**id, mass_to_interval(m)))
         .collect();
     CdstBpResult {
         iterations,
@@ -779,5 +816,156 @@ mod tests {
         assert!(result.converged);
         assert_eq!(result.iterations, 0);
         assert_eq!(result.updated_betps.len(), 1);
+    }
+
+    fn strong_unsupported(mass: f64) -> MassFunction {
+        MassFunction::simple(BINARY_FRAME.clone(), BTreeSet::from([H_UNSUPPORTED]), mass).unwrap()
+    }
+
+    /// Exact (bitwise) fingerprint of a mass function.
+    fn bits(m: &MassFunction) -> Vec<(FocalElement, u64)> {
+        m.focal_elements()
+            .map(|(fe, v)| (fe.clone(), v.to_bits()))
+            .collect()
+    }
+
+    /// A factor as `cdst_bp_iteration` takes it.
+    type Factor = (Uuid, FactorPotential, Vec<Uuid>);
+
+    /// Backlog 15582602: one target `t` with three supporters (each its own
+    /// alternative-set class) and a mutual-exclusion partner `x`, whose
+    /// anti-support message carries no source. The supporters' messages are
+    /// chosen so their pairwise conflicts straddle the adaptive threshold:
+    /// the order the fold meets them changes the result.
+    fn order_sensitive_fixture() -> (Uuid, Vec<Factor>, HashMap<Uuid, MassFunction>) {
+        let t = Uuid::from_u128(0x10);
+        let (a, b, c, x) = (
+            Uuid::from_u128(0x20),
+            Uuid::from_u128(0x30),
+            Uuid::from_u128(0x40),
+            Uuid::from_u128(0x50),
+        );
+        let mut beliefs = HashMap::new();
+        beliefs.insert(t, vacuous());
+        beliefs.insert(a, strong_supported(0.5));
+        beliefs.insert(b, strong_unsupported(0.5));
+        beliefs.insert(c, strong_unsupported(0.9));
+        beliefs.insert(x, strong_supported(0.6));
+        let support = |id: u128, other: Uuid| {
+            (
+                Uuid::from_u128(id),
+                FactorPotential::EvidentialSupport { strength: 1.0 },
+                vec![other, t],
+            )
+        };
+        let factors = vec![
+            support(0x1001, a),
+            support(0x1002, b),
+            support(0x1003, c),
+            (
+                Uuid::from_u128(0x1004),
+                FactorPotential::MutualExclusion,
+                vec![x, t],
+            ),
+        ];
+        (t, factors, beliefs)
+    }
+
+    /// One iteration's belief for `t`, from fresh message state.
+    fn one_iteration(
+        t: Uuid,
+        factors: &[(Uuid, FactorPotential, Vec<Uuid>)],
+        beliefs: &HashMap<Uuid, MassFunction>,
+    ) -> MassFunction {
+        let mut beliefs = beliefs.clone();
+        let mut messages = HashMap::new();
+        let evidence = HashMap::new();
+        cdst_bp_iteration(
+            factors,
+            &mut beliefs,
+            &evidence,
+            &mut messages,
+            &CdstBpConfig::default(),
+        );
+        beliefs.remove(&t).expect("t is updated")
+    }
+
+    /// The fixture is order-sensitive, measured directly: running the
+    /// incoming messages of `t` through the per-variable steps of
+    /// `cdst_bp_iteration` in different orders gives BetP values far apart. Without this the
+    /// determinism test below could pass by luck on an order-free fixture.
+    #[test]
+    fn the_determinism_fixture_is_order_sensitive() {
+        let (t, factors, beliefs) = order_sensitive_fixture();
+        let msgs: Vec<MassFunction> = factors
+            .iter()
+            .map(|(_, p, vars)| compute_cdst_factor_message(p, vars, t, &beliefs))
+            .collect();
+        // The per-variable pipeline of `cdst_bp_iteration` for one fold
+        // order: fold, anchor on (vacuous) evidence, damp against the
+        // (vacuous) previous belief.
+        let config = CdstBpConfig::default();
+        let pipeline = |order: &[usize]| -> MassFunction {
+            let mut acc = msgs[order[0]].clone();
+            for &i in &order[1..] {
+                acc = adaptive_combine(&acc, &msgs[i], config.conflict_threshold)
+                    .map(|(m, _)| m)
+                    .unwrap_or_else(|_| vacuous());
+            }
+            let anchored = adaptive_combine(&acc, &vacuous(), config.conflict_threshold)
+                .map(|(m, _)| m)
+                .unwrap_or_else(|_| vacuous());
+            damp(&anchored, &vacuous(), config.damping)
+        };
+        let orders: [[usize; 4]; 4] = [[0, 1, 2, 3], [0, 2, 1, 3], [2, 1, 0, 3], [3, 2, 1, 0]];
+        let results: Vec<MassFunction> = orders.iter().map(|o| pipeline(o)).collect();
+        let spread = |f: &dyn Fn(&MassFunction) -> f64| {
+            let v: Vec<f64> = results.iter().map(f).collect();
+            v.iter().copied().fold(f64::MIN, f64::max) - v.iter().copied().fold(f64::MAX, f64::min)
+        };
+        // Measured: the orders above leave BetP about .03 apart (and the
+        // conflict mass about .08), far above float noise.
+        let betp = spread(&|m| pignistic_probability(m, H_SUPPORTED));
+        let conflict = spread(&MassFunction::mass_of_conflict);
+        assert!(
+            betp > 1e-2 && conflict > 1e-2,
+            "the fixture must be order-sensitive: BetP spread {betp}, conflict spread {conflict}"
+        );
+    }
+
+    /// Backlog 15582602: the same graph gives the same BP result, bit for
+    /// bit, on every run and whatever order the caller lists its factors in.
+    /// The incoming messages used to be folded in `HashMap` iteration order,
+    /// which differs between map instances, under the order-dependent
+    /// adaptive rule.
+    #[test]
+    fn cdst_bp_iteration_is_deterministic_across_runs_and_factor_orders() {
+        let (t, factors, beliefs) = order_sensitive_fixture();
+        let reference = bits(&one_iteration(t, &factors, &beliefs));
+        for run in 0..64 {
+            let mut permuted = factors.clone();
+            permuted.rotate_left(run % factors.len());
+            if run % 2 == 1 {
+                permuted.reverse();
+            }
+            assert_eq!(
+                bits(&one_iteration(t, &permuted, &beliefs)),
+                reference,
+                "run {run} folded t's messages to a different belief"
+            );
+        }
+        // And the run's report lists the claims in one order: by id.
+        let result = run_cdst_bp(
+            &factors,
+            &beliefs,
+            &HashMap::new(),
+            &CdstBpConfig::default(),
+        );
+        let ids: Vec<Uuid> = result.updated_betps.iter().map(|(id, _)| *id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        let interval_ids: Vec<Uuid> = result.updated_intervals.iter().map(|(id, _)| *id).collect();
+        assert_eq!(interval_ids, sorted);
     }
 }
