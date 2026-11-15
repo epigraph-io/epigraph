@@ -51,20 +51,27 @@
 --     needs no change, and this file does not touch it.
 --
 -- Both orderings are pinned against the 176 body (where they commit a public
--- sealed claim) and against this body (where they are refused), by
--- crates/epigraph-db/tests/sealed_public_race.rs.
+-- sealed claim) and against this body (where they are refused), for a raw
+-- `UPDATE claims` and for 206's shipped `epigraph_publicize_claims` (which,
+-- seal first, waits in its pre-lock and then classifies the claim
+-- `refused_sealed`), by crates/epigraph-db/tests/sealed_public_race.rs.
 --
 -- WHY NOT FOR SHARE. FOR SHARE also conflicts with the publicize, but two
--- deliveries of one seal can BOTH hold it: `seal_claims_conn` makes a
--- re-delivered commit a no-op with `ON CONFLICT (claim_id) DO NOTHING`, and
--- the BEFORE trigger fires before the conflict check. The second delivery
--- would take FOR SHARE, then wait on the first's uncommitted unique-index
--- entry, while the first's statement 2 (`UPDATE claims`) waits on the
--- second's FOR SHARE: a deadlock (measured; pinned by
--- `a_redelivered_seal_is_a_no_op_not_a_deadlock`). FOR NO KEY UPDATE is the
--- lock statement 2 takes anyway, so the second delivery waits in its trigger
--- until the first commits, and its INSERT is then the no-op it was before.
--- It still does not conflict with the KEY SHARE an FK check takes.
+-- concurrent writers of the SAME seal can both hold it. `seal_claims_conn`
+-- makes a re-delivered commit a no-op with `ON CONFLICT (claim_id) DO
+-- NOTHING`, and the BEFORE trigger fires before the conflict check. The
+-- second writer would take FOR SHARE, then wait on the first's uncommitted
+-- unique-index entry, while the first's statement 2 (`UPDATE claims`) waits on
+-- the second's FOR SHARE: a deadlock (measured; pinned by
+-- `a_redelivered_seal_is_a_no_op_not_a_deadlock`). The privatization route
+-- does not reach this: `begin_batch_conn` takes a transaction-scoped advisory
+-- lock before `seal_claims_conn` runs, so two deliveries through it queue on
+-- that lock. A raw `claim_encryption` writer that skips the advisory lock
+-- does reach it. The deciding reason is that FOR NO KEY UPDATE is the lock
+-- statement 2 and 206's publicize pre-lock already take, so this adds no new
+-- kind of lock: the second writer waits in its trigger until the first
+-- commits, and its INSERT is then the no-op it was before. It still does not
+-- conflict with the KEY SHARE an FK check takes.
 --
 -- THE LOCK UNDER ROW SECURITY. The function stays SECURITY INVOKER, as 081
 -- wrote it, so the read is still the caller's. A locking read applies the
@@ -88,10 +95,15 @@
 -- (42501), so every caller that maps it answers as before.
 --
 -- COST: a seal holds each claim's row lock from its INSERT until it commits.
--- A seal already takes that same lock in its statement 2, so this moves the
--- wait earlier rather than adding a new kind of lock. A multi-claim seal and a multi-claim
--- publicize that reach the same claims in opposite orders can deadlock; one is
--- aborted with 40P01 and nothing is half-written.
+-- A seal already took that same lock in its statement 2, so this moves the
+-- wait earlier (into statement 1) rather than adding a new kind of lock. A
+-- caller that sets `lock_timeout` (the route sets 3s) now sees a 55P03 at
+-- statement 1 where it used to see it at statement 2. Lock ORDER: statement 1
+-- locks the claims in the order the client sent them; statement 2 locked them
+-- in planner order, which was never sorted either. A multi-claim seal and a
+-- multi-claim publicize (206 locks `ORDER BY c.id`) that reach the same claims
+-- in opposite orders could deadlock before 227 and still can; one is aborted
+-- with 40P01 and nothing is half-written. 227 does not introduce this.
 --
 -- ===================================================================
 -- RE-STATING A SHARED BODY
