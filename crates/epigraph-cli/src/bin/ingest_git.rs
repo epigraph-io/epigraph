@@ -1912,15 +1912,22 @@ async fn claim_exists(client: &reqwest::Client, endpoint: &str, id: Uuid) -> boo
 
 /// Does `content` cite exactly `PR #<n>`? The server's `content_contains` is a
 /// case-insensitive substring match, so `PR #8` also returns claims citing
-/// `PR #80` or `PR #812`; a digit right after the number rules those out.
+/// `PR #80`, `PR #812` or `SPR #8`; a digit right after the number, or a letter
+/// or digit right before `PR`, rules those out.
 fn content_cites_pr(content: &str, n: u64) -> bool {
     let haystack = content.to_ascii_lowercase();
     let needle = format!("pr #{n}");
     haystack.match_indices(&needle).any(|(i, _)| {
-        !haystack[i + needle.len()..]
+        // `apr #8` or `SPR #8` is not `PR #8`: no letter or digit right before.
+        let starts_a_word = !haystack[..i]
             .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit())
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        starts_a_word
+            && !haystack[i + needle.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
     })
 }
 
@@ -3463,6 +3470,11 @@ mod tests {
         assert!(!content_cites_pr("Fixed in PR #80", 8));
         assert!(!content_cites_pr("PR #812 merged", 8));
         assert!(!content_cites_pr("no citation", 8));
+        // Left boundary (review of 7d9e60c6): `apr #8` / `SPR #8` is not PR #8.
+        assert!(!content_cites_pr("see apr #8", 8));
+        assert!(!content_cites_pr("SPR #8", 8));
+        assert!(content_cites_pr("(PR #8)", 8));
+        assert!(content_cites_pr("SPR #8, then PR #8", 8));
         let resp = serde_json::json!({"claims": [
             {"id": "00000000-0000-4000-8000-000000000001", "content": "landed in PR #80"},
             {"id": "00000000-0000-4000-8000-000000000002", "content": "landed in PR #8"},
