@@ -9,8 +9,14 @@
 //! * a dry run writes nothing; an apply writes only `beta_alpha` / `beta_beta`
 //!   of claims still on the prior, records them in the manifest, and writes no
 //!   `ds_bayesian_divergence` row;
-//! * retracted rows, cached combinations and frames with no hypothesis index
-//!   count nothing; a claim off the prior is never touched;
+//! * a claim created through `submit_claim` replays to its live track too: its
+//!   creation BBA (`auto_wire` with no perspective) plays the seed's role and
+//!   is left out, and the comparison is not vacuous (counting it changes it);
+//! * `report_workflow_outcome` rows get their own replay label, so the
+//!   operator can see and exclude them apart from `update_with_evidence`'s;
+//! * retracted rows, cached combinations, ingest templates, creation rows and
+//!   frames with no hypothesis index count nothing; a claim off the prior is
+//!   never touched;
 //! * the reversal puts the found parameters back on every claim that still
 //!   holds what was written, and leaves a claim a live write moved since.
 
@@ -19,12 +25,18 @@ mod viewer_fixture;
 
 use std::collections::BTreeSet;
 
-use epigraph_cli::beta_replay::{reverse, run, ManifestRecord, Options};
+use epigraph_cli::beta_replay::{
+    reverse, run, ManifestRecord, Options, CREATION_LABEL, INGEST_TEMPLATE_LABEL,
+    WORKFLOW_OUTCOME_LABEL,
+};
 use epigraph_crypto::AgentSigner;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{FrameRepository, MassFunctionRepository};
 use epigraph_mcp::embed::McpEmbedder;
-use epigraph_mcp::types::{SubmitDsEvidenceParams, UpdateWithEvidenceParams};
+use epigraph_mcp::types::{
+    ReportWorkflowOutcomeParams, StepExecution, SubmitClaimParams, SubmitDsEvidenceParams,
+    UpdateWithEvidenceParams,
+};
 use epigraph_mcp::EpiGraphMcpFull;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -65,24 +77,24 @@ async fn server_and_group(pool: &PgPool) -> (EpiGraphMcpFull, Viewer, Uuid) {
     (server, viewer, group)
 }
 
-async fn binary_truth(pool: &PgPool) -> Uuid {
-    let existing: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
-            .fetch_optional(pool)
-            .await
-            .expect("read binary_truth");
+/// The two-hypothesis frame `name`, created when absent.
+async fn binary_frame_named(pool: &PgPool, name: &str) -> Uuid {
+    let existing: Option<Uuid> = sqlx::query_scalar("SELECT id FROM frames WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .expect("read the frame");
     if let Some(id) = existing {
         return id;
     }
-    FrameRepository::create(
-        pool,
-        "binary_truth",
-        Some("canonical binary frame"),
-        &["TRUE".to_string(), "FALSE".to_string()],
-    )
-    .await
-    .expect("binary_truth")
-    .id
+    FrameRepository::create(pool, name, None, &["TRUE".to_string(), "FALSE".to_string()])
+        .await
+        .expect("create the frame")
+        .id
+}
+
+async fn binary_truth(pool: &PgPool) -> Uuid {
+    binary_frame_named(pool, "binary_truth").await
 }
 
 async fn ternary_frame(pool: &PgPool) -> Uuid {
@@ -298,6 +310,227 @@ async fn replay_equals_the_live_track_of_the_mcp_writers(pool: PgPool) {
     );
 }
 
+/// `(creation rows, truth_value_seed rows)` stored on `claim`.
+async fn creation_and_seed_rows(pool: &PgPool, claim: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE combination_method = 'auto_wire' \
+                                   AND perspective_id IS NULL), \
+                count(*) FILTER (WHERE combination_method = 'truth_value_seed') \
+           FROM mass_functions WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("row shapes")
+}
+
+/// The commonest lineage: created by `submit_claim` (one
+/// creation BBA, `auto_wire` with no perspective, and so no seed later), then
+/// one `update_with_evidence`. Live, only the second moves the track. Reset to
+/// the prior and replayed with the defaults, the claim gets the live track
+/// back; counting the creation row gives a different one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_submit_claim_creation_bba_is_left_out_as_the_live_track_leaves_it(pool: PgPool) {
+    let (server, viewer, group) = server_and_group(&pool).await;
+    let content = "b96 submit_claim lineage claim";
+    epigraph_mcp::tools::claims::submit_claim(
+        &server,
+        &viewer,
+        SubmitClaimParams {
+            content: content.into(),
+            methodology: "direct_observation".into(),
+            evidence_data: "b96 creation evidence".into(),
+            evidence_type: "empirical".into(),
+            confidence: 0.9,
+            source_url: None,
+            reasoning: None,
+            labels: vec![],
+            novelty_threshold: Some(0.0),
+            // The server agent's personal group (`group`), which it writes.
+            visibility: Some("private".to_string()),
+            group_id: None,
+        },
+        None,
+    )
+    .await
+    .expect("submit_claim");
+    let (claim, owner): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, owner_group_id FROM claims WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .expect("the submitted claim");
+    assert_eq!(
+        owner, group,
+        "fixture: the claim is in the group the server writes"
+    );
+
+    // The lineage this test is about, asserted rather than assumed.
+    assert_eq!(
+        creation_and_seed_rows(&pool, claim).await,
+        (1, 0),
+        "fixture: submit_claim stores one creation BBA and no seed"
+    );
+    let (a0, b0) = beta(&pool, claim).await;
+    assert_eq!(
+        (a0.unwrap_or(1.0), b0.unwrap_or(1.0)),
+        (1.0, 1.0),
+        "fixture: submit_claim does not move the Beta track live; if it does, this \
+         test no longer pins the creation exclusion"
+    );
+
+    epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe(claim, "b96 lineage evidence", true, 0.8),
+        None,
+    )
+    .await
+    .expect("update_with_evidence");
+    assert_eq!(
+        creation_and_seed_rows(&pool, claim).await,
+        (1, 0),
+        "fixture: the creation row is the prior, so no seed is written"
+    );
+    let (live_a, live_b) = beta(&pool, claim).await;
+    let (live_a, live_b) = (live_a.expect("alpha"), live_b.expect("beta"));
+    assert!(
+        live_a > 1.0,
+        "the live update moved the track: ({live_a}, {live_b})"
+    );
+
+    reset_to_prior(&pool, claim).await;
+    let mut conn = pool.acquire().await.expect("conn");
+
+    // Not vacuous: counting the creation row gives a different track.
+    let mut with_creation = opts(false);
+    with_creation.excluded_methods.remove(CREATION_LABEL);
+    let counted = run(&mut conn, &with_creation, None).await.expect("dry run");
+    assert_eq!(counted.sample.len(), 1, "{counted:?}");
+    let (ca, cb) = counted.sample[0].replayed;
+    assert!(
+        !(close(ca, live_a) && close(cb, live_b)),
+        "counting the creation row must change the replay, or this test proves nothing"
+    );
+
+    let mut manifest = Vec::new();
+    let report = run(&mut conn, &opts(true), Some(&mut manifest))
+        .await
+        .expect("apply");
+    assert_eq!((report.replayed, report.written), (1, 1), "{report:?}");
+    assert_eq!(
+        report.excluded_by_method.get(CREATION_LABEL),
+        Some(&1),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.counted_by_method.get("auto_wire"),
+        Some(&1),
+        "{report:?}"
+    );
+    let (a, b) = beta(&pool, claim).await;
+    let (a, b) = (a.expect("alpha"), b.expect("beta"));
+    assert!(
+        close(a, live_a) && close(b, live_b),
+        "replay ({a}, {b}) must equal the live track ({live_a}, {live_b})"
+    );
+}
+
+/// `report_workflow_outcome` stores the same `auto_wire` shape as
+/// `update_with_evidence` (a perspective per evidence row), but the live track
+/// does not count it. Its rows are reported under their own label, so the
+/// operator sees them apart and `--exclude-method` can drop them alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn workflow_outcome_rows_are_reported_and_excludable_apart(pool: PgPool) {
+    let (server, viewer, group) = server_and_group(&pool).await;
+    let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "b96-wf-author").await;
+    let claim = viewer_fixture::seed_group_claim(&pool, author, group, "b96 workflow claim").await;
+    sqlx::query(
+        "UPDATE claims SET labels = ARRAY['workflow']::text[], properties = $2 WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(serde_json::json!({
+        "goal": "b96 workflow claim", "steps": ["s1"], "generation": 0,
+        "use_count": 0, "success_count": 0, "failure_count": 0, "avg_variance": 0.0,
+    }))
+    .execute(&pool)
+    .await
+    .expect("make it a flat workflow claim");
+
+    epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        ReportWorkflowOutcomeParams {
+            workflow_id: claim.to_string(),
+            success: true,
+            execution_log: vec![StepExecution {
+                step_index: 0,
+                planned: "s1".to_string(),
+                actual: "s1".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            }],
+            outcome_details: "b96 outcome".to_string(),
+            quality: Some(0.8),
+            goal_text: None,
+        },
+        None,
+    )
+    .await
+    .expect("report_workflow_outcome");
+    epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe(claim, "b96 workflow evidence", true, 0.6),
+        None,
+    )
+    .await
+    .expect("update_with_evidence");
+    let perspectives: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 \
+            AND combination_method = 'auto_wire' AND perspective_id IS NOT NULL",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count evidence rows");
+    assert_eq!(
+        perspectives, 2,
+        "fixture: both writers store an auto_wire row under an evidence perspective"
+    );
+    reset_to_prior(&pool, claim).await;
+
+    let mut conn = pool.acquire().await.expect("conn");
+    let report = run(&mut conn, &opts(false), None).await.expect("dry run");
+    assert_eq!(
+        report.counted_by_method.get(WORKFLOW_OUTCOME_LABEL),
+        Some(&1),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.counted_by_method.get("auto_wire"),
+        Some(&1),
+        "{report:?}"
+    );
+
+    let mut without = opts(false);
+    without
+        .excluded_methods
+        .insert(WORKFLOW_OUTCOME_LABEL.to_string());
+    let report = run(&mut conn, &without, None).await.expect("dry run");
+    assert_eq!(
+        report.excluded_by_method.get(WORKFLOW_OUTCOME_LABEL),
+        Some(&1),
+        "{report:?}"
+    );
+    assert_eq!(report.counted_by_method.get(WORKFLOW_OUTCOME_LABEL), None);
+    assert_eq!(
+        report.counted_by_method.get("auto_wire"),
+        Some(&1),
+        "excluding workflow outcomes keeps update_with_evidence's row: {report:?}"
+    );
+}
+
 /// One BBA row written as a legacy writer left it.
 async fn store_bba(
     pool: &PgPool,
@@ -334,7 +567,8 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid, index: Option<i32>) {
 /// The corpus the dry-run / apply / reverse tests share, written directly as
 /// legacy rows (oldest first per claim):
 /// * `counted`: two inputs on binary_truth (index 0), a retracted input, a
-///   cached combination row, and an input on a frame with no index;
+///   cached combination row, an input on a frame with no index, a creation
+///   row and an ingest template;
 /// * `seed_only`: only a `truth_value_seed` (left on the prior, unchanged);
 /// * `moved`: one input, but its track already moved (never touched).
 struct Corpus {
@@ -359,7 +593,7 @@ async fn corpus(pool: &PgPool) -> Corpus {
         binary,
         Some(agent),
         serde_json::json!({"0": 0.6, "~": 0.4}),
-        "auto_wire",
+        "edge_factor",
     )
     .await;
     store_bba(
@@ -404,9 +638,44 @@ async fn corpus(pool: &PgPool) -> Corpus {
         unindexed,
         Some(agent),
         serde_json::json!({"0": 0.8, "~": 0.2}),
+        "edge_factor",
+    )
+    .await;
+
+    // The creation BBA `submit_claim` / ingest store (`auto_wire`, no
+    // perspective) and an ingest template: both priors, left out.
+    let (creator, _) = viewer_fixture::seed_agent_with_group(pool, "b96-creator").await;
+    store_bba(
+        pool,
+        counted,
+        binary,
+        Some(creator),
+        serde_json::json!({"0": 0.9, "~": 0.1}),
         "auto_wire",
     )
     .await;
+    let template_frame = binary_frame_named(
+        pool,
+        epigraph_db::repos::mass_function::INGEST_TEMPLATE_FRAME_NAME,
+    )
+    .await;
+    assign(pool, counted, template_frame, Some(0)).await;
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        counted,
+        template_frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.1, "0,1": 0.9}),
+        None,
+        None,
+        Some(epigraph_db::repos::mass_function::INGEST_TEMPLATE_SOURCE_STRENGTH),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store the ingest template");
 
     let seed_only = viewer_fixture::seed_group_claim(pool, agent, group, "b96 seed only").await;
     assign(pool, seed_only, binary, Some(0)).await;
@@ -428,7 +697,7 @@ async fn corpus(pool: &PgPool) -> Corpus {
         binary,
         Some(agent),
         serde_json::json!({"0": 0.7, "~": 0.3}),
-        "auto_wire",
+        "edge_factor",
     )
     .await;
     sqlx::query("UPDATE claims SET beta_alpha = 1.7, beta_beta = 1.3 WHERE id = $1")
@@ -445,8 +714,9 @@ async fn corpus(pool: &PgPool) -> Corpus {
 }
 
 /// The two live inputs count, by hand: alpha 1 + 0.6 + 0 = 1.6, beta
-/// 1 + 0.4 + 1.0 = 2.4. The retracted row, the cached combination and the row
-/// on the unindexed frame count nothing.
+/// 1 + 0.4 + 1.0 = 2.4. The retracted row, the cached combination, the row
+/// on the unindexed frame, the creation row and the ingest template count
+/// nothing.
 const COUNTED: (f64, f64) = (1.6, 2.4);
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -472,6 +742,21 @@ async fn a_dry_run_writes_nothing_and_reports_what_an_apply_would(pool: PgPool) 
     assert_eq!(report.bbas_counted, 3, "{report:?}");
     assert_eq!(report.bbas_without_hypothesis_index, 1, "{report:?}");
     assert_eq!(report.excluded_by_method.get("truth_value_seed"), Some(&1));
+    assert_eq!(
+        report.excluded_by_method.get(CREATION_LABEL),
+        Some(&1),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.excluded_by_method.get(INGEST_TEMPLATE_LABEL),
+        Some(&1),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.counted_by_method.get("auto_wire"),
+        None,
+        "{report:?}"
+    );
     assert_eq!(report.divergence_rows_written, 0);
     let s = &report.sample[0];
     assert_eq!(s.claim_id, c.counted);
@@ -541,7 +826,7 @@ async fn the_reversal_restores_the_prior_unless_a_live_write_moved_the_claim(poo
         binary,
         Some(agent),
         serde_json::json!({"0": 0.3, "~": 0.7}),
-        "auto_wire",
+        "edge_factor",
     )
     .await;
     // NULL parameters read as the prior, and the reversal puts NULL back.

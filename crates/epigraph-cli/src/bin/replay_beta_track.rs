@@ -5,8 +5,9 @@
 //!
 //! Which claims, which BBAs, and what is left out are in
 //! `epigraph_cli::beta_replay`. In short: current claims still on the prior,
-//! their live non-cached BBAs, `truth_value_seed` and `prior` rows left out by
-//! default (`--exclude-method` leaves out more).
+//! their live non-cached BBAs, with the priors and placeholders left out by
+//! default (`truth_value_seed`, `auto_wire:creation`, `prior`,
+//! `ingest_template`; `--exclude-method` leaves out more).
 //!
 //! DRY RUN BY DEFAULT: without `--apply` it prints the counts (counted BBAs by
 //! writer label, excluded rows, claims that would move) and a sample, and
@@ -89,9 +90,11 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     sample: usize,
 
-    /// Also leave out BBAs with this `combination_method` label (repeatable;
-    /// `<null>` names an unlabelled row). `truth_value_seed` and `prior` are
-    /// always left out.
+    /// Also leave out BBAs with this replay label (repeatable): a
+    /// `combination_method`, `<null>` for an unlabelled row, or
+    /// `auto_wire:workflow_outcome`. `auto_wire` names only the remaining
+    /// auto_wire evidence rows. `truth_value_seed`, `auto_wire:creation`,
+    /// `prior` and `ingest_template` are always left out.
     #[arg(long, value_name = "LABEL")]
     exclude_method: Vec<String>,
 }

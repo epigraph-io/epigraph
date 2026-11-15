@@ -36,19 +36,56 @@
 //! `submit_ds_evidence` count it); a frame with no index counts nothing, as
 //! live.
 //!
-//! Left out by default, and counted by label in the report:
+//! Every row is reported under a REPLAY LABEL: its `combination_method`
+//! (`<null>` when unset), except for three row shapes that share a label with
+//! rows of a different kind and get one of their own:
+//!
+//! * [`CREATION_LABEL`] (`auto_wire:creation`): an `auto_wire` row with no
+//!   perspective. Only the creation writers store that shape:
+//!   `ds_auto::auto_wire_ds_for_claim` (the creation BBA of `submit_claim` /
+//!   `memorize`) and `ds_auto::auto_wire_ds_batch` (batch ingest's
+//!   self-assertion, `epigraph_engine::source_dependence::INGEST_ASSERTION_METHOD`).
+//!   Every `auto_wire` evidence write (`auto_wire_ds_update`) files under the
+//!   evidence id as its perspective;
+//! * [`WORKFLOW_OUTCOME_LABEL`] (`auto_wire:workflow_outcome`): an `auto_wire`
+//!   evidence row whose evidence is a `report_workflow_outcome` observation
+//!   (`evidence.properties`: `type` `observation`, `method`
+//!   `workflow_execution`). It is otherwise the same shape as an
+//!   `update_with_evidence` row;
+//! * [`INGEST_TEMPLATE_LABEL`] (`ingest_template`): the near-vacuous
+//!   placeholder document ingest attaches
+//!   (`mass_function::ingest_template_predicate`, the one spelling).
+//!
+//! Left out by default ([`DEFAULT_EXCLUDED_METHODS`]), and counted by label in
+//! the report:
 //!
 //! * `truth_value_seed` rows (`epigraph_mcp::tools::ds_auto::TRUTH_VALUE_SEED_METHOD`):
 //!   the claim's authored `truth_value` restated as a BBA. It is a prior, not
 //!   evidence; the Beta track has its own prior, and `update_with_evidence`,
 //!   which writes the seed, does not count it live;
+//! * `auto_wire:creation` rows: the same role as the seed. A claim created
+//!   through `submit_claim` or ingest gets its creation BBA (built from the
+//!   claim's own confidence) and therefore never a seed; no creation writer
+//!   moves the Beta track live, and the first `update_with_evidence` after it
+//!   counts only its own BBA;
 //! * `prior` rows: a vacuous hypothesis prior. The live arithmetic counts a
 //!   vacuous BBA's whole mass against the hypothesis, so counting one would
-//!   move the claim toward false on no evidence.
+//!   move the claim toward false on no evidence;
+//! * `ingest_template` rows: a placeholder, not an assessment, with at least
+//!   0.8 of its mass on the whole frame, so counted it would move the claim
+//!   toward false for the same reason.
 //!
-//! `--exclude-method` leaves out more writers by their `combination_method`
-//! label. The dry run lists the counted rows by label, so the operator sees
-//! which writers the replay would count before applying it.
+//! `--exclude-method` leaves out more rows by replay label: `auto_wire` now
+//! names only the `auto_wire` evidence rows that are not workflow outcomes
+//! (`update_with_evidence`, and `backfill_factors`, which this cannot tell
+//! apart), and `auto_wire:workflow_outcome` the workflow outcomes. The dry run
+//! lists the counted rows by label, so the operator sees which writers the
+//! replay would count before applying it.
+//!
+//! Counted by default although the live track does not count them yet (they
+//! are evidence; the live gap is theirs): `report_workflow_outcome`
+//! (`auto_wire:workflow_outcome`), `backfill_factors` (under `auto_wire`), the
+//! edge wire (`edge_factor`), propagated rows and assessment `discount` rows.
 //!
 //! # What the replay is and is not
 //!
@@ -59,6 +96,15 @@
 //! each BBA counts for the claim's CURRENT hypothesis index on its frame. The
 //! masses come from their stored JSON, so a replayed parameter can differ from
 //! an in-memory live sum in the last bit.
+//!
+//! It also counts rows the live track would have refused to count. Live, the
+//! Beta write (`ClaimRepository::add_beta_increments`) is gated on the claim
+//! being writable by the caller, so a non-owner attaching evidence to a public
+//! claim stores a BBA and leaves the track where it was. The replay runs with
+//! row security bypassed and counts that BBA like any other. And an `auto_wire`
+//! row with no perspective that a legacy `update_with_evidence` wrote (before
+//! evidence rows were filed under their own perspective) is labelled as a
+//! creation row and left out.
 //!
 //! # What it writes
 //!
@@ -97,7 +143,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, Write};
 
 use chrono::{DateTime, Utc};
-use epigraph_db::repos::mass_function::{cached_combination_predicate, not_retracted_predicate};
+use epigraph_db::repos::mass_function::{
+    cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+};
 use epigraph_db::DbError;
 use epigraph_ds::{FrameOfDiscernment, MassFunction};
 use serde::{Deserialize, Serialize};
@@ -106,11 +154,24 @@ use uuid::Uuid;
 
 use crate::belief_cache::exact_f64;
 
-/// The `combination_method` labels left out unless the operator says
-/// otherwise. See the module documentation for why each one is not evidence.
-pub const DEFAULT_EXCLUDED_METHODS: [&str; 2] = [
+/// The replay label of a creation BBA: an `auto_wire` row with no
+/// perspective (module docs).
+pub const CREATION_LABEL: &str = "auto_wire:creation";
+
+/// The replay label of a `report_workflow_outcome` BBA (module docs).
+pub const WORKFLOW_OUTCOME_LABEL: &str = "auto_wire:workflow_outcome";
+
+/// The replay label of an ingest template row (module docs).
+pub const INGEST_TEMPLATE_LABEL: &str = "ingest_template";
+
+/// The replay labels left out unless the operator says otherwise. See the
+/// module documentation for why each one is a prior or a placeholder, not
+/// evidence.
+pub const DEFAULT_EXCLUDED_METHODS: [&str; 4] = [
     epigraph_mcp::tools::ds_auto::TRUTH_VALUE_SEED_METHOD,
+    CREATION_LABEL,
     "prior",
+    INGEST_TEMPLATE_LABEL,
 ];
 
 /// Claims per batch transaction by default.
@@ -132,7 +193,7 @@ pub struct Options {
     pub max_batches: Option<u64>,
     /// How many claims the report samples.
     pub sample: usize,
-    /// `combination_method` labels whose rows are not counted.
+    /// Replay labels (module docs) whose rows are not counted.
     pub excluded_methods: BTreeSet<String>,
 }
 
@@ -190,9 +251,9 @@ pub struct Report {
     /// Counted BBAs on a frame where the claim has no hypothesis index: they
     /// count nothing, as live.
     pub bbas_without_hypothesis_index: u64,
-    /// Counted BBAs by `combination_method`.
+    /// Counted BBAs by replay label (module docs).
     pub counted_by_method: BTreeMap<String, u64>,
-    /// BBAs left out by `combination_method` (the exclusion list).
+    /// BBAs left out by replay label (the exclusion list).
     pub excluded_by_method: BTreeMap<String, u64>,
     /// Always 0: the replay records no divergence history (module docs).
     pub divergence_rows_written: u64,
@@ -224,7 +285,8 @@ pub struct ManifestRecord {
 /// One stored BBA as the replay reads it.
 struct BbaRow {
     claim_id: Uuid,
-    combination_method: Option<String>,
+    /// The replay label (module docs), derived in [`fold_inputs`].
+    label: String,
     masses: serde_json::Value,
     frame_name: String,
     hypotheses: Vec<String>,
@@ -234,7 +296,7 @@ struct BbaRow {
 /// [`BbaRow`] as the query returns it.
 type BbaTuple = (
     Uuid,
-    Option<String>,
+    String,
     serde_json::Value,
     String,
     Vec<String>,
@@ -288,9 +350,22 @@ async fn fold_inputs(
 ) -> Result<Vec<BbaRow>, DbError> {
     let not_retracted = not_retracted_predicate("mf.");
     let cached = cached_combination_predicate("mf.");
+    let template = ingest_template_predicate("mf.", "f.");
+    // The replay label, one CASE (module docs). The arms are disjoint: the
+    // template has no `combination_method`, and the two `auto_wire` arms
+    // split on the perspective.
     let sql = format!(
-        "SELECT mf.claim_id, mf.combination_method, mf.masses, f.name, f.hypotheses, \
-                cf.hypothesis_index \
+        "SELECT mf.claim_id, \
+                CASE WHEN {template} THEN '{INGEST_TEMPLATE_LABEL}' \
+                     WHEN mf.combination_method = 'auto_wire' AND mf.perspective_id IS NULL \
+                          THEN '{CREATION_LABEL}' \
+                     WHEN mf.combination_method = 'auto_wire' AND EXISTS ( \
+                          SELECT 1 FROM evidence e WHERE e.id = mf.evidence_id \
+                             AND e.properties->>'type' = 'observation' \
+                             AND e.properties->>'method' = 'workflow_execution') \
+                          THEN '{WORKFLOW_OUTCOME_LABEL}' \
+                     ELSE COALESCE(mf.combination_method, '{NULL_METHOD}') END, \
+                mf.masses, f.name, f.hypotheses, cf.hypothesis_index \
            FROM mass_functions mf \
            JOIN frames f ON f.id = mf.frame_id \
            LEFT JOIN claim_frames cf ON cf.claim_id = mf.claim_id AND cf.frame_id = mf.frame_id \
@@ -304,15 +379,13 @@ async fn fold_inputs(
     Ok(rows
         .into_iter()
         .map(
-            |(claim_id, combination_method, masses, frame_name, hypotheses, hypothesis_index)| {
-                BbaRow {
-                    claim_id,
-                    combination_method,
-                    masses,
-                    frame_name,
-                    hypotheses,
-                    hypothesis_index,
-                }
+            |(claim_id, label, masses, frame_name, hypotheses, hypothesis_index)| BbaRow {
+                claim_id,
+                label,
+                masses,
+                frame_name,
+                hypotheses,
+                hypothesis_index,
             },
         )
         .collect())
@@ -325,10 +398,7 @@ fn replay_claim(rows: &[&BbaRow], opts: &Options, report: &mut Report) -> Replay
     let mut excluded: BTreeMap<String, u64> = BTreeMap::new();
     let mut without_index = 0u64;
     for row in rows {
-        let method = row
-            .combination_method
-            .clone()
-            .unwrap_or_else(|| NULL_METHOD.to_string());
+        let method = row.label.clone();
         if opts.excluded_methods.contains(&method) {
             *excluded.entry(method).or_default() += 1;
             continue;
