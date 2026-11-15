@@ -74,7 +74,7 @@
 //! review), and since ruling R-50 `persist_packet`'s five and
 //! `experiment_loop.rs`'s four write through `EdgeRepository`'s signed
 //! primitive (the latter now counted in [`UNSTAMPED`]). None remains: the
-//! register is empty and its high water is 0, so any new route-layer raw
+//! register is empty and stays empty, so any new route-layer raw
 //! edge INSERT fails [`the_route_layer_raw_edge_inserts_are_exactly_the_register`].
 //!
 //! # The third register: unstamped raw-pool TRANSACTIONS that write edges
@@ -186,10 +186,10 @@ const HIGH_WATER: usize = 27;
 /// [`UNSTAMPED_TRANSACTIONS`]).
 const RAW_INSERTS: &[(&str, usize)] = &[];
 
-/// The total [`RAW_INSERTS`] may never exceed. 11 before R-50 moved
-/// `submit.rs`'s five and `experiment_loop.rs`'s four onto the signed primitive;
-/// 2 -> 0 when `crud.rs::promote_staged_edges` did (backlog `dae795f8`).
-const RAW_HIGH_WATER: usize = 0;
+// Its high water was 11 before R-50 moved `submit.rs`'s five and
+// `experiment_loop.rs`'s four onto the signed primitive, then 2, and 0 since
+// `crud.rs::promote_staged_edges` did (backlog `dae795f8`): the register stays
+// empty, which the register test asserts.
 
 /// Route handlers that write edges through `EdgeRepository` on a handle
 /// derived from a transaction begun on the UNSTAMPED raw pool (a savepoint, a
@@ -575,10 +575,9 @@ fn the_route_layer_raw_edge_inserts_are_exactly_the_register() {
          and run it on a transaction stamped with the caller's viewer \
          (`AppState::write_as`). A statement that went away: lower its row."
     );
-    let total: usize = RAW_INSERTS.iter().map(|(_, n)| n).sum();
     assert!(
-        total <= RAW_HIGH_WATER,
-        "the raw-insert register grew past its high-water mark ({total} > {RAW_HIGH_WATER})"
+        RAW_INSERTS.is_empty(),
+        "the raw-insert register reached zero and stays empty: never add a row"
     );
 }
 
@@ -656,7 +655,10 @@ fn the_unstamped_transaction_check_tells_a_stamped_handler_apart() {
                pub async fn h(\n) { stub() }\n";
     let body = handler_body(raw, "h").expect("found");
     assert!(writes_edges_on_an_unstamped_transaction(body));
-    assert!(!body.contains("stub"), "only the first definition: {body:?}");
+    assert!(
+        !body.contains("stub"),
+        "only the first definition: {body:?}"
+    );
     let stamped = "pub async fn h(\n) {\n\
                    let mut tx = state.write_as(&viewer).await?;\n\
                    EdgeRepository::create_signed_conn(&mut *tx, key, a);\n\
