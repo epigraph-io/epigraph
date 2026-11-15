@@ -856,4 +856,9 @@ jobs:
           # the branch; the script then lints the head commit alone.
           SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          # Private deny-list for E6 (customer and deployment names), one term
+          # per line. A repository secret, never a file in the repository: a
+          # committed list of customer names would publish them. Empty (not
+          # configured, or a fork's pull request) skips E6 and says so.
+          COMMIT_LINT_DENY_TERMS: ${{ secrets.COMMIT_LINT_DENY_TERMS }}
         run: python3 .github/scripts/commit-message-lint.py "$SCAN_BASE" "$SCAN_HEAD"
