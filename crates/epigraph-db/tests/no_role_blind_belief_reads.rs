@@ -94,6 +94,7 @@ const ROW_TYPES: &[&str] = &[
     "GroundedNeighbor",
     "ScopedBeliefRow",
     "SemanticFlatHit",
+    "SemanticSelectedClaim",
     "SubgraphClaimRow",
 ];
 
@@ -184,6 +185,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::Todo { pr: "unassigned", why: "workflow text search gated on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_graph_neighbors", Tag::Todo { pr: "PR-R5", why: "semantic search graph expansion returns c.belief / c.plausibility; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility; SPEC §7.2" }),
+    ("crates/epigraph-db/src/repos/claim.rs", "semantic_selected_claims", Tag::Todo { pr: "PR-R5", why: "the diverse /search/semantic row carries c.belief / c.plausibility, the read moved out of routes/search.rs's inline full_sql (backlog 67c905a3); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "sql_expr", Tag::Todo { pr: "PR-R3", why: "BeliefSort column for frame_claims_sorted; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "get_latest", Tag::Todo { pr: "PR-R1b", why: "divergence row BetP; SPEC §7.2 derived, see leaves" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "store", Tag::Writer("writes ds_bayesian_divergence.pignistic_prob; reads no claim belief")),
