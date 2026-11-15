@@ -116,7 +116,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("revoke_signature.rs", 6),
     ("search.rs", 4),
     ("submit.rs", 5),
-    ("workflows.rs", 4),
+    ("workflows.rs", 2),
 ];
 
 /// Total of [`REGISTER`]. Never raise this.
@@ -128,7 +128,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// Lowered to 112 when backlog 9bef22f3 deleted the PUT claim and evidence
 /// embedding routes (`rag.rs` 2 -> 0) and `assess` stored its claim vector
 /// through the shared unsealed writer (`assess.rs` 3 -> 2).
-const HIGH_WATER: usize = 112;
+/// Lowered to 110 when the hierarchical outcome report's counter write (its
+/// `SELECT metadata .. FOR UPDATE` and `UPDATE workflows SET metadata`) moved
+/// into `WorkflowRepository`, shared with the MCP tool (`workflows.rs` 4 -> 2).
+const HIGH_WATER: usize = 110;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
