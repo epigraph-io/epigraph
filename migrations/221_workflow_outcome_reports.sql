@@ -120,6 +120,15 @@ BEGIN
 END
 $$;
 
+-- 166's role-holder write check, as on every table the application role
+-- writes (166 installs it on the set it measured when it ran; a table granted
+-- to the application role after that carries none, and
+-- `tenancy_backfill verify` reports it). INSERT only is granted here, but the
+-- check covers every operation, as 166's own installs do.
+CREATE TRIGGER role_agent_write_check
+    BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.workflow_outcome_reports
+    FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_role_agent_write_check();
+
 COMMENT ON TABLE public.workflow_outcome_reports IS
     'One row per hierarchical workflow outcome report (migration 221): what the report said '
     '(success, quality, run_label, outcome_details), its optional idempotency key, unique per '

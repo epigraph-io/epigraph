@@ -400,7 +400,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/workflow_ingest.rs",
-        "execute_workflow_ingest_with_inserted",
+        "caller_viewer",
         1,
         PRE_VIEWER,
     ),

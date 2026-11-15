@@ -1096,6 +1096,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement with no row to filter; the SQL is unchanged.",
     ),
     (
+        "claim_theme.rs",
+        "begin_iterative_hnsw",
+        "NO ROW READ. A private helper that opens a savepoint and sets two transaction-local \
+         pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the viewer-spliced theme \
+         read its caller runs next (backlog a507966d); it reads and writes no table, so there is \
+         nothing to filter.",
+    ),
+    (
         "claim.rs",
         "update_labels_conn",
         "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
@@ -3935,6 +3943,20 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          edge it read is public, so the index discloses nothing a reader of the new public \
          edge could not read; the caller's authority is the workflow authority rule, not read \
          visibility, so no caller viewer is spliced.",
+    ),
+    // Backlog 8a168dd6 (F-PR18a-B1): the security-event read moved onto the
+    // caller's stamped connection, so the repo fn became executor-generic.
+    (
+        "security_event.rs",
+        "query",
+        "READ of `security_events` with optional agent / type / time / failures filters. The \
+         table has no visibility or owner_group_id column: its rows are decided by row security, \
+         `security_events_read` (migration 169), which admits a session's own events (minus the \
+         cascade-audit types) or an elevated / instance-admin session, keyed on the principal of \
+         the connection passed in. `routes/audit.rs` passes the caller's stamped `read_as` \
+         connection, so the policy filters for that caller; `routes/timeline.rs` still passes the \
+         unstamped pool and stays on no_unscoped_pool's register. A Viewer would have nothing to \
+         add to the policy.",
     ),
 ];
 

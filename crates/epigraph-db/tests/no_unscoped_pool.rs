@@ -806,7 +806,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// caller's viewer (backlog 4073bbb6): `routes/claims.rs` 17 -> 16. The merged
 /// 197 was read off `the_scanner_is_not_vacuous`'s failure on the merged
 /// tree, not computed.
-const HIGH_WATER: usize = 197;
+///
+/// Merged with main again (through `fix/backlog-b31`), which carries one step
+/// these lines do not: 204 -> 200 on merging backlog f64cf9c6 and 8a168dd6,
+/// when `create_reasoning_trace` moved its three pool sites onto the caller's
+/// `AppState::write_as` transaction (`routes/crud.rs`, keeping sites) and
+/// `query_security_events` read on the caller's `AppState::read_as`
+/// (`routes/audit.rs` reached zero and its key was DELETED;
+/// `HIGH_WATER_FILES` falls by one with it). The merged 193 is what the
+/// scanner measures on the merged tree; `the_scanner_is_not_vacuous` asserts
+/// the total exactly and passes on it.
+const HIGH_WATER: usize = 193;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -877,8 +887,9 @@ const HIGH_WATER: usize = 197;
 /// 38 -> 37 when `routes/rag.rs` reached zero (backlog 9bef22f3).
 /// 37 -> 36 when `routes/embeddings.rs` reached zero (backlog 67c905a3).
 /// One lower again when `routes/isomorphism.rs` was deleted on main in
-/// parallel (see [`HIGH_WATER`]).
-const HIGH_WATER_FILES: usize = 35;
+/// parallel (see [`HIGH_WATER`]), and one lower again when `routes/audit.rs`
+/// reached zero on main (backlog 8a168dd6).
+const HIGH_WATER_FILES: usize = 34;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -890,7 +901,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/agent_keys.rs", 6),
     ("routes/agents.rs", 10),
     ("routes/assess.rs", 1),
-    ("routes/audit.rs", 1),
+    // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
+    // `query_security_events` reads on `AppState::read_as` with the caller's
+    // viewer.
     // 17 before this PR. Shard 4 converted the FOURTEEN read-only handlers onto
     // `AppState::read_as`. The row SURVIVES at 3 rather than being deleted, and
     // the remainder is a class rather than a leftover: `create_frame`,
@@ -1019,7 +1032,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 31 -> 30: `build_themes_from_corpus` (the k-means bootstrap, a corpus-wide
     // write on `state.db_pool`) was deleted with the prototype, backlog
     // a0ed0180. A removal, not a conversion.
-    ("routes/crud.rs", 30),
+    // 30 -> 27 (backlog f64cf9c6): `create_reasoning_trace` writes its author
+    // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
+    // transaction. Its provenance append stays on the pool, as every
+    // `record_provenance` call does.
+    ("routes/crud.rs", 27),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
