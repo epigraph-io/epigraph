@@ -2926,7 +2926,7 @@ restart.
   characters) failed the INSERT with 22001, which `submit_ds_evidence`
   reported as an internal error. Bounded, not `text`; the MCP surface refuses
   a longer stored tag as `invalid_params` before the write
-  (`epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS`, the same number).
+  (`epigraph_mcp::tools::ds::LOCALITY_TAG_MAX_CHARS`, the same number).
   The widening is binary-coercible, so neither the table nor
   `idx_mass_functions_locality_tag` is rewritten. PostgreSQL refuses ALTER
   COLUMN TYPE on a column a trigger's WHEN reads, so 184's

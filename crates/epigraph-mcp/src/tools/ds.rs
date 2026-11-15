@@ -759,11 +759,19 @@ async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, 
         .is_some_and(|m| m.contains_key(&et.to_lowercase()))
 }
 
+/// The longest `mass_functions.locality_tag` the column stores, in
+/// characters: it is `varchar(64)` (migration 228, which widened 045's
+/// `varchar(20)` so `intra_methodological_overlap` fits). A longer tag is a
+/// database error at write time, so write paths that take a caller's tag
+/// refuse it up front. A column width, not a belief parameter: it lives here,
+/// outside the belief fold modules the literal ratchet scans.
+const LOCALITY_TAG_MAX_CHARS: usize = 64;
+
 /// Refuse a `locality_tag` that would be stored but cannot fit the column
-/// ([`epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS`], counted in
-/// characters as `varchar` does), as a parameter error naming the limit.
+/// ([`LOCALITY_TAG_MAX_CHARS`], counted in characters as `varchar` does), as a
+/// parameter error naming the limit.
 fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
-    let max = epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS;
+    let max = LOCALITY_TAG_MAX_CHARS;
     let len = stored.chars().count();
     if len > max {
         return Err(invalid_params(format!(
