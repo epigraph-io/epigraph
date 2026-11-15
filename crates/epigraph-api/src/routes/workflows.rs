@@ -392,6 +392,7 @@ pub async fn store_workflow(
     let mut decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
     let (mut tx, result) = execute_admitted_ingest(
         tx,
+        state.edge_signing_key(),
         None,
         &viewer,
         &plan,
@@ -401,7 +402,14 @@ pub async fn store_workflow(
     )
     .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
-    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
+    record_api_authorship(
+        &mut tx,
+        state.edge_signing_key(),
+        viewer.principal(),
+        &created,
+        "workflow_ingest",
+    )
+    .await?;
     record_workflow_submitter(
         &mut tx,
         None,
@@ -2435,6 +2443,7 @@ pub async fn ingest_workflow(
     let mut decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let (mut tx, result) = execute_admitted_ingest(
         tx,
+        state.edge_signing_key(),
         auth,
         &viewer,
         &plan,
@@ -2444,7 +2453,14 @@ pub async fn ingest_workflow(
     )
     .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
-    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
+    record_api_authorship(
+        &mut tx,
+        state.edge_signing_key(),
+        viewer.principal(),
+        &created,
+        "workflow_ingest",
+    )
+    .await?;
     record_workflow_submitter(
         &mut tx,
         auth,
@@ -3479,10 +3495,13 @@ async fn record_api_lineage_writes(
 /// `epigraph_ingest_executor::record_caller_authorship` call): one `AUTHORED`
 /// edge from the acting principal to each claim this request CREATED, on its
 /// own (caller-stamped) transaction; the claims are the caller's too. A
-/// request with no principal records nothing (it names no agent).
+/// request with no principal records nothing (it names no agent). Each edge
+/// is attested at INSERT by `key`, the API's own signing key, when one is
+/// configured.
 #[cfg(feature = "db")]
 async fn record_api_authorship(
     conn: &mut sqlx::PgConnection,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     acting: Option<Uuid>,
     created: &[Uuid],
     route: &str,
@@ -3490,7 +3509,7 @@ async fn record_api_authorship(
     let Some(acting) = acting else {
         return Ok(());
     };
-    epigraph_ingest_executor::record_caller_authorship(conn, acting, created, route)
+    epigraph_ingest_executor::record_caller_authorship(conn, key, acting, created, route)
         .await
         .map(|_| ())
         .map_err(|e| ApiError::InternalError {
@@ -3602,9 +3621,12 @@ async fn workflow_ingest_submitter(
 ///
 /// Takes the route's caller-stamped transaction and hands it back, so the
 /// walk and the check run on it and the route goes on to record and commit.
+/// `key` (the API's own signing key) attests every edge the walk inserts.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn execute_admitted_ingest<'s>(
     mut tx: epigraph_db::ScopedTx<'s>,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     viewer: &epigraph_db::Viewer,
     plan: &epigraph_ingest::common::plan::IngestPlan,
@@ -3621,7 +3643,7 @@ async fn execute_admitted_ingest<'s>(
     let mut admitted: Option<Uuid> = None;
     let result = loop {
         match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-            &mut tx, plan, extraction, viewer, declared, admitted,
+            &mut tx, key, plan, extraction, viewer, declared, admitted,
         )
         .await
         {
@@ -3780,6 +3802,7 @@ pub async fn add_step(
         require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
+        state.edge_signing_key(),
         author,
         &req.canonical_name,
         &req.step_text,
@@ -3788,7 +3811,14 @@ pub async fn add_step(
     .await
     .map_err(map_step_err)?;
     if r.claim_created {
-        record_api_authorship(&mut tx, auth.agent_id, &[r.step_claim_id], "add_step").await?;
+        record_api_authorship(
+            &mut tx,
+            state.edge_signing_key(),
+            auth.agent_id,
+            &[r.step_claim_id],
+            "add_step",
+        )
+        .await?;
     }
     if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
         let details = serde_json::json!({

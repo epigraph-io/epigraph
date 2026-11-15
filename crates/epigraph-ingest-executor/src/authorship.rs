@@ -13,10 +13,12 @@
 //! to its human through `OPERATED_BY` / the author binding, not through the
 //! edge.
 //!
-//! * The edge is written with `EdgeRepository::create_if_not_exists_conn`, the
-//!   same repo function the executor writes its plan edges with, on the
-//!   caller's (system-stamped) transaction, so it commits or rolls back with
-//!   the claims and a re-run never duplicates it.
+//! * The edge is written with `EdgeRepository::create_if_not_exists_signed_conn`,
+//!   on the caller's (stamped) transaction, so it commits or rolls back with
+//!   the claims and a re-run never duplicates it. It is attested at INSERT
+//!   with the `key` the entry point passes (the MCP server's or the API's
+//!   own signing key, never the acting agent's); with `None` it is
+//!   written unsigned (an API with no key configured).
 //! * Tenancy is never bound here: `epigraph_edges_tenancy` computes it from the
 //!   endpoints (an agent endpoint and a public claim give `('public', world)`,
 //!   migration 120; a narrower claim gives its meet).
@@ -35,21 +37,24 @@ use uuid::Uuid;
 pub const AUTHORED: &str = "AUTHORED";
 
 /// Write one `AUTHORED` edge from `acting_agent` to each of `created_claims`,
-/// idempotently, on `conn`. Returns how many edges this call inserted.
+/// idempotently, on `conn`, each attested at INSERT by `key` when given.
+/// Returns how many edges this call inserted.
 ///
 /// # Errors
 /// `DbError` if an edge cannot be written; the caller's transaction must then
 /// roll back.
 pub async fn record_caller_authorship(
     conn: &mut sqlx::PgConnection,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     acting_agent: Uuid,
     created_claims: &[Uuid],
     tool: &str,
 ) -> Result<usize, epigraph_db::DbError> {
     let mut inserted = 0;
     for &claim in created_claims {
-        let (_, was_created) = epigraph_db::EdgeRepository::create_if_not_exists_conn(
+        let (_, was_created) = epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
             &mut *conn,
+            key,
             acting_agent,
             "agent",
             claim,
