@@ -28,7 +28,9 @@ from _by_labels_fake import (  # noqa: E402
     KeysetServer,
     LegacyServer,
     StuckCursorServer,
+    cursor_of,
     make_rows,
+    newer_row,
 )
 
 B1 = "11111111-aaaa-4aaa-8aaa-000000000001"
@@ -310,13 +312,31 @@ class ReconcilerPageClaimsTests(unittest.TestCase):
 
     def test_a_write_between_pages_neither_duplicates_nor_drops_a_row(self):
         rows = make_rows(250)
-        newer = make_rows(1, prefix="n")[0]
+        newer = newer_row()
         server = KeysetServer(rows, insert_after_first_page=newer)
 
         got = [r["id"] for r in _page(server)]
 
         self.assertEqual(len(got), len(set(got)), "a row came back twice")
         self.assertEqual(got, [r["id"] for r in rows])
+
+    def test_the_cursor_row_leaving_the_filter_between_pages_drops_nothing(self):
+        # The row page one ended on stops matching between pages (another
+        # process labels it). The cursor names a position, not a row, so the
+        # walk resumes just below it. Offset paging shifted every later row
+        # up by one and skipped the first row of page two.
+        rows = make_rows(250)
+        cut = rows[99]["id"]
+
+        def drop_cut_row(live):
+            live[:] = [r for r in live if r["id"] != cut]
+
+        server = KeysetServer(rows, after_first_page=drop_cut_row)
+
+        got = [r["id"] for r in _page(server)]
+
+        self.assertEqual(len(got), len(set(got)), "a row came back twice")
+        self.assertEqual(got, [r["id"] for r in rows], "a row was skipped")
 
     def test_pages_by_cursor_never_by_offset(self):
         server = KeysetServer(make_rows(250))
@@ -327,7 +347,7 @@ class ReconcilerPageClaimsTests(unittest.TestCase):
         self.assertNotIn("after", server.calls[0])
         for call in server.calls:
             self.assertFalse(call.get("offset"), f"offset sent: {call!r}")
-        self.assertEqual(server.calls[1]["after"], "k1." + make_rows(250)[99]["id"])
+        self.assertEqual(server.calls[1]["after"], cursor_of(make_rows(250)[99]))
 
     def test_a_full_page_without_a_cursor_header_is_an_error(self):
         with self.assertRaises(RuntimeError) as cm:
