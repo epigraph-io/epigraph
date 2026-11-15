@@ -779,10 +779,25 @@ fn detect_section(line: &str) -> Option<Section> {
     }
 }
 
+/// Single-word keys that are trailers by convention. Any other trailer key
+/// must be hyphenated (`Co-Authored-By`, `Signed-off-by`, `Claude-Session`,
+/// `Epigraph-Orchestrator-Id`), so a closing one-line paragraph such as
+/// `Verification: cargo test passes` or `Note: see #12` stays message text.
+const SINGLE_WORD_TRAILER_KEYS: &[&str] = &[
+    "Fixes",
+    "Closes",
+    "Resolves",
+    "Refs",
+    "References",
+    "Cc",
+    "Link",
+    "Bug",
+];
+
 /// Is `line` a git trailer line (`Key: value`, the key one token of letters,
-/// digits and `-`)? Section headers (`Verification:`) carry no value and are
-/// not trailers; neither is a bullet (`- cargo test: ok`), whose key holds a
-/// space or starts with a marker.
+/// digits and `-`, hyphenated or a conventional single-word key)? Section
+/// headers (`Verification:`) carry no value and are not trailers; neither is a
+/// bullet (`- cargo test: ok`), whose key holds a space or starts with a marker.
 fn is_trailer_line(line: &str) -> bool {
     let Some((key, value)) = line.split_once(':') else {
         return false;
@@ -790,6 +805,10 @@ fn is_trailer_line(line: &str) -> bool {
     !key.is_empty()
         && key.starts_with(|c: char| c.is_ascii_alphanumeric())
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && (key.contains('-')
+            || SINGLE_WORD_TRAILER_KEYS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(key)))
         && value.starts_with(char::is_whitespace)
         && !value.trim().is_empty()
 }
@@ -3409,6 +3428,27 @@ mod tests {
         assert_eq!(parse_header(&split_trailers("docs: x").0).2, "x");
         // A mixed last paragraph is not a trailer block either.
         assert!(split_trailers("a: b\n\nKey: v\nplain text").1.is_empty());
+    }
+
+    // Review of 7d9e60c6: a closing one-line `Key: value` paragraph whose key is
+    // a plain word is message text, not a trailer block, so it is not dropped.
+    #[test]
+    fn closing_single_word_key_line_is_kept_as_text() {
+        let msg = "test(x): y\n\nEvidence:\n- e\n\nVerification: cargo test passes";
+        let (body, trailers) = split_trailers(msg);
+        assert!(trailers.is_empty(), "{trailers:?}");
+        assert_eq!(body, msg);
+        let (_, _, _, evidence, _, _) = parse_commit_message(msg);
+        assert!(
+            evidence.iter().any(|e| e.contains("cargo test passes")),
+            "{evidence:?}"
+        );
+        assert!(split_trailers("fix: y\n\nNote: see #12").1.is_empty());
+        // Hyphenated keys and conventional single-word keys still are trailers.
+        assert_eq!(
+            split_trailers("fix: y\n\nFixes: #12\nSigned-off-by: A <a@b>").1,
+            vec!["Fixes: #12", "Signed-off-by: A <a@b>"]
+        );
     }
 
     // Backlog 7d9e60c6 (3): an Epigraph-Orchestrator-Id trailer in a commit
