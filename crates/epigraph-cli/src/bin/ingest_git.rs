@@ -246,6 +246,8 @@ impl Args {
             i += 1;
         }
 
+        let token = token_or_env(token, std::env::var("EPIGRAPH_TOKEN").ok());
+
         Ok(Self {
             repo,
             endpoint,
@@ -270,6 +272,13 @@ impl Args {
     }
 }
 
+/// The Bearer token: `--token` when given, else a non-empty `EPIGRAPH_TOKEN`.
+/// The variable keeps the token off the command line (and out of
+/// `/proc/<pid>/cmdline`), which is how the reconciler hands it over.
+fn token_or_env(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or_else(|| env.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()))
+}
+
 const USAGE: &str = "\
 Usage: ingest_git [OPTIONS]
 
@@ -282,7 +291,7 @@ Options:
   -l, --limit <N>         Maximum number of commits to process
       --enricher <MODE>   Enrichment mode: noop (default) or llm
       --embed             Generate and store embeddings for submitted claims
-  -t, --token <TOKEN>     Bearer token for agent registration
+  -t, --token <TOKEN>     Bearer token [default: $EPIGRAPH_TOKEN]
   -h, --help              Show this help message
 
 PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
@@ -3274,6 +3283,16 @@ mod tests {
         // Case variants of one email are one author, not two entries.
         run1.get_or_create("ALICE@example.com", "Alice");
         assert_eq!(run1.len(), 1);
+    }
+
+    // Backlog 7d9e60c6 (1): the token can come from EPIGRAPH_TOKEN, off argv.
+    #[test]
+    fn token_flag_wins_then_env_then_none() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(token_or_env(s("flag"), s("env")), s("flag"));
+        assert_eq!(token_or_env(None, s(" env \n")), s("env"));
+        assert_eq!(token_or_env(None, s("  ")), None);
+        assert_eq!(token_or_env(None, None), None);
     }
 
     #[test]
