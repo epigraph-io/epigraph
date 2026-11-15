@@ -214,10 +214,13 @@ fn drop_probe_layer(rows: Vec<LineageRow>, max_depth: i32) -> (Vec<LineageRow>, 
 }
 
 /// The furthest shortest-depth layer [`LineageRepository::detect_cycles`] and
-/// [`LineageRepository::get_depth`] walk to: the bound their path-enumerating
-/// forms had. It bounds the stored layer rows (each carries the visited set),
-/// not the answer's cost on a dense graph, which is the claims and edges
-/// reached.
+/// [`LineageRepository::get_depth`] walk to. This is NOT the bound their
+/// path-enumerating forms had: those stopped at a path of 1000 claims, while
+/// this stops at claims more than 1000 SHORTEST hops away, so a chain longer
+/// than 1000 that a shortcut brings within reach is examined in full and
+/// `get_depth` can return more than 1000. It bounds the number of layer rows;
+/// each row carries the visited set, so the walk's work table grows with
+/// layers times claims reached.
 const SHAPE_WALK_MAX_DEPTH: i32 = 1000;
 
 /// A directed graph over claims, its edges pointing the way a walk follows
@@ -266,7 +269,9 @@ impl ClaimDigraph {
     }
 
     /// Whether any edge lies on a cycle: a component of two or more claims,
-    /// or a claim with an edge to itself.
+    /// or a claim with an edge to itself. The schema forbids claim-to-claim
+    /// self-loops (`edges_no_self_loop`), so the second case cannot come from
+    /// the database; it keeps the graph type correct on its own.
     fn has_cycle(&self) -> bool {
         let mut size = vec![0usize; self.comp_count];
         for &c in &self.comp {
@@ -928,10 +933,13 @@ impl LineageRepository {
     /// The walk is a breadth-first search with a visited set inside one
     /// statement (as `get_ancestor_ids`), which also returns the edges among
     /// the claims it reached; the cycle check is then a strongly connected
-    /// components pass in memory. Both are linear in the claims and edges
-    /// reached, never in the number of paths (backlog c07884a9). Claims more
-    /// than 1000 shortest hops away are not examined (the bound the
-    /// path-enumerating form had).
+    /// components pass in memory. Neither grows with the number of paths
+    /// (backlog c07884a9): the in-memory pass is linear in the claims and
+    /// edges reached, and the walk grows with layers times claims reached
+    /// (each layer row carries the visited set). There is no cap on claims
+    /// reached and every reached edge is loaded into memory; measure the plan
+    /// and add a cap before wiring this to a route. Claims more than 1000
+    /// shortest hops away are not examined (see `SHAPE_WALK_MAX_DEPTH`).
     ///
     /// # Arguments
     /// * `executor` - Database executor
@@ -961,7 +969,10 @@ impl LineageRepository {
     /// claims that derive from one another) counts as ONE step, since the
     /// longest simple path is NP-hard and the path-enumerating form that
     /// computed it was exponential on a dense DAG (backlog c07884a9). Claims
-    /// more than 1000 shortest hops away are not examined.
+    /// more than 1000 shortest hops away are not examined, but a chain
+    /// reached within that bound counts in full, so the answer can exceed
+    /// 1000 (see `SHAPE_WALK_MAX_DEPTH`). Same cost and lack of a claim cap
+    /// as [`LineageRepository::detect_cycles`].
     ///
     /// # Arguments
     /// * `executor` - Database executor
