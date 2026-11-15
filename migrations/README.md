@@ -2673,7 +2673,9 @@ restart.
   undo) and `epigraph-mcp/tests/locality_tag_width.rs`. Undo:
   `docs/runbooks/228-undo.sql` (tested: run twice, it returns the column to
   `varchar(20)` with the trigger intact; it refuses, writing nothing, while a
-  row holds a tag over 20 characters). Checked before claiming: slot 228 is
+  row holds a tag over 20 characters). A retracted row cannot be re-tagged
+  (184) and is removed only by 194's purge, so once a retracted row holds a
+  tag over 20 characters 228 is forward-only. Checked before claiming: slot 228 is
   this batch's assignment, and no migration on main or any origin branch
   carries a `228`. **Deploy order:** migrate first; a 228 binary running on an
   unmigrated database still gets 22001 (an internal error) for a 21-64

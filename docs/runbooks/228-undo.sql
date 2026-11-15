@@ -6,8 +6,16 @@
 -- longer than 20 characters, so this file refuses up front and writes
 -- nothing; decide what those rows' tags should be first (count them with
 -- `SELECT locality_tag, count(*) FROM mass_functions
---   WHERE char_length(locality_tag) > 20 GROUP BY 1`). A retracted row cannot
--- be re-tagged at all (184's rewrite guard). Roll every binary that accepts a
+--   WHERE char_length(locality_tag) > 20 GROUP BY 1`). Re-tag only the
+-- UNretracted ones. A RETRACTED row cannot be re-tagged (184's rewrite guard
+-- refuses RT07) and cannot be plainly deleted (194's delete guard refuses
+-- SR09); the only supported way to clear one is 194's
+-- `epigraph_purge_mass_functions(ids, reason)` (maintenance role only), which
+-- deletes the retracted row from `mass_functions` and keeps a copy only in a
+-- `security_events` entry. So once any retracted row holds a
+-- tag over 20 characters, treat 228 as FORWARD-ONLY: undo would mean
+-- purging retracted evidence or bypassing the guards by hand, which this
+-- runbook does not describe and does not endorse. Roll every binary that accepts a
 -- tag over 20 characters back first, or a write in between can re-block the
 -- undo. Unlike the widening, the narrowing re-checks every row, so it holds
 -- ACCESS EXCLUSIVE on `mass_functions` for a full table scan.
@@ -30,7 +38,8 @@ BEGIN
     SELECT count(*) INTO n FROM public.mass_functions WHERE char_length(locality_tag) > 20;
     IF n > 0 THEN
         RAISE EXCEPTION '228-undo: % mass_functions row(s) hold a locality_tag over 20 characters; '
-            're-tag them before narrowing the column; nothing was changed', n;
+            're-tag the unretracted ones before narrowing the column (a retracted one cannot be '
+            're-tagged: see this file''s header, 228 may be forward-only); nothing was changed', n;
     END IF;
 END $$;
 
