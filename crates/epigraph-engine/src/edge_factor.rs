@@ -1173,6 +1173,13 @@ pub fn is_known_evidence_type_key_in(key: &str, profile: &BeliefProfile) -> bool
         || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
 }
 
+/// The longest `mass_functions.locality_tag` the column stores, in
+/// characters: it is `varchar(64)` (migration 228, which widened 045's
+/// `varchar(20)` so `intra_methodological_overlap` fits). A longer tag is a
+/// database error at write time, so write paths that take a caller's tag
+/// refuse it up front.
+pub const LOCALITY_TAG_MAX_CHARS: usize = 64;
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
 /// keys that aren't in the known vocabulary of the profile the combine folds
 /// under.

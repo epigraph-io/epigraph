@@ -1264,7 +1264,8 @@ pub struct SubmitDsEvidenceParams {
                        'intra' (self-cite / methodological overlap) applies the calibrated intra-locality \
                        discount on top of the evidence_type weight; 'cross' or 'unknown' apply no locality \
                        discount. Only consulted when `evidence_type` is also supplied — otherwise ignored \
-                       and the BBA is stored with locality_tag='unknown' as before. Default: 'unknown'."
+                       and the BBA is stored with locality_tag='unknown' as before. A stored tag longer \
+                       than 64 characters is refused. Default: 'unknown'."
     )]
     #[serde(default)]
     pub locality_tag: Option<String>,

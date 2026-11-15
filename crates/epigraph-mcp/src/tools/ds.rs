@@ -223,6 +223,12 @@ pub async fn submit_ds_evidence(
     } else {
         "unknown"
     };
+    // A tag that is STORED must fit the column (`varchar(64)`, migration 228).
+    // A longer one used to reach the INSERT and come back as a redacted
+    // internal error with nothing written, so this refusal changes no call
+    // that succeeds today; a tag sent without `evidence_type` is dropped, not
+    // stored, and is never refused.
+    check_stored_locality_tag_len(stored_locality_tag)?;
     if calibrated_evidence_type.is_none() {
         let reliability = params.reliability.unwrap_or(1.0).clamp(0.0, 1.0);
         if reliability < 1.0 {
@@ -745,6 +751,20 @@ async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, 
         .is_some_and(|m| m.contains_key(&et.to_lowercase()))
 }
 
+/// Refuse a `locality_tag` that would be stored but cannot fit the column
+/// ([`epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS`], counted in
+/// characters as `varchar` does), as a parameter error naming the limit.
+fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
+    let max = epigraph_engine::edge_factor::LOCALITY_TAG_MAX_CHARS;
+    let len = stored.chars().count();
+    if len > max {
+        return Err(invalid_params(format!(
+            "locality_tag is {len} characters; at most {max} are stored"
+        )));
+    }
+    Ok(())
+}
+
 /// The `warnings` a `submit_ds_evidence` call earns by sending a deprecated
 /// parameter a non-default value (backlog 82dcff9d, G5).
 ///
@@ -1172,6 +1192,25 @@ mod tests {
             .expect_err(&format!("{masses} must be refused"));
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{masses}");
         err.message.into_owned()
+    }
+
+    /// Backlog 01807a57: a stored tag longer than the `varchar(64)` column
+    /// (migration 228) is refused as a parameter error naming the limit; 64
+    /// characters, or 64 multi-byte characters (more than 64 bytes), pass,
+    /// and so does the engine-named 28-character tag 045's column refused.
+    #[test]
+    fn an_over_long_stored_locality_tag_is_refused_by_characters() {
+        assert!(check_stored_locality_tag_len("unknown").is_ok());
+        assert!(check_stored_locality_tag_len("intra_methodological_overlap").is_ok());
+        assert!(check_stored_locality_tag_len(&"a".repeat(64)).is_ok());
+        assert!(check_stored_locality_tag_len(&"\u{e9}".repeat(64)).is_ok());
+        let err = check_stored_locality_tag_len(&"a".repeat(65)).expect_err("65 characters");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("65 characters") && err.message.contains("64"),
+            "{}",
+            err.message
+        );
     }
 
     /// Backlog 2fe81d61: on the write path an unparseable focal key became the
