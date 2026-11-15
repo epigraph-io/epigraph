@@ -562,7 +562,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // `UPDATE claims SET embedding` became
     // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
     // with the caller's viewer (`AppState::store_claim_embedding_as`).
-    ("belief.rs", 1),
+    // 1 -> 0, key removed (backlog f50344c0): `submit_evidence`'s
+    // `UPDATE claims SET beta_alpha, beta_beta` became
+    // `ClaimRepository::add_beta_increments` (spliced `{WRITABLE:c}`), called
+    // through `epigraph_engine::ds_divergence::apply_beta_update`, which the
+    // MCP DS tools share.
     // 4 -> 3 (backlog 1e2315a9): `create_claim_core`'s post-commit
     // `UPDATE claims SET embedding` became
     // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
