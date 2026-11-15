@@ -190,6 +190,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
+            "sqlx::query(UPDATE).execute",
         ],
     ),
     // stamped: the write transaction is stamped from the caller's viewer, and
@@ -282,17 +283,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "resolve_challenge",
         &["ChallengeRepository::resolve_as_claim_owner"],
     ),
-    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md)
-    // runs each act on `AppState::write_as`, the transaction stamped with this
-    // viewer, and calls a migration-206 SECURITY DEFINER that reads the caller
-    // from that stamp (`epigraph_principal_id()`) and makes the authority
-    // decision itself; a claim the caller cannot read is answered not-found by
-    // the definer. `writable_teams` reports the caller's own teams back.
-    (
-        "claim_visibility.rs",
-        "publicize_claims",
-        &["ClaimRepository::publicize_conn"],
-    ),
+    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md).
+    // The publicize and share handlers hand their viewer to
+    // `epigraph_engine::visibility_act` (the act plus the moved claims'
+    // cached-belief refold, migration 215), so they have no unviewed call.
     // The two default-group handlers (206's `me`, 209's `:id`) pass their
     // viewer to `set_default_for`, which spends it on `write_as` and calls 209's
     // setter definer on that stamped transaction; the definer decides whether
@@ -305,11 +299,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::set_agent_default_conn",
             "ClaimRepository::writable_teams",
         ],
-    ),
-    (
-        "claim_visibility.rs",
-        "share_claims_with_team",
-        &["ClaimRepository::share_with_team_conn"],
     ),
     // untenanted: the caller's own membership, and the seal record of a claim
     // already read through the viewer.
@@ -329,8 +318,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupMembershipRepository::is_member",
         ],
     ),
-    // gated (`write_target_of`) then write; the owner read is re-checked by the
-    // in-transaction viewer re-fetch (F-write-authz-reads-unfiltered).
+    // gated (`write_target_of`, for every caller since backlog 4073bbb6: the
+    // unfiltered `sqlx::query_scalar(SELECT)` owner read is gone) then write;
+    // the in-transaction viewer re-fetch still re-checks it
+    // (F-write-authz-reads-unfiltered).
     (
         "claims.rs",
         "patch_claim",
@@ -339,7 +330,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::patch_claim_atomic_conn",
             "ProvenanceRepository::append_conn",
             "db_pool.begin",
-            "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
     // gated (`ClaimRepository::get_by_id`) then write.
@@ -424,6 +414,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
+    // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the
+    // shared copy this request just created. It cannot take the caller's
+    // viewer: the copy is authored by the system agent and owned by that
+    // agent's group, which the sharer does not write, so it is stored where
+    // `ClaimRepository::create` above wrote the row (the raw pool), through
+    // `ClaimRepository::store_embedding` and its "not sealed" predicate.
     (
         "conventions.rs",
         "share_skill",
@@ -433,6 +429,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::create",
             "ClaimRepository::default_decl_for_author_pool",
             "EdgeRepository::create_signed_conn",
+            "embed_created_claim",
             "sqlx::query(UPDATE).execute",
         ],
     ),
@@ -850,9 +847,24 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
-    // stamped: the write runs on `write_as`, the transaction stamped from the
-    // caller's viewer; `set_source_reliability_conn` refuses a perspective the
-    // caller cannot see (404) or cannot update (403), and commits nothing.
+    // raw pool: the `papers` registry rows and their count. `papers` carries
+    // no row security (it is keyed on the document, not on a tenant). Every
+    // claim-derived field (authors, claim count, ingests) is read by
+    // `paper_listings` on the caller's stamped connection, with the viewer.
+    (
+        "papers.rs",
+        "list_papers",
+        &[
+            "sqlx::query(SELECT).fetch_all",
+            "sqlx::query(SELECT).fetch_all",
+            "sqlx::query_scalar(SELECT).fetch_one",
+            "sqlx::query_scalar(SELECT).fetch_one",
+        ],
+    ),
+    // gated (`PerspectiveRepository::get_by_id`) then write, on a transaction
+    // stamped with the caller's viewer: `perspectives`' owner-scoped UPDATE
+    // (migration 117) decides write authority, and the repo answers
+    // `WriteRefused` for a row it will not update (backlog 0f2f9ddb).
     (
         "perspective.rs",
         "set_source_reliability",
@@ -865,9 +877,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "create_challenge",
         &[
             "ClaimRepository::default_decl_for_author_pool",
-            "sqlx::query(SELECT).execute",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_optional",
+            "PolicyRepository::find_challenge_by_hash",
+            "PolicyRepository::insert_challenge",
+            "PolicyRepository::lock_challenge_create",
             "workflows::get_or_create_system_agent",
         ],
     ),
@@ -1099,16 +1111,13 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // write: propagation for the claim this request just persisted through
-    // the viewer (`persist_packet`); `validate_packet` runs no tenancy read.
+    // no SQL: `validate_packet` runs no tenancy read. `propagate_from` left
+    // this list with the in-memory orchestrator registration it ran on
+    // (backlog 7b3722b5).
     // The two post-commit embedding UPDATEs (claim, figure evidence) now
     // receive the viewer (`AppState::store_claim_embedding_as` /
     // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
-    (
-        "submit.rs",
-        "submit_packet",
-        &["propagate_from", "validate_packet"],
-    ),
+    ("submit.rs", "submit_packet", &["validate_packet"]),
     // gated (`write_target_of`) then write.
     (
         "versioning.rs",

@@ -113,7 +113,31 @@ pub struct ClaimQueryParams {
     /// Filter by evidence type (requires claim to have evidence of this type).
     /// Values: document, observation, testimony, computation, reference, figure, conversational
     pub evidence_type: Option<String>,
+
+    /// Restrict to the claims assigned to this theme (`claims.theme_id`). A
+    /// theme the caller reads nothing in, and an id that names no theme, both
+    /// select zero claims.
+    pub theme_id: Option<Uuid>,
+
+    /// `true`: also return `links`, the in-force epistemic edges (supports,
+    /// refutes, contradicts, cites, ...) whose two endpoints are both on the
+    /// returned page, so a timeline can draw the page with its connections.
+    pub include_links: Option<bool>,
 }
+
+/// One claim-to-claim link among the claims of a page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimLink {
+    /// The edge's id.
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    /// Lower-cased relationship name.
+    pub relationship: String,
+}
+
+/// Most links returned for one page ([`ClaimQueryParams::include_links`]).
+pub const MAX_PAGE_LINKS: usize = 500;
 
 /// Summary representation of a claim for list responses
 ///
@@ -166,6 +190,17 @@ pub struct ClaimListResponse {
 
     /// The offset that was applied
     pub offset: u32,
+
+    /// With `include_links=true`: the in-force epistemic edges among the
+    /// claims of this page that the caller may read, oldest first, at most
+    /// [`MAX_PAGE_LINKS`]. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<ClaimLink>>,
+
+    /// More than [`MAX_PAGE_LINKS`] links exist among the page's claims.
+    /// Present with `links`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links_truncated: Option<bool>,
 }
 
 // ============================================================================
@@ -381,12 +416,27 @@ pub async fn list_claims_query(
     // methodology/evidence_type that matched nothing must select zero claims,
     // so it stays `Some(&[])` (→ `id = ANY('{}')` → no rows). Collapsing it to
     // `None` would invert the filter into "return every claim".
-    let id_filter: Option<Vec<uuid::Uuid>> = match (&methodology_ids, &evidence_type_ids) {
-        (Some(m), Some(e)) => Some(m.intersection(e).copied().collect()),
-        (Some(m), None) => Some(m.iter().copied().collect()),
-        (None, Some(e)) => Some(e.iter().copied().collect()),
-        (None, None) => None,
+    // `theme_id` is a third pre-resolved set (backlog ea26d7aa), intersected
+    // the same way and with the same `Some(empty)` meaning.
+    let theme_ids: Option<HashSet<uuid::Uuid>> = match params.theme_id {
+        Some(theme_id) => {
+            let ids = ClaimRepository::claim_ids_by_theme(&mut *read, &viewer, theme_id)
+                .await
+                .map_err(|e| scoped_read_failure(&e, "Theme filter query failed"))?;
+            Some(ids.into_iter().collect())
+        }
+        None => None,
     };
+    let id_filter: Option<Vec<uuid::Uuid>> = [&methodology_ids, &evidence_type_ids, &theme_ids]
+        .into_iter()
+        .flatten()
+        .fold(None::<HashSet<uuid::Uuid>>, |acc, set| {
+            Some(match acc {
+                None => set.clone(),
+                Some(acc) => acc.intersection(set).copied().collect(),
+            })
+        })
+        .map(|set| set.into_iter().collect());
 
     // ---- Single path: every predicate runs in SQL, before LIMIT ----
     // `total` is a real COUNT(*) over the same WHERE clause that produced the
@@ -433,6 +483,25 @@ pub async fn list_claims_query(
             .await
             .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
 
+    // The links among the page's claims, on the same stamped handle. One more
+    // than the cap is asked for, so the response can say whether it is whole.
+    let links = if params.include_links.unwrap_or(false) {
+        let page_ids: Vec<uuid::Uuid> = rows.iter().map(|c| c.id.as_uuid()).collect();
+        let mut found = epigraph_db::EdgeRepository::links_among_claims(
+            &mut *read,
+            &viewer,
+            &page_ids,
+            MAX_PAGE_LINKS as i64 + 1,
+        )
+        .await
+        .map_err(|e| scoped_read_failure(&e, "Link query failed"))?;
+        let truncated = found.len() > MAX_PAGE_LINKS;
+        found.truncate(MAX_PAGE_LINKS);
+        Some((found, truncated))
+    } else {
+        None
+    };
+
     crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
     let paginated: Vec<ClaimSummary> = rows
@@ -449,11 +518,31 @@ pub async fn list_claims_query(
         })
         .collect();
 
+    let (links, links_truncated) = match links {
+        Some((found, truncated)) => (
+            Some(
+                found
+                    .into_iter()
+                    .map(|l| ClaimLink {
+                        id: l.id,
+                        source_id: l.source_id,
+                        target_id: l.target_id,
+                        relationship: l.relationship,
+                    })
+                    .collect(),
+            ),
+            Some(truncated),
+        ),
+        None => (None, None),
+    };
+
     Ok(Json(ClaimListResponse {
         claims: paginated,
         total,
         limit,
         offset,
+        links,
+        links_truncated,
     }))
 }
 
@@ -652,6 +741,8 @@ pub async fn list_claims_query(
             total: 0,
             limit,
             offset,
+            links: None,
+            links_truncated: None,
         }));
     }
 
@@ -759,6 +850,8 @@ pub async fn list_claims_query(
         total,
         limit,
         offset,
+        links: None,
+        links_truncated: None,
     }))
 }
 

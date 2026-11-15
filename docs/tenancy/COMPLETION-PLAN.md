@@ -292,8 +292,15 @@ In `~/tenancy-pending-decisions.md`, filed as EpiGraph backlog claims labelled
 - **`methods.source_claim_ids`** exposure
 - **`F-PR18b-A1`** — response assembly, out of band
 - **`F-089-A` / `F-089-C`** — *one question from two sides*; answer the first and the second
-  follows
-- **`F-089-F`** — the harvester trust model
+  follows. **Decided 2026-09-22: most restrictive wins.** Migration 218 applies it to
+  every choice among a fragment's citing claims (the provenance stamp, the backfill and
+  arm (d)). Still open: whether it also re-stamps a fragment already owned by a real
+  group and `public`, which the operator tools' node rule (`restrict-claims`,
+  `regroup-claims`) deliberately leaves on its tuple
+- **`F-089-F`** — the harvester trust model. **Decided 2026-09-22: accepted, the ingest
+  path is trusted.** Documented in `docs/tenancy.md` and at migration 218's stamping body.
+  Not yet enforced on every path (an application session can still INSERT a provenance
+  link that arm (d) later follows): new finding `F-218-A`, an operator decision
 
 ### 6.3 When to merge to `main` — **DECIDED, 2026-09-14. Do not re-open.**
 

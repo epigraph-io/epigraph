@@ -288,14 +288,17 @@ pub async fn create_evidence(
     use epigraph_core::{AgentId, ClaimId, Evidence, EvidenceType};
     use epigraph_db::EvidenceRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        // Accept either evidence:write or evidence:submit (naming inconsistency)
-        if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
-            return Err(crate::errors::ApiError::Forbidden {
-                reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
-            });
-        }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    // Accept either evidence:write or evidence:submit (naming inconsistency)
+    if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
+        return Err(crate::errors::ApiError::Forbidden {
+            reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
+        });
     }
 
     // Parse evidence_type from JSON
@@ -767,10 +770,13 @@ pub async fn create_analysis(
 ) -> Result<(StatusCode, Json<CreateAnalysisResponse>), ApiError> {
     use epigraph_db::AnalysisRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
 
     if request.analysis_type.trim().is_empty() {
         return Err(ApiError::ValidationError {
@@ -1330,9 +1336,12 @@ pub async fn get_boundary_claims(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<BoundaryClaimsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1749,9 +1758,12 @@ pub async fn get_split_candidates(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<SplitCandidatesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1821,9 +1833,12 @@ pub async fn get_distant_claims(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<DistantClaimsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::ClaimThemeRepository;
 

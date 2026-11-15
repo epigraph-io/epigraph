@@ -7,10 +7,10 @@
 use std::process::Command;
 
 fn bin_path() -> std::path::PathBuf {
-    // Built by cargo before the test runs.
-    let me = std::env::current_exe().unwrap();
-    let target_dir = me.parent().unwrap().parent().unwrap();
-    target_dir.join("cross_source_sweep")
+    // Cargo builds the binary before the test and tells us where it put it.
+    // Walking up from `current_exe()` assumed test executables live in
+    // `target/debug/deps`, which cargo's build-dir layout v2 (1.100) changed.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_cross_source_sweep"))
 }
 
 #[test]
