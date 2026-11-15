@@ -5,8 +5,9 @@
 //! `/maps/:map/:hierarchy/claims/:claim_id/leaf`.
 //!
 //! Hermetic `#[sqlx::test]` on a fresh database. `AppState` is built with
-//! `with_scoped_pool` (the `epigraph_app` role), so every read runs on a
-//! viewer-stamped connection under row security. Runs are written on the
+//! `with_scoped_pool` on a pool downgraded to the `epigraph_app` role (see
+//! [`router`]), so every read runs on a viewer-stamped connection under row
+//! security. Runs are written on the
 //! superuser pool with a bypass viewer, the nightly's maintenance stand-in.
 //!
 //! # The world ([`World::seed`])
@@ -41,7 +42,8 @@ use epigraph_atlas_contract::{
     LevelDocument, MapScope, Node, PlainNode, Switch, BUDGET_GZIP_BYTES, SCHEMA_VERSION,
 };
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, LevelDoc, NewMapRun};
-use epigraph_db::AtlasMapRepository;
+use epigraph_db::visibility::Viewer;
+use epigraph_db::{AtlasMapRepository, AtlasServeRepository, ScopedPool, SessionGucMode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -50,11 +52,28 @@ use uuid::Uuid;
 
 // ---- plumbing ---------------------------------------------------------------------
 
+/// The kernel as production runs it: a `ScopedPool` whose every connection
+/// is downgraded to `epigraph_app`, so the row policies filter each read as
+/// well as the in-query viewer predicate. (`fixture::scoped_pool` would run
+/// on the superuser DSN `#[sqlx::test]` hands out, where no policy is
+/// evaluated.)
 async fn router(pool: &PgPool) -> Router {
-    create_router(AppState::with_scoped_pool(
-        fixture::scoped_pool(pool).await,
-        ApiConfig::default(),
-    ))
+    let scoped = ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("an epigraph_app ScopedPool");
+    let role: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(scoped.inner())
+        .await
+        .expect("the pool's role");
+    assert_eq!(
+        role, "epigraph_app",
+        "the kernel must read as the application role"
+    );
+    create_router(AppState::with_scoped_pool(scoped, ApiConfig::default()))
 }
 
 fn token(agent: Uuid) -> String {
@@ -898,6 +917,71 @@ async fn claim_to_leaf_returns_only_leaves_the_viewer_can_read(pool: PgPool) {
             );
         }
     }
+}
+
+/// `AtlasServeRepository::leaves_of_claim` refuses on its own in-query
+/// predicates, with no row policy behind them. The route re-reads the leaf
+/// through the per-viewer filter before it answers, and under `epigraph_app`
+/// the row policies hide the same rows, so neither the route test above nor
+/// the role would notice a lookup that skipped the claim's or the level's
+/// visibility predicate. Here the lookup runs on the superuser connection
+/// `#[sqlx::test]` hands out (row security bypassed, asserted below), with
+/// a member's and a stranger's resolved viewers.
+///
+/// - M reads X1 and the public P: both are found on LM (the positive control,
+///   so "nothing found" cannot pass vacuously).
+/// - Z is on A's stored LM, but it is B's: the claim predicate must refuse it.
+/// - S reads P, but S is no member of A: the level predicate must refuse A's
+///   leaf of it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn leaves_of_claim_refuses_on_its_own_predicates(pool: PgPool) {
+    let w = World::seed(&pool).await;
+    let mut conn = pool.acquire().await.expect("a connection");
+    let bypasses: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("the session's role");
+    assert!(
+        bypasses,
+        "this arm needs a session no row policy filters, so the in-query predicates are the only guard"
+    );
+    let m = Viewer::resolve(&pool, w.m).await.expect("M's viewer");
+    let s = Viewer::resolve(&pool, w.s).await.expect("S's viewer");
+    async fn lookup(pool: &PgPool, w: &World, viewer: &Viewer, claim: Uuid) -> Vec<(Uuid, Uuid)> {
+        let mut conn = pool.acquire().await.expect("a connection");
+        AtlasServeRepository::leaves_of_claim(
+            &mut conn,
+            viewer,
+            w.team(),
+            w.team_run,
+            AtlasHierarchy::Meaning,
+            claim,
+        )
+        .await
+        .expect("the lookup")
+    }
+    assert_eq!(
+        lookup(&pool, &w, &m, w.x1).await,
+        vec![(w.theme, w.lm)],
+        "M reads X1"
+    );
+    assert_eq!(
+        lookup(&pool, &w, &m, w.p).await,
+        vec![(w.theme, w.lm)],
+        "M reads P"
+    );
+    assert_eq!(
+        lookup(&pool, &w, &m, w.z).await,
+        Vec::<(Uuid, Uuid)>::new(),
+        "B's claim Z is on A's stored leaf; M cannot read Z"
+    );
+    assert_eq!(
+        lookup(&pool, &w, &s, w.p).await,
+        Vec::<(Uuid, Uuid)>::new(),
+        "S reads P but no level of A's map"
+    );
 }
 
 // ---- maps and theme roots -----------------------------------------------------------

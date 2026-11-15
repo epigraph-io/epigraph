@@ -62,6 +62,8 @@ pub mod check;
 pub mod fixtures;
 #[cfg(any(test, feature = "check"))]
 pub mod preview;
+#[cfg(any(test, feature = "check"))]
+pub mod scale;
 #[cfg(test)]
 mod tests;
 
