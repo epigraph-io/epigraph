@@ -24,3 +24,6 @@ anyhow = { workspace = true }
 [[example]]
 name = "table_graph"
 path = "examples/table_graph/main.rs"
+
+[lints]
+workspace = true

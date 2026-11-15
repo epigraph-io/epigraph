@@ -18,19 +18,20 @@
 //!
 //! The modes are reported by:
 //!
-//! - the API server and the HTTP and stdio MCP servers, which journal them at
+//! - the API server and the HTTP and stdio MCP servers, which journal it at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
 //!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)
 //!   compares those reports across live processes;
-//! - the CLI wave bins `recompute_betp`, `backfill_factors` and
+//! - the CLI wave bins `recompute_betp`, `backfill_factors`,
+//!   `sweep_retired_source_bbas`, `refresh_truth_mirrors` and
 //!   `decompose_claims --retarget`, which compare their own [`current`] with
 //!   the API's report before a writing run ([`BeliefModes::skew`]).
 //!
 //! # Defaults, and what this build acts on
 //!
-//! Every default is the mode the rollout starts from. With every flag unset
-//! this build behaves exactly as the build before it did: reading and
-//! reporting a flag changes nothing by itself.
+//! Every default is the mode the rollout starts from. Under the defaults the
+//! atom fold is the legacy fold, a compound's belief is its legacy value, and
+//! BP apply is refused.
 //!
 //! | flag | values | default | acted on in this build |
 //! |---|---|---|---|
