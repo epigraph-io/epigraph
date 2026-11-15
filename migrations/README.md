@@ -2963,7 +2963,9 @@ restart.
   workflow row: the read and insert policies are `EXISTS` over `workflows`,
   which `workflows_read` filters; the application role holds SELECT and
   INSERT only; 126's three elevated refusals as on `workflows` (census class
-  T-PLAN). Pinned by `epigraph-db/tests/workflow_outcome_reports_tenancy.rs`
+  T-PLAN); 166's `role_agent_write_check` statement trigger on the table, so
+  `tenancy_backfill verify` finds no app-writable table without it. Pinned by
+  `epigraph-db/tests/workflow_outcome_reports_tenancy.rs`
   (on the application role), `epigraph-db/tests/elevation_arms_census.rs`,
   and the idempotency tests in `epigraph-mcp`'s `tools::workflow_hierarchical`
   and `epigraph-api`'s `routes::workflows`. Undo:
