@@ -55,10 +55,16 @@ DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/
 RESULT_DIR = "/tmp/theme_labels"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
+# Stored for a theme with no public member: there is no text every viewer may
+# read to name it from (theme_lib.public_label_source). is_placeholder_label
+# matches it, so a later run labels it once a public member joins.
+NO_PUBLIC_MEMBER_LABEL = theme_lib.NO_PUBLIC_MEMBER_LABEL
 
 
 def load_themes_with_samples(conn, limit=None):
-    """Load themes (ordered by claim_count desc) and their top-10 nearest claims."""
+    """Load themes (ordered by claim_count desc) and their top-10 nearest
+    PUBLIC claims (theme_lib.public_label_source). A theme with no public
+    member comes back with no samples."""
     themes = []
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         sql = """
@@ -72,11 +78,12 @@ def load_themes_with_samples(conn, limit=None):
         cur.execute(sql)
         for theme in cur.fetchall():
             theme_id = theme["id"]
-            # Top-10 claims most central to this theme. Joining on agents is
-            # cosmetic (label includes the source for human review); the
-            # LEFT JOIN keeps claims whose agent row has been pruned. Bug
-            # reports filed through the intake are never sampled: the label is
-            # shown outside the intake group (theme_lib.not_intake_owned).
+            # Top-10 public claims most central to this theme. Joining on
+            # agents is cosmetic (label includes the source for human review);
+            # the LEFT JOIN keeps claims whose agent row has been pruned. Only
+            # public, non-intake members are sampled: the stored label and
+            # description are shown to every viewer of any member
+            # (theme_lib.public_label_source).
             cur.execute(
                 f"""
                 SELECT substring(c.content for 200) AS content,
@@ -85,7 +92,7 @@ def load_themes_with_samples(conn, limit=None):
                 LEFT JOIN agents a ON c.agent_id = a.id
                 WHERE c.theme_id = %s
                   AND c.embedding IS NOT NULL
-                  AND {theme_lib.not_intake_owned("c")}
+                  AND {theme_lib.public_label_source("c")}
                 ORDER BY c.embedding <=> (SELECT centroid FROM claim_themes WHERE id = %s)
                 LIMIT 10
                 """,
@@ -188,11 +195,13 @@ def is_placeholder_label(label):
     Heuristic from V2: a short label is taken as already named unless it is a
     generated placeholder. Placeholders are `auto-NN` (theme_cluster),
     `cluster-NN` (the cluster_labels fallback that project_to_themes copies
-    onto a theme, and split_theme's `cluster-split-...` parts), and long or
+    onto a theme, and split_theme's `cluster-split-...` parts),
+    NO_PUBLIC_MEMBER_LABEL (a theme no public member could name), and long or
     definitional strings (the semicolon-joined nearest-claim excerpts).
     """
     return (
         not label
+        or label == NO_PUBLIC_MEMBER_LABEL
         or label.startswith("auto-")
         or label.startswith("cluster-")
         or len(label) >= 60
@@ -233,6 +242,7 @@ def main():
     print(f"  {len(themes)} themes to consider", file=sys.stderr)
 
     labeled = 0
+    placeholders = 0
     skipped = 0
     failed = 0
 
@@ -251,6 +261,17 @@ def main():
             f"(current: {current[:50] or '<none>'})",
             file=sys.stderr,
         )
+
+        if not theme["samples"]:
+            # No public member: store the placeholder (replacing any label an
+            # earlier run built from private text) and make no LLM call.
+            if args.dry_run:
+                print(f"  [DRY RUN] Would store {NO_PUBLIC_MEMBER_LABEL}", file=sys.stderr)
+                continue
+            update_theme(conn, theme["id"], NO_PUBLIC_MEMBER_LABEL, "")
+            print(f"  -> {NO_PUBLIC_MEMBER_LABEL} (no public member)", file=sys.stderr)
+            placeholders += 1
+            continue
 
         prompt, result_path = build_prompt(theme)
 
@@ -277,7 +298,8 @@ def main():
             failed += 1
 
     print(
-        f"\nDone: {labeled} labeled, {skipped} skipped, {failed} failed",
+        f"\nDone: {labeled} labeled, {placeholders} without a public member, "
+        f"{skipped} skipped, {failed} failed",
         file=sys.stderr,
     )
     conn.close()

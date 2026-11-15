@@ -45,6 +45,21 @@ use crate::matching::source_key::{
 };
 use std::collections::HashMap;
 
+/// Recall-stage accounting for one [`union_block_with_stats`] call, so a low
+/// yield can be attributed to "few pairs retrieved" versus "pairs retrieved
+/// and filtered" (a04248cf). Invariant:
+/// `retrieved == ineligible_dropped + same_source_dropped + kept`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockStats {
+    /// Distinct canonical pairs produced by all blockers, before any filter.
+    pub retrieved: usize,
+    /// Dropped because an endpoint is a non-substantive claim.
+    pub ineligible_dropped: usize,
+    /// Dropped by the structural same-source filter (shared asserting paper,
+    /// shared derivation root, or same-agent non-paper pair).
+    pub same_source_dropped: usize,
+}
+
 /// Run all blockers on the seed set, union & dedup the results, drop pairs that
 /// touch a non-substantive (ineligible) claim per `eligibility`, then drop
 /// pairs whose source keys are same-source (per `cfg`).
@@ -55,12 +70,32 @@ pub async fn union_block(
     cfg: SourceFilterConfig,
     eligibility: &EligibilityConfig,
 ) -> Result<Vec<CandidatePair>, sqlx::Error> {
+    Ok(
+        union_block_with_stats(pool, blockers, seeds, cfg, eligibility)
+            .await?
+            .0,
+    )
+}
+
+/// [`union_block`], also returning how many pairs each recall-stage filter
+/// dropped.
+pub async fn union_block_with_stats(
+    pool: &PgPool,
+    blockers: &[Box<dyn Blocker>],
+    seeds: &[Uuid],
+    cfg: SourceFilterConfig,
+    eligibility: &EligibilityConfig,
+) -> Result<(Vec<CandidatePair>, BlockStats), sqlx::Error> {
     let mut all: Vec<CandidatePair> = Vec::new();
     for b in blockers {
         all.extend(b.candidates(pool, seeds).await?);
     }
     all.sort_unstable();
     all.dedup();
+    let mut stats = BlockStats {
+        retrieved: all.len(),
+        ..BlockStats::default()
+    };
 
     // Candidate hygiene: drop pairs touching a non-substantive claim (e.g.
     // `workflow_step` artifacts like "Body", or host `telemetry`) before the
@@ -69,6 +104,7 @@ pub async fn union_block(
     if !eligibility.exclude_labels.is_empty() {
         all = filter_ineligible(pool, all, &eligibility.exclude_labels).await?;
     }
+    stats.ineligible_dropped = stats.retrieved - all.len();
 
     let mut keys: HashMap<Uuid, SourceKey> = HashMap::new();
     let mut out = Vec::with_capacity(all.len());
@@ -89,11 +125,13 @@ pub async fn union_block(
                 k
             }
         };
-        if !is_same_source(&ka, &kb, cfg) {
+        if is_same_source(&ka, &kb, cfg) {
+            stats.same_source_dropped += 1;
+        } else {
             out.push((a, b));
         }
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
 /// Keep only pairs whose BOTH endpoints are eligible to match: not carrying any

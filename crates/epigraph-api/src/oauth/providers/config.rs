@@ -335,13 +335,13 @@ default_scopes = ["claims:read"]
 
         // Present keys parse into the vecs.
         let text = format!(
-            "{sample}allowed_emails = [\"jeremy.barton@gmail.com\"]\nallowed_domains = [\"baros.associates\"]\n",
+            "{sample}allowed_emails = [\"owner@example.com\"]\nallowed_domains = [\"baros.associates\"]\n",
             sample = sample_redirect()
         );
         let cfg = ProvidersConfig::parse(&text).unwrap();
         assert_eq!(
             cfg.providers[0].allowed_emails,
-            vec!["jeremy.barton@gmail.com".to_string()]
+            vec!["owner@example.com".to_string()]
         );
         assert_eq!(
             cfg.providers[0].allowed_domains,
@@ -369,23 +369,19 @@ default_scopes = ["claims:read"]
 
     #[test]
     fn exact_email_match_is_case_insensitive() {
-        let allowed = emails(&["jeremy.barton@gmail.com"]);
-        assert!(email_is_allowed("Jeremy.Barton@GMAIL.com", &allowed, &[]));
+        let allowed = emails(&["owner@example.com"]);
+        assert!(email_is_allowed("Owner@EXAMPLE.com", &allowed, &[]));
     }
 
     #[test]
     fn email_whitespace_is_trimmed_before_match() {
-        let allowed = emails(&["jeremy.barton@gmail.com"]);
-        assert!(email_is_allowed(
-            "  jeremy.barton@gmail.com\t",
-            &allowed,
-            &[]
-        ));
+        let allowed = emails(&["owner@example.com"]);
+        assert!(email_is_allowed("  owner@example.com\t", &allowed, &[]));
     }
 
     #[test]
     fn unlisted_email_is_denied_when_allowlist_present() {
-        let allowed = emails(&["jeremy.barton@gmail.com"]);
+        let allowed = emails(&["owner@example.com"]);
         assert!(!email_is_allowed("evil@attacker.com", &allowed, &[]));
     }
 
@@ -414,7 +410,7 @@ default_scopes = ["claims:read"]
 
     #[test]
     fn empty_email_denied_when_allowlist_configured() {
-        let allowed = emails(&["jeremy.barton@gmail.com"]);
+        let allowed = emails(&["owner@example.com"]);
         assert!(!email_is_allowed("", &allowed, &[]));
         assert!(!email_is_allowed("   ", &allowed, &[]));
         // Also when only a domain allowlist is configured.
