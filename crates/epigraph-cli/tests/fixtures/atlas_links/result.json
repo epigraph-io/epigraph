@@ -1,0 +1,583 @@
+{
+ "format": "atlas-links-result/1",
+ "map": "team:5e5e0000-0000-4000-8000-000000007ea0",
+ "hierarchy": "links",
+ "cap": 6,
+ "seed": 42,
+ "versions": {
+  "numpy": "1.26.4",
+  "scikit-learn": "1.8.0",
+  "umap-learn": "0.5.11",
+  "networkx": "3.6.1",
+  "python": "3.12.3"
+ },
+ "themes": [
+  {
+   "theme_id": "3c886e23-925e-4966-b135-a7ef81df30a4",
+   "id_chunk_cuts": 0,
+   "embedding_splits": 1,
+   "groups": [
+    {
+     "id": "a3f580a9-6493-540c-a047-19edb935e318",
+     "parent": null,
+     "depth": 0,
+     "claim_count": 121,
+     "weight": 122,
+     "kind": "group",
+     "children": [
+      "a16e1ddf-74c5-55f8-bfd2-90fe5d3da644",
+      "bf66da30-bbcc-55d7-8475-d5cb05d2b25e",
+      "64672131-7ab9-57ac-b5e6-6c4d5ceb76bb",
+      "14266b8d-7760-55cf-b160-395d98ddf9be",
+      "d42ce09a-f1e7-5a33-a8bc-b2e410772d18",
+      "38d83ff8-c4f9-5f85-9fd6-680690bb1184",
+      "1c45d768-5c5f-5c9b-8cfb-a36b075b57c3",
+      "7d6f2377-ec23-5ac4-a908-55fccce69293",
+      "25620a2b-c66a-5eb0-9e6d-416d5cf65d3e",
+      "9df4d165-543b-5fe7-8997-48e51b2da5f7",
+      "c0c72121-6aed-5d2e-8a95-31f00201b272",
+      "8d132328-73d8-5655-b544-e2ae09cbdae4"
+     ]
+    },
+    {
+     "id": "a16e1ddf-74c5-55f8-bfd2-90fe5d3da644",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 13,
+     "weight": 14,
+     "kind": "group",
+     "children": [
+      "0395f203-9e13-5460-9b9b-390942e9e668",
+      "9e7e4dc9-f847-501c-a64a-bff0b97e5d66",
+      "48a199ac-6075-5fe1-b5ef-dd6ae9a64eff"
+     ]
+    },
+    {
+     "id": "0395f203-9e13-5460-9b9b-390942e9e668",
+     "parent": "a16e1ddf-74c5-55f8-bfd2-90fe5d3da644",
+     "depth": 2,
+     "claim_count": 5,
+     "weight": 6,
+     "kind": "leaf",
+     "members": [
+      "3427fab6-1eff-616c-103a-bd9be4e1af73",
+      "34b7fb76-9d17-498f-20ce-5531fd482162",
+      "363c244b-5ee9-e185-0ffd-1c81b2f74ab8",
+      "37373bf4-be03-ee6f-034c-70e455a64587",
+      "3887d7cd-e59d-be94-0918-e3cd522750dc"
+     ]
+    },
+    {
+     "id": "9e7e4dc9-f847-501c-a64a-bff0b97e5d66",
+     "parent": "a16e1ddf-74c5-55f8-bfd2-90fe5d3da644",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "0089a89a-751e-a7ac-2c45-1765095fa90c",
+      "00964415-7c0a-1a4a-37df-d169bb372d8b",
+      "00c6a27a-dcdc-c0a3-16d2-7f5d3b7d1ea3",
+      "01d1d4fd-bd81-001e-0bce-792631a2a953"
+     ]
+    },
+    {
+     "id": "48a199ac-6075-5fe1-b5ef-dd6ae9a64eff",
+     "parent": "a16e1ddf-74c5-55f8-bfd2-90fe5d3da644",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 5,
+     "kind": "leaf",
+     "members": [
+      "34b75abc-b29a-b262-0cff-79ff2824faf1",
+      "35535949-3db8-3244-10e7-5e1cefd84090",
+      "3663523c-4270-c8b9-16c0-ff1dd8fcc05f",
+      "373fe593-5ae3-01e3-29af-49626ceaf8a7"
+     ]
+    },
+    {
+     "id": "bf66da30-bbcc-55d7-8475-d5cb05d2b25e",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "87334460-1718-5388-b906-a9720b34a78b",
+      "897cad15-46d8-58a7-b456-dbbeefbb0cda",
+      "4b611c45-92cb-5e52-a2ea-27a38f83279d"
+     ]
+    },
+    {
+     "id": "87334460-1718-5388-b906-a9720b34a78b",
+     "parent": "bf66da30-bbcc-55d7-8475-d5cb05d2b25e",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "024a24b8-4833-e2a9-3871-b685950861e6",
+      "02530b78-b0c2-f7bd-3054-a6b578ed2780",
+      "0261a6e5-7fdd-b912-225e-35c64a833032",
+      "02652a50-bd13-29f5-1c48-477bb01af84e"
+     ]
+    },
+    {
+     "id": "897cad15-46d8-58a7-b456-dbbeefbb0cda",
+     "parent": "bf66da30-bbcc-55d7-8475-d5cb05d2b25e",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "02bdbe8b-f695-7000-092c-08fa649a1cc5",
+      "04020265-275a-bb9a-2192-77c25a93db81",
+      "044463a1-4458-230c-2af7-48f015cdd752",
+      "04fab796-1d45-c54c-02bb-9dd70aceed66"
+     ]
+    },
+    {
+     "id": "4b611c45-92cb-5e52-a2ea-27a38f83279d",
+     "parent": "bf66da30-bbcc-55d7-8475-d5cb05d2b25e",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "054a9d35-ed2c-c705-1aa6-7c50f4fadffa",
+      "06218174-6ece-0896-1571-d8c0a5f0a011",
+      "064f6d18-93db-c51a-0b27-5767e3b7dac3",
+      "07719c50-50d9-15eb-05f0-9cbd8b72cced"
+     ]
+    },
+    {
+     "id": "64672131-7ab9-57ac-b5e6-6c4d5ceb76bb",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "936328e9-c2f9-5d66-b5ee-ef6b8b60d708",
+      "391a1ce1-7228-5d6a-8503-ca6a25abb3f1",
+      "0a5d71d0-69a5-583c-a316-fe8c740b484b"
+     ]
+    },
+    {
+     "id": "936328e9-c2f9-5d66-b5ee-ef6b8b60d708",
+     "parent": "64672131-7ab9-57ac-b5e6-6c4d5ceb76bb",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "08220ac1-67eb-4424-08fc-82766ea52efa",
+      "088f3af8-8db2-57a6-2218-f7212958c0e2",
+      "08bd9d03-6b2f-3316-05a3-7685a3a5538b",
+      "09d78a67-d507-33de-233d-6318075f4519"
+     ]
+    },
+    {
+     "id": "391a1ce1-7228-5d6a-8503-ca6a25abb3f1",
+     "parent": "64672131-7ab9-57ac-b5e6-6c4d5ceb76bb",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "0a046b58-338f-40cb-3e67-6455959c269e",
+      "0a62c869-6f4d-69b5-0b30-5b5883d62f3f",
+      "0aa9f373-6181-eb0e-01e7-36b0400523ad",
+      "0b5bb980-66c8-2485-37a7-9545cdeb70eb"
+     ]
+    },
+    {
+     "id": "0a5d71d0-69a5-583c-a316-fe8c740b484b",
+     "parent": "64672131-7ab9-57ac-b5e6-6c4d5ceb76bb",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "0c173558-8657-70b5-1316-7163049ec45e",
+      "0c77190f-c038-0f86-08b0-7dd462aa735a",
+      "0c793bc9-cc9d-14cf-0a03-1738ae0a2304",
+      "0cc42bb9-8a79-1e76-3a07-fde3c1ec5184"
+     ]
+    },
+    {
+     "id": "14266b8d-7760-55cf-b160-395d98ddf9be",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "8b7f8e4c-b82b-5957-ba0d-de205f995f0a",
+      "772e0b2a-1586-5fe5-8a3d-642cfa293012",
+      "f55df2c2-e330-5663-a12e-c8f84e8c55e4"
+     ]
+    },
+    {
+     "id": "8b7f8e4c-b82b-5957-ba0d-de205f995f0a",
+     "parent": "14266b8d-7760-55cf-b160-395d98ddf9be",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "0d61b0ca-d89f-c348-29f6-066e572061bf",
+      "0d728b83-d742-0879-37fa-5b9c7c089c49",
+      "0dca3a22-a517-0c29-2ce6-8400378114b8",
+      "0dfae5fb-6bc3-3b71-0c25-de904cf044e3"
+     ]
+    },
+    {
+     "id": "772e0b2a-1586-5fe5-8a3d-642cfa293012",
+     "parent": "14266b8d-7760-55cf-b160-395d98ddf9be",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "0e4cfd84-4bda-d78a-3381-379858cce2e5",
+      "0e5074dc-60f2-dcce-11f1-0d2f98ee8ba7",
+      "0ee095ac-d308-c33d-1566-3cfd2cb7e0e9",
+      "0f513c49-3cf0-9179-1671-f1209b51ab92"
+     ]
+    },
+    {
+     "id": "f55df2c2-e330-5663-a12e-c8f84e8c55e4",
+     "parent": "14266b8d-7760-55cf-b160-395d98ddf9be",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "0f667c3f-9d6d-5199-19b1-cccfc2b7f0b5",
+      "100c660f-9254-d1cd-071c-65e348d316d3",
+      "11b7bac0-d817-4fcf-06e3-daf1cdfc2ea5",
+      "11c154a1-ba50-42f6-37b4-b620645cd31f"
+     ]
+    },
+    {
+     "id": "d42ce09a-f1e7-5a33-a8bc-b2e410772d18",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "3947d1c6-6afc-536b-8e2a-5e275109cf39",
+      "4f3556db-9806-5eae-b907-0984ae5948bc",
+      "9a7fec57-a9ea-5df0-b61a-fcc8cef6462b"
+     ]
+    },
+    {
+     "id": "3947d1c6-6afc-536b-8e2a-5e275109cf39",
+     "parent": "d42ce09a-f1e7-5a33-a8bc-b2e410772d18",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "11cf66fd-7680-3ef6-1e0e-387a193b8930",
+      "1215cac1-5974-7929-02d9-db01caa234dc",
+      "13c4341c-9b4d-ec89-35cb-c1d029b0db6d",
+      "140ca821-c46c-0008-1be0-2e3a6c5eddb2"
+     ]
+    },
+    {
+     "id": "4f3556db-9806-5eae-b907-0984ae5948bc",
+     "parent": "d42ce09a-f1e7-5a33-a8bc-b2e410772d18",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "1428b341-a926-7f45-3aa0-1b36585260ca",
+      "1488bd55-c92e-86d0-06b0-99ed4f8f9b0d",
+      "169d1d01-d761-70c5-1699-e5366cf730d6",
+      "17e362fd-310c-f5f2-00cd-42fbbb8b9df1"
+     ]
+    },
+    {
+     "id": "9a7fec57-a9ea-5df0-b61a-fcc8cef6462b",
+     "parent": "d42ce09a-f1e7-5a33-a8bc-b2e410772d18",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "17fa5830-efba-1e9d-2368-52ebc079aec9",
+      "196b3f4c-65f8-951e-047c-4f1ecd2cdbcc",
+      "19936031-f2a0-f221-1d77-ff0b3c71790b",
+      "1a3105d0-d98a-08a1-0989-3420e9f9b9db"
+     ]
+    },
+    {
+     "id": "38d83ff8-c4f9-5f85-9fd6-680690bb1184",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "187066b2-e7e3-5316-bec2-ecc2c88145d4",
+      "cb51f4ea-e583-5c51-adf2-5a7a2f630fe5",
+      "7170efa2-ba7d-5c57-8259-61169e862265"
+     ]
+    },
+    {
+     "id": "187066b2-e7e3-5316-bec2-ecc2c88145d4",
+     "parent": "38d83ff8-c4f9-5f85-9fd6-680690bb1184",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "1a68255e-f888-01d8-2046-6cdd121e99d9",
+      "1ac03a4c-a421-a0c5-1bfd-515784f3f685",
+      "1ad7176c-ce01-260a-365c-91dde64bcc97",
+      "1b7ac9f1-bb47-6b7c-2d3e-260361519a5e"
+     ]
+    },
+    {
+     "id": "cb51f4ea-e583-5c51-adf2-5a7a2f630fe5",
+     "parent": "38d83ff8-c4f9-5f85-9fd6-680690bb1184",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "1b87de35-3122-7dc7-10a7-ff2c1a7a9a12",
+      "1c2c4018-007b-cc3f-0d38-ba38baaded4d",
+      "1d34b959-1ad8-3551-33c1-09fef49d0043",
+      "1d6526e6-d93d-cb99-271b-05a015118afa"
+     ]
+    },
+    {
+     "id": "7170efa2-ba7d-5c57-8259-61169e862265",
+     "parent": "38d83ff8-c4f9-5f85-9fd6-680690bb1184",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "1d8f696d-022c-1b57-0307-77724bd881da",
+      "1e5af7cf-f61b-a878-23a9-664b806b2bfb",
+      "1e84e251-16ec-9ada-0530-055c55e73d2c",
+      "1f9f1426-388d-c7ae-21dd-055cc5904198"
+     ]
+    },
+    {
+     "id": "1c45d768-5c5f-5c9b-8cfb-a36b075b57c3",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "130fb5f0-8d07-50aa-800d-bcf1461dfc74",
+      "ac379ead-e419-5489-aa01-af6899492120",
+      "81e33947-17a6-5559-b44e-05c3b9e02449"
+     ]
+    },
+    {
+     "id": "130fb5f0-8d07-50aa-800d-bcf1461dfc74",
+     "parent": "1c45d768-5c5f-5c9b-8cfb-a36b075b57c3",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "2120c101-5e39-cae7-2fe3-6ff5f637e931",
+      "218b84cd-b32c-10f6-0a8c-92f5b858b4b7",
+      "221c0cee-c581-ab64-2d99-93e66012aa54",
+      "225882e5-5d6f-b9a4-0dde-a1d607a0687d"
+     ]
+    },
+    {
+     "id": "ac379ead-e419-5489-aa01-af6899492120",
+     "parent": "1c45d768-5c5f-5c9b-8cfb-a36b075b57c3",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "22e276a2-2291-2c32-13e6-df60a2e2f339",
+      "230666da-f14b-f87a-290c-f8a085fa4470",
+      "23351b1c-094e-7fb1-1da9-86538ce20fd2",
+      "23c11005-bba0-4eab-26bb-5e1247ca7d27"
+     ]
+    },
+    {
+     "id": "81e33947-17a6-5559-b44e-05c3b9e02449",
+     "parent": "1c45d768-5c5f-5c9b-8cfb-a36b075b57c3",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "254d75af-b383-1c91-3388-fdac1b50dcc6",
+      "254f50ec-3810-313a-1860-46ef1fc81497",
+      "25b64c51-6d2d-47c9-31dc-051d1f54206b",
+      "25c9024f-f98d-fd2a-2cd4-d59780d29202"
+     ]
+    },
+    {
+     "id": "7d6f2377-ec23-5ac4-a908-55fccce69293",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "685b61a3-6a18-5870-9418-be28ab4e3dde",
+      "52770ed6-01bb-508a-9dd1-a35adc5facf0",
+      "1508da85-8608-578f-acbc-49c60c727b39"
+     ]
+    },
+    {
+     "id": "685b61a3-6a18-5870-9418-be28ab4e3dde",
+     "parent": "7d6f2377-ec23-5ac4-a908-55fccce69293",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "25d6c74b-0dc2-be36-0622-506f57315676",
+      "25f9a1fe-3730-cd42-3d72-c079e492ba47",
+      "2699292b-4bbb-03a7-1d61-255e3a060365",
+      "269e2b8c-e0c9-06ec-3634-1523698178e2"
+     ]
+    },
+    {
+     "id": "52770ed6-01bb-508a-9dd1-a35adc5facf0",
+     "parent": "7d6f2377-ec23-5ac4-a908-55fccce69293",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "26c2bd6d-bfab-0147-33c7-24e27ccee3e7",
+      "277d0fe9-c791-439a-27e7-8df1c3cf9415",
+      "28a1c3b8-91e4-86ec-369e-c9e2e031fa30",
+      "29b1fd2e-3c40-ef56-3a00-92619b322b31"
+     ]
+    },
+    {
+     "id": "1508da85-8608-578f-acbc-49c60c727b39",
+     "parent": "7d6f2377-ec23-5ac4-a908-55fccce69293",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "29c51d23-4af2-2970-02c0-e8f83b8b39db",
+      "2a60c5e9-b4a0-de8a-0fdc-8e674b71e21f",
+      "2a6ae601-f2c2-c933-3e7e-2801afc0f61b",
+      "2ab1ad0e-7155-1376-3b89-8ae6c0d0c683"
+     ]
+    },
+    {
+     "id": "25620a2b-c66a-5eb0-9e6d-416d5cf65d3e",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 12,
+     "weight": 12,
+     "kind": "group",
+     "children": [
+      "d444a0a6-4838-5530-9e80-c6e9b64bc80c",
+      "3f13227b-d366-51bd-bd3e-ed55f4067170",
+      "55693be8-3d2e-59e9-b68f-0fe25d59b063"
+     ]
+    },
+    {
+     "id": "d444a0a6-4838-5530-9e80-c6e9b64bc80c",
+     "parent": "25620a2b-c66a-5eb0-9e6d-416d5cf65d3e",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "2b006a01-b780-8241-2de3-18cf5ff7b0a1",
+      "2c3aa519-2052-2636-087a-303860a5ecae",
+      "2c591403-4390-d7ea-31c5-21b8f18bdba8",
+      "2c74da9e-af2b-0bce-11e9-84018a86394e"
+     ]
+    },
+    {
+     "id": "3f13227b-d366-51bd-bd3e-ed55f4067170",
+     "parent": "25620a2b-c66a-5eb0-9e6d-416d5cf65d3e",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "2e8f8719-8de8-1478-3f1f-99a3a452e40a",
+      "2ec3aaf7-faa7-7f35-2722-782232f53213",
+      "2fa580ee-c613-dbea-1d01-d931aa693e64",
+      "30283e07-cee1-b86f-12ee-fce140e4ffad"
+     ]
+    },
+    {
+     "id": "55693be8-3d2e-59e9-b68f-0fe25d59b063",
+     "parent": "25620a2b-c66a-5eb0-9e6d-416d5cf65d3e",
+     "depth": 2,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "30c60903-d653-25f5-077c-b50721348aa0",
+      "312153cf-37d4-5ed9-3679-fd929d266872",
+      "321385c3-566e-bfc3-178b-57c92caf0c3e",
+      "32e88a7e-480f-c26b-3452-ec40b675dc99"
+     ]
+    },
+    {
+     "id": "9df4d165-543b-5fe7-8997-48e51b2da5f7",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "38914030-0940-f970-0588-a478f39bfda3",
+      "399f9a7c-252c-727c-33b1-fc36f242c73c",
+      "3a882f82-3e8a-8b06-0239-caf0ef7f0779",
+      "3af288d2-20f3-1c5a-17f0-df1fe2a33930"
+     ]
+    },
+    {
+     "id": "c0c72121-6aed-5d2e-8a95-31f00201b272",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "3b040f44-8208-8572-00ed-98965f69d0fd",
+      "3b30baf5-98cf-3efe-1728-3d6080b44284",
+      "3d155264-514a-812b-3a92-bcc1630fa6da",
+      "3d363ac2-14ad-c956-35ec-ed4a63b49edd"
+     ]
+    },
+    {
+     "id": "8d132328-73d8-5655-b544-e2ae09cbdae4",
+     "parent": "a3f580a9-6493-540c-a047-19edb935e318",
+     "depth": 1,
+     "claim_count": 4,
+     "weight": 4,
+     "kind": "leaf",
+     "members": [
+      "3d585a87-db11-d52a-050c-321f7dd5965e",
+      "3e487050-643a-7ce7-06e3-4f92a03eb68c",
+      "3ef53d3b-6cfc-9a94-1d1b-6b77f78e1ecc",
+      "3f0283ec-786d-0e75-0635-49eb3ccea927"
+     ]
+    }
+   ]
+  }
+ ]
+}
