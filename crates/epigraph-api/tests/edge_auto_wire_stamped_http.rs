@@ -214,3 +214,95 @@ async fn a_supports_edge_between_own_public_claims_wires_the_target(pool: PgPool
     let edge = post_supports(&state, &pool, member, source, target).await;
     assert_wired("public pair", wired(&pool, edge, target).await);
 }
+
+/// The PROPAGATION half: once the wire lands, `propagate_to_dependents`
+/// recomputes each claim whose reasoning trace names the target. Here that is
+/// a group-private dependent in the member's group, with a binary_truth BBA
+/// and a deliberately stale cache. On the raw pool the trace read could not
+/// see the dependent and its cache write would be refused; on the caller's
+/// stamped transaction the dependent's cache becomes its BBA fold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_wire_propagates_to_a_group_private_dependent(pool: PgPool) {
+    use epigraph_db::MassFunctionRepository;
+    use epigraph_engine::edge_factor::{ensure_binary_frame, preview_claim_belief_on_frame};
+
+    let state = production_state(&pool).await;
+    let (member, source, target) = pair(&pool, "autowire-propagate", "group").await;
+    let group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .expect("the pair's group");
+    let viewer = Viewer::resolve(&pool, member)
+        .await
+        .expect("resolve viewer");
+    let binary = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
+        .await
+        .expect("binary_truth");
+
+    let dependent = seed_group_claim(&pool, member, group, "autowire-propagate dependent").await;
+    MassFunctionRepository::store_with_perspective(
+        &pool,
+        dependent,
+        binary,
+        Some(member),
+        None,
+        &serde_json::json!({"0": 0.8, "0,1": 0.2}),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store the dependent's BBA");
+    sqlx::query(
+        "UPDATE claims SET belief = 0.1, plausibility = 0.2, pignistic_prob = 0.15, \
+                           belief_frame_id = $2 WHERE id = $1",
+    )
+    .bind(dependent)
+    .bind(binary)
+    .execute(&pool)
+    .await
+    .expect("give the dependent a stale cache");
+    let trace = viewer_fixture::seed_reasoning_trace(&pool, dependent, "deductive").await;
+    sqlx::query(
+        "UPDATE reasoning_traces \
+            SET properties = jsonb_build_object('inputs', \
+                    jsonb_build_array(jsonb_build_object('type', 'claim', 'id', $2::text))) \
+          WHERE id = $1",
+    )
+    .bind(trace)
+    .bind(target.to_string())
+    .execute(&pool)
+    .await
+    .expect("name the target as an input of the dependent's trace");
+    let fold = preview_claim_belief_on_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        dependent,
+        binary,
+    )
+    .await
+    .expect("preview")
+    .expect("the dependent's BBA folds");
+    assert!(
+        (fold.pignistic_prob - 0.15).abs() > 0.1,
+        "PREMISE: the stale cache differs from the fold ({fold:?})"
+    );
+
+    let edge = post_supports(&state, &pool, member, source, target).await;
+    assert_wired("propagation pair", wired(&pool, edge, target).await);
+
+    let betp: Option<f64> = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(dependent)
+        .fetch_one(&pool)
+        .await
+        .expect("read the dependent's cache");
+    assert!(
+        betp.is_some_and(|p| (p - fold.pignistic_prob).abs() < 1e-9),
+        "the 1-hop propagation must recompute the dependent on the caller's stamped \
+         transaction: cached {betp:?}, fold {fold:?}"
+    );
+}

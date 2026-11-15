@@ -140,8 +140,10 @@ use std::path::{Path, PathBuf};
 /// with a `Viewer` in scope and unspent. Measured rather than assumed: the ids
 /// reach no response — only a `tracing::info!` — and the write they feed is
 /// itself viewer-filtered, because `recompute_claim_belief` reads its BBAs
-/// through `MassFunctionRepository::get_for_claim_frame(pool, viewer, …)` and
-/// no-ops on a claim the viewer cannot see. So no cross-group mutation and no
+/// through `MassFunctionRepository::get_for_claim_frame(conn, viewer, …)` and
+/// no-ops on a claim the viewer cannot see. Both run on the caller's stamped
+/// transaction (backlog 8d720490 (5)), so row security filters the trace read
+/// to what the caller can see as well. So no cross-group mutation and no
 /// id disclosure. Recorded here rather than left in a review comment, because
 /// the next reader of this paragraph would otherwise re-open it.
 ///
