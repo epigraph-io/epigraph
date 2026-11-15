@@ -398,3 +398,66 @@ async fn the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role
          (response {resp})"
     );
 }
+
+/// Backlog d33a5c9f, REST twin: the claim's OWNER posts evidence on a frame
+/// that does not own the claim's cache. The claim already holds a
+/// `binary_truth` input and a `binary_truth` cache, and the cache owner rule
+/// ranks `binary_truth` above any other frame, so the cache must stay the
+/// `binary_truth` fold. Step 13 used to fold whatever frame was posted and,
+/// for a session that may write the claim row, re-point the cache to it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_owners_submission_on_a_non_owner_frame_keeps_the_binary_truth_cache(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts, RawPool::Superuser).await;
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&w.pool, w.owner)
+        .await
+        .expect("owner viewer");
+    let binary = {
+        let mut conn = w.pool.acquire().await.expect("acquire");
+        epigraph_engine::edge_factor::ensure_binary_frame(&mut conn, &owner_viewer)
+            .await
+            .expect("binary_truth")
+    };
+    let token = common::mint_token_with_agent(&["claims:write"], w.owner);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/api/v1/frames/{binary}/evidence", w.addr))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "claim_id": w.claim, "agent_id": w.owner, "reliability": 1.0,
+            "masses": {"0": 0.9, "0,1": 0.1},
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let text = resp.text().await.expect("body");
+    assert_eq!(status, 201, "the binary_truth POST must be 201: {text}");
+    let before = cache(&w).await;
+    assert!(
+        before.1 == Some(binary) && before.0.is_some_and(|b| (b - 0.9).abs() < EPS),
+        "PREMISE: the owner's binary_truth submission built a binary_truth cache of 0.9: \
+         {before:?} ({text})"
+    );
+
+    let resp = submit(&w, w.owner).await;
+
+    let after = cache(&w).await;
+    assert_eq!(
+        after, before,
+        "an owner's submission on a frame that does not own the cache must leave the \
+         binary_truth cache as it was (response {resp})"
+    );
+    assert_eq!(bbas(&w).await, vec![Some(w.owner)], "the BBA is stored");
+    assert!(
+        (reported(&resp) - 0.6).abs() < EPS,
+        "the response reports this frame's combination: {resp}"
+    );
+    assert!(
+        warnings(&resp)
+            .iter()
+            .any(|m| m.contains(CACHE_NOT_UPDATED) && m.contains(&binary.to_string())),
+        "the response must say the cache was not updated and name the owner frame: {resp}"
+    );
+}
