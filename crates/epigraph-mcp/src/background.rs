@@ -1,99 +1,159 @@
-//! Work a tool call hands off to run after its response: the detached
-//! `ingest_document` / `ingest_document_inline` walks and the post-commit
-//! embedding loops of both document walks.
+//! Tracking for the tasks a tool detaches and answers ahead of.
 //!
-//! Those tasks used to be bare `tokio::spawn`s that nothing owned. On stdio the
-//! process returns from `main` as soon as the client closes the transport, and
-//! the runtime then drops every task still running: a walk the caller was told
-//! was `queued` is cancelled (its one transaction rolls back), and an embedding
-//! loop stops partway, leaving committed claims with no vector. The operator
-//! `ingest-document` CLI lost its embedding loop the same way, because it exits
-//! as soon as the walk returns.
+//! `ingest_document` and `ingest_document_inline` answer `queued` and run the
+//! walk in a detached task; both document walkers embed their new claims in
+//! another. On the HTTP transport the process outlives the request, so those
+//! tasks finish. On stdio it did not: `main` awaited `service.waiting()` and
+//! returned, and a runtime that is dropped cancels every task still on it. A
+//! client that called `ingest_document`, read `queued` and closed the session
+//! ended the process mid-walk (nothing written, the `papers` row left behind)
+//! or mid-embedding (claims committed with no vector) (backlog b928ccc1).
 //!
-//! [`BackgroundTasks`] is the owner. Every clone of a server shares one, so a
-//! task a detached walk spawns (its embedding loop) is tracked by the same
-//! tracker as the walk itself. A process that is about to exit calls
-//! [`BackgroundTasks::drain`], which waits for what is still running, up to a
-//! limit.
+//! [`BackgroundTasks`] counts such tasks so the stdio entry point can wait for
+//! them, with a bound, before it returns. It is a counter and a `Notify`
+//! rather than a `JoinSet`: the tasks are spawned from `&self` tool handlers on
+//! clones of the server, and nothing needs their results, only to know when
+//! there are none left.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_util::task::TaskTracker;
-
-/// How long a stdio server, after its client has gone, and the operator
-/// `ingest-document` CLI wait for the tasks still running before they exit.
-///
-/// Sized for the slowest tracked task: an embedding loop makes one provider
-/// call per created claim, serially, at about 0.8 s each, so a 500-claim
-/// document needs about 400 s.
-pub const EXIT_DRAIN_LIMIT: Duration = Duration::from_secs(600);
-
-/// The tasks a server's tool calls left running. Cloning shares the tracker.
+/// A shared count of detached tasks still running. Clones share the count, so
+/// a per-session clone of the server spawns into the same set.
 #[derive(Clone, Default)]
 pub struct BackgroundTasks {
-    tracker: TaskTracker,
+    inner: Arc<Inner>,
 }
 
-impl std::fmt::Debug for BackgroundTasks {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BackgroundTasks")
-            .field("running", &self.tracker.len())
-            .field("closed", &self.tracker.is_closed())
-            .finish()
+#[derive(Default)]
+struct Inner {
+    active: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Held by a tracked task for its whole life. Decrements on drop, so a task
+/// that panics or is cancelled is still counted out.
+struct Guard(Arc<Inner>);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
     }
 }
 
 impl BackgroundTasks {
-    /// Run `task` on the runtime, tracked, so [`Self::drain`] waits for it.
-    pub fn spawn<F>(&self, task: F)
+    /// `tokio::spawn` a task that [`wait_idle`](Self::wait_idle) waits for.
+    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
     {
-        // The JoinHandle is not kept: a tracked task's failure is its own to
-        // log, as it was when these were bare `tokio::spawn`s.
-        drop(self.tracker.spawn(task));
+        // Counted BEFORE the spawn, not inside the task: a waiter that checks
+        // between the spawn and the task's first poll must already see it.
+        self.inner.active.fetch_add(1, Ordering::SeqCst);
+        let guard = Guard(Arc::clone(&self.inner));
+        tokio::spawn(async move {
+            let _guard = guard;
+            future.await
+        })
     }
 
-    /// How many tracked tasks have not finished yet.
+    /// How many tracked tasks are running now.
     #[must_use]
-    pub fn running(&self) -> usize {
-        self.tracker.len()
+    pub fn active(&self) -> usize {
+        self.inner.active.load(Ordering::SeqCst)
     }
 
-    /// Wait up to `limit` for every tracked task to finish, and return how
-    /// many were still running when the wait ended (0 when all finished).
+    /// Wait until no tracked task is running, or until `timeout` has passed.
+    /// Returns `true` when the set went idle, `false` on the timeout.
     ///
-    /// A task spawned while the drain waits, such as the embedding loop of a
-    /// walk that is finishing, is waited for too: the tracker is empty only
-    /// when the last of them is done. Tasks left at the limit are named in a
-    /// WARN; they are cancelled when the process exits.
-    pub async fn drain(&self, limit: Duration) -> usize {
-        self.tracker.close();
-        let running = self.tracker.len();
-        if running == 0 {
-            return 0;
-        }
-        tracing::info!(
-            running,
-            limit_secs = limit.as_secs(),
-            "waiting for background tasks (detached ingests, embedding loops) to finish \
-             before exiting"
+    /// A task spawned while this waits is waited for too.
+    pub async fn wait_idle(&self, timeout: Duration) -> bool {
+        let idle = async {
+            loop {
+                // Registered before the count is read, so a task that finishes
+                // between the read and the await still wakes this waiter.
+                let notified = self.inner.idle.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.active() == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, idle).await.is_ok()
+    }
+}
+
+/// How long a process waits, before it exits, for the tracked tasks still
+/// running: `EPIGRAPH_MCP_STDIO_DRAIN_SECS`, default 120. An unparseable value
+/// keeps the default; `0` waits not at all (the behaviour before the wait
+/// existed). Read by the stdio entry point after its client disconnects and
+/// by the operator `ingest-document` CLI after its walk returns with the
+/// embedding loop still running.
+#[must_use]
+pub fn exit_drain_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("EPIGRAPH_MCP_STDIO_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackgroundTasks;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn an_idle_set_does_not_wait() {
+        let tasks = BackgroundTasks::default();
+        assert!(tasks.wait_idle(Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_idle_returns_once_every_task_has_finished() {
+        let tasks = BackgroundTasks::default();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = done.clone();
+        tasks.spawn(async move {
+            let _ = gate.await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // A clone shares the set: this is the server clone a detached walk runs on.
+        let clone = tasks.clone();
+        clone.spawn(async {});
+        assert!(
+            tasks.active() >= 1,
+            "the gated task is counted from the spawn"
         );
-        if tokio::time::timeout(limit, self.tracker.wait())
-            .await
-            .is_ok()
-        {
-            return 0;
-        }
-        let left = self.tracker.len();
-        tracing::warn!(
-            left,
-            limit_secs = limit.as_secs(),
-            "background tasks still running at the drain limit are cancelled on exit: a \
-             detached ingest that had not committed wrote nothing, and claims whose embedding \
-             had not been stored carry no vector until the maintenance backfill reaches them"
+
+        assert!(
+            !tasks.wait_idle(Duration::from_millis(50)).await,
+            "a task that has not finished keeps the set busy"
         );
-        left
+        release.send(()).unwrap();
+        assert!(tasks.wait_idle(Duration::from_secs(5)).await);
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "idle means the task ran to completion, not that it was dropped"
+        );
+        assert_eq!(tasks.active(), 0);
+    }
+
+    /// A task that panics must not hold the process open until the timeout.
+    #[tokio::test]
+    async fn a_panicking_task_is_counted_out() {
+        let tasks = BackgroundTasks::default();
+        let handle = tasks.spawn(async { panic!("boom") });
+        assert!(handle.await.is_err());
+        assert!(tasks.wait_idle(Duration::from_secs(5)).await);
     }
 }

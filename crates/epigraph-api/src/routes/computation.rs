@@ -730,7 +730,16 @@ async fn apply_bp_updates(
 
 /// The stored BBAs that seed a CDST BP run, with each row's source (writing
 /// agent, its owner, its same-source key), read on one viewer-stamped
-/// connection.
+/// connection, and the belief profile their reliability discount resolves
+/// under.
+///
+/// Only rows on the canonical `binary_truth` frame seed BP (backlog
+/// 42be8a60): BP reads a row's masses by index on {supported, unsupported},
+/// and a row on another frame (three hypotheses, another order, another
+/// question) would be reinterpreted index by index. The profile is that
+/// frame's fold profile, as the served fold discounts under it
+/// ([`epigraph_engine::cdst_bp::seed_mass`]). No `binary_truth` frame the
+/// caller can read means no seeds.
 ///
 /// Ruling R-22: a run that writes caches (`apply`) seeds each claim with the
 /// BBAs its own recompute may fold (every source at least as widely readable
@@ -746,10 +755,13 @@ async fn bp_seed_rows(
     claim_ids: &[Uuid],
     apply: bool,
 ) -> Result<
-    Vec<(
-        epigraph_db::MassFunctionRow,
-        epigraph_engine::source_dependence::BbaSource,
-    )>,
+    (
+        Vec<(
+            epigraph_db::MassFunctionRow,
+            epigraph_engine::source_dependence::BbaSource,
+        )>,
+        epigraph_engine::belief_profile::BeliefProfile,
+    ),
     ApiError,
 > {
     // The BBA load shares the stamped connection with the source reads below.
@@ -762,6 +774,36 @@ async fn bp_seed_rows(
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to load mass functions: {e}"),
         })?;
+    // Before the scope filters and the source read, so rows and sources stay
+    // aligned and nothing off the seed frame is read further.
+    let seed_frame = epigraph_engine::edge_factor::find_binary_frame(&mut read, viewer)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to resolve the binary_truth frame: {e}"),
+        })?;
+    let (rows, profile) = match seed_frame {
+        Some(frame_id) => {
+            let profile = epigraph_engine::edge_factor::frame_fold_profile(
+                &mut read,
+                viewer,
+                frame_id,
+                epigraph_engine::belief_profile::BeliefProfile::served(),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to resolve the binary_truth fold profile: {e}"),
+            })?;
+            let rows: Vec<_> = rows
+                .into_iter()
+                .filter(|r| r.frame_id == frame_id)
+                .collect();
+            (rows, profile)
+        }
+        None => (
+            Vec::new(),
+            epigraph_engine::belief_profile::BeliefProfile::served().clone(),
+        ),
+    };
     let rows = if apply {
         epigraph_engine::derivation_scope::retain_for_cache(&mut read, rows).await?
     } else {
@@ -770,7 +812,7 @@ async fn bp_seed_rows(
     let sources =
         epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &rows).await?;
     crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
-    Ok(rows.into_iter().zip(sources).collect())
+    Ok((rows.into_iter().zip(sources).collect(), profile))
 }
 
 /// The claims of a BP run whose connected component in the factor graph
@@ -839,7 +881,73 @@ fn claims_informed_by_less_readable(
     out
 }
 
+/// The most iterations a `POST /api/v1/bp/propagate` caller may ask for. The
+/// default is 20; the engines' loops are synchronous and end only on
+/// convergence or this cap, so an unbounded value pins a runtime worker.
+#[cfg(feature = "db")]
+pub const BP_MAX_ITERATIONS: usize = 200;
+
+/// The BP configuration a [`PropagateRequest`] asks for, with the engine
+/// defaults (20 iterations, threshold 0.01, damping 0.5) for omitted fields.
+///
+/// # Errors
+/// `ApiError::ValidationError` (400) when `max_iterations` exceeds
+/// [`BP_MAX_ITERATIONS`], or `convergence_threshold` or `damping` is outside
+/// `[0, 1]`. Both are compared against beliefs in `[0, 1]`: a negative
+/// threshold can never be met, and a damping outside `[0, 1]` extrapolates
+/// instead of interpolating between the old and new message.
+#[cfg(feature = "db")]
+fn bp_config_from_request(
+    request: &PropagateRequest,
+) -> Result<epigraph_engine::BpConfig, ApiError> {
+    let unit_interval = |field: &str, value: f64| {
+        if (0.0..=1.0).contains(&value) {
+            Ok(value)
+        } else {
+            Err(ApiError::ValidationError {
+                field: field.to_string(),
+                reason: format!("Must be in [0, 1] (got {value})"),
+            })
+        }
+    };
+    let max_iterations = request.max_iterations.unwrap_or(20);
+    if max_iterations > BP_MAX_ITERATIONS {
+        return Err(ApiError::ValidationError {
+            field: "max_iterations".to_string(),
+            reason: format!("Must be at most {BP_MAX_ITERATIONS} (got {max_iterations})"),
+        });
+    }
+    Ok(epigraph_engine::BpConfig {
+        max_iterations,
+        convergence_threshold: unit_interval(
+            "convergence_threshold",
+            request.convergence_threshold.unwrap_or(0.01),
+        )?,
+        damping: unit_interval("damping", request.damping.unwrap_or(0.5))?,
+    })
+}
+
+/// Run a BP engine on the blocking pool, off the async runtime's workers
+/// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
+/// sweeps of the factor graph.
+#[cfg(feature = "db")]
+async fn run_bp_blocking<T, F>(run: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(run)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("belief propagation did not complete: {e}"),
+        })
+}
+
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
+///
+/// `max_iterations` is capped at [`BP_MAX_ITERATIONS`] and
+/// `convergence_threshold` / `damping` must lie in `[0, 1]`; anything else is
+/// a 400 before any factor is loaded.
 ///
 /// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
 /// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
@@ -857,11 +965,7 @@ pub async fn propagate_beliefs(
     State(state): State<AppState>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = epigraph_engine::BpConfig {
-        max_iterations: request.max_iterations.unwrap_or(20),
-        convergence_threshold: request.convergence_threshold.unwrap_or(0.01),
-        damping: request.damping.unwrap_or(0.5),
-    };
+    let config = bp_config_from_request(&request)?;
     let apply = request.apply_updates.unwrap_or(false);
 
     // BP apply is retired (SPEC §6.2, hazard H4): refused before anything is
@@ -971,22 +1075,29 @@ pub async fn propagate_beliefs(
     // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
     // (rulings R-22 and R-36), for the coverage check too, so a BBA the
     // caller may not see a fold of cannot flip the mode either.
-    let (use_cdst, seed_rows) = match mode {
+    let no_seeds = || {
+        (
+            Vec::new(),
+            epigraph_engine::belief_profile::BeliefProfile::served().clone(),
+        )
+    };
+    let (use_cdst, (seed_rows, seed_profile)) = match mode {
         "cdst" => (
             true,
             bp_seed_rows(&state, &viewer, &all_var_ids, apply).await?,
         ),
-        "scalar" | "interval" => (false, Vec::new()),
+        "scalar" | "interval" => (false, no_seeds()),
         _ => {
             // Auto: load mass functions and check coverage (a failed load
-            // reads as no coverage, as before).
-            let rows = bp_seed_rows(&state, &viewer, &all_var_ids, apply)
+            // reads as no coverage, as before). Coverage counts the seed
+            // rows only, so BBAs on other frames no longer pick CDST.
+            let seeds = bp_seed_rows(&state, &viewer, &all_var_ids, apply)
                 .await
-                .unwrap_or_default();
+                .unwrap_or_else(|_| no_seeds());
             let claims_with_mf: std::collections::HashSet<Uuid> =
-                rows.iter().map(|(r, _)| r.claim_id).collect();
+                seeds.0.iter().map(|(r, _)| r.claim_id).collect();
             let use_cdst = !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len();
-            (use_cdst, rows)
+            (use_cdst, seeds)
         }
     };
 
@@ -1005,7 +1116,9 @@ pub async fn propagate_beliefs(
             )>,
         > = HashMap::new();
         for (row, source) in seed_rows {
-            if let Ok(mf) = epigraph_engine::cdst_bp::parse_mass_function_row(&row.masses) {
+            // Discounted by its reliability before any combine, as the served
+            // fold does.
+            if let Ok(mf) = epigraph_engine::cdst_bp::seed_mass(&row, &seed_profile) {
                 per_claim
                     .entry(row.claim_id)
                     .or_default()
@@ -1074,12 +1187,16 @@ pub async fn propagate_beliefs(
             ..epigraph_engine::cdst_bp::CdstBpConfig::default()
         };
 
-        let result = epigraph_engine::cdst_bp::run_cdst_bp(
-            &engine_factors,
-            &initial,
-            &evidence,
-            &cdst_config,
-        );
+        let factors_count = engine_factors.len();
+        let result = run_bp_blocking(move || {
+            epigraph_engine::cdst_bp::run_cdst_bp(
+                &engine_factors,
+                &initial,
+                &evidence,
+                &cdst_config,
+            )
+        })
+        .await?;
 
         // Apply updates: write pignistic_prob, belief, plausibility to claims,
         // all-or-nothing on one transaction stamped with the caller's viewer
@@ -1114,7 +1231,7 @@ pub async fn propagate_beliefs(
             "max_change": result.max_change,
             "max_conflict": result.max_conflict,
             "messages_sent": result.messages_sent,
-            "factors_count": engine_factors.len(),
+            "factors_count": factors_count,
             "variables_count": all_var_ids.len(),
             "applied": apply,
             "applied_count": written,
@@ -1129,7 +1246,11 @@ pub async fn propagate_beliefs(
     }
 
     // -- Scalar BP fallback ---------------------------------------------------
-    let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
+    let factors_count = engine_factors.len();
+    let result = run_bp_blocking(move || {
+        epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config)
+    })
+    .await?;
 
     let (mut written, mut skipped, mut skipped_compounds, mut skipped_less_readable) =
         (0_usize, 0_usize, 0_usize, 0_usize);
@@ -1155,7 +1276,7 @@ pub async fn propagate_beliefs(
         "converged": result.converged,
         "max_change": result.max_change,
         "messages_sent": result.messages_sent,
-        "factors_count": engine_factors.len(),
+        "factors_count": factors_count,
         "variables_count": all_var_ids.len(),
         "applied": apply,
         "applied_count": written,
@@ -1398,6 +1519,65 @@ async fn extract_neighborhood(
     })?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+#[cfg(all(test, feature = "db"))]
+mod bp_config_tests {
+    use super::{bp_config_from_request, PropagateRequest, BP_MAX_ITERATIONS};
+    use crate::errors::ApiError;
+
+    fn request(body: serde_json::Value) -> PropagateRequest {
+        serde_json::from_value(body).expect("request deserializes")
+    }
+
+    fn refused_field(body: serde_json::Value) -> String {
+        match bp_config_from_request(&request(body.clone())) {
+            Err(ApiError::ValidationError { field, .. }) => field,
+            other => panic!("{body} must be a validation error, got {other:?}"),
+        }
+    }
+
+    /// The handler copied these three straight into `BpConfig`, so
+    /// `{"max_iterations": 10^12, "convergence_threshold": 0}` ran a
+    /// synchronous loop for as long as the caller liked (backlog 69f52e3f).
+    #[test]
+    fn out_of_range_iteration_parameters_are_refused() {
+        use serde_json::json;
+        assert_eq!(
+            refused_field(json!({"max_iterations": BP_MAX_ITERATIONS + 1})),
+            "max_iterations"
+        );
+        assert_eq!(
+            refused_field(json!({"max_iterations": 1_000_000_000_000_u64})),
+            "max_iterations"
+        );
+        for bad in [-0.01, 1.01, -1.0e9] {
+            assert_eq!(
+                refused_field(json!({"convergence_threshold": bad})),
+                "convergence_threshold"
+            );
+            assert_eq!(refused_field(json!({"damping": bad})), "damping");
+        }
+    }
+
+    #[test]
+    fn defaults_and_in_range_values_are_kept() {
+        use serde_json::json;
+        let d = bp_config_from_request(&request(json!({}))).expect("defaults are valid");
+        assert_eq!(d.max_iterations, 20);
+        assert!((d.convergence_threshold - 0.01).abs() < f64::EPSILON);
+        assert!((d.damping - 0.5).abs() < f64::EPSILON);
+
+        let c = bp_config_from_request(&request(json!({
+            "max_iterations": BP_MAX_ITERATIONS,
+            "convergence_threshold": 0.0,
+            "damping": 1.0,
+        })))
+        .expect("the bounds themselves are accepted");
+        assert_eq!(c.max_iterations, BP_MAX_ITERATIONS);
+        assert!(c.convergence_threshold.abs() < f64::EPSILON);
+        assert!((c.damping - 1.0).abs() < f64::EPSILON);
+    }
 }
 
 #[cfg(all(test, feature = "db"))]

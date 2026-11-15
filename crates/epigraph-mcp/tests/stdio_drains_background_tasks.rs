@@ -11,23 +11,24 @@
 //! Two halves are pinned here:
 //!
 //! - behaviour: over the real stdio transport (`stdio_server_transport` on an
-//!   in-memory duplex pipe), a task spawned on the server's tracker is still
-//!   running when the client has gone and `waiting` has returned, and
-//!   `BackgroundTasks::drain` returns only after it finished. A drain with a
-//!   limit gives up on a task that never ends and says how many were left.
-//! - wiring: `main.rs` takes the tracker before `serve` consumes the server
-//!   and drains it after `waiting`, without a `?` on `waiting` that would skip
-//!   the drain. Source-level for the reason `stdio_transport_wired_into_main.rs`
+//!   in-memory duplex pipe), a task spawned on the server's `BackgroundTasks`
+//!   is still running when the client has gone and `waiting` has returned, and
+//!   `BackgroundTasks::wait_idle` returns only after it finished. (The bound
+//!   and the panic case are `background::tests`.)
+//! - wiring: `main.rs` takes the set before `serve` consumes the server and
+//!   waits on it after `waiting`, without a `?` on `waiting` that would skip
+//!   the wait. Source-level for the reason `stdio_transport_wired_into_main.rs`
 //!   records: a test process cannot boot the binary into stdio mode.
 //!
 //! The operator `ingest-document` CLI (epigraph-cli) has the same exit shape:
 //! its walk returns with the embedding loop still running on the server's
-//! tracker, so it must drain before it exits; a source ratchet pins that too.
+//! `BackgroundTasks`, so it must wait for it before it exits; a source ratchet
+//! pins that too.
 //!
-//! Verified to fail: with `drain` returning without waiting, both drain tests
-//! fail (the task is reported left and is not finished); with the drain lines
-//! removed from `main.rs`, the wiring test fails; with the drain removed from
-//! the CLI, the CLI ratchet fails.
+//! Verified to fail: with `wait_idle` returning without waiting, the transport
+//! test fails (the task is not finished); with the wait removed from
+//! `main.rs`, the wiring test fails; with the wait removed from the CLI, the
+//! CLI ratchet fails.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -48,7 +49,7 @@ fn server() -> epigraph_mcp::EpiGraphMcpFull {
 }
 
 #[tokio::test]
-async fn a_task_left_running_when_the_client_closes_finishes_before_the_drain_returns() {
+async fn a_task_left_running_when_the_client_closes_finishes_before_the_wait_returns() {
     let (server_end, client_end) = tokio::io::duplex(1 << 20);
     let server = server();
     let background = server.background_tasks();
@@ -88,39 +89,28 @@ async fn a_task_left_running_when_the_client_closes_finishes_before_the_drain_re
         !finished.load(Ordering::SeqCst),
         "fixture: the task must still be running after the transport closed"
     );
-    assert_eq!(background.running(), 1, "the task is tracked");
+    assert_eq!(background.active(), 1, "the task is tracked");
 
-    // Released only now, so the drain below is what waits for it.
+    // Released only now, so the wait below is what waits for it.
     release.send(()).expect("the task is waiting");
-    let left = background.drain(Duration::from_secs(10)).await;
-    assert_eq!(left, 0, "every task finished inside the limit");
+    assert!(
+        background.wait_idle(Duration::from_secs(10)).await,
+        "every task finished inside the limit"
+    );
     assert!(
         finished.load(Ordering::SeqCst),
-        "the drain returned before the task it was draining finished"
+        "the wait returned before the task it was waiting for finished"
     );
 }
 
 #[tokio::test]
-async fn a_drain_gives_up_at_its_limit_and_counts_what_is_left() {
-    let background = server().background_tasks();
-    background.spawn(std::future::pending::<()>());
-    let started = std::time::Instant::now();
-    let left = background.drain(Duration::from_millis(200)).await;
-    assert_eq!(left, 1, "the never-ending task is reported as left");
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the drain is bounded by its limit"
-    );
-}
-
-#[tokio::test]
-async fn clones_of_a_server_share_one_tracker() {
+async fn clones_of_a_server_share_one_set() {
     // A detached walk runs on a CLONE of the request's server and spawns its
-    // embedding loop from there; the process drains the original's tracker.
+    // embedding loop from there; the process waits on the original's set.
     let original = server();
     let clone = original.clone();
     clone.background_tasks().spawn(std::future::pending::<()>());
-    assert_eq!(original.background_tasks().running(), 1);
+    assert_eq!(original.background_tasks().active(), 1);
 }
 
 // ── main.rs wiring ─────────────────────────────────────────────────────────
@@ -135,7 +125,8 @@ fn normalized(source: &str) -> String {
         .collect()
 }
 
-/// Every way `source` fails to drain the tracker around its stdio serve.
+/// Every way `source` fails to wait for the background set around its stdio
+/// serve.
 fn drain_wiring_violations(source: &str) -> Vec<String> {
     let code = normalized(source);
     let mut violations = Vec::new();
@@ -151,7 +142,7 @@ fn drain_wiring_violations(source: &str) -> Vec<String> {
         });
     let Some(name) = taken else {
         return vec![
-            "the tracker is not taken (`let <name> = server.background_tasks();`) before \
+            "the set is not taken (`let <name> = server.background_tasks();`) before \
              `.serve(transport)` consumes the server"
                 .into(),
         ];
@@ -162,13 +153,15 @@ fn drain_wiring_violations(source: &str) -> Vec<String> {
     };
     if after[waiting..].starts_with(".waiting().await?") {
         violations.push(
-            "`.waiting().await?` returns before the drain when `waiting` fails; capture it, \
-             drain, then propagate"
+            "`.waiting().await?` returns before the wait when `waiting` fails; capture it, \
+             wait, then propagate"
                 .into(),
         );
     }
-    if !after[waiting..].contains(&format!("{name}.drain(")) {
-        violations.push(format!("`{name}.drain(` is not called after `.waiting()`"));
+    if !after[waiting..].contains(&format!("{name}.wait_idle(")) {
+        violations.push(format!(
+            "`{name}.wait_idle(` is not called after `.waiting()`"
+        ));
     }
     violations
 }
@@ -180,7 +173,7 @@ fn main_drains_background_tasks_after_the_stdio_client_goes() {
     let violations = drain_wiring_violations(&source);
     assert!(
         violations.is_empty(),
-        "main.rs must drain the server's background tasks after its stdio client goes: {}",
+        "main.rs must wait for the server's background tasks after its stdio client goes: {}",
         violations.join("; ")
     );
 }
@@ -191,25 +184,36 @@ fn the_check_catches_the_pre_fix_shape_and_a_skipping_question_mark() {
     assert!(!drain_wiring_violations(before).is_empty());
     let skipping = "let background = server.background_tasks(); \
                     let service = server.serve(transport).await?; \
-                    service.waiting().await?; background.drain(LIMIT).await;";
+                    service.waiting().await?; background.wait_idle(LIMIT).await;";
     assert!(!drain_wiring_violations(skipping).is_empty());
     let fixed = "let background = server.background_tasks(); \
                  let service = server.serve(transport).await?; \
                  let served = service.waiting().await; \
-                 background.drain(LIMIT).await; served?;";
+                 if background.active() > 0 { background.wait_idle(LIMIT).await; } served?;";
     assert_eq!(drain_wiring_violations(fixed), Vec::<String>::new());
 }
 
-/// Every way the `ingest-document` CLI fails to drain after its walk.
+/// Every way the `ingest-document` CLI fails to wait for its background set
+/// after its walk.
 fn cli_drain_violations(source: &str) -> Vec<String> {
     let code = normalized(source);
     let Some(walk) = code.find("do_ingest_document_reporting(&server") else {
         return vec!["no `do_ingest_document_reporting(&server` call".into()];
     };
-    if code[walk..].contains("server.background_tasks().drain(") {
+    let after = &code[walk..];
+    let taken = after.find("=server.background_tasks();").and_then(|at| {
+        let start = after[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+        after[start..at].strip_prefix("let").map(str::to_string)
+    });
+    let Some(name) = taken else {
+        return vec![
+            "`let <name> = server.background_tasks();` is not taken after the walk".into(),
+        ];
+    };
+    if after.contains(&format!("{name}.wait_idle(")) {
         Vec::new()
     } else {
-        vec!["`server.background_tasks().drain(` is not called after the walk".into()]
+        vec![format!("`{name}.wait_idle(` is not called after the walk")]
     }
 }
 
@@ -223,7 +227,7 @@ fn the_ingest_document_cli_drains_before_it_exits() {
     let violations = cli_drain_violations(&source);
     assert!(
         violations.is_empty(),
-        "the ingest-document CLI must drain the server's background tasks (its embedding \
+        "the ingest-document CLI must wait for the server's background tasks (its embedding \
          loop) before it exits: {}",
         violations.join("; ")
     );
@@ -236,6 +240,7 @@ fn the_cli_check_catches_a_missing_drain() {
     assert!(!cli_drain_violations(before).is_empty());
     let fixed = "let (result, tenancy) = do_ingest_document_reporting(&server, viewer, \
                  &extraction, None, choice).await?; \
-                 let left = server.background_tasks().drain(LIMIT).await;";
+                 let background = server.background_tasks(); \
+                 if background.active() > 0 { background.wait_idle(LIMIT).await; }";
     assert_eq!(cli_drain_violations(fixed), Vec::<String>::new());
 }

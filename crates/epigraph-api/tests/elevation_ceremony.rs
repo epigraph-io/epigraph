@@ -4129,3 +4129,100 @@ async fn an_android_hardware_key_enrolls_under_an_android_root(pool: PgPool) {
     );
     assert!(passkey_rows(&pool, q.person).await.is_empty());
 }
+
+/// The enrollment ceremony on `id` by a fresh device-bound Android phone
+/// attested under `google`: `(challenge options, finish)`.
+async fn enroll_android_on(
+    s: &Server,
+    id: Uuid,
+    google: &TestAttestation,
+) -> (Value, (StatusCode, Value)) {
+    let base = format!("/elevate/enroll/{id}");
+    let (status, options) = s.post(&format!("{base}/challenge"), None, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "enrollment challenge: {options}");
+    let mut phone = SoftAuthenticator::new(SYNCED_MODEL).hardware();
+    let created = phone
+        .register(ORIGIN, options.clone(), ClientUv::AsRequested)
+        .await;
+    let response = google.android_key(&phone, &created, true);
+    (
+        options,
+        s.post(&format!("{base}/finish"), None, &response).await,
+    )
+}
+
+/// On the ANCHORED path through the real router, an Android hardware key
+/// whose standing cannot be checked (the attestation status list older than
+/// 48 hours) is refused `400 registration_refused`, naming the stale list,
+/// and no passkey row is written. CALIBRATION: on the same server, while the
+/// list is fresh, the same anchored ceremony records the phone `android-key`
+/// with no anchor (it stands on its own).
+/// Mutations: the anchored finish's status-unknown arm dropping instead of
+/// refusing -> the stale enrollment answers 200, recorded `none`; the route
+/// mapping `AttestationRefused` to another code -> the error is not
+/// `registration_refused`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_android_key_with_a_stale_status_list_is_refused_on_the_anchored_path(pool: PgPool) {
+    let att = TestAttestation::new("Allowlisted");
+    let google = TestAttestation::new("Android");
+    let status_file = support::android_status::fresh_empty();
+    let rp = Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Attested(epigraph_passkey::AttestedPolicy {
+            allowlist: Some(epigraph_passkey::AaguidAllowlist {
+                ca_pem: att.root_pem(),
+                aaguids: [MODEL].into_iter().collect(),
+            }),
+            android_key_ca_pem: Some(google.root_pem()),
+            android_key_status_file: Some(status_file.clone()),
+            allow_synced_anchored: true,
+        }),
+    })
+    .expect("relying party");
+    let s = spawn(&pool, Some(rp)).await;
+    let (p, mut hw) = attested_holder(&pool, &s, &att, "android anchored").await;
+    let token = elevated_token_device_bound(&s, &pool, &p).await;
+
+    let act = register_act(&s, &p, &token, &mut hw).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let (options, (status, body)) = enroll_android_on(&s, id, &google).await;
+    assert!(
+        anchored_options(&options),
+        "the anchored ceremony: {options}"
+    );
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: a fresh list: {body}");
+    assert_eq!(body["attestation_format"], "android-key", "{body}");
+    assert_eq!(body["anchored_by"], Value::Null, "{body}");
+
+    // The refresh job stops: the list is now 49 hours old.
+    std::fs::File::options()
+        .write(true)
+        .open(&status_file)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(49 * 3600))
+        .unwrap();
+    let act = register_act(&s, &p, &token, &mut hw).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let (options, (status, body)) = enroll_android_on(&s, id, &google).await;
+    assert!(
+        anchored_options(&options),
+        "the anchored ceremony: {options}"
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "registration_refused", "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("older than the 48h maximum")),
+        "names the stale list: {body}"
+    );
+    assert_eq!(
+        passkey_rows(&pool, p.person).await,
+        vec![
+            ("packed".to_string(), false),
+            ("android-key".to_string(), false)
+        ],
+        "no row for the refused phone"
+    );
+}

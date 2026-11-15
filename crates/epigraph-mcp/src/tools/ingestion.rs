@@ -247,10 +247,9 @@ pub async fn ingest_document(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    // Tracked, not a bare `tokio::spawn`: a stdio process whose client closes
-    // the session drains it before exiting (`crate::background`), instead of
-    // cancelling a walk the caller was told is `queued`.
-    server.background_tasks().spawn(async move {
+    // Tracked, so a stdio process waits for the walk before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -389,10 +388,9 @@ pub async fn ingest_document_inline(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    // Tracked, not a bare `tokio::spawn`: a stdio process whose client closes
-    // the session drains it before exiting (`crate::background`), instead of
-    // cancelling a walk the caller was told is `queued`.
-    server.background_tasks().spawn(async move {
+    // Tracked, so a stdio process waits for the walk before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -1044,6 +1042,100 @@ impl IngestTx<'_> {
         }
         Ok(resolution.decl(group))
     }
+}
+
+/// Embed the claims a document ingest just CREATED, in a detached task, and
+/// store each vector as the ingest wrote the claim: stamped from the
+/// ingesting `author`, widened by the ingest's team-write `grant`.
+///
+/// The claims used to go through `McpEmbedder::embed_and_store`, whose store
+/// path resolves a claim's author by reading the row as PUBLIC. A document
+/// ingest's claims have gone to the author's team (or stayed private) by
+/// default since the 2026-11-10 visibility ruling, never silently public, so
+/// for a default ingest that read found nothing and every background embed
+/// was refused with only a WARN (backlog 46902f71). `submit_claim`, `memorize`
+/// and workflow ingest were each moved off that path for this reason; the two
+/// document walkers were not.
+///
+/// `embed_queue` holds only claims this ingest inserted (a dedup-converged
+/// claim never enters it), so the ingesting author is the writer of every
+/// row. A server on a DECLARED privileged pool has no `ScopedPool` to stamp;
+/// there the embedder's own store path (the privileged pool) is the right one,
+/// as before.
+///
+/// Best-effort (CLAUDE.md "Embedding policy"): a failure is warned with its
+/// cause and the claim stays stored.
+///
+/// Returns how many embeddings were QUEUED, which is what the walk's response
+/// reports (backlog fdacc14f): a stored count is unknowable when the response
+/// is built. 0 when the queue is empty or this server has no embedding
+/// provider (`McpEmbedder::embeddings_disabled`); then no task is spawned,
+/// because every provider call would fail, and one WARN says so.
+fn spawn_ingest_embeds(
+    server: &EpiGraphMcpFull,
+    author: Uuid,
+    grant: Option<epigraph_db::TeamWriteGrant>,
+    embed_queue: Vec<(Uuid, String)>,
+    tool_name: &'static str,
+) -> usize {
+    if embed_queue.is_empty() {
+        return 0;
+    }
+    if server.embedder.embeddings_disabled() {
+        tracing::warn!(
+            tool = tool_name,
+            claims = embed_queue.len(),
+            "embeddings are disabled on this server (no provider key), so the claims this \
+             ingest created carry no vector until the maintenance backfill reaches them"
+        );
+        return 0;
+    }
+    let queued = embed_queue.len();
+    // The whole server, as the detached walk takes it: the stamped store needs
+    // its `ScopedPool` and its embedder, and reaches the pool only inside
+    // `claim_helper`, where every author-stamped store already does.
+    let bg = server.clone();
+    // Tracked, so a stdio process waits for the vectors before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
+        let (mut stored, total) = (0usize, embed_queue.len());
+        for (id, content) in embed_queue {
+            let embedded = if bg.scoped.is_some() {
+                crate::claim_helper::embed_claim_author_stamped_for(
+                    &bg,
+                    author,
+                    id,
+                    &content,
+                    None,
+                    tool_name,
+                    grant.as_ref(),
+                )
+                .await
+            } else {
+                // A DECLARED privileged pool: no stamp to take; the embedder's
+                // own store path is that pool.
+                bg.embedder.embed_and_store(id, &content).await
+            };
+            if embedded {
+                stored += 1;
+            } else {
+                tracing::warn!(
+                    tool = tool_name,
+                    "background embedding failed for claim {id}"
+                );
+            }
+        }
+        if stored < total {
+            tracing::warn!(
+                tool = tool_name,
+                stored,
+                queued = total,
+                "document ingest embedded fewer claims than it queued; the rest are current \
+                 claims with no vector until a backfill reaches them"
+            );
+        }
+    });
+    queued
 }
 
 async fn begin_ingest_tx<'p>(
@@ -1779,10 +1871,10 @@ pub async fn do_ingest_document_reporting(
     // by N × ~0.8 s OpenAI calls. The response reports the number QUEUED (0 when
     // this server has no embedding provider), never a number stored: nothing has
     // been stored when it is built. The task logs stored against queued.
-    let queued = spawn_created_claim_embeds(
+    let queued = spawn_ingest_embeds(
         server,
         agent_id,
-        resolution.grant(),
+        resolution.grant().cloned(),
         embed_queue,
         "ingest_document",
     );
@@ -1815,95 +1907,6 @@ pub async fn do_ingest_document_reporting(
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
     })?;
     Ok((result, tenancy))
-}
-
-/// Embed the claims a document walk CREATED, post-commit and best-effort, in a
-/// task on the server's tracker (`crate::background`).
-///
-/// Each vector is stored as the walk's AUTHOR, with the team-write grant the
-/// walk wrote under (`claim_helper::embed_claim_author_stamped_with_grant`),
-/// not through `McpEmbedder::embed_and_store`. That path resolves a claim's
-/// author by reading the claim as PUBLIC, and a document ingest that names no visibility
-/// lands in the author's team or private, never public (backlog 46902f71): on
-/// such a claim it found no author and stored nothing, and only a WARN said so.
-/// The walk already knows the author and the grant, as
-/// `workflow_ingest::store_ingest_embedding` knows its author.
-///
-/// The queue holds only claims this walk created (a converged claim is skipped
-/// before it is queued), so every row in it is the author's to write.
-///
-/// Returns how many embeddings were QUEUED (backlog fdacc14f): 0 when the queue
-/// is empty or this server has no embedding provider
-/// (`McpEmbedder::embeddings_disabled`), in which case no task is spawned,
-/// because every provider call would fail. The task logs how many it stored
-/// against how many were queued when it finishes.
-fn spawn_created_claim_embeds(
-    server: &EpiGraphMcpFull,
-    author: Uuid,
-    grant: Option<&epigraph_db::TeamWriteGrant>,
-    queue: Vec<(Uuid, String)>,
-    tool_name: &'static str,
-) -> usize {
-    if queue.is_empty() {
-        return 0;
-    }
-    if server.embedder.embeddings_disabled() {
-        tracing::warn!(
-            tool = tool_name,
-            claims = queue.len(),
-            "embeddings are disabled on this server (no provider key), so the claims this \
-             ingest created carry no vector until the maintenance backfill reaches them"
-        );
-        return 0;
-    }
-    let queued = queue.len();
-    // A clone shares the parent's pools and tracker; the grant is owned for
-    // the same `'static` reason.
-    let bg = server.clone();
-    let grant = grant.cloned();
-    server.background_tasks().spawn(async move {
-        let mut stored = 0usize;
-        for (id, content) in queue {
-            // A server DECLARED to run on a privileged pool (the operator
-            // `ingest-document` CLI on `MaintenancePool`, mirroring
-            // `begin_ingest_tx`) has no tenancy context to stamp: the
-            // embedder's own declared privileged store applies there.
-            let one = if bg.scoped.is_none() && bg.privileged_pool.is_some() {
-                bg.embedder.embed_and_store(id, &content).await
-            } else {
-                crate::claim_helper::embed_claim_author_stamped_with_grant(
-                    &bg,
-                    author,
-                    grant.as_ref(),
-                    id,
-                    &content,
-                    None,
-                    tool_name,
-                )
-                .await
-            };
-            if one {
-                stored += 1;
-            }
-        }
-        if stored == queued {
-            tracing::info!(
-                tool = tool_name,
-                stored,
-                queued,
-                "background embedding done"
-            );
-        } else {
-            tracing::warn!(
-                tool = tool_name,
-                stored,
-                queued,
-                "background embedding stored fewer vectors than it queued; the rest carry no \
-                 vector until the maintenance backfill reaches them"
-            );
-        }
-    });
-    queued
 }
 
 /// URN prefix for a synthesized (non-DOI) document identity key.
@@ -2756,10 +2759,10 @@ pub async fn do_ingest_document_spine(
 
     // ── 6. Detach embeddings (the response reports the number queued; see step 8
     // of `do_ingest_document_reporting`) ──
-    let queued = spawn_created_claim_embeds(
+    let queued = spawn_ingest_embeds(
         server,
         agent_id,
-        resolution.grant(),
+        resolution.grant().cloned(),
         embed_queue,
         "ingest_document_spine",
     );
