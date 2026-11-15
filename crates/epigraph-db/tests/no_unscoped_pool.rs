@@ -556,7 +556,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        19,
+        20,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -576,7 +576,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          the app that obtained the code (by its `client_id`, any status, as `register` does), \
          and the refresh grant's lookup of the app a chain was issued to (by id), each reading \
          one `oauth_clients` row's status before anything is minted, the same \
-         pre-authentication reason.",
+         pre-authentication reason. The twentieth is migration 213's single-use check of an \
+         agent's assertion (`AssertionNonceRepository::consume`), an app-callable definer keyed \
+         by the verified public key and the assertion's signed nonce, run after the signature and freshness \
+         verify and before anything is minted: the same pre-authentication reason.",
     ),
     (
         "routes/elevate.rs",
@@ -797,7 +800,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
 /// The merged 198 was read off `the_scanner_is_not_vacuous`'s failure on the
 /// merged tree, not computed.
-const HIGH_WATER: usize = 198;
+///
+/// Merged with `fix/backlog-b02`, which adds one step these lines do not
+/// carry: 205 -> 204 there when `patch_claim`'s ownership read moved onto the
+/// caller's viewer (backlog 4073bbb6): `routes/claims.rs` 17 -> 16. The merged
+/// 197 was read off `the_scanner_is_not_vacuous`'s failure on the merged
+/// tree, not computed.
+const HIGH_WATER: usize = 197;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -919,7 +928,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // UPDATE moved off `state.db_pool` onto `AppState::store_claim_embedding_as`
     // (the caller's stamp). Read off this test's own failure (`recorded 18,
     // measured 17`).
-    ("routes/claims.rs", 17),
+    // 17 -> 16 (backlog 4073bbb6): `patch_claim`'s ownership read moved off
+    // `state.db_pool` onto `AppState::read_as` (`ClaimRepository::write_target_of`
+    // through the caller's viewer), as `update_labels`'s did in batch H6.
+    ("routes/claims.rs", 16),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -1109,12 +1121,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // and not convertible.
     ("routes/papers.rs", 8),
     // 5 before conversion shard 5, which moved `list_perspectives`,
-    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`; 2
-    // before backlog 0f2f9ddb moved `set_source_reliability` onto
-    // `AppState::write_as` and `set_source_reliability_conn`. The one that
-    // remains WRITES -- `create_perspective` (which also creates a
-    // PERSPECTIVE_OF edge) -- and `PerspectiveRepository::create` takes no
-    // `Viewer`. Same owner as `context.rs`'s residue.
+    // `get_perspective` and `agent_perspectives` onto `AppState::read_as`, and
+    // 2 before `set_source_reliability` (an `UPDATE`) moved onto
+    // `AppState::write_as` (backlog 0f2f9ddb). The one that remains WRITES --
+    // `create_perspective` (which also creates a PERSPECTIVE_OF edge) -- and
+    // `PerspectiveRepository::create` takes no `Viewer`. Same owner as
+    // `context.rs`'s residue.
     ("routes/perspective.rs", 1),
     // 9 before the operator-binding delta review, which moved
     // `create_challenge`'s transaction onto `AppState::begin_claim_write`.

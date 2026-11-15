@@ -128,6 +128,7 @@ pub mod reasoning;
 pub mod revoke_signature;
 #[cfg(feature = "db")]
 pub mod search;
+pub mod sources;
 pub mod spans;
 pub mod staging;
 #[cfg(feature = "db")]
@@ -927,6 +928,9 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/edges", get(edges::list_edges))
         .route("/api/v1/papers", get(papers::list_papers))
+        // Who said what: the sources of the claims the caller may read, with
+        // the caller's own counts (backlog da4a8bc1).
+        .route("/api/v1/sources/overview", get(sources::sources_overview))
         .route(
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
@@ -1544,6 +1548,9 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/edges", get(edges::list_edges))
         .route("/api/v1/papers", get(papers::list_papers))
+        // Who said what: the sources of the claims the caller may read, with
+        // the caller's own counts (backlog da4a8bc1).
+        .route("/api/v1/sources/overview", get(sources::sources_overview))
         .route(
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
