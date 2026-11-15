@@ -517,10 +517,11 @@ jobs:
         #
         # Scope is deliberately lib+bins, NOT --all-targets: the crate's
         # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
-        # test targets link Postgres regardless of the feature flag and cannot
-        # pass under --no-default-features today. Every bin, `server`
-        # included, declares required-features = ["db"] (ruling R-39: not(db)
-        # is check-only), so in practice this checks the library.
+        # integration-test targets link Postgres regardless of the feature
+        # flag. Every bin, `server` included, declares required-features =
+        # ["db"] (ruling R-39: not(db) is check-only), so in practice this
+        # checks the library. The library's own unit-test target is compiled
+        # separately, by "No-db lib-test build check" in `lint-features`.
         run: cargo check -p epigraph-api --no-default-features --locked
 
   # The feature-gated checks, on their own runner. They used to follow Clippy
@@ -595,6 +596,18 @@ jobs:
         # it. It needs no database and no API key: it runs the built
         # `cross_source_sweep` binary's argument handling.
         run: cargo test -p epigraph-cli --features genai --locked --test cross_source_sweep_smoke
+      - name: No-db lib-test build check
+        # The "No-db build check" in `lint` is `cargo check` over lib+bins, so
+        # it never compiles the `#[cfg(test)]` modules. Those are where the
+        # not(db) arm's in-memory tests live, and they drifted unseen: 13
+        # errors (a fixture missing a new struct field, a db-only helper
+        # called from a not(db) module, a test of a db-only type left
+        # ungated) accumulated in the lib-test target while that check stayed
+        # green (backlog 01640684). This compiles the target without running
+        # it; several of its tests are stale at runtime and are a separate
+        # item. Warnings are not denied here: the not(db) arm carries unused
+        # imports that the db arm needs.
+        run: cargo test -p epigraph-api --no-default-features --lib --no-run --locked
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
