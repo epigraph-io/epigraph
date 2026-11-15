@@ -2747,14 +2747,6 @@ these during a quiet window, or after confirming
 `SELECT max(now() - xact_start) FROM pg_stat_activity WHERE state <> 'idle'` is
 small.
 
-### `scripts/prepare-engine-integration-db.sh`
-
-That script applies every `migrations/*.sql` with `psql -v ON_ERROR_STOP=1 -f`
-in autocommit and never writes `_sqlx_migrations`. `-- no-transaction` is an
-inert comment to psql and autocommit makes `CREATE INDEX CONCURRENTLY` legal, so
-063–066 survive that path unchanged. The pre-existing hazard is unaffected: a
-database prepared this way then fails every `sqlx::migrate!`.
-
 ## Tombstones
 
 Tables that exist in the field but have no owning code. Scheduled for an
@@ -2981,10 +2973,9 @@ Two things an earlier revision of this section recommended do not apply:
   header or ships a script in `docs/runbooks/` (`NNN-undo.sql`).
 - **A `psql -f` loop over `migrations/*.sql`** writes no `_sqlx_migrations`
   rows, so the checksum ledger the top of this file describes is bypassed and
-  a database prepared that way then fails every `sqlx::migrate!` run. The one
-  script that does apply files with `psql`,
-  `scripts/prepare-engine-integration-db.sh`, is described under
-  "`-- no-transaction` migrations" above.
+  a database prepared that way then fails every `sqlx::migrate!` run. No script
+  in the repo does this any more: build test databases with `epigraph-migrate`
+  (see "Test database" in `CLAUDE.md`).
 
 ## Schema Validation
 

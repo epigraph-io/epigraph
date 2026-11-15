@@ -889,9 +889,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "create_challenge",
         &[
             "ClaimRepository::default_decl_for_author_pool",
-            "sqlx::query(SELECT).execute",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_optional",
+            "PolicyRepository::find_challenge_by_hash",
+            "PolicyRepository::insert_challenge",
+            "PolicyRepository::lock_challenge_create",
             "workflows::get_or_create_system_agent",
         ],
     ),

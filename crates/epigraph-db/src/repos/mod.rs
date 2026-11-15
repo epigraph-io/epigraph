@@ -75,6 +75,7 @@ pub mod passkey;
 pub mod passkey_ceremony;
 pub mod pattern_template;
 pub mod perspective;
+pub mod policy;
 pub mod political;
 pub mod privatization;
 pub mod provenance;
@@ -231,6 +232,7 @@ pub use paper::{
     AUTHORED_REPLACES_KEY_RESERVED,
 };
 pub use perspective::PerspectiveRepository;
+pub use policy::PolicyRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
     PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,
