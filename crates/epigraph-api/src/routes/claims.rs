@@ -1138,18 +1138,28 @@ pub(crate) async fn create_claim_core(
         // two branches serialize against each other too) is held on `tx` until
         // this handler commits, so a racer's find runs after this row is
         // visible and answers 409 (backlog 00f1a517).
-        ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
-            .await?;
-        if ClaimRepository::find_by_content_hash_and_agent(
-            &mut tx,
-            viewer,
-            content_hash.as_slice(),
-            agent_uuid,
-        )
-        .await?
-        .is_some()
-        {
-            return Err(dup_conflict());
+        //
+        // NOT for the `fully_private` tier (backlog 55c12085). Its stored
+        // content is the constant "[private]" (set above), so every such claim
+        // by one author has the SAME `(content_hash, agent_id)`: the check
+        // answered 409 to an author's second private claim, and
+        // `if_not_exists=true` is refused for this tier, so there was no way to
+        // write one. The digest of a placeholder says nothing about whether the
+        // ciphertexts are duplicates, and the server cannot compare those.
+        if privacy_tier != "fully_private" {
+            ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
+                .await?;
+            if ClaimRepository::find_by_content_hash_and_agent(
+                &mut tx,
+                viewer,
+                content_hash.as_slice(),
+                agent_uuid,
+            )
+            .await?
+            .is_some()
+            {
+                return Err(dup_conflict());
+            }
         }
         match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
