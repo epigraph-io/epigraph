@@ -444,7 +444,12 @@ only the non-merge commits a change adds. It refuses:
   `CREATE FUNCTION` statement that carries the attribute) whose Verification
   records no run, or which has no Verification section. `Unverified:` does NOT
   clear E5: a later commit in the same change that names the first commit's sha
-  (7+ characters) next to the test result does.
+  (7+ characters) next to the test result does;
+- **E6** a term from the private deny-list (customer and deployment names). The
+  list lives in the repository secret `COMMIT_LINT_DENY_TERMS` (one term per
+  line) and, locally, in a file named by `COMMIT_LINT_DENY_FILE`; it is never
+  committed, because a public deny-list would publish the names it protects.
+
 It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
 message with none of the three sections (W3). Output is redacted, never the
 offending value.

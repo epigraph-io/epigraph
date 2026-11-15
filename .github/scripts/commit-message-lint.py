@@ -14,12 +14,18 @@ or all zeros) and reports per commit. ERRORS fail the run (exit 1):
      records no run (or it has no Verification section). `Unverified:` does not
      silence E5; a LATER commit in the same range that names this commit's sha
      (7+ hex characters) does, the "follow-up commit that cites it";
+  E6 a term from the private deny-list (customer and deployment names), read
+     from the COMMIT_LINT_DENY_TERMS environment variable (newline- or
+     comma-separated; CI fills it from a repository secret) and from the file
+     named by COMMIT_LINT_DENY_FILE. The list is never committed: a public
+     deny-list of customer names would publish them.
 WARNINGS never change the exit status: W2 a subject outside
 `<type>(<scope>)?: <text>`, W3 none of the Evidence/Reasoning/Verification
 sections. Offending values are NEVER printed (public CI logs): each finding is
 redacted, and a subject that itself holds an error is withheld. Run from the
 repository root.
 """
+import os
 import ipaddress
 import re
 import subprocess
@@ -87,6 +93,26 @@ def commits(base, head):
         if rec.strip():
             sha, _, msg = rec.lstrip("\n").partition("\x1f")
             yield sha, msg.strip("\n").split("\n", 1)[0], msg
+
+
+def deny_terms():
+    """The private deny-list: env COMMIT_LINT_DENY_TERMS plus COMMIT_LINT_DENY_FILE."""
+    raw = os.environ.get("COMMIT_LINT_DENY_TERMS", "")
+    path = os.environ.get("COMMIT_LINT_DENY_FILE", "")
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8") as fh:
+            raw += "\n" + "\n".join(l for l in fh.read().splitlines() if not l.lstrip().startswith("#"))
+    terms = [t.strip() for t in re.split(r"[\n,]", raw) if t.strip()]
+    return [re.compile(r"(?<![A-Za-z0-9])" + re.escape(t) + r"(?![A-Za-z0-9])", re.I) for t in terms]
+
+
+DENY = deny_terms()
+
+
+def scan_deny(line):
+    """Return the redacted E6 findings of one line (any line, trailers included)."""
+    return [("E6", f"deny-listed term (entry {i + 1} of the private list)")
+            for i, rx in enumerate(DENY) if rx.search(line)]
 
 
 def verification_not_run(message):
@@ -172,6 +198,7 @@ def lint(subject, message):
     """Return (errors, warnings) as lists of (class, redacted description)."""
     non_trailer = [l for l in message.split("\n") if not TRAILER_RE.match(l)]
     errors = [f for line in non_trailer for f in scan_line(line)]
+    errors += [f for line in message.split("\n") for f in scan_deny(line)]
     warnings = []
     if verification_not_run(message) and not UNVERIFIED_RE.search(message):
         errors.append(("E4", "Verification records something not run and the message has no Unverified: line"))
@@ -187,6 +214,7 @@ def main(argv):
         print("usage: commit-message-lint.py <base> <head>", file=sys.stderr)
         return 2
     n = n_err = n_warn = 0
+    print(f"commit-message-lint: private deny-list {'configured' if DENY else 'not configured'}")
     rows = list(commits(argv[1], argv[2]))  # newest first
     for idx, (sha, subject, message) in enumerate(rows):
         n += 1
@@ -198,7 +226,8 @@ def main(argv):
                                "add a later commit that names this sha with the test result"))
         n_err += len(errors)
         n_warn += len(warnings)
-        shown = "<subject withheld: holds an error>" if scan_line(subject) else subject[:72]
+        shown = ("<subject withheld: holds an error>" if scan_line(subject) or scan_deny(subject)
+                 else subject[:72])
         for cls, text in errors + warnings:
             level = "error" if cls[0] == "E" else "warning"
             print(f"{level} {cls} {sha[:10]} [{shown}]: {text}")

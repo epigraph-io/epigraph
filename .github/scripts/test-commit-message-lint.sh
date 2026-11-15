@@ -5,7 +5,8 @@
 # known-good content (all synthetic) and asserts that:
 #   1. errors   — E1 e-mail, E2 home path, E3 wildcard-DNS host, E3 public
 #                 IPv4, E4 an unrun Verification without `Unverified:`, E5 an
-#                 unrun change to a SECURITY DEFINER function each exit 1 and name their class;
+#                 unrun change to a SECURITY DEFINER function, E6 a private
+#                 deny-list term each exit 1 and name their class;
 #   2. warnings — W2, W3 are reported and exit 0;
 #   3. allowed  — trailers, example.com, /home/user/, documentation, private
 #                 and loopback addresses, and a clean protocol message pass
@@ -74,6 +75,14 @@ check "E4 Verification not run"  1 "feat(x): t"$'\n\n**Evidence:**\n- e\n\n**Ver
 check "E4 CI to confirm"         1 "feat(x): t"$'\n\n**Verification:**\n- CI to confirm' E4 -
 check "E4 silenced by Unverified" 0 "feat(x): t"$'\n\n**Verification:**\n- Not run\n\nUnverified: tests not run here' - -
 check "ok not-run outside Verification" 0 "feat(x): t"$'\n\n**Evidence:**\n- the job was not run before\n\n**Reasoning:**\n- r\n\n**Verification:**\n- cargo test passes' - -
+
+# E6: the deny-list comes only from the environment (and a private file), never
+# from the repository. The term is synthetic.
+deny_term="Zorblax Widgets"
+COMMIT_LINT_DENY_TERMS="$deny_term" check "E6 deny-listed term in body" 1 "feat(x): t$good_body"$'\n\nfor '"$deny_term"' only' E6 "$deny_term"
+COMMIT_LINT_DENY_TERMS="other, $deny_term" check "E6 term in subject, list comma-separated" 1 "feat(x): fix for ${deny_term}$good_body" E6 "$deny_term"
+COMMIT_LINT_DENY_TERMS="$deny_term" check "ok deny term inside a longer word" 0 "feat(x): t$good_body"$'\n\nZorblax WidgetsX is unrelated' - -
+check "ok deny-list not configured" 0 "feat(x): t$good_body"$'\n\nfor '"$deny_term"' only' - -
 
 # E5: a change inside a SECURITY DEFINER function with an unrun Verification.
 # file_commit <path> <content> <message>: commit one file.
