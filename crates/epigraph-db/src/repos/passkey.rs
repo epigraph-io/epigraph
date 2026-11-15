@@ -189,7 +189,9 @@ impl PasskeyRepository {
     ///
     /// # Errors
     /// `DbError::QueryFailed`: `ELV04` for an unknown passkey, `22004` for a
-    /// blank reason, `42501` on a non-maintenance connection.
+    /// blank reason, `42501` on a non-maintenance connection, `25000` in a
+    /// transaction that is not READ COMMITTED (migration 214: an older
+    /// snapshot would miss a passkey enrolled during the lock wait).
     #[instrument(skip(conn, reason))]
     pub async fn revoke_compromised(
         conn: &mut sqlx::PgConnection,

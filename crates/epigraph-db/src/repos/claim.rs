@@ -4730,7 +4730,17 @@ impl ClaimRepository {
     /// offset/limit.
     pub const MAX_AGENT_CLAIMS: i64 = 500;
 
-    /// Get all claims by an agent
+    /// Get an agent's CURRENT claims, newest first, at most
+    /// [`MAX_AGENT_CLAIMS`](Self::MAX_AGENT_CLAIMS).
+    ///
+    /// Retired rows (`is_current = false`) are excluded. Both callers are the
+    /// reputation calculators, which read `truth_value < 0.2` as "refuted";
+    /// retirement is operational, not epistemic. `deprecate_claim` writes
+    /// `truth_value = 0.05` in the statement that retires a row, and a
+    /// superseded version keeps whatever truth it had beside its successor, so
+    /// counting retired rows scored a workflow deprecation as a refutation and
+    /// counted one claim once per version (backlog 0f22d7b7). A current claim
+    /// whose belief has fallen below the threshold is still returned.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -4747,6 +4757,7 @@ impl ClaimRepository {
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE agent_id = $1
+              AND is_current = true
               /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
             LIMIT $2
@@ -8075,6 +8086,39 @@ impl ClaimRepository {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    /// Return the ids of the claims assigned to theme `theme_id`
+    /// (`claims.theme_id`) that `viewer` may read.
+    ///
+    /// The `theme_id` filter of `GET /api/v1/claims` (backlog ea26d7aa):
+    /// resolved once into the `ids` predicate of [`ClaimListFilter`], like
+    /// [`Self::claim_ids_by_methodology`]. A theme the viewer reads nothing in,
+    /// and a uuid that names no theme, both resolve to the empty set.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    pub async fn claim_ids_by_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id
+            FROM claims c
+            WHERE c.theme_id = $1
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(theme_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Return claim IDs that have at least one evidence record of the given type.
     ///
     /// Valid values mirror the DB evidence_type column:
@@ -11176,17 +11220,15 @@ impl ClaimRepository {
 mod label_tests {
     use super::*;
 
-    /// Helper: create a test claim and return (pool, claim_id, agent_id) for cleanup.
-    async fn setup_test_claim() -> (sqlx::PgPool, Uuid, Uuid) {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let pool = sqlx::PgPool::connect(&url).await.unwrap();
-
+    /// Helper: create a test claim in the test's own database and return
+    /// (claim_id, agent_id).
+    async fn setup_test_claim(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
         let agent_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO agents (public_key, display_name, agent_type, labels)
              VALUES (sha256(gen_random_uuid()::text::bytea), 'label-test', 'system', ARRAY['test'])
              RETURNING id",
         )
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
 
@@ -11196,41 +11238,27 @@ mod label_tests {
              RETURNING id",
         )
         .bind(agent_id)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
 
-        (pool, claim_id, agent_id)
+        (claim_id, agent_id)
     }
 
-    async fn cleanup(pool: &sqlx::PgPool, claim_id: Uuid, agent_id: Uuid) {
-        let _ = sqlx::query("DELETE FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
-            .bind(agent_id)
-            .execute(pool)
-            .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_add() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_add(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         let labels =
             ClaimRepository::update_labels(&pool, claim_id, &["foo".into(), "bar".into()], &[])
                 .await
                 .unwrap();
         assert!(labels.contains(&"foo".to_string()));
         assert!(labels.contains(&"bar".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_remove() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_remove(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["a".into(), "b".into(), "c".into()], &[])
             .await
             .unwrap();
@@ -11240,13 +11268,11 @@ mod label_tests {
         assert!(labels.contains(&"a".to_string()));
         assert!(!labels.contains(&"b".to_string()));
         assert!(labels.contains(&"c".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_atomic_add_remove() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_atomic_add_remove(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["x".into(), "y".into()], &[])
             .await
             .unwrap();
@@ -11256,13 +11282,11 @@ mod label_tests {
         assert!(!labels.contains(&"x".to_string()));
         assert!(labels.contains(&"y".to_string()));
         assert!(labels.contains(&"z".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_idempotent_add() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_idempotent_add(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["dup".into()], &[])
             .await
             .unwrap();
@@ -11270,27 +11294,23 @@ mod label_tests {
             .await
             .unwrap();
         assert_eq!(labels.iter().filter(|l| l.as_str() == "dup").count(), 1);
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_idempotent_remove() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_idempotent_remove(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         // Remove a label that was never added — should not error
         let labels = ClaimRepository::update_labels(&pool, claim_id, &[], &["nonexistent".into()])
             .await
             .unwrap();
         assert!(labels.is_empty() || !labels.contains(&"nonexistent".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
     // ── list_by_labels tests ──
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_happy_path() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_happy_path(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["backlog".into(), "pending".into()], &[])
             .await
             .unwrap();
@@ -11324,14 +11344,11 @@ mod label_tests {
             results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should find claim by ALL labels"
         );
-
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_no_match() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_no_match(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["backlog".into()], &[])
             .await
             .unwrap();
@@ -11350,14 +11367,11 @@ mod label_tests {
             !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should not match unrelated label"
         );
-
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_min_truth_filter() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_min_truth_filter(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         // Default truth_value from setup is 0.5
         ClaimRepository::update_labels(&pool, claim_id, &["truth-test".into()], &[])
             .await
@@ -11394,16 +11408,13 @@ mod label_tests {
             !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 < 0.9 should not match"
         );
-
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_respects_limit() {
-        let (pool, _, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_respects_limit(pool: sqlx::PgPool) {
+        let (_, agent_id) = setup_test_claim(&pool).await;
         // Create a second claim with the same label
-        let claim_id_2 = sqlx::query_scalar::<_, Uuid>(
+        let _claim_id_2 = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO claims (content, content_hash, truth_value, agent_id, labels)
              VALUES ('limit test 2', sha256('limit-test-2'::bytea), 0.5, $1, ARRAY['limit-test'])
              RETURNING id",
@@ -11413,7 +11424,7 @@ mod label_tests {
         .await
         .unwrap();
 
-        let claim_id_1 = sqlx::query_scalar::<_, Uuid>(
+        let _claim_id_1 = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO claims (content, content_hash, truth_value, agent_id, labels)
              VALUES ('limit test 1', sha256('limit-test-1'::bytea), 0.5, $1, ARRAY['limit-test'])
              RETURNING id",
@@ -11435,23 +11446,10 @@ mod label_tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1, "limit=1 should return exactly 1 result");
-
-        // cleanup
-        let _ = sqlx::query("DELETE FROM claims WHERE id = ANY($1)")
-            .bind([claim_id_1, claim_id_2])
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
-            .bind(agent_id)
-            .execute(&pool)
-            .await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_not_found() {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_not_found(pool: sqlx::PgPool) {
         let fake_id = Uuid::new_v4();
         let result = ClaimRepository::update_labels(&pool, fake_id, &["x".into()], &[]).await;
         assert!(result.is_err());
@@ -11466,7 +11464,7 @@ mod label_tests {
 
     // The two unexpanded-shell-variable regression tests that used to live here
     // moved to `crates/epigraph-db/tests/label_shell_variable_repo.rs`. Reason:
-    // every test in this module is `#[ignore]` (live-DB convention), so
+    // this module's tests were `#[ignore]` (live-DB convention) then, so
     // `cargo test -p epigraph-db` skipped the headline regression test for
     // backlog f6310444. The new file uses `#[sqlx::test]` and runs in the gate.
 
@@ -13906,7 +13904,8 @@ async fn reverse_marked_duplicate(
 /// * the supersede cascade binds it the same way for the successor
 ///   ([`ClaimRepository::regenerate_superseded_edge_factors_conn`]).
 ///
-/// It is the body of migration 038's `auto_create_factor_from_edge`, over a
+/// It is the body of migration 038's `auto_create_factor_from_edge` (re-stated
+/// by 217 as a maintenance-owned definer, unchanged in meaning), over a
 /// set, and must stay that: a migration that changes the trigger's mapping,
 /// potentials, description or properties changes this too (the
 /// `unmark_duplicate` tests compare the re-minted rows with the trigger's).

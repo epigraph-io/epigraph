@@ -4,7 +4,9 @@
 //!
 //! Each tool runs ONE transaction stamped from the caller's own write identity
 //! (`claim_helper::begin_author_stamped_tx`), and calls the migration-206
-//! definer on it. The definer reads the caller from that stamp
+//! definer on it (the two widening acts through
+//! `epigraph_engine::visibility_act`, which also refolds the moved claims'
+//! cached belief for their new audience before the commit). The definer reads the caller from that stamp
 //! (`epigraph_principal_id()`), makes the authority decision, and writes the
 //! audit row in the same transaction. The tool decides nothing about authority
 //! itself, so the HTTP twins (`epigraph-api` `routes/claim_visibility.rs`)
@@ -51,6 +53,18 @@ fn respond(outcomes: Vec<epigraph_db::VisibilityActOutcome>) -> Result<CallToolR
     })
 }
 
+/// A widening act's failure: a refusal as every visibility tool maps it, a
+/// failed cached-belief refold as internal (the transaction is dropped, so
+/// nothing was changed).
+fn act_error(e: epigraph_engine::visibility_act::VisibilityActError) -> McpError {
+    match e {
+        epigraph_engine::visibility_act::VisibilityActError::Db(e) => visibility_caller_error(e),
+        epigraph_engine::visibility_act::VisibilityActError::Cache(message) => {
+            internal_error(message)
+        }
+    }
+}
+
 /// `publicize_claims`: group → public, team admins only (D-V2), all or nothing.
 ///
 /// # Errors
@@ -67,9 +81,10 @@ pub async fn publicize_claims(
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "publicize_claims").await?;
-    let outcomes = epigraph_db::ClaimRepository::publicize_conn(&mut tx, &ids, &params.reason)
-        .await
-        .map_err(visibility_caller_error)?;
+    let outcomes =
+        epigraph_engine::visibility_act::publicize_claims(&mut tx, viewer, &ids, &params.reason)
+            .await
+            .map_err(act_error)?;
     tx.commit().await.map_err(internal_error)?;
     respond(outcomes)
 }
@@ -91,10 +106,15 @@ pub async fn share_claims_with_team(
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "share_claims_with_team")
             .await?;
-    let outcomes =
-        epigraph_db::ClaimRepository::share_with_team_conn(&mut tx, &ids, group, &params.reason)
-            .await
-            .map_err(visibility_caller_error)?;
+    let outcomes = epigraph_engine::visibility_act::share_claims_with_team(
+        &mut tx,
+        viewer,
+        &ids,
+        group,
+        &params.reason,
+    )
+    .await
+    .map_err(act_error)?;
     tx.commit().await.map_err(internal_error)?;
     respond(outcomes)
 }

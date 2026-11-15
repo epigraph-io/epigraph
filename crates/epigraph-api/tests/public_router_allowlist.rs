@@ -10,12 +10,12 @@
 //!   * **axum 0.7.9's `Router` exposes no route enumeration.** There is no API
 //!     that yields the set of registered paths, so even the variant that
 //!     compiles cannot be interrogated at runtime.
-//!   * **The `#[cfg(not(feature = "db"))]` variant is not built in any
-//!     buildable configuration.** `epigraph-api`'s default features are
-//!     `["db"]`, every CI job builds with defaults, and
-//!     `cargo check -p epigraph-api --no-default-features` fails with
-//!     pre-existing errors unrelated to tenancy. No compiler checks that
-//!     function.
+//!   * **The `#[cfg(not(feature = "db"))]` variant is never run.**
+//!     `epigraph-api`'s default features are `["db"]` and the `server` binary
+//!     requires `db`, so no binary serves that function and no CI job runs a
+//!     test against it. CI does type-check it (`cargo check -p epigraph-api
+//!     --no-default-features --locked`), which says nothing about which paths
+//!     it registers.
 //!
 //! So this is a **source-text lint**, which is the stronger choice anyway: it
 //! is the only mechanism that covers the second variant at all. Precedent for
@@ -132,7 +132,7 @@ const OAUTH_ALLOWLIST_DB: &[&str] = &[
 /// The OAuth router of the `not(db)` variant is **9** routes, not 11: it lacks
 /// `/oauth/callback` and `/oauth/authorize/consent`. That divergence predates
 /// PR-03 and is asserted rather than fixed — closing it would mean adding
-/// handlers to a build configuration that does not compile.
+/// handlers to a configuration that is check-only (ruling R-39).
 const OAUTH_ALLOWLIST_NO_DB: &[&str] = &[
     "/oauth/token",
     "/oauth/register",
