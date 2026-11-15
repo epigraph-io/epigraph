@@ -495,6 +495,34 @@ pub async fn wire_ds_for_new_claim_in_tx(
     Ok(result)
 }
 
+/// The canonical claim's text when it still needs an embedding, read as the
+/// CALLER: the repair-embed check `submit_claim` and `memorize` run after a
+/// content-hash dedup hit (`was_created == false`).
+///
+/// On the plain pool this read was blind to group-private rows, so a dedup hit
+/// on the caller's own private claim whose vector was missing answered "no
+/// embedding needed" and the claim stayed out of semantic recall. A failure is
+/// reported as text for the caller's warning, never returned as an error: the
+/// claim is committed, and the maintenance backfill covers a skipped embed.
+///
+/// # Errors
+/// The read's failure, as text.
+pub async fn claim_text_if_embedding_missing_as_caller(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: uuid::Uuid,
+) -> Result<Option<String>, String> {
+    let mut read = server
+        .read_as(viewer, "claim_text_if_embedding_missing")
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let text = ClaimRepository::claim_text_if_embedding_missing(&mut *read, viewer, claim_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    read.commit().await.map_err(|e| e.to_string())?;
+    Ok(text)
+}
+
 /// Generate (or reuse) a claim's embedding vector and store it on a connection
 /// stamped from the **author's** viewer. Post-commit, best-effort, and
 /// deliberately NOT inside the submission's write transaction.
@@ -569,6 +597,33 @@ pub async fn embed_claim_author_stamped(
     pending_embedding: Option<String>,
     tool_name: &'static str,
 ) -> bool {
+    embed_claim_author_stamped_for(
+        server,
+        author_agent_id,
+        claim_id,
+        text,
+        pending_embedding,
+        tool_name,
+        None,
+    )
+    .await
+}
+
+/// [`embed_claim_author_stamped`] for a claim written under a team-write
+/// `grant` (owner decision D-V3): the store's stamp carries the team the
+/// write's did ([`begin_author_stamped_tx_for`]), so an author that reaches a
+/// team only through its live human can give the claim it wrote there its
+/// vector. `None` is the plain author stamp. Document ingest stores through
+/// this, with the ingest's own grant (backlog 46902f71).
+pub async fn embed_claim_author_stamped_for(
+    server: &EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    text: &str,
+    pending_embedding: Option<String>,
+    tool_name: &'static str,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+) -> bool {
     // Reuse the novelty gate's already-generated vector when there is one; only
     // the gate's embedder-failure path and the repair arm (where an exact
     // resubmit means the gate never ran) pay a second provider call.
@@ -587,13 +642,14 @@ pub async fn embed_claim_author_stamped(
         },
     };
 
-    match store_embedding_author_stamped(
+    match store_embedding_author_stamped_for(
         server.scoped.as_ref(),
         &server.pool,
         author_agent_id,
         claim_id,
         &pgvec,
         tool_name,
+        grant,
     )
     .await
     {
@@ -668,12 +724,51 @@ pub(crate) async fn store_embedding_author_stamped(
     pgvec: &str,
     tool_name: &'static str,
 ) -> Result<bool, String> {
+    store_embedding_author_stamped_for(
+        scoped,
+        pool,
+        author_agent_id,
+        claim_id,
+        pgvec,
+        tool_name,
+        None,
+    )
+    .await
+}
+
+/// [`store_embedding_author_stamped`] for a claim written under a team-write
+/// `grant` (owner decision D-V3): the store's stamp carries the same team the
+/// write's did ([`begin_author_stamped_tx_for`]), so a claim the author wrote
+/// into a team it reaches only through its live human can be given its vector
+/// by that same author. `None` is the plain author stamp.
+///
+/// # Errors
+/// As [`store_embedding_author_stamped`], plus a grant that names another
+/// agent than `author_agent_id`.
+pub(crate) async fn store_embedding_author_stamped_for(
+    scoped: Option<&epigraph_db::ScopedPool>,
+    pool: &sqlx::PgPool,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    pgvec: &str,
+    tool_name: &'static str,
+    grant: Option<&epigraph_db::TeamWriteGrant>,
+) -> Result<bool, String> {
     // `author_write_authority` has already logged the specific cause at ERROR on
     // `tenancy.scoped_write`; its message is re-surfaced here so the caller's own
     // warn line carries it too.
     let (scoped, author_viewer) = author_write_authority(scoped, pool, author_agent_id, tool_name)
         .await
         .map_err(|e| e.message.to_string())?;
+    let author_viewer = match grant {
+        None => author_viewer,
+        Some(g) => author_viewer.with_team_write_grant(g).ok_or_else(|| {
+            format!(
+                "the team-write grant names agent {}, not the author {author_agent_id}",
+                g.agent()
+            )
+        })?,
+    };
 
     let mut tx = scoped
         .begin_as(&author_viewer)
