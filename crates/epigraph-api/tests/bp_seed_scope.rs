@@ -407,6 +407,7 @@ async fn a_bp_seed_folds_only_binary_truth_bbas_each_discounted(pool: PgPool) {
         "a BP seed ignored its row's reliability: {w}, expected the discounted {d} (full \
          strength gives {p})"
     );
+}
 
 /// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
 /// f00d75ab: `apply_updates: true` needs `claims:write`).
