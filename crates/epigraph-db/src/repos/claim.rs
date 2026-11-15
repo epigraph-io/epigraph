@@ -7965,31 +7965,6 @@ struct ClaimRow {
 }
 
 impl ClaimRepository {
-    /// Copy evidence links from old claim to new claim via derived_from edges.
-    /// Returns the number of inherited evidence links.
-    pub async fn inherit_evidence(
-        pool: &PgPool,
-        old_claim_id: Uuid,
-        new_claim_id: Uuid,
-    ) -> Result<usize, DbError> {
-        // Create derived_from edges from new claim to old claim's evidence
-        let result = sqlx::query(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-             SELECT $1, 'claim', e.id, 'evidence', 'derived_from', 
-                    jsonb_build_object('inherited_from', $2::text) 
-             FROM evidence e 
-             WHERE e.claim_id = $2 
-             ON CONFLICT DO NOTHING"#,
-        )
-        .bind(new_claim_id)
-        .bind(old_claim_id)
-        .execute(pool)
-        .await?;
-
-        Ok(result.rows_affected() as usize)
-    }
-
     /// Count all evidence for a claim, including inherited evidence (via derived_from edges).
     pub async fn count_all_evidence_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,

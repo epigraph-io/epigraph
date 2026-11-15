@@ -270,7 +270,11 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // three, add_step's six, the AUTHORED record's one) take the entry point's
 // key and call the signed twins; the MCP tools pass the server's key and the
 // HTTP routes the API's.
-const UNSIGNED_SITES_HIGH_WATER: usize = 39;
+// 35: four caller-less repository writers removed rather than signed
+// (`AnalysisRepository::{link_evidence, link_claim}`,
+// `ClaimRepository::inherit_evidence`, `SemanticLinkRepository::create`): no
+// production path called them, so there was no transport key to sign with.
+const UNSIGNED_SITES_HIGH_WATER: usize = 35;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -508,18 +512,6 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-db/src/repos/analysis.rs",
-        "link_evidence",
-        1,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/analysis.rs",
-        "link_claim",
-        1,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/analysis.rs",
         "persist_bundle",
         2,
         Unsigned(REPO_INTERNAL),
@@ -530,12 +522,6 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-db/src/repos/claim.rs",
         "supersede_act_conn",
         2,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/claim.rs",
-        "inherit_evidence",
-        1,
         Unsigned(REPO_INTERNAL),
     ),
     site(
@@ -622,12 +608,6 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
         "promote_if_pending_conn",
-        1,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/semantic_link.rs",
-        "create",
         1,
         Unsigned(REPO_INTERNAL),
     ),

@@ -169,46 +169,6 @@ impl AnalysisRepository {
             .collect())
     }
 
-    /// Create an `interpreted_by` edge from evidence to analysis.
-    pub async fn link_evidence(
-        pool: &PgPool,
-        evidence_id: Uuid,
-        analysis_id: Uuid,
-    ) -> Result<Uuid, sqlx::Error> {
-        let edge_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, $2, 'evidence', $3, 'analysis', 'interpreted_by', '{}'::jsonb) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(edge_id)
-        .bind(evidence_id)
-        .bind(analysis_id)
-        .execute(pool)
-        .await?;
-        Ok(edge_id)
-    }
-
-    /// Create a `concludes` edge from analysis to claim.
-    pub async fn link_claim(
-        pool: &PgPool,
-        analysis_id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<Uuid, sqlx::Error> {
-        let edge_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, $2, 'analysis', $3, 'claim', 'concludes', '{}'::jsonb) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(edge_id)
-        .bind(analysis_id)
-        .bind(claim_id)
-        .execute(pool)
-        .await?;
-        Ok(edge_id)
-    }
-
     /// Atomic: insert analysis + create all `concludes` and `interpreted_by` edges.
     pub async fn persist_bundle(
         pool: &PgPool,
