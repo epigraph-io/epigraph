@@ -8,6 +8,13 @@ API for each. Idempotent (Plan 2.5), stateless, safe to run repeatedly on a cron
 Auth: EPIGRAPH_GIT_INGEST_GITHUB_PAT (read-only) injected as GH_TOKEN, else the
 host's existing `gh auth` token. Writes go to the localhost API, not GitHub —
 no GitHub write scope is ever used.
+
+API auth: `ingest_git` gets its Bearer token as EPIGRAPH_TOKEN in its
+environment, never on its command line or in the log. The token is read from the
+config's `token_file` on each run, else inherited from the reconciler's own
+EPIGRAPH_TOKEN. The config's `default_orchestrator_id` is handed over the same way,
+as EPIGRAPH_DEFAULT_ORCHESTRATOR_ID, so a PR's Epigraph-Orchestrator-Id trailer
+still wins over it.
 """
 import argparse, datetime, json, logging, os, subprocess, sys, tempfile
 import tomllib
@@ -40,6 +47,7 @@ class Config:
     state_dir: str = DEFAULT_STATE_DIR
     default_orchestrator_id: str | None = None
     ingest_git_bin: str = "ingest_git"
+    token_file: str | None = None
 
 def load_config_str(text: str) -> Config:
     data = tomllib.loads(text)
@@ -50,10 +58,44 @@ def load_config_str(text: str) -> Config:
         state_dir=data.get("state_dir", DEFAULT_STATE_DIR),
         default_orchestrator_id=data.get("default_orchestrator_id"),
         ingest_git_bin=data.get("ingest_git_bin", "ingest_git"),
+        token_file=data.get("token_file"),
     )
 
 def load_config(path: str) -> Config:
     return load_config_str(Path(path).read_text())
+
+# GitHub credentials are for `gh` only; `ingest_git` talks to the EpiGraph API.
+_GITHUB_CRED_VARS = ("EPIGRAPH_GIT_INGEST_GITHUB_PAT", "GH_TOKEN", "GITHUB_TOKEN")
+
+def read_token(cfg: "Config", environ: dict | None = None) -> str | None:
+    """The API Bearer token for `ingest_git`: the content of `token_file` when
+    configured (re-read every run, so whatever refreshes the file is picked up),
+    else the reconciler's own EPIGRAPH_TOKEN. Raises OSError when `token_file`
+    is configured but unreadable. Never logs the value."""
+    environ = os.environ if environ is None else environ
+    if cfg.token_file:
+        tok = Path(cfg.token_file).read_text().strip()
+    else:
+        tok = (environ.get("EPIGRAPH_TOKEN") or "").strip()
+    return tok or None
+
+def ingest_env(token: str | None, default_orchestrator_id: str | None,
+               environ: dict | None = None) -> dict:
+    """The environment for an `ingest_git` child: the reconciler's own, minus
+    GitHub credentials, plus EPIGRAPH_TOKEN (the API token, kept off argv) and
+    EPIGRAPH_DEFAULT_ORCHESTRATOR_ID (a fallback `ingest_git` uses only when
+    neither `--orchestrator-id` nor an Epigraph-Orchestrator-Id trailer names
+    one). Passing the default as `--orchestrator-id` would override the trailer."""
+    env = dict(os.environ if environ is None else environ)
+    for k in _GITHUB_CRED_VARS:
+        env.pop(k, None)
+    if token:
+        env["EPIGRAPH_TOKEN"] = token
+    else:
+        env.pop("EPIGRAPH_TOKEN", None)
+    if default_orchestrator_id:
+        env["EPIGRAPH_DEFAULT_ORCHESTRATOR_ID"] = default_orchestrator_id
+    return env
 
 def compute_rev_range(mirror: str, merge_sha: str) -> str:
     """The PR's own commits. For a --merge commit (2 parents): base..head =
@@ -137,35 +179,33 @@ def ensure_mirror(clone_url: str, state_dir: str, env: dict, slug_key: str | Non
     return str(d)
 
 def build_ingest_argv(pr, mirror, endpoint, rev_range, slug, *,
-                      default_orchestrator_id=None, ingest_git_bin="ingest_git", dry_run=False):
+                      ingest_git_bin="ingest_git", dry_run=False):
     """Assemble the `ingest_git --pr-ingest` argv for one merged PR. `slug` is
     the repo slug (`owner/repo`), `mirror` the local clone the binary reads, and
-    `rev_range` the PR's own commit range (from `compute_rev_range`). The
-    `--orchestrator-id` flag is only emitted when configured; otherwise the
-    ingester resolves the trailer / `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` itself."""
+    `rev_range` the PR's own commit range (from `compute_rev_range`). It carries
+    neither the token nor `--orchestrator-id`: both go in the child's
+    environment (`ingest_env`), so the argv is safe to log."""
     argv = [ingest_git_bin, "--pr-ingest",
             "--repo-slug", slug, "--pr-number", str(pr.number),
             "--pr-title", pr.title, "--pr-body", pr.body,
             "--merge-sha", pr.merge_sha, "--merged-at", pr.merged_at,
             "--pr-author", pr.author, "--rev-range", rev_range,
             "--repo", mirror, "--endpoint", endpoint]
-    if default_orchestrator_id:
-        argv += ["--orchestrator-id", default_orchestrator_id]
     if dry_run:
         argv += ["--dry-run"]
     return argv
 
-def ingest_pr(pr, mirror, endpoint, slug, *, default_orchestrator_id=None,
+def ingest_pr(pr, mirror, endpoint, slug, *, env=None,
               ingest_git_bin="ingest_git", dry_run=False) -> int:
     """Compute the PR's commit range from the mirror, build the argv, and run
-    `ingest_git`. Returns the subprocess return code; logs (not raises) on a
-    non-zero exit so the caller can isolate per-PR failures."""
+    `ingest_git` with `env` (from `ingest_env`; None inherits the reconciler's).
+    Returns the subprocess return code; logs (not raises) on a non-zero exit so
+    the caller can isolate per-PR failures."""
     rng = compute_rev_range(mirror, pr.merge_sha)
     argv = build_ingest_argv(pr, mirror, endpoint, rng, slug,
-                             default_orchestrator_id=default_orchestrator_id,
                              ingest_git_bin=ingest_git_bin, dry_run=dry_run)
     LOG.info("ingest PR #%s (%s): %s", pr.number, slug, " ".join(argv))
-    res = subprocess.run(argv, capture_output=True, text=True)
+    res = subprocess.run(argv, capture_output=True, text=True, env=env)
     if res.returncode != 0:
         LOG.error("ingest PR #%s failed (%s): %s", pr.number, res.returncode, res.stderr.strip()[:500])
     return res.returncode
@@ -176,6 +216,14 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
     aborts the rest — and counted into the failure tally. Returns (ok, fail)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     env = gh_env()
+    try:
+        token = read_token(cfg)
+    except OSError as e:
+        LOG.error("cannot read token_file %s: %s", cfg.token_file, e.strerror or e)
+        return 0, 1
+    if token is None and not dry_run:
+        LOG.warning("no API token (token_file / EPIGRAPH_TOKEN): writes will be refused")
+    child_env = ingest_env(token, cfg.default_orchestrator_id)
     ok = fail = 0
     for slug in cfg.repos:
         try:
@@ -185,8 +233,7 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
             LOG.error("repo %s discovery failed: %s", slug, e); fail += 1; continue
         for pr in prs:
             try:
-                rc = ingest_pr(pr, mirror, cfg.endpoint, slug,
-                               default_orchestrator_id=cfg.default_orchestrator_id,
+                rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env,
                                ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run)
                 ok += (rc == 0); fail += (rc != 0)
             except Exception as e:
