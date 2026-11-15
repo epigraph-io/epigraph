@@ -885,6 +885,22 @@ fn bp_config_from_request(
     })
 }
 
+/// Run a BP engine on the blocking pool, off the async runtime's workers
+/// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
+/// sweeps of the factor graph.
+#[cfg(feature = "db")]
+async fn run_bp_blocking<T, F>(run: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(run)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("belief propagation did not complete: {e}"),
+        })
+}
+
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
 ///
 /// `max_iterations` is capped at [`BP_MAX_ITERATIONS`] and
@@ -1120,12 +1136,16 @@ pub async fn propagate_beliefs(
             ..epigraph_engine::cdst_bp::CdstBpConfig::default()
         };
 
-        let result = epigraph_engine::cdst_bp::run_cdst_bp(
-            &engine_factors,
-            &initial,
-            &evidence,
-            &cdst_config,
-        );
+        let factors_count = engine_factors.len();
+        let result = run_bp_blocking(move || {
+            epigraph_engine::cdst_bp::run_cdst_bp(
+                &engine_factors,
+                &initial,
+                &evidence,
+                &cdst_config,
+            )
+        })
+        .await?;
 
         // Apply updates: write pignistic_prob, belief, plausibility to claims,
         // all-or-nothing on one transaction stamped with the caller's viewer
@@ -1160,7 +1180,7 @@ pub async fn propagate_beliefs(
             "max_change": result.max_change,
             "max_conflict": result.max_conflict,
             "messages_sent": result.messages_sent,
-            "factors_count": engine_factors.len(),
+            "factors_count": factors_count,
             "variables_count": all_var_ids.len(),
             "applied": apply,
             "applied_count": written,
@@ -1175,7 +1195,11 @@ pub async fn propagate_beliefs(
     }
 
     // -- Scalar BP fallback ---------------------------------------------------
-    let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
+    let factors_count = engine_factors.len();
+    let result = run_bp_blocking(move || {
+        epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config)
+    })
+    .await?;
 
     let (mut written, mut skipped, mut skipped_compounds, mut skipped_less_readable) =
         (0_usize, 0_usize, 0_usize, 0_usize);
@@ -1201,7 +1225,7 @@ pub async fn propagate_beliefs(
         "converged": result.converged,
         "max_change": result.max_change,
         "messages_sent": result.messages_sent,
-        "factors_count": engine_factors.len(),
+        "factors_count": factors_count,
         "variables_count": all_var_ids.len(),
         "applied": apply,
         "applied_count": written,
