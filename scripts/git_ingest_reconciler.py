@@ -15,6 +15,12 @@ config's `token_file` on each run, else inherited from the reconciler's own
 EPIGRAPH_TOKEN. The config's `default_orchestrator_id` is handed over the same way,
 as EPIGRAPH_DEFAULT_ORCHESTRATOR_ID, so a PR's Epigraph-Orchestrator-Id trailer
 still wins over it.
+
+Author keys: a live run needs the host secret that keys every author and
+repo-root agent key (`ingest_git --author-key-file`). It comes from the config's
+`author_key_file`, else the reconciler's own EPIGRAPH_GIT_AUTHOR_KEY_FILE. A live
+run without one fails before any PR is ingested; a dry run needs neither it nor
+the token.
 """
 import argparse, datetime, json, logging, os, subprocess, sys, tempfile
 import tomllib
@@ -48,6 +54,7 @@ class Config:
     default_orchestrator_id: str | None = None
     ingest_git_bin: str = "ingest_git"
     token_file: str | None = None
+    author_key_file: str | None = None
 
 def load_config_str(text: str) -> Config:
     data = tomllib.loads(text)
@@ -59,6 +66,7 @@ def load_config_str(text: str) -> Config:
         default_orchestrator_id=data.get("default_orchestrator_id"),
         ingest_git_bin=data.get("ingest_git_bin", "ingest_git"),
         token_file=data.get("token_file"),
+        author_key_file=data.get("author_key_file"),
     )
 
 def load_config(path: str) -> Config:
@@ -78,6 +86,13 @@ def read_token(cfg: "Config", environ: dict | None = None) -> str | None:
     else:
         tok = (environ.get("EPIGRAPH_TOKEN") or "").strip()
     return tok or None
+
+def resolve_author_key_file(cfg: "Config", environ: dict | None = None) -> str | None:
+    """The path of the host secret that keys the author agents: the config's
+    `author_key_file`, else the reconciler's own EPIGRAPH_GIT_AUTHOR_KEY_FILE.
+    The path is not secret (the file is), so it goes on the argv."""
+    environ = os.environ if environ is None else environ
+    return cfg.author_key_file or (environ.get("EPIGRAPH_GIT_AUTHOR_KEY_FILE") or "").strip() or None
 
 def ingest_env(token: str | None, default_orchestrator_id: str | None,
                environ: dict | None = None) -> dict:
@@ -179,7 +194,7 @@ def ensure_mirror(clone_url: str, state_dir: str, env: dict, slug_key: str | Non
     return str(d)
 
 def build_ingest_argv(pr, mirror, endpoint, rev_range, slug, *,
-                      ingest_git_bin="ingest_git", dry_run=False):
+                      ingest_git_bin="ingest_git", dry_run=False, author_key_file=None):
     """Assemble the `ingest_git --pr-ingest` argv for one merged PR. `slug` is
     the repo slug (`owner/repo`), `mirror` the local clone the binary reads, and
     `rev_range` the PR's own commit range (from `compute_rev_range`). It carries
@@ -191,19 +206,22 @@ def build_ingest_argv(pr, mirror, endpoint, rev_range, slug, *,
             "--merge-sha", pr.merge_sha, "--merged-at", pr.merged_at,
             "--pr-author", pr.author, "--rev-range", rev_range,
             "--repo", mirror, "--endpoint", endpoint]
+    if author_key_file:
+        argv += ["--author-key-file", author_key_file]
     if dry_run:
         argv += ["--dry-run"]
     return argv
 
 def ingest_pr(pr, mirror, endpoint, slug, *, env=None,
-              ingest_git_bin="ingest_git", dry_run=False) -> int:
+              ingest_git_bin="ingest_git", dry_run=False, author_key_file=None) -> int:
     """Compute the PR's commit range from the mirror, build the argv, and run
     `ingest_git` with `env` (from `ingest_env`; None inherits the reconciler's).
     Returns the subprocess return code; logs (not raises) on a non-zero exit so
     the caller can isolate per-PR failures."""
     rng = compute_rev_range(mirror, pr.merge_sha)
     argv = build_ingest_argv(pr, mirror, endpoint, rng, slug,
-                             ingest_git_bin=ingest_git_bin, dry_run=dry_run)
+                             ingest_git_bin=ingest_git_bin, dry_run=dry_run,
+                             author_key_file=author_key_file)
     LOG.info("ingest PR #%s (%s): %s", pr.number, slug, " ".join(argv))
     res = subprocess.run(argv, capture_output=True, text=True, env=env)
     if res.returncode != 0:
@@ -216,13 +234,20 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
     aborts the rest — and counted into the failure tally. Returns (ok, fail)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     env = gh_env()
-    try:
-        token = read_token(cfg)
-    except OSError as e:
-        LOG.error("cannot read token_file %s: %s", cfg.token_file, e.strerror or e)
-        return 0, 1
-    if token is None and not dry_run:
-        LOG.warning("no API token (token_file / EPIGRAPH_TOKEN): writes will be refused")
+    key_file = resolve_author_key_file(cfg)
+    token = None
+    if not dry_run:  # a dry run makes no API call, so it needs no token or key
+        if key_file is None:
+            LOG.error("no author key file (author_key_file / EPIGRAPH_GIT_AUTHOR_KEY_FILE): "
+                      "ingest_git refuses a live run without it")
+            return 0, 1
+        try:
+            token = read_token(cfg)
+        except OSError as e:
+            LOG.error("cannot read token_file %s: %s", cfg.token_file, e.strerror or e)
+            return 0, 1
+        if token is None:
+            LOG.warning("no API token (token_file / EPIGRAPH_TOKEN): writes will be refused")
     child_env = ingest_env(token, cfg.default_orchestrator_id)
     ok = fail = 0
     for slug in cfg.repos:
@@ -234,7 +259,8 @@ def run_once(cfg: Config, *, dry_run: bool, now: datetime.datetime | None = None
         for pr in prs:
             try:
                 rc = ingest_pr(pr, mirror, cfg.endpoint, slug, env=child_env,
-                               ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run)
+                               ingest_git_bin=cfg.ingest_git_bin, dry_run=dry_run,
+                               author_key_file=key_file)
                 ok += (rc == 0); fail += (rc != 0)
             except Exception as e:
                 LOG.error("PR #%s (%s) ingest raised: %s", pr.number, slug, e); fail += 1
