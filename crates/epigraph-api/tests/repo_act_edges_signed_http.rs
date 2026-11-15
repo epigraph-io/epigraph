@@ -3,8 +3,9 @@
 //! repository act writes: `POST /api/v1/claims/:id/supersede` (the act's
 //! `supersedes` and the actor's `AUTHORED`), `POST /api/v1/claims/:id/dedup`
 //! (the `same_as` identity edge), `POST /api/v1/workflows/steps/:id/evolve`
-//! (the step edge) and the match promotion of `POST
-//! /api/v1/cross-source/candidates/:id/decide` (the matcher edge).
+//! (the step edge), the match promotion of `POST
+//! /api/v1/cross-source/candidates/:id/decide` (the matcher edge) and
+//! `POST /api/v1/analyses` (`concludes` and `interpreted_by`).
 //!
 //! Every edge each call wrote is attested at INSERT with the API's own key:
 //! `signer_id` is the API's signer agent, never the caller, and
@@ -30,7 +31,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 use viewer_fixture::{
-    database_url_for, downgraded_pool, seed_agent_with_group, seed_group_claim, seed_public_claim,
+    database_url_for, downgraded_pool, seed_agent_with_group, seed_evidence, seed_group_claim,
+    seed_public_claim,
 };
 
 fn auth(agent: Uuid, scopes: &[&str]) -> Option<Extension<AuthContext>> {
@@ -253,4 +255,35 @@ async fn the_evolve_step_route_attests_its_step_edge_with_the_api_key(pool: PgPo
     .unwrap_or_else(|e| panic!("evolve_step: {e:?}"));
     let rels = assert_new_edges_attested(&pool, &before, signer, caller, "evolve_step").await;
     require(&rels, &["revises"], "evolve_step");
+}
+
+/// `POST /api/v1/analyses` writes its `concludes` and `interpreted_by` edges
+/// signed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_analysis_attests_its_edges_with_the_api_key(pool: PgPool) {
+    let (caller, _) = seed_agent_with_group(&pool, "dae795f8-http-analysis").await;
+    let (state, signer) = signed_state(&pool).await;
+    let claim = seed_public_claim(&pool, caller, "dae795f8 http: concluded").await;
+    let evidence = seed_evidence(&pool, claim, "document").await;
+
+    let before = edge_ids(&pool).await;
+    let _written = epigraph_api::routes::crud::create_analysis(
+        State(state.clone()),
+        writer(caller),
+        Json(
+            serde_json::from_value(json!({
+                "analysis_type": "statistical",
+                "method_description": "dae795f8 http: a method",
+                "inference_path": "a -> b",
+                "agent_id": caller,
+                "input_evidence_ids": [evidence],
+                "claim_ids": [claim],
+            }))
+            .expect("analysis request"),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("create_analysis: {e:?}"));
+    let rels = assert_new_edges_attested(&pool, &before, signer, caller, "analysis").await;
+    require(&rels, &["concludes", "interpreted_by"], "analysis");
 }

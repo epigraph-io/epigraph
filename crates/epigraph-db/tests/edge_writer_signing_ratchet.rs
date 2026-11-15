@@ -224,9 +224,6 @@ const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signe
 const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key, and its one \
      caller (`run_pipeline`, called only by the cross_source_sweep operator CLI on the \
      maintenance DSN) has none to pass";
-const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
-     analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
-     signing caller must receive the edge id";
 const REPO_FOR_CLI: &str = "a repository act whose only caller is an operator CLI on the \
      maintenance DSN; it takes no key because that CLI has no entity signer to pass";
 const PRIMITIVE: &str = "the unsigned arm (no key) of an EdgeRepository insert primitive; a \
@@ -284,7 +281,8 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // 29: the claim acts (supersede 2, evolve_step 1, consolidate 1, the dedup
 // mark's identity edge 1) sign with the request transport's key. Not
 // changed: the legacy dedup identity backfill (REPO_FOR_CLI).
-const UNSIGNED_SITES_HIGH_WATER: usize = 29;
+// 27: the analysis bundle (`persist_bundle`, 2) signs with the API's key.
+const UNSIGNED_SITES_HIGH_WATER: usize = 27;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -524,7 +522,7 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-db/src/repos/analysis.rs",
         "persist_bundle",
         2,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     // Two sites: the `supersedes` edge and the acting agent's `AUTHORED` edge
     // (ruling R-23, merged from main), both emitted inside the supersede act.

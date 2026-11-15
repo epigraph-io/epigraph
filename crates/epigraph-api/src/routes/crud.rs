@@ -796,8 +796,12 @@ pub async fn create_analysis(
     let claim_ids = request.claim_ids.unwrap_or_default();
 
     // Persist analysis + edges atomically
+    // Its `concludes` / `interpreted_by` edges are attested at INSERT with the
+    // API's own key (backlog dae795f8), `None` when this API has none
+    // configured.
     let analysis_id = AnalysisRepository::persist_bundle(
         &state.db_pool,
+        state.edge_signing_key(),
         &analysis,
         &claim_ids,
         &request.input_evidence_ids,
