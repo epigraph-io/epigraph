@@ -330,8 +330,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupMembershipRepository::is_member",
         ],
     ),
-    // gated (`write_target_of`) then write; the owner read is re-checked by the
-    // in-transaction viewer re-fetch (F-write-authz-reads-unfiltered).
+    // gated (`write_target_of`, for every caller since backlog 4073bbb6: the
+    // unfiltered `sqlx::query_scalar(SELECT)` owner read is gone) then write;
+    // the in-transaction viewer re-fetch still re-checks it
+    // (F-write-authz-reads-unfiltered).
     (
         "claims.rs",
         "patch_claim",
@@ -340,7 +342,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::patch_claim_atomic_conn",
             "ProvenanceRepository::append_conn",
             "db_pool.begin",
-            "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
     // gated (`ClaimRepository::get_by_id`) then write.
