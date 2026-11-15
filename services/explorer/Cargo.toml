@@ -65,3 +65,29 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"
+
+# The BFF compresses every Atlas response (tower-http `compression-br` and
+# `compression-gzip`). In an unoptimised build the brotli encoder alone is
+# slower than the 30 ms BFF share that `tests/atlas_latency.rs` holds the
+# proxy to, so the debug `cargo test` in .github/workflows/explorer.yml
+# measured the compiler's opt-level, not the proxy. Optimise only the
+# compression crates in dev and test builds; this crate and every other
+# dependency stay unoptimised, and the budget is unchanged.
+[profile.dev.package.brotli]
+opt-level = 3
+[profile.dev.package.brotli-decompressor]
+opt-level = 3
+[profile.dev.package.alloc-no-stdlib]
+opt-level = 3
+[profile.dev.package.alloc-stdlib]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.compression-codecs]
+opt-level = 3
+[profile.dev.package.compression-core]
+opt-level = 3
+[profile.dev.package.async-compression]
+opt-level = 3
