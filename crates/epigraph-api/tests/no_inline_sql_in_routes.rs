@@ -33,7 +33,8 @@
 //! | `policies.rs`      | 9 |
 //! | `clusters.rs`      | 8 (tied with `papers.rs`) |
 //!
-//! 121 statements in 24 files in all. The large in-crate DB test modules of
+//! 121 statements in 24 files in all when this file was written (120 after
+//! #869). The large in-crate DB test modules of
 //! `workflows.rs` and `edges.rs` are not counted: they are `#[cfg(test)]` code,
 //! and their production halves hold 4 and 6. [`REGISTER`] is authoritative if
 //! this table ever drifts from it.
@@ -95,7 +96,7 @@ use std::path::{Path, PathBuf};
 const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 3),
     ("belief.rs", 10),
-    ("claims.rs", 4),
+    ("claims.rs", 3),
     ("clusters.rs", 8),
     ("computation.rs", 9),
     ("conflicts.rs", 1),
@@ -122,8 +123,9 @@ const REGISTER: &[(&str, usize)] = &[
 /// Total of [`REGISTER`]. Never raise this.
 ///
 /// Measured on 2026-11-14 at commit c802844b0 (origin/main, merge of PR #817):
-/// 121 production statements in 24 files.
-const HIGH_WATER: usize = 121;
+/// 121 production statements in 24 files. Lowered to 120 when #869 moved
+/// `patch_claim`'s ownership read into the repo layer.
+const HIGH_WATER: usize = 120;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
