@@ -161,6 +161,14 @@ async fn main() -> anyhow::Result<()> {
         serde_json::json!({
             "run_id":        report.run_id,
             "seeds":         seed_count,
+            // Recall stage: what the blockers retrieved and what the
+            // eligibility and structural same-source filters dropped, so a
+            // low yield reads as "few pairs retrieved" vs "retrieved, then
+            // filtered" vs "scored and rejected" below.
+            "retrieved_pairs":     report.retrieved_pairs,
+            "ineligible_dropped":  report.ineligible_dropped,
+            "same_source_dropped": report.same_source_dropped,
+            // Precision stage.
             "scanned_pairs": report.scanned_pairs,
             "promoted":      report.promoted,
             "mid_band":      report.mid_band,

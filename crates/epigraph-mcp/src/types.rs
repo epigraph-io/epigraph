@@ -429,33 +429,6 @@ pub struct UpdateWithEvidenceParams {
 
 // ── Provenance ──
 
-/// Parameters for MCP `claim_context` (backlog `0720d208`), the query of
-/// `GET /api/v1/claims/:id/context`.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ClaimContextParams {
-    #[schemars(description = "The UUID of the claim whose structural context to read")]
-    pub claim_id: String,
-
-    #[schemars(
-        description = "Page mode: return the claim plus only this list, one of papers, \
-                       parents, parts, siblings, edges. Omit for full mode (the first page of \
-                       every list)."
-    )]
-    #[serde(default)]
-    pub list: Option<String>,
-
-    #[schemars(
-        description = "The next_cursor of that list's previous page, passed back unchanged. \
-                       Requires list."
-    )]
-    #[serde(default)]
-    pub after: Option<String>,
-
-    #[schemars(description = "Page size for list, clamped to 1..=200. Requires list.")]
-    #[serde(default)]
-    pub limit: Option<u32>,
-}
-
 /// Parameters for MCP `resolve_claim_id_prefix` (backlog `30d8b667`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResolveClaimIdPrefixParams {
@@ -1555,6 +1528,14 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
+    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
+    /// estimated number of independent assertions (backlog `72850d43`).
+    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
+    /// selects, and the two can disagree on a short coordinated sentence.
+    pub conjunct_estimate: usize,
+    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
+    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    pub conjunct_signals: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3096,9 +3077,8 @@ pub struct TraverseNode {
     /// Dempster–Shafer pignistic probability when the node carries a DS cache,
     /// else `truth_value`. `None` for a non-claim node.
     ///
-    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
-    /// value of it could change which nodes are kept — so this equals
-    /// `truth_value` there.
+    /// The same value whatever `min_truth` was (backlog `1574d9b4`), and the
+    /// one `recall` reports as `belief_score` for the same claim and caller.
     pub belief_score: Option<f64>,
     pub depth: i32,
 }

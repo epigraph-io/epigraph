@@ -31,7 +31,6 @@ pub mod bp;
 pub mod calibration;
 pub mod cdst_bp;
 pub mod cdst_sheaf;
-pub mod claim_context;
 pub mod classifier;
 pub mod compound_belief;
 pub mod confidence;
@@ -70,6 +69,7 @@ pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;
 pub mod unified_bp;
+pub mod visibility_act;
 pub mod voi;
 pub mod workflow_promotion;
 
