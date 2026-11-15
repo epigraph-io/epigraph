@@ -108,7 +108,7 @@ claims into Notion. Re-measure before quoting them as current.
 ### Notion-side state
 
 The workspace (**Astera**) already has a working EpiGraph↔Notion contract, in the
-**NanoDynamics Purchase Order System**: properties `EpiGraph Ingestion Status`,
+**customer purchase-order database**: properties `EpiGraph Ingestion Status`,
 `EpiGraph Claim ID`, `Provenance / Notion Page ID`, `Ingested By`,
 `Record Schema Version`, with an idempotent round trip
 (`check_already_ingested` → stage/batch_submit; supersede/patch keyed on the

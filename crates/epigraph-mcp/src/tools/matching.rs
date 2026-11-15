@@ -204,7 +204,8 @@ pub async fn decide_match_candidate(
     let repo = MatchCandidateRepo::new(server.pool.clone());
     let row = repo.get(candidate_id).await.map_err(internal_error)?;
 
-    let acting_agent = server.write_identity(auth, viewer).await?.agent_id();
+    let acting = server.write_identity(auth, viewer).await?;
+    let acting_agent = acting.agent_id();
 
     // Already-decided gate — transport parity with
     // `routes/cross_source.rs::decide_candidate`'s `reject_if_decided`
@@ -253,12 +254,27 @@ pub async fn decide_match_candidate(
                 )));
             };
 
+            // The guard, the status flip and the edge all run on ONE
+            // transaction stamped from the acting agent. On the plain pool (an
+            // unstamped application session in production) row security hides
+            // every group-private claim, so the guard below refused a member's
+            // promote of a pair touching its own private claim as "not
+            // current", and the edge INSERT, owned by that claim's group, would
+            // have been refused by `edges_tenancy` anyway.
+            let mut tx = crate::claim_helper::begin_author_stamped_tx(
+                server,
+                acting,
+                "decide_match_candidate",
+            )
+            .await?;
+
             // Guard: the edge must connect two live claims. If
             // either endpoint was superseded or marked duplicate (is_current =
             // false) since the candidate was generated, promoting would create
             // a structural inconsistency — an edge incident on a retired claim
-            // (backlog bug 5c7fc645). Refuse rather than write it.
-            if !ClaimRepository::are_all_current(&server.pool, viewer, &[row.claim_a, row.claim_b])
+            // (backlog bug 5c7fc645). Refuse rather than write it. Read as the
+            // caller: an endpoint it cannot read is refused the same way.
+            if !ClaimRepository::are_all_current(&mut *tx, viewer, &[row.claim_a, row.claim_b])
                 .await
                 .map_err(internal_error)?
             {
@@ -295,17 +311,18 @@ pub async fn decide_match_candidate(
                 "decided_by":       acting_agent,
                 "source":           "cross_source_matcher",
             });
-            let outcome = repo
-                .promote_if_pending(
-                    candidate_id,
-                    Some(acting_agent),
-                    row.verifier_verdict.as_deref(),
-                    relationship,
-                    props,
-                )
-                .await
-                .map_err(internal_error)?;
+            let outcome = MatchCandidateRepo::promote_if_pending_conn(
+                &mut tx,
+                candidate_id,
+                Some(acting_agent),
+                row.verifier_verdict.as_deref(),
+                relationship,
+                props,
+            )
+            .await
+            .map_err(internal_error)?;
             refuse_if_lost_race(candidate_id, outcome)?;
+            tx.commit().await.map_err(internal_error)?;
         }
         "reject" => {
             reject_if_decided()?;
