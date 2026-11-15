@@ -114,7 +114,18 @@
 --     epochs (the application role holds SELECT only), unlike a GUC marker a
 --     session holding the DSN could pre-set;
 --   * survives ROLLBACK TO SAVEPOINT: the rolled-back bump's row version goes
---     with it, and the version left has the earlier marker.
+--     with it, and the version left has the earlier marker;
+--   * writes each counter in its OWN statement (an upsert for n, then an
+--     UPDATE for left_n), so the number of epoch rows a transaction inserts
+--     and updates depends only on WHICH maps it touched, never on the order
+--     of the calls: one insert or update per map whose n it bumps first, one
+--     more update per map whose left_n it bumps first. With one combined
+--     upsert a departure that came first cost one write and an arrival then
+--     a departure cost two, which a row census cannot predict from a set of
+--     rows changed in one statement. The epigraph-cli operator movers count
+--     every table their transaction writes and refuse an unpredicted row;
+--     `tables::map_epoch_bumps_due` there predicts this table by these
+--     rules, and must change with them.
 -- Nothing on this path RAISEs: an exception here would fail the claims,
 -- edges or evidence UPDATE that fired it.
 --
@@ -329,15 +340,14 @@ SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     cur xid8 := pg_catalog.pg_current_xact_id();
 BEGIN
+    -- n: one upsert, which also locks every map row it reaches, in key order
+    -- (a row it skips is locked all the same).
     INSERT INTO public.atlas_map_epochs AS e
            (owner_group_id, visibility, n, left_n, n_xact, left_xact)
     SELECT k.k,
            CASE WHEN k.k = '00000000-0000-0000-0000-000000000000'::uuid
                 THEN 'public' ELSE 'group' END,
-           1,
-           CASE WHEN k.k = ANY (left_keys) THEN 1 ELSE 0 END,
-           cur,
-           CASE WHEN k.k = ANY (left_keys) THEN cur END
+           1, 0, cur, NULL
       FROM (SELECT DISTINCT u AS k
               FROM pg_catalog.unnest(changed_keys || left_keys) AS u
              WHERE u IS NOT NULL) k
@@ -345,13 +355,19 @@ BEGIN
      WHERE g.kind IN ('world', 'team', 'community')
      ORDER BY k.k
     ON CONFLICT (owner_group_id) DO UPDATE
-       SET n         = CASE WHEN e.n_xact = cur THEN e.n ELSE e.n + 1 END,
-           n_xact    = cur,
-           left_n    = CASE WHEN EXCLUDED.left_n > 0 AND e.left_xact IS DISTINCT FROM cur
-                            THEN e.left_n + 1 ELSE e.left_n END,
-           left_xact = CASE WHEN EXCLUDED.left_n > 0 THEN cur ELSE e.left_xact END
-     WHERE e.n_xact IS DISTINCT FROM cur
-        OR (EXCLUDED.left_n > 0 AND e.left_xact IS DISTINCT FROM cur);
+       SET n = e.n + 1, n_xact = cur
+     WHERE e.n_xact IS DISTINCT FROM cur;
+    -- left_n: the departed maps (the same kind filter), every one of which
+    -- the upsert just reached and locked, so this takes no new row lock.
+    IF pg_catalog.cardinality(left_keys) > 0 THEN
+        UPDATE public.atlas_map_epochs e
+           SET left_n = e.left_n + 1, left_xact = cur
+          FROM public.groups g
+         WHERE e.owner_group_id = ANY (left_keys)
+           AND g.id = e.owner_group_id
+           AND g.kind IN ('world', 'team', 'community')
+           AND e.left_xact IS DISTINCT FROM cur;
+    END IF;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_atlas_map_bump(uuid[], uuid[]) FROM PUBLIC;
 
