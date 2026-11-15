@@ -94,7 +94,7 @@ use std::path::{Path, PathBuf};
 /// Production inline-SQL statements per file, as
 /// `(path relative to crates/epigraph-api/src/routes, count)`, sorted by path.
 const REGISTER: &[(&str, usize)] = &[
-    ("assess.rs", 3),
+    ("assess.rs", 2),
     ("belief.rs", 10),
     ("claims.rs", 3),
     ("clusters.rs", 8),
@@ -113,7 +113,6 @@ const REGISTER: &[(&str, usize)] = &[
     ("papers.rs", 8),
     ("policies.rs", 4),
     ("political.rs", 1),
-    ("rag.rs", 2),
     ("revoke_signature.rs", 6),
     ("search.rs", 4),
     ("submit.rs", 5),
@@ -126,7 +125,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// 121 production statements in 24 files. Lowered to 120 when #869 moved
 /// `patch_claim`'s ownership read into the repo layer, and to 115 when the
 /// policies reads and challenge-create statements moved into `PolicyRepository`.
-const HIGH_WATER: usize = 115;
+/// Lowered to 112 when assess's embedding UPDATE moved into the shared unsealed
+/// writer (-1) and the PUT claim and evidence embedding routes were deleted
+/// (`rag.rs`, -2; backlog 9bef22f3).
+const HIGH_WATER: usize = 112;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
