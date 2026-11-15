@@ -96,6 +96,19 @@ async fn main() {
             report.ahead, report.db_head, report.binary_head
         );
     }
+    // Backlog e30316ae: the kernel needs pgvector >= 0.8.0 and nothing checked
+    // it. Checked after migrating (001 creates the extension on a fresh
+    // database) and before the `migrations: ok` marker, so a refused run never
+    // prints it. This binary only: the server does not refuse to boot on it.
+    let pgvector = match epigraph_api::migrate::check_pgvector_version(&pool).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "pgvector version check FAILED");
+            eprintln!("migrations: FAILED: migrations were applied, but {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(pgvector = %pgvector, "pgvector version ok");
     tracing::info!(
         db_head_before = report.db_head_before,
         db_head = report.db_head,
@@ -104,6 +117,36 @@ async fn main() {
         db_ahead = report.db_ahead,
         "migrations: ok"
     );
+    // Test harnesses only (migration 216, backlog 0512ca33): the seed escape
+    // hatch now needs an explicit grant, which the superuser test harness
+    // used to get by implication. See `GRANT_SEED_TO_SELF_ENV`.
+    if epigraph_api::migrate::grant_seed_to_self_requested() {
+        let granted = match pool.acquire().await {
+            Ok(mut conn) => epigraph_api::migrate::grant_seed_to_session_user(&mut conn).await,
+            Err(e) => Err(e),
+        };
+        match granted {
+            Ok(Some(who)) => tracing::warn!(
+                role = %who,
+                env = epigraph_api::migrate::GRANT_SEED_TO_SELF_ENV,
+                "granted epigraph_seed to the migrating role (TEST HARNESS opt-in): its \
+                 undeclared writes now take the seed escape hatch. Never set this for a \
+                 deployed service login."
+            ),
+            Ok(None) => tracing::warn!(
+                env = epigraph_api::migrate::GRANT_SEED_TO_SELF_ENV,
+                "seed grant requested but the epigraph_seed role does not exist; nothing granted"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "seed grant FAILED");
+                eprintln!(
+                    "migrations: FAILED: {} was set but GRANT epigraph_seed failed: {e}",
+                    epigraph_api::migrate::GRANT_SEED_TO_SELF_ENV
+                );
+                std::process::exit(1);
+            }
+        }
+    }
     // Stdout marker for ops scripts: the line still STARTS with
     // `migrations: ok`, so an existing `grep 'migrations: ok'` keeps matching,
     // and it now carries both heads so the marker says what "ok" means.
