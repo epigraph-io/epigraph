@@ -186,8 +186,8 @@ const HIGH_WATER: usize = 27;
 /// [`UNSTAMPED_TRANSACTIONS`]).
 const RAW_INSERTS: &[(&str, usize)] = &[];
 
-// Its high water was 11 before R-50 moved `submit.rs`'s five and
-// `experiment_loop.rs`'s four onto the signed primitive, then 2, and 0 since
+// Its high water was 11 before `submit.rs`'s five and `experiment_loop.rs`'s
+// four moved onto the signed primitive, then 2, and 0 since
 // `crud.rs::promote_staged_edges` did (backlog `dae795f8`): the register stays
 // empty, which the register test asserts.
 
