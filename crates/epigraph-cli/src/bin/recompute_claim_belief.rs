@@ -16,8 +16,9 @@
 //!
 //! Frame handling: `claims.{belief, pl, pignistic_prob, ...}` is ONE shared
 //! cache, so for each input claim `edge_factor::recompute_claim_cached_belief`
-//! recomputes it from the claim's single owner frame (`binary_truth`, else
-//! `claim_validity`, else the frame the cache already records, else the frame
+//! recomputes it from the claim's single owner frame (a frame with a
+//! cache-admissible input first; then `binary_truth`, else `claim_validity`,
+//! else the frame the cache already records, else the frame
 //! holding the claim's earliest input; see
 //! `MassFunctionRepository::cache_owner_frame_for_claim`). No other frame name
 //! plays a part, so two runs against the same population converge to
