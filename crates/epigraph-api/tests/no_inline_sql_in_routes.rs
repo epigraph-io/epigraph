@@ -117,7 +117,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("revoke_signature.rs", 6),
     ("search.rs", 4),
     ("submit.rs", 5),
-    ("workflows.rs", 4),
+    ("workflows.rs", 2),
 ];
 
 /// Total of [`REGISTER`]. Never raise this.
@@ -126,7 +126,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// 121 production statements in 24 files. Lowered to 120 when #869 moved
 /// `patch_claim`'s ownership read into the repo layer, and to 115 when the
 /// policies reads and challenge-create statements moved into `PolicyRepository`.
-const HIGH_WATER: usize = 115;
+/// Lowered to 113 when the hierarchical outcome report's counter write (its
+/// `SELECT metadata .. FOR UPDATE` and `UPDATE workflows SET metadata`) moved
+/// into `WorkflowRepository`, shared with the MCP tool (`workflows.rs` 4 -> 2).
+const HIGH_WATER: usize = 113;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
