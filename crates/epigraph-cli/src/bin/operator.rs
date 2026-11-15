@@ -112,6 +112,7 @@
 //!         (MODE: holder_only | registered_agents | attached_agents)
 //!     epigraph-operator end-group-role-binding --binding <uuid> --reason TEXT [--apply]
 //!     epigraph-operator group-roster --group <uuid> [--at <RFC3339>]
+//!         (MEMBER: derived by a role binding; DIRECT: a row of the group's own roster)
 //!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
 //!         --reason TEXT [--apply]
 //!     epigraph-operator group-member set-role --group <uuid> --agent <uuid> \
@@ -446,8 +447,10 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Who holds a group through its role bindings at an instant (migration
-    /// 165): each role holder and each agent registered to one. Read-only.
+    /// Who holds a group at an instant. `MEMBER` lines: through its role
+    /// bindings (migration 165), each role holder and each agent registered
+    /// to one. `DIRECT` lines: the group's own live roster rows (what
+    /// `group-member add` writes). Read-only.
     GroupRoster {
         /// The group.
         #[arg(long)]
@@ -841,7 +844,8 @@ enum Command {
         #[arg(long)]
         accept_unenforced: bool,
         /// Also move public claims owned by a group other than the world
-        /// group. Off by default: only the world-owned corpus moves.
+        /// group. Off by default: only the world-owned corpus moves. A public
+        /// claim the target itself owns is narrowed in place (owner unchanged).
         #[arg(long)]
         allow_non_world_owner: bool,
         /// The decision this act carries out, recorded in the manifest and the
@@ -2093,10 +2097,20 @@ async fn main_inner() -> anyhow::Result<i32> {
                     row.agent, row.role, row.holder
                 );
             }
+            let direct = group_role::direct_members(&mut conn, group, at).await?;
+            for row in &direct {
+                println!(
+                    "DIRECT\tagent={}\trole={}\tjoined_at={}",
+                    row.agent,
+                    row.role,
+                    row.joined_at.to_rfc3339()
+                );
+            }
             println!(
-                "members={}\tgroup={group}\tat={}",
+                "members={}\tgroup={group}\tat={}\tdirect={}",
                 rows.len(),
-                at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339())
+                at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339()),
+                direct.len()
             );
             Ok(0)
         }

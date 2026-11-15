@@ -1955,94 +1955,15 @@ pub async fn submit_packet(
         (false, Some(trace_id), evidence_ids.clone())
     };
 
-    // 6. Create the claim object and register it for propagation
-    //
-    // This creates an in-memory representation of the claim for the
-    // propagation orchestrator to track truth value updates.
-    //
-    // Skip on a duplicate submit (B5): the canonical claim was inserted by an
-    // earlier submit and is already tracked in the in-memory DAG; re-registering
-    // it (and re-running propagation) would only churn the orchestrator for a
-    // claim that did not change. The in-memory `claim` is built *inside* this
-    // guard so it is never constructed on the dedup path.
-    if !was_duplicate {
-        let content_hash = ContentHasher::hash(packet.claim.content.as_bytes());
-        let claim = Claim::with_id(
-            ClaimId::from_uuid(claim_id),
-            packet.claim.content.clone(),
-            AgentId::from_uuid(packet.claim.agent_id),
-            [0u8; 32], // Placeholder public key - actual verification done in middleware
-            content_hash,
-            Some(TraceId::from_uuid(trace_id)),
-            None, // Signature verified in middleware
-            TruthValue::new(truth_value).unwrap_or_else(|_| TruthValue::uncertain()),
-            chrono::Utc::now(),
-            chrono::Utc::now(),
-        );
-
-        // 7. Register claim in the propagation orchestrator and trigger propagation
-        //
-        // This step:
-        //    a. Registers the new claim in the in-memory DAG
-        //    b. Triggers propagation to any dependent claims
-        //    c. Updates truth values throughout the graph
-        //    d. Records audit trail for forensic analysis
-        //
-        // CRITICAL: Propagation NEVER uses agent reputation to influence truth values.
-        // Only evidence strength and source claim truth affect the calculation.
-        {
-            let mut orchestrator = state.propagation_orchestrator.write().await;
-
-            // Register the new claim in the orchestrator
-            if let Err(e) = orchestrator.register_claim(claim) {
-                tracing::warn!(
-                    claim_id = %claim_id,
-                    error = %e,
-                    "Failed to register claim in propagation orchestrator"
-                );
-                // Continue anyway - claim submission shouldn't fail due to propagation issues
-            }
-
-            // Trigger propagation from this claim to any dependents
-            // Note: A newly created claim typically has no dependents yet, but this
-            // sets up the infrastructure for when dependencies are added later.
-            let propagation_result = state.propagator.propagate_from(
-                &mut orchestrator,
-                ClaimId::from_uuid(claim_id),
-                None, // Use the claim's current truth value
-            );
-
-            match propagation_result {
-                Ok(result) => {
-                    if !result.updated_claims.is_empty() {
-                        tracing::info!(
-                            claim_id = %claim_id,
-                            updated_count = result.updated_claims.len(),
-                            depth = result.depth_reached,
-                            converged = result.converged,
-                            depth_limited = result.depth_limited,
-                            "Propagation completed after claim submission"
-                        );
-
-                        // In production with database, persist the updated truth values:
-                        // for updated_id in &result.updated_claims {
-                        //     if let Some(updated_truth) = orchestrator.get_truth(*updated_id) {
-                        //         ClaimRepository::update_truth_value(pool, *updated_id, updated_truth).await?;
-                        //     }
-                        // }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        claim_id = %claim_id,
-                        error = %e,
-                        "Propagation failed after claim submission"
-                    );
-                    // Continue anyway - claim was already created successfully
-                }
-            }
-        }
-    } // end `if !was_duplicate` (skip register + propagation on dedup)
+    // 6-7. (removed) The claim used to be copied, content included, into an
+    // in-memory `PropagationOrchestrator` here, under a process-global write
+    // lock, and "propagated". Nothing in the API ever adds a dependency to
+    // that orchestrator, so the propagation could not reach another claim, the
+    // code that would have persisted a result was commented out, and the map
+    // has no eviction: a long-running server kept every packet-submitted
+    // claim's text (host telemetry included) until it restarted (backlog
+    // 7b3722b5). Belief is computed from stored mass functions on read; this
+    // route writes no in-memory graph.
 
     // 8. Generate and store embedding for the claim content
     //
@@ -2078,7 +1999,7 @@ pub async fn submit_packet(
     // and overwriting the column for an unchanged claim is wasted work.
     #[cfg(feature = "db")]
     if !was_duplicate {
-        if let Some(ref embedding_service) = state.embedding_service {
+        if let Some(embedding_service) = state.storing_embedding_service() {
             if is_host_telemetry {
                 tracing::debug!(
                     claim_id = %claim_id,
@@ -2175,7 +2096,7 @@ pub async fn submit_packet(
     // already have an embedding or do not exist.
     #[cfg(feature = "db")]
     if !was_duplicate {
-        if let Some(ref embedding_service) = state.embedding_service {
+        if let Some(embedding_service) = state.storing_embedding_service() {
             for (i, evidence_submission) in packet.evidence.iter().enumerate() {
                 if let EvidenceTypeSubmission::Figure { ref caption, .. } =
                     evidence_submission.evidence_type
@@ -2357,6 +2278,39 @@ mod tests {
             "Initial truth should be capped, got {}",
             truth
         );
+    }
+}
+
+/// `ViewerExtractor` requires an `AuthContext` on the request, which
+/// the bearer middleware installs in production. Test routers built from a
+/// bare `Router::new()` carry none, so they 401 before reaching the handler.
+///
+/// File-level so both feature arms reach it: `event_tests` (not(db)) and
+/// `signature_verification_tests` (db) each build such routers. It used to
+/// live inside the db module only, which left the not(db) lib-test target
+/// unable to resolve it.
+#[cfg(test)]
+fn test_auth() -> crate::middleware::bearer::AuthContext {
+    let id = uuid::Uuid::new_v4();
+    crate::middleware::bearer::AuthContext {
+        client_id: id,
+        agent_id: Some(id),
+        owner_id: Some(id),
+        client_type: crate::middleware::bearer::ClientType::Service,
+        scopes: vec![
+            "claims:read".to_string(),
+            "claims:write".to_string(),
+            "edges:read".to_string(),
+            "edges:write".to_string(),
+            "workflows:read".to_string(),
+            "workflows:write".to_string(),
+        ],
+        jti: uuid::Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -2633,33 +2587,6 @@ mod event_tests {
 
 #[cfg(all(test, feature = "db"))]
 mod signature_verification_tests {
-
-    /// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
-    /// the bearer middleware installs in production. Test routers built from a
-    /// bare `Router::new()` carry none, so they 401 before reaching the handler.
-    fn test_auth() -> crate::middleware::bearer::AuthContext {
-        let id = uuid::Uuid::new_v4();
-        crate::middleware::bearer::AuthContext {
-            client_id: id,
-            agent_id: Some(id),
-            owner_id: Some(id),
-            client_type: crate::middleware::bearer::ClientType::Service,
-            scopes: vec![
-                "claims:read".to_string(),
-                "claims:write".to_string(),
-                "edges:read".to_string(),
-                "edges:write".to_string(),
-                "workflows:read".to_string(),
-                "workflows:write".to_string(),
-            ],
-            jti: uuid::Uuid::new_v4(),
-            family_id: None,
-            elevation_claim: None,
-            elevation: None,
-            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
-            delegated_by: None,
-        }
-    }
     use super::*;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
