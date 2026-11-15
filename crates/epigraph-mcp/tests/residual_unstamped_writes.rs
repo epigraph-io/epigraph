@@ -311,6 +311,17 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),
+    (
+        "unauthenticated_reader.rs",
+        "AgentRepository::create",
+        1,
+        "`UnauthenticatedReader::find_or_create`'s first-use creation of the \
+         `--allow-unauthenticated-http` reader agent's OWN `agents` row. `agents` carries no \
+         owner group (universally readable, migration 077), so the INSERT is admitted \
+         unstamped, and no caller exists to stamp from: this IS the zero-membership identity \
+         the listener reads as. Same row class and reason as `server.rs`'s \
+         `AgentRepository::create`.",
+    ),
 ];
 
 /// Call sites the write-name heuristic matches but which do not WRITE through
