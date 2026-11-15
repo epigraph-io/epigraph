@@ -1952,6 +1952,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          transaction; the returned count lets it refuse a write that changed nothing.",
     ),
     (
+        "policy.rs",
+        "lock_challenge_create",
+        "Takes the transaction-scoped advisory lock `pg_advisory_xact_lock(hashtext(..), \
+         hashtext(content))` that serializes concurrent `create_challenge` calls (moved verbatim \
+         from `routes/policies.rs`). It reads and writes no table, so there is nothing for a \
+         viewer to filter; the caller's STAMPED transaction carries the identity.",
+    ),
+    (
+        "policy.rs",
+        "find_challenge_by_hash",
+        "READ of the oldest `claims` id labelled `policy:challenge` for a (content_hash, \
+         agent_id) pair, moved verbatim from `create_challenge`, on the caller's STAMPED write \
+         transaction. It is an idempotency probe for a challenge the SYSTEM agent authors \
+         instance-wide and it answers an id only; the stamp's row security decides visibility, \
+         exactly as when the statement ran inline in the handler.",
+    ),
+    (
+        "policy.rs",
+        "insert_challenge",
+        "WRITE (INSERT) of one pending `policy:challenge` claim authored by the SYSTEM agent \
+         with a tenancy declaration the handler resolved (`default_decl_for_author_pool`), moved \
+         verbatim from `create_challenge` onto the caller's STAMPED write transaction, where \
+         migration 122's claims trigger binds the caller. An INSERT has no read to filter, and \
+         the write-gate lint watches UPDATE/DELETE only.",
+    ),
+    (
         "workflow.rs",
         "ingest_anchors",
         "READ of `workflows` only: `find_root_by_canonical` / `head_by_canonical` / \
