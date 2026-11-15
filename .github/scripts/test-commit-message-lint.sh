@@ -82,6 +82,7 @@ check "ok Signed-off-by"         0 "feat(x): t$good_body"$'\n\nSigned-off-by: A 
 check "ok example.com"           0 "feat(x): t$good_body"$'\n\nowner@example.com' - -
 check "ok noreply addresses"     0 "feat(x): t$good_body"$'\n\nnoreply@anthropic.com 7@users.noreply.github.com' - -
 check "ok /home/user/"           0 "feat(x): t$good_body"$'\n\n/home/user/epigraph and /home/runner/work/' - -
+check "ok role@private-IP DSN"   0 "feat(x): t$good_body"$'\n\npostgres://epigraph@127.0.0.1/db and app@10.0.0.5' - -
 check "ok documentation IP"      0 "feat(x): t$good_body"$'\n\n192.0.2.9 198.51.100.4 203.0.113.250' - -
 check "ok private and loopback"  0 "feat(x): t$good_body"$'\n\n10.0.0.5 172.16.3.4 192.168.1.1 127.0.0.1 0.0.0.0' - -
 check "ok version string"        0 "feat(x): t$good_body"$'\n\nbump to 1.2.3.4.5 and v8.30.1' - -

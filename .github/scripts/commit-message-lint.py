@@ -82,6 +82,10 @@ def scan_line(line):
     found = []
     for m in EMAIL_RE.finditer(line):
         addr = m.group(0)
+        # `role@10.0.0.5` in a connection string is not an address; a public
+        # IP there is still caught below as E3.
+        if re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", m.group(1)):
+            continue
         if m.group(1).lower() not in EMAIL_OK_DOMAINS and addr.lower() not in EMAIL_OK_ADDRS:
             found.append(("E1", f"e-mail address ({addr[0]}..., {len(addr)} chars)"))
     for m in HOME_RE.finditer(line):
