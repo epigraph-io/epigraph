@@ -8,8 +8,13 @@ on:
 # A push to a pull request supersedes the run for its previous head: cancel it
 # rather than let both hold runners. Pushes to main are never cancelled, so
 # every merge commit keeps its own complete run.
+#
+# The group is per pull request, but per COMMIT for a push. A group allows one
+# running and one pending run, and a newly queued run replaces the pending one
+# even when `cancel-in-progress` is false; with one group for all of `main`
+# (`github.ref`), merges landing while a run was queued cancelled each other.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Actions are pinned to a full commit SHA (not a floating tag) so a compromised
