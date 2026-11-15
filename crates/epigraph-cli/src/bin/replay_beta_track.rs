@@ -99,6 +99,11 @@ struct Cli {
     exclude_method: Vec<String>,
 }
 
+/// The refusal when MAINTENANCE_DATABASE_URL is unset.
+const UNSET_MAINTENANCE_DSN: &str = "replay_beta_track rewrites claims across every owner, so it \
+     runs only on an explicitly configured MAINTENANCE_DATABASE_URL; it is unset, and the \
+     application DSN is never used for this";
+
 /// The manifest file. `flush`, which the replay calls once per batch before
 /// it commits, also syncs the file to disk, so a host crash after a commit
 /// cannot lose that batch's records.
@@ -129,6 +134,15 @@ async fn main() -> anyhow::Result<()> {
     if cli.apply && cli.reverse.is_none() && cli.manifest.is_none() {
         bail!("--apply needs --manifest <PATH>: the record a --reverse undoes the run by");
     }
+    // Refused before anything else, so an unset MAINTENANCE_DATABASE_URL
+    // never creates a manifest or opens a connection on the application DSN
+    // (checked again below on the pool's own answer).
+    let (_, dsn_source) =
+        epigraph_db::maintenance_database_url(&cli.database_url).map_err(|e| anyhow!("{e}"))?;
+    if dsn_source != epigraph_db::MaintenanceDsnSource::Configured {
+        bail!(UNSET_MAINTENANCE_DSN);
+    }
+
     // Opened before connecting, so an existing file refuses the run before it
     // touches the database, and a later write cannot clobber an older run's
     // manifest.
@@ -147,11 +161,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow!("{e}"))?;
     if maint.dsn_source() != epigraph_db::MaintenanceDsnSource::Configured {
-        bail!(
-            "replay_beta_track rewrites claims across every owner, so it runs only on an \
-             explicitly configured MAINTENANCE_DATABASE_URL; it is unset, and the application \
-             DSN is never used for this"
-        );
+        bail!(UNSET_MAINTENANCE_DSN);
     }
     let mut session = maint
         .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
