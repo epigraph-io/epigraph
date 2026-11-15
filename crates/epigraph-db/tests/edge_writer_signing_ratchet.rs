@@ -217,9 +217,6 @@ fn site_problems(body: &str) -> Vec<String> {
 
 /// Why an unsigned site does not sign. Each is a measured property of the
 /// tree, not a preference.
-const BULK_STAGING_COPY: &str = "one INSERT .. SELECT statement copies every approved \
-     edges_staging row (claims:admin); attesting each copy needs a per-row INSERT through the \
-     signed primitive with the API key, not yet threaded";
 const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signer";
 const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key, and its one \
      caller (`run_pipeline`, called only by the cross_source_sweep operator CLI on the \
@@ -282,7 +279,9 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // mark's identity edge 1) sign with the request transport's key. Not
 // changed: the legacy dedup identity backfill (REPO_FOR_CLI).
 // 27: the analysis bundle (`persist_bundle`, 2) signs with the API's key.
-const UNSIGNED_SITES_HIGH_WATER: usize = 27;
+// 25: the staged-edge promotion: its two bulk copies became one signed
+// per-row site.
+const UNSIGNED_SITES_HIGH_WATER: usize = 25;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -386,11 +385,12 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // One row at a time through the signed twin, with the API's key.
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "promote_staged_edges",
-        2,
-        Unsigned(BULK_STAGING_COPY),
+        1,
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",

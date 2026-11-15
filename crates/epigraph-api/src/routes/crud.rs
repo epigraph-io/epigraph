@@ -1091,6 +1091,20 @@ pub struct PromoteStagedEdgesRequest {
     pub edge_ids: Option<Vec<Uuid>>,
 }
 
+/// Whether a staged copy's INSERT was refused by a unique or exclusion
+/// constraint of `edges` (23505 / 23P01): what the bulk copy's bare
+/// `ON CONFLICT DO NOTHING` used to skip silently.
+#[cfg(feature = "db")]
+fn staged_copy_conflicts(e: &epigraph_db::DbError) -> bool {
+    match e {
+        epigraph_db::DbError::DuplicateKey { .. } => true,
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => matches!(d.code().as_deref(), Some("23505" | "23P01")),
+        _ => false,
+    }
+}
+
 /// Promote approved staged edges to the production edges table
 ///
 /// POST /api/v1/edges-staging/promote
@@ -1120,136 +1134,122 @@ pub async fn promote_staged_edges(
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
-    // Build the query based on whether specific IDs were provided. Each arm is
-    // ONE statement ($1 = the reserved keys), so the reserved-key check and
-    // the copy read the same snapshot. `reserved` lists the selected rows whose
-    // `properties` carry `dedup` or `supersede_act`; when any does,
-    // `to_promote` is empty and nothing is written. Those keys mark a dedup
-    // act's identity edge and a supersession's act edge, which only the acts
-    // write (create and patch refuse them too); a staged row is copied
-    // verbatim, so promoting it would publish a forged act record. The whole
-    // request is refused rather than silently promoting the rest. `lineage`
-    // does the same for a staged `supersedes` row (any spelling): copied
-    // verbatim it would publish a lineage edge that retires nothing.
-    //
-    // The one column NOT copied verbatim is a case-folded relationship
-    // (`CASE_FOLDED_RELATIONSHIPS`, the last bind): it is promoted in its
-    // lower-case canonical spelling, as every edge writer stores it (backlog
-    // 3ce5e00c; `edges_staging.relationship` defaults to `CORROBORATES`).
-    let (promoted_count, reserved, lineage, provenance): (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>) =
-        if let Some(ref ids) = request.edge_ids {
-            if ids.is_empty() {
-                return Err(ApiError::ValidationError {
-                    field: "edge_ids".to_string(),
-                    reason: "edge_ids array must not be empty when provided".to_string(),
-                });
-            }
+    if request.edge_ids.as_ref().is_some_and(Vec::is_empty) {
+        return Err(ApiError::ValidationError {
+            field: "edge_ids".to_string(),
+            reason: "edge_ids array must not be empty when provided".to_string(),
+        });
+    }
+    let db_err = |e: &dyn std::fmt::Display| ApiError::DatabaseError {
+        message: format!("Failed to promote staged edges: {e}"),
+    };
 
-            // Promote specific IDs (must be 'approved')
-            sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>)>(
-            &"WITH selected AS (
-                SELECT id, source_id, source_type, target_id, target_type,
-                       relationship, properties
+    // ONE transaction. The selected rows (the given ids, else every approved
+    // row; only 'approved' ones either way) are read and LOCKED with their
+    // three refusal flags in one statement, so the checks and the copy see the
+    // same rows. `reserved`: the row's `properties` carry `dedup` or
+    // `supersede_act` (a dedup act's identity edge, a supersession's act edge,
+    // which only the acts write; create and patch refuse them too), so copying
+    // it would publish a forged act record. `lineage`: a staged `supersedes`
+    // row (any spelling), which would publish a lineage edge that retires
+    // nothing. `provenance`: the document ingest's own provenance and the
+    // agent-credit edges (see the doc comment). When any row is refused the
+    // whole request is refused and NOTHING is written, rather than promoting
+    // the rest.
+    // id, source, source type, target, target type, relationship, properties,
+    // and the reserved / lineage / provenance flags.
+    type StagedRow = (
+        Uuid,
+        Uuid,
+        String,
+        Uuid,
+        String,
+        String,
+        serde_json::Value,
+        bool,
+        bool,
+        bool,
+    );
+    let mut tx = state.db_pool.begin().await.map_err(|e| db_err(&e))?;
+    let selected: Vec<StagedRow> = sqlx::query_as(
+        &"SELECT id, source_id, source_type::text, target_id, target_type::text,
+                     relationship::text, properties,
+                     COALESCE(properties ?| $1::text[], false),
+                     lower(relationship) = 'supersedes',
+                     COALESCE(__PROVENANCE__, false)
                 FROM edges_staging
-                WHERE id = ANY($2) AND review_status = 'approved'
+               WHERE review_status = 'approved'
+                 AND ($2::uuid[] IS NULL OR id = ANY($2))
+               ORDER BY id
+                 FOR UPDATE"
+            .replace(
+                "__PROVENANCE__",
+                &epigraph_db::staged_provenance_refusal_sql(),
             ),
-            reserved AS (
-                SELECT id FROM selected WHERE properties ?| $1::text[]
-            ),
-            lineage AS (
-                SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
-            ),
-            provenance AS (
-                SELECT id FROM selected WHERE __PROVENANCE__
-            ),
-            to_promote AS (
-                SELECT * FROM selected
-                WHERE NOT EXISTS (SELECT 1 FROM reserved)
-                  AND NOT EXISTS (SELECT 1 FROM lineage)
-                  AND NOT EXISTS (SELECT 1 FROM provenance)
-            ),
-            inserted AS (
-                INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type,
-                       CASE WHEN lower(relationship) = ANY($3::text[])
-                            THEN lower(relationship) ELSE relationship END,
-                       properties
-                FROM to_promote
-                ON CONFLICT DO NOTHING
-                RETURNING id
-            ),
-            updated AS (
-                UPDATE edges_staging
-                SET review_status = 'promoted', reviewed_at = NOW()
-                WHERE id IN (SELECT id FROM to_promote)
+    )
+    .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
+    .bind(request.edge_ids.as_deref())
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| db_err(&e))?;
+    let flagged = |pick: fn(&StagedRow) -> bool| -> Vec<Uuid> {
+        selected.iter().filter(|r| pick(r)).map(|r| r.0).collect()
+    };
+    let reserved = flagged(|r| r.7);
+    let lineage = flagged(|r| r.8);
+    let provenance = flagged(|r| r.9);
+    let mut promoted_count: i64 = 0;
+    if reserved.is_empty() && lineage.is_empty() && provenance.is_empty() {
+        // Each copy is attested at INSERT with the API's own key (backlog
+        // dae795f8; `None` when this API has none configured, and the copy is
+        // then unsigned). The signer is the API, never the claims:admin caller
+        // nor the row's stager. One row at a time, each in its own SAVEPOINT:
+        // a copy refused by a unique index of `edges` (migrations 091, 175) is
+        // skipped and the rest go on, as the bulk copy's bare
+        // `ON CONFLICT DO NOTHING` skipped it. The relationship is stored in
+        // its canonical spelling (`canonical_relationship`: the case-folded
+        // relationships, backlog 3ce5e00c, lower-cased; any other verbatim),
+        // as every edge writer stores it.
+        let key = state.edge_signing_key();
+        for (_, source_id, source_type, target_id, target_type, relationship, properties, ..) in
+            &selected
+        {
+            let mut sp = sqlx::Acquire::begin(&mut *tx)
+                .await
+                .map_err(|e| db_err(&e))?;
+            match epigraph_db::EdgeRepository::create_signed_conn(
+                &mut sp,
+                key,
+                *source_id,
+                source_type,
+                *target_id,
+                target_type,
+                relationship,
+                Some(properties.clone()),
+                None,
+                None,
             )
-            SELECT (SELECT COUNT(*) FROM to_promote),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM provenance), '{}'::uuid[])"
-                .replace("__PROVENANCE__", &epigraph_db::staged_provenance_refusal_sql()),
+            .await
+            {
+                Ok(_) => sp.commit().await.map_err(|e| db_err(&e))?,
+                Err(e) if staged_copy_conflicts(&e) => {
+                    sp.rollback().await.map_err(|e| db_err(&e))?;
+                }
+                Err(e) => return Err(db_err(&e)),
+            }
+        }
+        let ids: Vec<Uuid> = selected.iter().map(|r| r.0).collect();
+        sqlx::query(
+            "UPDATE edges_staging SET review_status = 'promoted', reviewed_at = NOW() \
+              WHERE id = ANY($1)",
         )
-        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
-        .bind(ids)
-        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
-        .fetch_one(&state.db_pool)
+        .bind(&ids)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to promote staged edges: {e}"),
-        })?
-        } else {
-            // Promote all approved
-            sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>)>(
-            &"WITH selected AS (
-                SELECT id, source_id, source_type, target_id, target_type,
-                       relationship, properties
-                FROM edges_staging
-                WHERE review_status = 'approved'
-            ),
-            reserved AS (
-                SELECT id FROM selected WHERE properties ?| $1::text[]
-            ),
-            lineage AS (
-                SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
-            ),
-            provenance AS (
-                SELECT id FROM selected WHERE __PROVENANCE__
-            ),
-            to_promote AS (
-                SELECT * FROM selected
-                WHERE NOT EXISTS (SELECT 1 FROM reserved)
-                  AND NOT EXISTS (SELECT 1 FROM lineage)
-                  AND NOT EXISTS (SELECT 1 FROM provenance)
-            ),
-            inserted AS (
-                INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type,
-                       CASE WHEN lower(relationship) = ANY($2::text[])
-                            THEN lower(relationship) ELSE relationship END,
-                       properties
-                FROM to_promote
-                ON CONFLICT DO NOTHING
-                RETURNING id
-            ),
-            updated AS (
-                UPDATE edges_staging
-                SET review_status = 'promoted', reviewed_at = NOW()
-                WHERE id IN (SELECT id FROM to_promote)
-            )
-            SELECT (SELECT COUNT(*) FROM to_promote),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM provenance), '{}'::uuid[])"
-                .replace("__PROVENANCE__", &epigraph_db::staged_provenance_refusal_sql()),
-        )
-        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
-        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
-        .fetch_one(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to promote staged edges: {e}"),
-        })?
-        };
+        .map_err(|e| db_err(&e))?;
+        tx.commit().await.map_err(|e| db_err(&e))?;
+        promoted_count = i64::try_from(selected.len()).unwrap_or(i64::MAX);
+    }
 
     if !provenance.is_empty() {
         let ids: Vec<String> = provenance.iter().map(Uuid::to_string).collect();

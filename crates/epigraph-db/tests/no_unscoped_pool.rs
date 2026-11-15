@@ -773,7 +773,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// (`HIGH_WATER_FILES` falls by one).
 /// 207 -> 206 when `supersede_claim`'s detached factor-count spawn was deleted
 /// (backlog 79e1f75d): `routes/versioning.rs` 2 -> 1, the file keeping 1 site.
-const HIGH_WATER: usize = 206;
+/// 206 -> 205 when `promote_staged_edges`'s two one-statement arms became one
+/// transaction on the same raw pool (backlog dae795f8): `routes/crud.rs`
+/// 30 -> 29. A merge of two sites, not a conversion.
+const HIGH_WATER: usize = 205;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -977,7 +980,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 31 -> 30: `build_themes_from_corpus` (the k-means bootstrap, a corpus-wide
     // write on `state.db_pool`) was deleted with the prototype, backlog
     // a0ed0180. A removal, not a conversion.
-    ("routes/crud.rs", 30),
+    // 30 -> 29: `promote_staged_edges`'s two arms (one `&state.db_pool` each)
+    // became one transaction begun on it (backlog dae795f8, the per-row signed
+    // copy). Still the raw pool, so not a conversion.
+    ("routes/crud.rs", 29),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,

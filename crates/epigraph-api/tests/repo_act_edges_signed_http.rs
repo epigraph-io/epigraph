@@ -4,8 +4,9 @@
 //! `supersedes` and the actor's `AUTHORED`), `POST /api/v1/claims/:id/dedup`
 //! (the `same_as` identity edge), `POST /api/v1/workflows/steps/:id/evolve`
 //! (the step edge), the match promotion of `POST
-//! /api/v1/cross-source/candidates/:id/decide` (the matcher edge) and
-//! `POST /api/v1/analyses` (`concludes` and `interpreted_by`).
+//! /api/v1/cross-source/candidates/:id/decide` (the matcher edge),
+//! `POST /api/v1/analyses` (`concludes` and `interpreted_by`) and
+//! `POST /api/v1/edges-staging/promote` (each promoted copy).
 //!
 //! Every edge each call wrote is attested at INSERT with the API's own key:
 //! `signer_id` is the API's signer agent, never the caller, and
@@ -286,4 +287,94 @@ async fn create_analysis_attests_its_edges_with_the_api_key(pool: PgPool) {
     .unwrap_or_else(|e| panic!("create_analysis: {e:?}"));
     let rels = assert_new_edges_attested(&pool, &before, signer, caller, "analysis").await;
     require(&rels, &["concludes", "interpreted_by"], "analysis");
+}
+
+async fn stage_approved(
+    pool: &PgPool,
+    src: Uuid,
+    tgt: Uuid,
+    rel: &str,
+    props: serde_json::Value,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges_staging (source_id, target_id, relationship, properties, review_status) \
+         VALUES ($1, $2, $3, $4, 'approved') RETURNING id",
+    )
+    .bind(src)
+    .bind(tgt)
+    .bind(rel)
+    .bind(props)
+    .fetch_one(pool)
+    .await
+    .expect("stage edge")
+}
+
+/// `POST /api/v1/edges-staging/promote`: each copy is attested with the API's
+/// key, not the claims:admin caller's, in its canonical spelling; a copy a
+/// unique index of `edges` refuses (a second matcher edge over a pair) is
+/// skipped as the bulk copy's `ON CONFLICT DO NOTHING` skipped it, and every
+/// selected row is still marked promoted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn promote_staged_edges_attests_each_copy_with_the_api_key(pool: PgPool) {
+    let (admin, _) = seed_agent_with_group(&pool, "dae795f8-http-staging").await;
+    let (state, signer) = signed_state(&pool).await;
+    let a = seed_public_claim(&pool, admin, "dae795f8 http: staged a").await;
+    let b = seed_public_claim(&pool, admin, "dae795f8 http: staged b").await;
+    let c = seed_public_claim(&pool, admin, "dae795f8 http: staged c").await;
+    let matcher = json!({"source": "cross_source_matcher"});
+    // An in-force matcher edge over (b, c) already exists, so the staged one
+    // over (c, b) collides with migration 175's symmetric index.
+    epigraph_db::EdgeRepository::create(
+        &pool,
+        b,
+        "claim",
+        c,
+        "claim",
+        "corroborates",
+        Some(matcher.clone()),
+        None,
+        None,
+    )
+    .await
+    .expect("existing matcher edge");
+    let rows = [
+        stage_approved(&pool, a, b, "supports", json!({"note": "ok"})).await,
+        stage_approved(&pool, a, c, "CORROBORATES", json!({})).await,
+        stage_approved(&pool, c, b, "corroborates", matcher).await,
+    ];
+
+    let before = edge_ids(&pool).await;
+    let Json(out) = epigraph_api::routes::crud::promote_staged_edges(
+        State(state.clone()),
+        auth(admin, &["claims:admin"]),
+        Json(epigraph_api::routes::crud::PromoteStagedEdgesRequest {
+            edge_ids: Some(rows.to_vec()),
+        }),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("promote_staged_edges: {e:?}"));
+    assert_eq!(out["promoted_count"], 3, "{out}");
+    let rels = assert_new_edges_attested(&pool, &before, signer, admin, "staged").await;
+    assert_eq!(
+        rels,
+        BTreeSet::from(["supports".to_string(), "corroborates".to_string()]),
+        "the two clean copies, the CORROBORATES one lower-cased"
+    );
+    assert_eq!(
+        edge_ids(&pool).await.len(),
+        before.len() + 2,
+        "the colliding matcher copy was skipped"
+    );
+    let statuses: Vec<String> = sqlx::query_scalar(
+        "SELECT review_status FROM edges_staging WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(&rows[..])
+    .fetch_all(&pool)
+    .await
+    .expect("statuses");
+    assert_eq!(
+        statuses,
+        vec!["promoted"; 3],
+        "every selected row is marked"
+    );
 }
