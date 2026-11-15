@@ -838,7 +838,8 @@ enum Command {
         #[arg(long)]
         accept_unenforced: bool,
         /// Also move public claims owned by a group other than the world
-        /// group. Off by default: only the world-owned corpus moves.
+        /// group. Off by default: only the world-owned corpus moves. A public
+        /// claim the target itself owns is narrowed in place (owner unchanged).
         #[arg(long)]
         allow_non_world_owner: bool,
         /// The decision this act carries out, recorded in the manifest and the
