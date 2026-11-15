@@ -1377,10 +1377,22 @@ async fn an_applied_marks_identity_edge_is_signed_by_the_server_not_the_caller(p
         check.signed && check.signature_valid,
         "the identity edge is signed and verifies: {check:?}"
     );
-    assert_eq!(check.signature_scheme, Some(SignatureScheme::V1), "{check:?}");
+    assert_eq!(
+        check.signature_scheme,
+        Some(SignatureScheme::V1),
+        "{check:?}"
+    );
     assert_eq!(check.content_matches, Some(true), "{check:?}");
-    assert_eq!(check.signer_id, Some(signer), "signed by the server: {check:?}");
-    assert_ne!(check.signer_id, Some(caller), "not by the caller: {check:?}");
+    assert_eq!(
+        check.signer_id,
+        Some(signer),
+        "signed by the server: {check:?}"
+    );
+    assert_ne!(
+        check.signer_id,
+        Some(caller),
+        "not by the caller: {check:?}"
+    );
 }
 
 /// On an application-role server over stdio, every write target takes the
