@@ -321,6 +321,7 @@ async fn undedup_follows_a_superseded_canonical_to_its_replacement() {
             .expect("the superseded claim's author");
     let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut conn,
+        None,
         epigraph_core::ClaimId::from_uuid(canonical),
         &format!("r11 canonical, revised {tag}"),
         epigraph_core::TruthValue::clamped(0.5),
@@ -521,6 +522,7 @@ async fn supersede(pool: &sqlx::PgPool, old: Uuid) -> Uuid {
             .expect("the superseded claim's author");
     let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut conn,
+        None,
         epigraph_core::ClaimId::from_uuid(old),
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
@@ -661,6 +663,7 @@ async fn undedup_onto_a_merged_canonical_needs_authority_over_the_merged_claim()
     let mut conn = pool.acquire().await.expect("acquire");
     let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
         &mut conn,
+        None,
         &[canonical, partner],
         &format!("r11 merged by another agent {tag}"),
         0.5,

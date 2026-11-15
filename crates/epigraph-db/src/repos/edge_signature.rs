@@ -167,6 +167,11 @@ pub(crate) enum SymmetricGuard {
     /// (`epigraph_core::edge::relationships::relationship_spellings`), as the
     /// unsigned `create_symmetric_if_absent*` guards match.
     InForce,
+    /// Skip when such an edge exists IN ANY STATE, a retracted one included
+    /// (the cross-source matcher's promotion,
+    /// `EdgeRepository::create_symmetric_if_absent_signed_conn`): a promotion
+    /// over a pair whose matcher edge was retracted stays a dedup hit.
+    AnyState,
 }
 
 /// A new edge's attestation, before its INSERT: a fresh `id` and the writer's
@@ -245,6 +250,11 @@ pub(crate) async fn insert_attested_conn(
                    AND relationship = ANY($14) AND {})",
             crate::repos::edge::EDGE_IN_FORCE_UNALIASED
         ),
+        SymmetricGuard::AnyState => " WHERE NOT EXISTS (SELECT 1 FROM edges \
+                 WHERE ((source_id = $2 AND target_id = $4) \
+                     OR (source_id = $4 AND target_id = $2)) \
+                   AND relationship = ANY($14))"
+            .to_string(),
     };
     let conflict = if on_conflict_do_nothing {
         " ON CONFLICT DO NOTHING"
@@ -278,7 +288,7 @@ pub(crate) async fn insert_attested_conn(
             .bind(digest.as_slice())
             .bind(signature.as_slice())
             .bind(key.signer_id);
-        if guard == SymmetricGuard::InForce {
+        if guard != SymmetricGuard::None {
             q = q.bind(relationship_spellings(&a.relationship));
         }
         let row = q.fetch_optional(&mut *sp).await?;

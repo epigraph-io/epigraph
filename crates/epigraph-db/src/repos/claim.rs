@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use crate::repos::edge_signature::EdgeSigningKey;
 use chrono::{DateTime, Utc};
 use epigraph_core::{AgentId, Claim, ClaimId, TenancyDecl, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
@@ -7035,8 +7036,13 @@ impl ClaimRepository {
             "supersede_conn (its edge migration re-points other writers' edges)",
         )
         .await?;
+        // Unsigned: the privileged one-transaction form has no request
+        // transport whose key could attest the act's edges (its callers are the
+        // pool form and maintenance fixtures). A request path signs through
+        // `supersede_act_conn` with its own key.
         let (new_uuid, old_uuid) = Self::supersede_act_conn(
             &mut *conn,
+            None,
             old_claim_id,
             new_content,
             new_truth,
@@ -7063,10 +7069,18 @@ impl ClaimRepository {
     /// ([`Self::migrate_superseded_edges_conn`], migration 117). The caller
     /// must run this in a transaction.
     ///
+    /// The act's two edges (`supersedes` and the actor's `AUTHORED`) are
+    /// attested at INSERT by `key` (backlog `dae795f8`): the request
+    /// transport's own key (the MCP server's, the API's), never the
+    /// actor's. With `key = None` they are written unsigned (an operator CLI
+    /// with no entity signer).
+    ///
     /// # Errors
-    /// As [`Self::supersede_conn`], without its privilege requirement.
+    /// As [`Self::supersede_conn`], without its privilege requirement, and
+    /// `DbError::InvalidData` if a stored edge cannot be attested.
     pub async fn supersede_act_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         old_claim_id: ClaimId,
         new_content: &str,
         new_truth: TruthValue,
@@ -7170,15 +7184,21 @@ impl ClaimRepository {
         .execute(&mut *conn)
         .await?;
 
-        // Insert supersedes edge for graph traversal
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties, created_at) \
-             VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'supersedes', jsonb_build_object('reason', $3), NOW())",
+        // Insert supersedes edge for graph traversal. Signed at INSERT when
+        // the caller passes its key; the edge then carries the writer's clock,
+        // not the transaction's `NOW()`.
+        crate::repos::edge::EdgeRepository::create_signed_conn(
+            &mut *conn,
+            key,
+            new_uuid,
+            "claim",
+            old_uuid,
+            "claim",
+            "supersedes",
+            Some(serde_json::json!({ "reason": reason })),
+            None,
+            None,
         )
-        .bind(new_uuid)
-        .bind(old_uuid)
-        .bind(reason)
-        .execute(&mut *conn)
         .await?;
 
         // The acting agent (backlog 73085534, ruling R-23): the replacement
@@ -7191,8 +7211,9 @@ impl ClaimRepository {
         // this edge apart from any other `AUTHORED` edge. Tenancy comes from the endpoints (`epigraph_edges_tenancy`).
         // A failure is an error: the act rolls back rather than land a
         // successor with no record of who wrote it.
-        crate::repos::edge::EdgeRepository::create_if_not_exists_conn(
+        crate::repos::edge::EdgeRepository::create_if_not_exists_signed_conn(
             &mut *conn,
+            key,
             actor.agent,
             "agent",
             new_uuid,
@@ -8016,31 +8037,6 @@ struct ClaimRow {
 }
 
 impl ClaimRepository {
-    /// Copy evidence links from old claim to new claim via derived_from edges.
-    /// Returns the number of inherited evidence links.
-    pub async fn inherit_evidence(
-        pool: &PgPool,
-        old_claim_id: Uuid,
-        new_claim_id: Uuid,
-    ) -> Result<usize, DbError> {
-        // Create derived_from edges from new claim to old claim's evidence
-        let result = sqlx::query(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-             SELECT $1, 'claim', e.id, 'evidence', 'derived_from', 
-                    jsonb_build_object('inherited_from', $2::text) 
-             FROM evidence e 
-             WHERE e.claim_id = $2 
-             ON CONFLICT DO NOTHING"#,
-        )
-        .bind(new_claim_id)
-        .bind(old_claim_id)
-        .execute(pool)
-        .await?;
-
-        Ok(result.rows_affected() as usize)
-    }
-
     /// Count all evidence for a claim, including inherited evidence (via derived_from edges).
     pub async fn count_all_evidence_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -8780,8 +8776,11 @@ impl ClaimRepository {
         agent_id: Uuid,
     ) -> Result<EvolveStepResult, DbError> {
         let mut tx = pool.begin().await?;
+        // Unsigned: the pool form has no request transport's key (its callers
+        // are fixtures); the request paths sign through `evolve_step_conn`.
         let result = Self::evolve_step_conn(
             &mut tx,
+            None,
             parent,
             new_content,
             edge_type,
@@ -8817,9 +8816,15 @@ impl ClaimRepository {
     ///   parent the session may not write by raising at its WITH CHECK
     ///   (`QueryFailed`, SQLSTATE 42501, the transaction aborted), not by
     ///   matching zero rows.
-    #[instrument(skip(conn))]
+    ///
+    /// The step edge (`supersedes` / `revises`, new step -> parent) is attested
+    /// at INSERT by `key` (backlog `dae795f8`): the request transport's own
+    /// key, never the author's; unsigned with `key = None`.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, key))]
     pub async fn evolve_step_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         parent: ClaimId,
         new_content: &str,
         edge_type: &str,
@@ -8982,17 +8987,18 @@ impl ClaimRepository {
         .execute(&mut *tx)
         .await?;
 
-        let edge_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, $2, 'claim', $3, 'claim', $4, jsonb_build_object('reason', $5))",
+        let edge_id = crate::repos::edge::EdgeRepository::create_signed_conn(
+            &mut *tx,
+            key,
+            new_uuid,
+            "claim",
+            parent_uuid,
+            "claim",
+            edge_type,
+            Some(serde_json::json!({ "reason": reason.unwrap_or("") })),
+            None,
+            None,
         )
-        .bind(edge_id)
-        .bind(new_uuid)
-        .bind(parent_uuid)
-        .bind(edge_type)
-        .bind(reason.unwrap_or(""))
-        .execute(&mut *tx)
         .await?;
 
         Ok(EvolveStepResult {
@@ -9110,6 +9116,7 @@ impl ClaimRepository {
     ) -> Result<DedupRepair, DbError> {
         Self::mark_duplicate_with_repair_attributed_conn(
             conn,
+            None,
             dup,
             canonical,
             &DuplicateProvenance::unattributed(),
@@ -9118,12 +9125,14 @@ impl ClaimRepository {
     }
 
     /// [`Self::mark_duplicate_with_repair_conn`] with the caller's
-    /// [`DuplicateProvenance`] on the identity edge the act writes.
+    /// [`DuplicateProvenance`] on the identity edge the act writes, attested
+    /// at INSERT by `key` (see [`Self::mark_duplicate_act_attributed_conn`]).
     ///
     /// # Errors
     /// As [`Self::mark_duplicate_with_repair_conn`].
     pub async fn mark_duplicate_with_repair_attributed_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         dup: ClaimId,
         canonical: ClaimId,
         provenance: &DuplicateProvenance,
@@ -9137,7 +9146,7 @@ impl ClaimRepository {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
+        mark_duplicate_act(&mut tx, key, dup_uuid, canon_uuid, provenance).await?;
         let repair = repair_marked_duplicate(&mut tx, dup_uuid, canon_uuid).await?;
         tx.commit().await?;
         Ok(repair)
@@ -9187,6 +9196,7 @@ impl ClaimRepository {
     ) -> Result<(), DbError> {
         Self::mark_duplicate_act_attributed_conn(
             conn,
+            None,
             dup,
             canonical,
             &DuplicateProvenance::unattributed(),
@@ -9199,10 +9209,16 @@ impl ClaimRepository {
     /// [`DuplicateProvenance`]. Returns the id of the `same_as` identity edge
     /// the act wrote.
     ///
+    /// The identity edge is attested at INSERT by `key` (backlog `dae795f8`):
+    /// the request transport's own key (the MCP server's, the API's), never
+    /// the marking agent's; unsigned with `key = None`.
+    ///
     /// # Errors
-    /// As [`Self::mark_duplicate_act_conn`].
+    /// As [`Self::mark_duplicate_act_conn`], and `DbError::InvalidData` if the
+    /// stored edge cannot be attested.
     pub async fn mark_duplicate_act_attributed_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         dup: ClaimId,
         canonical: ClaimId,
         provenance: &DuplicateProvenance,
@@ -9211,7 +9227,8 @@ impl ClaimRepository {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        let identity_edge = mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
+        let identity_edge =
+            mark_duplicate_act(&mut tx, key, dup_uuid, canon_uuid, provenance).await?;
         let foreign_private_canonical: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()
@@ -11740,8 +11757,12 @@ impl ClaimRepository {
         )
         .await?;
         let mut tx = conn.begin().await?;
+        // Unsigned: the privileged one-transaction form has no request
+        // transport's key (pool form and maintenance fixtures); a request path
+        // signs through `consolidate_act_conn` with its own key.
         let mut result = Self::consolidate_act_conn(
             &mut tx,
+            None,
             source_ids,
             merged_content,
             merged_truth,
@@ -11772,11 +11793,17 @@ impl ClaimRepository {
     /// ([`Self::migrate_consolidated_edges_conn`], migration 117). The
     /// returned counts of migrated and deduped edges are therefore zero.
     ///
+    /// The `supersedes` edges are attested at INSERT by `key` (backlog
+    /// `dae795f8`): the request transport's own key, never the acting agent's;
+    /// unsigned with `key = None`.
+    ///
     /// # Errors
-    /// As [`Self::consolidate`].
-    #[allow(clippy::too_many_lines)]
+    /// As [`Self::consolidate`], and `DbError::InvalidData` if a stored edge
+    /// cannot be attested.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn consolidate_act_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         source_ids: &[Uuid],
         merged_content: &str,
         merged_truth: f64,
@@ -12087,21 +12114,22 @@ impl ClaimRepository {
 
         // Reverse fan-out: merged → each source, mirroring supersede()'s edge.
         for src in source_ids {
-            sqlx::query!(
-                r#"
-                INSERT INTO edges (source_id, source_type, target_id, target_type,
-                                   relationship, properties)
-                VALUES ($1, 'claim', $2, 'claim', 'supersedes', $3)
-                "#,
+            crate::repos::edge::EdgeRepository::create_signed_conn(
+                &mut tx,
+                key,
                 merged_id,
-                src,
-                serde_json::json!({
+                "claim",
+                *src,
+                "claim",
+                "supersedes",
+                Some(serde_json::json!({
                     "reason": reason,
                     "mode": mode.as_str(),
                     "merged_at": chrono::Utc::now().to_rfc3339(),
-                }),
+                })),
+                None,
+                None,
             )
-            .execute(&mut *tx)
             .await?;
         }
 
@@ -12773,9 +12801,11 @@ async fn legacy_mark_refusal(
 /// The checks, the one `claims` UPDATE and the identity edge of a dedup's act.
 /// The callers ([`ClaimRepository::mark_duplicate_act_attributed_conn`],
 /// [`ClaimRepository::mark_duplicate_with_repair_attributed_conn`]) own the
-/// transaction. Returns the identity edge's id.
+/// transaction. Returns the identity edge's id. The edge is attested at
+/// INSERT by `key` when one is given (backlog `dae795f8`).
 async fn mark_duplicate_act(
     conn: &mut sqlx::PgConnection,
+    key: Option<EdgeSigningKey<'_>>,
     dup_uuid: Uuid,
     canon_uuid: Uuid,
     provenance: &DuplicateProvenance,
@@ -12870,24 +12900,34 @@ async fn mark_duplicate_act(
     let provenance_json = serde_json::to_value(provenance).map_err(|e| DbError::InvalidData {
         reason: format!("mark_duplicate: provenance does not serialize: {e}"),
     })?;
-    let identity_edge: Uuid = sqlx::query_scalar(
-        r#"INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-           VALUES ($1, 'claim', $2, 'claim', $3,
-                   jsonb_build_object($4::text,
-                       jsonb_strip_nulls(jsonb_build_object(
-                           'marked_by', public.epigraph_principal_id()))
-                       || $5::jsonb
-                       || jsonb_build_object('marked_at', now())))
-           RETURNING id"#,
+    // The properties are built by the database on this transaction, exactly
+    // as the INSERT used to build them (the session principal, the
+    // transaction's `now()`, in their JSONB spelling), so the attested row
+    // carries the same document an unsigned one does.
+    let properties: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT jsonb_build_object($1::text,
+                      jsonb_strip_nulls(jsonb_build_object(
+                          'marked_by', public.epigraph_principal_id()))
+                      || $2::jsonb
+                      || jsonb_build_object('marked_at', now()))"#,
     )
-    .bind(dup_uuid)
-    .bind(canon_uuid)
-    .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
     .bind(DUPLICATE_IDENTITY_PROPERTY)
     .bind(&provenance_json)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(identity_edge)
+    crate::repos::edge::EdgeRepository::create_signed_conn(
+        &mut *conn,
+        key,
+        dup_uuid,
+        "claim",
+        canon_uuid,
+        "claim",
+        DUPLICATE_IDENTITY_RELATIONSHIP,
+        Some(properties),
+        None,
+        None,
+    )
+    .await
 }
 
 /// The dedup's repair of the edge and derived-record layers, unchecked: the

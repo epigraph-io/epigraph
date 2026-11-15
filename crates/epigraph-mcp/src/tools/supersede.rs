@@ -36,6 +36,9 @@ pub async fn supersede_claim(
     // principal that transaction is stamped as, which the cascade's audit row
     // names; `caller` is the agent that called (the same agent unless a
     // `claims:admin` caller borrowed this server's stamp).
+    // The act's edges are attested at INSERT with the server's key (backlog
+    // `dae795f8`), resolved before the act's transaction opens.
+    let edge_key = server.edge_signing_key().await?;
     let (mut tx, actor, caller, author) = begin_claim_act(
         server,
         viewer,
@@ -60,6 +63,7 @@ pub async fn supersede_claim(
     // misattribute the act exactly as the inherited author did.
     let (new_id, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        Some(edge_key),
         old_claim_id,
         &params.content,
         truth,
@@ -469,6 +473,9 @@ pub async fn mark_duplicate(
     // the canonical is the caller's choice to make only where it could write
     // itself. Either one the caller cannot read is reported as not found,
     // exactly like a missing claim.
+    // The identity edge is attested at INSERT with the server's key (backlog
+    // `dae795f8`), resolved before the act's transaction opens.
+    let edge_key = server.edge_signing_key().await?;
     let (mut tx, actor, _, _) = begin_claim_act(
         server,
         viewer,
@@ -486,6 +493,7 @@ pub async fn mark_duplicate(
             .reason(params.reason.as_deref());
     ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
+        Some(edge_key),
         dup_claim_id,
         ClaimId::from_uuid(canon),
         &provenance,

@@ -894,3 +894,193 @@ async fn a_callers_workflow_edges_are_signed_by_the_server_not_the_caller(pool: 
         "caller add_step",
     );
 }
+
+/// A public claim authored by the caller (submitted with its token).
+async fn caller_claim(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    token: &epigraph_auth::AuthContext,
+    content: &str,
+) -> Uuid {
+    let out = epigraph_mcp::tools::claims::submit_claim(
+        server,
+        viewer,
+        epigraph_mcp::types::SubmitClaimParams {
+            content: content.into(),
+            methodology: "deductive_logic".into(),
+            evidence_data: format!("evidence for {content}"),
+            evidence_type: "logical".into(),
+            confidence: 0.6,
+            source_url: None,
+            reasoning: Some("because".into()),
+            labels: vec![],
+            novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        Some(token),
+    )
+    .await
+    .expect("submit_claim as the caller");
+    uuid_field(&common::first_text(&out), "claim_id")
+}
+
+fn params<T: serde::de::DeserializeOwned>(v: Value) -> T {
+    serde_json::from_value(v).expect("tool params")
+}
+
+/// A server and an authenticated caller that is not the server's agent.
+async fn server_and_caller(
+    pool: &PgPool,
+) -> (
+    EpiGraphMcpFull,
+    Uuid,
+    epigraph_auth::AuthContext,
+    epigraph_db::visibility::Viewer,
+) {
+    let server = server(pool).await;
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (caller, token, viewer) = common::seed_caller(pool, &["claims:read", "claims:write"]).await;
+    assert_ne!(caller, server_agent);
+    (server, caller, token, viewer)
+}
+
+/// Backlog `dae795f8`: the claim acts' edges, written inside a repository act
+/// on the caller's stamped transaction, are attested at INSERT with the
+/// SERVER's key, never the caller's. supersede_claim: the `supersedes` edge
+/// and the actor's `AUTHORED`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_attests_its_edges_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let old = caller_claim(&server, &viewer, &token, "dae795f8 mcp: to be superseded").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "claim_id": old.to_string(),
+            "content": "dae795f8 mcp: the replacement",
+            "truth_value": 0.7,
+            "reason": "restated",
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("supersede_claim");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "supersede").await;
+    require(&rels, &["supersedes", "AUTHORED"], "supersede");
+}
+
+/// mark_duplicate: the `same_as` identity edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_attests_its_identity_edge_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let dup = caller_claim(&server, &viewer, &token, "dae795f8 mcp: the duplicate").await;
+    let canon = caller_claim(&server, &viewer, &token, "dae795f8 mcp: the canonical").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "claim_id": dup.to_string(),
+            "canonical_id": canon.to_string(),
+            "reason": "same",
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("mark_duplicate");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "mark_duplicate").await;
+    require(&rels, &["same_as"], "mark_duplicate");
+}
+
+/// consolidate_claims: the `supersedes` fan-out, merged -> each source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_claims_attests_its_edges_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let s1 = caller_claim(&server, &viewer, &token, "dae795f8 mcp: source one").await;
+    let s2 = caller_claim(&server, &viewer, &token, "dae795f8 mcp: source two").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "source_claim_ids": [s1.to_string(), s2.to_string()],
+            "merged_content": "dae795f8 mcp: one and two, merged",
+            "mode": "merge",
+            "reason": "the same point twice",
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("consolidate_claims");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "consolidate").await;
+    require(&rels, &["supersedes"], "consolidate");
+    let lineage: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE relationship = 'supersedes' AND target_id = ANY($1)",
+    )
+    .bind(vec![s1, s2])
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(lineage, 2, "one supersedes edge per source");
+}
+
+/// evolve_step: the step edge (`revises`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_attests_its_step_edge_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let parent = caller_claim(&server, &viewer, &token, "dae795f8 mcp: a step").await;
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::evolve_step::evolve_step(
+        &server,
+        &viewer,
+        params(serde_json::json!({
+            "parent_id": parent.to_string(),
+            "content": "dae795f8 mcp: a revised step",
+            "edge_type": "revises",
+            "rationale": null,
+            "level": null,
+        })),
+        Some(&token),
+    )
+    .await
+    .expect("evolve_step");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "evolve_step").await;
+    require(&rels, &["revises"], "evolve_step");
+}
+
+/// Backlog `dae795f8`: the promote arm of decide_match_candidate writes the
+/// matcher edge (inside `MatchCandidateRepo::promote_if_pending_conn`, on the
+/// caller's stamped transaction) attested with the server's key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_match_promotion_attests_its_edge_with_the_server_key(pool: PgPool) {
+    let (server, caller, token, viewer) = server_and_caller(&pool).await;
+    let a = caller_claim(&server, &viewer, &token, "dae795f8 mcp: matched a").await;
+    let b = caller_claim(&server, &viewer, &token, "dae795f8 mcp: matched b").await;
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let candidate: Uuid = sqlx::query_scalar(
+        "INSERT INTO match_candidates (claim_a, claim_b, score, features, status) \
+         VALUES ($1, $2, 0.95, '{}'::jsonb, 'pending') RETURNING id",
+    )
+    .bind(lo)
+    .bind(hi)
+    .fetch_one(&pool)
+    .await
+    .expect("candidate");
+
+    let before = edge_ids(&pool).await;
+    epigraph_mcp::tools::matching::decide_match_candidate(
+        &server,
+        &viewer,
+        epigraph_mcp::types::DecideMatchCandidateParams {
+            candidate_id: candidate.to_string(),
+            verdict: "promote".into(),
+        },
+        Some(&token),
+    )
+    .await
+    .expect("promote");
+    let rels = assert_new_edges_attested(&pool, &before, Some(caller), "promote").await;
+    require(&rels, &["corroborates"], "promote");
+}

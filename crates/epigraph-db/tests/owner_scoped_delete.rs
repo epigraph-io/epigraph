@@ -2489,6 +2489,7 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
             let mut tx = conn.begin().await.expect("begin");
             let (n, _) = epigraph_db::ClaimRepository::supersede_act_conn(
                 &mut tx,
+                None,
                 epigraph_core::ClaimId::from_uuid(old),
                 "W's corrected claim",
                 epigraph_core::TruthValue::clamped(0.6),
@@ -2597,6 +2598,7 @@ async fn consolidate_is_an_act_plus_a_maintenance_edge_migration(pool: PgPool) {
         .await;
         let act = epigraph_db::ClaimRepository::consolidate_act_conn(
             &mut conn,
+            None,
             &[s1, s2],
             "W's merged claim",
             0.7,
@@ -3023,6 +3025,7 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
             let mut tx = conn.begin().await.expect("begin");
             let (gs, _) = epigraph_db::ClaimRepository::supersede_act_conn(
                 &mut tx,
+                None,
                 epigraph_core::ClaimId::from_uuid(v),
                 "A's corrected claim",
                 epigraph_core::TruthValue::clamped(0.6),

@@ -1874,8 +1874,11 @@ pub async fn evolve_step(
     // step lineage, checked for the SAME principal the step is authored as,
     // on the act's own transaction and before it, so a refusal writes nothing.
     let grants = require_api_lineage_authority(&mut tx, &auth, &viewer, agent, parent_id).await?;
+    // The step edge is attested at INSERT with the API's own key (backlog
+    // dae795f8), `None` when this API has none configured.
     let result = epigraph_db::ClaimRepository::evolve_step_conn(
         &mut tx,
+        state.edge_signing_key(),
         epigraph_core::ClaimId::from_uuid(parent_id),
         &req.content,
         &req.edge_type,
