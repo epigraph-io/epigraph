@@ -4038,6 +4038,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          unstamped pool and stays on no_unscoped_pool's register. A Viewer would have nothing to \
          add to the policy.",
     ),
+    // The assess route's writer record (backlog batch B19).
+    (
+        "event.rs",
+        "insert_on",
+        "WRITE, append-only, of one `events` row on the caller's executor (the assess route's \
+         transaction), so the event commits or rolls back with the write it records. `events` has \
+         no visibility or owner_group_id column and this function reads nothing, so there is no \
+         predicate a Viewer could be spent on; reads of `events` go through `list_events`, which \
+         applies the viewer.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
