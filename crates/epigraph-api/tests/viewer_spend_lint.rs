@@ -169,6 +169,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
     // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
     // it took the viewer only while it read lineage, and no longer reads any.
+    // write: `insert_on` records the `claim.assessed` writer event inside the
+    // slot transaction (ids and booleans only; the event list hides it from a
+    // reader who cannot read the claim).
     (
         "assess.rs",
         "assess_claim",
@@ -178,6 +181,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
+            "EventRepository::insert_on",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
