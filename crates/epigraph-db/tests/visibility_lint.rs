@@ -3936,6 +3936,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          edge could not read; the caller's authority is the workflow authority rule, not read \
          visibility, so no caller viewer is spliced.",
     ),
+    (
+        "paper.rs",
+        "licence",
+        "READ of `papers.licence` for one paper id (migration 226). `papers` carries no tenancy \
+         (127): there is no visibility or owner_group_id column and no policy, so there is \
+         nothing to filter, and the answer is one operator-set licence string, never claim \
+         content. Ingest only reads it, to decide whether a source may be treated as \
+         open-licensed; `None` means all rights reserved.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
