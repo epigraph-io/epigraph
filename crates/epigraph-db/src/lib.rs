@@ -87,6 +87,7 @@ pub use refusal_codes::{
 pub use repos::bug_report::{BugReportInput, BugReportReceipt, BugReportRepository, BugReportRow};
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
+pub use repos::PolicyRepository;
 pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{

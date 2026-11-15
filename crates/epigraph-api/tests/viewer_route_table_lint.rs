@@ -270,7 +270,6 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
-    ("policies.rs", 2),
     ("political.rs", 1),
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
     // forward-only scan could not see. Its in-code comment argues it is not a
