@@ -790,7 +790,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `PUT /api/v1/claims/:id/embedding` and `PUT /api/v1/evidence/:id/embedding`
 /// were deleted with their handlers; `routes/rag.rs` 2 -> 0, key DELETED.
 /// Each side lowered from 204 on its own branch; the merge keeps both drops.
-const HIGH_WATER: usize = 198;
+/// 198 -> 197 (backlog dae795f8, merged on staging after the lines above):
+/// `promote_staged_edges`'s two one-statement arms became one transaction on
+/// the same raw pool, `routes/crud.rs` one site fewer. A merge of two sites,
+/// not a conversion.
+const HIGH_WATER: usize = 197;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1006,7 +1010,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
     // transaction. Its provenance append stays on the pool, as every
     // `record_provenance` call does.
-    ("routes/crud.rs", 27),
+    // 27 -> 26 (backlog dae795f8): `promote_staged_edges`'s two arms (one
+    // `&state.db_pool` each) became one transaction begun on it. Still the raw
+    // pool, so not a conversion.
+    ("routes/crud.rs", 26),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,

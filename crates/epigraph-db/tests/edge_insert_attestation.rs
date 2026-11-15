@@ -665,3 +665,119 @@ async fn a_signed_insert_stores_and_dedups_the_canonical_relationship_spelling(p
         "a dedup hit leaves the legacy edge as it was"
     );
 }
+
+/// Backlog `dae795f8`: the matcher's any-state symmetric twin
+/// (`create_symmetric_if_absent_signed_conn`) attests the edge it INSERTS, and
+/// keeps the unsigned form's dedup: a matcher edge in EITHER direction, a
+/// RETRACTED one included, is a hit that writes nothing (a retired promotion
+/// stays retired); an in-force duplicate the guard cannot see is swallowed by
+/// migration 175's index (`ON CONFLICT DO NOTHING`), not an error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_matcher_twin_attests_its_insert_and_keeps_any_state_dedup(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x5A; 32]).expect("signer");
+    let s = seed_signer_agent(&pool, "dae795f8-matcher-twin", &signer).await;
+    let key = Some(EdgeSigningKey {
+        signer: &signer,
+        signer_id: s,
+    });
+    let mut c = Vec::new();
+    for i in 0..4 {
+        c.push(fixture::seed_public_claim(&pool, s, &format!("dae795f8 matcher {i}")).await);
+    }
+    let props = serde_json::json!({"source": "cross_source_matcher", "score": 0.9});
+    let mut conn = pool.acquire().await.expect("conn");
+    let matcher_edges = |a: Uuid, b: Uuid| {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM edges WHERE ((source_id = $1 AND target_id = $2) \
+                OR (source_id = $2 AND target_id = $1)) AND relationship = 'corroborates' \
+              ORDER BY created_at, id",
+        )
+        .bind(a)
+        .bind(b)
+    };
+
+    let created = EdgeRepository::create_symmetric_if_absent_signed_conn(
+        &mut conn,
+        key,
+        c[0],
+        c[1],
+        "CORROBORATES",
+        props.clone(),
+    )
+    .await
+    .expect("insert");
+    assert!(created);
+    let ids = matcher_edges(c[0], c[1])
+        .fetch_all(&pool)
+        .await
+        .expect("edges");
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_attested(&verify(&pool, ids[0]).await, s, "matcher twin");
+    let before = stored_attestation(&pool, ids[0]).await;
+
+    // The reverse direction is the same edge: a hit, nothing written.
+    let created = EdgeRepository::create_symmetric_if_absent_signed_conn(
+        &mut conn,
+        key,
+        c[1],
+        c[0],
+        "corroborates",
+        props.clone(),
+    )
+    .await
+    .expect("reverse dedup");
+    assert!(!created);
+    assert_eq!(
+        matcher_edges(c[0], c[1]).fetch_all(&pool).await.unwrap(),
+        ids
+    );
+    assert_eq!(stored_attestation(&pool, ids[0]).await, before);
+
+    // A RETRACTED matcher edge still stops it (any state), unlike the link
+    // tools' in-force twins.
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(ids[0])
+        .execute(&pool)
+        .await
+        .expect("retract");
+    let created = EdgeRepository::create_symmetric_if_absent_signed_conn(
+        &mut conn,
+        key,
+        c[0],
+        c[1],
+        "corroborates",
+        props.clone(),
+    )
+    .await
+    .expect("retracted dedup");
+    assert!(!created, "a retracted matcher edge is a dedup hit");
+    assert_eq!(
+        matcher_edges(c[0], c[1]).fetch_all(&pool).await.unwrap(),
+        ids
+    );
+
+    // An in-force matcher edge stored under a relationship spelling the guard
+    // does not match (`Corroborates`) is refused by migration 175's index and
+    // reported as a hit, not an error, as the unsigned form reports it.
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) VALUES ($1, 'claim', $2, 'claim', 'Corroborates', $3)",
+    )
+    .bind(c[2])
+    .bind(c[3])
+    .bind(&props)
+    .execute(&pool)
+    .await
+    .expect("a mixed-case matcher edge");
+    let created = EdgeRepository::create_symmetric_if_absent_signed_conn(
+        &mut conn,
+        key,
+        c[3],
+        c[2],
+        "corroborates",
+        props.clone(),
+    )
+    .await
+    .expect("the index swallows the duplicate");
+    assert!(!created);
+}
