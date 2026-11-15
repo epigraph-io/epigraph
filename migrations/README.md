@@ -1149,8 +1149,9 @@ Current reservation:
   132)". Checked before claiming: no remote branch carries a `132`.
   **Applied to a throwaway database only, NOT to any deployed database.**
 
-- **133+**: public next (the elevation stack stays at or below 139; 140-159
-  are reserved)
+- **133+**: public (the elevation stack stays at or below 139; 140-159
+  are reserved). The entries from here on are not in numeric order, and this
+  line is not the next free number: see the allocation rule after `141`.
 
 - **140**: public `refresh_rotate_keeps_token_scopes` (backlog drain U002;
   slot from the drain block 140-159, so 123-139 stay free for the in-flight
@@ -1182,8 +1183,16 @@ Current reservation:
   that read it (they fail closed without it), and after 123-129 have been
   applied (sqlx would otherwise apply them out of order after 141).
 
-Next public migration **outside both reserved tenancy ranges** must be `133` or
-later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
+Next public migration **outside both reserved tenancy ranges** takes a number
+that no file in this directory, no entry in this list and no open branch
+carries. Read the head from the directory, not from this file:
+`ls migrations/*.sql | tail -1` (`209` when this paragraph was last revised; an
+earlier revision said "`133` or later" long after the head had passed it). An
+unused number below the head is not free by default: several are held by
+entries in this list (133-139 for the elevation stack, 155-157 by the drain
+register), and sqlx applies a file numbered below an already-applied head out
+of order (see the **Deploy order** notes on 140 and 141).
+Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
 the same commit as the file**. Picking a colliding version (checksum mismatch on
@@ -2645,6 +2654,50 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **213**: public `oauth_assertion_nonces` (backlog 950696a1, step 1). An
+  agent's Ed25519 `client_credentials` assertion is now single use: the table
+  `oauth_assertion_nonces(agent_public_key, nonce, expires_at, used_at)`
+  (primary key `(agent_public_key, nonce)`, 32-byte key and 16-byte nonce
+  CHECKs, no FK, no tenancy columns, no row security, like 141's
+  `revoked_access_tokens`) and
+  one SECURITY DEFINER on 172's form, owned by `epigraph_maintenance`,
+  EXECUTE revoked from PUBLIC and granted to `epigraph_app`:
+  `epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)` answers
+  `'recorded'` when it records the pair, `'replay'` when it is already
+  recorded (one `INSERT .. ON CONFLICT DO NOTHING`), and `'expired'`,
+  recording nothing, when the caller's expiry has already passed on the
+  database clock (API host and database clocks skewed by more than the 60 s
+  margin; refused 401 and logged as skew, not as a replay), raises 22023 on a malformed key or
+  nonce or an expiry more than an hour ahead, and lazily prunes up to 1000
+  rows past their expiry (`FOR UPDATE SKIP LOCKED`). The application role
+  keeps SELECT only. The record is keyed by the public key the signature
+  verified under, not by the `oauth_clients` row: an agent's `client_id` is
+  its hex key as registered, and hex decoding accepts either case, so two
+  rows spelling one key differently would otherwise each grant a captured
+  assertion one more use. ACCEPTED BOUND: any session on the application
+  DSN can call the definer with any key and nonce, so it can grow the table
+  for up to an hour per row (AN03 bounds how long a row lives, not how many
+  there are; each call prunes at most 1000). That DSN can already write far
+  larger tables, and nonces are random, so this is not a lockout of a
+  particular agent. `oauth/token.rs` calls it after the assertion's signature and
+  freshness verify, on both the `client_credentials` and the refresh grant,
+  keeping each nonce until the signed timestamp + 360 s (the 300 s window
+  plus a 60 s skew margin). Registered in `tenancy_backfill.rs`
+  (`DEFERRED_DEFINER_FUNCTIONS` and the grant register). Pinned by
+  `epigraph-db/tests/app_role_table_lockdown.rs` (`CLOSED`, `NO_WRITE`,
+  `assertion_nonces_are_consumed_once_through_the_definer`,
+  `assertion_nonce_prune_removes_only_rows_past_their_window`) and
+  `epigraph-api/tests/agent_assertion_replay.rs`. The signed message is
+  unchanged (no domain or audience tag; that is step 2, a wire-format
+  change). Undo: `docs/runbooks/213-undo.sql` (tested: run twice on a
+  database at 213, it drops the definer, the table and its index, and the
+  second run is a no-op; a captured assertion then replays for its window
+  again). Slot 213
+  was assigned by the 2026-11-14 backlog batch; 210 to 212 are held by other
+  branches. **Deploy order:** migrate before rolling out a binary that calls
+  the definer (such a binary on a database without it refuses every agent
+  mint, 500); undo only after rolling every such binary back. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 - **214**: public `compromised_revoke_read_committed` (backlog c77931a7,
   2deb56fa). Re-states 200's `epigraph_revoke_passkey_compromised(uuid,
   text)` (same signature, result columns, walk, UPDATE and audit mode) with
@@ -2945,6 +2998,36 @@ restart.
   118's). Checked before claiming: slot 224 is this batch's assignment and no
   migration on main or an origin branch carries a `224`. **Deploy order:** no
   binary depends on it; apply whenever. **Applied to throwaway databases
+- **227**: public `sealed_public_race_lock` (backlog e8f9c07e). Re-states
+  176's `epigraph_no_public_sealed()` (the PRV01 trigger body on
+  `claim_encryption`) so its read of `claims.visibility` is `FOR NO KEY UPDATE OF c`
+  (the lock the seal's own `UPDATE claims` and 206's publicize pre-lock
+  already take; `FOR SHARE` would deadlock two concurrent raw writers of one
+  seal, which the privatization route's advisory lock otherwise serializes),
+  falling back to 176's unlocked read when the locked read finds no row (so
+  it never refuses less than 176). Before it, a seal and a publicize of the
+  same claim could both commit under READ COMMITTED, leaving a public claim
+  whose content is the seal sentinel: neither the PRV01 trigger nor 074's
+  `claims_block_widening` waited on the other's uncommitted write. Now the
+  seal waits on a publicize's row lock and re-reads the public row, and a
+  publicize waits on the seal's row lock and 074's unchanged EXISTS then
+  sees the committed ciphertext row. Guarded: refuses (55000) unless the
+  live body is 176's (md5 of `prosrc`). Same owner, ACL, SECURITY INVOKER and
+  PRV01 text and SQLSTATE; no table, trigger or policy changes. Pinned by
+  `epigraph-db/tests/sealed_public_race.rs` (both orderings commit a public
+  sealed claim at 226 and are refused at 227, for a raw `UPDATE claims` and
+  for 206's `epigraph_publicize_claims`, which seal-first answers
+  `refused_sealed`; every role that may write
+  `claim_encryption` holds UPDATE on `claims`, which a locking read needs; a redelivered seal is still a no-op;
+  a public claim hidden from the locking read is still refused; the
+  app role's PRV01 refusals are the same at 226 and 227). Undo:
+  `docs/runbooks/227-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 227); it brings the race back. A seal's row-lock wait (and
+  a 55P03 under the route's `lock_timeout`) now happens at its INSERT rather
+  than its `UPDATE claims`; the pre-existing multi-claim seal/publicize
+  lock-order deadlock (40P01, nothing half-written) is unchanged. Checked before claiming:
+  no migration on main or on an origin branch carries a `227`. **Deploy
+  order:** none; no binary depends on it. **Applied to throwaway databases
   only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
@@ -3038,14 +3121,6 @@ transaction blocks`, and it would not bound this wait even if it applied. Run
 these during a quiet window, or after confirming
 `SELECT max(now() - xact_start) FROM pg_stat_activity WHERE state <> 'idle'` is
 small.
-
-### `scripts/prepare-engine-integration-db.sh`
-
-That script applies every `migrations/*.sql` with `psql -v ON_ERROR_STOP=1 -f`
-in autocommit and never writes `_sqlx_migrations`. `-- no-transaction` is an
-inert comment to psql and autocommit makes `CREATE INDEX CONCURRENTLY` legal, so
-063–066 survive that path unchanged. The pre-existing hazard is unaffected: a
-database prepared this way then fails every `sqlx::migrate!`.
 
 ## Tombstones
 
@@ -3157,15 +3232,20 @@ provenance or dealt with by the opt-in. Consequences, all deliberate:
 
 ## Migration Order
 
-Migrations must be applied in numerical order:
+The migrator applies the files in version order, from an empty database to
+this directory's head.
 
-1. **001_create_extensions.sql** - Enable pgvector and uuid-ossp extensions
-2. **002_create_agents.sql** - Create agents table (cryptographic identities)
-3. **003_create_claims.sql** - Create claims table (epistemic assertions)
-4. **004_create_evidence.sql** - Create evidence table (supporting materials)
-5. **005_create_reasoning_traces.sql** - Create reasoning traces and DAG structure
-6. **006_create_relationships.sql** - Add circular FKs and LPG edges table
-7. **007_create_indexes.sql** - Create performance indexes (HNSW, composite, partial)
+- **`001_initial_schema.sql`** is one file collapsed from the pre-split
+  repository's migrations 001–097 (kernel subset, per its header): agents,
+  claims, evidence, reasoning traces, edges and their indexes among its 60
+  `CREATE TABLE` statements. The seven per-table files an earlier revision
+  of this section listed (`001_create_extensions.sql` through
+  `007_create_indexes.sql`) do not exist. `001` itself runs
+  `CREATE EXTENSION IF NOT EXISTS` for `pg_trgm`, `uuid-ossp` and `vector`.
+- **`002` onward** are incremental; each is described in "Version range
+  coordination with epigraph-internal" above. The version space has gaps and
+  that list is not in numeric order, so read the head from the directory
+  (`ls migrations/*.sql | tail -1`).
 
 ## Schema Overview
 
@@ -3215,7 +3295,7 @@ All core tables include:
 - Enables lineage queries via recursive CTEs
 
 #### 6. Circular FK Resolution
-- `claims.trace_id` FK added in migration 006 (after both tables exist)
+- `claims.trace_id` FK (`claims_trace_id_fkey`) is added after both tables exist, at the end of `001_initial_schema.sql`
 - Allows claims and traces to reference each other
 - Uses `ON DELETE SET NULL` to prevent cascade issues
 
@@ -3248,27 +3328,29 @@ All core tables include:
 
 ## Running Migrations
 
-### Using sqlx (Rust)
+Use the `epigraph-migrate` binary. It applies every migration embedded in the
+build, records each in `_sqlx_migrations`, and verifies the schema head before
+and after (`crates/epigraph-api/src/migrate.rs`):
 
 ```bash
-# Set DATABASE_URL in .env
-export DATABASE_URL="postgres://user:pass@localhost:5432/epigraph"
-
-# Run migrations
-sqlx migrate run
-
-# Revert last migration
-sqlx migrate revert
+# The migration login needs DDL privilege; see docs/deploy.md.
+MIGRATION_DATABASE_URL="postgres://user:pass@localhost:5432/epigraph" \
+  cargo run -p epigraph-api --bin epigraph-migrate
 ```
 
-### Using psql
+For a test database, create a fresh one whose name ends in `_test` and migrate
+it from empty (the repository's `CLAUDE.md`, "Test database").
 
-```bash
-# Apply all migrations in order
-for file in migrations/*.sql; do
-  psql $DATABASE_URL -f $file
-done
-```
+Two things an earlier revision of this section recommended do not apply:
+
+- **`sqlx migrate revert`** has nothing to run: this directory holds no
+  `.down.sql` files. A migration that can be reversed says how in its own
+  header or ships a script in `docs/runbooks/` (`NNN-undo.sql`).
+- **A `psql -f` loop over `migrations/*.sql`** writes no `_sqlx_migrations`
+  rows, so the checksum ledger the top of this file describes is bypassed and
+  a database prepared that way then fails every `sqlx::migrate!` run. No script
+  in the repo does this any more: build test databases with `epigraph-migrate`
+  (see "Test database" in `CLAUDE.md`).
 
 ## Schema Validation
 
@@ -3322,7 +3404,7 @@ ORDER BY pg_total_relation_size('public.'||tablename) DESC;
 
 -- Vector index performance (claims)
 EXPLAIN ANALYZE
-SELECT id, statement, truth_value
+SELECT id, content, truth_value
 FROM claims
 WHERE embedding IS NOT NULL
 ORDER BY embedding <=> '[0.1, 0.2, ...]'::vector
@@ -3352,5 +3434,4 @@ For high availability:
 - [pgvector Documentation](https://github.com/pgvector/pgvector)
 - [HNSW Algorithm](https://arxiv.org/abs/1603.09320)
 - [PostgreSQL GIN Indexes](https://www.postgresql.org/docs/current/gin.html)
-- [EpiGraph Implementation Plan](/home/user/EpiGraphV2/IMPLEMENTATION_PLAN.md)
-- [TruthValue Type](/home/user/EpiGraphV2/crates/epigraph-core/src/truth.rs)
+- [TruthValue Type](../crates/epigraph-core/src/truth.rs)

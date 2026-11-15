@@ -5,30 +5,187 @@ on:
     branches: [main]
   pull_request:
 
+# A push to a pull request supersedes the run for its previous head: cancel it
+# rather than let both hold runners. Pushes to main are never cancelled, so
+# every merge commit keeps its own complete run.
+#
+# The group is per pull request, but per COMMIT for a push. A group allows one
+# running and one pending run, and a newly queued run replaces the pending one
+# even when `cancel-in-progress` is false; with one group for all of `main`
+# (`github.ref`), merges landing while a run was queued cancelled each other.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Actions are pinned to a full commit SHA (not a floating tag) so a compromised
 # or force-pushed upstream tag cannot silently change what runs in CI. The
 # trailing comment records the version the SHA resolved to at pin time.
 # dtolnay/rust-toolchain selects the channel from the *ref name*; pinning by SHA
 # defeats that, so the channel stays explicit via the `toolchain` input below.
 jobs:
-  test:
+  # THE RUST TEST SUITE RUNS AS ONE JOB PER SHARD, IN PARALLEL.
+  #
+  # It used to be one job: six `cargo test` steps one after the other on one
+  # runner. That job took ~200 minutes on main, its cap was raised 90 -> 120 ->
+  # 150 -> 210 as the suite grew, and on 2026-11-14 a pull request whose every
+  # finished step had passed was cancelled at the 210-minute cap a few minutes
+  # short of the end, while two more finished with seven and six minutes to
+  # spare. Nothing about that is fixed by a larger cap: the suite is serial
+  # because the api, mcp and cli tests share one migrated database, not because
+  # the work is inherently sequential.
+  #
+  # So the unit of isolation is now the JOB: each shard gets its own runner and
+  # its own Postgres service container, migrated from empty, and runs its test
+  # binaries exactly as before (same `--test-threads`, one cargo invocation,
+  # one binary at a time). Shards of the same package never share a database,
+  # which is the same guarantee the single job gave two different packages.
+  #
+  # What runs where is decided by .github/scripts/test-shard.py, which is also
+  # what the `plan` job runs to PROVE that the shards of a package cover each
+  # of its test targets exactly once. Adding a test file needs no edit here:
+  # it is dealt to a shard by name. Adding a crate needs none either: it lands
+  # in `workspace-rest`, which is selected by exclusion.
+  #
+  # `test` (below) is the single required check. It fails unless every shard
+  # and every feature-gated check the plan asked for succeeded, so branch
+  # protection keeps one stable name however the shards are re-cut.
+  #
+  # ON A PULL REQUEST ONLY THE AFFECTED SHARDS RUN. The org's GitHub-hosted
+  # runners are capped at 20 concurrent jobs for every PR together, and the
+  # full plan is 13 shards plus the other jobs, so one PR running everything
+  # holds nearly the whole cap. `plan` diffs the PR against its base and keeps
+  # the shards of the packages the change can affect: packages with changed
+  # files, everything that depends on them, and the test targets whose source
+  # scans read a changed file (run together in one `source-scans` shard). A
+  # change no Rust source reads (most docs, Python outside scripts/) runs no
+  # shard at all. test-shard.py's docstring has the rules; its
+  # `affected --base <ref>` mode prints the selection locally.
+  #
+  # The FULL plan still runs on every push to main, on the staging and
+  # integration PRs (head branch integration/**, staging/**, backlog/base-*,
+  # atlas/*-base), on any PR labelled `ci:full` (add the label, then "Re-run
+  # all jobs": the label is read live, not from the event), and on any change
+  # to migrations/, Cargo.lock, the root Cargo.toml, .github/, rust-toolchain*,
+  # .sqlx/ or .cargo/. The coverage check below always runs on the full plan.
+  #
+  # SELF-HOSTED SHARD RUNNERS (off unless the operator turns them on). Self-
+  # hosted runners do not count against the 20-job cap. Set the repository
+  # variable SHARD_RUNS_ON to a JSON `runs-on` value, e.g.
+  #   gh variable set SHARD_RUNS_ON -R epigraph-io/epigraph \
+  #     --body '["self-hosted", "linux", "x64", "epigraph-shard"]'
+  # and only the shards move; unset it (`gh variable delete SHARD_RUNS_ON`) to
+  # move them back. A pull request from a FORK always gets ubuntu-latest
+  # whatever the variable says (test-shard.py `shard_runner`): self-hosted
+  # runners must never run a stranger's code on a public repository.
+  #
+  # THAT GUARD IS NOT THE SECURITY BOUNDARY. On a `pull_request` event GitHub
+  # runs the workflow and scripts from the PR's own merge ref, so a fork can
+  # edit `runs-on` (or `shard_runner`, or its test) in its PR and target the
+  # self-hosted labels directly. The guard only keeps the UNMODIFIED workflow
+  # from sending a fork's code there. Before setting SHARD_RUNS_ON, put a
+  # control in place that stops fork PR runs reaching these runners whatever
+  # their workflow says, and verify it with a test fork PR. Two controls that
+  # a PR cannot edit: the repository setting requiring approval to run
+  # workflows for every outside contributor (approving a fork's run means
+  # trusting its code), and a root-owned job-started hook on each runner
+  # (ACTIONS_RUNNER_HOOK_JOB_STARTED) that fails any job whose event payload
+  # names a fork head before a step runs. GitHub's own guidance warns against
+  # self-hosted runners on public repositories. Each
+  # runner must be Linux with Docker (the Postgres service container),
+  # `mold` and Python 3 installed, and one runner per machine or VM (the
+  # service binds host port 5432); ephemeral (`--ephemeral`) runners are the
+  # safe default. An org runner group does not serve public repositories
+  # until its "Allow public repositories" setting is on.
+  #
+  # PER-PR CAP. The repository variable SHARD_MAX_PARALLEL (a positive
+  # integer) caps how many shards of ONE run execute at once, so a single PR
+  # cannot take every runner; unset means no cap.
+  plan:
+    name: Plan test shards
     runs-on: ubuntu-latest
-    # Bound the job. Every job here inherited GitHub's 6-hour default, so a
-    # hung step burned six hours and left the merge watcher reporting "pending"
-    # with no signal to act on — PR-19 saw one step run ~40 minutes against a
-    # 7-12 minute norm with nothing to compare it to. 90 minutes was ~7x that
-    # norm when set; the job has since grown to ~60 minutes on main and ~82
-    # with the MT-C elevation suites (2026-10-05), which would leave a staging
-    # stack under 10 minutes of headroom. 120 keeps a hang cut off with a named
-    # cause while a real, larger suite still finishes.
-    # 2026-10-25: 150. With the static checks moved to the `lint` job, `test`
-    # alone took 1h55m on a main-sized tree (#691) and ~111 min of test steps on
-    # a staging-sized one (#690): 120 cut real suites off. 150 still bounds a hang.
-    # 2026-11-02: 210. main's own push run now takes ~147 of the 150 minutes,
-    # and a 15-PR staging tree (#750) was cut off at 150 inside the epigraph-mcp
-    # step with nothing failed, ~10 minutes short of finishing (~160 projected).
-    # 210 leaves headroom for run-to-run variance and still bounds a hang.
-    timeout-minutes: 210
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The labels are read live (a re-run reuses the original event's).
+      issues: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      run: ${{ steps.plan.outputs.run }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # On a pull request HEAD is the test merge commit; its first parent
+          # is the base it merged into, so HEAD^1...HEAD is exactly the PR's
+          # change. Depth 2 fetches both.
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Unit-test the shard planner
+        # The affected-set rules, the fork guard and the job graph below are
+        # tested here, where a failure blocks the run (the `python` job is
+        # advisory). PyYAML is in the runner image; install it if not.
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update -y && sudo apt-get install -y python3-yaml; }
+          python3 -m unittest discover -s .github/scripts/tests -v
+      - name: Check that the shards cover every test target exactly once
+        # Fails the run before any shard starts if a test target is in no
+        # shard or in two, or if a package's unit tests are in none. It also
+        # prints the targets a plain `cargo test -p` would skip for a missing
+        # feature, so a new feature-gated test is visible here rather than
+        # silently never run, and fails on a whole-tree source scan that is
+        # not declared in test-shard.py's WALKERS. Always the full plan.
+        run: python3 .github/scripts/test-shard.py check
+      - name: Plan the shards for this event
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SHARD_RUNS_ON: ${{ vars.SHARD_RUNS_ON }}
+          SHARD_MAX_PARALLEL: ${{ vars.SHARD_MAX_PARALLEL }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            export DIFF_BASE=HEAD^1
+            if ! PR_LABELS="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" --jq '[.[].name]')"; then
+              echo "::warning::could not read the PR's labels; using the event's"
+              PR_LABELS="$EVENT_LABELS"
+            fi
+            export PR_LABELS
+          fi
+          python3 .github/scripts/test-shard.py ci-plan >> "$GITHUB_OUTPUT"
+
+  test-shard:
+    name: test (${{ matrix.shard }})
+    needs: plan
+    # An affected plan can hold no shard at all (a docs-only change). The job
+    # is then skipped rather than started with an empty matrix, which GitHub
+    # rejects, and the `test` gate accepts the skip because the plan said so.
+    if: ${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}
+    # ubuntu-latest unless the operator set SHARD_RUNS_ON; never a self-hosted
+    # runner for a fork's PR from THIS workflow (a fork can edit its copy: see
+    # SELF-HOSTED SHARD RUNNERS above). Computed and validated by the planner:
+    # do not read the variable here, or this workflow bypasses the guard. The
+    # fork test is repeated here from the event itself, so a planner bug alone
+    # cannot route a fork's PR to a self-hosted runner (still defence in depth:
+    # a fork can edit this line too).
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || fromJSON(needs.plan.outputs.runs_on) }}
+    # A shard takes 25-40 minutes (setup and build ~10, tests 10-25). 90 bounds
+    # a hang with a named cause and leaves room for a slow runner; if a shard
+    # approaches it, add a shard in test-shard.py instead of raising this.
+    timeout-minutes: 90
+    strategy:
+      # Every shard reports. One red shard must not hide a second failure in
+      # another, or fixing CI takes one three-hour round trip per failure.
+      fail-fast: false
+      # SHARD_MAX_PARALLEL, or 256 (GitHub's matrix limit: no cap).
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -114,10 +271,13 @@ jobs:
         # Replaces rust-lld for the workspace. mold uses dramatically less
         # RAM than lld on multi-binary workspaces — the other half of the
         # linker-OOM fix above. apt's mold on ubuntu-24.04 runners is
-        # sufficient (>= 2.x).
+        # sufficient (>= 2.x). A self-hosted runner must have mold installed:
+        # it is never apt-installed there.
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y mold
+          if ! command -v mold >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y mold
+          fi
           mkdir -p .cargo
           {
             echo ""
@@ -143,17 +303,34 @@ jobs:
         # NOTE: an earlier attempt set CARGO_TARGET_DIR=/mnt — inert, because the
         # mount table shows no separate /mnt disk (/mnt is a dir on /dev/root).
         # The df -ih / df -h lines record the headroom actually reclaimed.
+        #
+        # GitHub-hosted only: on a self-hosted runner these directories are
+        # the machine's own, and deleting them is not this job's call.
+        if: runner.environment == 'github-hosted'
         run: |
           df -ih / ; df -h /
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
           df -ih / ; df -h /
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          # One dependency cache per PACKAGE, not per shard: the shards of a
+          # package build the same dependency graph, and GitHub's cache quota
+          # is per repository. Only main writes it, and only one shard per key,
+          # so pull requests restore main's cache and never evict it.
+          shared-key: test-${{ matrix.cache }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.save }}
       # --locked: Cargo.lock is committed; enforce it so CI builds the exact
       # locked dependency graph and fails loudly if the lock is stale rather
       # than silently resolving newer versions.
-      - name: Build
+      - name: Build (whole workspace)
+        # The "does everything build and link" gate, once. Clippy type-checks
+        # every target, but only a build links the binaries.
+        if: matrix.shard == 'workspace-rest'
         run: cargo build --workspace --locked
+      - name: Build epigraph-migrate
+        if: matrix.shard != 'workspace-rest'
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate
       - name: Run migrations
         # epigraph-ingest-executor's e2e_empty_content_guard test connects to
         # DATABASE_URL directly (no #[sqlx::test] template DB) and queries the
@@ -163,212 +340,189 @@ jobs:
         # (sqlx::migrate!("../../migrations") in epigraph-api/src/lib.rs) so no
         # external sqlx-cli is needed — just run the already-built binary.
         run: ./target/debug/epigraph-migrate
-      - name: Test (non-DB packages, parallel)
-        # Packages without DB tests can run fully in parallel.
-        # Crates with #[sqlx::test] integration tests (or live DB usage) are
-        # excluded here and run sequentially below — concurrent test instances
-        # race on _sqlx_migrations when applying migrations to the template DB.
-        run: cargo test --workspace --locked
-          --exclude epigraph-db
-          --exclude epigraph-api
-          --exclude epigraph-engine
-          --exclude epigraph-mcp
-          --exclude epigraph-embeddings
-      - name: Purge linked test executables
-        # Each test step links its package's test binaries (hundreds, tens to
-        # hundreds of MB each) and nothing deletes them, so on a staging-sized
-        # tree the runner's disk filled during a later step's link (#690:
-        # "mold: failed to write to an output file. Disk full?" in the
-        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
-        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
-        # gate does the same between steps (purge_test_executables).
+      - name: Test
+        if: matrix.shard != 'source-scans'
+        # --no-fail-fast: run every test binary of the shard even after one
+        # fails, so one run reports every failure in it.
+        #
+        # `--test-threads` is REQUIRED, not redundant: .cargo/config.toml sets
+        # RUST_TEST_THREADS = "1" workspace-wide as the safe default, and
+        # libtest's CLI argument is what overrides it. The value per package
+        # lives in test-shard.py:
+        #   * epigraph-db runs at 4: every test in its tests/ directory
+        #     provisions its own database with #[sqlx::test], and the lib arms
+        #     that touch the ambient DATABASE_URL are all #[ignore]d. Measured
+        #     peak 17 Postgres backends at 4 threads against the service's
+        #     default max_connections of 100; re-measure before raising it.
+        #     lineage_tests.rs::test_lineage_performance_with_large_graph
+        #     asserts an absolute wall-clock bound: do not widen that bound if
+        #     it flakes, give it its own shard at one thread.
+        #   * everything else runs at 1: the api, mcp, cli and engine suites
+        #     share the shard's one migrated database.
+        env:
+          SHARD: ${{ matrix.shard }}
+          THREADS: ${{ matrix.threads }}
+        # The body repeats the `if:` because the local gate (ci-local /
+        # ci-shards) runs every step of this job verbatim and does not
+        # evaluate `if:`; each step must be a no-op on the other's shard.
         run: |
-          df -h /
-          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
-          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
-          # target/debug/deps. The regex keeps build scripts (build_script_*,
-          # no -<hash> suffix), which cargo would otherwise re-run.
-          if [ -d target/debug/deps ]; then
-            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
+          if [ "$SHARD" = source-scans ]; then exit 0; fi
+          args="$(python3 .github/scripts/test-shard.py args "$SHARD")"
+          # shellcheck disable=SC2086  # $args is a list of cargo arguments
+          cargo test --locked --no-fail-fast $args -- --test-threads="$THREADS"
+          doc_package="$(python3 .github/scripts/test-shard.py doc "$SHARD")"
+          if [ -n "$doc_package" ]; then
+            cargo test --locked -p "$doc_package" --doc
           fi
-          if [ -d target/debug/build ]; then
-            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
-              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          df -h /
-      - name: Test (epigraph-db, parallel within package)
-        # Packages still run SEQUENTIALLY -- one cargo invocation at a time --
-        # which is what prevents the cross-binary _sqlx_migrations race
-        # ("tuple concurrently updated"). What changes here is only IN-binary
-        # concurrency, and only for this package.
-        #
-        # Every test in crates/epigraph-db/TESTS/ now provisions its own
-        # database via #[sqlx::test(migrations = "../../migrations")]. The last
-        # fixtures that shared one physical database -- and that ADDed/DROPped a
-        # constraint on `claims` in contradictory directions -- were converted,
-        # so nothing under tests/ depends on being the only writer any more.
-        # Measured before that conversion: at 4 threads exactly one of the 65
-        # binaries failed, with a DIFFERENT arm failing on each of 4 runs. The
-        # other 64 were already parallel-safe and were being serialized on its
-        # behalf.
-        #
-        # Scope that sentence honestly: `-p epigraph-db` ALSO runs the lib
-        # target, and src/repos/claim.rs still has arms that connect to the
-        # ambient DATABASE_URL and DELETE from `claims`/`agents`
-        # (setup_test_claim / cleanup). Every one of them carries
-        # `#[ignore] // Requires live database`, so none executes here, and the
-        # three non-ignored lib arms use invalid or lazy URLs and never reach a
-        # server. They are safe at 4 threads because they do not run -- NOT
-        # because they were converted. Un-ignoring any of them requires
-        # converting it first.
-        #
-        # Why 4, honestly: it is NOT the top of the measured curve. On a 4-vCPU
-        # reference host the whole package ran 420s at 1 thread, 231s at 2 (1.8x),
-        # 191s at 4 (2.2x) and 146s at 8 (2.9x) -- all 65 binaries green at every
-        # setting. 8 was faster, and is a deliberate DEFERRAL rather than a dead
-        # end.
-        #
-        # The variable to measure before bumping to 8 is PEAK POSTGRES BACKENDS,
-        # not disk. sqlx's own per-test pools cannot be the limit: sqlx 0.8
-        # builds each one as max_connections(5).parent(master_pool) and the
-        # master pool is max_connections(20), so every #[sqlx::test] pool in the
-        # process shares one 20-permit semaphore no matter what --test-threads
-        # says. (That shared cap is also why 4 -> 8 only bought 191s -> 146s
-        # rather than halving: tests queue on it.) What is NOT capped are the
-        # pools the tests construct themselves -- ScopedPool defaults to
-        # max_connections = 10 and viewer_fixture::downgraded_pool to 5, both
-        # unparented -- and those scale LINEARLY with thread count. Measured at
-        # --test-threads=4: peak 17 backends against the postgres service's
-        # default max_connections of 100. Comfortable at 4; re-measure that peak
-        # before 8. Per-test databases are ~24 MB against a runner with tens of
-        # GB free, so they are not the ENOSPC driver the "Free disk space on /"
-        # step above exists for -- build artifacts and WAL are.
-        #
-        # One arm in this package asserts an ABSOLUTE wall-clock bound rather
-        # than a ratio: lineage_tests.rs::test_lineage_performance_with_large_graph
-        # (< 100ms over a 1,111-node tree). #[sqlx::test] isolates its DATA but
-        # not the CPU it competes for, so it is the arm to re-measure before any
-        # bump past 4. Headroom measured: it passes 3/3 at 4 threads under 4
-        # concurrent CPU hogs, and 2/2 under 16 hogs on 4 cores. Do NOT widen the
-        # bound if it ever flakes -- that is the index-regression property it
-        # exists to prove; give it its own target with --test-threads=1 instead,
-        # which is what we already do for the api timing test.
-        #
-        # The explicit flag is REQUIRED, not redundant: .cargo/config.toml sets
-        # RUST_TEST_THREADS = "1" workspace-wide as the safe default for the
-        # packages not yet cleared, and libtest's CLI argument is what overrides
-        # that env var. Removing this flag silently re-serializes the package.
-        run: cargo test -p epigraph-db --locked -- --test-threads=4
-      - name: Purge linked test executables
-        # Each test step links its package's test binaries (hundreds, tens to
-        # hundreds of MB each) and nothing deletes them, so on a staging-sized
-        # tree the runner's disk filled during a later step's link (#690:
-        # "mold: failed to write to an output file. Disk full?" in the
-        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
-        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
-        # gate does the same between steps (purge_test_executables).
+      - name: Test (source scans)
+        # Only in an affected plan: the test targets of packages the change
+        # does not otherwise touch whose sources read a changed file (the
+        # cross-crate ratchets, the runbook and calibration checks). One
+        # cargo invocation per package, at that package's --test-threads.
+        # cargo's stdin is /dev/null: a test that spawns a child with inherited
+        # stdin must not eat the rest of the invocation list, which would end
+        # the loop early with exit 0.
+        if: matrix.shard == 'source-scans'
+        env:
+          SHARD: ${{ matrix.shard }}
+          TARGETS: ${{ matrix.targets }}
         run: |
-          df -h /
-          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
-          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
-          # target/debug/deps. The regex keeps build scripts (build_script_*,
-          # no -<hash> suffix), which cargo would otherwise re-run.
-          if [ -d target/debug/deps ]; then
-            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          if [ -d target/debug/build ]; then
-            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
-              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          df -h /
-      - name: Test (epigraph-api, serialized)
-        run: cargo test -p epigraph-api --locked -- --test-threads=1
-      - name: Purge linked test executables
-        # Each test step links its package's test binaries (hundreds, tens to
-        # hundreds of MB each) and nothing deletes them, so on a staging-sized
-        # tree the runner's disk filled during a later step's link (#690:
-        # "mold: failed to write to an output file. Disk full?" in the
-        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
-        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
-        # gate does the same between steps (purge_test_executables).
+          if [ "$SHARD" != source-scans ]; then exit 0; fi
+          invocations="$(mktemp)"
+          python3 .github/scripts/test-shard.py scan-args "$TARGETS" > "$invocations"
+          cat "$invocations"
+          status=0
+          while read -r threads args; do
+            # shellcheck disable=SC2086  # $args is a list of cargo arguments
+            cargo test --locked --no-fail-fast $args -- --test-threads="$threads" < /dev/null || status=1
+          done < "$invocations"
+          exit "$status"
+
+  # TESTS THAT NO PLAIN `cargo test -p` RUNS, as a gate.
+  #
+  # Until this job existed nothing in CI compiled the `integration` feature or
+  # passed --ignored, so these tests ran only when someone remembered to. Each
+  # step below was run on a fresh database before being added here and passed.
+  # A never-run test rots: two of these suites (cluster_graph_test, backlog
+  # bd439a7f; engine-integration, backlog 4290a51c) each had one test that had
+  # gone stale unnoticed, and gate here only since that test was fixed. Do not
+  # add `--skip` for a failing test: a skipped test is a never-run test.
+  test-extra:
+    name: test (feature-gated and ignored suites)
+    # Runs only when epigraph-api, epigraph-jobs or engine-integration-tests is
+    # affected (test-shard.py EXTRA_JOBS), and always on a full plan.
+    needs: plan
+    if: ${{ fromJSON(needs.plan.outputs.run)['test-extra'] }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: epigraph
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Same environment as `test-shard`; the reasons for each value are there.
+      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
+      SQLX_OFFLINE: "true"
+      EPIGRAPH_TEST_DESTRUCTIVE_DB: "1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Install mold (low-memory parallel linker)
         run: |
-          df -h /
-          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
-          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
-          # target/debug/deps. The regex keeps build scripts (build_script_*,
-          # no -<hash> suffix), which cargo would otherwise re-run.
-          if [ -d target/debug/deps ]; then
-            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          if [ -d target/debug/build ]; then
-            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
-              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          df -h /
-      - name: Test (epigraph-engine, serialized)
-        run: cargo test -p epigraph-engine --locked -- --test-threads=1
-      - name: Purge linked test executables
-        # Each test step links its package's test binaries (hundreds, tens to
-        # hundreds of MB each) and nothing deletes them, so on a staging-sized
-        # tree the runner's disk filled during a later step's link (#690:
-        # "mold: failed to write to an output file. Disk full?" in the
-        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
-        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
-        # gate does the same between steps (purge_test_executables).
+          sudo apt-get update -y
+          sudo apt-get install -y mold
+          mkdir -p .cargo
+          {
+            echo ""
+            echo "# CI-only: route the workspace through mold. Scoped to the"
+            echo "# runner triple so local dev on other platforms is unaffected."
+            echo "# Uses the default cc driver (-fuse-ld=mold), no clang required."
+            echo "[target.x86_64-unknown-linux-gnu]"
+            echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
+          } >> .cargo/config.toml
+          mold --version
+      - name: Free disk space on /
         run: |
-          df -h /
-          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
-          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
-          # target/debug/deps. The regex keeps build scripts (build_script_*,
-          # no -<hash> suffix), which cargo would otherwise re-run.
-          if [ -d target/debug/deps ]; then
-            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          if [ -d target/debug/build ]; then
-            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
-              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          df -h /
-      - name: Test (epigraph-mcp, serialized)
-        # claim_helper_tests adds a temporary CHECK constraint on `edges`
-        # that would race with sibling tests under parallel execution.
-        run: cargo test -p epigraph-mcp --locked -- --test-threads=1
-      - name: Purge linked test executables
-        # Each test step links its package's test binaries (hundreds, tens to
-        # hundreds of MB each) and nothing deletes them, so on a staging-sized
-        # tree the runner's disk filled during a later step's link (#690:
-        # "mold: failed to write to an output file. Disk full?" in the
-        # epigraph-mcp step after ~90 min). Linked executables in deps/ are
-        # regenerable; the rlibs/rmeta the next steps reuse are kept. The local
-        # gate does the same between steps (purge_test_executables).
-        run: |
-          df -h /
-          # Cargo >= 1.100 (build-dir layout v2) links each test binary at
-          # target/debug/build/<pkg>/<hash>/out/<name>-<hash>; older cargo used
-          # target/debug/deps. The regex keeps build scripts (build_script_*,
-          # no -<hash> suffix), which cargo would otherwise re-run.
-          if [ -d target/debug/deps ]; then
-            find target/debug/deps -maxdepth 1 -type f -perm -u+x \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          if [ -d target/debug/build ]; then
-            find target/debug/build -mindepth 4 -maxdepth 4 -type f -perm -u+x \
-              -regex '.*/\([0-9a-f]+\)/out/[^/]+-\1' \
-              ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' -delete
-          fi
-          df -h /
-      - name: Test (epigraph-embeddings, serialized)
-        # pgvector tests use #[sqlx::test] which races with parallel siblings
-        # on _sqlx_migrations whenever a new migration is added.
-        run: cargo test -p epigraph-embeddings --locked -- --test-threads=1
+          df -ih / ; df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
+          df -ih / ; df -h /
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          shared-key: test-extra
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build epigraph-migrate
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate
+      - name: Run migrations
+        run: ./target/debug/epigraph-migrate
+      - name: epigraph-api `integration` feature tests
+        # tests/integration/lineage_integration_tests.rs and
+        # tests/routes/semantic_search_tests.rs are compiled only with
+        # `--features integration` (backlog 8fbe1b43).
+        run: >-
+          cargo test -p epigraph-api --features integration --locked --no-fail-fast
+          --test lineage_integration_tests --test semantic_search_tests
+          -- --test-threads=1
+      - name: epigraph-jobs `integration` feature tests
+        # The integration-gated arms of postgres_queue_tests and the whole of
+        # cluster_graph_neighborhoods_test. cluster_graph_test's gated arm is
+        # the next step.
+        run: >-
+          cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
+          --test postgres_queue_tests --test cluster_graph_neighborhoods_test
+          -- --test-threads=1
+      - name: epigraph-jobs cluster_graph_test with `integration`
+        # The gated arm seeds two cliques and runs the clustering job end to
+        # end. It is a `#[sqlx::test]`: it creates its own database from
+        # DATABASE_URL, so nothing it seeds reaches the steps around it.
+        run: >-
+          cargo test -p epigraph-jobs --features integration --locked --no-fail-fast
+          --test cluster_graph_test
+          -- --test-threads=1
+
+  # The one required check for the Rust suite. `needs` lists every job whose
+  # failure must block a merge. Without an `if`, a job whose dependency failed
+  # is SKIPPED, and a skipped required check reads as "pending" forever; so
+  # this job runs whenever the RUN was not cancelled, and fails on anything
+  # but `success` from any dependency (a shard that hit its own timeout
+  # reports `cancelled` and fails it, as it should).
+  #
+  # `!cancelled()`, not `always()`: when a new push supersedes this run the
+  # `concurrency` rule above cancels it, and with `always()` this job then ran
+  # anyway and posted a red `test` on the superseded commit.
+  #
+  # A job the plan skipped (no affected shard, or no affected package for a
+  # feature-gated check) must be `skipped`, and passes; a job the plan asked
+  # for must be `success`; nothing passes unless `plan` succeeded. The rule is
+  # test-shard.py `gate`, unit-tested in `plan`.
+  test:
+    name: test
+    if: ${{ !cancelled() }}
+    needs: [plan, test-shard, test-extra, lint-features]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Every shard and feature check the plan asked for succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/test-shard.py gate
 
   # Clippy, Format check and the no-db build check run in their OWN job, on
   # their own runner, in parallel with `test`. On a staging-sized tree the test
@@ -499,11 +653,59 @@ jobs:
         #
         # Scope is deliberately lib+bins, NOT --all-targets: the crate's
         # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
-        # test targets link Postgres regardless of the feature flag and cannot
-        # pass under --no-default-features today. Every bin, `server`
-        # included, declares required-features = ["db"] (ruling R-39: not(db)
-        # is check-only), so in practice this checks the library.
+        # integration-test targets link Postgres regardless of the feature
+        # flag. Every bin, `server` included, declares required-features =
+        # ["db"], so in practice this checks the library. The library's own
+        # unit-test target is compiled separately, by "No-db lib-test build
+        # check" in `lint-features`.
         run: cargo check -p epigraph-api --no-default-features --locked
+
+  # The feature-gated checks, on their own runner. They used to follow Clippy
+  # in the `lint` job, which made that job (45 minutes) the longest in the
+  # workflow once the test suite was sharded. None of them needs the others'
+  # build products: each compiles a different feature set.
+  lint-features:
+    name: Lint (genai and tls features)
+    # Runs only when epigraph-api or epigraph-cli is affected
+    # (test-shard.py EXTRA_JOBS), and always on a full plan.
+    needs: plan
+    if: ${{ fromJSON(needs.plan.outputs.run)['lint-features'] }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      SQLX_OFFLINE: "true"
+      EPIGRAPH_TEST_DESTRUCTIVE_DB: "1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Install mold (low-memory parallel linker)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mold
+          mkdir -p .cargo
+          {
+            echo ""
+            echo "# CI-only: route the workspace through mold. Scoped to the"
+            echo "# runner triple so local dev on other platforms is unaffected."
+            echo "# Uses the default cc driver (-fuse-ld=mold), no clang required."
+            echo "[target.x86_64-unknown-linux-gnu]"
+            echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
+          } >> .cargo/config.toml
+          mold --version
+      - name: Free disk space on /
+        run: |
+          df -ih / ; df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
+          df -ih / ; df -h /
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
       - name: Genai feature build check
         # `genai` is off by default and no other step compiles it, so its code
         # had no compile-time signal: epigraph-api's POST
@@ -528,6 +730,32 @@ jobs:
         # required-features = ["tls"], so every other test step skips them.
         # No database: they handshake against the loaded config in-process.
         run: cargo test -p epigraph-api --features tls --locked --test tls_pem_loading --test tls_provider_choice
+      - name: Genai feature tests
+        # tests/cross_source_sweep_smoke.rs declares required-features =
+        # ["genai"], so no other step runs it; the Genai step above only lints
+        # it. It needs no database and no API key: it runs the built
+        # `cross_source_sweep` binary's argument handling.
+        run: cargo test -p epigraph-cli --features genai --locked --test cross_source_sweep_smoke
+      - name: Genai prompt drift guard
+        # `rerank` is `#[cfg(feature = "genai")]`, so its unit tests run in no
+        # other step. rerank::prompt::tests pins the live verifier prompt
+        # against tests/cross_source/prompts_v1.md; without this step an edit
+        # to build_validation_prompt stays green and the pre-registered
+        # protocol silently stops describing the deployed verifier (backlog
+        # ba25c292). Pure string tests: no database, no API key.
+        run: cargo test -p epigraph-cli --features genai --locked --lib rerank::prompt
+      - name: No-db lib-test build check
+        # The "No-db build check" in `lint` is `cargo check` over lib+bins, so
+        # it never compiles the `#[cfg(test)]` modules. Those are where the
+        # not(db) arm's in-memory tests live, and they drifted unseen: 13
+        # errors (a fixture missing a new struct field, a db-only helper
+        # called from a not(db) module, a test of a db-only type left
+        # ungated) accumulated in the lib-test target while that check stayed
+        # green (backlog 01640684). This compiles the target without running
+        # it; several of its tests are stale at runtime and are a separate
+        # item. Warnings are not denied here: the not(db) arm carries unused
+        # imports that the db arm needs.
+        run: cargo test -p epigraph-api --no-default-features --lib --no-run --locked
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
@@ -568,10 +796,14 @@ jobs:
   # tests/ci/pytest_skip_budget.py reads the run's JUnit XML and fails the step
   # on any skip not named in its --allow list, which also covers skips the flag
   # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
-  # cannot find the ingest_git binary built above). The one allowed skip is
-  # test_executed_dedup_removes_the_duplicate_from_recall: it needs a running
-  # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), which this
-  # job does not provide yet, so that arm does not run in CI.
+  # cannot find the ingest_git binary built above). No skip is allowed:
+  # test_executed_dedup_removes_the_duplicate_from_recall needs a running API
+  # and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), and
+  # tests/ci/with_test_api.sh provides both around that step: it serves
+  # epigraph_py_test with the `server` binary built above, mints a per-run
+  # claims:write + claims:admin token, and stops the server when pytest exits,
+  # so it cannot outlive the step into tests/theme's table wipes (backlog
+  # 03fd7e00).
   #
   # The database arms connect as the service container's superuser, so RLS is
   # bypassed: they verify the scripts' logic against the migrated schema, not
@@ -586,7 +818,7 @@ jobs:
     # for the image's system python3 (3.12; numpy 1.26.4 has none past cp312),
     # so a newer default image would turn the install into a source build.
     runs-on: ubuntu-24.04
-    # A cold debug build of the two binaries plus the suites; 60 cuts off a hang.
+    # A cold debug build of the three binaries plus the suites; 60 cuts off a hang.
     timeout-minutes: 60
     continue-on-error: true
     services:
@@ -622,7 +854,9 @@ jobs:
           # budget the `test` job's (much larger) entry depends on.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build epigraph-migrate and ingest_git
-        run: cargo build --locked -p epigraph-api --bin epigraph-migrate -p epigraph-cli --bin ingest_git
+        # Also the API `server`, which tests/ci/with_test_api.sh serves the
+        # test database with for the executed-dedup arm (backlog 03fd7e00).
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate --bin server -p epigraph-cli --bin ingest_git
       - name: Install Python test dependencies
         # A venv, not the system interpreter (PEP 668), from a pinned file, and
         # no extra setup action (the trust surface stays the pinned actions).
@@ -646,10 +880,10 @@ jobs:
       - name: Python tests (scripts/tests, tests/dedup)
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export TEST_API_DATABASE_URL="$DEDUP_TEST_DATABASE_URL"
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
-          python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
-          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml" \
-            --allow tests.dedup.test_fuzzy_dedup_retraction::test_executed_dedup_removes_the_duplicate_from_recall
+          tests/ci/with_test_api.sh python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml"
       - name: Python tests (tests/theme)
         # The theme pipeline's pytest files. Their DB fixture wipes the
         # clustering tables of the database it is given, which here is the
@@ -659,6 +893,16 @@ jobs:
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
           python3 -m pytest -rs tests/theme --junitxml "$RUNNER_TEMP/pytest-theme.xml"
           python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-theme.xml"
+      - name: Python tests (NLI stance client and service)
+        # scripts/lib/test_nli_stance.py and the services/nli stub tests ran
+        # nowhere (backlog 4ea6edba). The service's web dependencies are
+        # installed at the versions services/nli/requirements.txt pins; its
+        # model dependencies (torch, transformers) are not, so
+        # test_model_smoke.py, which downloads a model, stays out.
+        run: |
+          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet fastapi==0.111.0 pydantic==2.7.4
+          python3 -m pytest -rs scripts/lib/test_nli_stance.py \
+            services/nli/test_app.py services/nli/test_requirements_floor.py
       - name: SciFact conformal calibration check
         # The 1,189 gold-labelled SciFact fixtures: held-out split-conformal
         # coverage and efficiency, plus --check, which fails when the shipped
@@ -754,3 +998,37 @@ jobs:
           SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: .github/scripts/gitleaks-scan.sh "$SCAN_BASE" "$SCAN_HEAD"
+
+  # Gates the MESSAGES of the commits a change adds (E1 e-mail address, E2
+  # developer home path, E3 IP-encoding host or public IPv4 fail the job;
+  # missing sections, a non-protocol subject and a Verification that records no
+  # run only warn). The history of this public repository is permanent, so an
+  # identifying detail in a message cannot be taken back once merged.
+  # Only <base>..<head> is scanned: existing history already contains findings
+  # and cannot be rewritten, so scanning all of it would fail every change.
+  commit-message-lint:
+    name: Commit message lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The PR's base commit must be present for a <base>..<head> range.
+          fetch-depth: 0
+      - name: Self-test the lint
+        run: .github/scripts/test-commit-message-lint.sh
+      - name: Lint the commits this change adds
+        env:
+          # SHAs reach the script through env, never interpolated into the
+          # shell body. On a push, `before` is all zeros when the push created
+          # the branch; the script then lints the head commit alone.
+          SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          # Private deny-list for E6 (customer and deployment names), one term
+          # per line. A repository secret, never a file in the repository: a
+          # committed list of customer names would publish them. Empty (not
+          # configured, or a fork's pull request) skips E6 and says so.
+          COMMIT_LINT_DENY_TERMS: ${{ secrets.COMMIT_LINT_DENY_TERMS }}
+        run: python3 .github/scripts/commit-message-lint.py "$SCAN_BASE" "$SCAN_HEAD"

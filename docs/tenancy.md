@@ -1435,7 +1435,8 @@ Two consequences to know:
 * readers of the roster TABLE itself (the REST group routes, the consolidate
   act's membership test, a profile's detail check) see explicit rows only, so
   a derived member is refused there; use `group-roster` to see who holds a
-  group through its bindings;
+  group through its bindings (`MEMBER` lines) next to its explicit rows
+  (`DIRECT` lines);
 * an explicit membership is never granted on the strength of a derived one:
   `group-member add` of a teammate's agent still requires the teammate's own
   explicit writer row (GRP03), so no explicit row outlives a window.
@@ -2223,10 +2224,13 @@ is deliberately not built.
 Unseal enqueues one `embedding_generation` job per restored **claim**. Three
 things that does not amount to:
 
-- **The handler is registered CONDITIONALLY.** `crates/epigraph-api/src/bin/server.rs`
-  does register a handler for that job type, so the enqueued job is a
-  restoration rather than a marker — but only where the configured embedding
-  provider is the one that owns `claims.embedding`. Writing another provider's
+- **The handler is registered CONDITIONALLY.**
+  `crates/epigraph-api/src/jobs_drain.rs::build_job_runner` does register a
+  handler for that job type, so the enqueued job is a restoration rather than
+  a marker — but only in the `drain_jobs` timer binary (since D9 the server
+  runs no job runner, so an instance without the drain timer drains nothing),
+  and only where the configured embedding provider is the one that owns
+  `claims.embedding`. Writing another provider's
   vectors into that column would put two incompatible vector spaces in one ANN
   column and degrade recall with no error, so an instance configured for any
   other provider — including the development fallback — registers nothing and
@@ -2237,8 +2241,9 @@ things that does not amount to:
   from `live_missing` is still bounded to 24 hours: without the bound an
   unsealed claim on such an instance would be hidden from the audit forever. A
   non-zero count of `embedding_generation` jobs older than the bound now means
-  the instance's embedding provider is not the one that owns the column, which
-  is a deployment signal rather than a missing-code one.
+  the instance's embedding provider is not the one that owns the column, or its
+  `drain_jobs` timer is not running, which is a deployment signal rather than a
+  missing-code one.
 - **It does not name an evidence row.** The job payload carries a claim id and
   there is no evidence-shaped variant, so an unsealed evidence row keeps NULL
   vectors until a backfill reaches it.

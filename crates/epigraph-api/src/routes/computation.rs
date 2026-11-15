@@ -839,7 +839,57 @@ fn claims_informed_by_less_readable(
     out
 }
 
+/// The most iterations a `POST /api/v1/bp/propagate` caller may ask for. The
+/// default is 20; the engines' loops are synchronous and end only on
+/// convergence or this cap, so an unbounded value pins a runtime worker.
+#[cfg(feature = "db")]
+pub const BP_MAX_ITERATIONS: usize = 200;
+
+/// The BP configuration a [`PropagateRequest`] asks for, with the engine
+/// defaults (20 iterations, threshold 0.01, damping 0.5) for omitted fields.
+///
+/// # Errors
+/// `ApiError::ValidationError` (400) when `max_iterations` exceeds
+/// [`BP_MAX_ITERATIONS`], or `convergence_threshold` or `damping` is outside
+/// `[0, 1]`. Both are compared against beliefs in `[0, 1]`: a negative
+/// threshold can never be met, and a damping outside `[0, 1]` extrapolates
+/// instead of interpolating between the old and new message.
+#[cfg(feature = "db")]
+fn bp_config_from_request(
+    request: &PropagateRequest,
+) -> Result<epigraph_engine::BpConfig, ApiError> {
+    let unit_interval = |field: &str, value: f64| {
+        if (0.0..=1.0).contains(&value) {
+            Ok(value)
+        } else {
+            Err(ApiError::ValidationError {
+                field: field.to_string(),
+                reason: format!("Must be in [0, 1] (got {value})"),
+            })
+        }
+    };
+    let max_iterations = request.max_iterations.unwrap_or(20);
+    if max_iterations > BP_MAX_ITERATIONS {
+        return Err(ApiError::ValidationError {
+            field: "max_iterations".to_string(),
+            reason: format!("Must be at most {BP_MAX_ITERATIONS} (got {max_iterations})"),
+        });
+    }
+    Ok(epigraph_engine::BpConfig {
+        max_iterations,
+        convergence_threshold: unit_interval(
+            "convergence_threshold",
+            request.convergence_threshold.unwrap_or(0.01),
+        )?,
+        damping: unit_interval("damping", request.damping.unwrap_or(0.5))?,
+    })
+}
+
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
+///
+/// `max_iterations` is capped at [`BP_MAX_ITERATIONS`] and
+/// `convergence_threshold` / `damping` must lie in `[0, 1]`; anything else is
+/// a 400 before any factor is loaded.
 ///
 /// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
 /// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
@@ -857,11 +907,7 @@ pub async fn propagate_beliefs(
     State(state): State<AppState>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let config = epigraph_engine::BpConfig {
-        max_iterations: request.max_iterations.unwrap_or(20),
-        convergence_threshold: request.convergence_threshold.unwrap_or(0.01),
-        damping: request.damping.unwrap_or(0.5),
-    };
+    let config = bp_config_from_request(&request)?;
     let apply = request.apply_updates.unwrap_or(false);
 
     // BP apply is retired (SPEC §6.2, hazard H4): refused before anything is
@@ -1398,6 +1444,65 @@ async fn extract_neighborhood(
     })?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+#[cfg(all(test, feature = "db"))]
+mod bp_config_tests {
+    use super::{bp_config_from_request, PropagateRequest, BP_MAX_ITERATIONS};
+    use crate::errors::ApiError;
+
+    fn request(body: serde_json::Value) -> PropagateRequest {
+        serde_json::from_value(body).expect("request deserializes")
+    }
+
+    fn refused_field(body: serde_json::Value) -> String {
+        match bp_config_from_request(&request(body.clone())) {
+            Err(ApiError::ValidationError { field, .. }) => field,
+            other => panic!("{body} must be a validation error, got {other:?}"),
+        }
+    }
+
+    /// The handler copied these three straight into `BpConfig`, so
+    /// `{"max_iterations": 10^12, "convergence_threshold": 0}` ran a
+    /// synchronous loop for as long as the caller liked (backlog 69f52e3f).
+    #[test]
+    fn out_of_range_iteration_parameters_are_refused() {
+        use serde_json::json;
+        assert_eq!(
+            refused_field(json!({"max_iterations": BP_MAX_ITERATIONS + 1})),
+            "max_iterations"
+        );
+        assert_eq!(
+            refused_field(json!({"max_iterations": 1_000_000_000_000_u64})),
+            "max_iterations"
+        );
+        for bad in [-0.01, 1.01, -1.0e9] {
+            assert_eq!(
+                refused_field(json!({"convergence_threshold": bad})),
+                "convergence_threshold"
+            );
+            assert_eq!(refused_field(json!({"damping": bad})), "damping");
+        }
+    }
+
+    #[test]
+    fn defaults_and_in_range_values_are_kept() {
+        use serde_json::json;
+        let d = bp_config_from_request(&request(json!({}))).expect("defaults are valid");
+        assert_eq!(d.max_iterations, 20);
+        assert!((d.convergence_threshold - 0.01).abs() < f64::EPSILON);
+        assert!((d.damping - 0.5).abs() < f64::EPSILON);
+
+        let c = bp_config_from_request(&request(json!({
+            "max_iterations": BP_MAX_ITERATIONS,
+            "convergence_threshold": 0.0,
+            "damping": 1.0,
+        })))
+        .expect("the bounds themselves are accepted");
+        assert_eq!(c.max_iterations, BP_MAX_ITERATIONS);
+        assert!(c.convergence_threshold.abs() < f64::EPSILON);
+        assert!((c.damping - 1.0).abs() < f64::EPSILON);
+    }
 }
 
 #[cfg(all(test, feature = "db"))]

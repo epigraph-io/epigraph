@@ -37,9 +37,11 @@
 //! connection too, and is viewer-scoped by the spliced `claims` predicate in
 //! `ClaimThemeRepository::overview_page`: the per-theme count is of the
 //! current members the caller can read, and theme rows narrow to those with
-//! at least one such member. Its LABELS are not viewer-scoped: a stored label
-//! may be derived from members the caller cannot read (the label residual on
-//! `D-PR16-theme-cluster-viewer-scope`).
+//! at least one such member. Its LABELS are not viewer-scoped. The theme
+//! scripts now build them from public members only
+//! (`scripts/theme_lib.py::public_label_source`), but a label stored before
+//! that rule may still be derived from members the caller cannot read (the
+//! label residual on `D-PR16-theme-cluster-viewer-scope`).
 //!
 //! The other 2 sites — `overview`, `themes_expand` — are routed GETs that hold
 //! no `Viewer` at all. Their owner is `D-PR16-theme-cluster-viewer-scope`, an
@@ -643,12 +645,12 @@ async fn fetch_subgraph_edges(
 #[derive(Debug, Serialize)]
 pub struct ThemeOut {
     pub id: Uuid,
-    /// The stored theme label, cut to 200 characters. NOT viewer-scoped: for
-    /// a theme with members the caller cannot read, it may be derived from
-    /// their text (`scripts/label_themes_llm.py` samples members with no
-    /// visibility predicate, except that it never samples a claim the
-    /// bug-report intake group owns: `scripts/theme_lib.py::not_intake_owned`).
-    /// Residual recorded on `D-PR16-theme-cluster-viewer-scope`.
+    /// The stored theme label, cut to 200 characters. NOT viewer-scoped. The
+    /// theme scripts build stored labels from public, non-intake members only
+    /// (`scripts/theme_lib.py::public_label_source`), but a label stored
+    /// before that rule, until an operator relabels, may still be derived from
+    /// members the caller cannot read. Residual recorded on
+    /// `D-PR16-theme-cluster-viewer-scope`.
     pub label: String,
     /// Current claims assigned to this theme that the CALLER can read. Live,
     /// never the stored `claim_themes.claim_count` (backlog 57917c13).

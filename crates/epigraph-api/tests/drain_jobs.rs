@@ -866,6 +866,55 @@ async fn a_permanent_failure_is_terminal_on_its_first_run(pool: PgPool) {
     );
 }
 
+/// A failure the handler calls permanent (`JobError::should_retry()` false) is
+/// terminal on the FIRST run, whatever retries the row has left. The drain
+/// used to look only at the retry count, so it re-ran such a job on every run
+/// until the retries were spent, failing the unit each time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_permanent_failure_is_terminal_on_its_first_run_with_retries_left(pool: PgPool) {
+    // A privatization apply for a plan that does not exist: the handler
+    // refuses it with `PermanentFailure`. Privatization jobs are enqueued with
+    // one retry; this one is given three, so only the error's kind can make
+    // the first failure terminal.
+    let id = {
+        let job = fx::apply_job(Uuid::new_v4(), Uuid::new_v4(), "no-such-dispatch");
+        let id: Uuid = job.id.into();
+        PostgresJobQueue::new(pool.clone())
+            .enqueue(job)
+            .await
+            .expect("seed");
+        id
+    };
+    sqlx::query("UPDATE jobs SET max_retries = 3 WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("give the job three retries");
+
+    let scoped = maintenance_scoped(&pool).await;
+    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+    let first = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        first.failures.len() == 1 && first.failures[0].terminal,
+        "a permanent failure with retries left must be terminal: {first:?}"
+    );
+    let (state, err) = job_state(&pool, id).await;
+    assert_eq!(state, "failed", "a permanent failure went back to pending");
+    assert!(err.is_some(), "the error was not recorded");
+    assert_eq!(first.exit_code(), 1);
+
+    let after = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        after.failures.is_empty() && after.completed == 0,
+        "a permanently failed job was picked up again: {after:?}"
+    );
+    assert_eq!(after.exit_code(), 0);
+}
+
 /// The exit code's order: a failure (retryable or terminal) is 1 even when
 /// the run also ran out of time, because the unit treats 3 as success; out of
 /// time alone is 3; nothing to report is 0. A pure check of the report, with
