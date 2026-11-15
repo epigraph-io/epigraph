@@ -42,7 +42,6 @@ pub mod diverse_retrieval;
 pub mod diverse_select;
 pub mod domain_decay;
 pub mod edge_factor;
-pub mod embedder;
 pub mod epistemic_interval;
 pub mod error_mass;
 pub mod errors;
@@ -70,6 +69,7 @@ pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;
 pub mod unified_bp;
+pub mod visibility_act;
 pub mod voi;
 pub mod workflow_promotion;
 

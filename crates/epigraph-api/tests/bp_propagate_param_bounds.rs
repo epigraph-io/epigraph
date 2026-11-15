@@ -64,14 +64,14 @@ async fn out_of_range_run_parameters_are_refused(pool: PgPool) {
         "max_iterations",
         "an effectively unbounded run",
     );
-    for t in [0.0, -0.5] {
+    for t in [-0.01, -0.5, 1.5] {
         refused_on(
             run(&pool, serde_json::json!({ "convergence_threshold": t })).await,
             "convergence_threshold",
             &format!("threshold {t}"),
         );
     }
-    for d in [1.0, 1.5, -0.1] {
+    for d in [1.01, 1.5, -0.1] {
         refused_on(
             run(&pool, serde_json::json!({ "damping": d })).await,
             "damping",
@@ -90,8 +90,8 @@ async fn defaults_and_boundary_run_parameters_are_admitted(pool: PgPool) {
         &pool,
         serde_json::json!({
             "max_iterations": BP_MAX_ITERATIONS,
-            "convergence_threshold": 1e-9,
-            "damping": 0.0,
+            "convergence_threshold": 0.0,
+            "damping": 1.0,
         }),
     )
     .await

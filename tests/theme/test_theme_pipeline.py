@@ -99,3 +99,84 @@ def test_stop_reason_max_iter():
 def test_stop_reason_continue():
     assert T.stop_reason(current_k=30, target_k=72, iterations=2, max_iter=10,
                          n_selected=5) is None
+
+
+# --- label step: same database, absolute script path, failure surfaced --------
+
+def test_label_command_forwards_the_pipeline_database_url():
+    """Without --database-url the label script resolves its own DSN and
+    relabels a different database than the one just clustered."""
+    cmd = T.label_command("postgres://u:p@localhost/scratch_test")
+    assert cmd[cmd.index("--database-url") + 1] == "postgres://u:p@localhost/scratch_test"
+    assert "--relabel-all" in cmd
+
+
+def test_label_command_script_path_does_not_depend_on_cwd(tmp_path, monkeypatch):
+    import os
+    monkeypatch.chdir(tmp_path)
+    script = T.label_command("postgres://u:p@localhost/scratch_test")[1]
+    assert os.path.isabs(script)
+    assert os.path.isfile(script)
+    assert os.path.basename(script) == "label_themes_llm.py"
+
+
+def test_label_command_refuses_a_missing_url():
+    import pytest
+    with pytest.raises(ValueError):
+        T.label_command(None)
+
+
+def test_run_label_step_returns_the_subprocess_exit_code(monkeypatch):
+    seen = {}
+
+    class Done:
+        returncode = 3
+
+    def fake_run(cmd, check):
+        seen["cmd"], seen["check"] = cmd, check
+        return Done()
+
+    monkeypatch.setattr(T.subprocess, "run", fake_run)
+    assert T.run_label_step("postgres://u:p@localhost/scratch_test") == 3
+    assert seen["cmd"] == T.label_command("postgres://u:p@localhost/scratch_test")
+
+
+def test_run_label_step_reports_a_step_that_could_not_start(monkeypatch):
+    def fake_run(cmd, check):
+        raise FileNotFoundError("no interpreter")
+
+    monkeypatch.setattr(T.subprocess, "run", fake_run)
+    assert T.run_label_step("postgres://u:p@localhost/scratch_test") != 0
+
+
+def test_grow_result_does_not_call_a_failed_label_step_grown():
+    assert T.grow_result("r1", 72, 0) == {"status": "grown", "run_id": "r1", "k": 72}
+    failed = T.grow_result("r1", 72, 2)
+    assert failed["status"] == "label_failed"
+    assert failed["label_returncode"] == 2
+    assert failed["run_id"] == "r1" and failed["k"] == 72
+
+
+def test_grow_labels_the_database_it_was_given_and_surfaces_failure(monkeypatch):
+    """grow's label step gets args.database_url, and its failure reaches the
+    returned status (it used to return "grown" whatever the subprocess did)."""
+    import argparse
+    labelled = []
+
+    def fake_label(url):
+        labelled.append(url)
+        return 1
+
+    monkeypatch.setattr(T, "cluster_stats", lambda conn, run_id: [])
+    monkeypatch.setattr(T, "current_k", lambda conn, run_id: 5)
+    monkeypatch.setattr(T.project_to_themes, "project_run", lambda conn, run_id: None)
+    monkeypatch.setattr(T, "run_label_step", fake_label)
+    args = argparse.Namespace(
+        from_run_id="run-x", database_url="postgres://u:p@localhost/scratch_test",
+        min_size=2000, max_size=T.DEFAULT_MAX_SIZE, target_k=72, max_iter=8,
+        dry_run=False,
+    )
+    result = T.grow(None, args)
+    assert labelled == ["postgres://u:p@localhost/scratch_test"]
+    assert result["status"] == "label_failed"
+    assert result["run_id"] == "run-x"

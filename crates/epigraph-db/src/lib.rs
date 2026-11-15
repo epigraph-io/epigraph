@@ -87,6 +87,7 @@ pub use refusal_codes::{
 pub use repos::bug_report::{BugReportInput, BugReportReceipt, BugReportRepository, BugReportRow};
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
+pub use repos::PolicyRepository;
 pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
@@ -99,13 +100,13 @@ pub use repos::{
     AgentNameMatch, AgentRef, AgentSearchHit, AuthorNode, AuthorRef, AuthoredBy,
     AuthoredByRepository, CardCounts, CardRole, Corroboration, Filer, FindAgentQuery,
     FindAgentResult, Ingester, LiteratureAuthorship, MatchTier, PaperAuthor, PaperAuthorship,
-    PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
+    PaperIngest, PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
     AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
     AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
-    AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
+    AnalysisRecord, AnalysisRepository, AssertionNonceRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
     ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
@@ -130,17 +131,17 @@ pub use repos::{
     MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage, NewRecallEvent, OAuthClientRepository,
-    OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository, PaperRow, PatchClaimDiff,
-    PatchClaimInput, PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository,
-    ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
-    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
-    RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate,
-    TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
+    MovedBba, NearestClaimHit, NeighbourhoodThemeCoverage, NewRecallEvent, NonceConsumption,
+    OAuthClientRepository, OAuthClientRow, OperatorLink, OperatorLinkOutcome, PaperRepository,
+    PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
+    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReasoningTraceRepository,
+    RecallEventRepository, RecallEventRow, RefreshCheck, RefreshRevokeReason, RefreshRotateOutcome,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome,
+    RevokedAccessTokenRepository, RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository,
+    ScoredHierarchicalWorkflowRow, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    SortDirection, StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
+    SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
     TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
     WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
@@ -187,6 +188,11 @@ pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BIND
 pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 // The Atlas layout reads and the operator build (migration 197).
 pub use repos::AtlasLayoutRepository;
+// The sources overview (`GET /api/v1/sources/overview`).
+pub use repos::{
+    SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
+    SourcePage, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX, SOURCE_AUTHORS_MAX,
+};
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
     ClaimContextRepository, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ContextClaimRow,
@@ -205,8 +211,8 @@ pub use repos::conflict_density::{ConflictDensityRepository, FrameConflictDensit
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{
-    AttributedClaimRow, BbaCleanup, EdgeRefusal, EdgeRow, EdgeWithdrawal, SymmetricEdgeUpsert,
-    WithdrawnEdgeBbas, EDGE_RETRACT_DEFERRAL_REASON, EPISTEMIC_RELATIONSHIPS,
+    AttributedClaimRow, BbaCleanup, ClaimLinkRow, EdgeRefusal, EdgeRow, EdgeWithdrawal,
+    SymmetricEdgeUpsert, WithdrawnEdgeBbas, EDGE_RETRACT_DEFERRAL_REASON, EPISTEMIC_RELATIONSHIPS,
 };
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};

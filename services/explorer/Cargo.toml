@@ -8,7 +8,8 @@ description = "Server-rendered web UI and BFF for the EpiGraph knowledge graph"
 
 # Standalone root: its own Cargo.lock and target/. It is deliberately NOT a
 # member of the kernel workspace, so nothing below may use `workspace = true`
-# (it cannot resolve from here — see crates/epigraph-harvester).
+# (it cannot resolve from here: the empty `[workspace]` table below makes this
+# manifest its own workspace root, with no `[workspace.dependencies]`).
 [workspace]
 
 [lib]
@@ -43,6 +44,12 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+# The Atlas level contract test helper (tests/common/atlas_contract.rs):
+# a JSON Schema validator and gzip for the payload budget. default-features
+# = false: the defaults resolve remote `$ref`s over HTTP, which the schema
+# never needs.
+flate2 = "1"
+jsonschema = { version = "0.61", default-features = false }
 tokio = { version = "1", features = ["full", "test-util"] }
 wiremock = "0.6"
 

@@ -47,7 +47,6 @@ default = ["db"]
 db = ["sqlx", "pgvector"]  # Enable database storage/retrieval of embeddings
 openai = ["reqwest", "tiktoken-rs"]  # Enable OpenAI API support
 jina = ["reqwest"]  # Enable Jina multimodal embedding API support
-local = []  # Enable local embedding model support
 
 [[test]]
 name = "embeddings_tests"
