@@ -103,6 +103,10 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   (`crates/epigraph-api/src/routes/`) and MCP tools
   (`crates/epigraph-mcp/src/tools/`) both call the repo layer; do not
   duplicate SQL between them.
+  Neither is at zero yet, so two exact-count ratchet tests pin the residue:
+  `crates/epigraph-mcp/tests/no_inline_sql_in_tools.rs` (MCP tools) and
+  `crates/epigraph-api/tests/no_inline_sql_in_routes.rs` (HTTP routes); the
+  HTTP count can only fall, by moving a statement into the repo layer.
 - After adding or modifying a `sqlx::query!` / `sqlx::query_as!` macro
   call, run `DATABASE_URL=... cargo sqlx prepare --workspace -- --tests`
   and commit `.sqlx/` so `SQLX_OFFLINE=true cargo check --workspace`
