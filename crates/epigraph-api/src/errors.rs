@@ -1035,6 +1035,7 @@ mod tests {
 
     /// An elevated request asking to write is a 403 denial naming the remedy,
     /// not a 500. Mutation caught: the arm removed (it falls to the fault arm).
+    #[cfg(feature = "db")]
     #[test]
     fn an_elevated_write_is_a_403_denial() {
         let api = ApiError::from(DbError::ElevatedReadOnly);
