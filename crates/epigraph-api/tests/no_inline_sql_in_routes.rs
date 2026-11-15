@@ -95,7 +95,7 @@ use std::path::{Path, PathBuf};
 /// `(path relative to crates/epigraph-api/src/routes, count)`, sorted by path.
 const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 2),
-    ("belief.rs", 10),
+    ("belief.rs", 9),
     ("claims.rs", 3),
     ("clusters.rs", 8),
     ("computation.rs", 9),
@@ -107,7 +107,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("embeddings.rs", 2),
     ("experiment_loop.rs", 2),
     ("graph.rs", 11),
-    ("graph_neighborhood.rs", 7),
+    ("graph_neighborhood.rs", 1),
     ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
     ("papers.rs", 8),
@@ -128,7 +128,11 @@ const REGISTER: &[(&str, usize)] = &[
 /// Lowered to 112 when backlog 9bef22f3 deleted the PUT claim and evidence
 /// embedding routes (`rag.rs` 2 -> 0) and `assess` stored its claim vector
 /// through the shared unsealed writer (`assess.rs` 3 -> 2).
-const HIGH_WATER: usize = 112;
+/// Lowered to 105 when backlog batch B08 moved `frame_conflict`'s aggregate
+/// into `MassFunctionRepository::frame_conflict_summary` (`belief.rs` 10 -> 9)
+/// and the compound neighbourhood's graph reads into `GraphViewRepository`
+/// (`graph_neighborhood.rs` 7 -> 1).
+const HIGH_WATER: usize = 105;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
