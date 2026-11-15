@@ -228,6 +228,29 @@ fn reported(resp: &Value) -> f64 {
     resp["updated_belief"].as_f64().expect("updated_belief")
 }
 
+/// The `frame_id` of every `belief.updated` event naming `claim`. The event
+/// store is process-global and shared by the tests running in parallel, so
+/// the events are filtered by this test's own claim.
+async fn belief_updated_frames(claim: Uuid) -> Vec<Uuid> {
+    let filter = epigraph_api::routes::events::EventFilter {
+        event_type: Some("belief.updated".to_string()),
+        since: None,
+        after_id: None,
+        limit: Some(100_000),
+        offset: None,
+    };
+    epigraph_api::_test_event_store()
+        .list(&filter)
+        .await
+        .0
+        .into_iter()
+        .filter(|e| e.payload["claim_id"] == serde_json::json!(claim))
+        .map(|e| {
+            serde_json::from_value(e.payload["frame_id"].clone()).expect("the event's frame_id")
+        })
+        .collect()
+}
+
 /// The owner's writes all land on the application role: its BBA, its frame
 /// assignment, and the cache, attributed to this frame.
 #[sqlx::test(migrations = "../../migrations")]
@@ -440,6 +463,11 @@ async fn an_owners_submission_on_a_non_owner_frame_keeps_the_binary_truth_cache(
         "PREMISE: the owner's binary_truth submission built a binary_truth cache of 0.9: \
          {before:?} ({text})"
     );
+    assert_eq!(
+        belief_updated_frames(w.claim).await,
+        vec![binary],
+        "CONTROL: the submission that moved the cache emits belief.updated"
+    );
 
     let resp = submit(&w, w.owner).await;
 
@@ -459,5 +487,12 @@ async fn an_owners_submission_on_a_non_owner_frame_keeps_the_binary_truth_cache(
             .iter()
             .any(|m| m.contains(CACHE_NOT_UPDATED) && m.contains(&binary.to_string())),
         "the response must say the cache was not updated and name the owner frame: {resp}"
+    );
+    // Step 18's event used to report the claim's cache (0.9) moving to this
+    // frame's combination (0.6), a move that did not happen.
+    assert_eq!(
+        belief_updated_frames(w.claim).await,
+        vec![binary],
+        "a submission that leaves the cache as it was must not emit belief.updated"
     );
 }

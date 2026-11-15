@@ -1741,7 +1741,11 @@ pub async fn submit_evidence(
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Inserted => {}
     }
-    if !cache_written || cache_frame != Some(frame_id) {
+    // Whether the claim's cache now holds this frame's combination: the
+    // condition for the "NOT updated" warning below and for step 18's
+    // `belief.updated` event.
+    let cache_updated = cache_written && cache_frame == Some(frame_id);
+    if !cache_updated {
         let claim_id = request.claim_id;
         warnings.push(match cache_owner {
             Some(owner) if owner != frame_id => format!(
@@ -2151,25 +2155,33 @@ pub async fn submit_evidence(
         )
         .await;
 
-    // 18. Emit belief.updated event
-    event_store
-        .push(
-            "belief.updated".to_string(),
-            request.agent_id,
-            serde_json::json!({
-                "claim_id": request.claim_id,
-                "frame_id": frame_id,
-                "old_belief": old_belief,
-                "new_belief": final_bel,
-                "old_plausibility": old_plausibility,
-                "new_plausibility": final_pl,
-                "pignistic_prob": final_betp,
-                "combination_method": final_method,
-                "total_sources": total_sources,
-                "perspective_id": request.perspective_id,
-            }),
-        )
-        .await;
+    // 18. Emit belief.updated event, ONLY when step 13 moved the claim's
+    //     cache to this frame's combination. `old_belief` is the claim's cache
+    //     before this call and `new_belief` this frame's combination, so when
+    //     the cache was not written (another frame owns it, the claim is a
+    //     compound, or migration 114 declined a non-owner's write) the event
+    //     reported a move that did not happen (backlog d33a5c9f).
+    //     `evidence.submitted` above still records the submission.
+    if cache_updated {
+        event_store
+            .push(
+                "belief.updated".to_string(),
+                request.agent_id,
+                serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "frame_id": frame_id,
+                    "old_belief": old_belief,
+                    "new_belief": final_bel,
+                    "old_plausibility": old_plausibility,
+                    "new_plausibility": final_pl,
+                    "pignistic_prob": final_betp,
+                    "combination_method": final_method,
+                    "total_sources": total_sources,
+                    "perspective_id": request.perspective_id,
+                }),
+            )
+            .await;
+    }
 
     // 18b. Confidence velocity check — detect monotonic belief increase
     //      Reconstruct recent belief trajectory from scoped_belief snapshots.
