@@ -323,7 +323,7 @@ impl McpEmbedder {
     ///
     /// So this path is for a PUBLIC claim of unknown author. A caller that knows
     /// the author of a team or private claim stores through
-    /// `claim_helper::store_embedding_author_stamped` (or its `_with_grant`
+    /// `claim_helper::store_embedding_author_stamped` (or its `_for`
     /// form) instead: `submit_claim`, `memorize`, workflow ingest, both document
     /// walks and `consolidate_claims` do.
     ///

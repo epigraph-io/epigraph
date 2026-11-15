@@ -1820,7 +1820,6 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
- "tokio-util",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
@@ -5372,7 +5371,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "futures-util",
  "pin-project-lite",
  "tokio",
 ]
