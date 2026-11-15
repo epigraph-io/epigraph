@@ -58,11 +58,15 @@ pub struct LineageResult {
     pub traces: HashMap<Uuid, LineageTrace>,
     /// Nodes in topological order (ancestors first)
     pub topological_order: Vec<Uuid>,
-    /// Whether a cycle was detected. Always `false` from
-    /// [`LineageRepository::get_lineage`] and
-    /// [`LineageRepository::get_descendants`]: their walks never could set it
-    /// (see `get_lineage_conn`), and [`LineageRepository::detect_cycles`] is
-    /// the cycle check.
+    /// Whether the RETURNED claims contain a cycle through their
+    /// `parent_ids`: the claims after the `max_depth` bound and any
+    /// `max_nodes` cap, linked by the edges the walk follows (derivation edges
+    /// for [`LineageRepository::get_lineage`], every claim-to-claim edge for
+    /// [`LineageRepository::get_descendants`]) that the viewer can read. A
+    /// cycle that lies partly past the cut is not reported; a walk still ends
+    /// on a cycle and lists each claim once. For a check over the whole
+    /// reachable ancestor graph and every relationship, see
+    /// [`LineageRepository::detect_cycles`].
     pub cycle_detected: bool,
     /// Maximum depth reached
     pub max_depth_reached: i32,
@@ -207,6 +211,184 @@ fn drop_probe_layer(rows: Vec<LineageRow>, max_depth: i32) -> (Vec<LineageRow>, 
     let kept: Vec<LineageRow> = rows.into_iter().filter(|r| r.depth <= max_depth).collect();
     let cut = kept.len() != fetched;
     (kept, cut)
+}
+
+/// The furthest shortest-depth layer [`LineageRepository::detect_cycles`] and
+/// [`LineageRepository::get_depth`] walk to. This is NOT the bound their
+/// path-enumerating forms had: those stopped at a path of 1000 claims, while
+/// this stops at claims more than 1000 SHORTEST hops away, so a chain longer
+/// than 1000 that a shortcut brings within reach is examined in full and
+/// `get_depth` can return more than 1000. It bounds the number of layer rows;
+/// each row carries the visited set, so the walk's work table grows with
+/// layers times claims reached.
+const SHAPE_WALK_MAX_DEPTH: i32 = 1000;
+
+/// A directed graph over claims, its edges pointing the way a walk follows
+/// them, and the strongly connected components that decide both "is there a
+/// cycle" and "how long is the longest chain" in time linear in its size.
+///
+/// Neither question can be answered by enumerating paths (exponential on a
+/// dense DAG), nor from a breadth-first walk's shortest depths: a lattice
+/// reaches every claim many times over without a cycle, and a shortcut makes
+/// a claim's shortest depth smaller than its longest chain.
+struct ClaimDigraph {
+    index: HashMap<Uuid, usize>,
+    /// Deduplicated successors per node.
+    adj: Vec<Vec<usize>>,
+    /// `comp[v]`: v's strongly connected component. Components are numbered
+    /// in Tarjan's emission order, so every edge between two components goes
+    /// from a HIGHER number to a lower one.
+    comp: Vec<usize>,
+    comp_count: usize,
+}
+
+impl ClaimDigraph {
+    /// Build from `(from, to)` edges. Repeated pairs (two relationships on the
+    /// same claims) collapse to one edge.
+    fn new(edges: impl IntoIterator<Item = (Uuid, Uuid)>) -> Self {
+        let mut index: HashMap<Uuid, usize> = HashMap::new();
+        let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+        for (from, to) in edges {
+            let next = index.len();
+            let f = *index.entry(from).or_insert(next);
+            let next = index.len();
+            let t = *index.entry(to).or_insert(next);
+            pairs.insert((f, t));
+        }
+        let mut adj = vec![Vec::new(); index.len()];
+        for (f, t) in pairs {
+            adj[f].push(t);
+        }
+        let (comp, comp_count) = tarjan_scc(&adj);
+        Self {
+            index,
+            adj,
+            comp,
+            comp_count,
+        }
+    }
+
+    /// Whether any edge lies on a cycle: a component of two or more claims,
+    /// or a claim with an edge to itself. The schema forbids claim-to-claim
+    /// self-loops (`edges_no_self_loop`), so the second case cannot come from
+    /// the database; it keeps the graph type correct on its own.
+    fn has_cycle(&self) -> bool {
+        let mut size = vec![0usize; self.comp_count];
+        for &c in &self.comp {
+            size[c] += 1;
+        }
+        size.iter().any(|&n| n > 1) || self.adj.iter().enumerate().any(|(v, s)| s.contains(&v))
+    }
+
+    /// The longest chain of edges from `root`, counting each strongly
+    /// connected component as ONE step: exact on a DAG (where every component
+    /// is a single claim), and a well-defined, deterministic answer on a graph
+    /// with cycles, where the longest SIMPLE path is NP-hard. `0` when `root`
+    /// has no edges.
+    fn longest_chain_from(&self, root: Uuid) -> i32 {
+        let Some(&r) = self.index.get(&root) else {
+            return 0;
+        };
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); self.comp_count];
+        for (v, &c) in self.comp.iter().enumerate() {
+            members[c].push(v);
+        }
+        // Components in topological order are the descending numbers (see
+        // `comp`), so a component's chain length is final before any edge
+        // leaves it.
+        let mut chain: Vec<Option<i32>> = vec![None; self.comp_count];
+        chain[self.comp[r]] = Some(0);
+        let mut longest = 0;
+        for c in (0..self.comp_count).rev() {
+            let Some(here) = chain[c] else { continue };
+            longest = longest.max(here);
+            for &v in &members[c] {
+                for &w in &self.adj[v] {
+                    let cw = self.comp[w];
+                    if cw != c {
+                        let via = here.saturating_add(1);
+                        chain[cw] = Some(chain[cw].map_or(via, |x| x.max(via)));
+                    }
+                }
+            }
+        }
+        longest
+    }
+}
+
+/// Tarjan's strongly connected components, iteratively (a recursive form
+/// would recurse as deep as the longest chain). Returns each node's component
+/// and the component count; components are numbered in emission order, which
+/// is a reverse topological order of the condensation.
+fn tarjan_scc(adj: &[Vec<usize>]) -> (Vec<usize>, usize) {
+    const UNSEEN: usize = usize::MAX;
+    let n = adj.len();
+    let mut order = vec![UNSEEN; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut comp = vec![UNSEEN; n];
+    let mut stack: Vec<usize> = Vec::new();
+    // (node, index of its next successor to look at)
+    let mut calls: Vec<(usize, usize)> = Vec::new();
+    let mut next_order = 0usize;
+    let mut comp_count = 0usize;
+    for start in 0..n {
+        if order[start] != UNSEEN {
+            continue;
+        }
+        order[start] = next_order;
+        low[start] = next_order;
+        next_order += 1;
+        stack.push(start);
+        on_stack[start] = true;
+        calls.push((start, 0));
+        while let Some(&(v, i)) = calls.last() {
+            if let Some(&w) = adj[v].get(i) {
+                if let Some(top) = calls.last_mut() {
+                    top.1 += 1;
+                }
+                if order[w] == UNSEEN {
+                    order[w] = next_order;
+                    low[w] = next_order;
+                    next_order += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    calls.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(order[w]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(parent, _)) = calls.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == order[v] {
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    comp[w] = comp_count;
+                    if w == v {
+                        break;
+                    }
+                }
+                comp_count += 1;
+            }
+        }
+    }
+    (comp, comp_count)
+}
+
+/// Whether the `child -> parent_ids` links of a walk's returned claims
+/// contain a cycle: what [`LineageResult::cycle_detected`] reports. Every
+/// parent named is itself a returned claim (the parent-edge query constrains
+/// both ends to them), so this is a cycle among the returned claims.
+fn parent_links_have_cycle(parent_map: &HashMap<Uuid, Vec<Uuid>>) -> bool {
+    ClaimDigraph::new(
+        parent_map
+            .iter()
+            .flat_map(|(child, parents)| parents.iter().map(move |p| (*child, *p))),
+    )
+    .has_cycle()
 }
 
 // ============================================================================
@@ -516,15 +698,9 @@ impl LineageRepository {
         // the same rows as before and only `truncated` learns about the probe.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // Both of these describe the WALK, so they are measured before the
-        // node cap below trims it.
-        //
-        // `cycle_detected` is `false` by construction, as it always was: the
-        // path-enumerating walk computed it as `c.id = ANY(path)` on rows its
-        // own `NOT c.id = ANY(path)` guard had already excluded, so no row
-        // could set it. The deduplicated walk keeps no path to test against.
-        // `Self::detect_cycles` is the cycle check.
-        let cycle_detected = false;
+        // This describes the WALK, so it is measured before the node cap
+        // below trims it. `cycle_detected`, by contrast, describes the
+        // RETURNED claims and is computed from their `parent_ids` below.
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
         // Depth-based truncation is exact: the probe layer found a visible
@@ -563,9 +739,10 @@ impl LineageRepository {
 
         if claim_ids.is_empty() {
             // No row at all (an invisible or missing root) or a cap of zero:
-            // the walk's own measurements still stand.
+            // the walk's own measurements still stand, and no claim means no
+            // cycle.
             return Ok(LineageResult {
-                cycle_detected,
+                cycle_detected: false,
                 max_depth_reached,
                 truncated,
                 ..LineageResult::default()
@@ -609,6 +786,7 @@ impl LineageRepository {
             };
             parent_map.entry(child).or_default().push(parent);
         }
+        let cycle_detected = parent_links_have_cycle(&parent_map);
 
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
@@ -745,11 +923,26 @@ impl LineageRepository {
 
     /// Detect cycles in the lineage graph
     ///
-    /// Returns true if a cycle is detected, false otherwise.
-    /// Uses recursive CTE with path tracking to detect back edges.
+    /// Returns `true` iff the claims reachable from `claim_id` by walking its
+    /// ancestors over EVERY claim-to-claim edge (`target -> source`, any
+    /// relationship, unlike the derivation-only lineage walks) contain a
+    /// cycle, whether or not it passes through `claim_id`. Only claims and
+    /// edges the viewer can read take part, so an edge the viewer cannot read
+    /// can neither close a cycle nor be inferred from the answer.
+    ///
+    /// The walk is a breadth-first search with a visited set inside one
+    /// statement (as `get_ancestor_ids`), which also returns the edges among
+    /// the claims it reached; the cycle check is then a strongly connected
+    /// components pass in memory. Neither grows with the number of paths
+    /// (backlog c07884a9): the in-memory pass is linear in the claims and
+    /// edges reached, and the walk grows with layers times claims reached
+    /// (each layer row carries the visited set). There is no cap on claims
+    /// reached and every reached edge is loaded into memory; measure the plan
+    /// and add a cap before wiring this to a route. Claims more than 1000
+    /// shortest hops away are not examined (see `SHAPE_WALK_MAX_DEPTH`).
     ///
     /// # Arguments
-    /// * `pool` - Database connection pool
+    /// * `executor` - Database executor
     /// * `claim_id` - The claim to check for cycles from
     ///
     /// # Returns
@@ -763,58 +956,31 @@ impl LineageRepository {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct CycleResult {
-            has_cycle: Option<bool>,
-        }
-
-        // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
-        // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
-        // the walk. Marking only the anchor is the classic half-conversion: an
-        // invisible claim re-enters through the recursive arm and is returned
-        // in full, and `visibility_lint.rs` -- which checks that a marker is
-        // present, not where -- would not catch it.
-        let sql = viewer.splice(
-            r#"
-            WITH RECURSIVE lineage AS (
-                SELECT id, ARRAY[id] as path, false as has_cycle
-                FROM claims WHERE id = $1
-                  /* {VISIBILITY:claims} */
-
-                UNION ALL
-
-                SELECT c.id, l.path || c.id, c.id = ANY(l.path)
-                FROM claims c
-                JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-                JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
-                WHERE NOT l.has_cycle
-                  AND array_length(l.path, 1) < 1000
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
-            )
-            SELECT bool_or(has_cycle) as has_cycle FROM lineage
-            "#,
-            2,
-        );
-        let mut q = sqlx::query_as::<_, CycleResult>(&sql).bind(claim_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let result: CycleResult = q.fetch_one(executor).await?;
-
-        Ok(result.has_cycle.unwrap_or(false))
+        let graph = Self::ancestor_graph(executor, viewer, claim_id).await?;
+        Ok(graph.has_cycle())
     }
 
     /// Get the depth of a claim's lineage
     ///
-    /// Returns the maximum depth of ancestors from the given claim.
-    /// Useful for quick checks without fetching full lineage data.
+    /// Returns the length of the LONGEST chain of ancestors from the given
+    /// claim, walking every claim-to-claim edge (`target -> source`, any
+    /// relationship) the viewer can read. On a DAG that is the longest path;
+    /// on a graph with cycles each strongly connected component (each set of
+    /// claims that derive from one another) counts as ONE step, since the
+    /// longest simple path is NP-hard and the path-enumerating form that
+    /// computed it was exponential on a dense DAG (backlog c07884a9). Claims
+    /// more than 1000 shortest hops away are not examined, but a chain
+    /// reached within that bound counts in full, so the answer can exceed
+    /// 1000 (see `SHAPE_WALK_MAX_DEPTH`). Same cost and lack of a claim cap
+    /// as [`LineageRepository::detect_cycles`].
     ///
     /// # Arguments
-    /// * `pool` - Database connection pool
+    /// * `executor` - Database executor
     /// * `claim_id` - The claim to check depth for
     ///
     /// # Returns
-    /// * Maximum depth of ancestors (0 if claim has no parents)
+    /// * Length of the longest ancestor chain (0 if the claim has no parents,
+    ///   or is missing or unreadable)
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -824,45 +990,84 @@ impl LineageRepository {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<i32, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct DepthResult {
-            max_depth: Option<i32>,
-        }
+        let graph = Self::ancestor_graph(executor, viewer, claim_id).await?;
+        Ok(graph.longest_chain_from(claim_id))
+    }
 
+    /// The claims reachable from `claim_id` by walking ancestors over every
+    /// claim-to-claim edge, as a [`ClaimDigraph`] of the readable edges among
+    /// them, pointing `child -> parent` (the walk's direction). One statement.
+    async fn ancestor_graph<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<ClaimDigraph, DbError> {
         // RECURSIVE CTE. The predicate is on the ANCHOR term, on the
         // RECURSIVE term's `claims` alias, AND on the `edges` join that carries
         // the walk. Marking only the anchor is the classic half-conversion: an
         // invisible claim re-enters through the recursive arm and is returned
         // in full, and `visibility_lint.rs` -- which checks that a marker is
-        // present, not where -- would not catch it.
+        // present, not where -- would not catch it. The edge read after the
+        // walk is marked too: an edge the viewer cannot read must not close a
+        // cycle among claims it can.
         let sql = viewer.splice(
             r#"
-            WITH RECURSIVE lineage AS (
-                SELECT id, 0 as depth, ARRAY[id] as path
+            WITH RECURSIVE lineage(frontier, visited, depth) AS (
+                SELECT ARRAY[claims.id], ARRAY[claims.id], 0
                 FROM claims WHERE id = $1
                   /* {VISIBILITY:claims} */
 
+                -- One row per BFS layer; the next layer is the frontier's
+                -- parents minus every claim already visited (see the SQL
+                -- pattern on `get_lineage`), so a claim enters once and a
+                -- cycle ends the walk.
                 UNION ALL
 
-                SELECT c.id, l.depth + 1, l.path || c.id
-                FROM claims c
-                JOIN edges e ON e.source_id = c.id AND e.source_type = 'claim'
-                JOIN lineage l ON e.target_id = l.id AND e.target_type = 'claim'
-                WHERE NOT c.id = ANY(l.path)
-                  AND l.depth < 1000
-                  /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                SELECT nxt.ids, w.visited || nxt.ids, w.depth + 1
+                FROM lineage w
+                CROSS JOIN LATERAL (
+                    SELECT ARRAY(
+                        SELECT c.id
+                        FROM unnest(w.frontier) AS l(id)
+                        JOIN edges e ON e.target_id = l.id AND e.target_type = 'claim'
+                        JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
+                        WHERE true
+                          /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
+                        EXCEPT
+                        SELECT unnest(w.visited)
+                    ) AS ids
+                ) nxt
+                WHERE w.depth < $2
+                  AND cardinality(nxt.ids) > 0
+            ),
+            reached AS (
+                SELECT u.id
+                FROM lineage w
+                CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             )
-            SELECT MAX(depth) as max_depth FROM lineage
+            -- Every readable claim-to-claim edge with both ends reached, as
+            -- (child, parent): the edges the walk followed or found already
+            -- visited, and only those.
+            SELECT DISTINCT re.target_id AS source_id, re.source_id AS target_id
+            FROM edges re
+            JOIN reached child ON child.id = re.target_id
+            JOIN reached parent ON parent.id = re.source_id
+            WHERE re.source_type = 'claim'
+              AND re.target_type = 'claim'
+              /* {EDGE_VISIBILITY:re} */
             "#,
-            2,
+            3,
         );
-        let mut q = sqlx::query_as::<_, DepthResult>(&sql).bind(claim_id);
+        let mut q = sqlx::query_as::<_, EdgeQueryRow>(&sql)
+            .bind(claim_id)
+            .bind(SHAPE_WALK_MAX_DEPTH);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let result: DepthResult = q.fetch_one(executor).await?;
-
-        Ok(result.max_depth.unwrap_or(0))
+        let edges: Vec<EdgeQueryRow> = q.fetch_all(executor).await?;
+        Ok(ClaimDigraph::new(
+            edges.into_iter().map(|e| (e.source_id, e.target_id)),
+        ))
     }
 
     /// Get ancestor claim IDs only (without full data)
@@ -1107,8 +1312,6 @@ impl LineageRepository {
         // The probe layer goes first, as in `get_lineage_conn`.
         let (lineage_rows, truncated_by_depth) = drop_probe_layer(lineage_rows, max_depth);
 
-        // `false` by construction, as in `get_lineage_conn`.
-        let cycle_detected = false;
         let max_depth_reached = lineage_rows.iter().map(|r| r.depth).max().unwrap_or(0);
 
         // Collect claim IDs for subsequent queries
@@ -1145,6 +1348,7 @@ impl LineageRepository {
                 .or_default()
                 .push(edge.source_id);
         }
+        let cycle_detected = parent_links_have_cycle(&parent_map);
 
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
@@ -1514,6 +1718,88 @@ impl LineageRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `n` fresh ids, so a test can name nodes by index.
+    fn ids(n: usize) -> Vec<Uuid> {
+        (0..n).map(|_| Uuid::new_v4()).collect()
+    }
+
+    fn graph(v: &[Uuid], edges: &[(usize, usize)]) -> ClaimDigraph {
+        ClaimDigraph::new(edges.iter().map(|&(f, t)| (v[f], v[t])))
+    }
+
+    #[test]
+    fn digraph_dag_has_no_cycle_and_its_longest_chain() {
+        // 0 -> 1 -> 2 -> 3 plus the shortcut 0 -> 3 and a diamond 0 -> 4 -> 3.
+        let v = ids(5);
+        let g = graph(&v, &[(0, 1), (1, 2), (2, 3), (0, 3), (0, 4), (4, 3)]);
+        assert!(!g.has_cycle(), "a diamond and a shortcut are not cycles");
+        assert_eq!(g.longest_chain_from(v[0]), 3, "past the shortcut");
+        assert_eq!(g.longest_chain_from(v[1]), 2);
+        assert_eq!(g.longest_chain_from(v[3]), 0, "a sink");
+        assert_eq!(g.longest_chain_from(Uuid::new_v4()), 0, "not in the graph");
+    }
+
+    #[test]
+    fn digraph_repeated_edge_counts_once() {
+        let v = ids(2);
+        let g = graph(&v, &[(0, 1), (0, 1), (0, 1)]);
+        assert!(!g.has_cycle());
+        assert_eq!(g.longest_chain_from(v[0]), 1);
+    }
+
+    #[test]
+    fn digraph_self_loop_is_a_cycle() {
+        let v = ids(2);
+        let g = graph(&v, &[(0, 1), (1, 1)]);
+        assert!(g.has_cycle());
+        assert_eq!(g.longest_chain_from(v[0]), 1, "the loop adds no step");
+    }
+
+    #[test]
+    fn digraph_cycle_away_from_the_root_is_found_and_counted_once() {
+        // 0 -> 1 -> {2 <-> 3 -> 4 -> 2} -> 5, and 3 -> 5 as a second exit.
+        let v = ids(6);
+        let g = graph(
+            &v,
+            &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 2), (4, 5), (3, 5)],
+        );
+        assert!(g.has_cycle());
+        assert_eq!(
+            g.longest_chain_from(v[0]),
+            3,
+            "0, 1, the component {{2, 3, 4}}, 5"
+        );
+        assert_eq!(g.longest_chain_from(v[5]), 0);
+    }
+
+    #[test]
+    fn digraph_long_chain_does_not_recurse() {
+        // A recursive SCC pass would overflow the stack on a long chain.
+        let v = ids(200_000);
+        let edges: Vec<(usize, usize)> = (0..v.len() - 1).map(|i| (i, i + 1)).collect();
+        let g = graph(&v, &edges);
+        assert!(!g.has_cycle());
+        assert_eq!(g.longest_chain_from(v[0]), 199_999);
+        // Close it into a ring: one component, no step.
+        let mut ring = edges;
+        ring.push((v.len() - 1, 0));
+        let g = graph(&v, &ring);
+        assert!(g.has_cycle());
+        assert_eq!(g.longest_chain_from(v[0]), 0);
+    }
+
+    #[test]
+    fn parent_links_cycle_follows_the_links() {
+        let v = ids(3);
+        let mut links: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        links.insert(v[0], vec![v[1], v[2]]);
+        links.insert(v[1], vec![v[2]]);
+        assert!(!parent_links_have_cycle(&links));
+        links.insert(v[2], vec![v[0]]);
+        assert!(parent_links_have_cycle(&links));
+        assert!(!parent_links_have_cycle(&HashMap::new()));
+    }
 
     /// Create a test agent in the database and return its UUID.
     async fn create_test_agent(pool: &PgPool) -> Uuid {
