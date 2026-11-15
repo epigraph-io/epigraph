@@ -146,6 +146,8 @@ fn base_params() -> ClaimQueryParams {
         content_contains: None,
         methodology: None,
         evidence_type: None,
+        theme_id: None,
+        include_links: None,
     }
 }
 
@@ -551,4 +553,192 @@ fn methodology_params() -> ClaimQueryParams {
         methodology: Some("deductive".to_string()),
         ..base_params()
     }
+}
+
+/// A `claim_themes` row; returns its id.
+async fn seed_theme(pool: &PgPool, label: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO claim_themes (label) VALUES ($1) RETURNING id")
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("seed theme")
+}
+
+/// Assign `claim` to `theme` and give it a creation time `minutes` after a
+/// fixed instant, so date order is the fixture's and not the insert's.
+async fn place(pool: &PgPool, claim: Uuid, theme: Option<Uuid>, minutes: i32) {
+    sqlx::query(
+        "UPDATE claims SET theme_id = $2, \
+                created_at = '2026-01-01T00:00:00Z'::timestamptz + make_interval(mins => $3) \
+          WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(theme)
+    .bind(minutes)
+    .execute(pool)
+    .await
+    .expect("place the claim");
+}
+
+/// Backlog ea26d7aa: a theme's claims in date order with the links among them,
+/// which is what a timeline of a theme needs.
+///
+/// * `theme_id` selects the theme's claims the viewer may read: the viewer's
+///   own group claim is there, a stranger's group claim in the same theme is
+///   not, and `total` counts what was selectable.
+/// * `include_links=true` returns the in-force epistemic edges between two
+///   claims ON THE PAGE that the viewer may read. An edge to a claim outside
+///   the page, an edge private to another group between two readable claims, a
+///   retracted edge and a structural (non-epistemic) edge are all absent.
+/// * without `include_links` there is no `links` key at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_themes_claims_come_in_date_order_with_the_links_among_them(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "cq-theme-mine").await;
+    let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-theme-theirs").await;
+    let theme = seed_theme(&pool, "timeline theme").await;
+    let other_theme = seed_theme(&pool, "another theme").await;
+
+    let first = viewer_fixture::seed_public_claim(&pool, agent, "theme: first, public").await;
+    let second = seed_group_claim(&pool, agent, group, "theme: second, mine").await;
+    let third = viewer_fixture::seed_public_claim(&pool, stranger, "theme: third, public").await;
+    let hidden = seed_group_claim(&pool, stranger, stranger_group, "theme: hidden, theirs").await;
+    let elsewhere = viewer_fixture::seed_public_claim(&pool, agent, "other theme, public").await;
+    place(&pool, first, Some(theme), 1).await;
+    place(&pool, second, Some(theme), 2).await;
+    place(&pool, third, Some(theme), 3).await;
+    place(&pool, hidden, Some(theme), 4).await;
+    place(&pool, elsewhere, Some(other_theme), 5).await;
+
+    // On the page and readable: these two are the answer.
+    let supports = viewer_fixture::seed_edge(&pool, first, third).await;
+    let refutes: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'REFUTES') RETURNING id",
+    )
+    .bind(third)
+    .bind(second)
+    .fetch_one(&pool)
+    .await
+    .expect("upper-case refutes edge");
+    // Absent, each for its own reason.
+    let _to_outside_page = viewer_fixture::seed_edge(&pool, first, elsewhere).await;
+    let _private_to_strangers =
+        viewer_fixture::seed_edge_owned_by(&pool, third, first, "group", stranger_group).await;
+    let retracted = viewer_fixture::seed_edge(&pool, second, first).await;
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 hour' WHERE id = $1")
+        .bind(retracted)
+        .execute(&pool)
+        .await
+        .expect("retract");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
+    )
+    .bind(first)
+    .bind(second)
+    .execute(&pool)
+    .await
+    .expect("structural edge");
+
+    let state = split_state(&pool).await;
+    let out = list(
+        &pool,
+        state.clone(),
+        agent,
+        ClaimQueryParams {
+            theme_id: Some(theme),
+            include_links: Some(true),
+            sort_by: Some("created_at".to_string()),
+            sort_order: Some("asc".to_string()),
+            ..base_params()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        ids(&out),
+        vec![first, second, third],
+        "the theme's readable claims, oldest first; the stranger's group claim and the \
+         other theme's claim are absent"
+    );
+    assert_eq!(out.total, 3, "total counts the same selectable set");
+    let mut links: Vec<(Uuid, Uuid, Uuid, String)> = out
+        .links
+        .expect("include_links=true returns a links list")
+        .into_iter()
+        .map(|l| (l.id, l.source_id, l.target_id, l.relationship))
+        .collect();
+    links.sort();
+    let mut want = vec![
+        (supports, first, third, "supports".to_string()),
+        (refutes, third, second, "refutes".to_string()),
+    ];
+    want.sort();
+    assert_eq!(
+        links, want,
+        "exactly the in-force epistemic edges between two claims on the page that the \
+         viewer may read, relationship lower-cased"
+    );
+    assert_eq!(out.links_truncated, Some(false));
+
+    // A stranger reads its own group claim and not the viewer's; the link that
+    // is private to its group is now on its page.
+    let theirs = list(
+        &pool,
+        state.clone(),
+        stranger,
+        ClaimQueryParams {
+            theme_id: Some(theme),
+            include_links: Some(true),
+            sort_by: Some("created_at".to_string()),
+            sort_order: Some("asc".to_string()),
+            ..base_params()
+        },
+    )
+    .await;
+    assert_eq!(ids(&theirs), vec![first, third, hidden]);
+    let their_pairs: Vec<(Uuid, Uuid)> = theirs
+        .links
+        .expect("links")
+        .into_iter()
+        .map(|l| (l.source_id, l.target_id))
+        .collect();
+    assert!(their_pairs.contains(&(first, third)), "{their_pairs:?}");
+    assert!(
+        their_pairs.contains(&(third, first)),
+        "the edge private to the stranger's group is readable by the stranger: {their_pairs:?}"
+    );
+    assert!(
+        !their_pairs
+            .iter()
+            .any(|(s, t)| *s == second || *t == second),
+        "no link names a claim the stranger cannot read: {their_pairs:?}"
+    );
+
+    // Without the flag there is no links key; an unknown theme selects nothing.
+    let plain = list(
+        &pool,
+        state.clone(),
+        agent,
+        ClaimQueryParams {
+            theme_id: Some(theme),
+            ..base_params()
+        },
+    )
+    .await;
+    assert!(plain.links.is_none() && plain.links_truncated.is_none());
+    let unknown = list(
+        &pool,
+        state,
+        agent,
+        ClaimQueryParams {
+            theme_id: Some(Uuid::new_v4()),
+            include_links: Some(true),
+            ..base_params()
+        },
+    )
+    .await;
+    assert!(ids(&unknown).is_empty());
+    assert_eq!(unknown.total, 0);
+    assert_eq!(unknown.links.map(|l| l.len()), Some(0));
 }
