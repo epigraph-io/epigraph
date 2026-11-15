@@ -3073,6 +3073,9 @@ pub async fn query_undecomposed_claims(
         .map(|c| {
             let id = c.id.as_uuid();
             let looks_atomic = epigraph_core::atomicity::looks_atomic(&c.content);
+            // Advisory conjunct count (backlog `72850d43`): reported next to
+            // `looks_atomic`, never used to filter or to override it.
+            let conjuncts = epigraph_core::atomicity::conjunct_estimate(&c.content);
             let claim = ClaimResponse {
                 id: id.to_string(),
                 content: c.content.clone(),
@@ -3092,6 +3095,8 @@ pub async fn query_undecomposed_claims(
             crate::types::UndecomposedClaimResponse {
                 claim,
                 looks_atomic,
+                conjunct_estimate: conjuncts.count,
+                conjunct_signals: conjuncts.signals,
             }
         })
         .collect();

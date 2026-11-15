@@ -155,21 +155,24 @@ pub async fn scoped_pool_with_mode(pool: &PgPool, mode: SessionGucMode) -> Scope
 /// bug. (`grant_app_privileges` exists for the `tenancy_required.rs` fixtures,
 /// which run before 077's grants are in play.)
 ///
-/// Seeding, and `Viewer::resolve`, must still run on the ORIGINAL superuser
-/// pool: `Viewer::resolve` reads `group_memberships`, and on a downgraded
-/// unstamped session it resolves to an EMPTY group set — which would make every
-/// assertion keyed on that viewer pass for the wrong reason.
+/// Seeding must still run on the ORIGINAL superuser pool.
 ///
-/// **That warning is now load-bearing in five crates, not two.** Until the
-/// fixture was collapsed onto one body this helper existed only in the
-/// `epigraph-api` and `epigraph-db` copies, and the pairing hazard was contained
-/// by convention in `epigraph-db/tests/privatization_authz.rs` and
-/// `privatization_plan_policies.rs`, whose own headers spell it out.
-/// `epigraph-cli`, `epigraph-engine` and `epigraph-mcp` can now reach it too,
-/// with no such header. Nothing detects the wrong pairing —
-/// `viewer_fixture_single_source.rs` ratchets against a second COPY, not against
-/// a misuse — so a `resolve` on this pool is a silent, permanently green
-/// "a stranger cannot read this". Resolve first, downgrade second.
+/// **`Viewer::resolve` on this pool is sound, and a test pins it.**
+/// `Viewer::resolve` reads memberships through migration 077's SECURITY
+/// DEFINER `epigraph_live_memberships(uuid)` (re-stated by 164), owned by
+/// `epigraph_maintenance` and granted to `epigraph_app`, so a resolve on a
+/// downgraded, unstamped session sees exactly what the superuser pool sees.
+/// `downgraded_pool_viewer_resolve.rs` asserts that equality for both roles
+/// this helper is used with (admin, writer, reader and revoked memberships),
+/// and goes red if the resolve is ever routed through a policed read. This
+/// helper is reachable from five crates' test trees, so that test is the
+/// control for all of them.
+///
+/// **What IS blind on this pool is a DIRECT read of `group_memberships` or
+/// `groups`.** Both tables are policed, and on an unstamped `epigraph_app`
+/// session they return nothing (`author_stamped_write_loop.rs` measures both).
+/// A test that derives a membership or a group id from such a read, rather
+/// than from `Viewer::resolve` or the superuser pool, asserts against nothing.
 pub async fn downgraded_pool(pool: &PgPool, role: &str) -> PgPool {
     use sqlx::Executor;
     let url = database_url_for(pool).await;
@@ -889,14 +892,15 @@ pub async fn seed_group(pool: &PgPool) -> Uuid {
 ///
 /// # Why `SET SESSION AUTHORIZATION` and not `SET ROLE`
 ///
-/// Migration 074's seed escape hatch is
-/// `pg_has_role(session_user, 'epigraph_seed', 'MEMBER')`, keyed on
-/// `session_user` and not `current_user` because inside a `SECURITY DEFINER`
+/// Migration 074's seed escape hatch is keyed on `session_user` (since
+/// migration 216, `epigraph_session_is_seed()`: an explicit grant of
+/// `epigraph_seed`; before it, `pg_has_role(session_user, 'epigraph_seed',
+/// 'MEMBER')`), not on `current_user`, because inside a `SECURITY DEFINER`
 /// frame `current_user` is the function owner. `SET ROLE` changes only
 /// `current_user`, so **it does not reach the arm at all** — measured: an
 /// undeclared `INSERT INTO claims` under `SET ROLE epigraph_app` still takes
-/// arm 4 and succeeds, because the session is still the superuser the test
-/// harness connected as.
+/// arm 4 and succeeds, because the session is still the harness role the test
+/// connected as.
 ///
 /// `SET SESSION AUTHORIZATION` changes both, is available to a superuser, and
 /// is the only way a test on this harness can produce the `23502` that
