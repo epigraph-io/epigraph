@@ -11115,17 +11115,15 @@ impl ClaimRepository {
 mod label_tests {
     use super::*;
 
-    /// Helper: create a test claim and return (pool, claim_id, agent_id) for cleanup.
-    async fn setup_test_claim() -> (sqlx::PgPool, Uuid, Uuid) {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let pool = sqlx::PgPool::connect(&url).await.unwrap();
-
+    /// Helper: create a test claim in the test's own database and return
+    /// (claim_id, agent_id).
+    async fn setup_test_claim(pool: &sqlx::PgPool) -> (Uuid, Uuid) {
         let agent_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO agents (public_key, display_name, agent_type, labels)
              VALUES (sha256(gen_random_uuid()::text::bytea), 'label-test', 'system', ARRAY['test'])
              RETURNING id",
         )
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
 
@@ -11135,41 +11133,27 @@ mod label_tests {
              RETURNING id",
         )
         .bind(agent_id)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .unwrap();
 
-        (pool, claim_id, agent_id)
+        (claim_id, agent_id)
     }
 
-    async fn cleanup(pool: &sqlx::PgPool, claim_id: Uuid, agent_id: Uuid) {
-        let _ = sqlx::query("DELETE FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
-            .bind(agent_id)
-            .execute(pool)
-            .await;
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_add() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_add(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         let labels =
             ClaimRepository::update_labels(&pool, claim_id, &["foo".into(), "bar".into()], &[])
                 .await
                 .unwrap();
         assert!(labels.contains(&"foo".to_string()));
         assert!(labels.contains(&"bar".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_remove() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_remove(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["a".into(), "b".into(), "c".into()], &[])
             .await
             .unwrap();
@@ -11179,13 +11163,11 @@ mod label_tests {
         assert!(labels.contains(&"a".to_string()));
         assert!(!labels.contains(&"b".to_string()));
         assert!(labels.contains(&"c".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_atomic_add_remove() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_atomic_add_remove(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["x".into(), "y".into()], &[])
             .await
             .unwrap();
@@ -11195,13 +11177,11 @@ mod label_tests {
         assert!(!labels.contains(&"x".to_string()));
         assert!(labels.contains(&"y".to_string()));
         assert!(labels.contains(&"z".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_idempotent_add() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_idempotent_add(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["dup".into()], &[])
             .await
             .unwrap();
@@ -11209,27 +11189,23 @@ mod label_tests {
             .await
             .unwrap();
         assert_eq!(labels.iter().filter(|l| l.as_str() == "dup").count(), 1);
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_idempotent_remove() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_idempotent_remove(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         // Remove a label that was never added — should not error
         let labels = ClaimRepository::update_labels(&pool, claim_id, &[], &["nonexistent".into()])
             .await
             .unwrap();
         assert!(labels.is_empty() || !labels.contains(&"nonexistent".to_string()));
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
     // ── list_by_labels tests ──
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_happy_path() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_happy_path(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["backlog".into(), "pending".into()], &[])
             .await
             .unwrap();
@@ -11263,14 +11239,11 @@ mod label_tests {
             results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should find claim by ALL labels"
         );
-
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_no_match() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_no_match(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         ClaimRepository::update_labels(&pool, claim_id, &["backlog".into()], &[])
             .await
             .unwrap();
@@ -11289,14 +11262,11 @@ mod label_tests {
             !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should not match unrelated label"
         );
-
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_min_truth_filter() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_min_truth_filter(pool: sqlx::PgPool) {
+        let (claim_id, _agent_id) = setup_test_claim(&pool).await;
         // Default truth_value from setup is 0.5
         ClaimRepository::update_labels(&pool, claim_id, &["truth-test".into()], &[])
             .await
@@ -11333,16 +11303,13 @@ mod label_tests {
             !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 < 0.9 should not match"
         );
-
-        cleanup(&pool, claim_id, agent_id).await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_list_by_labels_respects_limit() {
-        let (pool, _, agent_id) = setup_test_claim().await;
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_list_by_labels_respects_limit(pool: sqlx::PgPool) {
+        let (_, agent_id) = setup_test_claim(&pool).await;
         // Create a second claim with the same label
-        let claim_id_2 = sqlx::query_scalar::<_, Uuid>(
+        let _claim_id_2 = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO claims (content, content_hash, truth_value, agent_id, labels)
              VALUES ('limit test 2', sha256('limit-test-2'::bytea), 0.5, $1, ARRAY['limit-test'])
              RETURNING id",
@@ -11352,7 +11319,7 @@ mod label_tests {
         .await
         .unwrap();
 
-        let claim_id_1 = sqlx::query_scalar::<_, Uuid>(
+        let _claim_id_1 = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO claims (content, content_hash, truth_value, agent_id, labels)
              VALUES ('limit test 1', sha256('limit-test-1'::bytea), 0.5, $1, ARRAY['limit-test'])
              RETURNING id",
@@ -11374,23 +11341,10 @@ mod label_tests {
         .await
         .unwrap();
         assert_eq!(results.len(), 1, "limit=1 should return exactly 1 result");
-
-        // cleanup
-        let _ = sqlx::query("DELETE FROM claims WHERE id = ANY($1)")
-            .bind([claim_id_1, claim_id_2])
-            .execute(&pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM agents WHERE id = $1")
-            .bind(agent_id)
-            .execute(&pool)
-            .await;
     }
 
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn test_update_labels_not_found() {
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
-        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn test_update_labels_not_found(pool: sqlx::PgPool) {
         let fake_id = Uuid::new_v4();
         let result = ClaimRepository::update_labels(&pool, fake_id, &["x".into()], &[]).await;
         assert!(result.is_err());
@@ -11405,7 +11359,7 @@ mod label_tests {
 
     // The two unexpanded-shell-variable regression tests that used to live here
     // moved to `crates/epigraph-db/tests/label_shell_variable_repo.rs`. Reason:
-    // every test in this module is `#[ignore]` (live-DB convention), so
+    // this module's tests were `#[ignore]` (live-DB convention) then, so
     // `cargo test -p epigraph-db` skipped the headline regression test for
     // backlog f6310444. The new file uses `#[sqlx::test]` and runs in the gate.
 
