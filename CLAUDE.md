@@ -428,14 +428,23 @@ security(crypto): use constant-time comparison in signature verification
 ## Commit-message lint (this repository)
 
 CI (`.github/scripts/commit-message-lint.py`, job `Commit message lint`) reads
-only the non-merge commits a change adds, and refuses three things: an e-mail
-address outside a trailer (placeholder domains and `noreply@anthropic.com`
-excepted); a home-directory path (`/home/<name>/`, `/Users/<name>/`) whose name
-is not generic (`user`, `runner`, `dev`, `you`, `me`, `USER`); and a wildcard-DNS
-host that encodes an address, or a bare public IPv4 outside the documentation,
-loopback and private ranges. It only warns about a Verification section that
-says "Not run", "CI to confirm" or "to be run", a subject outside
-`<type>(<scope>): <text>`, and a message with none of the three sections. A
-commit whose Verification records something that was not run should say so with
-a line starting `Unverified:`, which silences that warning. Output is redacted,
-never the offending value.
+only the non-merge commits a change adds. It refuses:
+
+- **E1** an e-mail address outside a trailer (placeholder domains and
+  `noreply@anthropic.com` excepted; `role@<IPv4>` in a connection string is not
+  an address);
+- **E2** a home-directory path (`/home/<name>/`, `/Users/<name>/`) whose name is
+  not generic (`user`, `runner`, `dev`, `you`, `me`, `USER`);
+- **E3** a wildcard-DNS host that encodes an address, or a bare public IPv4
+  outside the documentation, loopback and private ranges;
+- **E4** a Verification section that says "Not run", "CI to confirm" or "to be
+  run" when the message has no line starting `Unverified:`. Record what was not
+  run on an `Unverified:` line; that is the only thing that clears E4;
+- **E5** a change inside a `SECURITY DEFINER` function (any `*.sql` hunk inside a
+  `CREATE FUNCTION` statement that carries the attribute) whose Verification
+  records no run, or which has no Verification section. `Unverified:` does NOT
+  clear E5: a later commit in the same change that names the first commit's sha
+  (7+ characters) next to the test result does.
+It only warns about a subject outside `<type>(<scope>): <text>` (W2) and a
+message with none of the three sections (W3). Output is redacted, never the
+offending value.

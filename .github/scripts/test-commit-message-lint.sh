@@ -3,9 +3,10 @@
 #
 # Builds a throwaway git repository, commits messages with known-bad and
 # known-good content (all synthetic) and asserts that:
-#   1. errors   — E1 e-mail, E2 home path, E3 wildcard-DNS host and E3 public
-#                 IPv4 each exit 1 and name their class;
-#   2. warnings — W1, W2, W3 are reported and exit 0;
+#   1. errors   — E1 e-mail, E2 home path, E3 wildcard-DNS host, E3 public
+#                 IPv4, E4 an unrun Verification without `Unverified:`, E5 an
+#                 unrun change to a SECURITY DEFINER function each exit 1 and name their class;
+#   2. warnings — W2, W3 are reported and exit 0;
 #   3. allowed  — trailers, example.com, /home/user/, documentation, private
 #                 and loopback addresses, and a clean protocol message pass
 #                 with no finding at all;
@@ -69,10 +70,48 @@ check "E2 macOS home path"       1 "feat(x): t$good_body"$'\n\nsee /Users/bob/sr
 check "E3 wildcard-DNS host"     1 "feat(x): t$good_body"$'\n\nhost https://'"$bad_host" E3 "$bad_host"
 check "E3 public IPv4"           1 "feat(x): t$good_body"$'\n\nat '"$bad_ip" E3 "$bad_ip"
 
+check "E4 Verification not run"  1 "feat(x): t"$'\n\n**Evidence:**\n- e\n\n**Verification:**\n- Not run' E4 -
+check "E4 CI to confirm"         1 "feat(x): t"$'\n\n**Verification:**\n- CI to confirm' E4 -
+check "E4 silenced by Unverified" 0 "feat(x): t"$'\n\n**Verification:**\n- Not run\n\nUnverified: tests not run here' - -
+check "ok not-run outside Verification" 0 "feat(x): t"$'\n\n**Evidence:**\n- the job was not run before\n\n**Reasoning:**\n- r\n\n**Verification:**\n- cargo test passes' - -
+
+# E5: a change inside a SECURITY DEFINER function with an unrun Verification.
+# file_commit <path> <content> <message>: commit one file.
+file_commit() {
+  printf '%s\n' "$2" > "$r/$1"
+  git -C "$r" add "$1"
+  git -C "$r" -c user.name=ci -c user.email=ci@example.invalid commit -q -m "$3"
+}
+definer=$'CREATE OR REPLACE FUNCTION f() RETURNS int\nLANGUAGE sql SECURITY DEFINER\nAS $$ SELECT 1 $$;'
+invoker=$'CREATE OR REPLACE FUNCTION g() RETURNS int\nLANGUAGE sql\nAS $$ SELECT 1 $$;'
+notrun=$'\n\n**Verification:**\n- Not run\n\nUnverified: no database here'
+# check_range <name> <want rc> <base> <class|->: lint base..HEAD.
+check_range() {
+  local name=$1 want=$2 base=$3 class=$4 rc=0 out ok=1
+  out=$(cd "$r" && python3 "$lint" "$base" HEAD 2>&1) || rc=$?
+  [[ $rc == "$want" ]] || { echo "FAIL - $name: want rc=$want, got rc=$rc"; ok=0; }
+  if [[ $class == - ]]; then
+    grep -Eq '^error ' <<<"$out" && { echo "FAIL - $name: unexpected error"; ok=0; }
+  else
+    grep -q " $class " <<<"$out" || { echo "FAIL - $name: class $class not reported"; ok=0; }
+  fi
+  if ((ok)); then echo "ok   - $name"; else sed 's/^/       | /' <<<"$out"; failures=$((failures + 1)); fi
+}
+file_commit d.sql "$invoker" "chore(db): base$good_body"
+b0=$(git -C "$r" rev-parse HEAD)
+file_commit d.sql "$definer" "fix(db): definer$notrun"
+check_range "E5 definer change, Unverified does not silence" 1 "$b0" E5
+b1=$(git -C "$r" rev-parse HEAD)
+file_commit d.sql "$definer"$'\n-- comment' "test(db): run it"$'\n\n**Verification:**\n- cites '"${b1:0:7}"$': cargo test definer_test 3 passed'
+check_range "E5 silenced by a later commit citing the sha" 0 "$b0" -
+b2=$(git -C "$r" rev-parse HEAD)
+file_commit e.sql "$invoker"$'\n-- changed' "fix(db): invoker only$notrun"
+check_range "ok invoker function change with Unverified" 0 "$b2" -
+b3=$(git -C "$r" rev-parse HEAD)
+file_commit d.sql "$definer"$'\n-- comment\n-- more' "fix(db): definer, ran tests$good_body"
+check_range "ok definer change with a recorded run" 0 "$b3" -
+
 # --- warnings (exit 0) -------------------------------------------------------
-check "W1 Verification not run"  0 "feat(x): t"$'\n\n**Evidence:**\n- e\n\n**Verification:**\n- Not run' W1 -
-check "W1 CI to confirm"         0 "feat(x): t"$'\n\n**Verification:**\n- CI to confirm' W1 -
-check "W1 silenced by Unverified" 0 "feat(x): t"$'\n\n**Verification:**\n- Not run\n\nUnverified: tests not run here' - -
 check "W2 bad subject"           0 "did some stuff$good_body" W2 -
 check "W3 no sections"           0 "fix(x): plain message" W3 -
 
