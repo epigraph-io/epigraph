@@ -1389,7 +1389,7 @@ mod tests {
     // module (`--no-run`) so it cannot rot into compile errors again, but its
     // tests are not executed: in the not(db) arm `supersede_claim` and
     // `claim_history` are 503 stubs, so the in-memory supersession these tests
-    // exercise no longer exists there. PR-03's `OK -> UNAUTHORIZED` flips
+    // exercise no longer exists there. The `OK -> UNAUTHORIZED` flips
     // inside it are DOCUMENTATION of the intended behaviour;
     // `tests/public_router_allowlist.rs` is what asserts it, by probing every
     // route on the buildable variant's `protected` chain.
@@ -2058,7 +2058,7 @@ mod tests {
     // module (`--no-run`) so it cannot rot into compile errors again, but its
     // tests are not executed: in the not(db) arm `supersede_claim` and
     // `claim_history` are 503 stubs, so the in-memory supersession these tests
-    // exercise no longer exists there. PR-03's `OK -> UNAUTHORIZED` flips
+    // exercise no longer exists there. The `OK -> UNAUTHORIZED` flips
     // inside it are DOCUMENTATION of the intended behaviour;
     // `tests/public_router_allowlist.rs` is what asserts it, by probing every
     // route on the buildable variant's `protected` chain.

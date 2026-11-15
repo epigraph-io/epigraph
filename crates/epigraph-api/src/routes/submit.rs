@@ -2364,7 +2364,7 @@ mod tests {
     }
 }
 
-/// PR-06: `ViewerExtractor` requires an `AuthContext` on the request, which
+/// `ViewerExtractor` requires an `AuthContext` on the request, which
 /// the bearer middleware installs in production. Test routers built from a
 /// bare `Router::new()` carry none, so they 401 before reaching the handler.
 ///

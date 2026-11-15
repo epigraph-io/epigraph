@@ -519,9 +519,9 @@ jobs:
         # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
         # integration-test targets link Postgres regardless of the feature
         # flag. Every bin, `server` included, declares required-features =
-        # ["db"] (ruling R-39: not(db) is check-only), so in practice this
-        # checks the library. The library's own unit-test target is compiled
-        # separately, by "No-db lib-test build check" in `lint-features`.
+        # ["db"], so in practice this checks the library. The library's own
+        # unit-test target is compiled separately, by "No-db lib-test build
+        # check" in `lint-features`.
         run: cargo check -p epigraph-api --no-default-features --locked
 
   # The feature-gated checks, on their own runner. They used to follow Clippy
