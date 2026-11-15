@@ -205,8 +205,8 @@ pub use repos::conflict_density::{ConflictDensityRepository, FrameConflictDensit
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
 pub use repos::edge::{
-    AttributedClaimRow, BbaCleanup, EdgeRefusal, EdgeRow, EdgeWithdrawal, SymmetricEdgeUpsert,
-    WithdrawnEdgeBbas, EDGE_RETRACT_DEFERRAL_REASON, EPISTEMIC_RELATIONSHIPS,
+    AttributedClaimRow, BbaCleanup, ClaimLinkRow, EdgeRefusal, EdgeRow, EdgeWithdrawal,
+    SymmetricEdgeUpsert, WithdrawnEdgeBbas, EDGE_RETRACT_DEFERRAL_REASON, EPISTEMIC_RELATIONSHIPS,
 };
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
