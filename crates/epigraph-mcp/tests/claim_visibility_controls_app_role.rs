@@ -221,7 +221,7 @@ async fn derived_tenancy(pool: &PgPool, claim: Uuid) -> Vec<(String, Uuid)> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_default_write_lands_in_the_team_and_only_members_read_it(pool: PgPool) {
     let s = app_role(&pool).await;
-    let t = team(&pool, "nanodynamics").await;
+    let t = team(&pool, "acme-team").await;
     let (alice, _) = fixture::seed_agent_with_group(&pool, "vis-alice").await;
     let (bob, _) = fixture::seed_agent_with_group(&pool, "vis-bob").await;
     let (carol, _) = fixture::seed_agent_with_group(&pool, "vis-carol").await;

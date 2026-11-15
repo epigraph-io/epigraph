@@ -6,7 +6,7 @@
 use crate::matching::blocker::{
     compound_nbhd::CompoundNbhdBlocker, content_hash_prefix::ContentHashBlocker,
     embedding_ann::EmbeddingAnnBlocker, shared_triple::SharedTripleBlocker,
-    theme_cluster::ThemeClusterBlocker, union_block, Blocker,
+    theme_cluster::ThemeClusterBlocker, union_block_with_stats, Blocker,
 };
 use crate::matching::calibration::MatcherConfig;
 use crate::matching::policy::{Policy, PolicyAction};
@@ -26,6 +26,15 @@ pub struct RunInputs {
 #[derive(Debug, Clone)]
 pub struct RunReport {
     pub run_id: Uuid,
+    /// Distinct pairs the blockers retrieved, before any filter (recall
+    /// stage). `retrieved_pairs == ineligible_dropped + same_source_dropped +
+    /// scanned_pairs`.
+    pub retrieved_pairs: usize,
+    /// Retrieved pairs dropped because an endpoint is non-substantive.
+    pub ineligible_dropped: usize,
+    /// Retrieved pairs dropped by the structural same-source filter.
+    pub same_source_dropped: usize,
+    /// Pairs that survived the recall-stage filters and were scored.
     pub scanned_pairs: usize,
     pub promoted: usize,
     /// Candidates staged as `pending` for human review (`auto_promote=false`).
@@ -64,7 +73,7 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
         Box::new(SharedTripleBlocker::new(fan_out)),
         Box::new(ContentHashBlocker),
     ];
-    let pairs = union_block(
+    let (pairs, block_stats) = union_block_with_stats(
         pool,
         &blockers,
         &inputs.seeds,
@@ -176,6 +185,9 @@ pub async fn run_pipeline(pool: &PgPool, inputs: RunInputs) -> anyhow::Result<Ru
 
     Ok(RunReport {
         run_id,
+        retrieved_pairs: block_stats.retrieved,
+        ineligible_dropped: block_stats.ineligible_dropped,
+        same_source_dropped: block_stats.same_source_dropped,
         scanned_pairs: pairs.len(),
         promoted,
         staged,

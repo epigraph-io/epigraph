@@ -10,6 +10,14 @@ If you want to add features to EpiGraph itself, start with [`CLAUDE.md`](../../C
 
 If your use case involves experiments, protocols, samples, blobs, countersignatures, or synthesis claims, you want the **episcience** layer on top of the kernel. See https://github.com/epigraph-io/episcience.
 
+The kernel does carry the hypothesis and experiment loop itself, but not as MCP tools:
+
+- **Tables:** `experiments` and `experiment_results` (migration 023); a hypothesis is a claim.
+- **HTTP routes:** `POST /api/v1/hypothesis` with `/api/v1/hypothesis/:id/status` and `/promote`; `POST /api/v1/experiments/hypothesize`, `/design` and `/new`; `/api/v1/experiments/:id/start` and `/results`; `/api/v1/experiments/:eid/results/:rid/measurements` and `/analyze` (`routes/hypothesis.rs`, `experiments.rs` and `experiment_loop.rs` in `crates/epigraph-api`). The `analyze` step is the belief update: it stores a mass function on the hypothesis.
+- **CLIs** in `crates/epigraph-cli`: `hypothesis`, `experiment`, `protocol_gen` and `method_search`.
+
+No tool on the kernel's MCP server creates a hypothesis or an experiment, so an MCP-only client cannot drive the loop from the kernel alone: the routes and CLIs above are the kernel's surface for it.
+
 ## Deploying in production
 
 See [`docs/deploy.md`](../deploy.md), the install and operations runbook. Start with [section 2, a production install from an empty cluster](../deploy.md#2-a-production-install-from-an-empty-cluster). A database provisioned outside the public migration series needs [section 13, the legacy one-time procedures](../deploy.md#13-legacy-one-time-procedures), first.
