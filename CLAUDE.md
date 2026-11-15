@@ -438,8 +438,9 @@ only the non-merge commits a change adds. It refuses:
 - **E3** a wildcard-DNS host that encodes an address, or a bare public IPv4
   outside the documentation, loopback and private ranges;
 - **E4** a Verification section that says "Not run", "CI to confirm" or "to be
-  run" when the message has no line starting `Unverified:`. Record what was not
-  run on an `Unverified:` line; that is the only thing that clears E4;
+  run" when the message has no line starting `Unverified:` (a list item,
+  `- Unverified: ...`, counts). Record what was not run on such a line; that is
+  the only thing that clears E4;
 - **E5** a change inside a `SECURITY DEFINER` function (any `*.sql` hunk inside a
   `CREATE FUNCTION` statement that carries the attribute) whose Verification
   records no run, or which has no Verification section. `Unverified:` does NOT

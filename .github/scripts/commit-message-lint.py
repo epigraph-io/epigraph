@@ -59,8 +59,9 @@ SUBJECT_EXEMPT = ("Merge ", "Revert ", "merge(", "style(")
 SECTIONS = ("**Evidence:**", "**Reasoning:**", "**Verification:**")
 # Phrases that say a verification was not actually performed.
 NOT_RUN_RE = re.compile(r"Not run|not run|CI to confirm|to be run")
-# Marker a commit carries when its Verification records something not run.
-UNVERIFIED_RE = re.compile(r"^\s*Unverified:", re.M)
+# Marker a commit carries when its Verification records something not run: a
+# line starting `Unverified:`, also as a list item (`- Unverified:`).
+UNVERIFIED_RE = re.compile(r"^\s*(?:[-*]\s+)?Unverified:", re.M)
 # Next bold section heading, which ends the Verification section.
 HEADING_RE = re.compile(r"^\*\*[A-Za-z ]+:\*\*", re.M)
 # Start of a function definition in SQL, and the attribute E5 looks for.

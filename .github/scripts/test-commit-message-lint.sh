@@ -74,6 +74,7 @@ check "E3 public IPv4"           1 "feat(x): t$good_body"$'\n\nat '"$bad_ip" E3 
 check "E4 Verification not run"  1 "feat(x): t"$'\n\n**Evidence:**\n- e\n\n**Verification:**\n- Not run' E4 -
 check "E4 CI to confirm"         1 "feat(x): t"$'\n\n**Verification:**\n- CI to confirm' E4 -
 check "E4 silenced by Unverified" 0 "feat(x): t"$'\n\n**Verification:**\n- Not run\n\nUnverified: tests not run here' - -
+check "E4 silenced by a list-item Unverified" 0 "feat(x): t"$'\n\n**Verification:**\n- cargo test passes\n- Unverified: clippy not run here' - -
 check "ok not-run outside Verification" 0 "feat(x): t"$'\n\n**Evidence:**\n- the job was not run before\n\n**Reasoning:**\n- r\n\n**Verification:**\n- cargo test passes' - -
 
 # E6: the deny-list comes only from the environment (and a private file), never
