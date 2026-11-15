@@ -208,11 +208,14 @@ pub async fn rotate_agent_key(
     Path(id): Path<Uuid>,
     Json(request): Json<RotateKeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        require_self_or_admin(auth, id)?;
-    }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+    require_self_or_admin(auth, id)?;
 
     // Decode the new public key from hex
     let new_key_bytes =
@@ -383,11 +386,14 @@ pub async fn revoke_agent_key(
     Path((id, key_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<RevokeKeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        require_self_or_admin(auth, id)?;
-    }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+    require_self_or_admin(auth, id)?;
 
     // Look up the key to verify it belongs to this agent
     let key = AgentKeyRepository::get_by_id(&state.db_pool, key_id)

@@ -122,10 +122,13 @@ pub async fn create_paper(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreatePaperRequest>,
 ) -> Result<Json<PaperResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
 
     if request.doi.trim().is_empty() {
         return Err(ApiError::ValidationError {
