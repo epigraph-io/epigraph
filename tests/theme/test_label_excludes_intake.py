@@ -7,7 +7,12 @@ sampler DOES read the report's text while no intake is configured, then
 configures the intake and checks the report's text is gone from the sample (or
 the stored label) while the other members' text stays.
 
-One test per path from member text to a stored label (theme_lib.not_intake_owned
+The reports here are PUBLIC claims owned by the intake group, so the
+public-only rule (theme_lib.public_label_source, tested on group-private members
+in test_label_public_only.py) does not exclude them and only the intake conjunct
+can. A group-private report is excluded by the public-only rule alone.
+
+One test per path from member text to a stored label (theme_lib.public_label_source
 names them): label_themes_llm.load_themes_with_samples,
 cluster_claims.label_clusters, evidential_clustering.store_results,
 refine_clusters.auto_refine (the theme_pipeline grow loop's split labeller) and
@@ -38,9 +43,10 @@ def _group(cur, agent_id):
     return gid
 
 
-def _claim(cur, agent_id, content, theme_id=None, owner=None, seed=3):
-    """A claim; group-private and owned by `owner` when given, else as seeded
-    elsewhere in this suite (tenancy columns inherited)."""
+def _claim(cur, agent_id, content, theme_id=None, owner=None, seed=3, visibility="public"):
+    """A claim owned by `owner` with `visibility` when `owner` is given, else as
+    seeded elsewhere in this suite (tenancy columns inherited, which on a fresh
+    migrated database is public)."""
     if owner is None:
         cur.execute(
             "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, "
@@ -52,9 +58,9 @@ def _claim(cur, agent_id, content, theme_id=None, owner=None, seed=3):
         cur.execute(
             "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding, "
             "                    theme_id, visibility, owner_group_id) "
-            "VALUES (%s, sha256(%s::bytea), 0.5, %s, %s::vector, %s, 'group', %s) "
+            "VALUES (%s, sha256(%s::bytea), 0.5, %s, %s::vector, %s, %s, %s) "
             "RETURNING id::text",
-            (content, content, agent_id, make_embedding(seed), theme_id, owner),
+            (content, content, agent_id, make_embedding(seed), theme_id, visibility, owner),
         )
     return cur.fetchone()[0]
 
@@ -153,14 +159,18 @@ def test_cluster_labels_leave_out_intake_reports(db, seed_agent):
 REFINE_RUN = str(uuid.uuid4())
 
 
-def _refine_members(cur, agent_id, group):
-    """Cluster 0's members: blob A (8 public, 7 intake reports) and blob B
-    (15 intake reports only). Returns (public ids, report ids)."""
+def _refine_members(cur, agent_id, group, text=REPORT_TEXT, visibility="public"):
+    """Cluster 0's members: blob A (8 public, 7 claims owned by `group`) and
+    blob B (15 owned by `group` only). Returns (public ids, group-owned ids)."""
     public = [_claim(cur, agent_id, f"{PUBLIC_TEXT} a{i}", seed=0) for i in range(8)]
-    reports = [
-        _claim(cur, agent_id, f"{REPORT_TEXT} a{i}", owner=group, seed=0) for i in range(7)
-    ] + [_claim(cur, agent_id, f"{REPORT_TEXT} b{i}", owner=group, seed=50) for i in range(15)]
-    return public, reports
+    owned = [
+        _claim(cur, agent_id, f"{text} a{i}", owner=group, seed=0, visibility=visibility)
+        for i in range(7)
+    ] + [
+        _claim(cur, agent_id, f"{text} b{i}", owner=group, seed=50, visibility=visibility)
+        for i in range(15)
+    ]
+    return public, owned
 
 
 def _place_in_cluster_0(db, ids):

@@ -78,7 +78,7 @@ impl Rng {
 }
 
 /// Rounded to 4 decimals, as a builder storing compact documents would.
-fn r4(x: f64) -> f64 {
+pub(crate) fn r4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
@@ -102,7 +102,7 @@ fn capitalised(s: &str) -> String {
 }
 
 /// A synthetic group name of a few pseudo-words.
-fn group_name(rng: &mut Rng) -> String {
+pub(crate) fn group_name(rng: &mut Rng) -> String {
     let n = rng.range(2, 5);
     let words: Vec<String> = (0..n).map(|_| word(rng)).collect();
     capitalised(&words.join(" "))
@@ -139,7 +139,7 @@ fn naming(rng: &mut Rng) -> (Option<String>, bool) {
 }
 
 /// -1, 0 or 1, mostly supporting.
-fn net_sign(rng: &mut Rng) -> i8 {
+pub(crate) fn net_sign(rng: &mut Rng) -> i8 {
     let roll = rng.unit();
     if roll < 0.6 {
         1
@@ -151,18 +151,18 @@ fn net_sign(rng: &mut Rng) -> i8 {
 }
 
 /// The envelope fields shared by every fixture.
-struct Frame {
-    map_scope: MapScope,
-    map_group_id: Option<Uuid>,
-    hierarchy: Hierarchy,
-    theme_id: Uuid,
-    run_id: Uuid,
-    level_id: Uuid,
-    depth: u8,
-    name: Option<String>,
-    needs_naming: bool,
-    breadcrumbs: Vec<Breadcrumb>,
-    switch: Switch,
+pub(crate) struct Frame {
+    pub(crate) map_scope: MapScope,
+    pub(crate) map_group_id: Option<Uuid>,
+    pub(crate) hierarchy: Hierarchy,
+    pub(crate) theme_id: Uuid,
+    pub(crate) run_id: Uuid,
+    pub(crate) level_id: Uuid,
+    pub(crate) depth: u8,
+    pub(crate) name: Option<String>,
+    pub(crate) needs_naming: bool,
+    pub(crate) breadcrumbs: Vec<Breadcrumb>,
+    pub(crate) switch: Switch,
 }
 
 fn frame(rng: &mut Rng, map_scope: MapScope, hierarchy: Hierarchy, depth: u8) -> Frame {
@@ -345,7 +345,7 @@ impl ClaimValues {
 /// show that no edge weight depends on it.
 ///
 /// Returns the leaf and each claim's belief, in claim order.
-fn leaf_level(
+pub(crate) fn leaf_level(
     rng: &mut Rng,
     f: Frame,
     (n_claims, n_agents, n_evidence): (usize, usize, usize),
@@ -556,6 +556,40 @@ pub fn public_leaf() -> LevelDocument {
     LevelDocument::Leaf(leaf_level(&mut rng, f, (45, 5, 10), 3, 10, ClaimValues::AS_DRAWN).0)
 }
 
+/// A team leaf in which most evidence carries no mass the map's audience can
+/// read, the common case: every evidence-to-claim edge is served `none`
+/// (weight 0, sign 0, its relationship kept) except those of every fourth
+/// evidence node, which keep their exact stored mass. So the leaf has
+/// evidence attached to its claims only through `none` edges, `none` edges
+/// that `supports` and that `refutes` (sign 0 for both: the direction is in
+/// the relationship), and some `exact` evidence beside them.
+///
+/// Built from the same generator as the other leaves, then rewritten, so
+/// the other fixtures and their draws are untouched.
+pub fn team_leaf_sparse_mass() -> LevelDocument {
+    let mut rng = Rng::new(0xA71A_5006);
+    let f = frame(&mut rng, MapScope::Team, Hierarchy::Meaning, 4);
+    let (mut leaf, _) = leaf_level(&mut rng, f, (40, 6, 16), 3, 8, ClaimValues::AS_DRAWN);
+    let evidence: Vec<Uuid> = leaf
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Evidence(e) => Some(e.id),
+            _ => None,
+        })
+        .collect();
+    for e in &mut leaf.edges {
+        if let Some(i) = evidence.iter().position(|id| *id == e.source) {
+            if i % 4 != 0 {
+                e.sign = 0;
+                e.flow_weight = 0.0;
+                e.flow_basis = FlowBasis::None;
+            }
+        }
+    }
+    LevelDocument::Leaf(leaf)
+}
+
 /// A leaf built the way the committed leaf fixtures are, from any seed, with
 /// `vary` applied to every claim's drawn values, and each claim's belief (in
 /// claim order), which the leaf does not carry. For the contract's own tests
@@ -601,6 +635,7 @@ pub fn level_fixtures() -> Vec<(&'static str, LevelDocument)> {
         ("team_group_deep", team_group_deep()),
         ("team_leaf_dense", team_leaf_dense()),
         ("public_leaf", public_leaf()),
+        ("team_leaf_sparse_mass", team_leaf_sparse_mass()),
     ]
 }
 

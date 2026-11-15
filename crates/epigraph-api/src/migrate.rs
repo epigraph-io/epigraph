@@ -97,6 +97,66 @@ impl MigrateOptions {
     }
 }
 
+/// Environment variable that makes `epigraph-migrate` grant `epigraph_seed`
+/// to its own session user after a successful run. **Test harnesses only.**
+/// Parsed like [`ALLOW_DB_AHEAD_ENV`].
+///
+/// Since migration 216 the tenancy seed escape hatch (074's seed arm) is
+/// taken only by a session holding an EXPLICIT grant of `epigraph_seed`; a
+/// superuser no longer counts by implication (backlog 0512ca33). The
+/// `#[sqlx::test]` harness connects as a superuser and many fixtures insert
+/// rows without naming the tenancy columns, so the harness needs the grant.
+/// Roles are cluster-wide, so one grant before the suite covers every
+/// per-test database. CI's job env sets this variable; `ci.yml`-driven local
+/// gates copy that env into their `epigraph-migrate` run.
+///
+/// A deployed cluster must NEVER set it for a service login: the grant is
+/// exactly what re-opens the hatch, so an undeclared write by that login is
+/// stamped onto the memberless seed group instead of being refused. The API
+/// boot probe warns (and on the application role refuses) when a connection
+/// holds the grant.
+pub const GRANT_SEED_TO_SELF_ENV: &str = "EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF";
+
+/// Is [`GRANT_SEED_TO_SELF_ENV`] set to an enabled value?
+#[must_use]
+pub fn grant_seed_to_self_requested() -> bool {
+    crate::env_flag_enabled(std::env::var(GRANT_SEED_TO_SELF_ENV).ok().as_deref())
+}
+
+/// `GRANT epigraph_seed TO <session_user>` on `conn`, the test-harness grant
+/// [`GRANT_SEED_TO_SELF_ENV`] asks for. Returns the role granted to, or
+/// `None` when the `epigraph_seed` role does not exist (a cluster where 060
+/// could not create it), in which case nothing is changed.
+///
+/// Takes a connection, not the pool, so a test can run it inside a
+/// transaction it rolls back. Granting a role the session user already holds
+/// is a NOTICE, not an error, so a second run is a no-op.
+///
+/// # Errors
+/// The underlying database error, e.g. when the session user may not grant
+/// the role (neither superuser nor holding it WITH ADMIN).
+pub async fn grant_seed_to_session_user(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Option<String>, sqlx::Error> {
+    let who: Option<String> = sqlx::query_scalar(
+        "SELECT session_user::text \
+          WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_seed')",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(who) = who else {
+        return Ok(None);
+    };
+    // A role name cannot be a bind parameter in GRANT; quote it as an
+    // identifier server-side.
+    let stmt: String = sqlx::query_scalar("SELECT format('GRANT epigraph_seed TO %I', $1::text)")
+        .bind(&who)
+        .fetch_one(&mut *conn)
+        .await?;
+    sqlx::query(&stmt).execute(&mut *conn).await?;
+    Ok(Some(who))
+}
+
 /// Where the database stands relative to the binary's embedded migration set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaHeads {
@@ -470,9 +530,153 @@ async fn run_locked(
     Ok(report)
 }
 
+/// The lowest pgvector release the kernel's queries run on.
+///
+/// `ClaimRepository::semantic_search_flat` and `search_by_embedding_since` set
+/// `hnsw.iterative_scan`, which pgvector added in 0.8.0. Nothing else checks
+/// the installed release, so an older extension passed every migration and
+/// only showed at query time.
+pub const MIN_PGVECTOR_VERSION: (u32, u32, u32) = (0, 8, 0);
+
+/// Why [`check_pgvector_version`] refused.
+#[derive(Debug)]
+pub enum PgvectorVersionError {
+    /// Reading `pg_extension` failed.
+    Query(sqlx::Error),
+    /// The `vector` extension is not installed in this database.
+    NotInstalled,
+    /// `extversion` is not a dotted numeric version.
+    Unparseable { found: String },
+    /// The installed release is below [`MIN_PGVECTOR_VERSION`].
+    TooOld { found: String },
+}
+
+impl fmt::Display for PgvectorVersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (major, minor, patch) = MIN_PGVECTOR_VERSION;
+        match self {
+            Self::Query(e) => write!(f, "reading the pgvector version failed: {e}"),
+            Self::NotInstalled => write!(
+                f,
+                "the pgvector extension (`vector`) is not installed in this database;                  {major}.{minor}.{patch} or newer is required"
+            ),
+            Self::Unparseable { found } => write!(
+                f,
+                "cannot read the pgvector version {found:?}; {major}.{minor}.{patch} or newer                  is required"
+            ),
+            Self::TooOld { found } => write!(
+                f,
+                "pgvector {found} is installed but {major}.{minor}.{patch} or newer is                  required (semantic search sets hnsw.iterative_scan, added in 0.8.0). Install                  a newer pgvector on the server, then run `ALTER EXTENSION vector UPDATE` in                  this database."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PgvectorVersionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Query(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Parse a pgvector `extversion` (`"0.8.0"`, `"0.10.1"`) into
+/// `(major, minor, patch)`. A missing patch reads as 0. `None` when the major
+/// or minor part is absent or any part is not a number.
+#[must_use]
+pub fn parse_pgvector_version(extversion: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = extversion.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+        Some(p) => p.parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// The pure gate behind [`check_pgvector_version`]: `extversion` must parse
+/// and be at least [`MIN_PGVECTOR_VERSION`]. The comparison is numeric, part
+/// by part, so `0.10.1` is above `0.8.0`.
+///
+/// # Errors
+/// [`PgvectorVersionError::Unparseable`] or [`PgvectorVersionError::TooOld`].
+pub fn require_supported_pgvector(extversion: &str) -> Result<(), PgvectorVersionError> {
+    let found = || extversion.to_string();
+    let version = parse_pgvector_version(extversion)
+        .ok_or_else(|| PgvectorVersionError::Unparseable { found: found() })?;
+    if version < MIN_PGVECTOR_VERSION {
+        return Err(PgvectorVersionError::TooOld { found: found() });
+    }
+    Ok(())
+}
+
+/// Read the installed pgvector release and refuse one below
+/// [`MIN_PGVECTOR_VERSION`]. Returns the installed `extversion`.
+///
+/// Called by `epigraph-migrate` after a successful migration, so a deploy
+/// stops there. It is NOT part of [`run_migrations`]: the server's
+/// migrate-on-boot path does not refuse on it.
+///
+/// # Errors
+/// See [`PgvectorVersionError`].
+pub async fn check_pgvector_version(
+    pool: &epigraph_db::PgPool,
+) -> Result<String, PgvectorVersionError> {
+    let extversion: Option<String> =
+        sqlx::query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+            .fetch_optional(pool)
+            .await
+            .map_err(PgvectorVersionError::Query)?;
+    let extversion = extversion.ok_or(PgvectorVersionError::NotInstalled)?;
+    require_supported_pgvector(&extversion)?;
+    Ok(extversion)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pgvector_below_0_8_0_is_refused_and_newer_is_accepted() {
+        for old in ["0.6.0", "0.7.4", "0.7"] {
+            assert!(
+                matches!(
+                    require_supported_pgvector(old),
+                    Err(PgvectorVersionError::TooOld { .. })
+                ),
+                "{old} must be refused"
+            );
+        }
+        // 0.10.1 is the arm a string comparison gets wrong ("0.10.1" < "0.8.0").
+        for ok in ["0.8.0", "0.8.2", "0.10.1", "1.0.0", "0.8"] {
+            require_supported_pgvector(ok).unwrap_or_else(|e| panic!("{ok} refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn pgvector_version_parses_numerically_or_not_at_all() {
+        assert_eq!(parse_pgvector_version("0.8.2"), Some((0, 8, 2)));
+        assert_eq!(parse_pgvector_version("0.10.1"), Some((0, 10, 1)));
+        assert_eq!(parse_pgvector_version(" 0.8 "), Some((0, 8, 0)));
+        for bad in ["", "0", "abc", "0.8.x", "0.8.0.1", "0.8.0-dev"] {
+            assert_eq!(parse_pgvector_version(bad), None, "{bad:?}");
+            assert!(
+                matches!(
+                    require_supported_pgvector(bad),
+                    Err(PgvectorVersionError::Unparseable { .. })
+                ),
+                "{bad:?} must be refused as unreadable"
+            );
+        }
+        // The refusal names what was found and what is required.
+        let msg = require_supported_pgvector("0.6.0").unwrap_err().to_string();
+        assert!(msg.contains("0.6.0") && msg.contains("0.8.0"), "{msg}");
+    }
 
     const EMBEDDED: &[i64] = &[1, 2, 3, 36, 37, 38, 59, 60, 101];
     const STRICT: MigrateOptions = MigrateOptions {

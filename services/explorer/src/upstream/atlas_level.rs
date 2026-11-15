@@ -58,11 +58,13 @@ pub enum ChildKind {
     Leaf,
 }
 
-/// `exact` (evidence to claim, the stored mass), `proxy` (claim to claim,
-/// the link's strength times its sign and nothing else, with no belief
-/// factor of any kind, so it can never be divided back into a belief: shown
-/// as an estimate; `cites` has sign 0 and so weight 0) or
-/// `none` (no belief flow).
+/// `exact` (evidence to claim with a mass the map's audience can read, the
+/// stored mass), `proxy` (claim to claim, the link's strength times its sign
+/// and nothing else, with no belief factor of any kind, so it can never be
+/// divided back into a belief: shown as an estimate; `cites` has sign 0 and
+/// so weight 0) or `none` (no belief flow, weight 0 and sign 0 whatever the
+/// relationship; this includes evidence to claim with no readable mass, the
+/// common case, or with a relationship other than `supports` or `refutes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowBasis {
@@ -155,15 +157,22 @@ impl Node {
 }
 
 /// A link between two nodes of a leaf, pointing the way belief flows. The
-/// endpoint kinds fix `flow_basis`: evidence to claim is `exact`, claim to
-/// claim is `proxy`, every other pair is `none`.
+/// endpoint kinds limit `flow_basis`: claim to claim is `proxy`, evidence to
+/// claim is `exact` or `none` (no readable mass, or a relationship with no
+/// belief direction; the evidence still counts as attached to the claim),
+/// every other pair is `none`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Edge {
     pub source: Uuid,
     pub target: Uuid,
-    /// As stored, in either casing (`AUTHORED`, `supports`): compare it
+    /// Lower-cased by the builder (the `edges` table spells names in both
+    /// casings); the contract still admits upper case, so compare it
     /// case-insensitively.
     pub relationship: String,
+    /// 1 supporting, -1 opposing, 0 none. A `none` edge has sign 0 whatever
+    /// its relationship, so a `refutes` evidence edge with no readable mass
+    /// is served with sign 0: take that evidence's direction from
+    /// `relationship`, not from `sign`.
     pub sign: i8,
     pub flow_weight: f64,
     pub flow_basis: FlowBasis,
