@@ -3105,6 +3105,8 @@ pub async fn run_batch(
     let epoch_before = atlas_epoch(conn).await?;
     let bump_due = tables::layout_epoch_bump_due(conn).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
     // Each row compare-and-swapped on the prior the plan read (the FROM state,
     // or under --catch-up the source's private state).
@@ -3381,6 +3383,32 @@ pub async fn run_batch(
     let bump = act.narrows() && bump_due && (!public_claims.is_empty() || narrowed_edge);
     if bump {
         expect.insert("atlas_layout_epoch".to_string(), (0, 1, 0));
+    }
+    // Migration 210's map epochs: the claims statement, each cascaded row and
+    // each moving edge in the one step counted above (workflows carry no
+    // trigger).
+    if let Some(me) = map_epochs.as_mut() {
+        let prior: BTreeMap<Uuid, &ClaimRow> = comps
+            .iter()
+            .flat_map(|c| c.claims.iter())
+            .map(|c| (c.id, c))
+            .collect();
+        for c in &claims_after {
+            if let Some(b) = prior.get(&c.id) {
+                me.claim((&b.visibility, b.owner), (&c.visibility, c.owner));
+            }
+        }
+        for (k, a) in &rows {
+            if let Some(b) = attached_after.get(k) {
+                me.row(&k.0, &a.tenancy, &b.tenancy);
+            }
+        }
+        for e in &moving {
+            if let Some(a) = edges_after.get(&e.row.id) {
+                me.row("edges", &e.row.tenancy, &a.tenancy);
+            }
+        }
+        me.expect_into(conn, &mut expect).await?;
     }
     expect.retain(|_, d| *d != (0, 0, 0));
     v.extend(counter_violations(
@@ -4715,6 +4743,9 @@ async fn reverse_tx(
         .map(|e| (e.id, e.tenancy))
         .collect();
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
+    let claims_prior = fetch_claims(conn, &claim_ids, false).await?;
 
     let to_vis = act.to_vis();
     let payload = |t: &str| -> Value {
@@ -4780,8 +4811,11 @@ async fn reverse_tx(
     }
     let mut edges_trigger = 0i64;
     for e in fetch_edges(conn, &claim_ids, &wf_ids).await? {
-        if edges_pre.get(&e.id).is_some_and(|t| *t != e.tenancy) {
+        if let Some(t) = edges_pre.get(&e.id).filter(|t| **t != e.tenancy) {
             edges_trigger += 1;
+            if let Some(me) = map_epochs.as_mut() {
+                me.row("edges", t, &e.tenancy);
+            }
         }
     }
     if edges_trigger > 0 {
@@ -4934,6 +4968,29 @@ async fn reverse_tx(
     }
     for (t, n) in trigger_changed.iter().chain(restored_writes.iter()) {
         expect.entry(t.clone()).or_default().1 += n;
+    }
+    // Migration 210's map epochs: the claims statement, the cascade's edges
+    // (recorded above) and rows, then the restores, each in the step counted
+    // above.
+    if let Some(me) = map_epochs.as_mut() {
+        for b in &claims_prior {
+            if let Some(a) = claims_after.get(&b.id) {
+                me.claim((&b.visibility, b.owner), (&a.visibility, a.owner));
+            }
+        }
+        for (k, a) in &attached_now {
+            let (Some(mid), Some(got)) = (attached_mid.get(k), attached_after.get(k)) else {
+                continue;
+            };
+            me.row(&k.0, &a.tenancy, &mid.tenancy);
+            me.row(&k.0, &mid.tenancy, &got.tenancy);
+        }
+        for (id, mid) in &edges_mid {
+            if let Some(a) = edges_after.get(id) {
+                me.row("edges", mid, &a.tenancy);
+            }
+        }
+        me.expect_into(conn, &mut expect).await?;
     }
     expect.retain(|_, d| *d != (0, 0, 0));
     v.extend(counter_violations(

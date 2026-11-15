@@ -1398,6 +1398,8 @@ async fn run_batch(
 
     let views_before = three_views(conn, ctx, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
     let moved = sqlx::query(
         "UPDATE claims SET owner_group_id = $2 \
@@ -1551,6 +1553,28 @@ async fn run_batch(
     let edge_updates = trigger_edges + i64::try_from(edges_written).unwrap_or(i64::MAX);
     if edge_updates > 0 {
         expect_counts.entry("edges".into()).or_default().1 += edge_updates;
+    }
+    // The Atlas map epochs (migration 210): the claims statement, then each
+    // row in the steps counted above (an edge through the trigger's meet, then
+    // the exact meet written here).
+    if let Some(me) = map_epochs.as_mut() {
+        let before: BTreeMap<Uuid, &ClaimRow> = eligible.iter().map(|c| (c.id, c)).collect();
+        for c in &after_claims {
+            if let Some(b) = before.get(&c.id) {
+                me.claim((&b.visibility, b.owner), (&c.visibility, c.owner));
+            }
+        }
+        for (k, a) in &s0 {
+            let Some(got) = s2.get(k) else { continue };
+            match mid_edges.get(k) {
+                Some(m) => {
+                    me.row(&k.0, &a.tenancy, &m.tenancy);
+                    me.row(&k.0, &m.tenancy, &got.tenancy);
+                }
+                None => me.row(&k.0, &a.tenancy, &got.tenancy),
+            }
+        }
+        me.expect_into(conn, &mut expect_counts).await?;
     }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
@@ -2647,6 +2671,9 @@ async fn reverse_batch(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let views_before = three_views(conn, &ctx, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
+    let claims_prior = fetch_claims(conn, &claim_ids, false).await?;
 
     // ---- claims: back on their recorded owner (visibility stays group) ----
     let payload: Vec<Value> = work
@@ -2797,6 +2824,24 @@ async fn reverse_batch(
         expect_counts.entry(t.clone()).or_default().1 += n;
     }
     expect_counts.retain(|_, d| *d != (0, 0, 0));
+    // The Atlas map epochs (migration 210): the claims statement, then each
+    // row as the trigger left it and as the restore wrote it.
+    if let Some(me) = map_epochs.as_mut() {
+        let prior: BTreeMap<Uuid, &ClaimRow> = claims_prior.iter().map(|c| (c.id, c)).collect();
+        for c in &after {
+            if let Some(b) = prior.get(&c.id) {
+                me.claim((&b.visibility, b.owner), (&c.visibility, c.owner));
+            }
+        }
+        for (k, a) in &s0 {
+            let (Some(mid), Some(got)) = (s1.get(k), s2.get(k)) else {
+                continue;
+            };
+            me.row(&k.0, &a.tenancy, &mid.tenancy);
+            me.row(&k.0, &mid.tenancy, &got.tenancy);
+        }
+        me.expect_into(conn, &mut expect_counts).await?;
+    }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
         &expect_counts,
