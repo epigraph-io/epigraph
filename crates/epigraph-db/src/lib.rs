@@ -193,6 +193,8 @@ pub use repos::AtlasMapRepository;
 pub use repos::AtlasLeafRepository;
 // The Atlas "by meaning" hierarchy's reads (Atlas W4).
 pub use repos::AtlasMeaningRepository;
+// The rows behind the Atlas leaf flow weights (Atlas W7).
+pub use repos::AtlasFlowRepository;
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,

@@ -18,6 +18,7 @@
 
 pub mod admin_cascade;
 pub mod agent_assessment;
+pub mod atlas_flow;
 pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
