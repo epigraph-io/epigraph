@@ -111,7 +111,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
     ("papers.rs", 8),
-    ("policies.rs", 9),
+    ("policies.rs", 4),
     ("political.rs", 1),
     ("rag.rs", 2),
     ("revoke_signature.rs", 6),
@@ -124,8 +124,9 @@ const REGISTER: &[(&str, usize)] = &[
 ///
 /// Measured on 2026-11-14 at commit c802844b0 (origin/main, merge of PR #817):
 /// 121 production statements in 24 files. Lowered to 120 when #869 moved
-/// `patch_claim`'s ownership read into the repo layer.
-const HIGH_WATER: usize = 120;
+/// `patch_claim`'s ownership read into the repo layer, and to 115 when the
+/// policies reads and challenge-create statements moved into `PolicyRepository`.
+const HIGH_WATER: usize = 115;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same
