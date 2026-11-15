@@ -1,7 +1,8 @@
 //! Document ingest's background work, on the application role: the detached
-//! walk and the post-commit embedding loop are tracked by the server
-//! (backlog b928ccc1), so a process that drains its tracker before exiting
-//! ends with the walk committed and every claim it created embedded.
+//! walk and the post-commit embedding loop are tracked by the server's
+//! `BackgroundTasks` (backlog b928ccc1), so a process that waits for them to
+//! go idle before exiting ends with the walk committed and every claim it
+//! created embedded.
 //!
 //! Every pool the server holds is `epigraph_app` (NOSUPERUSER, NOBYPASSRLS);
 //! seeding and assertions run on the harness pool. The embedder's provider is
@@ -9,7 +10,7 @@
 //! a network call.
 //!
 //! `#[sqlx::test]` runs each test on a current-thread runtime, so a task the
-//! tool spawned has not been polled when the tool returns: `running()` right
+//! tool spawned has not been polled when the tool returns: `active()` right
 //! after the call counts exactly the tasks it left behind, deterministically.
 //!
 //! Verified to fail: with the detached walk spawned by a bare `tokio::spawn`,
@@ -142,9 +143,8 @@ async fn doc_state(pool: &PgPool, doi: &str) -> (i64, i64, Vec<String>) {
 }
 
 async fn drained(tasks: &BackgroundTasks) {
-    assert_eq!(
-        tasks.drain(Duration::from_secs(60)).await,
-        0,
+    assert!(
+        tasks.wait_idle(Duration::from_secs(60)).await,
         "every background task finishes inside the limit"
     );
 }
@@ -158,10 +158,10 @@ async fn a_queued_ingest_is_tracked_until_its_walk_and_embeddings_finish(pool: P
 
     let tasks = server.background_tasks();
     assert_eq!(
-        tasks.running(),
+        tasks.active(),
         1,
-        "the detached walk must be spawned on the server's tracker, or a stdio process \
-         exits under it"
+        "the detached walk must be spawned on the server's BackgroundTasks, or a stdio \
+         process exits under it"
     );
 
     drained(&tasks).await;
@@ -188,9 +188,9 @@ async fn a_waited_ingest_leaves_its_embedding_loop_tracked(pool: PgPool) {
 
     let tasks = server.background_tasks();
     assert_eq!(
-        tasks.running(),
+        tasks.active(),
         1,
-        "the post-commit embedding loop must be spawned on the server's tracker"
+        "the post-commit embedding loop must be spawned on the server's BackgroundTasks"
     );
     drained(&tasks).await;
     let (claims, embedded, _) = doc_state(&pool, doi).await;
@@ -436,7 +436,7 @@ async fn a_server_with_no_embedding_provider_reports_nothing_queued(pool: PgPool
         body["claims_embedded"], 0,
         "the deprecated alias too: {body}"
     );
-    assert_eq!(server.background_tasks().running(), 0, "no embedding task");
+    assert_eq!(server.background_tasks().active(), 0, "no embedding task");
 
     let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, None)
         .await
@@ -468,7 +468,7 @@ async fn a_server_with_no_embedding_provider_reports_nothing_queued(pool: PgPool
         body["paragraphs_embedded"], 0,
         "the deprecated alias too: {body}"
     );
-    assert_eq!(server.background_tasks().running(), 0, "no embedding task");
+    assert_eq!(server.background_tasks().active(), 0, "no embedding task");
 }
 
 /// An agent reads the tool descriptions, so every ingest tool that returns an

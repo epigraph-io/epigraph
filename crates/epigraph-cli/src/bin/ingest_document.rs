@@ -145,18 +145,20 @@ async fn run(
             .await
             .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
     // The walk returns once its transaction commits, with its embedding loop
-    // still running on the server's tracker. Exiting here would drop that loop
-    // and leave the new claims with no vector, so wait for it (bounded).
-    let left = server
-        .background_tasks()
-        .drain(epigraph_mcp::background::EXIT_DRAIN_LIMIT)
-        .await;
-    if left > 0 {
-        eprintln!(
-            "ingest-document: the embedding loop did not finish within {} s; claims it had not \
-             reached carry no vector until the maintenance backfill (embed_backfill) runs",
-            epigraph_mcp::background::EXIT_DRAIN_LIMIT.as_secs()
-        );
+    // still running on the server's `BackgroundTasks`. Exiting here would drop
+    // that loop and leave the new claims with no vector, so wait for it, with
+    // the stdio server's bound (`EPIGRAPH_MCP_STDIO_DRAIN_SECS`).
+    let background = server.background_tasks();
+    if background.active() > 0 {
+        let limit = epigraph_mcp::background::exit_drain_timeout();
+        if !background.wait_idle(limit).await {
+            eprintln!(
+                "ingest-document: the embedding loop did not finish within {} s; claims it had \
+                 not reached carry no vector until the maintenance backfill (embed_backfill) \
+                 runs",
+                limit.as_secs()
+            );
+        }
     }
     let text = result
         .content

@@ -17,9 +17,9 @@
 //!
 //! RETIRED CLAIMS ARE NEVER SELECTED. A retirement (`is_current = false`)
 //! nulls both vector columns, which is exactly the `embedding_3072 IS NULL`
-//! shape this tool selects on; re-populating it would make the claim
-//! retrievable again through recall at `centroid_dim = 3072`
-//! (`ClaimRepository::search_by_embedding_since` has no `is_current` filter),
+//! shape this tool selects on; re-populating it would put a vector back on a
+//! retired row (recall at `centroid_dim = 3072` has filtered `is_current`
+//! itself only since backlog 7720cb7a; before that, this was the guard),
 //! and `chk_deprecated_no_embedding` (migration 144) refuses the write, so one
 //! retired row would abort the whole run. The UPDATE re-checks the same
 //! predicate, so a claim retired between the fetch and the write is skipped

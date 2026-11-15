@@ -222,8 +222,9 @@ fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String>
     out
 }
 
-/// One of `submit_evidence`'s best-effort edges, written on its viewer-stamped
-/// transaction under a SAVEPOINT.
+/// One best-effort edge, written on a viewer-stamped transaction under a
+/// SAVEPOINT (`submit_evidence`'s edges, and `crud.rs::create_reasoning_trace`'s
+/// `HAS_TRACE`).
 ///
 /// Stamped, the edges trigger records the caller's writer group, and row
 /// security decides the INSERT against the caller's writable set. A refused
@@ -237,7 +238,7 @@ fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String>
 /// or closed.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
-async fn create_edge_under_savepoint(
+pub(crate) async fn create_edge_under_savepoint(
     conn: &mut sqlx::PgConnection,
     key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     source_id: Uuid,
@@ -267,7 +268,7 @@ async fn create_edge_under_savepoint(
     match created {
         Ok(_) => sp.commit().await,
         Err(e) => {
-            tracing::warn!("submit_evidence: {relationship} edge refused: {e}");
+            tracing::warn!("best-effort {relationship} edge refused: {e}");
             sp.rollback().await
         }
     }
@@ -1129,6 +1130,14 @@ pub async fn create_frame(
         return Err(ApiError::ValidationError {
             field: "hypotheses".to_string(),
             reason: "Frame must have at least 2 hypotheses".to_string(),
+        });
+    }
+    if let Some(dup) =
+        epigraph_ds::FrameOfDiscernment::first_duplicate_hypothesis(&request.hypotheses)
+    {
+        return Err(ApiError::ValidationError {
+            field: "hypotheses".to_string(),
+            reason: format!("Hypotheses must be distinct: `{dup}` appears more than once"),
         });
     }
 
@@ -2944,6 +2953,14 @@ pub async fn refine_frame(
             reason: "Refinement must have at least 2 hypotheses".to_string(),
         });
     }
+    if let Some(dup) =
+        epigraph_ds::FrameOfDiscernment::first_duplicate_hypothesis(&request.hypotheses)
+    {
+        return Err(ApiError::ValidationError {
+            field: "hypotheses".to_string(),
+            reason: format!("Hypotheses must be distinct: `{dup}` appears more than once"),
+        });
+    }
 
     if request.name.is_empty() || request.name.len() > 200 {
         return Err(ApiError::ValidationError {
@@ -3090,6 +3107,14 @@ pub async fn create_frame(
         return Err(ApiError::ValidationError {
             field: "hypotheses".to_string(),
             reason: "Frame must have at least 2 hypotheses".to_string(),
+        });
+    }
+    if let Some(dup) =
+        epigraph_ds::FrameOfDiscernment::first_duplicate_hypothesis(&request.hypotheses)
+    {
+        return Err(ApiError::ValidationError {
+            field: "hypotheses".to_string(),
+            reason: format!("Hypotheses must be distinct: `{dup}` appears more than once"),
         });
     }
 

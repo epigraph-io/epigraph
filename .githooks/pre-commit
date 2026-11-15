@@ -1,0 +1,7 @@
+#!/bin/sh
+# Pre-commit sensitive-data check: blocks commits whose staged content holds
+# AWS resource ids, EC2 hostnames, ARN account ids, or org terms listed in the
+# gitignored .check_sensitive_local.yaml. See scripts/README.md.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+exec python3 "$(dirname "$0")/../scripts/check_sensitive.py"

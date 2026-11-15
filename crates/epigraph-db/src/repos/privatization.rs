@@ -3568,17 +3568,30 @@ impl PrivatizationRepository {
     ///
     /// # Ordering: restrict first, then seal
     ///
-    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081),
-    /// which raises `42501` on sealing a claim that is still
-    /// `visibility='public'`. That is the backstop, not the control: the route
-    /// refuses a plan that has not been applied. It is load-bearing anyway,
-    /// because it is what makes the ordering an invariant of the database
-    /// rather than of this function.
+    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081,
+    /// coded PRV01 by 176, body last re-stated by 227), which raises `42501`
+    /// on sealing a claim that is still `visibility='public'`. That is the
+    /// backstop, not the control: the route refuses a plan that has not been
+    /// applied. It is load-bearing anyway, because it is what makes the
+    /// ordering an invariant of the database rather than of this function.
+    ///
+    /// # Row locks (migration 227)
+    ///
+    /// Since 227 that trigger reads each claim's visibility `FOR NO KEY
+    /// UPDATE`, so statement 1, not statement 2, is where this function first
+    /// takes the claim rows' locks and waits on a concurrent publicize (which
+    /// then either commits first and the seal is refused, or waits for the
+    /// seal and is refused by 074). The rows are locked in the order of
+    /// `items`. Under the route's `lock_timeout` a contended claim therefore
+    /// surfaces as a `55P03` from statement 1, and a lock-order deadlock with a
+    /// multi-claim publicize (possible before 227 at statement 2) as a `40P01`
+    /// from either statement; both abort the transaction with nothing written.
     ///
     /// # Errors
     ///
-    /// [`DbError`] for a query fault. A `42501` from statement 1 is 081's guard
-    /// refusing an unrestricted claim.
+    /// [`DbError`] for a query fault. A `42501` from statement 1 is the PRV01
+    /// guard refusing an unrestricted claim; a `55P03` or `40P01` is a lock
+    /// wait that timed out or deadlocked (above).
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,

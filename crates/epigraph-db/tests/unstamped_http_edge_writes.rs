@@ -49,7 +49,6 @@
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
 //! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
-//! | crud.rs | create_reasoning_trace | claim -> trace HAS_TRACE | no |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
 //! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
@@ -139,7 +138,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
-    ("crud.rs", 2),
+    // 2 before backlog f64cf9c6: `create_reasoning_trace` writes its HAS_TRACE
+    // edge on the caller's stamped `AppState::write_as` transaction.
+    ("crud.rs", 1),
     // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
     ("experiment_loop.rs", 4),
@@ -154,7 +155,10 @@ const UNSTAMPED: &[(&str, usize)] = &[
 ///
 /// 31 -> 27: `provenance.rs::set_provenance` writes its four edges on the
 /// caller's stamped transaction and left the register.
-const HIGH_WATER: usize = 27;
+///
+/// 27 -> 26 (backlog f64cf9c6): `create_reasoning_trace` was stamped and its
+/// `crud.rs` row fell 2 -> 1.
+const HIGH_WATER: usize = 26;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

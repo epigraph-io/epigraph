@@ -200,12 +200,11 @@ pub async fn consolidate_claims(
     // CLAUDE.md write-path invariant). Skipped on the idempotent return, where
     // nothing new was written.
     //
-    // Stored as the ACTING agent, the merged row's author, on a connection
-    // stamped from it (`claim_helper::embed_claim_author_stamped`), not through
-    // `McpEmbedder::embed_and_store`: that path resolves the author by reading
-    // the claim as PUBLIC, and a merge of team or private sources is neither,
-    // so it stored nothing there (backlog 46902f71). The merge's transaction
-    // carries no team-write grant, so none is needed here either.
+    // Stored through the ACTING agent, which authored the merged row on the
+    // transaction above. The embedder's own store path
+    // (`McpEmbedder::embed_and_store`) resolves the author by reading the row
+    // as PUBLIC, so a merge of group-private sources, whose merged claim is
+    // private to the same group, stored nothing (backlog 46902f71).
     let embedded = if result.already_existed {
         false
     } else {
