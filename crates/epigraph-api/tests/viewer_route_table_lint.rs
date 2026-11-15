@@ -270,7 +270,6 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
-    ("policies.rs", 2),
     ("political.rs", 1),
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
     // forward-only scan could not see. Its in-code comment argues it is not a
@@ -351,11 +350,25 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // row removed), `crud.rs` create_evidence/create_analysis (6 -> 4),
     // `papers.rs` create_paper (1 -> row removed) and `tasks.rs`
     // create/assign/complete/fail (6 -> 2). Rows that reached zero are REMOVED,
-    // not zeroed, for the reason the PR-10 note below gives. What remains is
-    // READ handlers only, plus `crud.rs::create_reasoning_trace`, which another
-    // branch converts. `tests/mutating_handlers_refuse_without_auth_context.rs`
-    // drives the eleven with no `AuthContext` and requires 401.
-    ("agent_keys.rs", 1),
+    // not zeroed, for the reason the PR-10 note below gives.
+    // `tests/mutating_handlers_refuse_without_auth_context.rs` drives the
+    // eleven with no `AuthContext` and requires 401.
+    //
+    // The same backlog then converted the READ handlers, six of them:
+    // `agent_keys.rs::list_agent_keys` (1 -> row removed), `tasks.rs` get_task
+    // and list_tasks (2 -> row removed), and `crud.rs` get_boundary_claims,
+    // get_split_candidates and get_distant_claims (4 -> 1).
+    // `tests/read_handlers_refuse_without_auth_context.rs` drives the six with
+    // no `AuthContext` and requires 401. All six are registered on the
+    // `protected` router only, never on `public` (`public_router_allowlist.rs`),
+    // so none is a public read whose conditional is intended. The three `crud.rs`
+    // ones also take `ViewerExtractor`, which already refused an anonymous
+    // request, so for them the change removes a dead conditional rather than
+    // closing a live hole.
+    //
+    // What remains is the single site `crud.rs::create_reasoning_trace`, which
+    // another branch (`fix/backlog-b03`) converts; it is deliberately not
+    // touched here. When that lands the `crud.rs` row is removed.
     // 1 → 2 when the needle set widened from one spelling to four. NOT a new
     // site and NOT a regression: `create_agent`'s `agents:write` check is
     // written `if let Some(axum::Extension(ref auth)) = &auth_ctx` — the same
@@ -394,7 +407,7 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // shape on the way. Its `record_provenance` block is a SEPARATE `if let`
     // and is deliberately untouched — it is still counted, in the other
     // register, where the count stays 4.
-    ("crud.rs", 4),
+    ("crud.rs", 1),
     // `("edges.rs", 5)` REMOVED by batch W12b, on the PR-10 precedent above:
     // the five write handlers (`create_edge`, `create_hierarchical_edge`,
     // `patch_edge`, `delete_edge`, `relate_claims`) took `ViewerExtractor`,
@@ -403,7 +416,6 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // `None`. They now take the prescribed `let Some(..) = auth_ctx else {
     // return Err(ApiError::Unauthorized ..) }` shape and check `edges:write`
     // unconditionally.
-    ("tasks.rs", 2),
     // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
     // `delete_webhook` to the prescribed
     // `auth_ctx.ok_or(ApiError::Unauthorized { .. })?` shape and made the scope

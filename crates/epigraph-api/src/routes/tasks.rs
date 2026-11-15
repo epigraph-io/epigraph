@@ -158,16 +158,19 @@ pub async fn create_task(
 ///
 /// GET /api/v1/tasks/:id
 ///
-/// Requires `tasks:read` scope when OAuth2-authenticated.
+/// Requires `tasks:read`; a request with no `AuthContext` is refused (401).
 #[cfg(feature = "db")]
 pub async fn get_task(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
 
     let row = TaskRepository::get_by_id(&state.db_pool, id)
         .await?
@@ -218,16 +221,19 @@ fn list_limit(requested: Option<i64>) -> i64 {
 ///   applies to those two listings. A `workflow_id` listing returns every task
 ///   of the workflow, as before.
 ///
-/// Requires `tasks:read` scope when OAuth2-authenticated.
+/// Requires `tasks:read`; a request with no `AuthContext` is refused (401).
 #[cfg(feature = "db")]
 pub async fn list_tasks(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<ListTasksQuery>,
 ) -> Result<Json<Vec<TaskResponse>>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
 
     let limit = list_limit(params.limit);
 
