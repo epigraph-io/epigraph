@@ -6,6 +6,8 @@ pub mod atlas_meaning;
 #[cfg(feature = "db")]
 pub mod atlas_naming;
 #[cfg(feature = "db")]
+pub mod atlas_nightly;
+#[cfg(feature = "db")]
 pub mod backfill_factors;
 #[cfg(feature = "db")]
 pub mod belief_cache;

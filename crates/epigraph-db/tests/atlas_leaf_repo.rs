@@ -1076,3 +1076,226 @@ async fn the_node_set_is_identical_across_runs(pool: PgPool) {
     assert!(split_a.len() >= 2);
     assert_eq!(split_a, split_b);
 }
+
+/// Atlas W9's leaf labels (review finding: the tenancy filter was untested).
+/// `node_labels` serves an evidence row's raw text, so it must label only
+/// the evidence the map may draw, whatever ids the caller passes: team T's
+/// map labels T's and public evidence, never team U's; the public map labels
+/// public evidence only. Agents carry no tenancy (077) and are labelled by
+/// display name on every map.
+#[sqlx::test(migrations = "../../migrations")]
+async fn node_labels_label_only_the_evidence_the_map_may_draw(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let u = team(&pool, "team-u").await;
+    let world = fixture::world_group(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let filer = agent(&pool).await;
+    sqlx::query("UPDATE agents SET display_name = 'The Filer' WHERE id = $1")
+        .bind(filer)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tc = claims(&pool, filer, "group", t, 1).await[0];
+    let uc = claims(&pool, filer, "group", u, 1).await[0];
+    let pc = claims(&pool, filer, "public", world, 1).await[0];
+    let ev_t = evidence(&pool, tc, 1).await[0];
+    let ev_u = evidence(&pool, uc, 1).await[0];
+    let ev_p = evidence(&pool, pc, 1).await[0];
+    for (ev, text) in [
+        (ev_t, "text of t"),
+        (ev_u, "text of u"),
+        (ev_p, "public text"),
+    ] {
+        sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
+            .bind(ev)
+            .bind(text)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let all = [ev_t, ev_u, ev_p];
+    let mut conn = pool.acquire().await.unwrap();
+    let (agents, ev) =
+        AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Team(t), &[filer], &all)
+            .await
+            .expect("node_labels");
+    assert_eq!(agents.get(&filer).map(String::as_str), Some("The Filer"));
+    assert_eq!(
+        ev.into_iter().collect::<Vec<_>>(),
+        {
+            let mut want = vec![
+                (ev_t, "text of t".to_string()),
+                (ev_p, "public text".to_string()),
+            ];
+            want.sort();
+            want
+        },
+        "team T's map labels T's and public evidence only"
+    );
+    let (agents, ev) =
+        AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Public, &[filer], &all)
+            .await
+            .expect("node_labels");
+    assert_eq!(agents.get(&filer).map(String::as_str), Some("The Filer"));
+    assert_eq!(
+        ev.into_iter().collect::<Vec<_>>(),
+        vec![(ev_p, "public text".to_string())],
+        "the public map labels public evidence only"
+    );
+}
+
+/// Make an edge public, owned by the world group.
+async fn make_public(pool: &PgPool, id: Uuid, world: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, \
+                          co_owner_group_id = NULL WHERE id = $1",
+    )
+    .bind(id)
+    .bind(world)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// [`AtlasLeafRepository::map_claim_links`], sorted.
+async fn links(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    ids: &[Uuid],
+) -> Vec<(Uuid, Uuid, String)> {
+    let mut v = AtlasLeafRepository::map_claim_links(conn, viewer, map, ids)
+        .await
+        .expect("map_claim_links");
+    v.sort();
+    v
+}
+
+/// Atlas W9's cross-group links read: only claim-to-claim edges in force
+/// between two of the claims asked for, under the MAP edge rule, and only
+/// between two claims the map may draw, whatever ids the caller passes.
+/// Team T's map gets T's own edges and public ones, never one co-owned with
+/// another team (the co-owner's members alone cannot read it), never another
+/// team's, and never a retracted one or one that touches evidence. Team U's
+/// map, asked about T's claims too, gets none of their edges, not even U's
+/// own edge between two of them or a public edge from one; the public map
+/// gets public edges between public claims only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn map_claim_links_return_only_claim_edges_the_map_may_draw(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let u = team(&pool, "team-u").await;
+    let world = fixture::world_group(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let filer = agent(&pool).await;
+    let tc = claims(&pool, filer, "group", t, 3).await;
+    let uc = claims(&pool, filer, "group", u, 1).await[0];
+    let uu = claims(&pool, filer, "group", u, 2).await;
+    let pc = claims(&pool, filer, "public", world, 2).await;
+    let c = LeafNode::claim;
+    // In on T's map: T's own edge (070 stamps it T's from its endpoints).
+    edge(&pool, c(tc[0]), c(tc[1]), "supports").await;
+    // In on T's map only: a public edge from T's claim to a public claim.
+    let public = edge(&pool, c(tc[0]), c(pc[0]), "elaborates").await;
+    make_public(&pool, public, world).await;
+    // In on every map that draws both: a public edge between public claims.
+    let both_public = edge(&pool, c(pc[0]), c(pc[1]), "cites").await;
+    make_public(&pool, both_public, world).await;
+    // Out: co-owned by T and U.
+    let co = edge(&pool, c(tc[1]), c(tc[2]), "refutes").await;
+    force_edge(&pool, co, t, Some(u)).await;
+    // Out: owned by U, between two of T's claims.
+    let other = edge(&pool, c(tc[2]), c(tc[0]), "supports").await;
+    force_edge(&pool, other, u, None).await;
+    // In on U's map only: U's own edge between U's claims.
+    edge(&pool, c(uu[0]), c(uu[1]), "supports").await;
+    // Out: retracted.
+    let gone = edge(&pool, c(tc[1]), c(tc[0]), "cites").await;
+    retract_edge(&pool, gone).await;
+    // Out: evidence to a claim, and a claim edge to a claim not asked for.
+    evidence(&pool, tc[0], 1).await;
+    edge(&pool, c(tc[0]), c(uc), "supports").await;
+
+    // Every map is asked about every claim but `uc`: the read itself must
+    // drop the claims a map may not draw.
+    let ids = [tc[0], tc[1], tc[2], uu[0], uu[1], pc[0], pc[1]];
+    let mut conn = pool.acquire().await.unwrap();
+    let sorted = |mut v: Vec<(Uuid, Uuid, String)>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        links(&mut conn, &system, AtlasMap::Team(t), &ids).await,
+        sorted(vec![
+            (tc[0], tc[1], "supports".to_string()),
+            (tc[0], pc[0], "elaborates".to_string()),
+            (pc[0], pc[1], "cites".to_string()),
+        ]),
+        "team T's map: its own and public edges between claims it draws"
+    );
+    assert_eq!(
+        links(&mut conn, &system, AtlasMap::Public, &ids).await,
+        vec![(pc[0], pc[1], "cites".to_string())],
+        "the public map: public edges between public claims only"
+    );
+    // Team U's map gets neither U's edge between two of T's claims nor the
+    // public edge from one, nor the co-owned one: it draws no claim of T's.
+    assert_eq!(
+        links(&mut conn, &system, AtlasMap::Team(u), &ids).await,
+        sorted(vec![
+            (uu[0], uu[1], "supports".to_string()),
+            (pc[0], pc[1], "cites".to_string()),
+        ]),
+        "team U's map: only edges between claims it may draw"
+    );
+}
+
+/// Atlas W9's leaf claim colour value: `claim_truth_values` returns the
+/// stored `truth_value` of the claims the map may draw, and nothing for a
+/// claim it may not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_truth_values_read_only_the_claims_the_map_may_draw(pool: PgPool) {
+    let t = team(&pool, "team-t").await;
+    let u = team(&pool, "team-u").await;
+    let world = fixture::world_group(&pool).await;
+    let (_scoped, system) = fixture::bypass(&pool).await;
+    let filer = agent(&pool).await;
+    let tc = claims(&pool, filer, "group", t, 1).await[0];
+    let uc = claims(&pool, filer, "group", u, 1).await[0];
+    let pc = claims(&pool, filer, "public", world, 1).await[0];
+    for (id, tv) in [(tc, 0.13_f64), (uc, 0.91), (pc, 0.42)] {
+        sqlx::query("UPDATE claims SET truth_value = $2 WHERE id = $1")
+            .bind(id)
+            .bind(tv)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let ids = [tc, uc, pc];
+    let mut conn = pool.acquire().await.unwrap();
+    let on_t = epigraph_db::AtlasMeaningRepository::claim_truth_values(
+        &mut conn,
+        &system,
+        AtlasMap::Team(t),
+        &ids,
+    )
+    .await
+    .expect("claim_truth_values");
+    assert_eq!(
+        on_t.into_iter().collect::<Vec<_>>(),
+        {
+            let mut want = vec![(tc, 0.13), (pc, 0.42)];
+            want.sort_by_key(|(id, _)| *id);
+            want
+        },
+        "team T's map reads T's and public claims only"
+    );
+    let on_public = epigraph_db::AtlasMeaningRepository::claim_truth_values(
+        &mut conn,
+        &system,
+        AtlasMap::Public,
+        &ids,
+    )
+    .await
+    .expect("claim_truth_values");
+    assert_eq!(on_public.into_iter().collect::<Vec<_>>(), vec![(pc, 0.42)]);
+}
