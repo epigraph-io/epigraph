@@ -1130,6 +1130,36 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
+        Self::create_symmetric_if_absent_signed_conn(conn, None, a, b, relationship, properties)
+            .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_conn`], with the edge it INSERTS
+    /// attested at INSERT by `key` (ruling R-50; see
+    /// [`Self::create_signed_conn`]). The same ANY-STATE dedup and the same
+    /// bare `ON CONFLICT DO NOTHING` (migration 090's index) as the unsigned
+    /// form; a dedup hit writes nothing and returns `false`.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_conn`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            return Ok(
+                insert_attested_conn(conn, key, att, None, SymmetricGuard::AnyState, true)
+                    .await?
+                    .is_some(),
+            );
+        }
         let result = sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)

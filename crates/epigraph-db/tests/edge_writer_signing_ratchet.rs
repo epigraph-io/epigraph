@@ -221,7 +221,9 @@ const BULK_STAGING_COPY: &str = "one INSERT .. SELECT statement copies every app
      edges_staging row (claims:admin); attesting each copy needs a per-row INSERT through the \
      signed primitive with the API key, not yet threaded";
 const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signer";
-const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key";
+const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key, and its one \
+     caller (`run_pipeline`, called only by the cross_source_sweep operator CLI on the \
+     maintenance DSN) has none to pass";
 const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
      analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
      signing caller must receive the edge id";
@@ -274,7 +276,10 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // (`AnalysisRepository::{link_evidence, link_claim}`,
 // `ClaimRepository::inherit_evidence`, `SemanticLinkRepository::create`): no
 // production path called them, so there was no transport key to sign with.
-const UNSIGNED_SITES_HIGH_WATER: usize = 35;
+// 34: the match promotion's matcher edge (`promote_if_pending_conn`), signed
+// with the deciding transport's key through the any-state symmetric twin.
+// Not changed: the matcher pipeline's `write_edge` (NO_KEY_ENGINE).
+const UNSIGNED_SITES_HIGH_WATER: usize = 34;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -560,9 +565,11 @@ const REGISTER: &[Site] = &[
         1,
         Unsigned(PRIMITIVE),
     ),
+    // The matcher's any-state symmetric INSERT: its unsigned arm (the
+    // unsigned `create_symmetric_if_absent_conn` delegates here with no key).
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "create_symmetric_if_absent_conn",
+        "create_symmetric_if_absent_signed_conn",
         1,
         Unsigned(PRIMITIVE),
     ),
@@ -604,12 +611,13 @@ const REGISTER: &[Site] = &[
     // Was `promote_if_pending`; the body moved into its connection form in the
     // raw-pool residual review (the pool form now acquires and delegates), so
     // the MCP promote can write the matcher edge on its author-stamped
-    // transaction. Same INSERT, same count.
+    // transaction. Same INSERT, same count. Signs with the deciding
+    // transport's key (the MCP server's, the API's), passed in.
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
         "promote_if_pending_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-engine/src/matching/policy.rs",

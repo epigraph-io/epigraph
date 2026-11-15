@@ -2504,6 +2504,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "create_symmetric_if_absent_signed_conn",
+        "WRITE. `create_symmetric_if_absent_conn` (which delegates here with no key) attested \
+         at INSERT by the caller's key (backlog dae795f8): the same any-state dedup and bare \
+         ON CONFLICT DO NOTHING, on the caller's connection; authorised by edges_tenancy's \
+         WITH CHECK. It reads no row back to a caller.",
+    ),
+    (
+        "edge.rs",
         "create_symmetric_if_absent_returning_conn",
         "WRITE. `create_symmetric_if_absent_returning` on a caller's connection, for \
          `link_alternative`'s author-stamped transaction. Same argument as \
