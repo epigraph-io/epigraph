@@ -1299,6 +1299,90 @@ async fn a_mixed_owner_cluster_goes_to_review_and_later_units_continue(pool: PgP
     assert_eq!(out["counts"]["failed"], 1, "{out}");
 }
 
+/// The identity edge an applied mark writes (backlog `dae795f8`) is attested
+/// at INSERT by the SERVER's key, never the calling agent's: it verifies as a
+/// valid v1 signature over the row as stored, by the agent holding the key
+/// every test server signs with, and that agent is not the caller.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_applied_marks_identity_edge_is_signed_by_the_server_not_the_caller(pool: PgPool) {
+    use epigraph_crypto::{AgentSigner, SignatureScheme};
+    use epigraph_db::repos::EdgeSignatureRepository;
+
+    let bytes = profile_bytes();
+    let server = superuser_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let survivor = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let loser = seed(
+        &pool,
+        caller,
+        caller_group,
+        "public",
+        PUMP_B,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+
+    let p = plan_params_json(&bytes, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(out["status"], "applied", "{out}");
+    assert!(
+        is_marked_onto(&pool, loser, survivor).await,
+        "precondition: the apply marked the loser onto the survivor: {out}"
+    );
+
+    let edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'same_as' AND valid_to IS NULL AND properties ? 'dedup'",
+    )
+    .bind(loser)
+    .bind(survivor)
+    .fetch_one(&pool)
+    .await
+    .expect("the mark's identity edge");
+    let server_key = AgentSigner::from_bytes(&[0xA7u8; 32])
+        .expect("signer")
+        .public_key();
+    let signer: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+        .bind(server_key.as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("the server's signer agent");
+    assert_ne!(signer, caller, "precondition: the caller is not the server");
+
+    let (_scoped, admin) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let check = EdgeSignatureRepository::verify_conn(&mut conn, &admin, edge)
+        .await
+        .expect("verify")
+        .expect("the identity edge is readable");
+    assert!(
+        check.signed && check.signature_valid,
+        "the identity edge is signed and verifies: {check:?}"
+    );
+    assert_eq!(check.signature_scheme, Some(SignatureScheme::V1), "{check:?}");
+    assert_eq!(check.content_matches, Some(true), "{check:?}");
+    assert_eq!(check.signer_id, Some(signer), "signed by the server: {check:?}");
+    assert_ne!(check.signer_id, Some(caller), "not by the caller: {check:?}");
+}
+
 /// On an application-role server over stdio, every write target takes the
 /// ownership check a cluster member takes (A4), not only the retirement gate:
 ///
