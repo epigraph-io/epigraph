@@ -104,14 +104,18 @@ fn require_write_scope(
 /// caller's own; a named one that is not the caller is `403`. Checked after
 /// the scope and before anything is read, so the refusal says nothing about
 /// the hypothesis, and before anything is written.
+///
+/// Shared with `crud.rs::create_reasoning_trace` (backlog f64cf9c6); `what`
+/// names the write in the no-principal refusal ("an experiment write").
 #[cfg(feature = "db")]
-fn caller_author(
+pub(crate) fn caller_author(
     viewer: &epigraph_db::visibility::Viewer,
     named: Option<Uuid>,
+    what: &str,
 ) -> Result<Uuid, ApiError> {
     let Some(caller) = viewer.principal() else {
         return Err(ApiError::Forbidden {
-            reason: "an experiment write needs an authenticated author".to_string(),
+            reason: format!("{what} needs an authenticated author"),
         });
     };
     if named.is_some_and(|n| n != caller) {
@@ -242,7 +246,7 @@ pub async fn create_experiment(
     Json(req): Json<CreateExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_write_scope(auth_ctx, "POST /api/v1/experiments/new")?;
-    let author = caller_author(&viewer, req.agent_id)?;
+    let author = caller_author(&viewer, req.agent_id, "an experiment write")?;
     require_hypothesis(
         &state,
         &viewer,
@@ -467,7 +471,7 @@ pub async fn analyze_result(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
-    let author = caller_author(&viewer, req.agent_id)?;
+    let author = caller_author(&viewer, req.agent_id, "an experiment write")?;
 
     // Load result
     let result = epigraph_db::ExperimentResultRepository::get(&state.db_pool, result_id)

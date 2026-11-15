@@ -1280,7 +1280,7 @@ mod tests {
         {
             let mut store = state.idempotency_store.write().await;
             store.insert(
-                "test-key".to_string(),
+                (uuid::Uuid::nil(), "test-key".to_string()),
                 crate::state::CachedSubmission {
                     claim_id: uuid::Uuid::new_v4(),
                     truth_value: 0.5,
@@ -1488,7 +1488,7 @@ mod tests {
         {
             let mut store = state.idempotency_store.write().await;
             store.insert(
-                "mutation-test-key".to_string(),
+                (uuid::Uuid::nil(), "mutation-test-key".to_string()),
                 crate::state::CachedSubmission {
                     claim_id: uuid::Uuid::new_v4(),
                     truth_value: 0.5,
