@@ -6,7 +6,6 @@ pub mod bba_retract;
 pub mod bug_report;
 pub mod cdst_maintenance;
 pub mod challenges;
-pub mod claim_context;
 pub mod claim_ids;
 pub mod claims;
 pub mod consolidate;

@@ -127,6 +127,18 @@
 //! snapshot of one agent). Which files the agent ran with is named by
 //! `snapshot_id`, which an admitted caller can look up in
 //! `GET /api/v1/agents/:id/prompt-history`.
+//!
+//! # The same three parts for a paper's ingest
+//!
+//! `GET /api/v1/papers` shows, per ingest of a paper, who ingested it and
+//! with which model (backlog b7354adc). Nothing records that when an ingest
+//! runs, so it is DERIVED: [`AuthoredByRepository::for_paper_ingests`] takes
+//! each ingest principal the caller may read with the instant of its oldest
+//! readable ingest-written edge on the paper
+//! (`PaperRepository::ingest_principals`) and reads the agent, the human and
+//! the snapshot for that (agent, instant) pair with the reads `for_claim`
+//! uses for (filer, `created_at`): one spelling of the binding read and one
+//! of the snapshot gate, shared by both.
 
 use std::collections::HashMap;
 
@@ -349,6 +361,29 @@ impl AuthoredBy {
     }
 }
 
+/// One ingest of a paper as a reader sees it
+/// ([`AuthoredByRepository::for_paper_ingests`]): the principal whose
+/// document ingest wrote the paper's edges, with its human and prompt
+/// snapshot at that ingest's first readable write.
+///
+/// DERIVED, not recorded: nothing is written at ingest that names the
+/// ingest's human or model. These are read from the binding record and the
+/// snapshot history at `first_written_at`, which is itself the oldest
+/// in-force ingest-written edge of the principal on the paper that the
+/// caller can read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaperIngest {
+    /// The ingesting agent, the human it was bound to at `first_written_at`
+    /// (for every reader; `None` when it was bound to no human then, and for
+    /// a human's own ingest), and the prompt snapshot it was running then
+    /// (`None` both when none was active and when the caller is not in the
+    /// audience).
+    pub ingested_by: Filer,
+    /// The principal's oldest readable in-force ingest-written edge on the
+    /// paper.
+    pub first_written_at: DateTime<Utc>,
+}
+
 pub struct AuthoredByRepository;
 
 impl AuthoredByRepository {
@@ -384,18 +419,7 @@ impl AuthoredByRepository {
                 .iter()
                 .map(|r| (r.ingested_by, r.recorded_at)),
         );
-        let bound: Vec<Option<Uuid>> = sqlx::query_as::<_, (i64, Option<Uuid>)>(
-            "SELECT u.n, public.epigraph_operator_bound_at(u.a, u.t) \
-               FROM unnest($1::uuid[], $2::timestamptz[]) WITH ORDINALITY AS u(a, t, n) \
-              ORDER BY u.n",
-        )
-        .bind(asks.iter().map(|(a, _)| *a).collect::<Vec<Uuid>>())
-        .bind(asks.iter().map(|(_, t)| *t).collect::<Vec<DateTime<Utc>>>())
-        .fetch_all(&mut *conn)
-        .await?
-        .into_iter()
-        .map(|(_, h)| h)
-        .collect();
+        let bound: Vec<Option<Uuid>> = Self::bound_at(&mut *conn, &asks).await?;
         let filer_human = bound.first().copied().flatten();
 
         // The documents: the creator's first, then each other document once,
@@ -492,36 +516,13 @@ impl AuthoredByRepository {
         }
         wanted.sort_unstable();
         wanted.dedup();
-        let names: HashMap<Uuid, Option<String>> = sqlx::query_as::<_, (Uuid, Option<String>)>(
-            "SELECT id, display_name FROM agents WHERE id = ANY($1)",
-        )
-        .bind(&wanted)
-        .fetch_all(&mut *conn)
-        .await?
-        .into_iter()
-        .collect();
+        let names: HashMap<Uuid, Option<String>> = Self::display_names(&mut *conn, &wanted).await?;
         let author_ref = |id: Uuid| AuthorRef {
             id,
             display_name: names.get(&id).cloned().flatten(),
         };
 
-        let prompt_snapshot = sqlx::query_as::<_, (Uuid, String, String, DateTime<Utc>)>(
-            "SELECT snapshot_id, model, prompt_hash, started_at \
-               FROM public.epigraph_agent_prompt_snapshot_at($1, $2, $3)",
-        )
-        .bind(agent_id)
-        .bind(created_at)
-        .bind(audience.is_open())
-        .fetch_optional(&mut *conn)
-        .await?
-        .map(
-            |(snapshot_id, model, prompt_hash, started_at)| PromptSnapshotAt {
-                snapshot_id,
-                model,
-                prompt_hash,
-                started_at,
-            },
-        );
+        let prompt_snapshot = Self::snapshot_at(&mut *conn, agent_id, created_at, audience).await?;
 
         let filer = Filer {
             agent: author_ref(agent_id),
@@ -612,5 +613,135 @@ impl AuthoredByRepository {
                 corroboration,
             }),
         })
+    }
+
+    /// Each ingest of paper `paper_id` that `viewer` may read
+    /// ([`PaperRepository::ingest_principals`]: oldest first, at most
+    /// `limit`), with the parts a claim read gives its filer, taken at the
+    /// ingest's first readable write: the ingesting agent, the human it was
+    /// bound to then, and the prompt snapshot it was running then, under
+    /// `audience` (backlog b7354adc).
+    ///
+    /// The three parts come from the reads [`Self::for_claim`] uses, for the
+    /// pair (principal, `first_written_at`) in place of (filer,
+    /// `created_at`): the binding record (`bound_at`), the snapshot
+    /// gate (`snapshot_at`) and the agents' names. So a paper's
+    /// ingest and a claim of that ingest name the same human and admit the
+    /// same callers to the snapshot. No prompt text is read.
+    ///
+    /// `conn` must be `viewer`'s own stamped connection: `viewer` decides
+    /// which ingests exist for this caller (nothing is resolved for an ingest
+    /// whose edges the caller cannot read), and the snapshot gate reads the
+    /// connection's session principal.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a read fails, including on a database
+    /// without migration 199 (42883).
+    pub async fn for_paper_ingests(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        paper_id: Uuid,
+        limit: i64,
+        audience: PromptSnapshotAudience,
+    ) -> Result<Vec<PaperIngest>, DbError> {
+        let principals =
+            PaperRepository::ingest_principals(&mut *conn, viewer, paper_id, limit).await?;
+        if principals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let asks: Vec<(Uuid, DateTime<Utc>)> = principals
+            .iter()
+            .map(|p| (p.ingested_by, p.first_written_at))
+            .collect();
+        let bound = Self::bound_at(&mut *conn, &asks).await?;
+        let mut wanted: Vec<Uuid> = asks.iter().map(|(a, _)| *a).collect();
+        wanted.extend(bound.iter().flatten().copied());
+        wanted.sort_unstable();
+        wanted.dedup();
+        let names = Self::display_names(&mut *conn, &wanted).await?;
+        let author_ref = |id: Uuid| AuthorRef {
+            id,
+            display_name: names.get(&id).cloned().flatten(),
+        };
+        let mut out = Vec::with_capacity(asks.len());
+        for (i, (agent_id, at)) in asks.iter().enumerate() {
+            let prompt_snapshot = Self::snapshot_at(&mut *conn, *agent_id, *at, audience).await?;
+            let human = bound.get(i).copied().flatten();
+            out.push(PaperIngest {
+                ingested_by: Filer {
+                    agent: author_ref(*agent_id),
+                    human: human.filter(|h| h != agent_id).map(author_ref),
+                    prompt_snapshot,
+                },
+                first_written_at: *at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The human each agent of `asks` was bound to at its instant (migration
+    /// 199's `epigraph_operator_bound_at`), in the order of `asks`.
+    async fn bound_at(
+        conn: &mut sqlx::PgConnection,
+        asks: &[(Uuid, DateTime<Utc>)],
+    ) -> Result<Vec<Option<Uuid>>, DbError> {
+        Ok(sqlx::query_as::<_, (i64, Option<Uuid>)>(
+            "SELECT u.n, public.epigraph_operator_bound_at(u.a, u.t) \
+               FROM unnest($1::uuid[], $2::timestamptz[]) WITH ORDINALITY AS u(a, t, n) \
+              ORDER BY u.n",
+        )
+        .bind(asks.iter().map(|(a, _)| *a).collect::<Vec<Uuid>>())
+        .bind(asks.iter().map(|(_, t)| *t).collect::<Vec<DateTime<Utc>>>())
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|(_, h)| h)
+        .collect())
+    }
+
+    /// The prompt snapshot `agent_id` was running at `at`, as the session of
+    /// `conn` may see it under `audience`: migration 199's
+    /// `epigraph_agent_prompt_snapshot_at`, the ONE spelling of the snapshot
+    /// gate. `None` both when no snapshot was active and when the caller is
+    /// not in the audience.
+    async fn snapshot_at(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        at: DateTime<Utc>,
+        audience: PromptSnapshotAudience,
+    ) -> Result<Option<PromptSnapshotAt>, DbError> {
+        Ok(sqlx::query_as::<_, (Uuid, String, String, DateTime<Utc>)>(
+            "SELECT snapshot_id, model, prompt_hash, started_at \
+                   FROM public.epigraph_agent_prompt_snapshot_at($1, $2, $3)",
+        )
+        .bind(agent_id)
+        .bind(at)
+        .bind(audience.is_open())
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(
+            |(snapshot_id, model, prompt_hash, started_at)| PromptSnapshotAt {
+                snapshot_id,
+                model,
+                prompt_hash,
+                started_at,
+            },
+        ))
+    }
+
+    /// The display name of each agent of `ids`; `agents` is readable by every
+    /// session.
+    async fn display_names(
+        conn: &mut sqlx::PgConnection,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Option<String>>, DbError> {
+        Ok(sqlx::query_as::<_, (Uuid, Option<String>)>(
+            "SELECT id, display_name FROM agents WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect())
     }
 }

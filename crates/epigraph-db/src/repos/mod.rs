@@ -14,6 +14,7 @@ pub mod agent_key;
 pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
+pub mod assertion_nonce;
 pub mod atlas_layout;
 pub mod atom_axiom;
 pub mod authored_by;
@@ -76,6 +77,7 @@ pub mod passkey;
 pub mod passkey_ceremony;
 pub mod pattern_template;
 pub mod perspective;
+pub mod policy;
 pub mod political;
 pub mod privatization;
 pub mod provenance;
@@ -86,8 +88,10 @@ pub mod revoked_access_token;
 pub mod role_assignment;
 pub mod scoped_belief;
 pub mod security_event;
+pub mod seed_posture;
 pub mod semantic_link;
 pub mod sheaf;
+pub mod sources;
 pub mod span;
 pub mod structural;
 pub mod system_agent;
@@ -134,7 +138,7 @@ pub use atlas_layout::{
 };
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
-    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperIngest, PaperRef, PromptSnapshotAt,
     PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
@@ -235,6 +239,7 @@ pub use paper::{
     AUTHORED_REPLACES_KEY_RESERVED,
 };
 pub use perspective::PerspectiveRepository;
+pub use policy::PolicyRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
     PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,
@@ -250,6 +255,10 @@ pub use recall_event::{
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
+pub use sources::{
+    SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
+    SourcePage, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX, SOURCE_AUTHORS_MAX,
+};
 pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
@@ -261,6 +270,7 @@ pub use workflow::{
 };
 
 // Privacy / encryption repositories
+pub use assertion_nonce::{AssertionNonceRepository, NonceConsumption};
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};

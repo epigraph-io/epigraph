@@ -49,6 +49,11 @@ pub struct EpiGraphMcpFull {
     /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
     /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
     pub(crate) privileged_pool: Option<&'static str>,
+    /// The tasks tools detach and answer ahead of (a queued document walk, a
+    /// post-commit embedding loop), counted so the stdio entry point can wait
+    /// for them before the process exits. Shared by every clone of the server.
+    /// See [`crate::background`].
+    pub(crate) background: crate::background::BackgroundTasks,
     /// The key every signature this server makes is by. In the legacy modes
     /// it is also the agent's identity (`agents.public_key`); in the
     /// separate-signing-key mode (agent identity lineage design D2) it is the
@@ -1154,6 +1159,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer: Arc::new(signer),
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1199,6 +1205,14 @@ impl EpiGraphMcpFull {
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
         self
+    }
+
+    /// The set of detached tasks this server (and every clone of it) has
+    /// running. `main` takes it before handing the server to the stdio
+    /// transport, and waits on it after the client disconnects.
+    #[must_use]
+    pub fn background_tasks(&self) -> crate::background::BackgroundTasks {
+        self.background.clone()
     }
 
     /// Switch connector-mode elevation on or off (see the field's doc; OFF is
@@ -1294,6 +1308,7 @@ impl EpiGraphMcpFull {
             pool,
             scoped: None,
             privileged_pool: None,
+            background: crate::background::BackgroundTasks::default(),
             signer,
             identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
@@ -1406,7 +1421,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is."
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is. Each row also carries conjunct_estimate (a deterministic estimate of how many independent assertions the text makes) and conjunct_signals (the rules behind an estimate above 1: sentences, semicolon, coordination, enumeration, respectively). Both are advisory: they change neither looks_atomic nor what decompose_claims selects, and a looks_atomic=true row stays terminal whatever its estimate."
     )]
     async fn query_undecomposed_claims(
         &self,
@@ -1482,19 +1497,6 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::workflow_plan::get_workflow_plan(self, viewer, params).await
-    }
-
-    #[tool(
-        description = "Read one claim's structural context BY ID: the same body as GET /api/v1/claims/:id/context. Full mode (no list) returns {claim, paper, papers, section, parents, parts, siblings, edges}: the claim; the paper of its primary document chain and every asserting paper; its level-1 section; its decomposes_to parents and parts; its siblings under the primary parent; and its epistemic edges in both directions (supports, refutes, contradicts, specializes, elaborates, cites, qualifies, corroborates) with per-relationship tallies. Each node carries id, content (clipped to 1500 characters, content_truncated says so), truth_value, is_current, level and theme_id; each list carries items, total and next_cursor. Page mode (list = papers | parents | parts | siblings | edges, with after = a previous next_cursor and limit 1..=200) returns the claim plus that one list. Everything is filtered to what you may read: a hidden node or edge is in no list, total or tally, and a claim you cannot read is reported as not found, the same as an id that names nothing. Use recall_with_context to find claims by text; use this when you have the id."
-    )]
-    async fn claim_context(
-        &self,
-        Parameters(params): Parameters<crate::types::ClaimContextParams>,
-        extensions: rmcp::model::Extensions,
-    ) -> Result<CallToolResult, McpError> {
-        let auth = extensions.get::<epigraph_auth::AuthContext>();
-        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
-        tools::claim_context::claim_context(self, viewer, params).await
     }
 
     #[tool(
@@ -1962,6 +1964,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::recall::recall_with_context(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "The document context of ONE claim, looked up by id: its paper, section, atoms, sibling paragraphs and epistemic edges, with belief fields. Returns {claim_id, context}, where context is exactly the block recall_with_context returns per hit (minus similarity). Use it when you already hold a claim id: searching for the claim's own text can return a near-duplicate instead, and never returns a claim that has no embedding. A claim that is absent or that you cannot read is reported as not found. Read-only; writes no recall audit row."
+    )]
+    async fn claim_context(
+        &self,
+        Parameters(params): Parameters<crate::tools::recall::ClaimContextParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::recall::claim_context(self, viewer, params).await
     }
 
     #[tool(
@@ -3178,14 +3193,17 @@ impl ServerHandler for EpiGraphMcpFull {
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
                 // (d) proxy to the downstream on a fresh caller-token session.
-                // `McpError` IS `rmcp::ErrorData`, so `internal_error` yields the
-                // handler's error type directly (no further conversion).
+                // A failure is answered as what it is (backlog 7ea4bd74): the
+                // downstream's own JSON-RPC error unchanged, and a designed
+                // message for an extension that is down or did not answer.
+                // Every one of these used to reach the caller as the same
+                // redacted "internal error".
                 return self
                     .federation
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map(rmcp::model::CallToolResponse::from)
-                    .map_err(crate::errors::internal_error);
+                    .map_err(|e| crate::errors::federated_call_error(&ext_name, &request.name, e));
             }
 
             // Neither a kernel tool nor a federated route: a ROUTING failure.
