@@ -3051,8 +3051,12 @@ async fn a_lost_revoke_keeps_the_backup_and_a_later_compromised_revoke_sweeps_it
 /// call it (42501), an unknown passkey or an empty reason is refused with
 /// nothing revoked, and its catalog contract is 200's (a definer owned by
 /// `epigraph_maintenance` on `pg_catalog, pg_temp`, EXECUTE-able by neither
-/// PUBLIC nor `epigraph_app`). Mutation: the REVOKE from `epigraph_app`
-/// dropped -> the app call succeeds.
+/// PUBLIC nor `epigraph_app`). Red line: 200's `REVOKE EXECUTE ... FROM
+/// PUBLIC` dropped -> the app call succeeds through PUBLIC's default EXECUTE
+/// (measured red). 200's REVOKE from `epigraph_app` is NOT a red line for this
+/// test: nothing grants functions to `epigraph_app` by default (077's default
+/// privileges cover tables and sequences only), so dropping it leaves the test
+/// green (measured).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_compromised_revoke_is_a_maintenance_only_definer(pool: PgPool) {
     let p = elevated_custodian(&pool, "custodian", 1).await;
