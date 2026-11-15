@@ -859,6 +859,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
+    // raw pool: the `papers` registry rows and their count. `papers` carries
+    // no row security (it is keyed on the document, not on a tenant). Every
+    // claim-derived field (authors, claim count, ingests) is read by
+    // `paper_listings` on the caller's stamped connection, with the viewer.
+    (
+        "papers.rs",
+        "list_papers",
+        &[
+            "sqlx::query(SELECT).fetch_all",
+            "sqlx::query(SELECT).fetch_all",
+            "sqlx::query_scalar(SELECT).fetch_one",
+            "sqlx::query_scalar(SELECT).fetch_one",
+        ],
+    ),
     // gated (`PerspectiveRepository::get_by_id`) then write, on a transaction
     // stamped with the caller's viewer: `perspectives`' owner-scoped UPDATE
     // (migration 117) decides write authority, and the repo answers

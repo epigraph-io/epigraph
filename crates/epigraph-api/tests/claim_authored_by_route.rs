@@ -535,6 +535,175 @@ async fn a_strangers_graft_lists_the_named_person_pending_on_the_wire(pool: PgPo
     }
 }
 
+async fn get_papers(state: &AppState, caller: Uuid, query: &str) -> (StatusCode, Value) {
+    let token = common::mint_token_with_agent(&["claims:read"], caller);
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/papers?{query}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, body)
+}
+
+/// Backlog fe75ef36. `GET /api/v1/papers?doi=` names the paper's authors, in
+/// the extraction's order with a pending author marked, and counts its claims,
+/// under any spelling of the DOI. The count is the CALLER's: a claim of the
+/// paper that is private to a group is counted for a member and not for a
+/// stranger, and a paper nobody has ingested lists no author and no claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_papers_route_lists_authors_and_counts_the_callers_claims(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (member, group) = viewer_fixture::seed_agent_with_group(&pool, "member").await;
+    let (ingester, _) = viewer_fixture::seed_agent_with_group(&pool, "ingester").await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, journal) \
+         VALUES ('10.0000/fixture.list', 'Listed Paper', 'Fixture Letters') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("paper");
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ('10.0000/fixture.bare', 'Bare Paper')")
+        .execute(&pool)
+        .await
+        .expect("bare paper");
+
+    let (second, _) = viewer_fixture::seed_agent_with_group(&pool, "second").await;
+    named(&pool, second, "Second Author").await;
+    let (first, _) = viewer_fixture::seed_agent_with_group(&pool, "first").await;
+    named(&pool, first, "First Author").await;
+    let (person, _) = viewer_fixture::seed_agent_with_group(&pool, "person").await;
+    named(&pool, person, "Named Person").await;
+
+    let public_claim =
+        viewer_fixture::seed_public_claim(&pool, ingester, "a public claim of the paper").await;
+    let private_claim =
+        viewer_fixture::seed_group_claim(&pool, member, group, "a group claim of the paper").await;
+    ingest_record(
+        &pool,
+        doc,
+        public_claim,
+        ingester,
+        true,
+        &[first, second, person],
+    )
+    .await;
+    ingest_record(&pool, doc, private_claim, ingester, true, &[]).await;
+    authored_edge(
+        &pool,
+        second,
+        doc,
+        ingester,
+        json!({"position": 1, "role": "author", "affiliations": []}),
+    )
+    .await;
+    authored_edge(
+        &pool,
+        first,
+        doc,
+        ingester,
+        json!({"position": 0, "role": "corresponding", "affiliations": ["Fixture Institute"]}),
+    )
+    .await;
+    authored_edge(
+        &pool,
+        person,
+        doc,
+        ingester,
+        json!({"position": 2, "pending_countersign": true, "ingested_by": ingester.to_string()}),
+    )
+    .await;
+
+    // Every spelling of the document key finds the one paper.
+    for spelling in [
+        "10.0000/fixture.list",
+        "doi:10.0000/fixture.list",
+        "https://doi.org/10.0000/fixture.list",
+    ] {
+        let (status, body) = get_papers(&state, stranger, &format!("doi={spelling}")).await;
+        assert_eq!(status, StatusCode::OK, "{spelling}: {body}");
+        assert_eq!(body["total"], json!(1), "{spelling}: {body}");
+        assert_eq!(body["items"][0]["id"], json!(doc), "{spelling}: {body}");
+    }
+
+    let (_, body) = get_papers(&state, stranger, "doi=10.0000/fixture.list").await;
+    let item = &body["items"][0];
+    assert_eq!(item["title"], json!("Listed Paper"));
+    assert_eq!(item["journal"], json!("Fixture Letters"));
+    assert_eq!(
+        item["authors"],
+        json!([
+            {"agent_id": first, "name": "First Author", "position": 0,
+             "role": "corresponding", "affiliations": ["Fixture Institute"],
+             "pending_countersign": false},
+            {"agent_id": second, "name": "Second Author", "position": 1,
+             "role": "author", "affiliations": [],
+             "pending_countersign": false},
+            {"agent_id": person, "name": "Named Person", "position": 2,
+             "role": "author", "affiliations": [],
+             "pending_countersign": true},
+        ]),
+        "{item}"
+    );
+    assert_eq!(item["authors_truncated"], json!(false));
+    assert_eq!(
+        item["ingests"]
+            .as_array()
+            .expect("ingests")
+            .iter()
+            .map(|i| i["ingested_by"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(ingester)],
+        "{item}"
+    );
+    assert_eq!(
+        item["claim_count"],
+        json!(1),
+        "a stranger counts the public claim only: {item}"
+    );
+
+    let (_, member_body) = get_papers(&state, member, "doi=10.0000/fixture.list").await;
+    assert_eq!(
+        member_body["items"][0]["claim_count"],
+        json!(2),
+        "a member also counts its group's claim: {member_body}"
+    );
+
+    // A paper with no ingest: the fields are present and empty.
+    let (_, bare) = get_papers(&state, stranger, "doi=10.0000/fixture.bare").await;
+    let bare_item = &bare["items"][0];
+    assert_eq!(bare_item["authors"], json!([]), "{bare_item}");
+    assert_eq!(bare_item["claim_count"], json!(0), "{bare_item}");
+    assert_eq!(bare_item["ingests"], json!([]), "{bare_item}");
+
+    // The unfiltered list carries the same fields on every row.
+    let (status, all) = get_papers(&state, stranger, "limit=10").await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    let listed = all["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|p| p["id"] == json!(doc))
+        .expect("the paper is on the list")
+        .clone();
+    assert_eq!(listed["claim_count"], json!(1), "{listed}");
+    assert_eq!(
+        listed["authors"].as_array().map(Vec::len),
+        Some(3),
+        "{listed}"
+    );
+}
+
 /// The ingest's `asserts` edge and its record (with the authors it resolved),
 /// written with the walk's own primitives (ingest-written, by `by`). Returns
 /// the asserts edge.
