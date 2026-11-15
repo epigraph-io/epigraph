@@ -229,6 +229,7 @@ impl MassFunction {
     /// Create a new mass function with validation
     ///
     /// # Errors
+    /// - `DsError::InvalidProbability` if any mass is NaN
     /// - `DsError::NegativeMass` if any mass is negative
     /// - `DsError::ElementOutsideFrame` if a positive subset contains invalid indices
     /// - `DsError::InvalidMassSum` if masses don't sum to 1.0
@@ -237,6 +238,12 @@ impl MassFunction {
         masses: BTreeMap<FocalElement, f64>,
     ) -> Result<Self, DsError> {
         for (fe, &mass) in &masses {
+            // NaN first: `NaN < 0.0` and `(NaN - 1.0).abs() > tol` are both
+            // false, so without this a NaN mass passes every check below.
+            // (Infinities are already refused: -inf as negative, +inf by the sum.)
+            if mass.is_nan() {
+                return Err(DsError::InvalidProbability { value: mass });
+            }
             if mass < 0.0 {
                 return Err(DsError::NegativeMass { value: mass });
             }
@@ -296,12 +303,16 @@ impl MassFunction {
     /// Both focal elements are positive (standard DS).
     ///
     /// # Errors
-    /// Returns error if `mass` is not in [0, 1] or `subset` is invalid.
+    /// Returns error if `mass` is NaN or not in [0, 1], or `subset` is invalid.
     pub fn simple(
         frame: FrameOfDiscernment,
         subset: BTreeSet<usize>,
         mass: f64,
     ) -> Result<Self, DsError> {
+        // NaN compares false against both bounds below, so refuse it here.
+        if mass.is_nan() {
+            return Err(DsError::InvalidProbability { value: mass });
+        }
         if mass < 0.0 {
             return Err(DsError::NegativeMass { value: mass });
         }
@@ -335,12 +346,16 @@ impl MassFunction {
     /// Evidence that truth is *outside* subset.
     ///
     /// # Errors
-    /// Returns error if `mass` is not in [0, 1] or `subset` is invalid.
+    /// Returns error if `mass` is NaN or not in [0, 1], or `subset` is invalid.
     pub fn simple_negative(
         frame: FrameOfDiscernment,
         subset: BTreeSet<usize>,
         mass: f64,
     ) -> Result<Self, DsError> {
+        // NaN compares false against both bounds below, so refuse it here.
+        if mass.is_nan() {
+            return Err(DsError::InvalidProbability { value: mass });
+        }
         if mass < 0.0 {
             return Err(DsError::NegativeMass { value: mass });
         }
@@ -797,6 +812,48 @@ mod tests {
         masses.insert(FocalElement::positive(BTreeSet::from([1])), 0.3);
         let result = MassFunction::new(frame, masses);
         assert!(matches!(result, Err(DsError::InvalidMassSum { .. })));
+    }
+
+    /// `NaN < 0.0` and `(NaN - 1.0).abs() > tol` are both false, so a NaN
+    /// mass used to pass every check in the validating constructors.
+    #[test]
+    fn reject_nan_mass() {
+        let frame = binary_frame();
+        let mut masses = BTreeMap::new();
+        masses.insert(FocalElement::positive(BTreeSet::from([0])), f64::NAN);
+        masses.insert(FocalElement::theta(&frame), 0.5);
+        assert!(matches!(
+            MassFunction::new(frame.clone(), masses),
+            Err(DsError::InvalidProbability { .. })
+        ));
+        assert!(matches!(
+            MassFunction::simple(frame.clone(), BTreeSet::from([0]), f64::NAN),
+            Err(DsError::InvalidProbability { .. })
+        ));
+        assert!(matches!(
+            MassFunction::simple_negative(frame, BTreeSet::from([0]), f64::NAN),
+            Err(DsError::InvalidProbability { .. })
+        ));
+    }
+
+    /// The infinities were already refused; pinned so the NaN check above
+    /// stays the only gap that needed closing.
+    #[test]
+    fn reject_infinite_mass() {
+        let frame = binary_frame();
+        for bad in [f64::INFINITY, f64::NEG_INFINITY] {
+            let mut masses = BTreeMap::new();
+            masses.insert(FocalElement::positive(BTreeSet::from([0])), bad);
+            assert!(MassFunction::new(frame.clone(), masses).is_err(), "{bad}");
+            assert!(
+                MassFunction::simple(frame.clone(), BTreeSet::from([0]), bad).is_err(),
+                "{bad}"
+            );
+            assert!(
+                MassFunction::simple_negative(frame.clone(), BTreeSet::from([0]), bad).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -2281,3 +2281,153 @@ fn the_fixture_seeds_exactly_the_tables_the_seal_deletes() {
         "the fixture's derived-table list and the seal mutation's DELETE list disagree"
     );
 }
+
+// =========================================================================
+// The theme channel (backlog f43ef0a6)
+// =========================================================================
+
+/// A `pgvector` literal whose even entries are `1` and odd entries `0`
+/// (`phase = 0`), or the reverse (`phase = 1`). Two phases are ORTHOGONAL, so
+/// the centroid of one of each is at a measurable cosine distance from both;
+/// [`vector_literal`]'s constant vectors all point the same way and would make
+/// any centroid assertion vacuous.
+fn alternating_literal(dims: usize, phase: usize) -> String {
+    let body: Vec<&str> = (0..dims)
+        .map(|i| {
+            if (i + phase).is_multiple_of(2) {
+                "1"
+            } else {
+                "0"
+            }
+        })
+        .collect();
+    format!("[{}]", body.join(","))
+}
+
+async fn seed_theme(pool: &PgPool, label: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, description) VALUES ($1, 'seal fixture') RETURNING id",
+    )
+    .bind(label)
+    .fetch_one(pool)
+    .await
+    .expect("seed theme")
+}
+
+async fn place_in_theme(pool: &PgPool, claim: Uuid, theme: Uuid, phase: usize) {
+    sqlx::query("UPDATE claims SET theme_id = $2, embedding = $3::vector WHERE id = $1")
+        .bind(claim)
+        .bind(theme)
+        .bind(alternating_literal(1536, phase))
+        .execute(pool)
+        .await
+        .expect("place the claim in the theme");
+}
+
+/// `(claim_count, centroid IS NULL, cosine distance from centroid to the
+/// phase-`phase` vector)`; the distance is `None` when the centroid is NULL.
+async fn theme_state(pool: &PgPool, theme: Uuid, phase: usize) -> (i32, bool, Option<f64>) {
+    sqlx::query_as(
+        "SELECT claim_count, centroid IS NULL, (centroid <=> $2::vector)::float8 \
+           FROM claim_themes WHERE id = $1",
+    )
+    .bind(theme)
+    .bind(alternating_literal(1536, phase))
+    .fetch_one(pool)
+    .await
+    .expect("read theme")
+}
+
+async fn recompute(pool: &PgPool, theme: Uuid) {
+    let (_scoped, viewer) = viewer_fixture::bypass(pool).await;
+    epigraph_db::ClaimThemeRepository::recompute_centroid_for_theme(pool, &viewer, theme)
+        .await
+        .expect("recompute centroid");
+}
+
+/// A sealed claim leaves its theme, and the theme's centroid and count no
+/// longer include it, in the seal's own transaction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_takes_the_sealed_vector_out_of_its_themes_centroid_and_count(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sealed = seed_sealable_claim(&pool, &world, "the sealed theme member").await;
+    let kept = seed_sealable_claim(&pool, &world, "the theme member that stays").await;
+    let theme = seed_theme(&pool, "seal-mixed-theme").await;
+    place_in_theme(&pool, sealed, theme, 0).await;
+    place_in_theme(&pool, kept, theme, 1).await;
+    recompute(&pool, theme).await;
+
+    // CALIBRATION: before the seal the centroid averages BOTH members, so it
+    // is measurably far from the kept member's vector alone.
+    let (count, null, distance) = theme_state(&pool, theme, 1).await;
+    assert_eq!(count, 2, "fixture: two embedded members");
+    assert!(!null, "fixture: the theme has a centroid");
+    let distance = distance.expect("a centroid");
+    assert!(
+        distance > 0.2,
+        "fixture: the two-member centroid is not the kept vector (distance {distance})"
+    );
+
+    let payload = seal_payload(&pool, sealed).await;
+    assert_eq!(commit_seal(&pool, &world, &[payload]).await, vec![sealed]);
+
+    let theme_of: Option<Uuid> = sqlx::query_scalar("SELECT theme_id FROM claims WHERE id = $1")
+        .bind(sealed)
+        .fetch_one(&pool)
+        .await
+        .expect("read sealed theme_id");
+    assert_eq!(theme_of, None, "the sealed claim leaves its theme");
+
+    let (count, null, distance) = theme_state(&pool, theme, 1).await;
+    assert_eq!(count, 1, "the count no longer includes the sealed member");
+    assert!(
+        !null,
+        "the theme keeps a centroid over its remaining member"
+    );
+    let distance = distance.expect("a centroid");
+    assert!(
+        distance < 1e-6,
+        "the centroid is the remaining member's vector alone (distance {distance})"
+    );
+
+    let kept_theme: Option<Uuid> = sqlx::query_scalar("SELECT theme_id FROM claims WHERE id = $1")
+        .bind(kept)
+        .fetch_one(&pool)
+        .await
+        .expect("read kept theme_id");
+    assert_eq!(
+        kept_theme,
+        Some(theme),
+        "an unsealed member stays in the theme"
+    );
+}
+
+/// The worst case: a theme whose only embedded member is sealed. Its centroid
+/// IS the sealed vector until it is recomputed, so the seal must clear it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_clears_the_centroid_of_a_theme_it_leaves_with_no_embedded_member(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sealed = seed_sealable_claim(&pool, &world, "the only theme member").await;
+    let theme = seed_theme(&pool, "seal-singleton-theme").await;
+    place_in_theme(&pool, sealed, theme, 0).await;
+    recompute(&pool, theme).await;
+
+    // CALIBRATION: the one-member centroid is exactly the sealed vector.
+    let (count, null, distance) = theme_state(&pool, theme, 0).await;
+    assert_eq!(count, 1, "fixture: one embedded member");
+    assert!(!null, "fixture: the theme has a centroid");
+    assert!(
+        distance.expect("a centroid") < 1e-6,
+        "fixture: a one-member centroid is that member's vector"
+    );
+
+    let payload = seal_payload(&pool, sealed).await;
+    assert_eq!(commit_seal(&pool, &world, &[payload]).await, vec![sealed]);
+
+    let (count, null, _) = theme_state(&pool, theme, 0).await;
+    assert_eq!(count, 0, "no embedded member remains");
+    assert!(
+        null,
+        "a centroid that was the sealed vector must not survive the seal"
+    );
+}

@@ -737,12 +737,20 @@ pub fn apply_context_modifier(
 ///
 /// # Errors
 /// - `DsError::IncompatibleFrames` if frames differ.
+/// - `DsError::FrameTooLarge` above [`CAUTIOUS_RULE_MAX_HYPOTHESES`]: the
+///   Moebius inversion below compares every pair of subsets, `O(4^n)`.
 pub fn cautious_combine(m1: &MassFunction, m2: &MassFunction) -> Result<MassFunction, DsError> {
     use crate::measures::commonality;
 
     check_frame_compat(m1, m2)?;
 
     let frame = m1.frame();
+    // `power_set` alone allows 20 hypotheses (about a million subsets), and
+    // the nested loop below would then run about 10^12 subset comparisons.
+    let n = frame.hypothesis_count();
+    if n > CAUTIOUS_RULE_MAX_HYPOTHESES {
+        return Err(DsError::FrameTooLarge { n });
+    }
     let power_set = frame.power_set()?;
 
     // 1. Compute combined commonality: q(A) = min(q1(A), q2(A))
@@ -960,9 +968,18 @@ pub fn cross_frame_combine(
     redistribute(&m1_reindexed, &m2_reindexed, method, gamma)
 }
 
-/// Check that two mass functions are defined on the same frame
+/// Check that two mass functions are defined on the same frame: the same id
+/// AND the same hypotheses in the same order, which is what
+/// `FrameOfDiscernment`'s `PartialEq` means by equal.
+///
+/// Comparing the id alone (backlog e5da67ef) admitted two frames that share an
+/// id and differ in hypotheses, which `FrameOfDiscernment::extend` produces by
+/// construction. Focal sets are indices into the frame, so combining across
+/// such a pair reads one operand's indices against the other's hypothesis
+/// list. That is what `cross_frame_combine` (reindex onto the union frame) is
+/// for.
 fn check_frame_compat(m1: &MassFunction, m2: &MassFunction) -> Result<(), DsError> {
-    if m1.frame().id != m2.frame().id {
+    if m1.frame() != m2.frame() {
         return Err(DsError::IncompatibleFrames {
             left: m1.frame().id.clone(),
             right: m2.frame().id.clone(),
@@ -1065,6 +1082,41 @@ pub fn combine_alternative_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backlog e5da67ef: `check_frame_compat` compared the frame id alone, so
+    /// a mass on a frame and a mass on that frame EXTENDED (same id, one more
+    /// hypothesis, which is what `FrameOfDiscernment::extend` returns) were
+    /// combined index against index. They are different frames by the type's
+    /// own `PartialEq`, and the combine must say so.
+    #[test]
+    fn combining_across_a_frame_and_its_extension_is_incompatible() {
+        let base = FrameOfDiscernment::new("f", vec!["a".into(), "b".into()]).unwrap();
+        let extended = base.extend(vec!["c".into()]).unwrap();
+        assert_eq!(base.id, extended.id, "extend keeps the id");
+        assert_ne!(base, extended, "and changes the hypotheses");
+
+        let on_base = MassFunction::simple(base.clone(), BTreeSet::from([0]), 0.8).unwrap();
+        // {c}: index 2 does not exist on the base frame.
+        let on_extended = MassFunction::simple(extended, BTreeSet::from([2]), 0.6).unwrap();
+
+        for (name, result) in [
+            ("conjunctive", conjunctive_combine(&on_base, &on_extended)),
+            ("dempster", dempster_combine(&on_base, &on_extended)),
+        ] {
+            assert!(
+                matches!(result, Err(DsError::IncompatibleFrames { .. })),
+                "{name}: same id, different hypotheses must be refused, got {result:?}"
+            );
+        }
+
+        // The same frame built twice is still the same frame.
+        let again = FrameOfDiscernment::new("f", vec!["a".into(), "b".into()]).unwrap();
+        let other = MassFunction::simple(again, BTreeSet::from([1]), 0.5).unwrap();
+        assert!(
+            dempster_combine(&on_base, &other).is_ok(),
+            "two masses on equal frames combine as before"
+        );
+    }
     use crate::frame::FrameOfDiscernment;
 
     fn binary_frame() -> FrameOfDiscernment {
@@ -1643,6 +1695,26 @@ mod tests {
             (combined_mass - original_mass).abs() < 1e-10,
             "Cautious combination should be idempotent: {combined_mass} vs {original_mass}",
         );
+    }
+
+    /// The public function used to rely on `power_set`'s cap of 20 alone,
+    /// where its pairwise subset loop is about 10^12 comparisons.
+    #[test]
+    fn cautious_combine_refuses_a_frame_above_the_cautious_cap() {
+        let at_cap = CAUTIOUS_RULE_MAX_HYPOTHESES;
+        let frame_of = |n: usize| {
+            FrameOfDiscernment::new("big", (0..n).map(|i| format!("h{i}")).collect()).unwrap()
+        };
+
+        let over = MassFunction::vacuous(frame_of(at_cap + 1));
+        assert_eq!(
+            cautious_combine(&over, &over).unwrap_err(),
+            DsError::FrameTooLarge { n: at_cap + 1 }
+        );
+
+        // The engine's only caller stays below the cap (8 hypotheses).
+        let small = MassFunction::vacuous(frame_of(8));
+        assert!(cautious_combine(&small, &small).is_ok());
     }
 
     #[test]
