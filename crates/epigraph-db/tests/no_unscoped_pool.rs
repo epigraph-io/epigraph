@@ -556,7 +556,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        19,
+        20,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -576,7 +576,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          the app that obtained the code (by its `client_id`, any status, as `register` does), \
          and the refresh grant's lookup of the app a chain was issued to (by id), each reading \
          one `oauth_clients` row's status before anything is minted, the same \
-         pre-authentication reason.",
+         pre-authentication reason. The twentieth is migration 213's single-use check of an \
+         agent's assertion (`AssertionNonceRepository::consume`), an app-callable definer keyed \
+         by the verified public key and the assertion's signed nonce, run after the signature and freshness \
+         verify and before anything is minted: the same pre-authentication reason.",
     ),
     (
         "routes/elevate.rs",

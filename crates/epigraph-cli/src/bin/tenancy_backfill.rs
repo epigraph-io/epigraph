@@ -2228,6 +2228,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // read is filtered to the session principal's own rows: fail CLOSED,
     // fewer roles shown, never more.
     ("epigraph_disclosed_role_assignments", 198),
+    // 213 (backlog 950696a1), single use of an agent's client_credentials
+    // assertion: the ONLY write path into `oauth_assertion_nonces`, whose
+    // application-role DML 213 revokes. Under an APP-owned body it fails
+    // CLOSED with 42501 (every agent client_credentials and refresh grant
+    // answers 500 and nothing is minted, loud); under the migration runner's
+    // superuser it keeps working with more authority than intended (083's
+    // case). The table has no row security, so a non-member owner changes
+    // nothing else.
+    ("epigraph_oauth_assertion_nonce_consume", 213),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2864,6 +2873,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_bug_report_gate",
             "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
             false,
+        ),
+        // 213: every agent client_credentials and refresh grant records its
+        // assertion nonce on the request DSN; a missing grant refuses every
+        // agent mint (500).
+        (
+            "epigraph_oauth_assertion_nonce_consume",
+            "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
+            true,
         ),
         (
             "epigraph_confirm_admin_act",
