@@ -3822,7 +3822,8 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_patch_requires_auth_401() {
-        let pool = test_pool_or_skip!();
+        // Only the skip matters here: the request is refused before any read.
+        let _pool = test_pool_or_skip!();
         let claim_id = Uuid::new_v4();
 
         // Router WITHOUT injected AuthContext extension
