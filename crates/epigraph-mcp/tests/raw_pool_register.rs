@@ -600,10 +600,33 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          the existence check is viewer_reads_row on read_as) and one REGISTERED_WRITE \
          (BehavioralExecutionRepository::create, a table with no tenancy).",
     ),
+    (
+        "epigraph-mcp/src/unauthenticated_reader.rs",
+        "find_or_create",
+        2,
+        "NO_ROW_SECURITY: finds or creates the `--allow-unauthenticated-http` reader agent by its \
+         public key (AgentRepository::get_by_public_key / create, twice for the lost-race \
+         lookup); `agents` carries no tenancy row security, and there is no caller to stamp \
+         from because this IS the identity the listener reads as.",
+    ),
+    (
+        "epigraph-mcp/src/unauthenticated_reader.rs",
+        "resolve",
+        1,
+        "PRE_VIEWER: asserts the reader agent holds no live membership through \
+         GroupMembershipRepository::list_live_for_agent, the `epigraph_live_memberships` \
+         SECURITY DEFINER read that answers without a stamp (the same read Viewer::resolve \
+         makes); it runs before the zero-membership viewer exists, so stamping would be \
+         circular.",
+    ),
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 84;
+///
+/// 84 -> 87 when `unauthenticated_reader.rs` (security(mcp): read the
+/// unauthenticated listener as a zero-membership principal) added its three
+/// registered pre-viewer identity sites; none is a viewer-filtered read.
+const HIGH_WATER: usize = 87;
 
 // ===========================================================================
 // The scanner.
