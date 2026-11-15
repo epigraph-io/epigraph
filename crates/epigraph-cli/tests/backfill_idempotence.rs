@@ -1746,6 +1746,109 @@ async fn a_seed_fragment_on_a_world_claim_is_neither_moved_nor_counted(pool: PgP
     );
 }
 
+// ── F-089-A: a fragment with several citing claims (migration 218's rule) ──
+
+/// One more provenance row for `fragment`, inserted with migration 089's
+/// stamping trigger DISABLED, as [`seed_unstamped_fragment`] inserts its own.
+async fn link_unstamped(pool: &PgPool, claim: Uuid, fragment: Uuid) {
+    let mut tx = pool.begin().await.expect("begin");
+    for (sql, what) in [
+        (
+            "ALTER TABLE harvester_claim_provenance \
+             DISABLE TRIGGER harvester_claim_provenance_fragment_inherit_tenancy",
+            "disable 089 trigger",
+        ),
+        (
+            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
+            "link",
+        ),
+        (
+            "ALTER TABLE harvester_claim_provenance \
+             ENABLE TRIGGER harvester_claim_provenance_fragment_inherit_tenancy",
+            "re-enable 089 trigger",
+        ),
+    ] {
+        let q = sqlx::query(sql);
+        let q = if sql.contains("$1") {
+            q.bind(claim).bind(fragment)
+        } else {
+            q
+        };
+        q.execute(&mut *tx).await.expect(what);
+    }
+    tx.commit().await.expect("commit");
+}
+
+/// F-089-A (migration 218's rule, applied by the backfill). A world-owned
+/// fragment cited by a public claim and a group-private claim is repaired to
+/// the PRIVATE claim's tenancy, and of two group-private citers to the lower
+/// owner id, whichever provenance row is on disk first. Each shape is seeded
+/// twice with its two rows in opposite orders, so a rule that took whichever
+/// joined row the plan produced cannot satisfy both. `verify` counts exactly
+/// the four fragments before and none after.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_citer_fragment_takes_its_most_restrictive_claim(pool: PgPool) {
+    let a = fixture::seed_agent_with_group(&pool, "multi citer a").await;
+    let b = fixture::seed_agent_with_group(&pool, "multi citer b").await;
+    let ((agent_lo, lo), (agent_hi, hi)) = if a.1 < b.1 { (a, b) } else { (b, a) };
+    let public_lo = seed_public_claim_owned_by(&pool, agent_lo, lo, "public lo").await;
+    let private_hi = seed_group_private_claim(&pool, agent_hi, hi, "private hi").await;
+    let private_lo = seed_group_private_claim(&pool, agent_lo, lo, "private lo").await;
+
+    let mut cases = Vec::new();
+    for (first, second, want, what) in [
+        (public_lo, private_hi, (hi, "group"), "public citer first"),
+        (private_hi, public_lo, (hi, "group"), "private citer first"),
+        (private_lo, private_hi, (lo, "group"), "lower group first"),
+        (private_hi, private_lo, (lo, "group"), "higher group first"),
+    ] {
+        let f = seed_unstamped_fragment(&pool, WORLD, first).await;
+        link_unstamped(&pool, second, f).await;
+        assert_eq!(
+            fragment_tenancy(&pool, f).await,
+            (WORLD, "public".to_string()),
+            "CALIBRATION ({what}): the 089 trigger must not have stamped the fragment"
+        );
+        cases.push((f, want, what));
+    }
+
+    let platform = &["verify", "--legacy-owner", "platform"][..];
+    let (_code, stderr) = run_backfill(&pool, platform).await;
+    let line = fragment_line(&stderr)
+        .unwrap_or_else(|| panic!("verify must report harvester_fragments: {stderr}"));
+    assert!(
+        line.contains("FAIL: 4 row(s) in harvester_fragments"),
+        "verify must count the four multi-citer fragments; got: {line}"
+    );
+
+    let (code, stderr) = run_backfill(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "platform",
+            "--entity",
+            "harvester-fragments",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "the fragment arm must succeed; stderr: {stderr}");
+    for (f, (owner, vis), what) in cases {
+        assert_eq!(
+            fragment_tenancy(&pool, f).await,
+            (owner, vis.to_string()),
+            "{what}: the fragment must take its most restrictive citing claim's tenancy \
+             (group before public, then the lower owner id), not whichever row came first"
+        );
+    }
+    let (_code, stderr) = run_backfill(&pool, platform).await;
+    assert_eq!(
+        fragment_line(&stderr),
+        None,
+        "after the repair no harvester_fragments row is residual: {stderr}"
+    );
+}
+
 // ── strict verify lists harvester_claim_provenance offenders (d5e6575c) ──
 
 /// Backlog d5e6575c. `harvester_claim_provenance` has no `id` column (its key

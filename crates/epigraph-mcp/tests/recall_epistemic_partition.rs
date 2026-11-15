@@ -405,6 +405,7 @@ mod ctxfx {
             since: None,
             epistemic_partition,
             diversity_radius: None,
+            group_by_parent: false,
         }
     }
 }
