@@ -473,6 +473,14 @@ async fn main() {
             .with_bp_apply(bp_apply_from_env())
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
+        // The router wraps every route in `rate_limit_middleware`, which is a
+        // no-op unless a limiter is installed, and nothing installed one
+        // (backlog 966164c8). Opt-in, from the environment; the log line
+        // below says which state this process is in.
+        let state = match rate_limiter_from_env() {
+            Some(limiter) => state.with_rate_limiter(limiter),
+            None => state,
+        };
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the
@@ -811,6 +819,41 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
         );
     }
     switch
+}
+
+/// `EPIGRAPH_RATE_LIMIT_RPM` (and the optional
+/// `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM`), read once at boot: the limiter the
+/// router's `rate_limit_middleware` enforces, or `None` when the operator set
+/// none. Logged either way, so a journal shows whether this process limits
+/// requests at all; an unusable value refuses to start (exit 1) rather than
+/// serve unlimited while a limit is believed to be installed.
+#[cfg(feature = "db")]
+fn rate_limiter_from_env() -> Option<epigraph_api::AgentRateLimiter> {
+    use epigraph_api::security::rate_limit::{RATE_LIMIT_GLOBAL_RPM_ENV, RATE_LIMIT_RPM_ENV};
+    let per_client = std::env::var(RATE_LIMIT_RPM_ENV).ok();
+    let global = std::env::var(RATE_LIMIT_GLOBAL_RPM_ENV).ok();
+    match epigraph_api::RateLimitConfig::from_env_values(per_client.as_deref(), global.as_deref()) {
+        Ok(Some(config)) => {
+            tracing::info!(
+                per_client_rpm = config.default_rpm,
+                global_rpm = config.enable_global_limit.then_some(config.global_rpm),
+                "Rate limiting: ON (keyed by client IP; health probes exempt)"
+            );
+            Some(epigraph_api::AgentRateLimiter::new(config))
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "Rate limiting: OFF. {RATE_LIMIT_RPM_ENV} is not set, so no request is rate \
+                 limited by this process, the anonymous /oauth and /elevate endpoints included. \
+                 Set it, or limit at the reverse proxy."
+            );
+            None
+        }
+        Err(reason) => {
+            tracing::error!("Rate limiting is misconfigured: {reason}. Refusing to start.");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a
