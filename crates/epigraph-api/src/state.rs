@@ -42,8 +42,11 @@ pub struct CachedSubmission {
     pub created_at: Instant,
 }
 
-/// Idempotency store type alias
-pub type IdempotencyStore = Arc<RwLock<HashMap<String, CachedSubmission>>>;
+/// Idempotency store type alias.
+///
+/// Keyed by `(authenticated principal, client idempotency key)`: a client key
+/// is only unique within the caller that chose it (backlog 449bc6c1).
+pub type IdempotencyStore = Arc<RwLock<HashMap<(Uuid, String), CachedSubmission>>>;
 
 /// Thread-safe propagation orchestrator type alias
 pub type SharedOrchestrator = Arc<RwLock<PropagationOrchestrator>>;
@@ -347,11 +350,12 @@ pub struct AppState {
     /// §5 tells operators their dashboards for those two event types will read
     /// empty.
     ///
-    /// Not deleted here because removing it means touching `AppState`'s two
-    /// non-db constructors, and the `not(feature = "db")` configuration does
-    /// not compile today (28 pre-existing errors), so the change could not be
-    /// verified. It is dead weight, not a hazard: nothing reads it on a request
-    /// path.
+    /// Not deleted in PR-03 because removing it means touching `AppState`'s
+    /// two non-db constructors, and the `not(feature = "db")` configuration
+    /// did not compile then, so the change could not be verified. That reason
+    /// has lapsed: CI now runs
+    /// `cargo check -p epigraph-api --no-default-features --locked`. The field
+    /// is still dead weight, not a hazard: nothing reads it on a request path.
     pub signature_state: SignatureVerificationState,
     /// Thread-safe propagation orchestrator for truth propagation
     ///
@@ -379,6 +383,13 @@ pub struct AppState {
     /// When absent, semantic search falls back to mock/deterministic embeddings.
     /// This is optional to maintain backward compatibility with existing code.
     pub embedding_service: Option<SharedEmbeddingService>,
+    /// Which provider [`Self::embedding_service`] is, when the process that
+    /// built this state declared it ([`Self::with_embedding_provider`];
+    /// `bin/server.rs` does). `None` for a state built without one (tests and
+    /// embedders that wire their own service), which is treated as owning the
+    /// stored vector columns, as before the provider was carried at all.
+    /// See [`Self::storing_embedding_service`].
+    pub embedding_provider: Option<crate::embedding_restore::EmbeddingProviderKind>,
     /// Challenge service for claim dispute management
     ///
     /// Manages the lifecycle of challenges against claims, including
@@ -432,8 +443,12 @@ pub struct AppState {
     /// principal owns the resource or holds `admin`/`writer` in its owning
     /// group. `with_policy_gate` replaces it.
     ///
-    /// Unlike the pre-PR-11 field, this one is **consulted**: see
-    /// `routes/ownership.rs::assign_ownership` / `::update_partition`.
+    /// **No handler consults it at present.** Its only callers were the
+    /// ownership routes (`assign_ownership` / `update_partition`), which PR-14
+    /// deleted together with their route file. The field is assigned in every
+    /// constructor and by `with_policy_gate`, and read only by this file's
+    /// `extension_wiring_tests`; write authorization on the request path is
+    /// row security plus each handler's own checks.
     pub policy_gate: SharedPolicyGate,
 
     /// External identity provider registry. Built once at startup from `providers.toml`.
@@ -476,11 +491,10 @@ pub struct AppState {
     pub edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
 }
 
-/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
-pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
-
 /// Whether `POST /api/v1/bp/propagate` may write its results to `claims`
-/// (`apply_updates: true`).
+/// (`apply_updates: true`): `EPIGRAPH_BP_APPLY`, the
+/// [`epigraph_engine::belief_modes`] flag, parsed there once per process
+/// (backlog 820c15f1), so `/health`'s `bp_apply` and the gate are one value.
 ///
 /// BP apply is RETIRED under atom-level belief (SPEC §6.2, hazard H4): a
 /// whole-graph loopy-BP run rewrote claim caches, compounds included, with
@@ -490,63 +504,15 @@ pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
 /// then it writes atoms only (a compound is a query over its atoms and has no
 /// cache of its own to write). Read-only BP runs stay available as a
 /// diagnostic whatever this says.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum BpApply {
-    /// `apply_updates: true` is refused (409). The default everywhere.
-    #[default]
-    Off,
-    /// `apply_updates: true` writes BP's values to the non-compound claims
-    /// the caller can see.
-    On,
-}
+///
+/// `Off` (the default everywhere): `apply_updates: true` is refused (409).
+/// `On`: it writes BP's values to the non-compound claims the caller can see.
+/// ONLY the value `on` (trimmed, any case) switches it on; `true`, `1` or a
+/// typo leave it off and are reported at boot.
+pub use epigraph_engine::belief_modes::BpApply;
 
-impl BpApply {
-    /// The switch's parse, apart from the environment: ONLY the exact value
-    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
-    /// `1` or a typo leave it OFF, so a mistyped value fails closed.
-    #[must_use]
-    pub fn parse(raw: Option<&str>) -> Self {
-        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
-            Self::On
-        } else {
-            Self::Off
-        }
-    }
-
-    /// Whether `raw` is SET to a value that is neither `on` nor `off`
-    /// (trimmed, case-insensitive): a value [`Self::parse`] silently reads as
-    /// OFF, which the server warns about at boot. Unset or blank is the plain
-    /// default and is not flagged.
-    #[must_use]
-    pub fn is_unrecognised(raw: Option<&str>) -> bool {
-        raw.map(str::trim).is_some_and(|v| {
-            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
-        })
-    }
-}
-
-#[cfg(test)]
-mod bp_apply_switch_tests {
-    use super::BpApply;
-
-    #[test]
-    fn only_on_switches_bp_apply_on() {
-        for on in ["on", "ON", " On "] {
-            assert_eq!(BpApply::parse(Some(on)), BpApply::On, "{on:?}");
-            assert!(!BpApply::is_unrecognised(Some(on)), "{on:?}");
-        }
-        // Values an operator might mean as "yes" stay OFF, and are flagged.
-        for typo in ["true", "1", "yes", "enabled", "onn"] {
-            assert_eq!(BpApply::parse(Some(typo)), BpApply::Off, "{typo:?}");
-            assert!(BpApply::is_unrecognised(Some(typo)), "{typo:?}");
-        }
-        for off in [None, Some(""), Some("  "), Some("off"), Some("OFF")] {
-            assert_eq!(BpApply::parse(off), BpApply::Off, "{off:?}");
-            assert!(!BpApply::is_unrecognised(off), "{off:?}");
-        }
-        assert_eq!(BpApply::default(), BpApply::Off);
-    }
-}
+/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
+pub const BP_APPLY_ENV: &str = BpApply::ENV;
 
 /// API configuration options
 #[derive(Clone)]
@@ -751,6 +717,10 @@ pub struct RlsPosture {
     /// `crates/epigraph-api`.
     pub has_bypassrls: bool,
     /// Can this connection take migration 074's `epigraph_seed` escape hatch?
+    /// Asked as the triggers ask it at the database's migration level
+    /// (`epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL`): since
+    /// migration 216 an explicit grant, which a superuser does NOT hold by
+    /// implication.
     /// `D-PR16-seed-membership-refusal-downgraded` assigns arming this to PR-17
     /// and notes it is a SEVENTH refusal, not one of the six the plan lists.
     pub is_seed_member: bool,
@@ -1181,6 +1151,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1232,6 +1203,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1264,6 +1236,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1603,6 +1576,21 @@ impl AppState {
         Ok(ClaimWriteTx::Unscoped(tx))
     }
 
+    /// The backstop behind [`Self::storing_embedding_service`]: a store helper
+    /// refuses a vector from a provider that does not own the column, whatever
+    /// its caller generated it with.
+    #[cfg(feature = "db")]
+    fn refuse_non_owning_provider(&self) -> Result<(), String> {
+        match self.embedding_provider {
+            Some(provider) if !provider.may_restore_claim_embeddings() => Err(format!(
+                "this process's embedding provider is {}, which does not own the stored \
+                 vector columns; nothing was stored",
+                provider.as_str()
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Store a claim's embedding after the claim's own write committed, on the
     /// SAME authority that wrote it: a [`Self::begin_claim_write`] transaction
     /// stamped with the request's `viewer`.
@@ -1648,6 +1636,7 @@ impl AppState {
         embedding_pgvector: &str,
         handler: &'static str,
     ) -> Result<bool, String> {
+        self.refuse_non_owning_provider()?;
         let mut tx = self
             .begin_claim_write(viewer, handler)
             .await
@@ -1664,6 +1653,56 @@ impl AppState {
             .await
             .map_err(|e| format!("the embedding UPDATE ran but could not commit: {e}"))?;
         Ok(stored)
+    }
+
+    /// Generate `text`'s embedding and store it on `claim_id` through
+    /// [`Self::store_claim_embedding_as`], for a write path whose claim has
+    /// already committed. Best-effort by contract (CLAUDE.md "Embedding
+    /// policy"): every failure is warned and reported as `false`, never
+    /// returned, because a failed embed must not unwind a committed claim.
+    ///
+    /// `false` also when no embedding service is configured.
+    #[cfg(feature = "db")]
+    pub async fn embed_claim_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim_id: Uuid,
+        text: &str,
+        handler: &'static str,
+    ) -> bool {
+        let Some(embedder) = self.embedding_service() else {
+            tracing::debug!(claim_id = %claim_id, handler, "embedding_service not configured; skipping embed");
+            return false;
+        };
+        let embedding = match embedder.generate(text).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, handler, error = %e, "embedding generation failed (claim still stored)");
+                return false;
+            }
+        };
+        let pgvec = format!(
+            "[{}]",
+            embedding
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        match self
+            .store_claim_embedding_as(viewer, claim_id, &pgvec, handler)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(claim_id = %claim_id, handler, "embedding matched no row (claim missing, sealed, superseded, or not writable by the caller); no vector stored");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, handler, error = %e, "embedding not stored (claim still stored)");
+                false
+            }
+        }
     }
 
     /// Store an evidence row's embedding after the packet that inserted it
@@ -1686,6 +1725,7 @@ impl AppState {
         embedding_pgvector: &str,
         handler: &'static str,
     ) -> Result<bool, String> {
+        self.refuse_non_owning_provider()?;
         let mut tx = self
             .begin_claim_write(viewer, handler)
             .await
@@ -1729,6 +1769,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1763,6 +1804,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -1803,6 +1845,7 @@ impl AppState {
             rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
+            embedding_provider: None,
             challenge_service: Arc::new(ChallengeService::new()),
             claim_store: Arc::new(RwLock::new(HashMap::new())),
             event_bus: Arc::new(EventBus::new(1000)),
@@ -2117,20 +2160,16 @@ impl AppState {
     /// Returns `DbError::QueryFailed` if the catalog cannot be read at all.
     #[cfg(feature = "db")]
     pub async fn probe_rls_posture(&self) -> Result<RlsPosture, epigraph_db::DbError> {
-        let (current_user, is_superuser, has_bypassrls, is_seed_member, forced, protected): (
-            String,
-            bool,
-            bool,
-            bool,
-            i64,
-            i64,
-        ) = sqlx::query_as(
+        // The seed column asks what the `*_require_tenancy` triggers ask AT
+        // THIS DATABASE'S MIGRATION LEVEL: since 216 an explicit grant, not
+        // `pg_has_role`, which every superuser satisfies. See
+        // `epigraph_db::repos::seed_posture` for why it is an expression.
+        let sql = format!(
             "SELECT current_user::text, \
                     COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = session_user), false), \
                     COALESCE((SELECT rolbypassrls FROM pg_roles WHERE rolname = session_user), \
                              false), \
-                    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
-                      AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
+                    {seed}, \
                     (SELECT count(*) FROM pg_class c \
                        JOIN pg_namespace n ON n.oid = c.relnamespace \
                       WHERE n.nspname = 'public' AND c.relname = ANY($1) \
@@ -2139,10 +2178,19 @@ impl AppState {
                        JOIN pg_namespace n ON n.oid = c.relnamespace \
                       WHERE n.nspname = 'public' AND c.relname = ANY($1) \
                         AND c.relkind IN ('r','p'))",
-        )
-        .bind(FORCE_PROTECTED_SET)
-        .fetch_one(&self.db_pool)
-        .await?;
+            seed = epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL,
+        );
+        let (current_user, is_superuser, has_bypassrls, is_seed_member, forced, protected): (
+            String,
+            bool,
+            bool,
+            bool,
+            i64,
+            i64,
+        ) = sqlx::query_as(&sql)
+            .bind(FORCE_PROTECTED_SET)
+            .fetch_one(&self.db_pool)
+            .await?;
 
         // Below 078 there is no canary. `to_regclass` returns NULL rather than
         // raising, so this is one statement either way.
@@ -2284,19 +2332,37 @@ impl AppState {
     /// the boot log of every environment, so week 11d's flip is a change whose
     /// blast radius is already known rather than discovered on the day.
     ///
+    /// # Since migration 216
+    ///
+    /// The "`rolsuper` satisfies it for free" above describes 074's trigger
+    /// question. 216 made the hatch require an explicit grant, so the probe
+    /// now asks what the triggers ask at the database's migration level
+    /// (`epigraph_db::repos::seed_posture`), and a superuser without the grant
+    /// gets its own warning saying what its undeclared writes do instead.
+    ///
     /// # Errors
     /// Returns the underlying `DbError` if the catalog probe itself fails. The
     /// posture findings are logged, not returned.
     #[cfg(feature = "db")]
     pub async fn warn_on_privileged_connection(&self) -> Result<(), epigraph_db::DbError> {
-        let (current_user, is_seed_member, is_super): (String, bool, bool) = sqlx::query_as(
-            "SELECT current_user::text, \
-                    EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_seed') \
-                      AND pg_has_role(session_user, 'epigraph_seed', 'MEMBER'), \
-                    (SELECT rolsuper FROM pg_roles WHERE rolname = session_user)",
-        )
-        .fetch_one(&self.db_pool)
-        .await?;
+        // See `epigraph_db::repos::seed_posture`: the seed column is the
+        // question the triggers ask at this migration level, and the last
+        // column says which question that is (216's explicit grant, or 074's
+        // `pg_has_role`, which every superuser satisfies).
+        let sql = format!(
+            "SELECT current_user::text, {seed}, \
+                    COALESCE((SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                             false), \
+                    {explicit}",
+            seed = epigraph_db::repos::seed_posture::SESSION_IS_SEED_SQL,
+            explicit = epigraph_db::repos::seed_posture::SEED_FUNCTION_EXISTS_SQL,
+        );
+        let (current_user, is_seed_member, is_super, explicit_seed_question): (
+            String,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(&sql).fetch_one(&self.db_pool).await?;
 
         if current_user != "epigraph_app" {
             tracing::warn!(
@@ -2315,6 +2381,17 @@ impl AppState {
                  '00000000-0000-0000-0000-00000000dead'. \
                  Arming this as a refusal is D-PR16-seed-membership-refusal-downgraded, \
                  owned by PR-17."
+            );
+        } else if is_super && explicit_seed_question {
+            // Migration 216: a superuser is no longer a seed by implication, so
+            // the message above would be false for it. Say what does happen.
+            tracing::warn!(
+                current_user = %current_user,
+                "connected as a SUPERUSER that holds no grant of epigraph_seed. Since migration \
+                 216 this connection does NOT take the seed escape hatch: an undeclared claim, \
+                 root row, or claim-derived row with no parent claim raises 23502. A superuser \
+                 still bypasses every row-level security policy; move this service onto \
+                 epigraph_app."
             );
         }
         Ok(())
@@ -2376,10 +2453,60 @@ impl AppState {
         self
     }
 
-    /// Get a reference to the embedding service if configured
+    /// Get a reference to the embedding service if configured.
+    ///
+    /// For QUERY vectors (search, density, affinity lookups). A write path
+    /// that will STORE the vector asks [`Self::storing_embedding_service`].
     #[must_use]
     pub fn embedding_service(&self) -> Option<&SharedEmbeddingService> {
         self.embedding_service.as_ref()
+    }
+
+    /// Declare which provider the configured embedding service is (builder
+    /// pattern), so that write paths can tell whether its vectors belong in
+    /// the stored columns.
+    #[must_use]
+    pub fn with_embedding_provider(
+        mut self,
+        provider: crate::embedding_restore::EmbeddingProviderKind,
+    ) -> Self {
+        self.embedding_provider = Some(provider);
+        self
+    }
+
+    /// Whether this process's embedding provider may write the stored vector
+    /// columns (`claims.embedding`, `evidence.embedding`): the rule
+    /// [`EmbeddingProviderKind::may_restore_claim_embeddings`] states for the
+    /// job handler, applied to the request-serving write paths too (backlog
+    /// 211bd623). `true` when no provider was declared.
+    ///
+    /// [`EmbeddingProviderKind::may_restore_claim_embeddings`]: crate::embedding_restore::EmbeddingProviderKind::may_restore_claim_embeddings
+    #[must_use]
+    pub fn may_store_embeddings(&self) -> bool {
+        self.embedding_provider.is_none_or(
+            crate::embedding_restore::EmbeddingProviderKind::may_restore_claim_embeddings,
+        )
+    }
+
+    /// The embedding service for a vector that will be STORED on a claim or
+    /// evidence row, or `None` when there is no service or its provider does
+    /// not own those columns.
+    ///
+    /// `embedding_service_from_env` falls through OpenAI, Jina and a mock, and
+    /// only the job handler was told which one it got. An API process started
+    /// without `OPENAI_API_KEY` therefore wrote deterministic mock vectors, or
+    /// Jina-space vectors, into `claims.embedding` from every inline write
+    /// path: one ANN column holding two vector spaces, with no error anywhere.
+    /// The service stays available for query embedding through
+    /// [`Self::embedding_service`]; this accessor is what a write path uses,
+    /// so a non-owning provider costs no generate call either.
+    #[must_use]
+    pub fn storing_embedding_service(&self) -> Option<&SharedEmbeddingService> {
+        if self.may_store_embeddings() {
+            self.embedding_service.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Set a custom challenge service for this state (builder pattern)

@@ -11,6 +11,7 @@
 
 use engine_integration_tests::harness::*;
 use epigraph_engine::{run_bp, BpConfig, FactorPotential};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -31,11 +32,9 @@ const PREFIX: &str = "[test-bp-factors]";
 /// 3. potential.strength == 0.85 exactly (catches drift in
 ///    `edge_to_factor_type`'s CORROBORATES row).
 /// 4. `run_bp` converges, beliefs stay near priors, both variables agree.
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn auto_factor_trigger_creates_factors_for_corroborates() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn auto_factor_trigger_creates_factors_for_corroborates(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
     let agent = create_test_agent(&db.pool).await;
 
     let claim_a = create_test_claim(&db.pool, agent, &format!("{PREFIX} claim A"), 0.6).await;
@@ -117,11 +116,9 @@ async fn auto_factor_trigger_creates_factors_for_corroborates() {
 /// supersession guard (`migrations/001_initial_schema.sql:82-85`) — inserting
 /// a CORROBORATES edge where one claim has `is_current=false` must NOT
 /// create a factor.
-#[tokio::test]
-#[ignore] // Requires DATABASE_URL pointing to live PostgreSQL
-async fn superseded_claim_excluded_from_auto_factor() {
-    let db = TestDb::setup().await;
-    let _guard = PrefixGuard::new(&db.pool, PREFIX);
+#[sqlx::test(migrations = "../../migrations")]
+async fn superseded_claim_excluded_from_auto_factor(pool: PgPool) {
+    let db = TestDb::from_pool(pool);
     let agent = create_test_agent(&db.pool).await;
 
     let claim_a = create_test_claim(&db.pool, agent, &format!("{PREFIX} current-claim"), 0.6).await;
