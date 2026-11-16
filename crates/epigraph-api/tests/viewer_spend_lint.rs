@@ -869,10 +869,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
-    // raw pool: the `papers` registry rows and their count. `papers` carries
-    // no row security (it is keyed on the document, not on a tenant). Every
-    // claim-derived field (authors, claim count, ingests) is read by
-    // `paper_listings` on the caller's stamped connection, with the viewer.
+    // untenanted: the `papers` registry rows and their count, read on the
+    // caller's stamped connection. `papers` carries no row security (it is
+    // keyed on the document, not on a tenant), so no viewer predicate applies.
+    // Every claim-derived field (authors, claim count, ingests) is read by
+    // `paper_listings` on the same connection, with the viewer.
     (
         "papers.rs",
         "list_papers",

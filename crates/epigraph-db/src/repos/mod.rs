@@ -280,7 +280,8 @@ pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use sources::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
-    SourcePage, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX, SOURCE_AUTHORS_MAX,
+    SourcePage, SOURCES_OVERVIEW_STATEMENT_TIMEOUT, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX,
+    SOURCE_AUTHORS_MAX,
 };
 pub use structural::{BeliefIntervalRow, StructuralRepository};
 pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};

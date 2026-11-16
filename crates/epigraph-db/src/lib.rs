@@ -208,7 +208,8 @@ pub use repos::AtlasNamingRepository;
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
-    SourcePage, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX, SOURCE_AUTHORS_MAX,
+    SourcePage, SOURCES_OVERVIEW_STATEMENT_TIMEOUT, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX,
+    SOURCE_AUTHORS_MAX,
 };
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
