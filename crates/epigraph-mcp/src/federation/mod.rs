@@ -91,6 +91,12 @@ pub struct MountedExtension {
     pub tools: Vec<Tool>,
     /// Whether the discovery session is currently believed healthy.
     pub healthy: bool,
+    /// Bumped on every change to this mount (promotion, demotion, a replaced
+    /// tool list or session). A health pass snapshots it before its unlocked
+    /// network I/O and applies its result only if it is unchanged, so a stale
+    /// result never overwrites a fresher one (see
+    /// [`SharedFederation::reconnect_tick`]).
+    generation: u64,
 }
 
 impl MountedExtension {
@@ -140,6 +146,9 @@ struct TickTarget {
     /// The discovery session's peer handle when the extension is mounted
     /// healthy; `None` when it is unhealthy (there is no session to probe).
     peer: Option<rmcp::service::Peer<rmcp::RoleClient>>,
+    /// The mount's generation when the snapshot was taken. The pass's result
+    /// is applied only if it is still current.
+    generation: u64,
 }
 
 impl FederationRegistry {
@@ -248,6 +257,7 @@ impl FederationRegistry {
                             client: Some(session),
                             tools,
                             healthy: true,
+                            generation: 0,
                         }
                     }
                     Err(e) => {
@@ -263,6 +273,7 @@ impl FederationRegistry {
                             client: None,
                             tools: Vec::new(),
                             healthy: false,
+                            generation: 0,
                         }
                     }
                 },
@@ -279,6 +290,7 @@ impl FederationRegistry {
                         client: None,
                         tools: Vec::new(),
                         healthy: false,
+                        generation: 0,
                     }
                 }
             };
@@ -410,6 +422,7 @@ impl FederationRegistry {
                 } else {
                     None
                 },
+                generation: ext.generation,
             })
             .collect()
     }
@@ -432,8 +445,26 @@ impl FederationRegistry {
         ext.client = None;
         ext.tools.clear();
         ext.healthy = false;
+        ext.generation += 1;
         self.routes.retain(|_, owner| *owner != index);
         was_healthy
+    }
+
+    /// [`demote`](Self::demote) extension `index` only if its generation is
+    /// still `generation`, the one a health pass planned its failed probe
+    /// from. A mount that changed since (a failed call demoted it and a later
+    /// pass re-promoted it) is left alone: the stale failure says nothing
+    /// about its new session.
+    fn demote_at(&mut self, index: usize, generation: u64) -> bool {
+        if self.generation_of(index) != Some(generation) {
+            return false;
+        }
+        self.demote(index)
+    }
+
+    /// The current generation of extension `index`.
+    fn generation_of(&self, index: usize) -> Option<u64> {
+        self.extensions.get(index).map(|e| e.generation)
     }
 
     /// The index of the extension named `name`.
@@ -454,6 +485,12 @@ impl FederationRegistry {
     /// collision is surfaced at the next `build`. The extension is then left
     /// exactly as it was. Returns `true` when the list was applied.
     ///
+    /// Applied only if the mount is still at `generation`, the one the pass
+    /// snapshotted before its unlocked network I/O. Otherwise the mount changed
+    /// meanwhile (a failed call demoted it, or another pass replaced its list),
+    /// and this older result is dropped: it would re-promote a demoted mount
+    /// with no session, or swap an older list over a newer one.
+    ///
     /// A tool named like a kernel tool is never routed
     /// ([`without_reserved`](Self::without_reserved)): `build` refuses that
     /// clash, but an extension down at boot first shows its list here, so the
@@ -461,10 +498,16 @@ impl FederationRegistry {
     fn apply_tools(
         &mut self,
         index: usize,
+        generation: u64,
         session: Option<ExtensionClient>,
         tools: Vec<Tool>,
     ) -> bool {
-        if index >= self.extensions.len() {
+        if self.generation_of(index) != Some(generation) {
+            tracing::debug!(
+                extension = ?self.extensions.get(index).map(|e| &e.config.name),
+                "federation: health-pass result is stale (the mount changed meanwhile); \
+                 not applied"
+            );
             return false;
         }
         let tools = self.without_reserved(index, tools);
@@ -508,6 +551,9 @@ impl FederationRegistry {
             );
         }
         let ext = &mut self.extensions[index];
+        if !was_healthy || changed || session.is_some() {
+            ext.generation += 1;
+        }
         if let Some(session) = session {
             ext.client = Some(session);
         }
@@ -713,6 +759,7 @@ impl SharedFederation {
             index,
             config,
             peer,
+            generation,
         } in targets
         {
             let was_healthy = peer.is_some();
@@ -720,7 +767,7 @@ impl SharedFederation {
                 match client::list_all_tools_on(&peer).await {
                     Ok(raw) => {
                         let tools = FederationRegistry::prefix_tools(&config, raw);
-                        self.write().apply_tools(index, None, tools);
+                        self.write().apply_tools(index, generation, None, tools);
                         continue;
                     }
                     Err(e) => {
@@ -738,10 +785,11 @@ impl SharedFederation {
             match redialled {
                 Ok((session, raw)) => {
                     let tools = FederationRegistry::prefix_tools(&config, raw);
-                    self.write().apply_tools(index, Some(session), tools);
+                    self.write()
+                        .apply_tools(index, generation, Some(session), tools);
                 }
                 Err(e) if was_healthy => {
-                    if self.write().demote(index) {
+                    if self.write().demote_at(index, generation) {
                         tracing::warn!(
                             extension = %config.name,
                             error = %e,
@@ -859,5 +907,188 @@ mod candidate_tests {
             vec!["empty".to_string(), "other".to_string()],
             "an empty prefix is not evidence of ownership"
         );
+    }
+}
+
+/// The `generation` guard on the health pass ([`FederationRegistry::apply_tools`]
+/// and [`FederationRegistry::demote_at`]).
+///
+/// A pass snapshots a mount's generation, drops the lock for its network I/O,
+/// and applies its result later. Between the two, a failed call
+/// ([`SharedFederation::invoke`]) may have demoted the mount, or another pass
+/// replaced its list or session. These tests stage exactly that: the mount is
+/// in a state the stale result would otherwise be applied to, so only the
+/// generation comparison can refuse the stale write. Each has a control at the
+/// current generation, so a test cannot pass because the write is a no-op for
+/// some other reason.
+#[cfg(test)]
+mod generation_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    use rmcp::model::Tool;
+    use rmcp::{ServerHandler, ServiceExt};
+
+    use super::{client, FederationRegistry, MountedExtension};
+    use crate::federation::client::ExtensionClient;
+    use crate::federation::config::ExtensionConfig;
+
+    fn tool(name: &str) -> Tool {
+        Tool::new(
+            name.to_string(),
+            "test tool",
+            Arc::new(serde_json::Map::new()),
+        )
+    }
+
+    fn config() -> ExtensionConfig {
+        ExtensionConfig {
+            name: "ext".to_string(),
+            addr: "127.0.0.1:1".to_string(),
+            scope: "ext:tools".to_string(),
+            prefix: None,
+        }
+    }
+
+    /// One mount at `generation`, routing `tools` when `healthy`, holding
+    /// `client` as its discovery session.
+    fn registry(
+        healthy: bool,
+        generation: u64,
+        tools: &[&str],
+        client: Option<ExtensionClient>,
+    ) -> FederationRegistry {
+        let tools: Vec<Tool> = if healthy {
+            tools.iter().map(|n| tool(n)).collect()
+        } else {
+            Vec::new()
+        };
+        let routes: HashMap<String, usize> =
+            tools.iter().map(|t| (t.name.to_string(), 0)).collect();
+        FederationRegistry {
+            extensions: vec![MountedExtension {
+                config: config(),
+                client,
+                tools,
+                healthy,
+                generation,
+            }],
+            routes,
+            discovery_token: String::new(),
+            call_timeout: client::DEFAULT_CALL_TIMEOUT,
+            reserved: HashSet::new(),
+        }
+    }
+
+    fn routed(registry: &FederationRegistry) -> Vec<String> {
+        let mut names: Vec<String> = registry.routes.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// A downstream with no tools, served over an in-memory pipe, so a test
+    /// holds a real discovery session without a socket.
+    struct Downstream;
+    impl ServerHandler for Downstream {}
+
+    async fn session() -> ExtensionClient {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(running) = Downstream.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        match ().serve(client_io).await {
+            Ok(client) => client,
+            Err(e) => panic!("in-memory MCP handshake failed: {e}"),
+        }
+    }
+
+    /// A re-list that failed, planned before the mount was demoted and
+    /// re-dialled, must not demote the freshly re-dialled mount.
+    #[tokio::test]
+    async fn a_stale_failed_relist_does_not_demote_a_redialled_mount() {
+        let mut stale = registry(true, 2, &["a"], Some(session().await));
+        assert!(!stale.demote_at(0, 0));
+        assert!(
+            stale.extensions[0].healthy,
+            "a stale failure demoted the mount"
+        );
+        assert_eq!(routed(&stale), vec!["a".to_string()]);
+
+        let mut current = registry(true, 2, &["a"], Some(session().await));
+        assert!(current.demote_at(0, 2));
+        assert!(
+            !current.extensions[0].healthy,
+            "control: a failure at the current generation must demote"
+        );
+        assert!(routed(&current).is_empty());
+        assert_eq!(current.extensions[0].generation, 3);
+    }
+
+    /// A re-list that answered, planned before a newer change, must not swap
+    /// in its older tool list.
+    #[tokio::test]
+    async fn a_stale_changed_relist_does_not_swap_routes() {
+        let mut stale = registry(true, 2, &["a"], Some(session().await));
+        assert!(!stale.apply_tools(0, 0, None, vec![tool("old")]));
+        assert_eq!(
+            routed(&stale),
+            vec!["a".to_string()],
+            "a stale tool list replaced the current one"
+        );
+        assert_eq!(stale.extensions[0].generation, 2);
+
+        let mut current = registry(true, 2, &["a"], Some(session().await));
+        assert!(current.apply_tools(0, 2, None, vec![tool("new")]));
+        assert_eq!(
+            routed(&current),
+            vec!["new".to_string()],
+            "control: a changed list at the current generation must be swapped in"
+        );
+        assert_eq!(current.extensions[0].generation, 3);
+    }
+
+    /// A re-list that answered just before a failed call demoted the mount
+    /// must not re-promote it: it would be marked healthy with no session.
+    #[test]
+    fn a_stale_relist_does_not_re_promote_a_mount_a_failed_call_demoted() {
+        // Planned at generation 2; the failed call's demotion made it 3.
+        let mut stale = registry(false, 3, &[], None);
+        assert!(!stale.apply_tools(0, 2, None, vec![tool("a")]));
+        assert!(
+            !stale.extensions[0].healthy,
+            "a stale re-list re-promoted a demoted mount"
+        );
+        assert!(routed(&stale).is_empty());
+
+        let mut current = registry(false, 3, &[], None);
+        assert!(current.apply_tools(0, 3, None, vec![tool("a")]));
+        assert!(
+            current.extensions[0].healthy,
+            "control: a list applied at the current generation must promote"
+        );
+    }
+
+    /// A reconnect planned before the mount was promoted and demoted again
+    /// must not promote it with its stale session and tool list.
+    #[tokio::test]
+    async fn a_stale_reconnect_does_not_promote_a_demoted_mount() {
+        let mut stale = registry(false, 2, &[], None);
+        assert!(!stale.apply_tools(0, 0, Some(session().await), vec![tool("old")]));
+        assert!(
+            !stale.extensions[0].healthy,
+            "a stale reconnect promoted the mount"
+        );
+        assert!(stale.extensions[0].client.is_none());
+        assert!(routed(&stale).is_empty());
+
+        let mut current = registry(false, 2, &[], None);
+        assert!(current.apply_tools(0, 2, Some(session().await), vec![tool("new")]));
+        assert!(
+            current.extensions[0].healthy,
+            "control: a reconnect at the current generation must promote"
+        );
+        assert_eq!(routed(&current), vec!["new".to_string()]);
     }
 }
