@@ -65,8 +65,9 @@
 //! # The envelope
 //!
 //! The routes sit on the `public` router (`routes/mod.rs`), so they carry its
-//! layers: the anonymous body limit and the rate limiter, which charges a
-//! request without a token to its client address. Every answer is
+//! layers: the anonymous body limit and, when the operator configured one
+//! (it is off unless `EPIGRAPH_RATE_LIMIT*` is set), the rate limiter, which
+//! charges a request without a token to its client address. Every answer is
 //! `Cache-Control: no-store`, so a claim made private stops being served at
 //! once rather than when a cache expires.
 
