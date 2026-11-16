@@ -287,7 +287,7 @@ fn the_named_readers_are_scanned() {
         ),
         (
             "crates/epigraph-db/src/repos/mass_function.rs",
-            "cache_owner_frame_for_claim",
+            "resolve_cache_owner_frame",
         ),
         (
             "crates/epigraph-db/src/repos/mass_function.rs",
