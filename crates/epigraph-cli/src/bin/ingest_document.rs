@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use epigraph_crypto::AgentSigner;
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::tools::ingestion::{do_ingest_document_reporting, IngestTenancy};
 use epigraph_mcp::EpiGraphMcpFull;
@@ -144,6 +144,22 @@ async fn run(
         do_ingest_document_reporting(&server, viewer, &extraction, None, choice)
             .await
             .map_err(|e| anyhow!("ingest_document failed: {}", e.message))?;
+    // The walk returns once its transaction commits, with its embedding loop
+    // still running on the server's `BackgroundTasks`. Exiting here would drop
+    // that loop and leave the new claims with no vector, so wait for it, with
+    // the stdio server's bound (`EPIGRAPH_MCP_STDIO_DRAIN_SECS`).
+    let background = server.background_tasks();
+    if background.active() > 0 {
+        let limit = epigraph_mcp::background::exit_drain_timeout();
+        if !background.wait_idle(limit).await {
+            eprintln!(
+                "ingest-document: the embedding loop did not finish within {} s; claims it had \
+                 not reached carry no vector until the maintenance backfill (embed_backfill) \
+                 runs",
+                limit.as_secs()
+            );
+        }
+    }
     let text = result
         .content
         .first()

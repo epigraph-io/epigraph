@@ -322,7 +322,7 @@ async fn assert_signed_evidence_rows_v1(
     }
 }
 
-fn ingest_extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
+fn ingest_extraction(tag: &str) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {
             "title": format!("R-34 {tag}: Tagged Signatures for Ingested Documents"),

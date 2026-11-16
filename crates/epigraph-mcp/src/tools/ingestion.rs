@@ -18,12 +18,13 @@ use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
-use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
+use epigraph_ingest::common::plan::PlannedClaim;
+use epigraph_ingest::document::builder::build_ingest_plan;
 use epigraph_ingest::document::schema::ByteSpan;
+use epigraph_ingest::document::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 use epigraph_ingest::document::structure::{
     parse_structure, slice_segmentation, SourceFormat, StructuredDoc,
 };
-use epigraph_ingest::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -184,7 +185,7 @@ pub async fn ingest_document(
     let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
-    // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
+    // owned viewer: a spawned task is `'static` and cannot borrow the caller's.
     // `Viewer` is not `Clone`; `detach_scoped` is the narrow replacement, and
     // what it yields is the caller's own scoped read authority and nothing
     // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
@@ -264,7 +265,7 @@ pub async fn ingest_document(
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
 /// points, run before `ensure_paper_node` writes anything.
 ///
-/// `do_ingest_document` runs in a `tokio::spawn`ed task, so a refusal inside it
+/// `do_ingest_document` runs in a spawned task, so a refusal inside it
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
@@ -1064,16 +1065,32 @@ impl IngestTx<'_> {
 ///
 /// Best-effort (CLAUDE.md "Embedding policy"): a failure is warned with its
 /// cause and the claim stays stored.
+///
+/// Returns how many embeddings were QUEUED, which is what the walk's response
+/// reports (backlog fdacc14f): a stored count is unknowable when the response
+/// is built. 0 when the queue is empty or this server has no embedding
+/// provider (`McpEmbedder::embeddings_disabled`); then no task is spawned,
+/// because every provider call would fail, and one WARN says so.
 fn spawn_ingest_embeds(
     server: &EpiGraphMcpFull,
     author: Uuid,
     grant: Option<epigraph_db::TeamWriteGrant>,
     embed_queue: Vec<(Uuid, String)>,
     tool_name: &'static str,
-) {
+) -> usize {
     if embed_queue.is_empty() {
-        return;
+        return 0;
     }
+    if server.embedder.embeddings_disabled() {
+        tracing::warn!(
+            tool = tool_name,
+            claims = embed_queue.len(),
+            "embeddings are disabled on this server (no provider key), so the claims this \
+             ingest created carry no vector until the maintenance backfill reaches them"
+        );
+        return 0;
+    }
+    let queued = embed_queue.len();
     // The whole server, as the detached walk takes it: the stamped store needs
     // its `ScopedPool` and its embedder, and reaches the pool only inside
     // `claim_helper`, where every author-stamped store already does.
@@ -1118,6 +1135,7 @@ fn spawn_ingest_embeds(
             );
         }
     });
+    queued
 }
 
 async fn begin_ingest_tx<'p>(
@@ -1850,11 +1868,10 @@ pub async fn do_ingest_document_reporting(
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
-    // by N × ~0.8 s OpenAI calls. The response's `claims_embedded` is the number
-    // QUEUED here, not the number embedded (the field keeps its wire name); the
-    // invariant (every is_current claim has an embedding) is satisfied eventually.
-    let queued = embed_queue.len();
-    spawn_ingest_embeds(
+    // by N × ~0.8 s OpenAI calls. The response reports the number QUEUED (0 when
+    // this server has no embedding provider), never a number stored: nothing has
+    // been stored when it is built. The task logs stored against queued.
+    let queued = spawn_ingest_embeds(
         server,
         agent_id,
         resolution.grant().cloned(),
@@ -1879,6 +1896,7 @@ pub async fn do_ingest_document_reporting(
         authors: author_responses,
         ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
+        claims_embedding_queued: queued,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
         relationships_created,
@@ -2739,9 +2757,9 @@ pub async fn do_ingest_document_spine(
         crate::errors::internal_error_logged("ingest_document_spine: could not commit", e)
     })?;
 
-    // ── 6. Detach embeddings ──
-    let queued = embed_queue.len();
-    spawn_ingest_embeds(
+    // ── 6. Detach embeddings (the response reports the number queued; see step 8
+    // of `do_ingest_document_reporting`) ──
+    let queued = spawn_ingest_embeds(
         server,
         agent_id,
         resolution.grant().cloned(),
@@ -2758,6 +2776,7 @@ pub async fn do_ingest_document_spine(
         ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
+        paragraphs_embedding_queued: queued,
         paragraphs_embedded: queued,
         new_paragraph_paths,
         converged_claims_unlabelled: converged_unlabelled,
