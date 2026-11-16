@@ -75,6 +75,9 @@ struct Args {
     rev_range: Option<String>,
     /// Explicit orchestrator agent id, overriding trailer/env resolution (PR mode)
     orchestrator_id: Option<Uuid>,
+    /// File holding the host secret that keys the author and repo-root agent
+    /// keys (`--author-key-file`, else `EPIGRAPH_GIT_AUTHOR_KEY_FILE`)
+    author_key_file: Option<PathBuf>,
 }
 
 impl Args {
@@ -99,6 +102,7 @@ impl Args {
         let mut pr_author = None;
         let mut rev_range = None;
         let mut orchestrator_id = None;
+        let mut author_key_file = None;
 
         let mut i = 1;
         while i < args.len() {
@@ -241,6 +245,13 @@ impl Args {
                             format!("--orchestrator-id must be a UUID, got: {val}")
                         })?);
                 }
+                "--author-key-file" => {
+                    i += 1;
+                    author_key_file = Some(PathBuf::from(
+                        args.get(i)
+                            .ok_or("--author-key-file requires a path argument")?,
+                    ));
+                }
                 "--help" | "-h" => {
                     return Err(USAGE.to_string());
                 }
@@ -250,6 +261,13 @@ impl Args {
             }
             i += 1;
         }
+
+        let token = token_or_env(token, std::env::var("EPIGRAPH_TOKEN").ok());
+        let author_key_file = author_key_file.or_else(|| {
+            std::env::var_os("EPIGRAPH_GIT_AUTHOR_KEY_FILE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        });
 
         Ok(Self {
             repo,
@@ -270,8 +288,16 @@ impl Args {
             pr_author,
             rev_range,
             orchestrator_id,
+            author_key_file,
         })
     }
+}
+
+/// The Bearer token: `--token` when given, else a non-empty `EPIGRAPH_TOKEN`.
+/// The variable keeps the token off the command line (and out of
+/// `/proc/<pid>/cmdline`), which is how the reconciler hands it over.
+fn token_or_env(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or_else(|| env.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()))
 }
 
 const USAGE: &str = "\
@@ -285,7 +311,11 @@ Options:
   -s, --since <DATE>      Only process commits after this date (YYYY-MM-DD)
   -l, --limit <N>         Maximum number of commits to process
       --enricher <MODE>   Enrichment mode: noop (default) or llm
-  -t, --token <TOKEN>     Bearer token for agent registration
+  -t, --token <TOKEN>     Bearer token [default: $EPIGRAPH_TOKEN]
+      --author-key-file <PATH>  File holding the 32-byte host secret (64 hex
+                              characters) that keys every author and repo-root
+                              agent key; required for a live --pr-ingest or
+                              per-author run [default: $EPIGRAPH_GIT_AUTHOR_KEY_FILE]
   -h, --help              Show this help message
 
 PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
@@ -298,7 +328,9 @@ PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
       --merged-at <ISO8601>   Merge timestamp (ISO-8601)
       --pr-author <LOGIN>     GitHub login of the PR author
       --rev-range <A..B>      Git revision range covering the PR's commits
-      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides trailer/env)";
+      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides the
+                              Epigraph-Orchestrator-Id trailer and
+                              $EPIGRAPH_DEFAULT_ORCHESTRATOR_ID)";
 
 // =============================================================================
 // COMMIT TYPES & PARSING
@@ -403,6 +435,9 @@ struct ParsedCommit {
     verification: Vec<String>,
     parent_hashes: Vec<String>,
     files_changed: Vec<String>,
+    /// The message's trailer block (`Key: value` lines), e.g.
+    /// `Epigraph-Orchestrator-Id: <uuid>`; never part of a section.
+    trailers: Vec<String>,
 }
 
 // =============================================================================
@@ -747,7 +782,88 @@ fn detect_section(line: &str) -> Option<Section> {
     }
 }
 
-/// Parse a raw commit message into structured form
+/// Single-word keys that are trailers by convention. Any other trailer key
+/// must be hyphenated (`Co-Authored-By`, `Signed-off-by`, `Claude-Session`,
+/// `Epigraph-Orchestrator-Id`), so a closing one-line paragraph such as
+/// `Verification: cargo test passes` or `Note: see #12` stays message text.
+const SINGLE_WORD_TRAILER_KEYS: &[&str] = &[
+    "Fixes",
+    "Closes",
+    "Resolves",
+    "Refs",
+    "References",
+    "Cc",
+    "Link",
+    "Bug",
+];
+
+/// Is `line` a git trailer line (`Key: value`, the key one token of letters,
+/// digits and `-`, hyphenated or a conventional single-word key)? Section
+/// headers (`Verification:`) carry no value and are not trailers; neither is a
+/// bullet (`- cargo test: ok`), whose key holds a space or starts with a marker.
+fn is_trailer_line(line: &str) -> bool {
+    let Some((key, value)) = line.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && key.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && (key.contains('-')
+            || SINGLE_WORD_TRAILER_KEYS
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(key)))
+        && value.starts_with(char::is_whitespace)
+        && !value.trim().is_empty()
+}
+
+/// Split a commit message into its body and its trailer block, as git does:
+/// the trailer block is the LAST paragraph (after the last blank line), and only
+/// when every line of it is a trailer line and it is not the header paragraph.
+/// `Co-Authored-By:`, `Claude-Session:` and `Epigraph-Orchestrator-Id:` live
+/// there, so they are kept out of the Evidence/Reasoning/Verification sections
+/// and handed to the trailer readers instead.
+fn split_trailers(message: &str) -> (String, Vec<String>) {
+    let lines: Vec<&str> = message.trim_end().lines().collect();
+    let Some(last_blank) = lines.iter().rposition(|l| l.trim().is_empty()) else {
+        return (message.trim_end().to_string(), Vec::new());
+    };
+    let block = &lines[last_blank + 1..];
+    let first_content = lines.iter().position(|l| !l.trim().is_empty());
+    if block.is_empty()
+        || first_content.is_some_and(|i| i > last_blank)
+        || !block.iter().all(|l| is_trailer_line(l.trim()))
+    {
+        return (message.trim_end().to_string(), Vec::new());
+    }
+    let body = lines[..last_blank].join("\n").trim_end().to_string();
+    let trailers = block.iter().map(|l| l.trim().to_string()).collect();
+    (body, trailers)
+}
+
+/// Strip a list marker (`- `, `* `, `+ `, `1. `, `1) `) from a trimmed line.
+/// Returns `None` when the line does not start a list item.
+fn strip_bullet(trimmed: &str) -> Option<&str> {
+    for m in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(m) {
+            return Some(rest.trim_start());
+        }
+    }
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &trimmed[digits..];
+        if let Some(r) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return Some(r.trim_start());
+        }
+    }
+    None
+}
+
+/// Parse a raw commit message into structured form.
+///
+/// Each list item under a section is one entry: a line that starts with a list
+/// marker opens an item, and a following line with no blank line between (a
+/// wrapped bullet) continues it. The trailer block (`split_trailers`) is not part
+/// of any section.
 fn parse_commit_message(
     message: &str,
 ) -> (
@@ -758,16 +874,19 @@ fn parse_commit_message(
     Vec<String>,
     Vec<String>,
 ) {
-    let mut lines = message.lines();
+    let (body, _trailers) = split_trailers(message);
+    let mut lines = body.lines();
 
     // First line is the header
     let first_line = lines.next().unwrap_or("");
     let (commit_type, scope, claim_text) = parse_header(first_line);
 
-    let mut evidence = Vec::new();
-    let mut reasoning = Vec::new();
-    let mut verification = Vec::new();
+    let mut evidence: Vec<String> = Vec::new();
+    let mut reasoning: Vec<String> = Vec::new();
+    let mut verification: Vec<String> = Vec::new();
     let mut current_section = Section::None;
+    // Whether the previous line belonged to an item that a wrapped line extends.
+    let mut item_open = false;
 
     for line in lines {
         let trimmed = line.trim();
@@ -775,23 +894,31 @@ fn parse_commit_message(
         // Check for section header
         if let Some(section) = detect_section(trimmed) {
             current_section = section;
+            item_open = false;
             continue;
         }
 
-        // Skip empty lines
+        // A blank line closes the open item.
         if trimmed.is_empty() {
+            item_open = false;
             continue;
         }
 
-        // Collect bullet points under current section
-        let bullet_text = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+        let items = match current_section {
+            Section::Evidence => &mut evidence,
+            Section::Reasoning => &mut reasoning,
+            Section::Verification => &mut verification,
+            Section::None => continue, // Skip lines outside sections
+        };
 
-        match current_section {
-            Section::Evidence => evidence.push(bullet_text.to_string()),
-            Section::Reasoning => reasoning.push(bullet_text.to_string()),
-            Section::Verification => verification.push(bullet_text.to_string()),
-            Section::None => {} // Skip lines outside sections
+        match (strip_bullet(trimmed), items.last_mut()) {
+            (None, Some(last)) if item_open => {
+                last.push(' ');
+                last.push_str(trimmed);
+            }
+            (bullet, _) => items.push(bullet.unwrap_or(trimmed).to_string()),
         }
+        item_open = true;
     }
 
     (
@@ -926,6 +1053,7 @@ fn parse_git_log_output(output: &str) -> Result<Vec<ParsedCommit>, String> {
 
         let (commit_type, scope, claim_text, evidence, reasoning, verification) =
             parse_commit_message(&message);
+        let (_, trailers) = split_trailers(&message);
 
         commits.push(ParsedCommit {
             hash,
@@ -940,6 +1068,7 @@ fn parse_git_log_output(output: &str) -> Result<Vec<ParsedCommit>, String> {
             verification,
             parent_hashes,
             files_changed,
+            trailers,
         });
     }
 
@@ -1051,45 +1180,121 @@ struct CreateAgentRequest {
 // AGENT MANAGEMENT
 // =============================================================================
 
-/// Derive a STABLE Ed25519 signer for a git author from their email, so the same
-/// human maps to the same agent identity across every run and repo. Email is
-/// normalized (trimmed + lowercased). This is the interim author-DID scheme
-/// pending the project's real DID system (spec §6.3).
-fn author_signer(_display_name: &str, email: &str) -> AgentSigner {
-    let normalized = email.trim().to_ascii_lowercase();
-    let seed = blake3::hash(format!("epigraph-git-author-v1:{normalized}").as_bytes());
-    let key: [u8; 32] = *seed.as_bytes();
-    AgentSigner::from_bytes(&key).expect("32-byte blake3 hash is a valid Ed25519 seed")
+/// The host secret that keys every git-author and repo-root signing key.
+///
+/// The key for an author is `blake3::keyed_hash(secret, "epigraph-git-author-v2:" +
+/// normalized email)`. Without the secret, that key would be a function of the
+/// email alone, which is public in `git log`. The server gives a newly
+/// registered agent an active OAuth client when the caller is authenticated,
+/// and the client accepts any assertion that verifies under the agent's key, so
+/// a key anyone can compute is a login anyone can use. The secret makes the key
+/// stable on the host that holds it and unguessable everywhere else, the same
+/// pattern as the keyed LLM-agent identity (`keypair_from_llm_agent_keyed`).
+struct GitAuthorKeys {
+    secret: [u8; 32],
 }
 
-/// Derive the STABLE signer for the single repo-root *system* agent, derived from
-/// a constant identity (independent of repo or orchestrator). Every repo-root node
-/// is authored by this agent so that `(content_hash, agent_id)` is constant across
-/// every PR/orchestrator and the server's find-or-create collapses it to one node.
-/// Reuses the `author_signer` derivation so the key is a deterministic Ed25519 seed.
-fn repo_root_signer() -> AgentSigner {
-    author_signer("git-ingester-system", "git-ingester@epigraph.system")
+/// Domain-separation prefixes for the keyed derivation. Changing one changes
+/// every derived agent, so they are versioned.
+const GIT_AUTHOR_KEY_CONTEXT: &str = "epigraph-git-author-v2:";
+const GIT_REPO_ROOT_KEY_CONTEXT: &str = "epigraph-git-repo-root-v2";
+
+impl GitAuthorKeys {
+    /// Parse a key file: exactly 64 hex characters (32 bytes) after trimming,
+    /// not all zero. `openssl rand -hex 32` makes one. The error never echoes
+    /// the content.
+    fn parse(text: &str) -> Result<Self, String> {
+        let t = text.trim();
+        let mut secret = [0u8; 32];
+        if t.len() != 64 || hex::decode_to_slice(t, &mut secret).is_err() {
+            return Err("the author key file must hold exactly 64 hex characters \
+                        (32 bytes), e.g. from `openssl rand -hex 32`"
+                .to_string());
+        }
+        if secret == [0u8; 32] {
+            return Err("the author key file holds an all-zero key".to_string());
+        }
+        Ok(Self { secret })
+    }
+
+    fn load(path: &std::path::Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read author key file {}: {e}", path.display()))?;
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// A random secret for a dry run with no key file. Nothing is registered in
+    /// a dry run, so the keys only need to be distinct per author within it.
+    fn ephemeral() -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut secret);
+        Self { secret }
+    }
+
+    fn signer_for(&self, input: &str) -> AgentSigner {
+        let seed = blake3::keyed_hash(&self.secret, input.as_bytes());
+        AgentSigner::from_bytes(seed.as_bytes())
+            .expect("32-byte blake3 hash is a valid Ed25519 seed")
+    }
+
+    /// The signer for a git author. The email is normalized (trimmed and
+    /// lowercased) and the display name is not an input, so one human maps to
+    /// one agent across runs and repos on this host. This is the interim
+    /// author-DID scheme pending the project's real DID system (spec §6.3).
+    fn author(&self, email: &str) -> AgentSigner {
+        let normalized = email.trim().to_ascii_lowercase();
+        self.signer_for(&format!("{GIT_AUTHOR_KEY_CONTEXT}{normalized}"))
+    }
+
+    /// The signer for the single repo-root *system* agent. Every repo-root node
+    /// is authored by it, so `(content_hash, agent_id)` is constant across every
+    /// PR and orchestrator and the server's find-or-create collapses it to one
+    /// node. Its input is not an email, so no git author can collide with it.
+    fn repo_root(&self) -> AgentSigner {
+        self.signer_for(GIT_REPO_ROOT_KEY_CONTEXT)
+    }
+}
+
+/// The author keys for a run that derives author keys (`--pr-ingest`, or
+/// `--agent-key per-author`): the key file when one is given; with none, a live
+/// run is refused before any network call and a dry run gets an ephemeral
+/// secret.
+fn author_keys_for_run(
+    key_file: Option<&std::path::Path>,
+    dry_run: bool,
+) -> Result<GitAuthorKeys, String> {
+    match key_file {
+        Some(path) => GitAuthorKeys::load(path),
+        None if dry_run => Ok(GitAuthorKeys::ephemeral()),
+        None => Err(
+            "a live run needs --author-key-file (or EPIGRAPH_GIT_AUTHOR_KEY_FILE): \
+             without the host secret every author key is computable from the public \
+             git log, and the server provisions a login for each registered agent"
+                .to_string(),
+        ),
+    }
 }
 
 /// Resolve (and register if needed) the stable agent id for a git author.
 /// Caches the resolved agent id per email within a run to avoid duplicate POSTs.
 ///
-/// `AgentSigner` is not `Clone` and the key is fully derived from the (normalized)
-/// email, so the cache stores only the `Uuid`; the signer is rebuilt deterministically
-/// via `author_signer` on every call. Per Task 0, agent registration is NOT idempotent
-/// on `public_key` (a UNIQUE constraint makes a repeated POST error), so the in-run cache
-/// is what prevents the duplicate registration; cross-run find-or-create is a server
-/// concern tracked for Task 8.
+/// `AgentSigner` is not `Clone` and the key is fully derived from the host secret
+/// and the (normalized) email, so the cache stores only the `Uuid`; the signer is
+/// rebuilt deterministically via `GitAuthorKeys::author` on every call. `POST /agents` is find-or-create on
+/// `public_key`, so a later run gets the same id back; the cache only saves the
+/// repeated POSTs within a run.
 #[allow(dead_code)]
 async fn resolve_author_agent(
     client: &reqwest::Client,
     endpoint: &str,
+    keys: &GitAuthorKeys,
     cache: &mut std::collections::HashMap<String, Uuid>,
     display_name: &str,
     email: &str,
 ) -> Result<(AgentSigner, Uuid), String> {
     let key = email.trim().to_ascii_lowercase();
-    let signer = author_signer(display_name, email);
+    let signer = keys.author(email);
     if let Some(&agent_id) = cache.get(&key) {
         return Ok((signer, agent_id));
     }
@@ -1113,30 +1318,42 @@ fn parse_orchestrator_trailer(text: &str) -> Option<Uuid> {
         .next_back()
 }
 
-/// Resolve the implementing orchestrator agent id for a PR:
-/// 1) `Epigraph-Orchestrator-Id:` trailer in the PR body or any commit message;
-/// 2) else `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` env var.
+/// Resolve the implementing orchestrator agent id for a PR, first match wins:
+/// 1) `explicit` (`--orchestrator-id`);
+/// 2) an `Epigraph-Orchestrator-Id:` trailer in the PR body;
+/// 3) that trailer in a commit message's trailer block, oldest commit first;
+/// 4) `env_default` (`EPIGRAPH_DEFAULT_ORCHESTRATOR_ID`), a fallback only.
 ///
-/// Returns an error if neither is present (the PR claim MUST have an author).
-/// Existence of the resolved agent is verified by the caller (Task 8 / `run_pr_ingest`)
-/// via the registration route; this resolver only determines the id, never mints one.
-#[allow(dead_code)]
-fn resolve_orchestrator_agent(pr_body: &str, commit_msgs: &[String]) -> Result<Uuid, String> {
+/// Returns an error if none is present (the PR claim MUST have an author), or if
+/// the fallback is set but is not a UUID. The resolver only determines the id,
+/// never mints one; a bogus id surfaces at submit time.
+fn resolve_orchestrator_agent(
+    explicit: Option<Uuid>,
+    pr_body: &str,
+    commits: &[ParsedCommit],
+    env_default: Option<&str>,
+) -> Result<Uuid, String> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
     if let Some(id) = parse_orchestrator_trailer(pr_body) {
         return Ok(id);
     }
-    for m in commit_msgs {
-        if let Some(id) = parse_orchestrator_trailer(m) {
+    for c in commits {
+        if let Some(id) = parse_orchestrator_trailer(&c.trailers.join("\n")) {
             return Ok(id);
         }
     }
-    std::env::var("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
-        .ok()
-        .and_then(|s| s.trim().parse::<Uuid>().ok())
-        .ok_or_else(|| {
-            "no Epigraph-Orchestrator-Id trailer and EPIGRAPH_DEFAULT_ORCHESTRATOR_ID unset"
-                .to_string()
-        })
+    match env_default.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) => v
+            .parse::<Uuid>()
+            .map_err(|_| format!("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID must be a UUID, got: {v}")),
+        None => Err(
+            "no --orchestrator-id, no Epigraph-Orchestrator-Id trailer in the PR body or a \
+             commit, and EPIGRAPH_DEFAULT_ORCHESTRATOR_ID unset"
+                .to_string(),
+        ),
+    }
 }
 
 /// Candidate resolution references extracted from PR body + commit text.
@@ -1181,21 +1398,28 @@ struct AuthorAgent {
 
 /// Registry mapping author emails to their agent state
 struct AgentRegistry {
+    keys: GitAuthorKeys,
     agents: HashMap<String, AuthorAgent>,
 }
 
 impl AgentRegistry {
-    fn new() -> Self {
+    fn new(keys: GitAuthorKeys) -> Self {
         Self {
+            keys,
             agents: HashMap::new(),
         }
     }
 
-    /// Get or create an agent for the given author email.
-    /// In dry-run mode, agents are generated locally without API registration.
+    /// Get or create an agent for the given author email. The key is derived
+    /// from the host secret and the normalized email (`GitAuthorKeys::author`),
+    /// so the same author maps to the same agent on every run, as in PR mode;
+    /// the id is a placeholder until registration returns the server's id (live
+    /// mode).
     fn get_or_create(&mut self, email: &str, display_name: &str) -> &AuthorAgent {
-        self.agents.entry(email.to_string()).or_insert_with(|| {
-            let signer = AgentSigner::generate();
+        let key = email.trim().to_ascii_lowercase();
+        let keys = &self.keys;
+        self.agents.entry(key).or_insert_with(|| {
+            let signer = keys.author(email);
             let agent_id = Uuid::new_v4();
             println!(
                 "  New agent for {email} ({display_name}): {}",
@@ -1695,6 +1919,45 @@ async fn claim_exists(client: &reqwest::Client, endpoint: &str, id: Uuid) -> boo
     )
 }
 
+/// Does `content` cite exactly `PR #<n>`? The server's `content_contains` is a
+/// case-insensitive substring match, so `PR #8` also returns claims citing
+/// `PR #80`, `PR #812` or `SPR #8`; a digit right after the number, or a letter
+/// or digit right before `PR`, rules those out.
+fn content_cites_pr(content: &str, n: u64) -> bool {
+    let haystack = content.to_ascii_lowercase();
+    let needle = format!("pr #{n}");
+    haystack.match_indices(&needle).any(|(i, _)| {
+        // `apr #8` or `SPR #8` is not `PR #8`: no letter or digit right before.
+        let starts_a_word = !haystack[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+        starts_a_word
+            && !haystack[i + needle.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// The ids in a `GET /api/v1/claims` response whose content cites exactly
+/// `PR #<n>` (see `content_cites_pr`).
+fn claim_ids_citing_pr(v: &serde_json::Value, n: u64) -> Vec<Uuid> {
+    v["claims"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|c| {
+                    c["content"]
+                        .as_str()
+                        .is_some_and(|t| content_cites_pr(t, n))
+                })
+                .filter_map(|c| c["id"].as_str()?.parse::<Uuid>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Find existing resolution/backlog claims whose CONTENT cites "PR #<n>".
 #[allow(dead_code)]
 async fn find_claims_citing_pr(client: &reqwest::Client, endpoint: &str, n: u64) -> Vec<Uuid> {
@@ -1717,14 +1980,7 @@ async fn find_claims_citing_pr(client: &reqwest::Client, endpoint: &str, n: u64)
     let Ok(v) = resp.json::<serde_json::Value>().await else {
         return vec![];
     };
-    v["claims"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|c| c["id"].as_str()?.parse::<Uuid>().ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    claim_ids_citing_pr(&v, n)
 }
 
 /// For each resolved target, create `target --RESOLVED_BY--> PR`, datestamped at
@@ -1913,10 +2169,6 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     };
     let rev_range = args.rev_range.clone().ok_or("--rev-range required")?;
     let commits = parse_git_log_range(&args.repo, &rev_range)?;
-    let commit_msgs: Vec<String> = commits
-        .iter()
-        .map(|c| format!("[{}][{}] {}", c.commit_type, c.scope, c.claim_text))
-        .collect();
 
     // Resolution references (PR-level): UUID refs + PR-number citations from the
     // PR body and commit messages. Computed up front so --dry-run can show the
@@ -1942,13 +2194,21 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         return Ok(());
     }
 
+    // The host secret for the author and repo-root keys, checked before any
+    // network call: a live run without it is refused.
+    let author_keys = author_keys_for_run(args.author_key_file.as_deref(), false)?;
+
     // 1) Resolve the implementing orchestrator agent: explicit flag, then trailer
-    //    (PR body / commits), then EPIGRAPH_DEFAULT_ORCHESTRATOR_ID. The resolver
-    //    only reads an id (never mints one); a bogus id surfaces at submit time.
-    let orchestrator_id = match args.orchestrator_id {
-        Some(id) => id,
-        None => resolve_orchestrator_agent(&meta.body, &commit_msgs)?,
-    };
+    //    (PR body, then each commit's trailer block), then
+    //    EPIGRAPH_DEFAULT_ORCHESTRATOR_ID as the fallback.
+    let orchestrator_id = resolve_orchestrator_agent(
+        args.orchestrator_id,
+        &meta.body,
+        &commits,
+        std::env::var("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
+            .ok()
+            .as_deref(),
+    )?;
 
     // 2) Repo root node, attributed to a fixed system agent (NOT the per-PR
     //    orchestrator). Keying on the orchestrator made the repo node's
@@ -1957,7 +2217,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     //    use its returned id as the node's author. Registration is now `.await?`
     //    (not best-effort) because create_agent is idempotent on public_key
     //    (Plan 2.5 Tasks 1-2): a re-run returns the same id instead of a 400.
-    let repo_root_signer = repo_root_signer();
+    let repo_root_signer = author_keys.repo_root();
     let repo_root_id = AgentRegistry::register_agent(
         &client,
         &args.endpoint,
@@ -2001,6 +2261,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         let (signer, author_id) = resolve_author_agent(
             &client,
             &args.endpoint,
+            &author_keys,
             &mut author_cache,
             &commit.author_name,
             &commit.author_email,
@@ -2132,8 +2393,23 @@ async fn main() {
         }
     };
 
+    // Per-author keys need the host secret; a live per-author run without it is
+    // refused here, before enrichment or registration makes a network call. The
+    // other modes never derive an author key.
+    let author_keys = if primary_signer.is_none() {
+        match author_keys_for_run(args.author_key_file.as_deref(), args.dry_run) {
+            Ok(keys) => keys,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        GitAuthorKeys::ephemeral()
+    };
+
     // Agent management: single shared agent or per-author agents
-    let mut registry = AgentRegistry::new();
+    let mut registry = AgentRegistry::new(author_keys);
     let mut shared_agent_id = primary_signer.as_ref().map(|_| Uuid::new_v4());
 
     if let Some(id) = shared_agent_id {
@@ -2657,11 +2933,17 @@ mod tests {
     // Deterministic per-author agent identity tests
     // -------------------------------------------------------------------------
 
+    /// A fixed test secret (never a real one).
+    fn test_keys() -> GitAuthorKeys {
+        GitAuthorKeys::parse(&"a5".repeat(32)).expect("64 hex characters")
+    }
+
     #[test]
-    fn author_signer_is_deterministic_per_email() {
-        let a = author_signer("A. Developer", "owner@example.com");
-        let b = author_signer("A. Dev", "owner@example.com"); // name differs, email same
-        let c = author_signer("Someone", "other@example.com");
+    fn author_key_is_deterministic_per_email() {
+        let keys = test_keys();
+        let a = keys.author("owner@example.com");
+        let b = test_keys().author("owner@example.com"); // a second load of the same secret
+        let c = keys.author("other@example.com");
         assert_eq!(a.public_key(), b.public_key(), "same email => same key");
         assert_ne!(
             a.public_key(),
@@ -2672,13 +2954,98 @@ mod tests {
 
     #[test]
     fn author_email_is_normalized() {
-        let a = author_signer("x", "Owner@Example.com  ");
-        let b = author_signer("x", "owner@example.com");
+        let keys = test_keys();
         assert_eq!(
-            a.public_key(),
-            b.public_key(),
+            keys.author("Owner@Example.com  ").public_key(),
+            keys.author("owner@example.com").public_key(),
             "case/space-insensitive email"
         );
+    }
+
+    // Review of backlog 7d9e60c6: a key derived from the email alone is
+    // computable from the public git log, and the server provisions an OAuth
+    // client for a newly registered key, so such a key is a login anyone can
+    // use. The key must depend on the host secret, and must not be the old
+    // public formula.
+    #[test]
+    fn author_key_is_not_computable_from_the_email_alone() {
+        let email = "alice@example.com";
+        let under_a = test_keys().author(email).public_key();
+        let under_b = GitAuthorKeys::parse(&"5a".repeat(32))
+            .unwrap()
+            .author(email)
+            .public_key();
+        assert_ne!(under_a, under_b, "the host secret must be an input");
+
+        let public_seed = blake3::hash(format!("epigraph-git-author-v1:{email}").as_bytes());
+        let public_formula = AgentSigner::from_bytes(public_seed.as_bytes()).unwrap();
+        assert_ne!(under_a, public_formula.public_key());
+        assert_ne!(under_b, public_formula.public_key());
+
+        // The documented derivation, spelled out independently.
+        let expected_seed = blake3::keyed_hash(
+            &[0xa5; 32],
+            format!("epigraph-git-author-v2:{email}").as_bytes(),
+        );
+        assert_eq!(
+            under_a,
+            AgentSigner::from_bytes(expected_seed.as_bytes())
+                .unwrap()
+                .public_key()
+        );
+    }
+
+    #[test]
+    fn repo_root_key_is_keyed_too() {
+        let public_seed = blake3::hash(b"epigraph-git-author-v1:git-ingester@epigraph.system");
+        let public_formula = AgentSigner::from_bytes(public_seed.as_bytes()).unwrap();
+        assert_ne!(
+            test_keys().repo_root().public_key(),
+            public_formula.public_key()
+        );
+        assert_ne!(
+            test_keys().repo_root().public_key(),
+            GitAuthorKeys::parse(&"5a".repeat(32))
+                .unwrap()
+                .repo_root()
+                .public_key(),
+            "the host secret must be an input"
+        );
+    }
+
+    #[test]
+    fn author_key_file_must_be_32_bytes_of_hex_and_not_zero() {
+        assert!(GitAuthorKeys::parse(&format!("  {}\n", "a5".repeat(32))).is_ok());
+        assert!(GitAuthorKeys::parse(&"a5".repeat(31)).is_err(), "too short");
+        assert!(GitAuthorKeys::parse(&"a5".repeat(33)).is_err(), "too long");
+        assert!(GitAuthorKeys::parse(&"zz".repeat(32)).is_err(), "not hex");
+        assert!(GitAuthorKeys::parse(&"00".repeat(32)).is_err(), "all zero");
+        let err = GitAuthorKeys::parse(&"zz".repeat(32)).err().unwrap();
+        assert!(!err.contains("zz"), "the error must not echo the content");
+    }
+
+    #[test]
+    fn a_live_run_without_an_author_key_file_is_refused() {
+        let err = author_keys_for_run(None, false)
+            .err()
+            .expect("live run refused");
+        assert!(err.contains("--author-key-file"), "{err}");
+        assert!(
+            author_keys_for_run(None, true).is_ok(),
+            "a dry run needs no key file"
+        );
+
+        let dir = std::env::temp_dir().join(format!("ingest-git-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("author.key");
+        std::fs::write(&path, format!("{}\n", "a5".repeat(32))).unwrap();
+        let loaded = author_keys_for_run(Some(&path), false).expect("key file loads");
+        assert_eq!(
+            loaded.author("x@example.com").public_key(),
+            test_keys().author("x@example.com").public_key()
+        );
+        assert!(author_keys_for_run(Some(&dir.join("missing")), true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // -------------------------------------------------------------------------
@@ -2692,14 +3059,15 @@ mod tests {
         // `create_or_get` collapses the repo node across every PR/orchestrator.
         // `orchestrator_id` is not even an input to the repo-root signer, so two
         // different orchestrators necessarily resolve the same repo-root key.
+        let keys = test_keys();
         assert_eq!(
-            repo_root_signer().public_key(),
-            repo_root_signer().public_key(),
-            "repo-root signer is deterministic from a constant"
+            keys.repo_root().public_key(),
+            test_keys().repo_root().public_key(),
+            "repo-root signer is deterministic under one host secret"
         );
         assert_ne!(
-            repo_root_signer().public_key(),
-            author_signer("x", "someone@example.com").public_key(),
+            keys.repo_root().public_key(),
+            keys.author("git-ingester@epigraph.system").public_key(),
             "repo-root system agent is distinct from any git author"
         );
     }
@@ -2749,6 +3117,240 @@ mod tests {
     // -------------------------------------------------------------------------
     // Repo-node find-or-create packet tests
     // -------------------------------------------------------------------------
+
+    /// One `git log --format=<RS>%H<FS>%an<FS>%ae<FS>%aI<FS>%P<FS>%B --name-only`
+    /// record, as `parse_git_log` reads it (`%B` ends with a newline, then
+    /// `--name-only` adds a blank line and the file names).
+    fn git_log_record(hash: &str, email: &str, message: &str) -> String {
+        format!(
+            "{RECORD_SEP}{hash}{FIELD_SEP}A{FIELD_SEP}{email}{FIELD_SEP}2026-11-14T00:00:00Z\
+             {FIELD_SEP}{FIELD_SEP}{message}\n\nsrc/lib.rs\n"
+        )
+    }
+
+    // Backlog 7d9e60c6 (5): trailer lines are not Verification evidence, and a
+    // wrapped bullet is one evidence row, not one per line.
+    #[test]
+    fn trailer_block_is_not_section_evidence() {
+        let msg =
+            "fix(api): x\n\n**Evidence:**\n- e1\n\n**Verification:**\n- cargo test: 3 passed\n\
+                   - clippy clean\n\nCo-Authored-By: A Bot <a@example.com>\n\
+                   Claude-Session: https://example.com/s/1";
+        let out = git_log_record("h1", "a@example.com", msg);
+        let commits = parse_git_log_output(&out).unwrap();
+        assert_eq!(commits.len(), 1);
+        let c = &commits[0];
+        assert_eq!(c.verification, vec!["cargo test: 3 passed", "clippy clean"]);
+        assert_eq!(c.evidence, vec!["e1"]);
+        assert_eq!(
+            c.trailers,
+            vec![
+                "Co-Authored-By: A Bot <a@example.com>",
+                "Claude-Session: https://example.com/s/1"
+            ]
+        );
+        assert_eq!(c.files_changed, vec!["src/lib.rs"]);
+
+        // With no Verification section the trailers would have landed in Reasoning.
+        let (_, _, _, _, reasoning, _) =
+            parse_commit_message("feat: y\n\nReasoning:\n- r1\n\nSigned-off-by: A <a@b>");
+        assert_eq!(reasoning, vec!["r1"]);
+    }
+
+    #[test]
+    fn wrapped_bullets_are_one_item_and_every_list_marker_opens_one() {
+        let msg = "feat(x): y\n\n**Evidence:**\n- first line\n  wrapped onto two\n- second\n\
+                   * star\n+ plus\n1. one\n2) two\n\n**Verification:**\n- passes:\n  3 tests\n\
+                   unindented wrap\n\nseparate paragraph";
+        let (_, _, _, evidence, _, verification) = parse_commit_message(msg);
+        assert_eq!(
+            evidence,
+            vec![
+                "first line wrapped onto two",
+                "second",
+                "star",
+                "plus",
+                "one",
+                "two"
+            ]
+        );
+        assert_eq!(
+            verification,
+            vec!["passes: 3 tests unindented wrap", "separate paragraph"]
+        );
+    }
+
+    #[test]
+    fn last_paragraph_that_is_not_all_trailers_is_kept() {
+        // A Verification section closing the message is not a trailer block,
+        // even when its bullets hold `key: value` text.
+        let msg = "test(x): y\n\nEvidence:\n- e\n\nVerification:\n- cargo test: ok\n- fmt: clean";
+        let (_, _, _, _, _, verification) = parse_commit_message(msg);
+        assert_eq!(verification, vec!["cargo test: ok", "fmt: clean"]);
+        let (body, trailers) = split_trailers(msg);
+        assert!(trailers.is_empty());
+        assert_eq!(body, msg);
+        // A one-paragraph message (`docs: x` looks like a trailer) has no trailers.
+        assert!(split_trailers("docs: x").1.is_empty());
+        assert_eq!(parse_header(&split_trailers("docs: x").0).2, "x");
+        // A mixed last paragraph is not a trailer block either.
+        assert!(split_trailers("a: b\n\nKey: v\nplain text").1.is_empty());
+    }
+
+    // Review of 7d9e60c6: a closing one-line `Key: value` paragraph whose key is
+    // a plain word is message text, not a trailer block, so it is not dropped.
+    #[test]
+    fn closing_single_word_key_line_is_kept_as_text() {
+        let msg = "test(x): y\n\nEvidence:\n- e\n\nVerification: cargo test passes";
+        let (body, trailers) = split_trailers(msg);
+        assert!(trailers.is_empty(), "{trailers:?}");
+        assert_eq!(body, msg);
+        let (_, _, _, evidence, _, _) = parse_commit_message(msg);
+        assert!(
+            evidence.iter().any(|e| e.contains("cargo test passes")),
+            "{evidence:?}"
+        );
+        assert!(split_trailers("fix: y\n\nNote: see #12").1.is_empty());
+        // Hyphenated keys and conventional single-word keys still are trailers.
+        assert_eq!(
+            split_trailers("fix: y\n\nFixes: #12\nSigned-off-by: A <a@b>").1,
+            vec!["Fixes: #12", "Signed-off-by: A <a@b>"]
+        );
+    }
+
+    // Backlog 7d9e60c6 (3): an Epigraph-Orchestrator-Id trailer in a commit
+    // message is read (it used to see only the `[type][scope] claim` header).
+    #[test]
+    fn commit_message_orchestrator_trailer_is_read() {
+        let id = Uuid::parse_str("7b3a0c1e-0000-4000-8000-0000000000c1").unwrap();
+        let msg = format!(
+            "feat(x): y\n\n**Verification:**\n- ok\n\nEpigraph-Orchestrator-Id: {id}\n\
+             Co-Authored-By: A <a@b>"
+        );
+        let mut out = git_log_record("h0", "a@b", "chore: earlier commit, no trailer");
+        out.insert_str(0, &git_log_record("h1", "a@b", &msg)); // git log is newest first
+        let commits = parse_git_log_output(&out).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(
+            resolve_orchestrator_agent(None, "PR body without one", &commits, None),
+            Ok(id)
+        );
+        // The trailer is not a Verification row.
+        assert_eq!(commits[1].verification, vec!["ok"]);
+    }
+
+    // Backlog 7d9e60c6 (2): EPIGRAPH_DEFAULT_ORCHESTRATOR_ID is a fallback only.
+    #[test]
+    fn orchestrator_precedence_flag_body_commit_then_default() {
+        let flag = Uuid::parse_str("00000000-0000-4000-8000-0000000000f1").unwrap();
+        let body_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000b1").unwrap();
+        let commit_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000c1").unwrap();
+        let default = "00000000-0000-4000-8000-0000000000d1";
+        let body = format!("text\n\nEpigraph-Orchestrator-Id: {body_id}");
+        let out = git_log_record(
+            "h1",
+            "a@b",
+            &format!("fix: y\n\nEpigraph-Orchestrator-Id: {commit_id}"),
+        );
+        let commits = parse_git_log_output(&out).unwrap();
+        let r = |f, b: &str, c: &[ParsedCommit], d| resolve_orchestrator_agent(f, b, c, d);
+        assert_eq!(r(Some(flag), &body, &commits, Some(default)), Ok(flag));
+        assert_eq!(r(None, &body, &commits, Some(default)), Ok(body_id));
+        assert_eq!(r(None, "", &commits, Some(default)), Ok(commit_id));
+        assert_eq!(
+            r(None, "", &[], Some(default)),
+            Ok(Uuid::parse_str(default).unwrap())
+        );
+        assert!(r(None, "", &[], None).is_err());
+        assert!(r(None, "", &[], Some("  ")).is_err());
+        let bad = r(None, "", &[], Some("not-a-uuid")).unwrap_err();
+        assert!(bad.contains("must be a UUID"), "{bad}");
+    }
+
+    // Review of 7d9e60c6: with trailers in several commits, the OLDEST wins.
+    #[test]
+    fn orchestrator_trailer_of_the_oldest_commit_wins() {
+        let older = Uuid::parse_str("00000000-0000-4000-8000-0000000000a1").unwrap();
+        let newer = Uuid::parse_str("00000000-0000-4000-8000-0000000000a2").unwrap();
+        let mut out = git_log_record(
+            "h0",
+            "a@b",
+            &format!("fix: first\n\nEpigraph-Orchestrator-Id: {older}"),
+        );
+        // git log is newest first.
+        out.insert_str(
+            0,
+            &git_log_record(
+                "h1",
+                "a@b",
+                &format!("fix: second\n\nEpigraph-Orchestrator-Id: {newer}"),
+            ),
+        );
+        let commits = parse_git_log_output(&out).unwrap();
+        assert_eq!(commits[0].hash, "h0", "commits are oldest first");
+        assert_eq!(
+            resolve_orchestrator_agent(None, "", &commits, None),
+            Ok(older)
+        );
+    }
+
+    // Backlog 7d9e60c6 (4): `#8` resolves only claims citing PR #8, not #80.
+    #[test]
+    fn pr_citation_matches_the_exact_number() {
+        assert!(content_cites_pr("Fixed in PR #8.", 8));
+        assert!(content_cites_pr("fixed in pr #8", 8));
+        assert!(content_cites_pr("PR #80 and PR #8", 8));
+        assert!(content_cites_pr("PR #8", 8));
+        assert!(!content_cites_pr("Fixed in PR #80", 8));
+        assert!(!content_cites_pr("PR #812 merged", 8));
+        assert!(!content_cites_pr("no citation", 8));
+        // Left boundary (review of 7d9e60c6): `apr #8` / `SPR #8` is not PR #8.
+        assert!(!content_cites_pr("see apr #8", 8));
+        assert!(!content_cites_pr("SPR #8", 8));
+        assert!(content_cites_pr("(PR #8)", 8));
+        assert!(content_cites_pr("SPR #8, then PR #8", 8));
+        let resp = serde_json::json!({"claims": [
+            {"id": "00000000-0000-4000-8000-000000000001", "content": "landed in PR #80"},
+            {"id": "00000000-0000-4000-8000-000000000002", "content": "landed in PR #8"},
+            {"id": "00000000-0000-4000-8000-000000000003", "content": "PR #812"},
+            {"id": "00000000-0000-4000-8000-000000000004"}
+        ]});
+        assert_eq!(
+            claim_ids_citing_pr(&resp, 8),
+            vec![Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap()]
+        );
+    }
+
+    // Backlog 7d9e60c6 (6): per-author keys are derived from the email outside
+    // PR mode too, so a re-run maps an author to the same agent.
+    #[test]
+    fn per_author_registry_keys_are_stable_across_runs() {
+        let mut run1 = AgentRegistry::new(test_keys());
+        let mut run2 = AgentRegistry::new(test_keys());
+        let pk1 = run1
+            .get_or_create("alice@example.com", "Alice")
+            .signer
+            .public_key();
+        let pk2 = run2
+            .get_or_create(" Alice@Example.com ", "Alice")
+            .signer
+            .public_key();
+        assert_eq!(pk1, pk2);
+        assert_eq!(pk1, test_keys().author("alice@example.com").public_key());
+        // Case variants of one email are one author, not two entries.
+        run1.get_or_create("ALICE@example.com", "Alice");
+        assert_eq!(run1.len(), 1);
+    }
+
+    // Backlog 7d9e60c6 (1): the token can come from EPIGRAPH_TOKEN, off argv.
+    #[test]
+    fn token_flag_wins_then_env_then_none() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(token_or_env(s("flag"), s("env")), s("flag"));
+        assert_eq!(token_or_env(None, s(" env \n")), s("env"));
+        assert_eq!(token_or_env(None, s("  ")), None);
+        assert_eq!(token_or_env(None, None), None);
+    }
 
     #[test]
     fn repo_node_packet_has_stable_idempotency_and_label() {
@@ -3081,6 +3683,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["Chose f64 for precision".to_string()],
             verification: vec!["test_truth_bounds passes".to_string()],
             parent_hashes: vec!["parent123".to_string()],
+            trailers: vec![],
             files_changed: vec!["src/core/claim.rs".to_string()],
         };
 
@@ -3130,6 +3733,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["Cargo.lock".to_string()],
         };
 
@@ -3165,6 +3769,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
 
@@ -3212,6 +3817,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["DRY principle".to_string()],
             verification: vec![],
             parent_hashes: vec!["deadbeef".to_string()],
+            trailers: vec![],
             files_changed: vec![
                 "src/engine/propagation.rs".to_string(),
                 "src/engine/mod.rs".to_string(),
@@ -3255,6 +3861,7 @@ fix(db): prevent SQL injection in claim search
                 reasoning: vec![],
                 verification: vec![],
                 parent_hashes: vec![],
+                trailers: vec![],
                 files_changed: vec![],
             },
             ParsedCommit {
@@ -3269,6 +3876,7 @@ fix(db): prevent SQL injection in claim search
                 reasoning: vec![],
                 verification: vec![],
                 parent_hashes: vec!["aaa".to_string()],
+                trailers: vec![],
                 files_changed: vec![],
             },
         ];
@@ -3384,6 +3992,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["re".into()],
             verification: vec!["ve".into()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3405,6 +4014,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec!["re".into()],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3426,6 +4036,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3462,6 +4073,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -3478,7 +4090,7 @@ fix(db): prevent SQL injection in claim search
 
     #[test]
     fn test_agent_registry_creates_unique_agents() {
-        let mut registry = AgentRegistry::new();
+        let mut registry = AgentRegistry::new(test_keys());
 
         let a1 = registry.get_or_create("alice@example.com", "Alice");
         let a1_id = a1.agent_id;
@@ -3496,7 +4108,7 @@ fix(db): prevent SQL injection in claim search
 
     #[test]
     fn test_agent_registry_reuses_existing() {
-        let mut registry = AgentRegistry::new();
+        let mut registry = AgentRegistry::new(test_keys());
 
         let first = registry.get_or_create("alice@example.com", "Alice");
         let first_id = first.agent_id;
@@ -3511,7 +4123,7 @@ fix(db): prevent SQL injection in claim search
 
     #[test]
     fn test_agent_registry_empty() {
-        let registry = AgentRegistry::new();
+        let registry = AgentRegistry::new(test_keys());
         assert_eq!(registry.len(), 0);
     }
 
@@ -3537,6 +4149,7 @@ fix(db): prevent SQL injection in claim search
             reasoning: vec![],
             verification: vec![],
             parent_hashes: parents.into_iter().map(String::from).collect(),
+            trailers: vec![],
             files_changed: vec![],
         }
     }
@@ -4050,7 +4663,7 @@ crates/epigraph-core/src/domain/mod.rs",
         let output = realistic_git_log_output();
         let commits = parse_git_log_output(&output).unwrap();
 
-        let mut registry = AgentRegistry::new();
+        let mut registry = AgentRegistry::new(test_keys());
 
         for commit in &commits {
             registry.get_or_create(&commit.author_email, &commit.author_name);
@@ -4312,6 +4925,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec!["Chose approach A".into()],
             verification: vec!["tests pass".into()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["src/lib.rs".into()],
         };
         let signer = AgentSigner::generate();
@@ -4352,6 +4966,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec!["reasoning".into()],
             verification: vec!["verification".into()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -4389,6 +5004,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec![],
             verification: vec![],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec![],
         };
         let signer = AgentSigner::generate();
@@ -5177,6 +5793,7 @@ crates/epigraph-core/src/domain/mod.rs",
             reasoning: vec!["BLAKE3 chosen over SHA-256 for speed".to_string()],
             verification: vec!["test_hash_deterministic passes".to_string()],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["crates/epigraph-crypto/src/hasher.rs".to_string()],
         };
 
@@ -5287,6 +5904,7 @@ crates/epigraph-core/src/domain/mod.rs",
                 "test_claim_rejects_truth_above_one: passes".to_string(),
             ],
             parent_hashes: vec![],
+            trailers: vec![],
             files_changed: vec!["crates/epigraph-core/src/domain/claim.rs".to_string()],
         };
 
