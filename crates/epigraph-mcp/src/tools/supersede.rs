@@ -39,7 +39,7 @@ pub async fn supersede_claim(
     // The act's edges are attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, caller, author) = begin_claim_act(
+    let (mut tx, actor, caller) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -104,16 +104,19 @@ pub async fn supersede_claim(
         }
         (None, status) => (status, CascadeReport::default()),
     };
+    // The maintenance connection goes back to its pool BEFORE the provider
+    // round trip below: an embedding call must not hold a pooled connection.
+    drop(session);
 
-    // The replacement is a CURRENT claim with new text and no vector (the act
-    // copies none on purpose), so it is embedded here like every other write
-    // path: post-commit and best-effort (CLAUDE.md "Embedding policy"; backlog
-    // 7628ab2c). Without this the claim that replaced a recallable one was
-    // invisible to `recall` until a backfill ran. Stored through the
-    // replacement's author, which it inherits from the retired claim.
+    // The replacement is a new CURRENT claim, so it is embedded post-commit,
+    // best-effort (CLAUDE.md's write-path rule; backlog 7628ab2c): without a
+    // vector it is invisible to recall. Stored on a connection stamped as
+    // `actor`, the principal whose transaction just INSERTed the row (and so
+    // provably writes its owner group), not the inherited author, who may no
+    // longer write the group the claim lives in.
     let embedded = crate::claim_helper::embed_claim_author_stamped(
         server,
-        author,
+        actor,
         new_id,
         &params.content,
         None,
@@ -190,20 +193,24 @@ fn database_42501(e: &epigraph_db::DbError) -> Option<String> {
 /// both claims' group. On the supersede path the act runs first in the same
 /// transaction, so only the authority arm is reachable there, and that is what
 /// [`epigraph_auth::claim_act::supersede_not_recorded_message`] says.
+///
+/// The predicate is [`epigraph_auth::claim_act::is_cascade_deferral_refusal`],
+/// shared with the HTTP route's twin, so CX03 is recognised by one rule.
 fn cx03_denial(claim: uuid::Uuid, e: &epigraph_db::DbError) -> Option<McpError> {
-    let message = database_42501(e)?;
-    let cx03 = format!(
-        "{}:",
-        epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
-    );
-    if !message.starts_with(&cx03) {
+    let epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::Database(d),
+    } = e
+    else {
+        return None;
+    };
+    if !epigraph_auth::claim_act::is_cascade_deferral_refusal(d.code().as_deref(), d.message()) {
         return None;
     }
     tracing::warn!(
         target: "tenancy.scoped_write",
         tool = "supersede_claim",
         claim = %claim,
-        detail = %message,
+        detail = %d.message(),
         "the cascade deferral refused the supersession"
     );
     Some(caller_denial(
@@ -265,16 +272,21 @@ pub async fn supersede_session_or_deferral<'s>(
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
     let claim = trigger.subject_id;
-    session_or_deferral(server, tx, trigger, |e| {
-        supersede_deferral_refusal(claim, e)
-    })
+    admin_cascade::session_or_record_deferral(
+        crate::maintenance::admin_cascade_session(server).await,
+        tx,
+        trigger,
+    )
     .await
+    .map_err(|e| supersede_deferral_refusal(claim, e))
 }
 
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
 /// commits. When there is none -- not configured, or not usable -- record the
 /// deferral inside the act's own transaction `tx`, so the act and its audit row
-/// commit together, and return that status.
+/// commit together, and return that status. The core is
+/// [`admin_cascade::session_or_record_deferral`], shared with the HTTP routes;
+/// this answers its error as a fault.
 ///
 /// # Errors
 /// The deferral INSERT's error: the caller propagates it and nothing commits.
@@ -283,26 +295,13 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     tx: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
-    session_or_deferral(server, tx, trigger, internal_error).await
-}
-
-/// [`admin_session_or_deferral`] with the deferral's error answered by
-/// `refusal`.
-async fn session_or_deferral<'s>(
-    server: &'s EpiGraphMcpFull,
-    tx: &mut sqlx::PgConnection,
-    trigger: &CascadeTrigger,
-    refusal: impl FnOnce(epigraph_db::DbError) -> McpError,
-) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
-    match crate::maintenance::admin_cascade_session(server).await {
-        Ok(session) => Ok((Some(session), CascadeStatus::default())),
-        Err(reason) => {
-            let status = admin_cascade::record_deferral(&mut *tx, trigger, &reason)
-                .await
-                .map_err(refusal)?;
-            Ok((None, status))
-        }
-    }
+    admin_cascade::session_or_record_deferral(
+        crate::maintenance::admin_cascade_session(server).await,
+        tx,
+        trigger,
+    )
+    .await
+    .map_err(internal_error)
 }
 
 /// The gate read, the authority decision and the stamped transaction a claim
@@ -361,15 +360,7 @@ async fn begin_claim_act<'p>(
     canonical: Option<uuid::Uuid>,
     tool: &'static str,
     action: &str,
-) -> Result<
-    (
-        epigraph_db::ScopedTx<'p>,
-        uuid::Uuid,
-        uuid::Uuid,
-        uuid::Uuid,
-    ),
-    McpError,
-> {
+) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid, uuid::Uuid), McpError> {
     let not_found = |id: uuid::Uuid| invalid_params(format!("claim {id} not found"));
 
     // The write identity (batch H-b, D1): the caller's own agent over HTTP,
@@ -384,7 +375,7 @@ async fn begin_claim_act<'p>(
             .map_err(internal_error)?
             .ok_or_else(|| not_found(claim))?;
         crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
-        return Ok((tx, caller.agent_id(), caller.agent_id(), claim_author));
+        return Ok((tx, caller.agent_id(), caller.agent_id()));
     };
 
     let mut caller_tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
@@ -437,7 +428,7 @@ async fn begin_claim_act<'p>(
     tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
-        return Ok((caller_tx, caller.agent_id(), caller.agent_id(), author));
+        return Ok((caller_tx, caller.agent_id(), caller.agent_id()));
     }
     if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
         // Not reachable through `claim_act_arm` (a non-admin arm requires the
@@ -453,7 +444,7 @@ async fn begin_claim_act<'p>(
         .await?;
     drop(caller_tx);
     let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
-    Ok((tx, server_agent.agent_id(), caller.agent_id(), author))
+    Ok((tx, server_agent.agent_id(), caller.agent_id()))
 }
 
 pub async fn mark_duplicate(
@@ -493,7 +484,7 @@ pub(crate) async fn mark_duplicate_preflight(
     canon: uuid::Uuid,
     tool: &'static str,
 ) -> Result<(), McpError> {
-    let (tx, _, _, _) = begin_claim_act(
+    let (tx, _, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -532,7 +523,7 @@ pub(crate) async fn mark_duplicate_pair(
     // The identity edge is attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, _, _) = begin_claim_act(
+    let (mut tx, actor, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -702,7 +693,7 @@ pub(crate) async fn unmark_gate(
              written"
         )));
     }
-    let (mut tx, actor, _, _) = begin_claim_act(
+    let (mut tx, actor, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -729,7 +720,7 @@ pub(crate) async fn unmark_gate(
     // The same gate over each claim that replaced the canonical: the reversal
     // moves the duplicate's rows off it as off the canonical.
     for replacement in chain.iter().flat_map(|c| c.iter().skip(1)) {
-        let (mut tx, _, _, _) = begin_claim_act(
+        let (mut tx, _, _) = begin_claim_act(
             server,
             viewer,
             auth,
