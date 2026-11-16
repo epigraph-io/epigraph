@@ -349,6 +349,7 @@ async fn a_submit_claim_creation_bba_is_left_out_as_the_live_track_leaves_it(poo
             // The server agent's personal group (`group`), which it writes.
             visibility: Some("private".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

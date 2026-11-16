@@ -80,9 +80,11 @@
 //!   takes the exact meet too (co-owned, reported as `CO-OWNED-EDGE`; a public
 //!   one holds the claim, `public-row`).
 //!   `epigraph_node_tenancy` (070), and so the trigger, count such a node as
-//!   public: left alone, the trigger would put an edge from a source-private
-//!   workflow on `('group', TARGET)` alone, which source-only members lose and
-//!   target-only members gain while it names a workflow they cannot read. The
+//!   public (a workflow excepted since migration 219, which meets it with its
+//!   own row, as this tool does): left alone, the trigger would put an edge
+//!   from a source-private context on `('group', TARGET)` alone, which
+//!   source-only members lose and target-only members gain while it names a
+//!   node they cannot read. The
 //!   tool writes the exact meet instead (co-owned with the node's group) and
 //!   reports every edge to a group-private node that is not the target's
 //!   (`SOURCE-NODE-EDGE` lines and a count). A public node, or one in the
@@ -452,10 +454,11 @@ fn model_readable(
 /// table carries its own `(owner_group_id, visibility)`: entity type -> table.
 ///
 /// `epigraph_node_tenancy` (070) answers `('public', world)` for every type but
-/// claim and evidence, so the trigger's meet treats such a node as public even
-/// when the row itself is group-private (a workflow, migration 183; a frame,
-/// context, perspective or community, migration 062; a reasoning trace, which
-/// follows its claim). Read from the schema,
+/// claim, evidence and (since migration 219) workflow, so the trigger's meet
+/// treats such a node as public even when the row itself is group-private (a
+/// frame, context, perspective or community, migration 062; a reasoning trace,
+/// which follows its claim; a workflow, migration 183, until 219). A workflow
+/// stays in this map: reading its own row agrees with the oracle. Read from the schema,
 /// not from `entity_types.tenancy_tier` (which still says `derived` for
 /// `workflow`), so a type that gains tenancy columns later is covered.
 pub type NodeTypes = BTreeMap<String, String>;

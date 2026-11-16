@@ -352,6 +352,7 @@ pub async fn query_claims_by_evidence(
                 epigraph_core::EvidenceType::Literature { .. } => "reference",
                 epigraph_core::EvidenceType::Consensus { .. } => "consensus",
                 epigraph_core::EvidenceType::Figure { .. } => "figure",
+                epigraph_core::EvidenceType::Dataset { .. } => "dataset",
             };
             type_name == evidence_type_lower
                 || (evidence_type_lower == "computation" && type_name == "document")

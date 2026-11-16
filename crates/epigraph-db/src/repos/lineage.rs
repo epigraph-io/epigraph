@@ -103,6 +103,11 @@ pub struct LineageEvidence {
     pub claim_id: Uuid,
     pub evidence_type: String,
     pub content_hash: Vec<u8>,
+    /// The row's `properties` (the serialised `EvidenceType::Dataset`) when it
+    /// is `dataset` evidence, so a provenance reader can resolve and verify
+    /// the data without a second read (backlog c8beb101); `None` for every
+    /// other evidence type, whose `properties` the lineage never carried.
+    pub dataset: Option<serde_json::Value>,
 }
 
 /// Trace data in lineage result
@@ -170,6 +175,25 @@ struct EvidenceQueryRow {
     claim_id: Uuid,
     evidence_type: String,
     content_hash: Vec<u8>,
+    dataset: Option<serde_json::Value>,
+}
+
+/// A `dataset` row's `properties` as the lineage reports them: only when they
+/// parse as an `EvidenceType::Dataset`.
+///
+/// A sealed row's `properties` are blanked to `{}` (`privatization` seal), and
+/// a hand-written row may hold anything; reporting either as `dataset` would
+/// hand a provenance reader an object with no root, digest or counts.
+/// `EvidenceRepository::datasets_by_claim_ids` skips the same rows, so
+/// `get_provenance` and `get_claim` agree (review finding 5, backlog
+/// c8beb101).
+fn dataset_properties(properties: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    properties.filter(|v| {
+        matches!(
+            serde_json::from_value::<epigraph_core::EvidenceType>(v.clone()),
+            Ok(epigraph_core::EvidenceType::Dataset { .. })
+        )
+    })
 }
 
 /// Row for trace queries
@@ -791,7 +815,8 @@ impl LineageRepository {
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
             r#"
-            SELECT id, claim_id, evidence_type, content_hash
+            SELECT id, claim_id, evidence_type, content_hash,
+                   CASE WHEN evidence_type = 'dataset' THEN properties END AS dataset
             FROM evidence
             WHERE claim_id = ANY($1)
               /* {VISIBILITY:evidence} */
@@ -813,6 +838,7 @@ impl LineageRepository {
                 claim_id: row.claim_id,
                 evidence_type: row.evidence_type,
                 content_hash: row.content_hash,
+                dataset: dataset_properties(row.dataset),
             };
             evidence_map.insert(row.id, evidence);
             claim_evidence_map
@@ -1353,7 +1379,8 @@ impl LineageRepository {
         // Query all evidence for claims in lineage
         let vsql = viewer.splice(
             r#"
-            SELECT id, claim_id, evidence_type, content_hash
+            SELECT id, claim_id, evidence_type, content_hash,
+                   CASE WHEN evidence_type = 'dataset' THEN properties END AS dataset
             FROM evidence
             WHERE claim_id = ANY($1)
               /* {VISIBILITY:evidence} */
@@ -1375,6 +1402,7 @@ impl LineageRepository {
                 claim_id: row.claim_id,
                 evidence_type: row.evidence_type,
                 content_hash: row.content_hash,
+                dataset: dataset_properties(row.dataset),
             };
             evidence_map.insert(row.id, evidence);
             claim_evidence_map

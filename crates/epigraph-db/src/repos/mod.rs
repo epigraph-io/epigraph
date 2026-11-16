@@ -224,9 +224,9 @@ pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventCursor, EventRepository, EventRow};
 pub use evidence::{
-    DerivationEvidence, EvidenceAtTimeRow, EvidenceClaimLink, EvidenceDetailRow, EvidenceDirection,
-    EvidenceEdge, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow, EvidenceRepository,
-    EvidenceSearchResult,
+    DatasetEvidence, DerivationEvidence, EvidenceAtTimeRow, EvidenceClaimLink, EvidenceDetailRow,
+    EvidenceDirection, EvidenceEdge, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow,
+    EvidenceRepository, EvidenceSearchResult,
 };
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,

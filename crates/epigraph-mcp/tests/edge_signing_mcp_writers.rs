@@ -115,6 +115,7 @@ async fn submit(server: &EpiGraphMcpFull, pool: &PgPool, content: &str) -> Uuid 
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -550,6 +551,7 @@ async fn a_callers_edges_are_signed_by_the_server_not_the_caller(pool: PgPool) {
                 novelty_threshold: Some(0.0),
                 visibility: Some("public".to_string()),
                 group_id: None,
+                dataset: None,
             },
             Some(&token),
         )
@@ -917,6 +919,7 @@ async fn caller_claim(
             novelty_threshold: Some(0.0),
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         Some(token),
     )

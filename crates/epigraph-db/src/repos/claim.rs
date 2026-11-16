@@ -8334,7 +8334,8 @@ impl ClaimRepository {
     /// Return claim IDs that have at least one evidence record of the given type.
     ///
     /// Valid values mirror the DB evidence_type column:
-    /// document, observation, testimony, computation, reference, figure, conversational.
+    /// document, observation, testimony, computation, reference, figure,
+    /// conversational, dataset (`epigraph_core::STORED_EVIDENCE_TYPES`).
     pub async fn claim_ids_by_evidence_type<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,

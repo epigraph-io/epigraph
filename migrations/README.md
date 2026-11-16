@@ -2978,6 +2978,68 @@ restart.
   INSERT). Checked before claiming: slot 218 assigned to this batch;
   no migration on main carries a `218`. **Applied to throwaway databases only,
   NOT to any deployed database.**
+- **219**: public `workflow_endpoint_tenancy` (backlog 630af617, item 3).
+  A `workflow` edge endpoint contributes its own row's tenancy (183's
+  `workflows.owner_group_id`, `visibility`) to the edge's meet. Re-states
+  070's `epigraph_node_tenancy(uuid, text)` with a `workflow` arm and 168's
+  `epigraph_propagate_tenancy()` with a `workflows` LEFT JOIN per endpoint
+  (nothing else in either body changes; CREATE OR REPLACE keeps owner and
+  ACL, and the owner is re-set). Re-meets, once, every edge with a
+  group-private workflow endpoint under the propagation's rules (group meet
+  only, never widening) and RAISEs a NOTICE with the counts by relationship
+  and transition. So a group plan's `variant_of`, `AUTHORED` and `executes`
+  edges (onto a public step or atom too) are the plan's group's, and an edge
+  from a group plan onto another group's claim is co-owned. Adds the
+  SECURITY DEFINER `epigraph_step_lineage_executors(uuid)` on 172's form
+  (owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted
+  to `epigraph_app`): every workflow executing a step's lineage, read
+  unfiltered, for the `evolve_step` authority gates, which could no longer
+  see a hidden plan's `executes` edge; they check every workflow it returns
+  and answer a refusal over one the caller did not find as a missing parent.
+  A GUARD refuses to apply 219 unless `epigraph_node_tenancy` and
+  `epigraph_propagate_tenancy` still hold 070's and 168's bodies (md5 of
+  `prosrc`), so 219 never silently reverts another re-statement; the undo
+  carries the same guard against 219's bodies. Registered in
+  `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS` and the grant register).
+  Pinned by `epigraph-db/tests/workflow_endpoint_tenancy.rs`,
+  `epigraph-db/tests/workflow_endpoint_tenancy_undo.rs`,
+  `epigraph-api/tests/workflow_ingest_group_tenancy.rs` (HTTP and MCP, on the
+  application role), `epigraph-api/tests/privatization_workflow_rows.rs` and
+  `epigraph-cli/tests/operator_reown_workflows.rs`. Must run as the
+  maintenance role or a superuser (it refuses otherwise). Undo:
+  `docs/runbooks/219-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 219, both bodies byte for byte); edges 219 narrowed stay
+  narrowed. Checked before claiming: no migration on main re-states either
+  function after 070 / 168; one change in flight also re-states the
+  propagation, and the guard makes whichever lands second re-state the merged
+  body. The slot was assigned to this batch. **Deploy order:** migrate
+  before rolling out the 219 binary (its `evolve_step` gates call the definer); undo only after
+  rolling every 219 binary back. **Applied to throwaway databases only, NOT
+  to any deployed database.**
+- **220**: public `jobs_redelivery_count` (backlog 1320b4e3). Adds
+  `jobs.redelivery_count integer NOT NULL DEFAULT 0` with the CHECK
+  `jobs_redelivery_count_non_negative`. The drain's stale-job reaper
+  (`PostgresJobQueue::reap_stale_jobs_counting_attempts`) resets a
+  one-attempt row (`max_retries <= 1`: the privatization apply, revert and
+  reseal jobs) WITHOUT counting the attempt, so it is re-delivered to its
+  handler; it now bumps this counter on each such reset and fails the row with
+  `REAPED_REDELIVERIES_SPENT_MESSAGE` on the reap past
+  `MAX_CRASH_REDELIVERIES` (3). Before it, a one-attempt job that crashed on
+  every run was re-delivered for ever. A multi-attempt row's reap still
+  counts `retry_count` and leaves this column alone. No grant, policy,
+  function or trigger. Pinned by
+  `epigraph-jobs/tests/recover_stale_jobs_test.rs`,
+  `epigraph-api/tests/drain_jobs.rs` and
+  `epigraph-db/tests/jobs_redelivery_count_undo.rs`. Undo:
+  `docs/runbooks/220-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 220); it loses the counts and leaves rows a bounded reap
+  already failed. Slot 220 was assigned to this batch; checked before
+  claiming: no migration on main, open PR or origin branch carries a `220`.
+  **Deploy order:** migrate before rolling out the 220 `drain_jobs` (it names
+  the column; on an older schema every run fails with 42703); an older
+  `drain_jobs` ignores it; undo only after rolling every 220 `drain_jobs`
+  back. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 - **221**: public `workflow_outcome_reports` (backlog 9928b61f). One row per
   hierarchical outcome report (`report_hierarchical_outcome`, the hierarchical
   branch of `report_workflow_outcome`, `POST
@@ -3020,6 +3082,32 @@ restart.
   **Deploy order:** migrate before running the 222 `cluster_claims.py` (it
   writes and reads only `umap_centroid`); undo only after rolling the script
   back. **Applied to throwaway databases only, NOT to any deployed database.**
+- **224**: public `oauth_definers_pg_catalog_path` (backlog 368ce622, the
+  family after 190's). Re-states 118's six OAuth definers
+  (`epigraph_oauth_code_consume`, `_session_to_consent`, `_session_take`,
+  `_client_lock_for_link`, `_client_link_agent`, `_client_approve`) on 172's
+  form: `SET search_path = pg_catalog, pg_temp` (from 190's
+  `pg_catalog, public, pg_temp`), with `now()`, `jsonb_build_object(` and
+  `to_jsonb(` qualified `pg_catalog.` and no other byte of the 118 bodies
+  changed (`_client_lock_for_link` calls no function: only its path moves).
+  On the old path a `public.to_jsonb(text[])` decided the scopes the
+  approval's `oauth.client_approved` audit row records, running as the
+  definer's owner. Signatures, owner (`epigraph_maintenance`) and ACL
+  unchanged (188's revoke on the approve definer stands); they stay
+  registered at 118 in `tenancy_backfill.rs`. A precondition checks the md5
+  of each 118 body and RAISEs `55000` (changing nothing) over any other.
+  `PUBLIC_PATH_REGISTER` shrinks from 198 to 192. Pinned by
+  `epigraph-db/tests/definer_search_path_ratchet.rs`
+  (`the_oauth_family_resolves_in_pg_catalog_only`,
+  `the_oauth_client_approval_ignores_a_public_overload_of_to_jsonb`,
+  `migration_224_changes_only_the_oauth_family_paths_and_qualifiers`,
+  `migration_224_refuses_to_apply_over_another_body`,
+  `the_224_undo_restores_the_oauth_family_on_190s_path`). Undo:
+  `docs/runbooks/224-undo.sql` (tested: run twice, it returns every definer
+  to its state below 224; it refuses `55000` over any body but 224's or
+  118's). Checked before claiming: slot 224 is this batch's assignment and no
+  migration on main or an origin branch carries a `224`. **Deploy order:** no
+  binary depends on it; apply whenever. **Applied to throwaway databases
 - **226**: public `paper_licence` (backlog 8709d128). Adds the nullable
   `papers.licence text` (an SPDX-style identifier; NULL = unknown) with the
   CHECK `papers_licence_nonblank` (refuses an empty or padded value). The
@@ -3100,6 +3188,27 @@ restart.
   character tag, as today, and nothing else changes. Undo only after rolling
   the 228 binary back. **Applied to throwaway
   databases only, NOT to any deployed database.**
+- **229**: public `evidence_type_dataset` (backlog c8beb101). Re-creates
+  `evidence_type_valid` on `evidence` with migration 001's seven values plus
+  `dataset`, the stored name of `epigraph_core::EvidenceType::Dataset`
+  (evidence committing to a multi-file dataset by its manifest digest; its
+  fields live in `properties`, as every variant's do). One `ALTER TABLE` (drop
+  and add), under `lock_timeout = 5s`; the re-validation scans `evidence`
+  under the ALTER's ACCESS EXCLUSIVE lock. No table, column, function,
+  trigger, policy, index or grant; no tenancy surface. The vocabulary's one
+  Rust copy is `epigraph_core::STORED_EVIDENCE_TYPES`. Pinned by
+  `epigraph-db/tests/evidence_type_dataset.rs` (the CHECK's names equal
+  `STORED_EVIDENCE_TYPES`; the repository round trip; the undo).
+  Undo: `docs/runbooks/229-undo.sql` (tested: run twice, it returns the
+  constraint to 001's definition byte for byte; it refuses, changing
+  nothing, while any `dataset` row exists). Slot 229 was assigned by the
+  2026-11-14 backlog wave; checked before claiming: no origin branch carries
+  a `229`. **Deploy order:** migrate before rolling out a binary that writes
+  dataset evidence (each such write is refused 23514 on an unmigrated
+  database); a pre-229 binary reads a `dataset` row as an
+  `application/octet-stream` Document. Undo only after rolling every 229
+  binary back. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 

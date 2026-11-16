@@ -58,6 +58,7 @@ fn submit_params(content: &str) -> epigraph_mcp::types::SubmitClaimParams {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 
@@ -74,6 +75,7 @@ fn batch_entry(content: &str) -> epigraph_mcp::types::BatchClaimEntry {
         labels: vec![],
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

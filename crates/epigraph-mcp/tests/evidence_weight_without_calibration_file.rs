@@ -143,6 +143,7 @@ async fn submit_claim_weights_empirical_from_the_served_calibration(pool: PgPool
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

@@ -115,6 +115,7 @@ async fn submit_claim_stores_the_canonical_key_not_the_callers_spelling(pool: Pg
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

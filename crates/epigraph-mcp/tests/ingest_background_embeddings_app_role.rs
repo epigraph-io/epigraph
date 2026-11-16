@@ -378,6 +378,7 @@ async fn a_consolidated_team_claim_is_embedded(pool: PgPool) {
                 novelty_threshold: Some(0.0),
                 visibility: None,
                 group_id: None,
+                dataset: None,
             },
             None,
         )
