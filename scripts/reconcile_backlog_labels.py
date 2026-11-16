@@ -56,6 +56,12 @@ if not TOKEN:
     )
 AUTH_HEADERS = {"Authorization": f"Bearer {TOKEN}"}
 
+# `GET /api/v1/claims/by-labels` pages by keyset cursor: a full page carries
+# this response header, passed back unchanged as `after` for the next page; no
+# header means the set is exhausted. Offset paging re-read a row whenever a
+# claim was written between two page reads (backlog b444e39f).
+NEXT_CURSOR_HEADER = "x-next-cursor"
+
 # Shared with cleanup_backlog_labels.py — same convention.
 KEYWORD_RE = re.compile(
     r"\b(?:resolves?|supersedes?|closes?|fixes?)\b[^\n]{0,40}?"
@@ -66,7 +72,7 @@ RECON_WINDOW_DAYS = int(os.environ.get("RECON_WINDOW_DAYS", "7"))
 
 
 def page_claims(base_url: str, labels: list[str], exclude: list[str]) -> list[dict]:
-    """Page through all claims matching the filter — loops until a short page.
+    """Page through all claims matching the filter, following the keyset cursor.
 
     See `cleanup_backlog_labels.page_claims` for the shared semantics. We
     keep the parameter list slimmer here (no `current_only`) to minimize
@@ -74,14 +80,16 @@ def page_claims(base_url: str, labels: list[str], exclude: list[str]) -> list[di
     only behavior change.
     """
     out: list[dict] = []
-    offset = 0
     page_size = 100
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
     while True:
         params: dict[str, object] = {
             "labels": ",".join(labels),
             "limit": page_size,
-            "offset": offset,
         }
+        if cursor is not None:
+            params["after"] = cursor
         if exclude:
             params["exclude_labels"] = ",".join(exclude)
         # PR-03: this read moved behind Bearer auth; without AUTH_HEADERS it 401s.
@@ -94,10 +102,24 @@ def page_claims(base_url: str, labels: list[str], exclude: list[str]) -> list[di
         r.raise_for_status()
         page = r.json()
         out.extend(page)
-        if len(page) < page_size:
+        cursor = r.headers.get(NEXT_CURSOR_HEADER)
+        if not cursor:
+            if len(page) >= page_size:
+                # The route sends the header on every full page. Its absence
+                # means a server that predates keyset paging; stopping here
+                # would silently truncate the walk at one page.
+                raise RuntimeError(
+                    f"by-labels returned a full page ({len(page)} rows) with no "
+                    f"{NEXT_CURSOR_HEADER} header; the API predates keyset paging"
+                )
             break
-        offset += page_size
-        if offset >= 10_000:  # safety belt
+        if cursor in seen_cursors:
+            raise RuntimeError(
+                f"by-labels repeated the {NEXT_CURSOR_HEADER} cursor {cursor!r}; "
+                "refusing to loop on the same page"
+            )
+        seen_cursors.add(cursor)
+        if len(out) >= 10_000:  # safety belt
             print(
                 f"WARN: page_claims hit 10k cap at labels={labels}",
                 file=sys.stderr,
@@ -131,7 +153,7 @@ def main() -> int:
     for bc in open_backlog:
         backlog_by_prefix.setdefault(bc["id"][:8].lower(), []).append(bc)
 
-    # Page resolved claims (page_claims now loops until exhaustion or 10k cap).
+    # Page resolved claims (page_claims follows the cursor to exhaustion or the 10k cap).
     resolved_page = page_claims(args.base_url, ["resolved"], [])
     resolved_recent = [
         rc for rc in resolved_page

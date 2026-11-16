@@ -23,6 +23,16 @@ sys.path.insert(0, str(REPO / "scripts"))
 os.environ.setdefault("EPIGRAPH_TOKEN", "t")
 import reconcile_backlog_labels as rbl  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _by_labels_fake import (  # noqa: E402
+    KeysetServer,
+    LegacyServer,
+    StuckCursorServer,
+    cursor_of,
+    make_rows,
+    newer_row,
+)
+
 B1 = "11111111-aaaa-4aaa-8aaa-000000000001"
 B2 = "22222222-bbbb-4bbb-8bbb-000000000002"
 # Two open backlog items sharing an 8-hex prefix: ambiguous by construction.
@@ -45,6 +55,8 @@ def _now_iso() -> str:
 class _Resp:
     def __init__(self, payload):
         self._payload = payload
+        # A short (stub) page carries no X-Next-Cursor header: the walk ends.
+        self.headers = rbl.httpx.Headers()
 
     def raise_for_status(self):
         return None
@@ -280,6 +292,76 @@ class ReconcilerMainTests(unittest.TestCase):
         self.assertEqual(
             self._summary(out), "Reconciler: patched=1 needs_review=0 apply=True"
         )
+
+
+
+def _page(server):
+    with mock.patch.object(rbl.httpx, "get", side_effect=server.get), \
+            contextlib.redirect_stderr(io.StringIO()):
+        return rbl.page_claims("http://fake", ["resolved"], [])
+
+
+class ReconcilerPageClaimsTests(unittest.TestCase):
+    """`page_claims` follows the by-labels keyset cursor, not `offset`.
+
+    Offset paging re-read the last row of a page whenever a claim was written
+    between two page reads (backlog b444e39f). For the reconciler that turns
+    one resolution claim into two matches, so an unambiguous item is logged as
+    AMBIGUOUS and never patched.
+    """
+
+    def test_a_write_between_pages_neither_duplicates_nor_drops_a_row(self):
+        rows = make_rows(250)
+        newer = newer_row()
+        server = KeysetServer(rows, insert_after_first_page=newer)
+
+        got = [r["id"] for r in _page(server)]
+
+        self.assertEqual(len(got), len(set(got)), "a row came back twice")
+        self.assertEqual(got, [r["id"] for r in rows])
+
+    def test_the_cursor_row_leaving_the_filter_between_pages_drops_nothing(self):
+        # The row page one ended on stops matching between pages (another
+        # process labels it). The cursor names a position, not a row, so the
+        # walk resumes just below it. Offset paging shifted every later row
+        # up by one and skipped the first row of page two.
+        rows = make_rows(250)
+        cut = rows[99]["id"]
+
+        def drop_cut_row(live):
+            live[:] = [r for r in live if r["id"] != cut]
+
+        server = KeysetServer(rows, after_first_page=drop_cut_row)
+
+        got = [r["id"] for r in _page(server)]
+
+        self.assertEqual(len(got), len(set(got)), "a row came back twice")
+        self.assertEqual(got, [r["id"] for r in rows], "a row was skipped")
+
+    def test_pages_by_cursor_never_by_offset(self):
+        server = KeysetServer(make_rows(250))
+
+        _page(server)
+
+        self.assertEqual(len(server.calls), 3, server.calls)
+        self.assertNotIn("after", server.calls[0])
+        for call in server.calls:
+            self.assertFalse(call.get("offset"), f"offset sent: {call!r}")
+        self.assertEqual(server.calls[1]["after"], cursor_of(make_rows(250)[99]))
+
+    def test_a_full_page_without_a_cursor_header_is_an_error(self):
+        with self.assertRaises(RuntimeError) as cm:
+            _page(LegacyServer(make_rows(250)))
+        self.assertIn("x-next-cursor", str(cm.exception).lower())
+
+    def test_a_repeated_cursor_is_an_error(self):
+        server = StuckCursorServer()
+
+        with self.assertRaises(RuntimeError) as cm:
+            _page(server)
+
+        self.assertIn("repeated", str(cm.exception))
+        self.assertEqual(server.calls, 2)
 
 
 if __name__ == "__main__":

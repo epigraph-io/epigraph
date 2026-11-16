@@ -2250,7 +2250,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Find claims by label using PostgreSQL array containment (GIN-indexed). Returns claims containing ALL specified labels. Useful for querying backlog items (e.g. [\"backlog\", \"pending\"]), workflows, or any labeled claim set."
+        description = "Find claims by label using PostgreSQL array containment (GIN-indexed). Returns claims containing ALL specified labels. Useful for querying backlog items (e.g. [\"backlog\", \"pending\"]), workflows, or any labeled claim set. To page, pass `after` (\"\" for the first page): the response becomes {claims, next_cursor}; pass each `next_cursor` back as `after` until it is null. Without `after` the response is a bare array paged by `offset`, which drifts under concurrent writes."
     )]
     async fn query_claims_by_label(
         &self,
