@@ -1,4 +1,7 @@
 pub mod atlas_layout;
+#[cfg(feature = "db")]
+pub mod atlas_links;
+#[cfg(feature = "db")]
 pub mod atlas_meaning;
 pub mod atlas_naming;
 #[cfg(feature = "db")]

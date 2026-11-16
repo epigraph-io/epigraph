@@ -100,7 +100,8 @@ const fn other(h: AtlasHierarchy) -> AtlasHierarchy {
 
 /// Every level document of `tree` in run `run_id`, in the tree's pre-order,
 /// ready for `AtlasMapRepository::put_level`. `labels` holds the text of every
-/// claim of the tree (`AtlasMeaningRepository::claim_labels`).
+/// claim of the tree (`AtlasMeaningRepository::claim_labels`). Every level's
+/// switch leads to the other hierarchy's root of the same theme.
 ///
 /// # Errors
 /// A claim with no label, or a document the contract refuses (validation or
@@ -110,13 +111,32 @@ pub fn level_documents(
     run_id: Uuid,
     labels: &BTreeMap<Uuid, String>,
 ) -> anyhow::Result<Vec<LevelDoc>> {
+    let to_root = root_id(tree.map, other(tree.hierarchy), tree.theme_id);
+    level_documents_with_switch(tree, run_id, labels, &|_| Ok(to_root))
+}
+
+/// [`level_documents`] with each level's switch target chosen by `switch`:
+/// the id of a level of the OTHER hierarchy of the same theme, for the
+/// level `TreeNode` (the "by links" hierarchy points each level at its best
+/// overlapping meaning group).
+///
+/// # Errors
+/// What [`level_documents`] refuses, or an error from `switch`.
+pub fn level_documents_with_switch(
+    tree: &MeaningTree,
+    run_id: Uuid,
+    labels: &BTreeMap<Uuid, String>,
+    switch: &dyn Fn(&TreeNode) -> anyhow::Result<Uuid>,
+) -> anyhow::Result<Vec<LevelDoc>> {
     let (map_scope, map_group_id) = match tree.map {
         AtlasMap::Public => (MapScope::Public, None),
         AtlasMap::Team(t) => (MapScope::Team, Some(t)),
     };
-    let switch = Switch {
-        hierarchy: contract_hierarchy(other(tree.hierarchy)),
-        level_id: root_id(tree.map, other(tree.hierarchy), tree.theme_id),
+    let switch_of = |node: &TreeNode| -> anyhow::Result<Switch> {
+        Ok(Switch {
+            hierarchy: contract_hierarchy(other(tree.hierarchy)),
+            level_id: switch(node)?,
+        })
     };
     let by_id: BTreeMap<Uuid, &TreeNode> = tree.nodes.iter().map(|n| (n.id, n)).collect();
     let mut out = Vec::with_capacity(tree.nodes.len());
@@ -133,6 +153,7 @@ pub fn level_documents(
             up = parent.parent;
         }
         breadcrumbs.reverse();
+        let level_switch = switch_of(node)?;
         let doc = match &node.body {
             NodeBody::Group(children) => {
                 let n = children.len();
@@ -170,7 +191,7 @@ pub fn level_documents(
                     name: None,
                     needs_naming: true,
                     breadcrumbs,
-                    switch: switch.clone(),
+                    switch: level_switch.clone(),
                     children,
                     bundles: Vec::new(),
                     targets: Vec::new(),
@@ -207,7 +228,7 @@ pub fn level_documents(
                     name: None,
                     needs_naming: true,
                     breadcrumbs,
-                    switch: switch.clone(),
+                    switch: level_switch.clone(),
                     nodes,
                     edges: Vec::new(),
                     outgoing: Vec::new(),

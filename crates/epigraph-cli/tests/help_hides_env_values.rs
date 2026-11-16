@@ -46,6 +46,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/atlas_layout.rs",
     ),
     (
+        "atlas_links",
+        Some(env!("CARGO_BIN_EXE_atlas_links")),
+        "src/bin/atlas_links.rs",
+    ),
+    (
         "atlas_meaning",
         Some(env!("CARGO_BIN_EXE_atlas_meaning")),
         "src/bin/atlas_meaning.rs",
