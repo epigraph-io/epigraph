@@ -589,8 +589,10 @@ async fn place(pool: &PgPool, claim: Uuid, theme: Option<Uuid>, minutes: i32) {
 ///   not, and `total` counts what was selectable.
 /// * `include_links=true` returns the in-force epistemic edges between two
 ///   claims ON THE PAGE that the viewer may read. An edge to a claim outside
-///   the page, an edge private to another group between two readable claims, a
-///   retracted edge and a structural (non-epistemic) edge are all absent.
+///   the page, an edge FROM a claim outside the page (both ends must be on it,
+///   not just one), an edge private to another group between two readable
+///   claims, a retracted edge and a structural (non-epistemic) edge are all
+///   absent.
 /// * without `include_links` there is no `links` key at all.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_themes_claims_come_in_date_order_with_the_links_among_them(pool: PgPool) {
@@ -623,6 +625,7 @@ async fn a_themes_claims_come_in_date_order_with_the_links_among_them(pool: PgPo
     .expect("upper-case refutes edge");
     // Absent, each for its own reason.
     let _to_outside_page = viewer_fixture::seed_edge(&pool, first, elsewhere).await;
+    let _from_outside_page = viewer_fixture::seed_edge(&pool, elsewhere, first).await;
     let _private_to_strangers =
         viewer_fixture::seed_edge_owned_by(&pool, third, first, "group", stranger_group).await;
     let retracted = viewer_fixture::seed_edge(&pool, second, first).await;
