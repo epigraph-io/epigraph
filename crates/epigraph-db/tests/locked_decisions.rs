@@ -240,6 +240,10 @@
 //!   §4.12 assigns to PR-09. It does not create an anonymous *shape* — there is
 //!   still exactly one `Viewer::resolve` and it still requires a principal — so
 //!   [`d3_viewer_has_no_infallible_constructor`] is unchanged and correct.
+//!   NARROWED by backlog fe514fc3 (operator decision): the READ-ONLY listener
+//!   now injects a dedicated zero-membership agent
+//!   (`epigraph-mcp/src/unauthenticated_reader.rs`), so it reads public rows
+//!   only; the `--allow-unauthenticated-writes` opt-in keeps the server agent.
 //!
 //! Nothing else in PR-09 is one of the four: the rest is read-path filtering
 //! (viewer predicates spliced into repo functions and into `recall.rs`'s
