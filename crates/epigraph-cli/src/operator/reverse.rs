@@ -83,6 +83,10 @@ pub struct Options {
     pub apply: bool,
     pub batch_size: usize,
     pub lock_timeout: String,
+    /// `--allow-truncated-tail`: read each manifest with
+    /// [`manifest::read_tolerating_truncated_tail`], dropping one torn final
+    /// line (a run that crashed mid-append) and printing a WARN for it.
+    pub allow_truncated_tail: bool,
 }
 
 /// A manifest resolved against the live table specs.
@@ -578,16 +582,35 @@ fn tally(
 }
 
 /// Read every manifest and order them newest-first by header `created_at`.
+/// With `allow_truncated_tail`, each is read with
+/// [`manifest::read_tolerating_truncated_tail`]; what it dropped is in each
+/// manifest's `truncated_tail`.
 ///
 /// # Errors
 /// A manifest cannot be read, lacks `created_at`, or two share one.
-pub fn read_ordered(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, manifest::Manifest)>> {
+pub fn read_ordered(
+    paths: &[PathBuf],
+    allow_truncated_tail: bool,
+) -> anyhow::Result<Vec<(PathBuf, manifest::Manifest)>> {
     if paths.is_empty() {
         bail!("at least one --manifest is required");
     }
     let mut ms = Vec::with_capacity(paths.len());
     for p in paths {
-        let m = manifest::read(p)?;
+        if super::workflow_submitter::is_manifest_file(p) {
+            bail!(
+                "{} is a set-workflow-submitter manifest; reverse it with \
+                 `epigraph-operator set-workflow-submitter --reverse {} --operator <uuid>` (it \
+                 records workflow submitters, not row tenancy)",
+                p.display(),
+                p.display()
+            );
+        }
+        let m = if allow_truncated_tail {
+            manifest::read_tolerating_truncated_tail(p)?
+        } else {
+            manifest::read(p)?
+        };
         let at = m
             .header
             .get("created_at")
@@ -624,7 +647,20 @@ pub async fn run(
     if opts.batch_size == 0 {
         bail!("--batch-size must be at least 1");
     }
-    let ordered = read_ordered(&opts.manifests)?;
+    let ordered = read_ordered(&opts.manifests, opts.allow_truncated_tail)?;
+    for (p, m) in &ordered {
+        if let Some(t) = &m.truncated_tail {
+            writeln!(
+                out,
+                "WARN\ttruncated-tail\t{}\tline {} ({} bytes, no newline) DROPPED: a record \
+                 whose append never completed. Reverse with it only after proving from the \
+                 database that the batch it belongs to rolled back.",
+                p.display(),
+                t.line,
+                t.bytes
+            )?;
+        }
+    }
     let specs = tables::propagated_tables(conn).await?;
     let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
     tables::probe_session_switch(conn).await?;
