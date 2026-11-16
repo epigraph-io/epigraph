@@ -75,6 +75,36 @@ impl From<epigraph_ingest_executor::ReusedClaim> for ReusedItem {
 
 // ── Pool-only inner ────────────────────────────────────────────────────────
 
+/// The viewer a workflow write made AS `caller` reads through, when it is not
+/// `viewer` itself: `None` when `viewer` already names `caller` (over HTTP,
+/// where `write_identity` refused a viewer naming another principal), else
+/// `caller`'s own viewer, resolved here (on stdio the write identity is this
+/// server's own agent whatever viewer a driver passed). Shared by the ingest
+/// executor and `store_workflow`'s existing-workflow match, so the one
+/// pre-viewer resolve lives in one place.
+///
+/// # Errors
+/// `McpError::internal_error` if the resolve fails.
+pub(crate) async fn caller_viewer(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    caller: uuid::Uuid,
+    context: &'static str,
+) -> Result<Option<epigraph_db::visibility::Viewer>, McpError> {
+    if viewer.principal() == Some(caller) {
+        return Ok(None);
+    }
+    epigraph_db::visibility::Viewer::resolve(&server.pool, caller)
+        .await
+        .map(Some)
+        .map_err(|e| {
+            crate::errors::internal_error_logged(
+                format!("{context}: could not resolve the caller's viewer"),
+                e,
+            )
+        })
+}
+
 /// Inner helper: runs the executor and builds the response, but also returns
 /// the executor's `inserted` vec so MCP entry points can embed those claims
 /// inline. `pub(crate)` so sibling MCP tool modules (e.g.
@@ -136,20 +166,8 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // (`write_identity` refused a viewer naming another principal); on stdio
     // the write identity is this server's own agent whatever viewer a driver
     // passed, and its viewer is resolved here.
-    let resolved;
-    let viewer = if viewer.principal() == Some(caller.agent_id()) {
-        viewer
-    } else {
-        resolved = epigraph_db::visibility::Viewer::resolve(&server.pool, caller.agent_id())
-            .await
-            .map_err(|e| {
-                crate::errors::internal_error_logged(
-                    "workflow ingest: could not resolve the caller's viewer",
-                    e,
-                )
-            })?;
-        &resolved
-    };
+    let resolved = caller_viewer(server, viewer, caller.agent_id(), "workflow ingest").await?;
+    let viewer = resolved.as_ref().unwrap_or(viewer);
     if let Some(group) = declared.and_then(|d| d.owner_group_bind()) {
         epigraph_ingest_executor::require_caller_writes_group(viewer, caller.agent_id(), group)
             .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
@@ -159,6 +177,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let extraction = &extraction;
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
 
+    // The server's own key attests every edge the walk and the authorship
+    // record write at INSERT, resolved before the caller's transaction.
+    let edge_key = server.edge_signing_key().await?;
     let mut tx =
         crate::claim_helper::begin_caller_workflow_tx(server, caller, "workflow_ingest").await?;
 
@@ -236,7 +257,13 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let mut admitted: Option<uuid::Uuid> = None;
     let result = loop {
         match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-            &mut tx, &plan, extraction, viewer, declared, admitted,
+            &mut tx,
+            Some(edge_key),
+            &plan,
+            extraction,
+            viewer,
+            declared,
+            admitted,
         )
         .await
         {
@@ -276,6 +303,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     let created: Vec<uuid::Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
     epigraph_ingest_executor::record_caller_authorship(
         &mut tx,
+        Some(edge_key),
         caller.agent_id(),
         &created,
         "workflow_ingest",
@@ -554,8 +582,10 @@ pub async fn do_ingest_workflow_via_pool(
         let mut unstamped_tx = pool.begin().await.map_err(|e| {
             crate::errors::internal_error_logged("workflow ingest: could not begin", e)
         })?;
+        // No server, so no key: this fixture path writes unsigned edges.
         let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
             &mut unstamped_tx,
+            None,
             &plan,
             extraction,
         )
@@ -725,7 +755,7 @@ pub(crate) async fn embed_created_workflow_claims(
     for (claim_id, content) in inserted {
         match server.embedder.generate(content).await {
             Ok(v) => {
-                let pgvec = crate::embed::format_pgvector(&v);
+                let pgvec = epigraph_db::pgvector_literal(&v);
                 store_ingest_embedding(server, Some(caller.agent_id()), *claim_id, &pgvec).await;
             }
             Err(e) => tracing::warn!("embedding failed (claim still stored): {e}"),

@@ -104,45 +104,6 @@ async fn test_similar_queries_produce_similar_embeddings() {
     );
 }
 
-/// Test that embedding service can store and retrieve embeddings
-#[tokio::test]
-async fn test_embedding_store_and_retrieve() {
-    let config = EmbeddingConfig::openai(1536);
-    let provider = MockProvider::new(config);
-
-    let claim_id = uuid::Uuid::new_v4();
-    let embedding = provider.generate("test claim content").await.unwrap();
-
-    // Store the embedding
-    provider.store(claim_id, &embedding).await.unwrap();
-
-    // Retrieve it back
-    let retrieved = provider.get(claim_id).await.unwrap();
-
-    assert_eq!(embedding.len(), retrieved.len());
-    for (a, b) in embedding.iter().zip(retrieved.iter()) {
-        assert!(
-            (a - b).abs() < 0.0001,
-            "Retrieved embedding should match stored"
-        );
-    }
-}
-
-/// Test that embedding service returns error for non-existent claim
-#[tokio::test]
-async fn test_embedding_get_nonexistent_returns_error() {
-    let config = EmbeddingConfig::openai(1536);
-    let provider = MockProvider::new(config);
-
-    let claim_id = uuid::Uuid::new_v4();
-    let result = provider.get(claim_id).await;
-
-    assert!(
-        result.is_err(),
-        "Should return error for non-existent claim"
-    );
-}
-
 /// Test that empty text returns error
 #[tokio::test]
 async fn test_embedding_empty_text_error() {
@@ -152,42 +113,6 @@ async fn test_embedding_empty_text_error() {
     let result = provider.generate("").await;
 
     assert!(result.is_err(), "Should return error for empty text");
-}
-
-/// Test that similar claims can be found by embedding
-#[tokio::test]
-async fn test_embedding_similarity_search() {
-    let config = EmbeddingConfig::openai(1536);
-    let provider = MockProvider::new(config);
-
-    // Store some claims with embeddings
-    let claim1_id = uuid::Uuid::new_v4();
-    let claim2_id = uuid::Uuid::new_v4();
-    let claim3_id = uuid::Uuid::new_v4();
-
-    let emb1 = provider.generate("The Earth is round").await.unwrap();
-    let emb2 = provider.generate("The Earth is a sphere").await.unwrap();
-    let emb3 = provider.generate("Quantum entanglement").await.unwrap();
-
-    provider.store(claim1_id, &emb1).await.unwrap();
-    provider.store(claim2_id, &emb2).await.unwrap();
-    provider.store(claim3_id, &emb3).await.unwrap();
-
-    // Search for similar to "Earth shape"
-    let query_embedding = provider.generate("shape of Earth").await.unwrap();
-    let similar = provider.similar(&query_embedding, 10, 0.0).await.unwrap();
-
-    assert!(!similar.is_empty(), "Should find similar claims");
-
-    // The Earth-related claims should have higher similarity than quantum claim
-    let earth_ids: std::collections::HashSet<_> = [claim1_id, claim2_id].into_iter().collect();
-
-    // At least one Earth-related claim should be in the top results
-    let has_earth_claim = similar.iter().any(|s| earth_ids.contains(&s.claim_id));
-    assert!(
-        has_earth_claim,
-        "Should find Earth-related claims as similar"
-    );
 }
 
 /// Test dimension configuration

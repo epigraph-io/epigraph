@@ -23,6 +23,12 @@
 //! (`auto_wire_ds_update`) and the recompute paths. Rows older than
 //! `DivergenceRepository`'s TTL are not served either.
 //!
+//! A claim whose evidence was all stored before its writer kept the Beta track
+//! still holds the `Beta(1, 1)` prior. [`replay_beta_params`] rebuilds the
+//! parameters from its stored BBAs by the same arithmetic, and the operator
+//! backfill `replay_beta_track` (`epigraph-cli`'s `beta_replay`) applies it.
+//! The backfill writes no divergence row for that history.
+//!
 //! # Best-effort, under a SAVEPOINT
 //!
 //! Both records are derived. Neither may fail the submission that produced
@@ -140,6 +146,27 @@ fn with_increments((alpha, beta): (f64, f64), increments: Option<(f64, f64)>) ->
         Some((d_alpha, d_beta)) => (alpha + d_alpha.max(0.0), beta + d_beta.max(0.0)),
         None => (alpha, beta),
     }
+}
+
+/// The Beta parameters [`apply_beta_update`] leaves after counting each BBA of
+/// `bbas`, in order, starting from `start`: what the live track would hold had
+/// every one of those BBAs been counted when it was stored.
+///
+/// Each item is a BBA and the claim's hypothesis index on that BBA's frame,
+/// and contributes [`beta_increments`]`(bba, index)`, added one BBA at a time
+/// in the given order, exactly as successive live writes add them (floating
+/// point addition is not associative, so the order is part of the result).
+/// The backfill of claims whose evidence predates the MCP paths keeping this
+/// track (`epigraph-cli`'s `beta_replay`) replays a claim's stored BBAs
+/// through this, oldest first.
+#[must_use]
+pub fn replay_beta_params<'a>(
+    start: (f64, f64),
+    bbas: impl IntoIterator<Item = (&'a MassFunction, Option<i32>)>,
+) -> (f64, f64) {
+    bbas.into_iter().fold(start, |params, (bba, index)| {
+        with_increments(params, Some(beta_increments(bba, index)))
+    })
 }
 
 /// The version of frame `frame_id` as the viewer reads it, for a divergence
@@ -268,5 +295,33 @@ mod tests {
         let (a, b) = beta_increments(&bba, Some(1));
         assert!(a.abs() < 1e-12 && (b - 1.0).abs() < 1e-12, "{a} {b}");
         assert_eq!(beta_increments(&bba, None), (0.0, 0.0));
+    }
+
+    /// The replay adds each BBA's increments one at a time, in order, from the
+    /// start it is given: the sum successive live writes store. Expected values
+    /// are written out by hand from the masses.
+    #[test]
+    fn replay_adds_each_bba_in_order_from_the_start() {
+        let frame = binary();
+        let support = |s: f64, conflict: f64| {
+            let mut masses = BTreeMap::new();
+            masses.insert(FocalElement::positive([0].into_iter().collect()), s);
+            if conflict > 0.0 {
+                masses.insert(FocalElement::conflict(), conflict);
+            }
+            masses.insert(FocalElement::theta(&frame), 1.0 - s - conflict);
+            MassFunction::new(frame.clone(), masses).unwrap()
+        };
+        let a = support(0.6, 0.0); // +0.6 / +0.4
+        let b = support(0.3, 0.2); // +0.3 / +0.5 (conflict counts for neither)
+        let (alpha, beta) =
+            replay_beta_params((1.0, 1.0), [(&a, Some(0)), (&b, Some(0)), (&a, None)]);
+        assert!((alpha - 1.9).abs() < 1e-12, "alpha {alpha}");
+        assert!((beta - 1.9).abs() < 1e-12, "beta {beta}");
+        // On hypothesis 1 the singleton {1} carries no mass, so every
+        // non-conflict unit counts against it.
+        let (alpha, beta) = replay_beta_params((2.0, 3.0), [(&b, Some(1))]);
+        assert!((alpha - 2.0).abs() < 1e-12 && (beta - 3.8).abs() < 1e-12);
+        assert_eq!(replay_beta_params((1.0, 1.0), []), (1.0, 1.0));
     }
 }

@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use crate::repos::edge_signature::EdgeSigningKey;
 use chrono::{DateTime, Utc};
 use epigraph_core::{AgentId, Claim, ClaimId, TenancyDecl, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
@@ -124,6 +125,37 @@ pub enum ClaimSortOrder {
 /// the struct: a `total` produced by a different predicate set than the rows
 /// it describes is the defect this type exists to prevent (backlog
 /// `2265a67b`).
+/// A `created_at` window for [`ClaimRepository::list_by_belief_range`]: both
+/// bounds INCLUSIVE, either open. The inclusive spelling is the REST
+/// `GET /api/v1/claims` filter's (`created_after` / `created_before`), so the
+/// two surfaces agree about a row created exactly on a bound.
+///
+/// A struct rather than two more positional `Option<DateTime>` arguments
+/// beside each other, which a call site could swap silently.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedWindow {
+    /// Keep rows with `created_at >= after`.
+    pub after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep rows with `created_at <= before`.
+    pub before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl CreatedWindow {
+    /// No bound: every `created_at` passes.
+    pub const ANY: Self = Self {
+        after: None,
+        before: None,
+    };
+
+    /// `true` when both bounds are set and `after` is later than `before`, a
+    /// window no row can fall in. Callers refuse it rather than answer an
+    /// empty page that reads as "nothing was created then".
+    #[must_use]
+    pub fn is_inverted(&self) -> bool {
+        matches!((self.after, self.before), (Some(a), Some(b)) if a > b)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ClaimListFilter<'a> {
     /// Case-insensitive `content ILIKE '%search%'`.
@@ -451,6 +483,25 @@ pub struct SemanticNeighborHit {
     pub nb_plausibility: Option<f64>,
     pub similarity: f64,
     pub direction: String,
+}
+
+/// Result row for [`ClaimRepository::semantic_selected_claims`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticSelectedClaim {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub agent_id: Uuid,
+    pub trace_id: Option<Uuid>,
+    /// `labels[1]`.
+    pub claim_type: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub theme_id: Option<Uuid>,
+    /// The claim's cluster in the most recently completed cluster run.
+    pub cluster_id: Option<Uuid>,
+    pub similarity: f64,
 }
 
 /// Result row for [`ClaimRepository::list_by_belief_bounds`].
@@ -2094,6 +2145,12 @@ impl ClaimRepository {
     /// disjunct and the result is unchanged; it becomes load-bearing exactly
     /// when the endpoints are private.
     ///
+    /// # Provenance-only evidence does not ground
+    ///
+    /// The same exclusion as [`Self::has_grounded_evidence`] (derivation rows
+    /// and memorize stamps), spelled here separately; each reader has its own
+    /// test in `grounding_excludes_provenance_evidence.rs`.
+    ///
     /// **The edge marker is defense in depth and is NOT what the acceptance
     /// test proves**, which is stated rather than left for a reader to assume.
     /// Because 070 makes the edge inherit, a private claim's grounding edge is
@@ -2129,6 +2186,13 @@ impl ClaimRepository {
                     AND e.source_type IN ('paper', 'evidence', 'analysis')
                     AND e.relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                     /* {EDGE_VISIBILITY:e} */
+                    AND NOT EXISTS (
+                        SELECT 1 FROM evidence pe
+                        WHERE e.source_type = 'evidence'
+                          AND pe.id = e.source_id
+                          AND (pe.properties ? 'derived_from_claim'
+                               OR pe.properties->>'source' = 'mcp-memorize')
+                    )
               )
               /* {VISIBILITY:c} */
             ORDER BY similarity DESC
@@ -3423,6 +3487,68 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
+    /// The full result rows of a diverse semantic search: one row per id in
+    /// `claim_ids` that `viewer` may read, with its similarity to `embedding`
+    /// over `embedding_col`, its latest cluster from
+    /// `claim_cluster_membership`, nearest first.
+    ///
+    /// Moved here from an inline `format!`-built statement in `epigraph-api`'s
+    /// `routes/search.rs::semantic_search`, which carried no predicate and was
+    /// safe only by a caller-side derivation: every id came out of one of two
+    /// viewer-spliced theme reads. The predicate here makes the read safe
+    /// whatever its caller hands it, so a third source of ids added later does
+    /// not reopen it. For today's two sources it filters nothing they had not
+    /// already filtered, so the result set is unchanged.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails, or
+    /// `DbError::InvalidData` for an unrecognised `embedding_col`.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_selected_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding_col: &str,
+        embedding: &str,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SemanticSelectedClaim>, DbError> {
+        if embedding_col != "embedding" && embedding_col != "embedding_3072" {
+            return Err(DbError::InvalidData {
+                reason: format!("unsupported embedding column {embedding_col:?}"),
+            });
+        }
+        let sql = viewer.splice(
+            &format!(
+                r#"
+                SELECT c.id, c.content, c.truth_value, c.belief, c.plausibility,
+                       c.agent_id, c.trace_id,
+                       c.labels[1] as claim_type, c.created_at,
+                       c.theme_id,
+                       (
+                           SELECT m.cluster_id
+                           FROM claim_cluster_membership m
+                           JOIN graph_cluster_runs r ON r.run_id = m.run_id
+                           WHERE m.claim_id = c.id
+                           ORDER BY r.completed_at DESC
+                           LIMIT 1
+                       ) AS cluster_id,
+                       1 - (c.{embedding_col} <=> $1::vector) as similarity
+                FROM claims c
+                WHERE c.id = ANY($2)
+                  /* {{VISIBILITY:c}} */
+                ORDER BY c.{embedding_col} <=> $1::vector
+                "#
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, SemanticSelectedClaim>(&sql)
+            .bind(embedding)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Claims whose belief interval falls inside the given bounds, optionally
     /// restricted to one frame.
     ///
@@ -3989,9 +4115,19 @@ impl ClaimRepository {
     /// so, at 1536d, the partial HNSW index from migration 029).
     /// [`EmbeddingSeedScope::AllClaims`] drops it, so the 1536d statement is
     /// served by `idx_claims_embedding_hnsw` (migration 001, `WHERE embedding
-    /// IS NOT NULL`). No `is_current` predicate is needed in either scope:
-    /// `chk_deprecated_no_embedding` guarantees a retired claim carries no
-    /// vector in either column.
+    /// IS NOT NULL`).
+    ///
+    /// # Current claims only
+    ///
+    /// Both shapes state `c.is_current` (backlog 7720cb7a), as every other
+    /// recall leg does. `chk_deprecated_no_embedding` already keeps a vector
+    /// off a retired row, but that is a write-side invariant of another
+    /// migration; a read that is correct only while it holds resurfaces
+    /// superseded claims the moment it is dropped or re-added `NOT VALID`.
+    /// Neither partial HNSW index encodes `is_current`; both stay usable
+    /// because `c.{column} IS NOT NULL` is still in the WHERE clause, and the
+    /// iterative scan below fills `LIMIT` past rows the extra predicate
+    /// rejects.
     ///
     /// # Iterative HNSW scan
     ///
@@ -4101,6 +4237,7 @@ impl ClaimRepository {
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
                 WHERE {level_clause} c.{column} IS NOT NULL
+                  AND c.is_current
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   AND EXISTS (
                       SELECT 1 FROM edges e
@@ -4121,6 +4258,7 @@ impl ClaimRepository {
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
                 WHERE {level_clause} c.{column} IS NOT NULL
+                  AND c.is_current
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -4185,8 +4323,16 @@ impl ClaimRepository {
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
-        Self::search_by_embedding_scoped(pool, viewer, query_embedding_pgvector, limit, None, None)
-            .await
+        let mut conn = pool.acquire().await?;
+        Self::search_by_embedding_scoped(
+            &mut conn,
+            viewer,
+            query_embedding_pgvector,
+            limit,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`search_by_embedding_current`] with optional scope predicates pushed
@@ -4196,11 +4342,32 @@ impl ClaimRepository {
     /// so the two compose with AND. Scoping at the DB keeps it correct and
     /// index-friendly rather than over-fetching and filtering in Rust.
     ///
+    /// # Iterative HNSW scan (backlog a507966d)
+    ///
+    /// The statement is served by `idx_claims_embedding_hnsw`, whose scan
+    /// yields at most `hnsw.ef_search` rows (pgvector default 40) BEFORE the
+    /// predicates the index does not encode — `is_current`, the scope filters
+    /// and the visibility splice — are applied. With a plain scan, 40 rows the
+    /// viewer cannot read sitting nearer the query than its own rows emptied
+    /// the viewer's page, and how far it emptied told the viewer how many
+    /// foreign rows sat near the query: a ranking side channel across
+    /// tenants, measured as a full page of 10 going to 0. So, exactly as in
+    /// [`Self::search_by_embedding_since_conn`], the statement runs in a short
+    /// transaction that first sets, `is_local`,
+    /// `hnsw.iterative_scan = strict_order` (keep scanning, in exact distance
+    /// order, until `LIMIT` matching rows are found) and
+    /// `hnsw.ef_search = clamp(limit, 40, 1000)`, and is ROLLED BACK so the
+    /// settings never reach the caller's later reads. `hnsw.max_scan_tuples`
+    /// (default 20,000) still bounds the scan.
+    ///
+    /// Takes a connection rather than an executor because the settings need
+    /// a transaction (a savepoint on a caller's own transaction).
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding_scoped<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    #[instrument(skip(conn, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped(
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -4237,7 +4404,18 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(executor).await?;
+
+        // See "Iterative HNSW scan" above.
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
 
         Ok(rows)
     }
@@ -5554,13 +5732,21 @@ impl ClaimRepository {
     /// text value, never a cast, so an absent or odd `level` cannot raise.
     /// `false` folds the predicate away and leaves the page unchanged.
     ///
+    /// # `window` (backlog `24caecaa`)
+    ///
+    /// [`CreatedWindow`] bounds `created_at` in SQL, inclusive at both ends,
+    /// before `LIMIT`, so `limit` + `offset` page through EVERY claim the
+    /// viewer may read that was created in the window. `recall`'s `since` is
+    /// a semantic top-k narrowed by time, never a complete listing; this is
+    /// the complete one. [`CreatedWindow::ANY`] folds both predicates away.
+    ///
     /// # Bind layout
     ///
-    /// `is_current` occupies `$3` and `exclude_spine` `$6`, so the viewer's
-    /// group bind is `$7`. The group bind is conditional (a `Bypass` or
-    /// elevated viewer binds nothing), so it must stay LAST: were it `$6`, a
-    /// bind-less viewer would leave the statement one value short of the
-    /// `$7` it references.
+    /// `is_current` occupies `$3`, `exclude_spine` `$6` and the window `$7`
+    /// and `$8`, so the viewer's group bind is `$9`. The group bind is
+    /// conditional (a `Bypass` or elevated viewer binds nothing), so it must
+    /// stay LAST: were it `$8`, a bind-less viewer would leave the statement
+    /// one value short of the `$9` it references.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -5571,6 +5757,7 @@ impl ClaimRepository {
         limit: i64,
         offset: i64,
         exclude_spine: bool,
+        window: CreatedWindow,
     ) -> Result<Vec<(Claim, f64)>, DbError> {
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
@@ -5604,6 +5791,8 @@ impl ClaimRepository {
                 FROM claims
                 WHERE ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
                   AND (NOT $6::bool OR COALESCE(properties->>'level', '') NOT IN ('0', '1', '2'))
+                  AND ($7::timestamptz IS NULL OR created_at >= $7)
+                  AND ($8::timestamptz IS NULL OR created_at <= $8)
                   /* {VISIBILITY:claims} */
             ) scored
             WHERE belief_score >= $1 AND belief_score <= $2
@@ -5612,7 +5801,7 @@ impl ClaimRepository {
             "#,
             ]
             .concat(),
-            7,
+            9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(min_belief)
@@ -5620,7 +5809,9 @@ impl ClaimRepository {
             .bind(is_current)
             .bind(limit)
             .bind(offset)
-            .bind(exclude_spine);
+            .bind(exclude_spine)
+            .bind(window.after)
+            .bind(window.before);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -6983,8 +7174,13 @@ impl ClaimRepository {
             "supersede_conn (its edge migration re-points other writers' edges)",
         )
         .await?;
+        // Unsigned: the privileged one-transaction form has no request
+        // transport whose key could attest the act's edges (its callers are the
+        // pool form and maintenance fixtures). A request path signs through
+        // `supersede_act_conn` with its own key.
         let (new_uuid, old_uuid) = Self::supersede_act_conn(
             &mut *conn,
+            None,
             old_claim_id,
             new_content,
             new_truth,
@@ -7011,10 +7207,18 @@ impl ClaimRepository {
     /// ([`Self::migrate_superseded_edges_conn`], migration 117). The caller
     /// must run this in a transaction.
     ///
+    /// The act's two edges (`supersedes` and the actor's `AUTHORED`) are
+    /// attested at INSERT by `key` (backlog `dae795f8`): the request
+    /// transport's own key (the MCP server's, the API's), never the
+    /// actor's. With `key = None` they are written unsigned (an operator CLI
+    /// with no entity signer).
+    ///
     /// # Errors
-    /// As [`Self::supersede_conn`], without its privilege requirement.
+    /// As [`Self::supersede_conn`], without its privilege requirement, and
+    /// `DbError::InvalidData` if a stored edge cannot be attested.
     pub async fn supersede_act_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         old_claim_id: ClaimId,
         new_content: &str,
         new_truth: TruthValue,
@@ -7118,15 +7322,21 @@ impl ClaimRepository {
         .execute(&mut *conn)
         .await?;
 
-        // Insert supersedes edge for graph traversal
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties, created_at) \
-             VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'supersedes', jsonb_build_object('reason', $3), NOW())",
+        // Insert supersedes edge for graph traversal. Signed at INSERT when
+        // the caller passes its key; the edge then carries the writer's clock,
+        // not the transaction's `NOW()`.
+        crate::repos::edge::EdgeRepository::create_signed_conn(
+            &mut *conn,
+            key,
+            new_uuid,
+            "claim",
+            old_uuid,
+            "claim",
+            "supersedes",
+            Some(serde_json::json!({ "reason": reason })),
+            None,
+            None,
         )
-        .bind(new_uuid)
-        .bind(old_uuid)
-        .bind(reason)
-        .execute(&mut *conn)
         .await?;
 
         // The acting agent (backlog 73085534, ruling R-23): the replacement
@@ -7139,8 +7349,9 @@ impl ClaimRepository {
         // this edge apart from any other `AUTHORED` edge. Tenancy comes from the endpoints (`epigraph_edges_tenancy`).
         // A failure is an error: the act rolls back rather than land a
         // successor with no record of who wrote it.
-        crate::repos::edge::EdgeRepository::create_if_not_exists_conn(
+        crate::repos::edge::EdgeRepository::create_if_not_exists_signed_conn(
             &mut *conn,
+            key,
             actor.agent,
             "agent",
             new_uuid,
@@ -7964,31 +8175,6 @@ struct ClaimRow {
 }
 
 impl ClaimRepository {
-    /// Copy evidence links from old claim to new claim via derived_from edges.
-    /// Returns the number of inherited evidence links.
-    pub async fn inherit_evidence(
-        pool: &PgPool,
-        old_claim_id: Uuid,
-        new_claim_id: Uuid,
-    ) -> Result<usize, DbError> {
-        // Create derived_from edges from new claim to old claim's evidence
-        let result = sqlx::query(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-             SELECT $1, 'claim', e.id, 'evidence', 'derived_from', 
-                    jsonb_build_object('inherited_from', $2::text) 
-             FROM evidence e 
-             WHERE e.claim_id = $2 
-             ON CONFLICT DO NOTHING"#,
-        )
-        .bind(new_claim_id)
-        .bind(old_claim_id)
-        .execute(pool)
-        .await?;
-
-        Ok(result.rows_affected() as usize)
-    }
-
     /// Count all evidence for a claim, including inherited evidence (via derived_from edges).
     pub async fn count_all_evidence_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -8029,6 +8215,25 @@ impl ClaimRepository {
     /// - `evidence --SUPPORTS-->       claim` (either spelling, `SUPPORTS` or `supports`)
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
+    ///
+    /// # Provenance-only evidence does not ground
+    ///
+    /// Since backlog 2d60f619 every evidence row carries its stored
+    /// `evidence -> claim` edge, including two kinds of row that are
+    /// bookkeeping, not evidence, and are excluded here (and in
+    /// [`Self::grounded_neighborhood`], which spells the same rule):
+    ///
+    /// * a DERIVATION row (`properties ? 'derived_from_claim'`,
+    ///   `EvidenceRepository::record_derivation_conn`): its text is the parent
+    ///   claim's, so it is claim-to-claim propagation by this function's own
+    ///   rule;
+    /// * a MEMORIZE stamp (`properties->>'source' = 'mcp-memorize'`): its text
+    ///   is "stored via MCP memorize tool", the claim's author remembering it.
+    ///
+    /// Before 2d60f619 neither had an edge, so neither grounded; this keeps it
+    /// so. Caller-supplied evidence text (`submit_claim`'s `evidence_data`, a
+    /// packet's evidence, an ingested passage) still grounds, as packet
+    /// evidence always did.
     pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -8043,6 +8248,13 @@ impl ClaimRepository {
                   AND source_type IN ('paper', 'evidence', 'analysis')
                   AND relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                   /* {EDGE_VISIBILITY:edges} */
+                  AND NOT EXISTS (
+                      SELECT 1 FROM evidence pe
+                      WHERE edges.source_type = 'evidence'
+                        AND pe.id = edges.source_id
+                        AND (pe.properties ? 'derived_from_claim'
+                             OR pe.properties->>'source' = 'mcp-memorize')
+                  )
             )
             "#,
             2,
@@ -8122,7 +8334,8 @@ impl ClaimRepository {
     /// Return claim IDs that have at least one evidence record of the given type.
     ///
     /// Valid values mirror the DB evidence_type column:
-    /// document, observation, testimony, computation, reference, figure, conversational.
+    /// document, observation, testimony, computation, reference, figure,
+    /// conversational, dataset (`epigraph_core::STORED_EVIDENCE_TYPES`).
     pub async fn claim_ids_by_evidence_type<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -8728,8 +8941,11 @@ impl ClaimRepository {
         agent_id: Uuid,
     ) -> Result<EvolveStepResult, DbError> {
         let mut tx = pool.begin().await?;
+        // Unsigned: the pool form has no request transport's key (its callers
+        // are fixtures); the request paths sign through `evolve_step_conn`.
         let result = Self::evolve_step_conn(
             &mut tx,
+            None,
             parent,
             new_content,
             edge_type,
@@ -8765,9 +8981,15 @@ impl ClaimRepository {
     ///   parent the session may not write by raising at its WITH CHECK
     ///   (`QueryFailed`, SQLSTATE 42501, the transaction aborted), not by
     ///   matching zero rows.
-    #[instrument(skip(conn))]
+    ///
+    /// The step edge (`supersedes` / `revises`, new step -> parent) is attested
+    /// at INSERT by `key` (backlog `dae795f8`): the request transport's own
+    /// key, never the author's; unsigned with `key = None`.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, key))]
     pub async fn evolve_step_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         parent: ClaimId,
         new_content: &str,
         edge_type: &str,
@@ -8930,17 +9152,18 @@ impl ClaimRepository {
         .execute(&mut *tx)
         .await?;
 
-        let edge_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, $2, 'claim', $3, 'claim', $4, jsonb_build_object('reason', $5))",
+        let edge_id = crate::repos::edge::EdgeRepository::create_signed_conn(
+            &mut *tx,
+            key,
+            new_uuid,
+            "claim",
+            parent_uuid,
+            "claim",
+            edge_type,
+            Some(serde_json::json!({ "reason": reason.unwrap_or("") })),
+            None,
+            None,
         )
-        .bind(edge_id)
-        .bind(new_uuid)
-        .bind(parent_uuid)
-        .bind(edge_type)
-        .bind(reason.unwrap_or(""))
-        .execute(&mut *tx)
         .await?;
 
         Ok(EvolveStepResult {
@@ -9058,6 +9281,7 @@ impl ClaimRepository {
     ) -> Result<DedupRepair, DbError> {
         Self::mark_duplicate_with_repair_attributed_conn(
             conn,
+            None,
             dup,
             canonical,
             &DuplicateProvenance::unattributed(),
@@ -9066,12 +9290,14 @@ impl ClaimRepository {
     }
 
     /// [`Self::mark_duplicate_with_repair_conn`] with the caller's
-    /// [`DuplicateProvenance`] on the identity edge the act writes.
+    /// [`DuplicateProvenance`] on the identity edge the act writes, attested
+    /// at INSERT by `key` (see [`Self::mark_duplicate_act_attributed_conn`]).
     ///
     /// # Errors
     /// As [`Self::mark_duplicate_with_repair_conn`].
     pub async fn mark_duplicate_with_repair_attributed_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         dup: ClaimId,
         canonical: ClaimId,
         provenance: &DuplicateProvenance,
@@ -9085,7 +9311,7 @@ impl ClaimRepository {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
+        mark_duplicate_act(&mut tx, key, dup_uuid, canon_uuid, provenance).await?;
         let repair = repair_marked_duplicate(&mut tx, dup_uuid, canon_uuid).await?;
         tx.commit().await?;
         Ok(repair)
@@ -9135,6 +9361,7 @@ impl ClaimRepository {
     ) -> Result<(), DbError> {
         Self::mark_duplicate_act_attributed_conn(
             conn,
+            None,
             dup,
             canonical,
             &DuplicateProvenance::unattributed(),
@@ -9147,10 +9374,16 @@ impl ClaimRepository {
     /// [`DuplicateProvenance`]. Returns the id of the `same_as` identity edge
     /// the act wrote.
     ///
+    /// The identity edge is attested at INSERT by `key` (backlog `dae795f8`):
+    /// the request transport's own key (the MCP server's, the API's), never
+    /// the marking agent's; unsigned with `key = None`.
+    ///
     /// # Errors
-    /// As [`Self::mark_duplicate_act_conn`].
+    /// As [`Self::mark_duplicate_act_conn`], and `DbError::InvalidData` if the
+    /// stored edge cannot be attested.
     pub async fn mark_duplicate_act_attributed_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         dup: ClaimId,
         canonical: ClaimId,
         provenance: &DuplicateProvenance,
@@ -9159,7 +9392,8 @@ impl ClaimRepository {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        let identity_edge = mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
+        let identity_edge =
+            mark_duplicate_act(&mut tx, key, dup_uuid, canon_uuid, provenance).await?;
         let foreign_private_canonical: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()
@@ -11513,40 +11747,102 @@ mod label_tests {
     }
 }
 
-/// How a consolidation restates its sources. Recorded in
-/// `properties.merge.mode`; the server does not interpret it — the caller
-/// supplies the synthesized content either way.
+/// What a consolidation does to its sources (backlog 22602dd8). Three
+/// explicit modes, because "these claims are the same" and "these claims
+/// together say something new" are different acts with different reversals:
+///
+/// - [`Self::Identity`]: the sources are restatements of one of them, the
+///   caller-chosen survivor. Each other source is marked a duplicate of the
+///   survivor through the dedup act (`mark_duplicate`), so it gets the
+///   identity edge, its belief inputs pool onto the survivor, and it can be
+///   un-marked. No new claim is written. The merge act below refuses this
+///   mode: the MCP `consolidate_claims` tool runs the dedup act per source.
+/// - [`Self::Merge`]: the sources are complementary, not duplicates. A new
+///   merged claim is written and every source is retired into it.
+/// - [`Self::Abstract`]: a new, higher-level claim generalises the sources.
+///   It is linked to each source by a `generalizes` edge, and nothing is
+///   retired: the sources stay current and keep their edges.
+///
+/// Recorded in `properties.merge.mode` on the new claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsolidateMode {
-    /// Combined restatement of all sources.
+    /// Mark every non-survivor source a duplicate of the survivor.
+    Identity,
+    /// A new merged claim; every source is retired into it.
     Merge,
-    /// Higher-level generalisation over the sources.
+    /// A new generalisation; the sources stay current.
     Abstract,
-    /// Refined restatement (typically N=2, near-identical inputs).
-    Rewrite,
 }
 
 impl ConsolidateMode {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Identity => "identity",
             Self::Merge => "merge",
             Self::Abstract => "abstract",
-            Self::Rewrite => "rewrite",
         }
     }
 
-    /// Parse a wire-format mode string.
+    /// Whether this mode retires its sources into a new claim.
+    #[must_use]
+    pub fn retires_sources(self) -> bool {
+        matches!(self, Self::Merge)
+    }
+
+    /// Parse a wire-format mode string. `rewrite`, a former mode that
+    /// behaved exactly as a merge, is still accepted and means [`Self::Merge`].
     ///
     /// # Errors
     /// Returns the offending string when it is not a known mode.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "merge" => Ok(Self::Merge),
+            "identity" => Ok(Self::Identity),
+            "merge" | "rewrite" => Ok(Self::Merge),
             "abstract" => Ok(Self::Abstract),
-            "rewrite" => Ok(Self::Rewrite),
             other => Err(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod consolidate_mode_tests {
+    use super::ConsolidateMode;
+
+    #[test]
+    fn the_three_modes_parse_and_rewrite_is_a_merge() {
+        assert_eq!(
+            ConsolidateMode::parse("identity"),
+            Ok(ConsolidateMode::Identity)
+        );
+        assert_eq!(
+            ConsolidateMode::parse(" Merge "),
+            Ok(ConsolidateMode::Merge)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("rewrite"),
+            Ok(ConsolidateMode::Merge)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("abstract"),
+            Ok(ConsolidateMode::Abstract)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("obliterate"),
+            Err("obliterate".to_string())
+        );
+        // `rewrite` is an alias, not a fourth recorded mode.
+        assert_eq!(
+            ConsolidateMode::parse("rewrite").map(ConsolidateMode::as_str),
+            Ok("merge")
+        );
+    }
+
+    #[test]
+    fn only_merge_retires_its_sources() {
+        assert!(ConsolidateMode::Merge.retires_sources());
+        assert!(!ConsolidateMode::Abstract.retires_sources());
+        assert!(!ConsolidateMode::Identity.retires_sources());
     }
 }
 
@@ -11688,8 +11984,12 @@ impl ClaimRepository {
         )
         .await?;
         let mut tx = conn.begin().await?;
+        // Unsigned: the privileged one-transaction form has no request
+        // transport's key (pool form and maintenance fixtures); a request path
+        // signs through `consolidate_act_conn` with its own key.
         let mut result = Self::consolidate_act_conn(
             &mut tx,
+            None,
             source_ids,
             merged_content,
             merged_truth,
@@ -11698,7 +11998,9 @@ impl ClaimRepository {
             acting_agent_id,
         )
         .await?;
-        if !result.already_existed {
+        // Only a merge retires its sources, so only a merge has edges to move:
+        // an abstraction leaves every source current with its edges.
+        if !result.already_existed && mode.retires_sources() {
             let m = migrate_consolidated_edges(&mut tx, result.merged_id, source_ids).await?;
             result.edges_migrated = m.migrated.len() as u64;
             result.edges_deduped = m.retracted.len() as u64;
@@ -11708,8 +12010,15 @@ impl ClaimRepository {
     }
 
     /// The consolidation's own act, and nothing else: validate and lock the
-    /// sources, insert the merged claim, retire every source (`supersedes =
-    /// merged`) and insert the `supersedes` edges merged → source.
+    /// sources, insert the new claim, and then by mode:
+    ///
+    /// - [`ConsolidateMode::Merge`]: retire every source (`supersedes =
+    ///   merged`) and insert the `supersedes` edges merged → source.
+    /// - [`ConsolidateMode::Abstract`]: retire nothing; insert a
+    ///   `generalizes` edge abstraction → source for each source.
+    /// - [`ConsolidateMode::Identity`] is refused (input): it writes no new
+    ///   claim, and runs as the dedup act per source instead
+    ///   ([`Self::mark_duplicate_act_attributed_conn`]).
     ///
     /// Every row it writes is one the consolidating caller authors or must be
     /// able to write (the merged claim, its own sources, the edges between
@@ -11720,11 +12029,17 @@ impl ClaimRepository {
     /// ([`Self::migrate_consolidated_edges_conn`], migration 117). The
     /// returned counts of migrated and deduped edges are therefore zero.
     ///
+    /// The `supersedes` edges are attested at INSERT by `key` (backlog
+    /// `dae795f8`): the request transport's own key, never the acting agent's;
+    /// unsigned with `key = None`.
+    ///
     /// # Errors
-    /// As [`Self::consolidate`].
-    #[allow(clippy::too_many_lines)]
+    /// As [`Self::consolidate`], and `DbError::InvalidData` if a stored edge
+    /// cannot be attested.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn consolidate_act_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         source_ids: &[Uuid],
         merged_content: &str,
         merged_truth: f64,
@@ -11734,6 +12049,18 @@ impl ClaimRepository {
     ) -> Result<ConsolidateResult, DbError> {
         use sqlx::Acquire;
         let refused = |kind: crate::RefusalKind, m: String| DbError::Refused { kind, message: m };
+
+        if mode == ConsolidateMode::Identity {
+            // Input: identity writes no new claim. Each non-survivor source is
+            // marked a duplicate of the survivor through the dedup act, which
+            // records the identity edge this act does not and can be un-marked.
+            return Err(refused(
+                crate::RefusalKind::Input,
+                "consolidate: mode 'identity' writes no new claim; mark each non-survivor \
+                 source a duplicate of the survivor (mark_duplicate) instead"
+                    .into(),
+            ));
+        }
 
         if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES
         {
@@ -11805,7 +12132,9 @@ impl ClaimRepository {
                     format!("consolidate: source {} is not current", r.id),
                 ));
             }
-            if r.supersedes.is_some() {
+            // Only a merge re-points `supersedes`; an abstraction may
+            // generalise a revision successor, which keeps its own pointer.
+            if mode.retires_sources() && r.supersedes.is_some() {
                 return Err(refused(
                     crate::RefusalKind::State,
                     format!(
@@ -12018,38 +12347,56 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Retire sources. One statement: chk_deprecated_no_embedding (migration
-        // 052) is a per-statement CHECK, so is_current=false and both
-        // embedding=NULL / embedding_3072=NULL must land together.
-        sqlx::query!(
-            r#"
+        // Retire sources (a merge only). One statement:
+        // chk_deprecated_no_embedding (migration 052) is a per-statement
+        // CHECK, so is_current=false and both embedding=NULL /
+        // embedding_3072=NULL must land together.
+        if mode.retires_sources() {
+            sqlx::query!(
+                r#"
             UPDATE claims
             SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL, updated_at = NOW()
             WHERE id = ANY($2)
             "#,
-            merged_id,
-            source_ids,
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        // Reverse fan-out: merged → each source, mirroring supersede()'s edge.
-        for src in source_ids {
-            sqlx::query!(
-                r#"
-                INSERT INTO edges (source_id, source_type, target_id, target_type,
-                                   relationship, properties)
-                VALUES ($1, 'claim', $2, 'claim', 'supersedes', $3)
-                "#,
                 merged_id,
-                src,
-                serde_json::json!({
-                    "reason": reason,
-                    "mode": mode.as_str(),
-                    "merged_at": chrono::Utc::now().to_rfc3339(),
-                }),
+                source_ids,
             )
             .execute(&mut *tx)
+            .await?;
+        }
+
+        // Reverse fan-out, new claim → each source: a merge's `supersedes`
+        // (mirroring supersede()'s edge), an abstraction's `generalizes`.
+        let relationship = if mode.retires_sources() {
+            "supersedes"
+        } else {
+            "generalizes"
+        };
+        let mut edge_props = serde_json::json!({
+            "reason": reason,
+            "mode": mode.as_str(),
+            "merged_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if !mode.retires_sources() {
+            // An abstraction's default confidence is derived from its sources,
+            // so its `generalizes` edge must not feed that belief back into
+            // them: the belief readers (the factor backfill, the sheaf) skip
+            // an edge marked this way.
+            edge_props[crate::repos::edge::MOVES_BELIEF_PROPERTY] = serde_json::Value::Bool(false);
+        }
+        for src in source_ids {
+            crate::repos::edge::EdgeRepository::create_signed_conn(
+                &mut tx,
+                key,
+                merged_id,
+                "claim",
+                *src,
+                "claim",
+                relationship,
+                Some(edge_props.clone()),
+                None,
+                None,
+            )
             .await?;
         }
 
@@ -12057,7 +12404,11 @@ impl ClaimRepository {
 
         Ok(ConsolidateResult {
             merged_id,
-            superseded: source_ids.to_vec(),
+            superseded: if mode.retires_sources() {
+                source_ids.to_vec()
+            } else {
+                Vec::new()
+            },
             edges_migrated: 0,
             edges_deduped: 0,
             already_existed: false,
@@ -12721,9 +13072,11 @@ async fn legacy_mark_refusal(
 /// The checks, the one `claims` UPDATE and the identity edge of a dedup's act.
 /// The callers ([`ClaimRepository::mark_duplicate_act_attributed_conn`],
 /// [`ClaimRepository::mark_duplicate_with_repair_attributed_conn`]) own the
-/// transaction. Returns the identity edge's id.
+/// transaction. Returns the identity edge's id. The edge is attested at
+/// INSERT by `key` when one is given (backlog `dae795f8`).
 async fn mark_duplicate_act(
     conn: &mut sqlx::PgConnection,
+    key: Option<EdgeSigningKey<'_>>,
     dup_uuid: Uuid,
     canon_uuid: Uuid,
     provenance: &DuplicateProvenance,
@@ -12818,24 +13171,34 @@ async fn mark_duplicate_act(
     let provenance_json = serde_json::to_value(provenance).map_err(|e| DbError::InvalidData {
         reason: format!("mark_duplicate: provenance does not serialize: {e}"),
     })?;
-    let identity_edge: Uuid = sqlx::query_scalar(
-        r#"INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-           VALUES ($1, 'claim', $2, 'claim', $3,
-                   jsonb_build_object($4::text,
-                       jsonb_strip_nulls(jsonb_build_object(
-                           'marked_by', public.epigraph_principal_id()))
-                       || $5::jsonb
-                       || jsonb_build_object('marked_at', now())))
-           RETURNING id"#,
+    // The properties are built by the database on this transaction, exactly
+    // as the INSERT used to build them (the session principal, the
+    // transaction's `now()`, in their JSONB spelling), so the attested row
+    // carries the same document an unsigned one does.
+    let properties: serde_json::Value = sqlx::query_scalar(
+        r#"SELECT jsonb_build_object($1::text,
+                      jsonb_strip_nulls(jsonb_build_object(
+                          'marked_by', public.epigraph_principal_id()))
+                      || $2::jsonb
+                      || jsonb_build_object('marked_at', now()))"#,
     )
-    .bind(dup_uuid)
-    .bind(canon_uuid)
-    .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
     .bind(DUPLICATE_IDENTITY_PROPERTY)
     .bind(&provenance_json)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(identity_edge)
+    crate::repos::edge::EdgeRepository::create_signed_conn(
+        &mut *conn,
+        key,
+        dup_uuid,
+        "claim",
+        canon_uuid,
+        "claim",
+        DUPLICATE_IDENTITY_RELATIONSHIP,
+        Some(properties),
+        None,
+        None,
+    )
+    .await
 }
 
 /// The dedup's repair of the edge and derived-record layers, unchecked: the

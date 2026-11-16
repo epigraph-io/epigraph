@@ -28,7 +28,7 @@ fn server_key() -> [u8; 32] {
         .public_key()
 }
 
-fn extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
+fn extraction(tag: &str) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {
             "title": format!("4ff87716 {tag}: Stored Claim Signatures"),

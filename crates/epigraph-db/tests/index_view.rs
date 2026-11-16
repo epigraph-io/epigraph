@@ -18,6 +18,7 @@ async fn mark(pool: &PgPool, dup: Uuid, canonical: Uuid) -> epigraph_db::DedupRe
     let mut conn = pool.acquire().await.expect("acquire");
     ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", "shared_id"),

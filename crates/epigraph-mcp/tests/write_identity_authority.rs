@@ -69,6 +69,7 @@ fn submit(content: &str) -> SubmitClaimParams {
         novelty_threshold: Some(0.0),
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

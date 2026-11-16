@@ -32,7 +32,7 @@ import psycopg2
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
-from lib.tiered_enrichment import auto_tier, EnrichmentResult
+from lib.tiered_enrichment import auto_tier, routing_quantiles, EnrichmentResult
 from maintenance_dsn import require_same_database
 
 log = logging.getLogger(__name__)
@@ -408,6 +408,12 @@ async def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    # auto_tier routes on calibration.toml [conformal.quantiles] and raises when
+    # they are missing. Read them before touching the queue: process_entry turns
+    # every auto_tier exception into status='failed', so a bad CALIBRATION_PATH
+    # would otherwise fail the whole batch one claim at a time.
+    routing_quantiles()
 
     entries = get_pending_assessments(args.limit, include_failed=args.retry_failed)
 

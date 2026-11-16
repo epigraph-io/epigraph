@@ -492,11 +492,12 @@ async fn factor(pool: &PgPool, frame: Uuid, a: Uuid, b: Uuid) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn bp_seeds_the_members_own_private_claim(pool: PgPool) {
     let p = plant(&pool, "bpseed").await;
+    // The canonical frame: only its BBAs seed BP.
     let frame = epigraph_db::FrameRepository::create(
         &pool,
-        "public_only_bp_seed_frame",
+        "binary_truth",
         None,
-        &["supported".to_string(), "unsupported".to_string()],
+        &["TRUE".to_string(), "FALSE".to_string()],
     )
     .await
     .expect("frame")

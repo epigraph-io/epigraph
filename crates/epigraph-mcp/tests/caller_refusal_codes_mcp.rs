@@ -23,7 +23,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::errors::{db_caller_error, internal_error, INTERNAL_ERROR_MESSAGE};
 use epigraph_mcp::server::EpiGraphMcpFull;
