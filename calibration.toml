@@ -89,6 +89,7 @@ computation = "statistical"    # computational / statistical analysis
 document    = "logical"        # claim asserted in a document
 reference   = "logical"        # citation to another claim/source
 testimony   = "testimonial"    # explicit agent testimony
+dataset     = "empirical"      # manifest-committed dataset (backlog c8beb101); as the engine maps it
 
 # Phase 2 (issue #197): Relationship → canonical evidence_type. These
 # are written by `auto_wire_ds_for_edge` and now go through the

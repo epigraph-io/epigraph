@@ -235,12 +235,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         ENGINE_POOL_PARAM,
     ),
     (
-        "epigraph-engine/src/export/prov.rs",
-        "export_provenance_prov_o",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
         "epigraph-engine/src/matching/policy.rs",
         "write_edge",
         1,
@@ -400,7 +394,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/workflow_ingest.rs",
-        "execute_workflow_ingest_with_inserted",
+        "caller_viewer",
         1,
         PRE_VIEWER,
     ),
@@ -623,10 +617,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 
 /// The never-raised ceiling on the register's total site count.
 ///
-/// 84 -> 87 when `unauthenticated_reader.rs` (security(mcp): read the
+/// 83 -> 86 when `unauthenticated_reader.rs` (security(mcp): read the
 /// unauthenticated listener as a zero-membership principal) added its three
 /// registered pre-viewer identity sites; none is a viewer-filtered read.
-const HIGH_WATER: usize = 87;
+const HIGH_WATER: usize = 86;
 
 // ===========================================================================
 // The scanner.

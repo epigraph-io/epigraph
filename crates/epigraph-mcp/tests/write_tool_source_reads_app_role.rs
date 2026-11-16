@@ -141,6 +141,7 @@ async fn consolidate_default_confidence_reads_the_members_private_sources(pool: 
             mode: "merge".to_string(),
             reason: "app-role default-confidence probe".to_string(),
             confidence: None,
+            survivor_claim_id: None,
         },
         Some(&auth),
     )
@@ -218,6 +219,7 @@ async fn consolidate_default_confidence_refuses_when_a_source_read_fails_in_tran
             mode: "merge".to_string(),
             reason: "transaction-mode failed-read probe".to_string(),
             confidence: None,
+            survivor_claim_id: None,
         },
         Some(&auth),
     )

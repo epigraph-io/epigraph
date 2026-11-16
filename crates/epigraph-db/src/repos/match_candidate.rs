@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::errors::DbError;
 use crate::repos::edge::EdgeRepository;
+use crate::repos::edge_signature::EdgeSigningKey;
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MatchCandidateRow {
@@ -314,8 +315,11 @@ impl MatchCandidateRepo {
     ///
     /// The claim pair comes from the row the flip updated (`RETURNING`), not
     /// from the caller. The edge is written by
-    /// [`EdgeRepository::create_symmetric_if_absent_conn`], the same INSERT
-    /// the promote paths always ran, any-state dedup included. On
+    /// [`EdgeRepository::create_symmetric_if_absent_signed_conn`], the same
+    /// INSERT the promote paths always ran, any-state dedup included, attested
+    /// at INSERT by `key` (backlog `dae795f8`): the deciding transport's own
+    /// key (the MCP server's, the API's), never the deciding agent's. With
+    /// `key = None` the edge is written unsigned. On
     /// `AlreadyDecided` or `VerdictChanged` nothing is written (the
     /// transaction rolls back).
     ///
@@ -323,6 +327,7 @@ impl MatchCandidateRepo {
     /// The query's error; a candidate that does not exist is `RowNotFound`.
     pub async fn promote_if_pending(
         &self,
+        key: Option<EdgeSigningKey<'_>>,
         id: Uuid,
         by: Option<Uuid>,
         read_verdict: Option<&str>,
@@ -330,8 +335,16 @@ impl MatchCandidateRepo {
         properties: serde_json::Value,
     ) -> Result<DecideOutcome, DbError> {
         let mut conn = self.pool.acquire().await?;
-        Self::promote_if_pending_conn(&mut conn, id, by, read_verdict, relationship, properties)
-            .await
+        Self::promote_if_pending_conn(
+            &mut conn,
+            key,
+            id,
+            by,
+            read_verdict,
+            relationship,
+            properties,
+        )
+        .await
     }
 
     /// [`Self::promote_if_pending`] on a connection the caller owns, which may
@@ -352,6 +365,7 @@ impl MatchCandidateRepo {
     /// As [`Self::promote_if_pending`].
     pub async fn promote_if_pending_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         id: Uuid,
         by: Option<Uuid>,
         read_verdict: Option<&str>,
@@ -380,8 +394,9 @@ impl MatchCandidateRepo {
             }
             return Ok(DecideOutcome::AlreadyDecided { status });
         };
-        EdgeRepository::create_symmetric_if_absent_conn(
+        EdgeRepository::create_symmetric_if_absent_signed_conn(
             &mut tx,
+            key,
             claim_a,
             claim_b,
             relationship,

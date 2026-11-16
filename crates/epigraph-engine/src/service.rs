@@ -504,7 +504,8 @@ impl EpistemicService {
     const fn map_evidence_type(&self, core_type: &epigraph_core::EvidenceType) -> EvidenceType {
         match core_type {
             epigraph_core::EvidenceType::Observation { .. }
-            | epigraph_core::EvidenceType::Figure { .. } => EvidenceType::Empirical,
+            | epigraph_core::EvidenceType::Figure { .. }
+            | epigraph_core::EvidenceType::Dataset { .. } => EvidenceType::Empirical,
             epigraph_core::EvidenceType::Document { .. } => EvidenceType::Logical,
             epigraph_core::EvidenceType::Literature { .. } => EvidenceType::Statistical,
             epigraph_core::EvidenceType::Testimony { .. } => EvidenceType::Testimonial,

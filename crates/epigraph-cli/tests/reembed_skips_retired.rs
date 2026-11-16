@@ -12,8 +12,9 @@
 //! clause a run re-populates every retired claim it meets. Two costs:
 //!
 //! 1. Recall at `centroid_dim = 3072`
-//!    (`ClaimRepository::search_by_embedding_since`) has no `is_current`
-//!    filter, so the retired claim becomes retrievable again.
+//!    (`ClaimRepository::search_by_embedding_since`) had no `is_current`
+//!    filter until backlog 7720cb7a, so the retired claim became retrievable
+//!    again.
 //! 2. `chk_deprecated_no_embedding` covers `embedding_3072` (migration 144),
 //!    so the first retired row in a batch makes the UPDATE raise 23514 and
 //!    the whole run aborts.
@@ -31,7 +32,7 @@ use uuid::Uuid;
 
 use epigraph_cli::reembed::{run, ReembedConfig, ReembedTarget};
 use epigraph_embeddings::{
-    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, SimilarClaim, TokenUsage,
+    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, TokenUsage,
 };
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
@@ -185,23 +186,6 @@ impl EmbeddingService for ProbeProvider {
             .expect("retire the victim mid-batch");
         }
         self.inner.batch_generate(texts).await
-    }
-
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.inner.store(claim_id, embedding).await
-    }
-
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.inner.get(claim_id).await
-    }
-
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.inner.similar(embedding, k, min_similarity).await
     }
 
     fn dimension(&self) -> usize {

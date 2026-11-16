@@ -261,6 +261,9 @@ pub async fn decide_match_candidate(
             // promote of a pair touching its own private claim as "not
             // current", and the edge INSERT, owned by that claim's group, would
             // have been refused by `edges_tenancy` anyway.
+            // The matcher edge is attested at INSERT with the server's key
+            // (backlog `dae795f8`), resolved before the stamped transaction.
+            let edge_key = server.edge_signing_key().await?;
             let mut tx = crate::claim_helper::begin_author_stamped_tx(
                 server,
                 acting,
@@ -296,7 +299,7 @@ pub async fn decide_match_candidate(
             // matcher re-score of the verdict `relationship` was resolved from
             // refuses the promote instead of inverting it.
             //
-            // The edge goes through `EdgeRepository::create_symmetric_if_absent_conn`
+            // The edge goes through `EdgeRepository::create_symmetric_if_absent_signed_conn`
             // (inside the repo method): its existence check is the FAST PATH,
             // and migration 090's `edges_symmetric_relationship_uniq` is what
             // makes the answer true for a duplicate the check cannot see. The
@@ -313,6 +316,7 @@ pub async fn decide_match_candidate(
             });
             let outcome = MatchCandidateRepo::promote_if_pending_conn(
                 &mut tx,
+                Some(edge_key),
                 candidate_id,
                 Some(acting_agent),
                 row.verifier_verdict.as_deref(),

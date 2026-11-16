@@ -153,6 +153,11 @@ path = "src/bin/decompose_claims.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "atomicity_sweep"
+path = "src/bin/atomicity_sweep.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "prune_recall_events"
 path = "src/bin/prune_recall_events.rs"
 required-features = ["db"]
@@ -265,6 +270,13 @@ name = "embed_backfill_workflows"
 path = "tests/embed_backfill_workflows.rs"
 required-features = ["db"]
 
+# Atlas W6: positions filled into a synthetic map and stored through W2's
+# `AtlasMapRepository` (a fresh database per test).
+[[test]]
+name = "atlas_w6_layout_store"
+path = "tests/atlas_w6_layout_store.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "bootstrap_clients"
 path = "src/bin/bootstrap_clients.rs"
@@ -316,6 +328,15 @@ name = "backfill_evidence_type"
 path = "src/bin/backfill_evidence_type.rs"
 required-features = ["db"]
 
+# Beta-track replay backfill (follow-up to backlog f50344c0): rebuilds
+# beta_alpha/beta_beta of claims still on the Beta(1,1) prior from their stored
+# BBAs. Maintenance-only, dry run by default, --apply writes a manifest that
+# --reverse undoes.
+[[bin]]
+name = "replay_beta_track"
+path = "src/bin/replay_beta_track.rs"
+required-features = ["db"]
+
 # The identity-edge backfill for duplicates the legacy raw-SQL
 # fuzzy_dedup_claims marked (backlog d5781a48). Dry run unless --apply.
 [[bin]]
@@ -341,6 +362,61 @@ required-features = ["db"]
 [[test]]
 name = "atlas_layout_bin"
 path = "tests/atlas_layout_bin.rs"
+required-features = ["db"]
+
+# Atlas W4: the "by meaning" hierarchy's export and apply (maintenance DSN).
+[[bin]]
+name = "atlas_meaning"
+path = "src/bin/atlas_meaning.rs"
+required-features = ["db"]
+
+# Atlas W4: the "by meaning" hierarchy's export and apply, in process, and
+# the binary's argument refusals.
+[[test]]
+name = "atlas_meaning"
+path = "tests/atlas_meaning.rs"
+required-features = ["db"]
+
+# Atlas W8: LLM names for every group of a map, through the Claude CLI
+# (maintenance DSN). Dry run unless --apply.
+[[bin]]
+name = "atlas_naming"
+path = "src/bin/atlas_naming.rs"
+required-features = ["db"]
+
+# Atlas W8: the naming step on a fresh database, with a recording backend.
+[[test]]
+name = "atlas_naming"
+path = "tests/atlas_naming.rs"
+required-features = ["db"]
+
+# Atlas W5: the "by links" hierarchy's export, and the apply that writes both
+# hierarchies into one run (maintenance DSN).
+[[bin]]
+name = "atlas_links"
+path = "src/bin/atlas_links.rs"
+required-features = ["db"]
+
+# Atlas W5: the "by links" hierarchy's export and apply, in process, and the
+# binary's argument refusals.
+[[test]]
+name = "atlas_links"
+path = "tests/atlas_links.rs"
+required-features = ["db"]
+
+[[bin]]
+name = "atlas_nightly"
+path = "src/bin/atlas_nightly.rs"
+required-features = ["db"]
+
+[[test]]
+name = "atlas_nightly"
+path = "tests/atlas_nightly.rs"
+required-features = ["db"]
+
+[[test]]
+name = "atlas_nightly_units"
+path = "tests/atlas_nightly_units.rs"
 required-features = ["db"]
 
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
@@ -410,7 +486,13 @@ epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
 epigraph-mcp = { workspace = true }
 epigraph-ingest = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+# v5: the Atlas "by meaning" group ids (atlas_meaning::tree). Already enabled
+# Atlas: the v1 level documents. W6's `atlas_layout::fill` (always built) puts
+# positions into them, and the "by meaning" build (db feature) stores them.
+epigraph-atlas-contract = { workspace = true }
+# v4 + v5: the Atlas "by meaning" group ids (atlas_meaning::tree). v5 is already
+# in the build graph (uuid's sha1_smol is in the lockfile), so no new crate.
+uuid = { workspace = true, features = ["v4", "v5"] }
 epigraph-db = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 # `epigraph-operator verify-confirmations` (elevation plan EL-13): re-verifies
@@ -429,7 +511,6 @@ serde = { workspace = true }
 # graph through sqlx-core's `json` feature.
 serde_json = { workspace = true, features = ["raw_value"] }
 anyhow = { workspace = true }
-csv = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -439,6 +520,11 @@ dotenvy = "0.15"
 base64 = "0.22"
 blake3 = { workspace = true }
 sha2 = { workspace = true }
+# Atlas naming (`atlas_naming::backend`): the effective uid its private
+# working directory is checked against, and the kill of the Claude CLI's
+# process group at the timeout, both without `unsafe` (forbidden in this
+# workspace). Already in the lockfile, at this version.
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 rand = { workspace = true }
 linfa = { workspace = true }
 linfa-clustering = { workspace = true }
@@ -446,6 +532,8 @@ ndarray = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+# Atlas W6: the contract's fixture levels, for `atlas_layout::fill`'s tests.
+epigraph-atlas-contract = { workspace = true, features = ["check"] }
 sqlx = { workspace = true }
 # PR-hierarchical ingest integration test (tests/pr_hierarchical_ingest_test.rs):
 # oneshot the real epigraph-api handlers the CLI hits against epigraph_db_repo_test.

@@ -1234,7 +1234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // a stuck provider call cannot hold the process open forever.
         let pending = background.active();
         if pending > 0 {
-            let drain = stdio_drain_timeout();
+            let drain = epigraph_mcp::background::exit_drain_timeout();
             tracing::info!(
                 pending,
                 timeout_secs = drain.as_secs(),
@@ -1253,19 +1253,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-/// How long the stdio entry point waits, after its client disconnects, for
-/// detached work to finish: `EPIGRAPH_MCP_STDIO_DRAIN_SECS`, default 120. An
-/// unparseable value keeps the default; `0` waits not at all (the behaviour
-/// before the wait existed).
-fn stdio_drain_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(
-        std::env::var("EPIGRAPH_MCP_STDIO_DRAIN_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(120),
-    )
 }
 
 #[cfg(test)]

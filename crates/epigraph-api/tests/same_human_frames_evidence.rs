@@ -58,6 +58,7 @@ async fn submit(state: &AppState, pool: &PgPool, caller: Uuid, claim: Uuid, fram
     }))
     .expect("request");
     let _created = submit_evidence(
+        write_scope(),
         ViewerExtractor(viewer),
         State(state.clone()),
         Path(frame),
@@ -146,4 +147,26 @@ async fn frames_evidence_by_two_agents_of_one_human_does_not_aggregate(pool: PgP
         independent > baseline + 1e-3,
         "agents of different owners must still reinforce: {independent} vs {baseline}"
     );
+}
+
+/// The `claims:write` scope the write handlers now take as their first
+/// extractor (backlog f00d75ab). A direct handler call stands in for the
+/// bearer middleware, so it supplies the scope the route checks.
+fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
+    let principal = uuid::Uuid::new_v4();
+    epigraph_api::middleware::bearer::RequireScopeWrite(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: epigraph_api::middleware::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    )
 }
