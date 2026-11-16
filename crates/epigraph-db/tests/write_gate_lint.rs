@@ -239,10 +239,8 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("claim_theme.rs::bulk_assign", "clustering, corpus-wide"),
     ("claim_theme.rs::delete_all_conn", "clustering, corpus-wide"),
     ("claim_theme.rs::unassign_claim", "clustering, corpus-wide"),
-    (
-        "evidence.rs::store_embedding",
-        "embedding backfill, corpus-wide",
-    ),
+    // `evidence.rs::store_embedding` left this register with the function
+    // (backlog f78526ad): it had no caller and no seal predicate.
     (
         "edge.rs::remove_withdrawn_edge_bbas_conn",
         "the `edge_retract` administrative cascade (batch W12b, migration 120), on the \

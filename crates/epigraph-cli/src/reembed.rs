@@ -237,6 +237,11 @@ async fn fetch_batch(
 /// Writing anyway would raise 23514 on `chk_deprecated_no_embedding` and abort
 /// the run; the predicate turns it into a zero-row no-op instead.
 ///
+/// Re-checks [`ReembedTarget::sealed_predicate`] for the same window: a row
+/// sealed after it was fetched would otherwise reach migration 212's row
+/// trigger, whose 42501 aborts the run (and before 212 the vector was written
+/// onto ciphertext). With the predicate it is a zero-row no-op too.
+///
 /// Returns whether a row was written.
 async fn update_embedding_3072(
     pool: &PgPool,
@@ -246,8 +251,11 @@ async fn update_embedding_3072(
 ) -> Result<bool, ReembedError> {
     let table = target.table();
     let eligible = target.eligible_predicate();
-    let sql =
-        format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2 AND {eligible}");
+    let sealed = target.sealed_predicate();
+    let sql = format!(
+        "UPDATE {table} SET embedding_3072 = $1::vector \
+          WHERE id = $2 AND {eligible} AND NOT {sealed}"
+    );
     let done = sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
     Ok(done.rows_affected() > 0)
 }

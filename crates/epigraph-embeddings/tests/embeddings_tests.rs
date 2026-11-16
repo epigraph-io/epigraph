@@ -1031,6 +1031,110 @@ async fn test_pgvector_store_and_retrieve(pool: sqlx::PgPool) {
     }
 }
 
+/// `EmbeddingRepository::store` refuses a sealed claim (backlog f78526ad).
+///
+/// Its UPDATE had no `claim_encryption` predicate, so it could put a
+/// plaintext-derived vector on a claim whose content is ciphertext. The
+/// unsealed sibling in the same group is the calibration that the statement
+/// does write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_pgvector_store_refuses_a_sealed_claim(pool: sqlx::PgPool) {
+    use epigraph_embeddings::EmbeddingRepository;
+
+    let agent_id = Uuid::new_v4();
+    let public_key: Vec<u8> = agent_id
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent_id)
+        .bind(&public_key)
+        .execute(&pool)
+        .await
+        .expect("insert agent");
+    // A seal needs a group-private claim (migration 081) and the group's key
+    // epoch (the claim_encryption FK).
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('seal-store', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $1) \
+         RETURNING id",
+    )
+    .bind(agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert group");
+    sqlx::query("INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active')")
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("insert key epoch");
+
+    let mut claims = Vec::new();
+    for (i, content) in ["unsealed claim", "sealed claim"].iter().enumerate() {
+        let id = Uuid::new_v4();
+        let mut hash = vec![7u8; 31];
+        hash.push(i as u8);
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, visibility, owner_group_id) \
+             VALUES ($1, $2, $3, $4, 'group', $5)",
+        )
+        .bind(id)
+        .bind(*content)
+        .bind(&hash)
+        .bind(agent_id)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("insert claim");
+        claims.push(id);
+    }
+    let (open, sealed) = (claims[0], claims[1]);
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                       encrypted_content) \
+         VALUES ($1, $2, 0, 'fully_private', decode('0badc0de', 'hex'))",
+    )
+    .bind(sealed)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("seal the claim");
+
+    let repo = EmbeddingRepository::new(pool.clone(), 1536);
+    let embedding = Normalizer::normalize(&vec![1.0_f32; 1536]).unwrap();
+    let has_vector = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read vector")
+        }
+    };
+
+    assert!(
+        repo.store(open, &embedding).await.expect("store"),
+        "CALIBRATION: stored"
+    );
+    assert!(
+        has_vector(open).await,
+        "CALIBRATION: the unsealed claim has its vector"
+    );
+
+    assert!(
+        !repo.store(sealed, &embedding).await.expect("store"),
+        "a sealed claim reports nothing stored"
+    );
+    assert!(
+        !has_vector(sealed).await,
+        "a sealed claim never gains a vector"
+    );
+}
+
 /// Test k-NN similarity search with pgvector
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_pgvector_similarity_search(pool: sqlx::PgPool) {

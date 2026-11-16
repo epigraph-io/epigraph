@@ -119,6 +119,9 @@ pub async fn consolidate_claims(
     // than it was given and the merge refuses with NotFound before writing; a
     // PUBLIC foreign source is visible but its retirement UPDATE fails `WITH
     // CHECK`, which aborts the whole transaction — the merged row included.
+    // The act's `supersedes` edges are attested at INSERT with the server's
+    // key (backlog `dae795f8`), resolved before the act's transaction opens.
+    let edge_key = server.edge_signing_key().await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, acting, "consolidate_claims").await?;
     //
@@ -128,6 +131,7 @@ pub async fn consolidate_claims(
     // cascade below.
     let result = ClaimRepository::consolidate_act_conn(
         &mut tx,
+        Some(edge_key),
         &source_ids,
         &params.merged_content,
         merged_truth,

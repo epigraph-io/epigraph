@@ -558,8 +558,15 @@ const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 ///
 /// Everything else is debt. Do not add to it.
 const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
-    ("assess.rs", 1),
-    ("belief.rs", 1),
+    // 1 -> 0, key removed (backlog f78526ad): `assess_claim`'s
+    // `UPDATE claims SET embedding` became
+    // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
+    // with the caller's viewer (`AppState::store_claim_embedding_as`).
+    // 1 -> 0, key removed (backlog f50344c0): `submit_evidence`'s
+    // `UPDATE claims SET beta_alpha, beta_beta` became
+    // `ClaimRepository::add_beta_increments` (spliced `{WRITABLE:c}`), called
+    // through `epigraph_engine::ds_divergence::apply_beta_update`, which the
+    // MCP DS tools share.
     // 4 -> 3 (backlog 1e2315a9): `create_claim_core`'s post-commit
     // `UPDATE claims SET embedding` became
     // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
@@ -569,7 +576,9 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("conventions.rs", 2),
     ("hypothesis.rs", 2),
     ("policies.rs", 4),
-    ("rag.rs", 2),
+    // 2 -> 0, key removed (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding`
+    // and `PUT /api/v1/evidence/:id/embedding` (`generate_claim_embedding`,
+    // `generate_evidence_embedding`) were deleted.
     ("reasoning.rs", 2),
     ("revoke_signature.rs", 1),
     // The `sqlx::query!` macro write is not counted — see the note above.

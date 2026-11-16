@@ -711,6 +711,17 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "edge.rs",
+        "reaches_in_force_conn",
+        "READ of `edges` only, returning one boolean: whether one node reaches another along \
+         in-force edges of the named relationships (backlog 41d7b27a, the cycle guard for \
+         MCP `link_hierarchical`'s `invokes` / `depends_on`). It returns no row. Its caller \
+         runs it on the writer's STAMPED transaction, after both endpoints were read as the \
+         viewer, so `edges_tenancy` bounds the walk to edges that session reads; an edge it \
+         cannot see does not count toward a cycle, and the answer reveals nothing beyond \
+         what the session could already traverse.",
+    ),
+    (
         "admin_act.rs",
         "get",
         "READ of one `pending_admin_acts` row by id for the maintenance CLI (migration 130): an \
@@ -2536,6 +2547,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "create_symmetric_if_absent_signed_conn",
+        "WRITE. `create_symmetric_if_absent_conn` (which delegates here with no key) attested \
+         at INSERT by the caller's key (backlog dae795f8): the same any-state dedup and bare \
+         ON CONFLICT DO NOTHING, on the caller's connection; authorised by edges_tenancy's \
+         WITH CHECK. It reads no row back to a caller.",
+    ),
+    (
+        "edge.rs",
         "create_symmetric_if_absent_returning_conn",
         "WRITE. `create_symmetric_if_absent_returning` on a caller's connection, for \
          `link_alternative`'s author-stamped transaction. Same argument as \
@@ -3957,6 +3976,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          connection, so the policy filters for that caller; `routes/timeline.rs` still passes the \
          unstamped pool and stays on no_unscoped_pool's register. A Viewer would have nothing to \
          add to the policy.",
+    ),
+    // The assess route's writer record (backlog batch B19).
+    (
+        "event.rs",
+        "insert_on",
+        "WRITE, append-only, of one `events` row on the caller's executor (the assess route's \
+         transaction), so the event commits or rolls back with the write it records. `events` has \
+         no visibility or owner_group_id column and this function reads nothing, so there is no \
+         predicate a Viewer could be spent on; reads of `events` go through `list_events`, which \
+         applies the viewer.",
     ),
 ];
 

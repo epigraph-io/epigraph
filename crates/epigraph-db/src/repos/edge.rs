@@ -1141,6 +1141,36 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
+        Self::create_symmetric_if_absent_signed_conn(conn, None, a, b, relationship, properties)
+            .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_conn`], with the edge it INSERTS
+    /// attested at INSERT by `key` (see [`Self::create_signed_conn`]). The
+    /// same ANY-STATE dedup and the same bare `ON CONFLICT DO NOTHING`
+    /// (migration 090's index) as the unsigned form; a dedup hit writes
+    /// nothing and returns `false`.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_conn`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            return Ok(
+                insert_attested_conn(conn, key, att, None, SymmetricGuard::AnyState, true)
+                    .await?
+                    .is_some(),
+            );
+        }
         let result = sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
@@ -2237,6 +2267,63 @@ impl EdgeRepository {
         .fetch_optional(executor)
         .await?;
         Ok(found.unwrap_or(false))
+    }
+
+    /// Whether `to` is reachable from `from` along IN-FORCE edges whose
+    /// relationship is one of `relationships`, followed source -> target
+    /// (backlog 41d7b27a: the cycle guard for the workflow references
+    /// `invokes` and `depends_on`). `from == to` answers true.
+    ///
+    /// A writer about to add `a -rel-> b` asks `reaches(b, a)`: true means the
+    /// new edge would close a cycle. The walk is a recursive `UNION`, which
+    /// discards a node already reached, so it terminates on a graph that
+    /// already holds a cycle.
+    ///
+    /// Run it on the writer's STAMPED transaction: `edges_tenancy` bounds the
+    /// walk to edges that session reads, so an edge it cannot see does not
+    /// count toward a cycle (a cycle closed only through another group's
+    /// private edge is not refused).
+    ///
+    /// It first takes a transaction-scoped advisory lock keyed on the walked
+    /// relationship set, held until the caller's transaction ends. Two
+    /// concurrent writers of `a -rel-> b` and `b -rel-> a` then check and
+    /// insert one after the other: the second's walk runs on a fresh READ
+    /// COMMITTED snapshot that sees the first's committed edge, so the pair
+    /// cannot both pass and commit a 2-cycle. Call it on the transaction that
+    /// then writes the edge.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn reaches_in_force_conn(
+        conn: &mut sqlx::PgConnection,
+        from: Uuid,
+        to: Uuid,
+        relationships: &[&str],
+    ) -> Result<bool, DbError> {
+        let rels: Vec<String> = relationships.iter().map(|r| (*r).to_string()).collect();
+        let mut key: Vec<&str> = relationships.to_vec();
+        key.sort_unstable();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("edges.reaches:{}", key.join(",")))
+            .execute(&mut *conn)
+            .await?;
+        let reached: bool = sqlx::query_scalar(&format!(
+            "WITH RECURSIVE reach(node) AS ( \
+                 SELECT $1::uuid \
+               UNION \
+                 SELECT e.target_id FROM reach r \
+                   JOIN edges e ON e.source_id = r.node \
+                  WHERE e.relationship = ANY($3) AND {EDGE_IN_FORCE} \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM reach WHERE node = $2)"
+        ))
+        .bind(from)
+        .bind(to)
+        .bind(&rels)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(reached)
     }
 
     /// Get edges by target entity

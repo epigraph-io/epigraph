@@ -506,8 +506,9 @@ decision or conversion before the operator drops `claims_privacy`,
    - `POST /claims/:id/dedup` (claims:admin at the time; since batch OA1,
      claims:write plus write authority over both claims): 409 "already superseded or
      invalid input", a misleading status for an RLS refusal;
-   - `PUT /claims/:id/embedding`;
-   - `POST /api/v1/evidence`, `PUT /evidence/:id`, `PUT /evidence/:id/embedding`;
+   - `PUT /claims/:id/embedding` (route since removed, backlog 9bef22f3);
+   - `POST /api/v1/evidence`, `PUT /evidence/:id`, `PUT /evidence/:id/embedding`
+     (the last since removed, backlog 9bef22f3);
    - `POST /api/v1/edges` from an own-private source: 404;
    - `POST /workflows/steps/:id/evolve`;
    - `POST /skills/share` on an own flat workflow.

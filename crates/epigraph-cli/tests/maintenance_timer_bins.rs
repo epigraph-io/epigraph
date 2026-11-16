@@ -1027,6 +1027,7 @@ async fn the_unmark_cli_follows_a_superseded_canonical(pool: PgPool) {
             .expect("the canonical's author");
         let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
             &mut conn,
+            None,
             epigraph_core::ClaimId::from_uuid(strong),
             &format!("revised later, revised {}", Uuid::new_v4()),
             epigraph_core::TruthValue::clamped(0.5),

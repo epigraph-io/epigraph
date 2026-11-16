@@ -122,7 +122,13 @@ async fn share_skill_embeds_the_shared_copy(pool: PgPool) {
     let (sharer, _) = seed_agent_with_group(&pool, "sharer").await;
     let workflow = seed_public_claim(&pool, author, "a workflow worth sharing").await;
 
+    let Some(Extension(write)) = token(sharer, ClientType::Service, "claims:write") else {
+        unreachable!("token always returns a context")
+    };
     let (status, Json(shared)) = share_skill(
+        // `share_skill` takes `claims:write` as its first extractor (backlog
+        // f00d75ab); a direct call stands in for the bearer middleware.
+        epigraph_api::middleware::bearer::RequireScopeWrite(write),
         ViewerExtractor(Viewer::resolve(&pool, sharer).await.expect("viewer")),
         State(state),
         Json(ShareSkillRequest {

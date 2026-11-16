@@ -787,7 +787,15 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// transaction (`routes/crud.rs`, keeping sites), and `query_security_events`
 /// reads on the caller's `AppState::read_as` (`routes/audit.rs` reached zero
 /// and its key was DELETED; `HIGH_WATER_FILES` falls by one with it).
-const HIGH_WATER: usize = 200;
+/// 200 -> 198 (backlog 9bef22f3, merged on staging after the line above):
+/// `PUT /api/v1/claims/:id/embedding` and `PUT /api/v1/evidence/:id/embedding`
+/// were deleted with their handlers; `routes/rag.rs` 2 -> 0, key DELETED.
+/// Each side lowered from 204 on its own branch; the merge keeps both drops.
+/// 198 -> 197 (backlog dae795f8, merged on staging after the lines above):
+/// `promote_staged_edges`'s two one-statement arms became one transaction on
+/// the same raw pool, `routes/crud.rs` one site fewer. A merge of two sites,
+/// not a conversion.
+const HIGH_WATER: usize = 197;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -857,7 +865,9 @@ const HIGH_WATER: usize = 200;
 /// caller's stamped transaction; merged with the line above on staging).
 /// 38 -> 37 when `routes/isomorphism.rs` was deleted (see [`HIGH_WATER`]).
 /// 37 -> 36 when `routes/audit.rs` reached zero (backlog 8a168dd6).
-const HIGH_WATER_FILES: usize = 36;
+/// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
+/// staging after the line above).
+const HIGH_WATER_FILES: usize = 35;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1001,7 +1011,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
     // transaction. Its provenance append stays on the pool, as every
     // `record_provenance` call does.
-    ("routes/crud.rs", 27),
+    // 27 -> 26 (backlog dae795f8): `promote_staged_edges`'s two arms (one
+    // `&state.db_pool` each) became one transaction begun on it. Still the raw
+    // pool, so not a conversion.
+    ("routes/crud.rs", 26),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
@@ -1061,9 +1074,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 92, row-level security is OFF on both and neither carries a policy, so
     // stamping that connection narrows nothing. The stamp is for the `claims` /
     // `edges` / `claim_neighborhood_membership` reads that follow. (2) The seven
-    // inline edge/membership aggregates in this file remain viewer-less in the
-    // statement; `F-edges-unfiltered` owns that and conversion neither closes
-    // nor worsens it. What DID change beyond the counter is that
+    // inline edge/membership aggregates in this file stayed viewer-less in the
+    // statement at conversion; backlog batch B08 later moved the four edge
+    // statements into `GraphViewRepository` with the edge predicate
+    // (`F-edges-unfiltered`), and conversion neither closed nor worsened it. What DID change beyond the counter is that
     // `compound_response` and `atomic_response` moved from `pool: &PgPool` to
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.
@@ -1122,7 +1136,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
     ("routes/political.rs", 5),
-    ("routes/rag.rs", 2),
+    // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
+    // its two writers, `generate_claim_embedding` and
+    // `generate_evidence_embedding` (the `PUT …/embedding` routes).
     // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
     // loader moved onto `AppState::read_as` and
     // `EdgeRepository::claim_edges_for_reasoning` ({EDGE_VISIBILITY:e}), and the

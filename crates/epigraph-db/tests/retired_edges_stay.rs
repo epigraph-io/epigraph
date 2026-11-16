@@ -182,6 +182,7 @@ async fn supersede_act(pool: &PgPool, author: Uuid, group: Uuid, old: Uuid) -> U
         let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
         let (new_id, _) = ClaimRepository::supersede_act_conn(
             &mut tx,
+            None,
             ClaimId::from_uuid(old),
             &format!("a restatement of {old}"),
             TruthValue::clamped(0.6),
@@ -217,6 +218,7 @@ async fn consolidate_act(pool: &PgPool, author: Uuid, group: Uuid, sources: Vec<
         let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
         let merged = ClaimRepository::consolidate_act_conn(
             &mut tx,
+            None,
             &sources,
             "the sources, merged",
             0.6,

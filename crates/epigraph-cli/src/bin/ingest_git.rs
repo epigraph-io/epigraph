@@ -53,8 +53,6 @@ struct Args {
     limit: Option<usize>,
     /// Enricher mode: noop (default) or llm
     enricher: EnricherMode,
-    /// Whether to generate and store embeddings for submitted claims
-    embed: bool,
     /// Bearer token for agent registration (required for /agents endpoint)
     token: Option<String>,
     /// PR-hierarchical ingestion mode (repo → PR → commit hierarchy)
@@ -90,7 +88,6 @@ impl Args {
         let mut since = None;
         let mut limit = None;
         let mut enricher = EnricherMode::Noop;
-        let mut embed = false;
         let mut token = None;
         let mut pr_mode = false;
         let mut repo_slug = None;
@@ -151,7 +148,15 @@ impl Args {
                     enricher = EnricherMode::from_str(val)?;
                 }
                 "--embed" => {
-                    embed = true;
+                    // The server's PUT /api/v1/{claims,evidence}/:id/embedding
+                    // routes are gone (backlog 9bef22f3): any bearer could
+                    // overwrite any row's vector from caller-supplied text.
+                    return Err(
+                        "--embed was removed: the server embeds each claim when the \
+                                packet is submitted, and `epigraph-cli reembed` backfills \
+                                claim and evidence vectors"
+                            .into(),
+                    );
                 }
                 "--token" | "-t" => {
                     i += 1;
@@ -254,7 +259,6 @@ impl Args {
             since,
             limit,
             enricher,
-            embed,
             token,
             pr_mode,
             repo_slug,
@@ -281,7 +285,6 @@ Options:
   -s, --since <DATE>      Only process commits after this date (YYYY-MM-DD)
   -l, --limit <N>         Maximum number of commits to process
       --enricher <MODE>   Enrichment mode: noop (default) or llm
-      --embed             Generate and store embeddings for submitted claims
   -t, --token <TOKEN>     Bearer token for agent registration
   -h, --help              Show this help message
 
@@ -1026,8 +1029,6 @@ struct SubmitResponse {
     truth_value: f64,
     #[allow(dead_code)]
     was_duplicate: bool,
-    #[serde(default)]
-    evidence_ids: Vec<Uuid>,
 }
 
 /// Response from POST /agents
@@ -1253,8 +1254,6 @@ struct RelationshipTracker {
     scope_feats: HashMap<String, Uuid>,
     /// Maps git hash → claim_id (for parent→child refinement)
     hash_to_claim: HashMap<String, Uuid>,
-    /// Maps git hash → evidence_ids (for evidence embedding after ingestion)
-    hash_to_evidence: HashMap<String, Vec<Uuid>>,
 }
 
 impl RelationshipTracker {
@@ -1262,7 +1261,6 @@ impl RelationshipTracker {
         Self {
             scope_feats: HashMap::new(),
             hash_to_claim: HashMap::new(),
-            hash_to_evidence: HashMap::new(),
         }
     }
 
@@ -1271,14 +1269,6 @@ impl RelationshipTracker {
         self.hash_to_claim.insert(commit.hash.clone(), claim_id);
         if commit.commit_type == CommitType::Feat && !commit.scope.is_empty() {
             self.scope_feats.insert(commit.scope.clone(), claim_id);
-        }
-    }
-
-    /// Record evidence IDs from a successful submission
-    fn record_evidence(&mut self, commit: &ParsedCommit, evidence_ids: Vec<Uuid>) {
-        if !evidence_ids.is_empty() {
-            self.hash_to_evidence
-                .insert(commit.hash.clone(), evidence_ids);
         }
     }
 
@@ -1879,198 +1869,6 @@ fn count_semantic_edges(enrichments: &[EnrichedData]) -> usize {
     enrichments.iter().map(|e| e.semantic_edges.len()).sum()
 }
 
-/// Request body for PUT /api/v1/claims/:id/embedding
-#[derive(Debug, Serialize)]
-struct GenerateEmbeddingRequest {
-    text: String,
-}
-
-/// Batch size for embedding generation requests.
-/// Processing in chunks prevents overwhelming the API server and provides
-/// progress feedback during large ingestion runs.
-const EMBEDDING_BATCH_SIZE: usize = 100;
-
-/// Generate and store embeddings for all submitted claims.
-///
-/// For each commit that was successfully submitted (has a claim_id in the tracker),
-/// sends a PUT request to the API to generate and store an embedding.
-///
-/// Processes in chunks of `EMBEDDING_BATCH_SIZE` with progress reporting.
-///
-/// Returns (successful, failed) counts.
-async fn submit_embeddings(
-    commits: &[ParsedCommit],
-    tracker: &RelationshipTracker,
-    endpoint: &str,
-    client: &reqwest::Client,
-) -> (usize, usize) {
-    let mut ok = 0;
-    let mut fail = 0;
-
-    // Collect all embeddable claims
-    let embeddable: Vec<(&ParsedCommit, Uuid)> = commits
-        .iter()
-        .filter_map(|commit| {
-            tracker
-                .hash_to_claim
-                .get(&commit.hash)
-                .map(|id| (commit, *id))
-        })
-        .collect();
-
-    let total = embeddable.len();
-    if total == 0 {
-        return (0, 0);
-    }
-
-    // Process in chunks for progress reporting and rate limiting
-    for (chunk_idx, chunk) in embeddable.chunks(EMBEDDING_BATCH_SIZE).enumerate() {
-        let chunk_start = chunk_idx * EMBEDDING_BATCH_SIZE;
-        println!(
-            "  Embedding batch {}/{} ({}/{})",
-            chunk_idx + 1,
-            total.div_ceil(EMBEDDING_BATCH_SIZE),
-            chunk_start + 1,
-            total,
-        );
-
-        for (commit, claim_id) in chunk {
-            let claim_content = format!(
-                "[{}][{}] {}",
-                commit.commit_type, commit.scope, commit.claim_text
-            );
-
-            let request = GenerateEmbeddingRequest {
-                text: claim_content,
-            };
-
-            let url = format!("{endpoint}/api/v1/claims/{claim_id}/embedding");
-            match client
-                .put(&url)
-                .json(&request)
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    ok += 1;
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    eprintln!("Embedding failed for {claim_id} (HTTP {status}): {body}");
-                    fail += 1;
-                }
-                Err(e) => {
-                    eprintln!("Embedding error for {claim_id}: {e}");
-                    fail += 1;
-                }
-            }
-        }
-    }
-
-    (ok, fail)
-}
-
-/// Generate and store embeddings for evidence items from submitted claims.
-///
-/// For each commit that was successfully submitted and has evidence IDs in the tracker,
-/// sends a PUT request to the API to generate and store an embedding for each
-/// evidence item's raw_content.
-///
-/// Processes in chunks of `EMBEDDING_BATCH_SIZE` with progress reporting.
-///
-/// Returns (successful, failed) counts.
-async fn submit_evidence_embeddings(
-    commits: &[ParsedCommit],
-    tracker: &RelationshipTracker,
-    endpoint: &str,
-    client: &reqwest::Client,
-) -> (usize, usize) {
-    let mut ok = 0;
-    let mut fail = 0;
-
-    // Collect all embeddable evidence: (evidence_id, raw_content text)
-    let embeddable: Vec<(Uuid, String)> = commits
-        .iter()
-        .filter_map(|commit| {
-            tracker
-                .hash_to_evidence
-                .get(&commit.hash)
-                .map(|evidence_ids: &Vec<Uuid>| {
-                    // Pair each evidence ID with its text content
-                    let all_content: Vec<String> = commit
-                        .evidence
-                        .iter()
-                        .chain(commit.verification.iter())
-                        .cloned()
-                        .collect();
-
-                    evidence_ids
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, eid)| {
-                            all_content
-                                .get(i)
-                                .map(|content: &String| (*eid, content.clone()))
-                        })
-                        .collect::<Vec<_>>()
-                })
-        })
-        .flatten()
-        .collect();
-
-    let total = embeddable.len();
-    if total == 0 {
-        return (0, 0);
-    }
-
-    for (chunk_idx, chunk) in embeddable.chunks(EMBEDDING_BATCH_SIZE).enumerate() {
-        let chunk_start = chunk_idx * EMBEDDING_BATCH_SIZE;
-        println!(
-            "  Evidence embedding batch {}/{} ({}/{})",
-            chunk_idx + 1,
-            total.div_ceil(EMBEDDING_BATCH_SIZE),
-            chunk_start + 1,
-            total,
-        );
-
-        for (evidence_id, content) in chunk {
-            let content_str: &String = content;
-            let request = GenerateEmbeddingRequest {
-                text: content_str.clone(),
-            };
-
-            let url = format!("{endpoint}/api/v1/evidence/{evidence_id}/embedding");
-            match client
-                .put(&url)
-                .json(&request)
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => {
-                    ok += 1;
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let body = response.text().await.unwrap_or_default();
-                    eprintln!(
-                        "Evidence embedding failed for {evidence_id} (HTTP {status}): {body}"
-                    );
-                    fail += 1;
-                }
-                Err(e) => {
-                    eprintln!("Evidence embedding error for {evidence_id}: {e}");
-                    fail += 1;
-                }
-            }
-        }
-    }
-
-    (ok, fail)
-}
-
 // =============================================================================
 // PR-HIERARCHICAL INGESTION
 // =============================================================================
@@ -2567,7 +2365,6 @@ async fn main() {
                                 result.truth_value,
                             );
                             tracker.record(commit, result.claim_id);
-                            tracker.record_evidence(commit, result.evidence_ids);
                             submitted += 1;
 
                             // Create edge: Activity --generated--> Claim
@@ -2619,7 +2416,6 @@ async fn main() {
                                         result.truth_value,
                                     );
                                     tracker.record(commit, result.claim_id);
-                                    tracker.record_evidence(commit, result.evidence_ids);
                                     submitted += 1;
                                     if let Some(ref act_id) = activity_id {
                                         create_prov_edge(
@@ -2666,7 +2462,6 @@ async fn main() {
                                         result.truth_value,
                                     );
                                     tracker.record(commit, result.claim_id);
-                                    tracker.record_evidence(commit, result.evidence_ids);
                                     submitted += 1;
                                     retried = true;
                                     if let Some(ref act_id) = activity_id {
@@ -2725,34 +2520,6 @@ async fn main() {
         );
         if edges_failed > 0 {
             failed += edges_failed;
-        }
-    }
-
-    // Generate and store embeddings if --embed flag is set
-    if args.embed {
-        let embed_count = tracker.hash_to_claim.len();
-        println!("\nGenerating embeddings for {embed_count} submitted claims...");
-        let (embeds_ok, embeds_fail) =
-            submit_embeddings(&commits, &tracker, &args.endpoint, &client).await;
-        println!("Embedding generation: {embeds_ok} stored, {embeds_fail} failed");
-        if embeds_fail > 0 {
-            failed += embeds_fail;
-        }
-
-        // Also embed evidence items
-        let evidence_count: usize = tracker
-            .hash_to_evidence
-            .values()
-            .map(|v: &Vec<Uuid>| v.len())
-            .sum();
-        if evidence_count > 0 {
-            println!("\nGenerating embeddings for {evidence_count} evidence items...");
-            let (ev_ok, ev_fail) =
-                submit_evidence_embeddings(&commits, &tracker, &args.endpoint, &client).await;
-            println!("Evidence embedding generation: {ev_ok} stored, {ev_fail} failed");
-            if ev_fail > 0 {
-                failed += ev_fail;
-            }
         }
     }
 
@@ -5039,168 +4806,10 @@ crates/epigraph-core/src/domain/mod.rs",
         assert!(enrichments[1].semantic_edges.is_empty());
     }
 
-    // -------------------------------------------------------------------------
-    // Embedding generation tests (Phase 2.3)
-    // -------------------------------------------------------------------------
-
     #[test]
-    fn test_generate_embedding_request_serializes() {
-        let request = GenerateEmbeddingRequest {
-            text: "[feat][core] define Claim model with bounded truth values".to_string(),
-        };
-        let json = serde_json::to_value(&request).unwrap();
-        assert!(json["text"]
-            .as_str()
-            .unwrap()
-            .contains("define Claim model"));
-    }
-
-    #[test]
-    fn test_embed_flag_default_false() {
-        // Verify that --embed is false by default (tested via USAGE string presence)
-        assert!(USAGE.contains("--embed"));
-    }
-
-    #[test]
-    fn test_embedding_only_for_submitted_commits() {
-        // Only commits with claim IDs in the tracker should get embeddings
-        let commits = [
-            make_commit("aaa", CommitType::Feat, "core", vec![]),
-            make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
-            make_commit("ccc", CommitType::Docs, "", vec![]),
-        ];
-
-        let mut tracker = RelationshipTracker::new();
-        let claim_a = Uuid::new_v4();
-        // Only commit "aaa" was submitted and tracked
-        tracker.record(&commits[0], claim_a);
-
-        // "aaa" should be embeddable, "bbb" and "ccc" should not
-        assert!(tracker.hash_to_claim.contains_key("aaa"));
-        assert!(!tracker.hash_to_claim.contains_key("bbb"));
-        assert!(!tracker.hash_to_claim.contains_key("ccc"));
-    }
-
-    #[test]
-    fn test_embedding_text_matches_claim_content() {
-        let commit = make_commit("aaa", CommitType::Feat, "core", vec![]);
-        // The embedding text format should match build_packet's claim content
-        let expected_content = format!(
-            "[{}][{}] {}",
-            commit.commit_type, commit.scope, commit.claim_text
-        );
-        assert!(expected_content.starts_with("[feat][core]"));
-    }
-
-    #[test]
-    fn test_embedding_batch_size_is_reasonable() {
-        assert_eq!(EMBEDDING_BATCH_SIZE, 100);
-    }
-
-    // -------------------------------------------------------------------------
-    // Evidence embedding tracking tests (Phase 5.2)
-    // -------------------------------------------------------------------------
-
-    #[test]
-    fn test_record_evidence_stores_evidence_ids() {
-        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
-        let mut tracker = RelationshipTracker::new();
-        let evidence_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
-        tracker.record_evidence(&commits[0], evidence_ids.clone());
-
-        assert_eq!(tracker.hash_to_evidence.get("aaa").unwrap(), &evidence_ids);
-    }
-
-    #[test]
-    fn test_record_evidence_skips_empty() {
-        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
-        let mut tracker = RelationshipTracker::new();
-        tracker.record_evidence(&commits[0], vec![]);
-
-        assert!(!tracker.hash_to_evidence.contains_key("aaa"));
-    }
-
-    #[test]
-    fn test_record_evidence_independent_of_claim() {
-        let commits = [make_commit("aaa", CommitType::Feat, "core", vec![])];
-        let mut tracker = RelationshipTracker::new();
-        let claim_id = Uuid::new_v4();
-        let evidence_ids = vec![Uuid::new_v4()];
-        tracker.record(&commits[0], claim_id);
-        tracker.record_evidence(&commits[0], evidence_ids.clone());
-
-        assert_eq!(tracker.hash_to_claim.get("aaa"), Some(&claim_id));
-        assert_eq!(tracker.hash_to_evidence.get("aaa").unwrap(), &evidence_ids);
-    }
-
-    #[test]
-    fn test_submit_response_parses_evidence_ids() {
-        let json = serde_json::json!({
-            "claim_id": Uuid::nil(),
-            "truth_value": 0.8,
-            "was_duplicate": false,
-            "evidence_ids": [Uuid::nil(), Uuid::nil()]
-        });
-        let response: SubmitResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(response.evidence_ids.len(), 2);
-    }
-
-    #[test]
-    fn test_submit_response_default_evidence_ids_empty() {
-        // When the API doesn't include evidence_ids, serde default gives empty vec
-        let json = serde_json::json!({
-            "claim_id": Uuid::nil(),
-            "truth_value": 0.8,
-            "was_duplicate": false
-        });
-        let response: SubmitResponse = serde_json::from_value(json).unwrap();
-        assert!(response.evidence_ids.is_empty());
-    }
-
-    #[test]
-    fn test_evidence_embedding_only_for_tracked_evidence() {
-        let commits = [
-            make_commit("aaa", CommitType::Feat, "core", vec![]),
-            make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
-        ];
-
-        let mut tracker = RelationshipTracker::new();
-        let ev_ids_a = vec![Uuid::new_v4(), Uuid::new_v4()];
-        tracker.record_evidence(&commits[0], ev_ids_a.clone());
-        // commit "bbb" has no evidence tracked
-
-        assert!(tracker.hash_to_evidence.contains_key("aaa"));
-        assert!(!tracker.hash_to_evidence.contains_key("bbb"));
-    }
-
-    #[test]
-    fn test_evidence_count_aggregation() {
-        let commits = [
-            make_commit("aaa", CommitType::Feat, "core", vec![]),
-            make_commit("bbb", CommitType::Fix, "core", vec!["aaa"]),
-        ];
-
-        let mut tracker = RelationshipTracker::new();
-        tracker.record_evidence(&commits[0], vec![Uuid::new_v4(), Uuid::new_v4()]);
-        tracker.record_evidence(&commits[1], vec![Uuid::new_v4()]);
-
-        let evidence_count: usize = tracker
-            .hash_to_evidence
-            .values()
-            .map(|v: &Vec<Uuid>| v.len())
-            .sum();
-        assert_eq!(evidence_count, 3);
-    }
-
-    #[test]
-    fn test_embedding_batch_chunking() {
-        // Verify that chunks of EMBEDDING_BATCH_SIZE cover all items
-        let items: Vec<usize> = (0..250).collect();
-        let chunks: Vec<&[usize]> = items.chunks(EMBEDDING_BATCH_SIZE).collect();
-        assert_eq!(chunks.len(), 3); // 100 + 100 + 50
-        assert_eq!(chunks[0].len(), 100);
-        assert_eq!(chunks[1].len(), 100);
-        assert_eq!(chunks[2].len(), 50);
+    fn test_usage_no_longer_offers_embed() {
+        // The embedding PUT routes it drove were removed (backlog 9bef22f3).
+        assert!(!USAGE.contains("--embed"));
     }
 
     // =========================================================================

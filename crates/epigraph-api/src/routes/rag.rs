@@ -16,7 +16,7 @@
 //! GET /api/v1/query/rag?query=climate+change+effects&limit=5&min_truth=0.8&domain=factual
 //! ```
 //!
-//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
+//! # Tenancy: both of this file's remaining raw-pool sites are converted
 //!
 //! Conversion shard 6. `rag_context` and `search_evidence` each run their single
 //! read on a viewer-stamped connection from [`AppState::read_as`].
@@ -30,12 +30,14 @@
 //! so there is no coherence to preserve across the wait and no reason to hold one
 //! of the request pool's ten connections while a third party answers.
 //!
-//! `generate_claim_embedding` and `generate_evidence_embedding` are NOT
-//! converted: both WRITE, and [`AppState::read_as`] is read-only — a write routed
-//! through a `ScopedRead` type-checks and is then rolled back on drop under
-//! `SessionGucMode::Transaction`. They remain counted, and
-//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
-//! `("rag.rs", 2)` for them, unchanged by this shard.
+//! The two other sites were `generate_claim_embedding` and
+//! `generate_evidence_embedding`, behind `PUT /api/v1/claims/:id/embedding` and
+//! `PUT /api/v1/evidence/:id/embedding`. Both were DELETED (backlog 9bef22f3):
+//! they took no scope and no viewer and ran `UPDATE … SET embedding` on the
+//! unstamped pool from caller-supplied text, so any bearer could overwrite any
+//! row's vector, a sealed row's included. Claims are embedded when they are
+//! written (`POST /api/v1/claims`, `POST /api/v1/submit/packet`) and
+//! `epigraph-cli reembed` backfills claim and evidence vectors.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -451,136 +453,6 @@ pub async fn rag_context(
     }
 }
 
-// ============================================================================
-// Embedding Generation Endpoint
-// ============================================================================
-
-/// Request body for PUT /api/v1/claims/:id/embedding
-#[derive(Debug, Deserialize)]
-pub struct GenerateEmbeddingRequest {
-    /// The text to embed (typically the claim content)
-    pub text: String,
-}
-
-/// Response from PUT /api/v1/claims/:id/embedding
-#[derive(Debug, Serialize)]
-pub struct EmbeddingResponse {
-    pub claim_id: Uuid,
-    pub dimension: usize,
-    pub stored: bool,
-}
-
-/// Generate and store an embedding for a claim.
-///
-/// `PUT /api/v1/claims/:id/embedding`
-///
-/// Uses the configured embedding service to generate a vector embedding
-/// for the provided text and stores it in the claim's embedding column.
-///
-/// Protected route — requires Ed25519 signature verification.
-#[cfg(feature = "db")]
-pub async fn generate_claim_embedding(
-    State(state): State<AppState>,
-    axum::extract::Path(claim_id): axum::extract::Path<Uuid>,
-    Json(request): Json<GenerateEmbeddingRequest>,
-) -> Result<Json<EmbeddingResponse>, ApiError> {
-    if request.text.trim().is_empty() {
-        return Err(ApiError::ValidationError {
-            field: "text".to_string(),
-            reason: "Text cannot be empty".to_string(),
-        });
-    }
-
-    // Generate embedding (ignore mode flag — we always store regardless)
-    let (embedding, _is_real) = generate_query_embedding(&state, &request.text).await;
-    let dimension = embedding.len();
-
-    // Format and store in DB
-    let pgvector_str = format_embedding_for_pgvector(&embedding);
-    let pool = &state.db_pool;
-
-    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-        .bind(&pgvector_str)
-        .bind(claim_id)
-        .execute(pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to store embedding: {e}"),
-        })?;
-
-    Ok(Json(EmbeddingResponse {
-        claim_id,
-        dimension,
-        stored: true,
-    }))
-}
-
-/// Generate and store an embedding for an evidence item.
-///
-/// `PUT /api/v1/evidence/:id/embedding`
-///
-/// Uses the configured embedding service to generate a vector embedding
-/// for the provided text (typically evidence raw_content) and stores it
-/// in the evidence's embedding column.
-///
-/// Protected route — requires Ed25519 signature verification.
-#[cfg(feature = "db")]
-pub async fn generate_evidence_embedding(
-    State(state): State<AppState>,
-    axum::extract::Path(evidence_id): axum::extract::Path<Uuid>,
-    Json(request): Json<GenerateEmbeddingRequest>,
-) -> Result<Json<EvidenceEmbeddingResponse>, ApiError> {
-    if request.text.trim().is_empty() {
-        return Err(ApiError::ValidationError {
-            field: "text".to_string(),
-            reason: "Text cannot be empty".to_string(),
-        });
-    }
-
-    // Generate embedding (ignore mode flag — we always store regardless)
-    let (embedding, _is_real) = generate_query_embedding(&state, &request.text).await;
-    let dimension = embedding.len();
-
-    // Format and store in DB
-    let pgvector_str = format_embedding_for_pgvector(&embedding);
-    let pool = &state.db_pool;
-
-    sqlx::query("UPDATE evidence SET embedding = $1::vector WHERE id = $2")
-        .bind(&pgvector_str)
-        .bind(evidence_id)
-        .execute(pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to store evidence embedding: {e}"),
-        })?;
-
-    Ok(Json(EvidenceEmbeddingResponse {
-        evidence_id,
-        dimension,
-        stored: true,
-    }))
-}
-
-/// Non-DB stub for evidence embedding generation
-#[cfg(not(feature = "db"))]
-pub async fn generate_evidence_embedding(
-    State(_state): State<AppState>,
-    axum::extract::Path(_evidence_id): axum::extract::Path<Uuid>,
-    Json(_request): Json<GenerateEmbeddingRequest>,
-) -> Result<Json<EvidenceEmbeddingResponse>, ApiError> {
-    Err(ApiError::ServiceUnavailable {
-        service: "database".to_string(),
-    })
-}
-
-/// Response from PUT /api/v1/evidence/:id/embedding
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EvidenceEmbeddingResponse {
-    pub evidence_id: Uuid,
-    pub dimension: usize,
-    pub stored: bool,
-}
-
 /// Search evidence by semantic similarity
 ///
 /// `GET /api/v1/search/evidence`
@@ -732,18 +604,6 @@ pub struct EvidenceSearchResponse {
 // `EvidenceRepository::search_by_embedding`, which returns
 // `epigraph_db::EvidenceSearchResult` with the visibility predicate already
 // spliced on, so the local row struct has no remaining use.
-
-/// Non-DB stub for embedding generation
-#[cfg(not(feature = "db"))]
-pub async fn generate_claim_embedding(
-    State(_state): State<AppState>,
-    axum::extract::Path(_claim_id): axum::extract::Path<Uuid>,
-    Json(_request): Json<GenerateEmbeddingRequest>,
-) -> Result<Json<EmbeddingResponse>, ApiError> {
-    Err(ApiError::ServiceUnavailable {
-        service: "database".to_string(),
-    })
-}
 
 // ============================================================================
 // Tests
@@ -1181,57 +1041,6 @@ mod tests {
         }
     }
 
-    // ---- Embedding Endpoint Tests ----
-
-    #[test]
-    fn test_generate_embedding_request_deserializes() {
-        let json = serde_json::json!({"text": "test claim content"});
-        let request: GenerateEmbeddingRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(request.text, "test claim content");
-    }
-
-    #[test]
-    fn test_embedding_response_serializes() {
-        let response = EmbeddingResponse {
-            claim_id: Uuid::new_v4(),
-            dimension: 1536,
-            stored: true,
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        assert_eq!(json["dimension"], 1536);
-        assert_eq!(json["stored"], true);
-    }
-
-    // ---- Evidence Embedding Tests ----
-
-    #[test]
-    fn test_evidence_embedding_response_serializes() {
-        let response = EvidenceEmbeddingResponse {
-            evidence_id: Uuid::new_v4(),
-            dimension: 1536,
-            stored: true,
-        };
-        let json = serde_json::to_value(&response).unwrap();
-        assert_eq!(json["dimension"], 1536);
-        assert_eq!(json["stored"], true);
-        assert!(json["evidence_id"].is_string());
-    }
-
-    #[test]
-    fn test_evidence_embedding_response_roundtrip() {
-        let id = Uuid::new_v4();
-        let response = EvidenceEmbeddingResponse {
-            evidence_id: id,
-            dimension: 768,
-            stored: false,
-        };
-        let json_str = serde_json::to_string(&response).unwrap();
-        let deserialized: EvidenceEmbeddingResponse = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(deserialized.evidence_id, id);
-        assert_eq!(deserialized.dimension, 768);
-        assert!(!deserialized.stored);
-    }
-
     // ---- Evidence Search DTO Tests ----
 
     #[test]
@@ -1380,48 +1189,6 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
                 "Evidence search is no longer anonymously readable"
             );
-        }
-    }
-
-    // ---- Evidence Embedding Handler Test (non-DB) ----
-
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
-    #[cfg(not(feature = "db"))]
-    mod evidence_embedding_handler_tests {
-        use super::*;
-        use crate::state::ApiConfig;
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use axum::routing::put;
-        use axum::Router;
-        use tower::ServiceExt;
-
-        #[tokio::test]
-        async fn test_evidence_embedding_without_db_returns_503() {
-            let state = AppState::new(ApiConfig::default());
-            let router = Router::new()
-                .route(
-                    "/api/v1/evidence/:id/embedding",
-                    put(generate_evidence_embedding),
-                )
-                .with_state(state);
-
-            let id = Uuid::new_v4();
-            let body = serde_json::json!({"text": "test evidence"});
-            let request = Request::builder()
-                .method("PUT")
-                .uri(format!("/api/v1/evidence/{id}/embedding"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 }

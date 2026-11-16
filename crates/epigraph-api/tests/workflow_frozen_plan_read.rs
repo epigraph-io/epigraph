@@ -881,6 +881,7 @@ async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
     let r = epigraph_ingest_executor::workflow_steps::add_step(
         &mut tx,
+        None,
         curator,
         "acme-frozen-plan",
         text,
@@ -906,6 +907,7 @@ async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
     let r = epigraph_ingest_executor::workflow_steps::add_step(
         &mut tx,
+        None,
         curator,
         "acme-frozen-plan",
         text,

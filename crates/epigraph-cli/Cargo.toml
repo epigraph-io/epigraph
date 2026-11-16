@@ -316,6 +316,15 @@ name = "backfill_evidence_type"
 path = "src/bin/backfill_evidence_type.rs"
 required-features = ["db"]
 
+# Beta-track replay backfill (follow-up to backlog f50344c0): rebuilds
+# beta_alpha/beta_beta of claims still on the Beta(1,1) prior from their stored
+# BBAs. Maintenance-only, dry run by default, --apply writes a manifest that
+# --reverse undoes.
+[[bin]]
+name = "replay_beta_track"
+path = "src/bin/replay_beta_track.rs"
+required-features = ["db"]
+
 # The identity-edge backfill for duplicates the legacy raw-SQL
 # fuzzy_dedup_claims marked (backlog d5781a48). Dry run unless --apply.
 [[bin]]

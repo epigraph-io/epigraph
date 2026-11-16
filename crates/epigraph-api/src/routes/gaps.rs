@@ -51,6 +51,8 @@ pub struct GapAnalysisRequest {
 /// and creates challenge records for gaps above the severity threshold.
 #[cfg(feature = "db")]
 pub async fn surface_gaps(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<SurfaceGapsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -156,6 +158,8 @@ pub async fn surface_gaps(
 /// resolves to no `agents.id` now 401s here.
 #[cfg(feature = "db")]
 pub async fn gap_analysis(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<GapAnalysisRequest>,

@@ -169,6 +169,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
     // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
     // it took the viewer only while it read lineage, and no longer reads any.
+    // write: `insert_on` records the `claim.assessed` writer event inside the
+    // slot transaction (ids and booleans only; the event list hides it from a
+    // reader who cannot read the claim).
     (
         "assess.rs",
         "assess_claim",
@@ -178,6 +181,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
+            "EventRepository::insert_on",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
@@ -190,7 +194,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
-            "sqlx::query(UPDATE).execute",
         ],
     ),
     // stamped (backlog 8a168dd6): the read runs on `AppState::read_as` with the
@@ -214,13 +217,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "bba_retract.rs",
         "unretract_bba",
         &["MassFunctionRepository::unretract_conn"],
-    ),
-    // open finding: F-aggregate-existence-oracles (the frame's conflict
-    // aggregate over mass_functions).
-    (
-        "belief.rs",
-        "frame_conflict",
-        &["sqlx::query_as(SELECT).fetch_one"],
     ),
     // gated (parent frame) then write.
     (
@@ -250,7 +246,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "CommunityRepository::communities_for_perspective",
             "CommunityRepository::member_perspective_ids",
             "ConflictDensityRepository::for_frames",
-            "DivergenceRepository::store",
             "MassFunctionRepository::store_with_perspective",
             "ScopedBeliefRepository::upsert",
             "ScopedBeliefRepository::upsert",
@@ -262,10 +257,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
             "sqlx::query(INSERT).execute",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_scalar(SELECT).fetch_optional",
@@ -753,16 +746,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AtlasLayoutRepository::resolve_sides",
             "AtlasLayoutRepository::run",
-        ],
-    ),
-    // open finding: F-aggregate-existence-oracles (the two decomposes_to
-    // counts deciding center_kind).
-    (
-        "graph_neighborhood.rs",
-        "claim_compound_neighborhood",
-        &[
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
     // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
@@ -1338,24 +1321,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "db_pool.acquire",
             "sqlx::query_scalar(SELECT).fetch_optional",
-        ],
-    ),
-    // stamped: the neighborhood's edge projections, on the caller's stamped
-    // connection, are constrained in Rust to endpoints that survived the
-    // viewer-filtered node projection (PR-07); the edges' own predicate is
-    // F-edges-unfiltered.
-    (
-        "graph_neighborhood.rs",
-        "atomic_response",
-        &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    (
-        "graph_neighborhood.rs",
-        "compound_response",
-        &[
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
         ],
     ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
