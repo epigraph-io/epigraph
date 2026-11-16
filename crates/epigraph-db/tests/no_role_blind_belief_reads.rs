@@ -94,6 +94,7 @@ const ROW_TYPES: &[&str] = &[
     "GroundedNeighbor",
     "ScopedBeliefRow",
     "SemanticFlatHit",
+    "SemanticSelectedClaim",
     "SubgraphClaimRow",
 ];
 
@@ -184,6 +185,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::Todo { pr: "unassigned", why: "workflow text search gated on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_graph_neighbors", Tag::Todo { pr: "PR-R5", why: "semantic search graph expansion returns c.belief / c.plausibility; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility; SPEC §7.2" }),
+    ("crates/epigraph-db/src/repos/claim.rs", "semantic_selected_claims", Tag::Todo { pr: "PR-R5", why: "the diverse /search/semantic row carries c.belief / c.plausibility, the read moved out of routes/search.rs's inline full_sql (backlog 67c905a3); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "sql_expr", Tag::Todo { pr: "PR-R3", why: "BeliefSort column for frame_claims_sorted; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "get_latest", Tag::Todo { pr: "PR-R1b", why: "divergence row BetP; SPEC §7.2 derived, see leaves" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "store", Tag::Writer("writes ds_bayesian_divergence.pignistic_prob; reads no claim belief")),
@@ -195,6 +197,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/graph_view.rs", "neighborhood_atomic_nodes", Tag::Todo { pr: "PR-R3", why: "graph view node BetP; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/graph_view.rs", "neighborhood_compound_nodes", Tag::Todo { pr: "PR-R3", why: "graph view compound node BetP is the compound's own cache; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/graph_view.rs", "subgraph_claims", Tag::Todo { pr: "PR-R5", why: "subgraph rows behind graph_query_utils carry the cache columns; SPEC §7.2" }),
+    ("crates/epigraph-db/src/repos/graph_view.rs", "theme_neighborhoods", Tag::Todo { pr: "PR-R3", why: "graph view neighbourhood mean BetP over the viewer's readable members, compounds included; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/mass_function.rs", "clear_claim_belief", Tag::Writer("NULLs the cache columns; reads none (SPEC §4.2 stops calling it on atoms)")),
     ("crates/epigraph-db/src/repos/mass_function.rs", "update_claim_belief", Tag::Writer("writes the cache columns; reads none")),
     ("crates/epigraph-db/src/repos/method.rs", "get_evidence_strength", Tag::Todo { pr: "PR-M2", why: "aggregates BetP / truth_value over claims, compounds included; SPEC §7.2 excludes compounds" }),
@@ -229,6 +232,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-mcp/src/tools/link_epistemic.rs", "do_link_epistemic", Tag::Todo { pr: "PR-W1b", why: "reads the source's cache to wire an edge and reports the target's; SPEC §4.1 W7" }),
     ("crates/epigraph-mcp/src/tools/recall.rs", "fetch_batched_context", Tag::Todo { pr: "PR-R2", why: "recall_with_context context rows gated on truth_value; SPEC §7.2" }),
     // --- scripts ------------------------------------------------------------
+    ("scripts/label_themes_llm.py", "load_neighborhoods_with_samples", Tag::Todo { pr: "unassigned", why: "orders a neighbourhood's public sample claims by cached BetP for the labelling prompt, compounds included; no plan row converts it" }),
     ("scripts/migrate_provenance_bba.py", "census", Tag::Todo { pr: "PR-W4", why: "seed-migration census on truth_value; SPEC §4.1 W13 script, frozen" }),
 ];
 

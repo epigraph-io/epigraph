@@ -311,6 +311,7 @@ async fn deferred_supersede_replay_of_group_private_step_keeps_the_executes_edge
             .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(p.steps[2]),
         "step 2: do the thing, restated",
         TruthValue::clamped(0.6),
@@ -407,6 +408,7 @@ async fn deferred_dedup_and_consolidate_replays_of_a_group_private_step_keep_the
     .expect("dedup act");
     let merged = ClaimRepository::consolidate_act_conn(
         &mut tx,
+        None,
         &[p.steps[2], p.steps[3]],
         "steps 2 and 3, merged",
         0.6,
@@ -559,6 +561,7 @@ async fn public_step_deferred_replays_still_move_executes(pool: PgPool) {
             .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(p.steps[1]),
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
@@ -572,6 +575,7 @@ async fn public_step_deferred_replays_still_move_executes(pool: PgPool) {
     .expect("supersede act");
     let merged = ClaimRepository::consolidate_act_conn(
         &mut tx,
+        None,
         &[p.steps[2], outside],
         "step 2 and a note, merged",
         0.6,
@@ -695,6 +699,7 @@ async fn merge_of_a_public_and_a_group_step_freezes_only_the_group_steps_execute
     let mut tx = pool.begin().await.unwrap();
     let merged = ClaimRepository::consolidate_act_conn(
         &mut tx,
+        None,
         &[p.steps[2], p.steps[3]],
         "steps 2 and 3, merged",
         0.6,

@@ -59,6 +59,7 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -114,6 +115,7 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -202,6 +204,7 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     labels: vec!["backlog".into()],
                     visibility: Some("public".to_string()),
                     group_id: None,
+                    dataset: None,
                 },
                 epigraph_mcp::types::BatchClaimEntry {
                     content: bad.into(),
@@ -215,6 +218,7 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     labels: vec![BAD_LABEL.into()],
                     visibility: Some("public".to_string()),
                     group_id: None,
+                    dataset: None,
                 },
             ],
         },
@@ -390,7 +394,7 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
       }],
       "relationships": []
     }"#;
-    let extraction: epigraph_ingest::schema::DocumentExtraction =
+    let extraction: epigraph_ingest::document::schema::DocumentExtraction =
         serde_json::from_str(fixture).expect("fixture parses");
 
     let err = epigraph_mcp::tools::ingestion::do_ingest_document(

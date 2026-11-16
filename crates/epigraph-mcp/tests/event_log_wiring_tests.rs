@@ -94,6 +94,7 @@ async fn submit_claim_emits_claim_created_event() {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     };
 
     let before = chrono::Utc::now();
@@ -186,6 +187,7 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     };
 
     // First submit — should create the claim and emit one event.

@@ -222,8 +222,9 @@ fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String>
     out
 }
 
-/// One of `submit_evidence`'s best-effort edges, written on its viewer-stamped
-/// transaction under a SAVEPOINT.
+/// One best-effort edge, written on a viewer-stamped transaction under a
+/// SAVEPOINT (`submit_evidence`'s edges, and `crud.rs::create_reasoning_trace`'s
+/// `HAS_TRACE`).
 ///
 /// Stamped, the edges trigger records the caller's writer group, and row
 /// security decides the INSERT against the caller's writable set. A refused
@@ -237,7 +238,7 @@ fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String>
 /// or closed.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
-async fn create_edge_under_savepoint(
+pub(crate) async fn create_edge_under_savepoint(
     conn: &mut sqlx::PgConnection,
     key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     source_id: Uuid,
@@ -267,7 +268,7 @@ async fn create_edge_under_savepoint(
     match created {
         Ok(_) => sp.commit().await,
         Err(e) => {
-            tracing::warn!("submit_evidence: {relationship} edge refused: {e}");
+            tracing::warn!("best-effort {relationship} edge refused: {e}");
             sp.rollback().await
         }
     }
@@ -659,18 +660,6 @@ const DIVERGENCE_SPIKE_THRESHOLD: f64 = 0.5;
 // HELPERS
 // =============================================================================
 
-/// Compute symmetric KL divergence between two Bernoulli distributions.
-///
-/// KL(p || q) = p * ln(p/q) + (1-p) * ln((1-p)/(1-q))
-///
-/// Clamps inputs to [ε, 1-ε] to avoid log(0).
-fn kl_divergence_bernoulli(p: f64, q: f64) -> f64 {
-    let eps = 1e-10;
-    let p = p.clamp(eps, 1.0 - eps);
-    let q = q.clamp(eps, 1.0 - eps);
-    p * (p / q).ln() + (1.0 - p) * ((1.0 - p) / (1.0 - q)).ln()
-}
-
 /// Convert a FrameRow to a FrameResponse
 #[cfg(feature = "db")]
 fn frame_to_response(row: epigraph_db::FrameRow) -> FrameResponse {
@@ -901,43 +890,13 @@ pub async fn frame_conflict(
             id: frame_id.to_string(),
         })?;
 
-    // The aggregate below stays inline and carries no `/* {VISIBILITY:…} */`
-    // marker, because a route handler cannot carry one. It binds only
-    // `frame_id` and calls no `Viewer::splice`, so it is the ONE site this
-    // shard converted that has a single control layer where the other eighteen
-    // have two. Registered as `F-SHARD4-A5`, because no existing register can
-    // see it: `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` scans
-    // `CONTENT_TABLES`, and `mass_functions` is not one.
-    //
-    // WHICH DIRECTION THE CONVERSION MOVED IT, stated because the obvious
-    // reading is backwards. UNSTAMPED, `epigraph_session_groups()` is empty, so
-    // once `mass_functions`' policies are live this statement already counted
-    // PUBLIC rows only. Stamping it WIDENS the aggregate to public plus the
-    // viewer's own groups. That is the correct direction — it removes
-    // over-suppression — but it is not a leak being closed, and a later reader
-    // must not cite it as one.
-    //
-    // And the narrowing half is CONDITIONAL, unlike the spliced sites: with no
-    // in-query predicate, whether this aggregate describes the caller's corpus
-    // at all depends on the reading session being subject to `mass_functions`'
-    // row-level policies. On a deployment whose connecting role bypasses them
-    // it is unchanged. That is precisely why the site stays owned by
-    // `F-aggregate-existence-oracles`, whose own disposition prescribes
-    // repo-layer relocation — a DIFFERENT mechanism from this executor swap,
-    // and the actual fix.
-    let row: (i64, Option<f64>, Option<f64>) = sqlx::query_as(
-        r#"
-        SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k)
-        FROM mass_functions
-        WHERE frame_id = $1 AND conflict_k IS NOT NULL AND retracted_at IS NULL
-        "#,
-    )
-    .bind(frame_id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: e.to_string(),
-    })?;
+    // The aggregate counts only the BBAs this viewer can read: the repo
+    // statement splices `{VISIBILITY:mass_functions}` on the stamped
+    // connection, so it does not depend on the session being subject to row
+    // security (`F-aggregate-existence-oracles`, `F-SHARD4-A5`).
+    let row =
+        epigraph_db::MassFunctionRepository::frame_conflict_summary(&mut *read, &viewer, frame_id)
+            .await?;
 
     crate::routes::finish_scoped_read(read, "frame_conflict").await?;
 
@@ -1787,72 +1746,26 @@ pub async fn submit_evidence(
     //      Best-effort, under a SAVEPOINT (the read included: a failed statement
     //      aborts the enclosing transaction whether it read or wrote).
     let bayesian_posterior = {
-        use sqlx::Acquire as _;
-        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to open a savepoint: {e}"),
-        })?;
-        let beta_row: Result<Option<(f64, f64)>, sqlx::Error> =
-            sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
-                .bind(request.claim_id)
-                .fetch_optional(&mut *sp)
-                .await;
-
-        let (mut alpha, mut beta_param) = beta_row
-            .as_ref()
-            .ok()
-            .copied()
-            .flatten()
-            .unwrap_or((1.0, 1.0));
-
         // An identical resubmission stored nothing new (backlog 33ce3f5d):
         // its Beta update was applied when the BBA was first stored, and
         // applying it again would count the same evidence twice. The
         // posterior is reported from the parameters as they stand.
         let counted = write_outcome != epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged;
-
-        // Use the submitted evidence's singleton mass as the evidence strength
-        if let (true, Some(h_i)) = (counted, h_idx) {
-            let singleton =
-                epigraph_ds::FocalElement::positive(std::iter::once(h_i as usize).collect());
-            let m_support = modified.mass_of(&singleton);
-            // Evidence strength: mass on the singleton hypothesis vs complement
-            // Higher m_support → stronger evidence for the hypothesis
-            if m_support > 0.0 {
-                alpha += m_support;
-            }
-            let m_complement = 1.0 - m_support - modified.mass_of_empty();
-            if m_complement > 0.0 {
-                beta_param += m_complement;
-            }
-        }
-
-        // Store updated Beta parameters
-        let stored = match beta_row {
-            Ok(_) if !counted => Ok(()),
-            Ok(_) => sqlx::query(
-                "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
-            )
-            .bind(request.claim_id)
-            .bind(alpha)
-            .bind(beta_param)
-            .execute(&mut *sp)
-            .await
-            .map(|_| ()),
-            Err(e) => Err(e),
-        };
-        match stored {
-            Ok(()) => sp.commit().await,
-            Err(e) => {
-                tracing::warn!("submit_evidence: Beta update refused: {e}");
-                sp.rollback().await
-            }
-        }
+        // The submitted evidence's singleton mass is the evidence strength
+        // (shared with the MCP DS tools: `epigraph_engine::ds_divergence`).
+        let increments =
+            counted.then(|| epigraph_engine::ds_divergence::beta_increments(&modified, h_idx));
+        epigraph_engine::ds_divergence::apply_beta_update(
+            &mut tx,
+            &viewer,
+            request.claim_id,
+            increments,
+            "submit_evidence",
+        )
+        .await
         .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to close a savepoint: {e}"),
-        })?;
-
-        // Compute posterior: E[Beta(alpha, beta)] = alpha / (alpha + beta)
-        alpha / (alpha + beta_param)
+            message: format!("Failed to open or close a savepoint: {e}"),
+        })?
     };
 
     // The BBAs the shared pipeline just combined, read through the same
@@ -2360,7 +2273,8 @@ pub async fn submit_evidence(
     //     fail the request: the submission is already committed.
     {
         use sqlx::Acquire as _;
-        let kl = kl_divergence_bernoulli(final_betp, bayesian_posterior);
+        let kl =
+            epigraph_engine::ds_divergence::kl_divergence_bernoulli(final_betp, bayesian_posterior);
 
         match state
             .write_as(&viewer, "submit_evidence.derived_rows")
@@ -2396,19 +2310,18 @@ pub async fn submit_evidence(
                         break;
                     }
                 }
-                if let Ok(mut sp) = side.begin().await {
-                    let stored = epigraph_db::DivergenceRepository::store(
-                        &mut *sp,
-                        request.claim_id,
-                        frame_id,
-                        final_betp,
-                        bayesian_posterior,
-                        kl,
-                        Some(frame_row.version),
-                    )
-                    .await;
-                    let _ = finish_savepoint(sp, stored, "divergence record").await;
-                }
+                // Best-effort: a refusal is logged and rolled back to its own
+                // savepoint, and nothing here fails the request.
+                let _ = epigraph_engine::ds_divergence::record_divergence(
+                    &mut side,
+                    request.claim_id,
+                    frame_id,
+                    final_betp,
+                    bayesian_posterior,
+                    Some(frame_row.version),
+                    "submit_evidence",
+                )
+                .await;
                 if let Err(e) = side.commit().await {
                     tracing::warn!("submit_evidence: derived rows not committed: {e}");
                 }
@@ -3273,51 +3186,6 @@ mod tests {
         }
         let at_two = compute_hypothesis_belief(&mf, &frame, Some(2));
         assert!((at_two.0 - 0.2).abs() < 1e-12, "in range is honoured");
-    }
-
-    #[test]
-    fn kl_divergence_identical_distributions_is_zero() {
-        let kl = kl_divergence_bernoulli(0.7, 0.7);
-        assert!(kl.abs() < 1e-8, "KL(p || p) should be ~0, got {kl}");
-    }
-
-    #[test]
-    fn kl_divergence_different_distributions_is_positive() {
-        let kl = kl_divergence_bernoulli(0.9, 0.5);
-        assert!(
-            kl > 0.0,
-            "KL divergence should be positive for different distributions"
-        );
-    }
-
-    #[test]
-    fn kl_divergence_extreme_values_dont_panic() {
-        // Edge cases near 0 and 1 should be clamped safely
-        let kl = kl_divergence_bernoulli(0.0, 1.0);
-        assert!(
-            kl.is_finite(),
-            "KL with extreme inputs should be finite, got {kl}"
-        );
-
-        let kl2 = kl_divergence_bernoulli(1.0, 0.0);
-        assert!(
-            kl2.is_finite(),
-            "KL with extreme inputs should be finite, got {kl2}"
-        );
-    }
-
-    #[test]
-    fn kl_divergence_symmetric_for_equal_distance() {
-        // KL is NOT symmetric in general, but verify it doesn't panic
-        let kl_forward = kl_divergence_bernoulli(0.3, 0.7);
-        let kl_reverse = kl_divergence_bernoulli(0.7, 0.3);
-        assert!(kl_forward > 0.0);
-        assert!(kl_reverse > 0.0);
-        // They should be equal for this symmetric case (|0.5-p| = |0.5-q|)
-        assert!(
-            (kl_forward - kl_reverse).abs() < 1e-10,
-            "Symmetric case: forward={kl_forward}, reverse={kl_reverse}"
-        );
     }
 
     #[test]

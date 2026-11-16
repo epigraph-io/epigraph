@@ -59,6 +59,7 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
             .expect("the superseded claim's author");
     let (a_new, _) = ClaimRepository::supersede_act_conn(
         &mut a,
+        None,
         ClaimId::from_uuid(old),
         "revision from A",
         TruthValue::clamped(0.6),
@@ -92,6 +93,7 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
                 .expect("the superseded claim's author");
         let r = ClaimRepository::supersede_act_conn(
             &mut tx,
+            None,
             ClaimId::from_uuid(old),
             "revision from B",
             TruthValue::clamped(0.7),
@@ -196,6 +198,7 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
             .expect("the superseded claim's author");
     ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(old),
         "first revision",
         TruthValue::clamped(0.6),
@@ -218,6 +221,7 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
             .expect("the superseded claim's author");
     let again = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(old),
         "second revision",
         TruthValue::clamped(0.6),
@@ -237,6 +241,7 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
     let missing = Uuid::new_v4();
     let gone = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(missing),
         "revision of nothing",
         TruthValue::clamped(0.6),
@@ -309,6 +314,7 @@ async fn supersede_act_conn_refuses_a_current_claim_it_cannot_retire(pool: PgPoo
             .expect("the superseded claim's author");
     let r = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(old),
         "revision that cannot retire its original",
         TruthValue::clamped(0.6),

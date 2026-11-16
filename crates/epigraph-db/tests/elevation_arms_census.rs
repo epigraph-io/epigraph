@@ -79,11 +79,15 @@ const ARMED_REFUSE_ONLY: &[(&str, &str)] = &[
     // tenancy; an elevated session reads them as its plain viewer does and
     // writes none.
     ("workflows", "T-PLAN"),
+    // T-PLAN (migration 221, backlog 9928b61f): a workflow's outcome reports
+    // inherit its row's tenancy; an elevated session reads them as its plain
+    // viewer does and writes none.
+    ("workflow_outcome_reports", "T-PLAN"),
 ];
 
 /// Tables armed by a migration AFTER 126, with the same policy shapes; listed
 /// in the census arrays above like every other table.
-const ARMED_AFTER_126: &[&str] = &["workflows"];
+const ARMED_AFTER_126: &[&str] = &["workflows", "workflow_outcome_reports"];
 
 /// No elevated policy, each for a reason. None grants the application a write
 /// (`no_excluded_or_read_only_table_lets_the_application_write_unrefused`).
@@ -172,6 +176,27 @@ const EXCLUDED: &[(&str, &str)] = &[
         "harvester_audit_reports",
         "harvester pipeline (173): the application writes no row (118 section 6), and no \
          elevated read arm is added, so an elevated session reads only what its tenancy admits",
+    ),
+    (
+        "atlas_map_epochs",
+        "Atlas team maps (210): the application role holds SELECT only (the nightly writes on \
+         the maintenance connection, the staleness epochs are written by a maintenance-owned \
+         definer trigger), and no elevated read arm is added, so an elevated session reads only \
+         what its tenancy admits",
+    ),
+    (
+        "atlas_map_runs",
+        "Atlas team maps (210): the application role holds SELECT only (the nightly writes on \
+         the maintenance connection, the staleness epochs are written by a maintenance-owned \
+         definer trigger), and no elevated read arm is added, so an elevated session reads only \
+         what its tenancy admits",
+    ),
+    (
+        "atlas_map_levels",
+        "Atlas team maps (210): the application role holds SELECT only (the nightly writes on \
+         the maintenance connection, the staleness epochs are written by a maintenance-owned \
+         definer trigger), and no elevated read arm is added, so an elevated session reads only \
+         what its tenancy admits",
     ),
 ];
 

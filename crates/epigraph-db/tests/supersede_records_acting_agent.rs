@@ -64,6 +64,7 @@ async fn the_successor_keeps_its_author_and_records_the_acting_agent(pool: PgPoo
     let mut tx = pool.begin().await.expect("begin");
     let (new, returned_old) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(old),
         "a correction written by B",
         TruthValue::clamped(0.6),
@@ -129,6 +130,7 @@ async fn a_failed_authorship_edge_fails_the_act(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
     let result = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(old),
         "a correction whose authorship cannot be recorded",
         TruthValue::clamped(0.6),

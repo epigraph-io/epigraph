@@ -1,7 +1,8 @@
 //! Boot-time rate-limit installation (backlog 966164c8): the `server` binary
 //! builds its rate limiter from `EPIGRAPH_RATE_LIMIT*` and
 //! `EPIGRAPH_TRUSTED_PROXIES`, says at boot whether it is on, and refuses to
-//! start on a malformed value.
+//! start on a malformed value. It is OFF unless one of the rate-limit
+//! variables is set (the operator's ruling on #841).
 //!
 //! Before the fix the binary never built a limiter at all, so it logged
 //! nothing about one and accepted any value of these variables. Drives the
@@ -47,9 +48,29 @@ fn boot(env: &[(&str, &str)]) -> (Output, String) {
     (out, text)
 }
 
+/// The operator's ruling: a deployment that sets none of the variables does
+/// not rate limit, and the boot log says so.
 #[test]
-fn the_limiter_is_on_by_default_and_says_so() {
+fn the_limiter_is_off_by_default_and_says_so() {
     let (_, log) = boot(&[]);
+    assert!(
+        log.contains("rate limiter OFF") && log.contains("EPIGRAPH_RATE_LIMIT_RPM is not set"),
+        "the boot log must say the limiter is off and how to turn it on; got:\n{log}"
+    );
+    assert!(!log.contains("rate limiter ON"), "got:\n{log}");
+}
+
+/// A trusted-proxy list keys a limiter; it does not install one.
+#[test]
+fn a_proxy_list_alone_does_not_turn_it_on() {
+    let (_, log) = boot(&[("EPIGRAPH_TRUSTED_PROXIES", "192.0.2.10")]);
+    assert!(log.contains("rate limiter OFF"), "got:\n{log}");
+    assert!(!log.contains("rate limiter ON"), "got:\n{log}");
+}
+
+#[test]
+fn on_alone_uses_the_default_limit_and_loopback_proxies() {
+    let (_, log) = boot(&[("EPIGRAPH_RATE_LIMIT", "on")]);
     assert!(
         log.contains("rate limiter ON"),
         "the boot log must say the limiter is on; got:\n{log}"
@@ -78,8 +99,14 @@ fn the_configured_limits_are_the_ones_logged() {
 
 #[test]
 fn off_is_logged_as_a_warning() {
-    let (_, log) = boot(&[("EPIGRAPH_RATE_LIMIT", "off")]);
-    assert!(log.contains("rate limiter OFF"), "got:\n{log}");
+    let (_, log) = boot(&[
+        ("EPIGRAPH_RATE_LIMIT", "off"),
+        ("EPIGRAPH_RATE_LIMIT_RPM", "42"),
+    ]);
+    assert!(
+        log.contains("rate limiter OFF (EPIGRAPH_RATE_LIMIT=off)"),
+        "got:\n{log}"
+    );
     assert!(!log.contains("rate limiter ON"), "got:\n{log}");
 }
 

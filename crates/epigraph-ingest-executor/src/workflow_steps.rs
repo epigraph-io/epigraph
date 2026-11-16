@@ -357,8 +357,16 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 /// [`crate::owner::resolve_caller_owner`] with the plan's own owner group as
 /// the public container (the plan's group when `caller` writes it, else
 /// `caller`'s own group): a public plan's step stays public.
+///
+/// # Signed at INSERT
+///
+/// Every edge it writes (`executes`, `decomposes_to`, the `step_follows`
+/// chain edges) is attested at INSERT by `key`: the entry
+/// point's own signing key (the MCP server's, the API's), never `caller`'s.
+/// With `None` they are written unsigned.
 pub async fn add_step(
     conn: &mut sqlx::PgConnection,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     caller: Uuid,
     canonical_name: &str,
     step_text: &str,
@@ -548,8 +556,9 @@ pub async fn add_step(
         Some(k) => serde_json::json!({"level": 2, "plan_index": k}),
         None => serde_json::json!({"level": 2}),
     };
-    epigraph_db::EdgeRepository::create_if_not_exists_conn(
+    epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
         &mut *conn,
+        key,
         workflow_id,
         "workflow",
         step_claim_id,
@@ -560,8 +569,9 @@ pub async fn add_step(
         None,
     )
     .await?;
-    epigraph_db::EdgeRepository::create_if_not_exists_conn(
+    epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
         &mut *conn,
+        key,
         phase_id,
         "claim",
         step_claim_id,
@@ -575,8 +585,9 @@ pub async fn add_step(
 
     if !chain.is_empty() {
         if position == 0 {
-            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+            epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
                 &mut *conn,
+                key,
                 step_claim_id,
                 "claim",
                 chain[0],
@@ -588,8 +599,9 @@ pub async fn add_step(
             )
             .await?;
         } else if position == chain.len() {
-            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+            epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
                 &mut *conn,
+                key,
                 chain[chain.len() - 1],
                 "claim",
                 step_claim_id,
@@ -602,8 +614,9 @@ pub async fn add_step(
             .await?;
         } else if let Some((prev, next)) = rewire {
             // `prev -> next` was removed (and verified) above.
-            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+            epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
                 &mut *conn,
+                key,
                 prev,
                 "claim",
                 step_claim_id,
@@ -614,8 +627,9 @@ pub async fn add_step(
                 None,
             )
             .await?;
-            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+            epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
                 &mut *conn,
+                key,
                 step_claim_id,
                 "claim",
                 next,

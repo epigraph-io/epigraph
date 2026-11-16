@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Default embedding dimension for `OpenAI` text-embedding-3-small
 pub const DEFAULT_OPENAI_DIMENSION: usize = 1536;
 
-/// Default embedding dimension for local models
+/// Default embedding dimension for the offline (`local`) configuration
 pub const DEFAULT_LOCAL_DIMENSION: usize = 384;
 
 /// Default maximum tokens for `OpenAI` embeddings
@@ -63,7 +63,10 @@ impl EmbeddingConfig {
         }
     }
 
-    /// Create configuration for local model embeddings
+    /// Create an offline configuration (no API, rate limiting off).
+    ///
+    /// No provider in this crate runs a local model; this is the configuration
+    /// the deterministic `MockProvider` is usually built from in tests.
     #[must_use]
     pub const fn local(dimension: usize) -> Self {
         Self {
