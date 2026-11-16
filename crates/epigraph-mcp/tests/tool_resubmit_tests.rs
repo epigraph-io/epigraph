@@ -58,6 +58,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     };
     let params2 = SubmitClaimParams {
         content: content.clone(),
@@ -71,6 +72,7 @@ async fn submit_claim_resubmit_creates_evidence_trace_via_edges() {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     };
 
     tools::claims::submit_claim(&server, &viewer, params1, None)
@@ -337,6 +339,7 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
     // each test run from colliding with leftover rows in the shared test DB.
     let goal = format!("resubmit idempotent {}", Uuid::new_v4());
     let make_params = || StoreWorkflowParams {
+        force_new: None,
         tenancy: None,
         goal: goal.clone(),
         steps: vec!["step1".to_string(), "step2".to_string()],

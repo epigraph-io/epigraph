@@ -46,9 +46,9 @@ fn generator() -> epigraph_mcp::embed::EmbeddingGenerator {
 
 /// `supersede_claim` on the APPLICATION role (row security enforced), by the
 /// claim's own writer: the replacement comes back `embedded: true` and carries
-/// a vector. The store goes through the replacement's author, which is why the
-/// fixture is the app role and not the BYPASSRLS superuser `#[sqlx::test]`
-/// connects as, where any store path would succeed.
+/// a vector. The store goes through the stamp that wrote the row (`actor`),
+/// which is why the fixture is the app role and not the BYPASSRLS superuser
+/// `#[sqlx::test]` connects as, where any store path would succeed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_claim_embeds_the_replacement(pool: PgPool) {
     use epigraph_db::{ScopedPool, SessionGucMode};

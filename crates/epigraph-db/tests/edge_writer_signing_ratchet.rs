@@ -217,16 +217,12 @@ fn site_problems(body: &str) -> Vec<String> {
 
 /// Why an unsigned site does not sign. Each is a measured property of the
 /// tree, not a preference.
-const BULK_STAGING_COPY: &str = "one INSERT .. SELECT statement copies every approved \
-     edges_staging row (claims:admin); attesting each copy needs a per-row INSERT through the \
-     signed primitive with the API key, not yet threaded";
 const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signer";
-const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key";
-const NO_KEY_EXECUTOR: &str = "epigraph-ingest-executor is pure-DB and holds no key; its MCP \
-     and HTTP callers would sign through the returned edge ids";
-const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
-     analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
-     signing caller must receive the edge id";
+const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key, and its one \
+     caller (`run_pipeline`, called only by the cross_source_sweep operator CLI on the \
+     maintenance DSN) has none to pass";
+const REPO_FOR_CLI: &str = "a repository act whose only caller is an operator CLI on the \
+     maintenance DSN; it takes no key because that CLI has no entity signer to pass";
 const PRIMITIVE: &str = "the unsigned arm (no key) of an EdgeRepository insert primitive; a \
      writer signs by passing its key to the primitive's _signed_conn twin";
 
@@ -268,7 +264,28 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // (`ClaimIngestRepository::record_signed_conn`), registered PRIMITIVE like the
 // `EdgeRepository` twins: unsigned only when a caller passes no key, and both
 // of its callers pass the walk's key.
-const UNSIGNED_SITES_HIGH_WATER: usize = 49;
+// 39: the epigraph-ingest-executor shard. Its ten sites (the plan walk's
+// three, add_step's six, the AUTHORED record's one) take the entry point's
+// key and call the signed twins; the MCP tools pass the server's key and the
+// HTTP routes the API's.
+// 35: four caller-less repository writers removed rather than signed
+// (`AnalysisRepository::{link_evidence, link_claim}`,
+// `ClaimRepository::inherit_evidence`, `SemanticLinkRepository::create`): no
+// production path called them, so there was no transport key to sign with.
+// 34: the match promotion's matcher edge (`promote_if_pending_conn`), signed
+// with the deciding transport's key through the any-state symmetric twin.
+// Not changed: the matcher pipeline's `write_edge` (NO_KEY_ENGINE).
+// 29: the claim acts (supersede 2, evolve_step 1, consolidate 1, the dedup
+// mark's identity edge 1) sign with the request transport's key. Not
+// changed: the legacy dedup identity backfill (REPO_FOR_CLI).
+// 27: the analysis bundle (`persist_bundle`, 2) signs with the API's key.
+// 25: the staged-edge promotion: its two bulk copies became one signed
+// per-row site.
+// 26: the bug-report intake's evidence -> claim edge (migration 211, a
+// database function with no key; backlog 2d60f619, merged on staging batch 4).
+// The evidence -> claim edge backfill writes through the signed
+// `EvidenceRepository::link_to_claims_signed_conn`, so it adds no site.
+const UNSIGNED_SITES_HIGH_WATER: usize = 26;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -281,6 +298,14 @@ struct DbSite {
 
 /// The database-side inventory, measured from `migrations/*.sql`.
 const DB_REGISTER: &[DbSite] = &[
+    // The bug-report intake's evidence -> claim edge (migration 211, backlog
+    // 2d60f619): a database function, so no transport key.
+    DbSite {
+        migration: "211_bug_report_evidence_edge.sql",
+        function: "epigraph_submit_bug_report",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
     // The legacy-author OPERATED_BY backfill (custodian role).
     DbSite {
         migration: "123_custodian_role.sql",
@@ -345,13 +370,7 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "learn_convention",
-        4,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/conventions.rs",
-        "forget_convention",
-        1,
+        3,
         Signed,
     ),
     site(
@@ -368,15 +387,9 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
-        "create_reasoning_trace",
+        "promote_staged_edges",
         1,
         Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/crud.rs",
-        "promote_staged_edges",
-        2,
-        Unsigned(BULK_STAGING_COPY),
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
@@ -441,7 +454,7 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-api/src/routes/submit.rs",
         "persist_packet",
-        5,
+        4,
         Signed,
     ),
     // The legacy ingest-marker backfill's creation records: written on the
@@ -498,6 +511,14 @@ const REGISTER: &[Site] = &[
     ),
     // The ingest record's insert primitive: the key is the caller's (both
     // document walks pass theirs, checked per site above).
+    // The evidence -> claim edges an evidence write creates in its own
+    // transaction (backlog 2d60f619), signed with the transport's key.
+    site(
+        "crates/epigraph-db/src/repos/evidence.rs",
+        "link_to_claims_signed_conn",
+        1,
+        Signed,
+    ),
     site(
         "crates/epigraph-db/src/repos/claim_ingest.rs",
         "record_signed_conn",
@@ -506,59 +527,48 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-db/src/repos/analysis.rs",
-        "link_evidence",
-        1,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/analysis.rs",
-        "link_claim",
-        1,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/analysis.rs",
         "persist_bundle",
         2,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     // Two sites: the `supersedes` edge and the acting agent's `AUTHORED` edge
     // (ruling R-23, merged from main), both emitted inside the supersede act.
+    // The claim acts below sign with the request transport's key, passed in
+    // (the MCP server's, the API's). NOT COUNTED by this register: an operator
+    // CLI that passes `None` (the custodian supersede; the semantic-duplicate
+    // sweep's marks), which needs the CLI-signer ruling (NO_KEY_CLI).
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "supersede_act_conn",
         2,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/claim.rs",
-        "inherit_evidence",
-        1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "evolve_step_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
+    // The legacy fuzzy-dedup identity backfill: its only caller is the
+    // `backfill_dedup_identity_edges` operator CLI on the maintenance DSN, so
+    // there is no transport key to sign with until operator CLIs get a signer.
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "backfill_legacy_dedup_identity_edges_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Unsigned(REPO_FOR_CLI),
     ),
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "consolidate_act_conn",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "mark_duplicate_act",
         1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
@@ -572,9 +582,11 @@ const REGISTER: &[Site] = &[
         1,
         Unsigned(PRIMITIVE),
     ),
+    // The matcher's any-state symmetric INSERT: its unsigned arm (the
+    // unsigned `create_symmetric_if_absent_conn` delegates here with no key).
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "create_symmetric_if_absent_conn",
+        "create_symmetric_if_absent_signed_conn",
         1,
         Unsigned(PRIMITIVE),
     ),
@@ -616,18 +628,13 @@ const REGISTER: &[Site] = &[
     // Was `promote_if_pending`; the body moved into its connection form in the
     // raw-pool residual review (the pool form now acquires and delegates), so
     // the MCP promote can write the matcher edge on its author-stamped
-    // transaction. Same INSERT, same count.
+    // transaction. Same INSERT, same count. Signs with the deciding
+    // transport's key (the MCP server's, the API's), passed in.
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
         "promote_if_pending_conn",
         1,
-        Unsigned(REPO_INTERNAL),
-    ),
-    site(
-        "crates/epigraph-db/src/repos/semantic_link.rs",
-        "create",
-        1,
-        Unsigned(REPO_INTERNAL),
+        Signed,
     ),
     site(
         "crates/epigraph-engine/src/matching/policy.rs",
@@ -639,19 +646,19 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-ingest-executor/src/authorship.rs",
         "record_caller_authorship",
         1,
-        Unsigned(NO_KEY_EXECUTOR),
+        Signed,
     ),
     site(
         "crates/epigraph-ingest-executor/src/workflow.rs",
         "execute_plan",
         3,
-        Unsigned(NO_KEY_EXECUTOR),
+        Signed,
     ),
     site(
         "crates/epigraph-ingest-executor/src/workflow_steps.rs",
         "add_step",
         6,
-        Unsigned(NO_KEY_EXECUTOR),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/claim_helper.rs",

@@ -1542,6 +1542,7 @@ async fn an_outcome_report_on_a_private_plan_resolves_steps_only_for_members(poo
         &server,
         &viewer,
         epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            idempotency_key: None,
             workflow_id: w.workflow_id.to_string(),
             success: true,
             step_executions: serde_json::from_value(json!(steps)).expect("step executions"),

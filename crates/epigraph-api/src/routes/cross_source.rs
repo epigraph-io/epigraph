@@ -598,6 +598,7 @@ pub async fn decide_candidate(
             });
             let outcome = repo
                 .promote_if_pending(
+                    state.edge_signing_key(),
                     id,
                     decided_by,
                     row.verifier_verdict.as_deref(),

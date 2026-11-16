@@ -85,13 +85,6 @@ const POOL_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
-        "inherit_evidence",
-        "WRITE. Copies evidence links from a superseded claim onto its successor via \
-         derived_from edges (`INSERT INTO edges ... FROM evidence`); carries an in-SQL \
-         VISIBILITY-EXEMPT marker: the read is part of the mutation, not a disclosure.",
-    ),
-    (
-        "claim.rs",
         "update_labels",
         "WRITE. Read-modify-write of `claims.labels` for one claim id under the write-side \
          predicate; the `SELECT ... FROM claims` CTE feeds the UPDATE and carries an in-SQL \

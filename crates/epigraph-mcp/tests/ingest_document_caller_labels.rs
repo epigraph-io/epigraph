@@ -24,7 +24,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::ingestion::{

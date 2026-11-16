@@ -126,6 +126,8 @@ fn default_limit() -> i64 {
 /// `POST /api/v1/perspectives`
 #[cfg(feature = "db")]
 pub async fn create_perspective(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<CreatePerspectiveRequest>,
 ) -> Result<(StatusCode, Json<PerspectiveResponse>), ApiError> {
@@ -195,17 +197,15 @@ pub async fn create_perspective(
 /// Nothing is written on any of them.
 #[cfg(feature = "db")]
 pub async fn set_source_reliability(
+    // `claims:write`, checked by the extractor BEFORE the body is parsed, so a
+    // token without it is 403 even when its body would not deserialize (an
+    // in-body check answered 422 there; issue #128, backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(request): Json<SetSourceReliabilityRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let axum::Extension(auth) = auth_ctx.ok_or_else(|| ApiError::Unauthorized {
-        reason: "PUT /api/v1/perspectives/:id/source-reliability requires authentication"
-            .to_string(),
-    })?;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
     validate_reliability(&request.source_reliability)?;
 
     let mut tx = state.write_as(&viewer, "set_source_reliability").await?;

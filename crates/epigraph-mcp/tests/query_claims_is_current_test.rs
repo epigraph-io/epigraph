@@ -107,6 +107,9 @@ async fn run(
             limit: Some(50),
             is_current,
             exclude_spine: None,
+            created_after: None,
+            created_before: None,
+            offset: None,
         },
     )
     .await
@@ -218,6 +221,9 @@ async fn query_claims_exclude_spine_reaches_the_sql_page(pool: PgPool) {
                     limit: Some(1),
                     is_current: None,
                     exclude_spine,
+                    created_after: None,
+                    created_before: None,
+                    offset: None,
                 },
             )
             .await

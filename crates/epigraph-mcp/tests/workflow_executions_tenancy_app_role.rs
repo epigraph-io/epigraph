@@ -168,6 +168,8 @@ async fn executions(server: &EpiGraphMcpFull, viewer: &Viewer, wf: Uuid) -> serd
             server,
             viewer,
             GetWorkflowExecutionsParams {
+                include_deviation_summary: None,
+                window_days: None,
                 workflow_id: wf.to_string(),
                 limit: Some(100),
             },
@@ -400,4 +402,204 @@ async fn promotion_reads_lineage_and_counts_as_the_caller(pool: PgPool) {
     // Member through the same public edge: the parent's runs count.
     let mp = promotion(&server, &member_v, public_variant).await;
     assert_eq!(mp["parent"]["total"], 10, "member, public edge: {mp}");
+}
+
+/// `get_workflow_executions`' deviation summary (backlog 0a2ed32d), read as
+/// the caller: a stranger gets no summary for another group's private plan,
+/// and on a PUBLIC plan it never learns a lineage whose step it cannot read.
+/// The member gets both, which is what pins that the summary runs on the
+/// caller's stamped read (an unstamped one would hide the member's own private
+/// step too). On the application role `claims`' row security hides the step
+/// from the stranger on its own; the query's step-claim predicate states the
+/// same rule for a privileged reader.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_deviation_summary_is_read_as_the_caller(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "wfx-dev-member").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "wfx-dev-stranger").await;
+    let mut plans = Vec::new();
+    for decl in [
+        epigraph_core::TenancyDecl::group(group),
+        epigraph_core::TenancyDecl::public(group),
+    ] {
+        let id = Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            id,
+            &format!("wfx-dev-{id}"),
+            0,
+            "a plan with a private step",
+            None,
+            serde_json::json!({}),
+            decl,
+        )
+        .await
+        .expect("insert workflows row");
+        let step = fixture::seed_group_claim(
+            &pool,
+            member,
+            group,
+            &format!("wfx private step {}", Uuid::new_v4()),
+        )
+        .await;
+        BehavioralExecutionRepository::create(
+            &pool,
+            BehavioralExecutionRow {
+                id: Uuid::new_v4(),
+                workflow_id: id,
+                goal_text: SECRET.to_string(),
+                success: false,
+                step_beliefs: serde_json::json!({"deviated": true, "deviation_reason": SECRET}),
+                tool_pattern: vec!["step".into()],
+                quality: Some(0.5),
+                deviation_count: 1,
+                total_steps: 1,
+                created_at: chrono::Utc::now(),
+                step_claim_id: Some(step),
+                run_label: None,
+            },
+            None,
+        )
+        .await
+        .expect("seed step row");
+        plans.push(id);
+    }
+
+    let server = production_shaped_server(&pool).await;
+    let member_v = Viewer::resolve(&pool, member).await.expect("member viewer");
+    let stranger_v = Viewer::resolve(&pool, stranger)
+        .await
+        .expect("stranger viewer");
+    let reasons = |json: &serde_json::Value| {
+        json["deviation_summary"]["reasons"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(usize::MAX)
+    };
+    for plan in &plans {
+        let (json, _) = result_json(
+            epigraph_mcp::tools::workflows::get_workflow_executions(
+                &server,
+                &member_v,
+                GetWorkflowExecutionsParams {
+                    include_deviation_summary: Some(true),
+                    window_days: None,
+                    workflow_id: plan.to_string(),
+                    limit: Some(5),
+                },
+            )
+            .await
+            .expect("member read"),
+        );
+        assert_eq!(reasons(&json), 1, "the member sees its own lineage: {json}");
+        let (json, text) = result_json(
+            epigraph_mcp::tools::workflows::get_workflow_executions(
+                &server,
+                &stranger_v,
+                GetWorkflowExecutionsParams {
+                    include_deviation_summary: Some(true),
+                    window_days: None,
+                    workflow_id: plan.to_string(),
+                    limit: Some(5),
+                },
+            )
+            .await
+            .expect("stranger read"),
+        );
+        assert_eq!(
+            reasons(&json),
+            0,
+            "a stranger sees no hidden lineage: {json}"
+        );
+        assert!(
+            !json["deviation_summary"].to_string().contains(SECRET),
+            "the private reason left the database: {text}"
+        );
+    }
+}
+
+/// The deviation summary's WORKFLOW filter on its own: a group-private plan
+/// whose step claim is PUBLIC (a shared atom). `claims`' row security admits
+/// that step to anyone, and `behavioral_executions` has no row security, so
+/// only the summary's parent filter (the plan must be one the caller reads)
+/// keeps a stranger from learning the plan's deviation reasons and lineage
+/// ids. The member gets the group (the positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_deviation_summary_of_a_private_plan_with_a_public_step_stays_private(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "wfx-dev2-member").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "wfx-dev2-stranger").await;
+    let plan = Uuid::new_v4();
+    WorkflowRepository::insert_root(
+        &pool,
+        plan,
+        &format!("wfx-dev2-{plan}"),
+        0,
+        "a private plan with a public step",
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::group(group),
+    )
+    .await
+    .expect("insert workflows row");
+    let step = fixture::seed_public_claim(&pool, member, &format!("wfx public step {plan}")).await;
+    BehavioralExecutionRepository::create(
+        &pool,
+        BehavioralExecutionRow {
+            id: Uuid::new_v4(),
+            workflow_id: plan,
+            goal_text: "a private plan with a public step".to_string(),
+            success: false,
+            step_beliefs: serde_json::json!({"deviated": true, "deviation_reason": SECRET}),
+            tool_pattern: vec!["step".into()],
+            quality: Some(0.5),
+            deviation_count: 1,
+            total_steps: 1,
+            created_at: chrono::Utc::now(),
+            step_claim_id: Some(step),
+            run_label: None,
+        },
+        None,
+    )
+    .await
+    .expect("seed step row");
+
+    let server = production_shaped_server(&pool).await;
+    let summary_for = |viewer: Viewer| {
+        let server = &server;
+        async move {
+            result_json(
+                epigraph_mcp::tools::workflows::get_workflow_executions(
+                    server,
+                    &viewer,
+                    GetWorkflowExecutionsParams {
+                        include_deviation_summary: Some(true),
+                        window_days: None,
+                        workflow_id: plan.to_string(),
+                        limit: Some(5),
+                    },
+                )
+                .await
+                .expect("get_workflow_executions"),
+            )
+        }
+    };
+    let (json, _) = summary_for(Viewer::resolve(&pool, member).await.expect("member")).await;
+    assert_eq!(
+        json["deviation_summary"]["reasons"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the member sees its plan's deviation group: {json}"
+    );
+    let (json, text) = summary_for(Viewer::resolve(&pool, stranger).await.expect("stranger")).await;
+    assert_eq!(
+        json["deviation_summary"]["reasons"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "a stranger got a private plan's deviation groups: {json}"
+    );
+    assert!(
+        !text.contains(SECRET) && !text.contains(&step.to_string()),
+        "the private plan's telemetry left the database: {text}"
+    );
 }

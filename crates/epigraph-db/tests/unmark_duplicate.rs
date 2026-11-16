@@ -219,6 +219,7 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
     let repair = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
@@ -284,6 +285,7 @@ async fn mark_then_unmark_restores_every_row_the_dedup_touched(pool: PgPool) {
     // edge and its own record.
     let again = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
@@ -486,6 +488,7 @@ async fn unmark_does_not_resurrect_an_edge_retracted_again_after_the_mark(pool: 
     let mut conn = pool.acquire().await.expect("acquire");
     let repair = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),
@@ -548,6 +551,7 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
     let mut conn = pool.acquire().await.expect("acquire");
     let r1 = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(d1),
         ClaimId::from_uuid(c1),
         &prov,
@@ -556,6 +560,7 @@ async fn a_chain_of_dedups_unmarks_in_reverse_order(pool: PgPool) {
     .expect("mark d1 onto c1");
     let r2 = ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(c1),
         ClaimId::from_uuid(c2),
         &prov,
@@ -632,6 +637,7 @@ async fn mark(pool: &PgPool, dup: Uuid, canonical: Uuid) -> epigraph_db::DedupRe
     let mut conn = pool.acquire().await.expect("acquire");
     ClaimRepository::mark_duplicate_with_repair_attributed_conn(
         &mut conn,
+        None,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(canonical),
         &DuplicateProvenance::new("test", DuplicateProvenance::RULE_CALLER_ASSERTED),

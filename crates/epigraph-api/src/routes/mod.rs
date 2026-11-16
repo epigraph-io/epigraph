@@ -37,6 +37,9 @@ pub mod agents;
 pub mod analyze;
 #[cfg(feature = "db")]
 pub mod assess;
+/// The per-team Atlas maps' nested levels (migration 210, Atlas W10).
+#[cfg(feature = "db")]
+pub mod atlas_maps;
 #[cfg(feature = "db")]
 pub mod audit;
 pub mod batch;
@@ -533,14 +536,6 @@ pub fn create_router_with_extensions(
             "/api/v1/claims/:id/provenance",
             post(provenance::set_provenance),
         )
-        .route(
-            "/api/v1/claims/:id/embedding",
-            put(rag::generate_claim_embedding),
-        )
-        .route(
-            "/api/v1/evidence/:id/embedding",
-            put(rag::generate_evidence_embedding),
-        )
         .route("/api/v1/staging/ingest/json", post(staging::ingest_json))
         .route("/api/v1/staging/ingest/git", post(staging::ingest_git))
         .route("/api/v1/staging/merge", post(staging::merge_staging))
@@ -829,6 +824,19 @@ pub fn create_router_with_extensions(
             get(graph_layout::themes_layout),
         )
         .route("/api/v1/graph/links", get(graph_layout::graph_links))
+        .route("/api/v1/atlas/maps", get(atlas_maps::atlas_maps))
+        .route(
+            "/api/v1/atlas/maps/:map/themes",
+            get(atlas_maps::atlas_map_themes),
+        )
+        .route(
+            "/api/v1/atlas/maps/:map/:hierarchy/levels/:id",
+            get(atlas_maps::atlas_level),
+        )
+        .route(
+            "/api/v1/atlas/maps/:map/:hierarchy/claims/:claim_id/leaf",
+            get(atlas_maps::atlas_claim_leaf),
+        )
         .route(
             "/api/v1/graph/themes/:theme_id/expand",
             get(graph::themes_expand),
@@ -1520,14 +1528,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/analyze/unconstrained",
             post(analyze::unconstrained_analysis),
-        )
-        .route(
-            "/api/v1/claims/:id/embedding",
-            put(rag::generate_claim_embedding),
-        )
-        .route(
-            "/api/v1/evidence/:id/embedding",
-            put(rag::generate_evidence_embedding),
         )
         .route("/api/v1/staging/ingest/json", post(staging::ingest_json))
         .route("/api/v1/staging/ingest/git", post(staging::ingest_git))

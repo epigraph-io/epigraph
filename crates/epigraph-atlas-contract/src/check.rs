@@ -256,3 +256,138 @@ pub fn assert_indistinguishable(non_member: (u16, &[u8]), absent: (u16, &[u8])) 
         "a non-member gets a different body than an absent level"
     );
 }
+
+// ---- the claim-to-leaf lookup (contract atlas_claim_leaf v1) ------------------
+
+/// The claim-to-leaf v1 JSON Schema, as committed.
+pub const CLAIM_LEAF_SCHEMA_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../services/explorer/contract/atlas_claim_leaf/v1/schema.json"
+));
+
+fn claim_leaf_schema() -> &'static Value {
+    static SCHEMA: OnceLock<Value> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        serde_json::from_str(CLAIM_LEAF_SCHEMA_JSON).expect("the claim-leaf schema is JSON")
+    })
+}
+
+/// Schema errors of a value against the claim-leaf schema's root, or one of
+/// its `$defs`.
+pub fn claim_leaf_schema_errors(def: Option<&str>, v: &Value) -> Vec<String> {
+    let s = claim_leaf_schema();
+    let doc = match def {
+        None => s.clone(),
+        Some(name) => json!({
+            "$schema": s["$schema"],
+            "$id": format!("urn:epigraph:atlas-claim-leaf:v1:{name}"),
+            "$defs": s["$defs"],
+            "$ref": format!("#/$defs/{name}"),
+        }),
+    };
+    let validator = jsonschema::validator_for(&doc).expect("the claim-leaf schema compiles");
+    validator
+        .iter_errors(v)
+        .map(|e| format!("schema {}: {e}", e.instance_path()))
+        .collect()
+}
+
+/// What a claim-to-leaf request was for, as the test knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLeafExpected {
+    pub map_scope: MapScope,
+    pub map_group_id: Option<Uuid>,
+    pub hierarchy: crate::Hierarchy,
+    pub claim_id: Uuid,
+}
+
+/// Check one claim-to-leaf answer: JSON, the schema, the strict type, and that
+/// it is the map, hierarchy and claim the request named. Returns the decoded
+/// answer, or every failure found.
+pub fn check_claim_leaf_body(
+    body: &[u8],
+    expected: &ClaimLeafExpected,
+) -> Result<crate::ClaimLeaf, Vec<String>> {
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return Err(vec![format!("not JSON: {e}")]),
+    };
+    let mut errors = claim_leaf_schema_errors(None, &value);
+    let decoded = match serde_json::from_value::<crate::ClaimLeaf>(value) {
+        Ok(c) => {
+            if c.schema_version != crate::CLAIM_LEAF_SCHEMA_VERSION {
+                errors.push(format!("schema_version {} is not 1", c.schema_version));
+            }
+            if (c.map_scope, c.map_group_id) != (expected.map_scope, expected.map_group_id) {
+                errors.push(format!(
+                    "viewer: the answer is the {:?} map {:?}, the request was for the {:?} map {:?}",
+                    c.map_scope, c.map_group_id, expected.map_scope, expected.map_group_id
+                ));
+            }
+            if c.hierarchy != expected.hierarchy {
+                errors.push(format!(
+                    "the answer is in {:?}, the request was for {:?}",
+                    c.hierarchy, expected.hierarchy
+                ));
+            }
+            if c.claim_id != expected.claim_id {
+                errors.push(format!(
+                    "the answer is for claim {}, the request was for {}",
+                    c.claim_id, expected.claim_id
+                ));
+            }
+            Some(c)
+        }
+        Err(e) => {
+            errors.push(format!("types: {e}"));
+            None
+        }
+    };
+    match decoded {
+        Some(c) if errors.is_empty() => Ok(c),
+        _ => Err(errors),
+    }
+}
+
+/// Check a claim-to-leaf refusal: a 404 whose body is exactly the closed
+/// not-found shape and, on the kernel side, names only the claim asked for.
+pub fn check_claim_leaf_not_found(
+    side: Side,
+    status: u16,
+    body: &[u8],
+    requested_id: &str,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if status != 404 {
+        errors.push(format!("status {status}, not 404"));
+    }
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("not JSON: {e}"));
+            return Err(errors);
+        }
+    };
+    let def = match side {
+        Side::Kernel => "kernel_not_found",
+        Side::Bff => "bff_not_found",
+    };
+    errors.extend(claim_leaf_schema_errors(Some(def), &value));
+    if side == Side::Kernel {
+        if value["details"]["id"] != json!(requested_id) {
+            errors.push(format!(
+                "details.id {} is not the requested id {requested_id}",
+                value["details"]["id"]
+            ));
+        }
+        let message = format!("atlas_claim_leaf with ID {requested_id} not found");
+        if value["message"] != json!(message) {
+            errors.push(format!("message {} is not `{message}`", value["message"]));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
