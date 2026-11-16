@@ -259,6 +259,8 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host>
 EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
 # OPENAI_API_KEY=<key>            # semantic search and embedding on write
 # EPIGRAPH_METRICS_ADDR=127.0.0.1:9090
+# EPIGRAPH_TRUSTED_PROXIES=127.0.0.0/8,::1/128  # the reverse proxy in front of the API
+# EPIGRAPH_RATE_LIMIT_RPM=600
 ```
 
 - **TLS.** Either build with `--features epigraph-api/tls` and set both `EPIGRAPH_TLS_CERT`
@@ -266,6 +268,31 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   that terminates TLS. `EPIGRAPH_PUBLIC_BASE_URL` must be the public origin
   either way. It is used in OAuth discovery documents and consent links, and
   it defaults to `http://localhost:8080`.
+- **Rate limiting** is off unless configured: with none of
+  `EPIGRAPH_RATE_LIMIT`, `EPIGRAPH_RATE_LIMIT_RPM` and
+  `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` set, the API applies **no** rate limit
+  (logged at boot as `rate limiter OFF`); set one, or limit at the reverse
+  proxy. Once on, the limit is `EPIGRAPH_RATE_LIMIT_RPM` (600 when only
+  `EPIGRAPH_RATE_LIMIT=on` or a global limit is given) requests a minute per
+  bucket, after a burst of the same size. An
+  authenticated request is charged to its principal (the token's agent, else
+  its client); an anonymous one (`/oauth/*`, `/.well-known/*`, `/elevate/*`,
+  the allowlist without a token) to its client address. The address is the
+  TCP peer unless the peer is in `EPIGRAPH_TRUSTED_PROXIES`, in which case it
+  is the right-most `X-Forwarded-For` hop that is not itself a trusted proxy.
+  **Set `EPIGRAPH_TRUSTED_PROXIES` to the address your reverse proxy connects
+  from** (the default, loopback, fits a proxy on the same host). Otherwise
+  every client behind the proxy is charged to the proxy's one bucket. The
+  proxy must APPEND the client address to `X-Forwarded-For` (Caddy and
+  nginx's `$proxy_add_x_forwarded_for` do). Never list an address that
+  untrusted clients can connect from: whatever they write in the header is
+  then believed. A request to a protected route without a valid token is
+  refused 401 before the limiter. A 429 carries `Retry-After`, and one
+  refusal per bucket per minute is recorded as a `rate_limit_exceeded` event
+  in the in-memory security audit log. Its database copy is best-effort:
+  `security_events.agent_id` references `agents`, so a refusal keyed on a
+  client address (or on an agentless token's client) is not persisted and
+  logs `Failed to persist security event` instead.
 - **Metrics** are served only on the internal listener
   `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`), never on the
   application port. See section 7.
@@ -276,7 +303,9 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   out for a `.env` file in its working directory too: the server loads one if
   it exists.
 
-**Check.** The log contains `Session-GUC probe passed`,
+**Check.** The log contains `rate limiter ON` (with the effective
+`per_key_rpm`, `global_rpm` and `trusted_proxies`) when you configured a limit,
+`rate limiter OFF` otherwise, `Session-GUC probe passed`,
 `entity_types registry cache loaded`, `Internal metrics listener started`
 and `Server listening on 0.0.0.0:<port>`. An operator-binding line is also
 logged: `operator binding is NOT ARMED on this database: ...` until you arm it
@@ -420,6 +449,10 @@ For the others, anything else is off.
 | `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
 | `EPIGRAPH_PORT` | `8080` | The application port. The bind address is `0.0.0.0`. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
+| `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
+| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
+| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
 | `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot and panics on failure. The supported path is `epigraph-migrate`. |
@@ -436,8 +469,6 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
-| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Requests per minute allowed to one client, enforced in-process on every route except the health probes. Unset → the API applies **no** rate limit (logged at boot as `Rate limiting: OFF`); limit at the reverse proxy instead, or set this. The client is its IP, taken from `X-Forwarded-For` / `X-Real-IP` when present, so set it only where a trusted proxy writes those headers, and remember that agents sharing one address share one allowance. An unusable value → exit 1. |
-| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global ceiling) | Requests per minute across all clients together. Read only with `EPIGRAPH_RATE_LIMIT_RPM`, and must not be below it. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |

@@ -135,10 +135,11 @@ async fn oauth_error_responses_carry_the_oauth_headers() {
     assert_oauth_headers(&headers, "token endpoint 413");
 }
 
-/// The rate limiter wraps the merged router, OUTSIDE the OAuth header layer,
-/// so its 429 never passes through that layer. It must still be
-/// uncacheable. The limiter keys an anonymous request on its forwarded IP;
-/// the CONTROL (the first request is 200 and carries the full set) shows the
+/// A rate-limited OAuth response must be uncacheable. The limiter sets
+/// no-store itself, and on the OAuth router it also sits inside the OAuth
+/// header layer, so either alone would satisfy this. These requests carry no
+/// connect info, so the limiter charges both to its fallback bucket; the
+/// CONTROL (the first request is 200 and carries the full set) shows the
 /// limiter is live and the route is an OAuth one.
 #[tokio::test]
 async fn a_rate_limited_oauth_response_is_not_cacheable() {

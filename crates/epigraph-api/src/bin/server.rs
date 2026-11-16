@@ -154,6 +154,53 @@ async fn main() {
         }
     }
 
+    // Rate limiting (backlog 966164c8), read once. Until this block the
+    // limiter the router layers (`middleware::rate_limit`) was never built in
+    // this binary, so every request, including the anonymous `/oauth/token`,
+    // `/oauth/register` and `/elevate/*`, was unlimited. OFF unless configured
+    // (the operator's ruling: a deployment that sets none of the variables
+    // must not start rate limiting); once configured it is keyed on the
+    // principal or the TCP peer. A
+    // malformed limit or proxy list refuses to start, because the silent
+    // alternative (a different limit, or every client behind the proxy in one
+    // bucket) is worse than a refusal. Built here, before any connection, so
+    // the boot log says whether it is on even when the database is down.
+    let rate_limit = match epigraph_api::RateLimitSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: rate limiting is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    if rate_limit.unrecognised_switch {
+        tracing::warn!(
+            "EPIGRAPH_RATE_LIMIT is set to a value that is neither `on` nor `off`: rate \
+             limiting is ON (only `off` disables it)"
+        );
+    }
+    let rate_limiter = rate_limit.build();
+    if rate_limiter.is_some() {
+        tracing::info!(
+            per_key_rpm = rate_limit.per_key_rpm,
+            global_rpm = ?rate_limit.global_rpm,
+            trusted_proxies = %rate_limit.trusted_proxies,
+            "rate limiter ON: authenticated requests are charged to their principal, \
+             anonymous ones to their client address (X-Forwarded-For believed only from \
+             trusted_proxies)"
+        );
+    } else if rate_limit.switched_off {
+        tracing::warn!(
+            "rate limiter OFF (EPIGRAPH_RATE_LIMIT=off): no request is rate limited by this \
+             process, the anonymous OAuth and elevation endpoints included"
+        );
+    } else {
+        tracing::warn!(
+            "rate limiter OFF: EPIGRAPH_RATE_LIMIT_RPM is not set, so no request is rate \
+             limited by this process, the anonymous OAuth and elevation endpoints included. \
+             Set it, or limit at the reverse proxy."
+        );
+    }
+
     // The passkey relying party (elevation plan EL-3), read once. Unset is
     // "off" (the enrollment endpoints answer 503); a partial or malformed
     // configuration refuses to start rather than silently serving 503s.
@@ -485,14 +532,6 @@ async fn main() {
             .with_bp_apply(bp_apply_from_env())
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
-        // The router wraps every route in `rate_limit_middleware`, which is a
-        // no-op unless a limiter is installed, and nothing installed one
-        // (backlog 966164c8). Opt-in, from the environment; the log line
-        // below says which state this process is in.
-        let state = match rate_limiter_from_env() {
-            Some(limiter) => state.with_rate_limiter(limiter),
-            None => state,
-        };
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the
@@ -568,6 +607,12 @@ async fn main() {
         )
         .expect("failed to build providers registry");
         state.with_providers(providers)
+    };
+
+    // Install the limiter built at the top of `main` (or none when it is off).
+    let state = match rate_limiter {
+        Some(limiter) => state.with_rate_limiter(limiter),
+        None => state,
     };
 
     // Hydrate the in-process webhook store from `webhook_subscriptions`
@@ -784,8 +829,10 @@ async fn main() {
             .await
             .expect("Failed to load TLS certificate/key");
 
+        // With connect info: the rate limiter keys an anonymous request on
+        // its TCP peer, and without it every such request shares one bucket.
         axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("TLS server error");
         return;
@@ -805,9 +852,19 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
-    tracing::info!("Server listening on {}", addr);
+    // The bound address, not the requested one: with EPIGRAPH_PORT=0 the
+    // kernel picks the port, and this line is how a caller learns it.
+    let bound = listener.local_addr().unwrap_or(addr);
+    tracing::info!("Server listening on {}", bound);
 
-    axum::serve(listener, app).await.expect("Server error");
+    // With connect info: the rate limiter keys an anonymous request on its
+    // TCP peer, and without it every such request shares one bucket.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("Server error");
 }
 
 /// `EPIGRAPH_BP_APPLY`, as the belief modes read it at boot: whether
@@ -827,41 +884,6 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
         );
     }
     switch
-}
-
-/// `EPIGRAPH_RATE_LIMIT_RPM` (and the optional
-/// `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM`), read once at boot: the limiter the
-/// router's `rate_limit_middleware` enforces, or `None` when the operator set
-/// none. Logged either way, so a journal shows whether this process limits
-/// requests at all; an unusable value refuses to start (exit 1) rather than
-/// serve unlimited while a limit is believed to be installed.
-#[cfg(feature = "db")]
-fn rate_limiter_from_env() -> Option<epigraph_api::AgentRateLimiter> {
-    use epigraph_api::security::rate_limit::{RATE_LIMIT_GLOBAL_RPM_ENV, RATE_LIMIT_RPM_ENV};
-    let per_client = std::env::var(RATE_LIMIT_RPM_ENV).ok();
-    let global = std::env::var(RATE_LIMIT_GLOBAL_RPM_ENV).ok();
-    match epigraph_api::RateLimitConfig::from_env_values(per_client.as_deref(), global.as_deref()) {
-        Ok(Some(config)) => {
-            tracing::info!(
-                per_client_rpm = config.default_rpm,
-                global_rpm = config.enable_global_limit.then_some(config.global_rpm),
-                "Rate limiting: ON (keyed by client IP; health probes exempt)"
-            );
-            Some(epigraph_api::AgentRateLimiter::new(config))
-        }
-        Ok(None) => {
-            tracing::warn!(
-                "Rate limiting: OFF. {RATE_LIMIT_RPM_ENV} is not set, so no request is rate \
-                 limited by this process, the anonymous /oauth and /elevate endpoints included. \
-                 Set it, or limit at the reverse proxy."
-            );
-            None
-        }
-        Err(reason) => {
-            tracing::error!("Rate limiting is misconfigured: {reason}. Refusing to start.");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a
