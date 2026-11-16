@@ -42,6 +42,13 @@
 //! An empty value (`?theme_id=&kind=`) is the parameter left out. A value that
 //! does not parse is a 400.
 //!
+//! # Time bound
+//!
+//! Each statement of a page runs under
+//! [`epigraph_db::SOURCES_OVERVIEW_STATEMENT_TIMEOUT`]. A page that runs past
+//! it is a 503 telling the caller to narrow the read with `theme_id`; any
+//! other read failure is an opaque 500.
+//!
 //! All SQL lives in `epigraph_db` (`SourceOverviewRepository::page`).
 
 use crate::errors::ApiError;
@@ -54,8 +61,8 @@ use crate::middleware::bearer::ViewerExtractor;
 use axum::extract::Query;
 #[cfg(feature = "db")]
 use epigraph_db::{
-    SourceCursor, SourceDetail, SourceKind, SourceOverviewRepository, SOURCES_PAGE_DEFAULT,
-    SOURCES_PAGE_MAX,
+    SourceCursor, SourceDetail, SourceKind, SourceOverviewRepository,
+    SOURCES_OVERVIEW_STATEMENT_TIMEOUT, SOURCES_PAGE_DEFAULT, SOURCES_PAGE_MAX,
 };
 #[cfg(feature = "db")]
 use serde::{Deserialize, Serialize};
@@ -134,10 +141,49 @@ fn bad_param(field: &str, reason: &str) -> ApiError {
     }
 }
 
+/// The answer to a failed overview read: a 503 when a statement ran past
+/// [`epigraph_db::SOURCES_OVERVIEW_STATEMENT_TIMEOUT`] (`57014
+/// query_canceled`), telling the caller to narrow by `theme_id`, else an
+/// opaque 500. Either way the driver's error is logged, never answered.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn overview_read_failed(e: &epigraph_db::DbError) -> ApiError {
+    tracing::error!(
+        target: "tenancy.scoped_read",
+        error = %e,
+        handler = "sources_overview",
+        "sources overview read failed"
+    );
+    let canceled = matches!(
+        e,
+        epigraph_db::DbError::QueryFailed { source }
+            if source
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref()
+                == Some("57014")
+    );
+    if canceled {
+        ApiError::ServiceUnavailable {
+            service: "sources overview (the read ran past its time bound; narrow it with \
+                      theme_id)"
+                .to_string(),
+        }
+    } else {
+        ApiError::InternalError {
+            message: "Failed to read the sources overview".to_string(),
+        }
+    }
+}
+
 /// `GET /api/v1/sources/overview`
 ///
 /// The sources of the current claims the caller may read, grouped by kind,
 /// each with the caller's own claim count, one page at a time.
+///
+/// # Errors
+/// 400 for a malformed parameter; 503 when the page ran past its time bound;
+/// 500 when a read fails.
 #[cfg(feature = "db")]
 pub async fn sources_overview(
     ViewerExtractor(viewer): ViewerExtractor,
@@ -192,9 +238,17 @@ pub async fn sources_overview(
         }
     })?;
 
-    let page =
-        SourceOverviewRepository::page(&mut read, &viewer, theme_id, kind, after.as_ref(), limit)
-            .await?;
+    let page = SourceOverviewRepository::page_bounded(
+        &mut read,
+        &viewer,
+        theme_id,
+        kind,
+        after.as_ref(),
+        limit,
+        SOURCES_OVERVIEW_STATEMENT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| overview_read_failed(&e))?;
 
     crate::routes::finish_scoped_read(read, "sources_overview").await?;
 

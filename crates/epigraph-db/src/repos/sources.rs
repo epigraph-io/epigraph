@@ -45,8 +45,19 @@
 //! changes between two pages can move its source across the cut (served
 //! twice, or not at all, in that walk); on a corpus at rest every source is
 //! served exactly once.
+//!
+//! # Time bound
+//!
+//! Without a `theme_id` a page re-aggregates EVERY readable current claim
+//! (the grouping cannot be cut off before the `LIMIT`), and the API's scoped
+//! pool sets no `statement_timeout`. So the route reads through
+//! [`SourceOverviewRepository::page_bounded`], which runs the page under its
+//! own `statement_timeout` ([`SOURCES_OVERVIEW_STATEMENT_TIMEOUT`]) and puts
+//! the connection's previous value back on every exit. An overrun is a `57014
+//! query_canceled`, which the route answers with a 503.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -62,6 +73,12 @@ pub const SOURCES_PAGE_DEFAULT: i64 = 50;
 pub const SOURCE_AUTHORS_MAX: i64 = 10;
 /// Longest paper title or agent display name served, in characters.
 pub const SOURCE_TEXT_MAX: i32 = 300;
+/// The bound on each statement of one overview page
+/// ([`SourceOverviewRepository::page_bounded`]). A placeholder until the
+/// unthemed overview has been measured at production scale: without it an
+/// unthemed request in a loop is an unbounded aggregation of the corpus per
+/// call.
+pub const SOURCES_OVERVIEW_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A kind of source, in listing order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +284,42 @@ impl SourceOverviewRepository {
                 break;
             }
         }
+        Ok(page)
+    }
+
+    /// [`Self::page`] under `statement_timeout` (at least 1 ms: a zero would
+    /// DISABLE the bound). The connection's previous `statement_timeout` is
+    /// read first and restored on every exit, the error ones included, before
+    /// the result is returned, because a session `SET` on a pooled connection
+    /// would otherwise outlive the request. On a transaction-mode connection a
+    /// timed-out statement aborts the transaction, the restore then fails too,
+    /// and the page's own error is the one returned (the rollback on drop
+    /// undoes the `SET` with everything else).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a database query fails, including
+    /// `57014 query_canceled` when a statement runs past `statement_timeout`.
+    pub async fn page_bounded(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        theme_id: Option<Uuid>,
+        kind: Option<SourceKind>,
+        after: Option<&SourceCursor>,
+        limit: i64,
+        statement_timeout: Duration,
+    ) -> Result<SourcePage, DbError> {
+        let previous = crate::pool::read_statement_timeout(conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        crate::pool::apply_statement_timeout(conn, statement_timeout.max(Duration::from_millis(1)))
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        let page = Self::page(&mut *conn, viewer, theme_id, kind, after, limit).await;
+        // Restored BEFORE the `?` on `page`, so a timeout leaves the
+        // connection as it was found.
+        let restored = crate::pool::restore_statement_timeout(conn, &previous).await;
+        let page = page?;
+        restored.map_err(|source| DbError::QueryFailed { source })?;
         Ok(page)
     }
 
