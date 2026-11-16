@@ -20,6 +20,19 @@ use uuid::Uuid;
 /// Kept here (the lower `epigraph-db` layer) so DB-layer batch queries like
 /// [`crate::repos::claim::ClaimRepository::in_epistemic_degree_batch`] don't
 /// need to depend upward on `epigraph-mcp` for the list.
+/// Edge property that marks an edge of an epistemic relationship as moving
+/// no belief. An edge whose `properties` hold `"moves_belief": false` is still
+/// a navigable, typed link, but the belief readers skip it (the factor
+/// backfill's edge selection and the sheaf's edge reads). Written today only
+/// by an abstract consolidation's `generalizes` edges, whose abstraction takes
+/// its default confidence from the very sources the edge points at.
+pub const MOVES_BELIEF_PROPERTY: &str = "moves_belief";
+
+/// SQL predicate, for an edge aliased `e`, that keeps every edge except one
+/// marked with `"moves_belief": false` ([`MOVES_BELIEF_PROPERTY`]). A NULL or
+/// absent property keeps the edge.
+pub const EDGE_MOVES_BELIEF_SQL: &str = "(e.properties->>'moves_belief') IS DISTINCT FROM 'false'";
+
 pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "supports",
     "corroborates",

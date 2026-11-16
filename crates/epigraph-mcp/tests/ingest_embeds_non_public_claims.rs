@@ -229,6 +229,7 @@ async fn a_merge_of_private_claims_is_embedded(pool: PgPool) {
             mode: "merge".to_string(),
             reason: "two wordings of one claim".to_string(),
             confidence: None,
+            survivor_claim_id: None,
         },
         None,
     )
