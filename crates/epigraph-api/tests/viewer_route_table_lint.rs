@@ -212,10 +212,14 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
 ///
-/// Twelve handler sites across seven files read `tier_a` claim content inline
-/// (thirteen across eight until `tenancy/fix-security-track` retired
-/// `hypothesis.rs`'s — see the comment on that removal below)
-/// in the route layer with no `Viewer` spliced into the statement. Before PR-14
+/// Four handler sites across two files read `tier_a` claim content inline in
+/// the route layer with no `Viewer` spliced into the statement: `clusters.rs`
+/// (2) and `policies.rs` (2). It was ten across seven before backlog 67c905a3
+/// retired `conflicts.rs`, `embeddings.rs`, `political.rs`, `search.rs` and the
+/// rest of `workflows.rs` (see the comment on each removal below); this
+/// paragraph said "twelve" from before `workflows.rs` went 4 -> 2. It was
+/// thirteen across eight before `tenancy/fix-security-track` retired
+/// `hypothesis.rs`'s. Before PR-14
 /// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
 /// become live disclosure the moment ownership is transcribed into the tenancy
 /// columns, with nothing behind them."* That prediction is not stale — it has
@@ -243,8 +247,24 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs
 /// handler. Do not add to it — move the statement into
 /// `crates/epigraph-db/src/repos/`, mark it, and splice a `Viewer`.
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
+    // `build_from_bridges`' two `edges ⨝ claims` reads (the bridge edges and
+    // the paragraph nodes). Not converted with the rest of backlog 67c905a3:
+    // this handler WRITES the shared `graph_cluster_runs` / `graph_clusters` /
+    // `claim_cluster_membership` rows from what it reads, on the raw pool, so
+    // stamping only the reads would hand an unstamped writer membership rows
+    // for claims its own session cannot see. The reads and the writes have to
+    // move onto one stamped transaction together.
     ("clusters.rs", 2),
-    ("conflicts.rs", 1),
+    // `conflicts.rs` was 1 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The site was `scan_conflicts`'s
+    // `mass_functions ⨝ claims` scan, run on the raw pool with no viewer and
+    // projecting `c.content`. Under a login subject to row security that
+    // session sees public rows only, so it hid a member's own private
+    // high-conflict claims; only under a login that bypasses row security
+    // would it have returned every claim's content to any bearer. It is now
+    // `ConflictDensityRepository::high_conflict_claims(.., &viewer, ..)`, which
+    // marks both `mf` and `c`, on the caller's `read_as` connection. Pinned by
+    // `tier_a_inline_reads_scoped.rs`.
     // `cross_source.rs` was 1 until PR-09 and is now 0, so it is gone from the
     // register entirely. The site was `SELECT id, content FROM claims WHERE id
     // = ANY($1)` in `list_candidates`, hydrating excerpts for the candidate
@@ -256,7 +276,15 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `MatchCandidateRepo::corroborates_edges_for_claim`. Both were byte-for-byte
     // duplicates of SQL in `epigraph-mcp/src/tools/matching.rs`; there is now
     // one copy, in the repo layer, filtered.
-    ("embeddings.rs", 1),
+    // `embeddings.rs` was 1 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The counted site was `neighborhood_density`'s
+    // level / source-type sample. Its sibling, the count / mean / median
+    // aggregate over the same radius, was never counted: `sqlx_call_offsets`
+    // stops at the first `>` of a turbofish, and that call's was
+    // `query_as::<_, (i64, Option<f64>, Option<f64>)>`. Both now call the
+    // repo methods the MCP `embedding_neighborhood_density` tool already used,
+    // `ClaimRepository::{embedding_radius_density, embedding_radius_breakdown}`,
+    // each marking `c`, on the caller's `read_as` connection.
     // `hypothesis.rs` was 1 until `tenancy/fix-security-track` and is now 0, so
     // it is gone from the register entirely. The site was
     // `create_hypothesis`'s VOI neighborhood scan — `SELECT c.id, c.belief,
@@ -270,21 +298,26 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
-    ("political.rs", 1),
-    // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
-    // forward-only scan could not see. Its in-code comment argues it is not a
-    // live leak — the ids come from the viewer-filtered
-    // `ClaimThemeRepository::claims_in_themes_at_dim_since`, which splices
-    // `{VISIBILITY:c}` onto the joined `claims` (PR-29 re-pointed the route at
-    // that repo method directly; it previously named the engine wrapper
-    // `candidates_in_themes_at_dim`, whose body was the same call), or, for a
-    // request pinned with `theme_id`, from the equally spliced
-    // `ClaimThemeRepository::claims_in_theme_exact_at_dim` — and that
-    // derivation looks sound. It is
-    // registered anyway: the argument is a caller-side invariant with nothing
-    // enforcing it, which is precisely the kind of reasoning this register
-    // exists to keep visible rather than to accept silently.
-    ("search.rs", 1),
+    // `policies.rs` was 2 and is now 0, so it is gone from the register: its
+    // two reads, `list_network_policies` and `get_challenge`, moved into
+    // `PolicyRepository` (backlog 56d2430b). Both are single unjoined reads
+    // that backlog 67c905a3 left out only to keep its change to the files it
+    // had proving tests for.
+    // `political.rs` was 1 and is now 0, so it is gone from the register
+    // (backlog 67c905a3). The site was `inflation_leaderboard`'s
+    // `claims ⨝ agents` aggregate; it is now
+    // `PoliticalRepository::get_inflation_leaderboard(.., &viewer)`, marking
+    // `c` in the `WHERE` so the mean and the `HAVING` threshold both see only
+    // visible claims, on the caller's `read_as` connection.
+    // `search.rs` was 1 and is now 0, so it is gone from the register (backlog
+    // 67c905a3). The site was the `format!`-built `full_sql` in
+    // `semantic_search`'s diverse arm. That statement was safe only by a
+    // caller-side derivation, with nothing enforcing it: every id came out of
+    // one of two viewer-spliced theme reads. It is now
+    // `ClaimRepository::semantic_selected_claims(.., &viewer, ..)`, which marks
+    // `c` itself, on the same `read_as` connection. The result set is unchanged
+    // for today's two sources of ids; the marker is what keeps a third source
+    // from reopening the read.
     // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
     // claims` for the goal fallback became a `get_by_id_with_labels` read
     // through the caller's viewer.
@@ -292,7 +325,14 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // (it projected `claims.properties`) moved to
     // `WorkflowRepository::plan_step_claim_ids`, with its viewer predicates,
     // run on a transaction stamped with the caller's viewer.
-    ("workflows.rs", 2),
+    // 2 -> 0, key removed (backlog 67c905a3). Both remaining statements read
+    // the legacy flat workflow claim, and both now call
+    // `WorkflowRepository::flat_workflow_claim(conn, &viewer, id)`, which marks
+    // `c`. `get_workflow`'s flat fallback already spliced that predicate in the
+    // route layer, so for it this is a move. `report_outcome`'s counter read on
+    // its stamped write transaction had no predicate, but the handler 404s an
+    // unreadable workflow first, through the caller's viewer, so it was not a
+    // live disclosure either. Neither move changes a response.
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
@@ -750,28 +790,53 @@ fn sqlx_call_offsets(src: &str) -> Vec<usize> {
     while let Some(rel) = src[from..].find("sqlx::query") {
         let at = from + rel;
         from = at + "sqlx::query".len();
-
-        // Skip the `_as` / `_scalar` suffix, then any turbofish, then require `(`.
-        let mut tail = &src[from..];
-        for suffix in ["_as", "_scalar"] {
-            if let Some(rest) = tail.strip_prefix(suffix) {
-                tail = rest;
-                break;
-            }
-        }
-        let tail = tail.trim_start();
-        let opens_call = if let Some(rest) = tail.strip_prefix("::<") {
-            // Turbofish: find its close, then require `(`.
-            rest.find('>')
-                .is_some_and(|gt| rest[gt + 1..].trim_start().starts_with('('))
-        } else {
-            tail.starts_with('(')
-        };
-        if opens_call {
+        if call_open_paren(src, at).is_some() {
             out.push(at);
         }
     }
     out
+}
+
+/// The byte offset of the `(` that opens the `sqlx::query*` call at `at`, or
+/// `None` when the text there is not a call.
+///
+/// Skips the `_as` / `_scalar` suffix, then any turbofish, then requires `(`.
+/// The turbofish's close is found by BALANCING angle brackets, not by taking
+/// the first `>`: in `::<_, (i64, Option<f64>)>(` the first `>` closes
+/// `Option<f64>`. Both [`sqlx_call_offsets`] and [`arg_region`] go through
+/// here, so the two cannot disagree on where a call opens. Before this, a
+/// nested turbofish was not counted as a call at all, and a tuple turbofish
+/// (`::<_, (Uuid, String)>(`) had its TYPE TUPLE scanned as the argument
+/// region in place of the SQL. See `a_nested_generic_turbofish_is_counted`.
+fn call_open_paren(src: &str, at: usize) -> Option<usize> {
+    let mut pos = at + "sqlx::query".len();
+    for suffix in ["_as", "_scalar"] {
+        if src[pos..].starts_with(suffix) {
+            pos += suffix.len();
+            break;
+        }
+    }
+    pos += src[pos..].len() - src[pos..].trim_start().len();
+    if src[pos..].starts_with("::<") {
+        pos += "::<".len();
+        let mut depth = 1usize;
+        let close = src[pos..].char_indices().find_map(|(i, c)| {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            None
+        })?;
+        pos += close + 1;
+        pos += src[pos..].len() - src[pos..].trim_start().len();
+    }
+    src[pos..].starts_with('(').then_some(pos)
 }
 
 /// The balanced-paren argument region of the `sqlx::query*` call at `at`.
@@ -782,7 +847,15 @@ fn sqlx_call_offsets(src: &str) -> Vec<usize> {
 /// that parentheses inside the SQL text cannot unbalance the depth count.
 fn arg_region(src: &str, at: usize) -> &str {
     let b = src.as_bytes();
-    let Some(open) = src[at..].find('(').map(|i| at + i) else {
+    // At a `sqlx::query*` call the region opens AFTER any turbofish, which may
+    // itself hold a `(` (a tuple row type). Anywhere else (the `auth_ctx`
+    // shape classifier passes a `Some(` site) it is the first `(`.
+    let open = if src[at..].starts_with("sqlx::query") {
+        call_open_paren(src, at)
+    } else {
+        src[at..].find('(').map(|i| at + i)
+    };
+    let Some(open) = open else {
         return &src[at..];
     };
     let n = src.len();
@@ -1411,6 +1484,60 @@ fn a_format_built_statement_is_counted() {
     let offsets = sqlx_call_offsets(raw);
     assert_eq!(offsets.len(), 1);
     assert!(reads_claim_content(&resolved_region(raw, offsets[0])));
+}
+
+/// A turbofish whose type arguments are themselves generic is still a call.
+///
+/// `sqlx_call_offsets` used to take the FIRST `>` after `::<` as the
+/// turbofish's close. In `query_as::<_, (i64, Option<f64>)>(` that `>` closes
+/// `Option<f64>`, the text after it is `)>(` rather than `(`, and the call was
+/// silently not counted. That is how `embeddings.rs::neighborhood_density`'s
+/// count / mean / median aggregate over `claims.embedding` stayed out of
+/// [`UNCOMPENSATED_INLINE_READS`] while its sibling was in it (backlog
+/// 67c905a3). [`arg_region`] had the matching hole: it opened the region at
+/// the first `(` after the call, which for a tuple row type
+/// (`::<_, (Uuid, String)>(`) is the TYPE, so the SQL was never scanned. Both
+/// now go through [`call_open_paren`]. Measured when the scan was fixed, after
+/// that handler's conversion: every exact-set register in this file kept its
+/// value, so the fix moved no register.
+#[test]
+fn a_nested_generic_turbofish_is_counted() {
+    let nested = r#"
+        let row = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(
+            "SELECT COUNT(*), AVG(1 - (embedding <=> $1::vector)), NULL FROM claims",
+        )
+        .fetch_one(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(nested);
+    assert_eq!(
+        offsets.len(),
+        1,
+        "a turbofish with nested generics must still be recognised as a call"
+    );
+    assert!(
+        reads_claim_content(&resolved_region(nested, offsets[0])),
+        "and its statement must be scanned like any other"
+    );
+
+    // A TUPLE row type opens a `(` inside the turbofish. The argument region
+    // must start after the turbofish, at the SQL, not at the type tuple.
+    let tuple = r#"
+        let rows = sqlx::query_as::<_, (Uuid, String)>("SELECT c.id, c.content FROM claims c")
+            .fetch_all(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(tuple);
+    assert_eq!(offsets.len(), 1, "a tuple turbofish is one call");
+    assert!(
+        reads_claim_content(&resolved_region(tuple, offsets[0])),
+        "the region of a tuple-turbofish call must be its SQL, not its row type"
+    );
+
+    // A turbofish that never opens a call is still not one.
+    let bare = "// see sqlx::query_as::<_, Option<f64>> for the row shape";
+    assert!(
+        sqlx_call_offsets(bare).is_empty(),
+        "a bare mention of a nested turbofish is prose, not a call"
+    );
 }
 
 #[test]

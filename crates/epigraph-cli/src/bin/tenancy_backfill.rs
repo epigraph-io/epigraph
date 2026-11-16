@@ -1791,6 +1791,23 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // update policy (42501): nothing is ever confirmed or declined that the
     // owner could not see.
     ("epigraph_countersign_authorship", 208),
+    // 210 (Atlas W2, backlog 77f4bf09), the per-team Atlas map staleness
+    // epochs. The bump is the only writer of the FORCEd `atlas_map_epochs`
+    // (the application role holds SELECT only), and the two triggers call it
+    // on every claims, edges and evidence UPDATE that changes a row's
+    // signature. Under an owner without the epochs grant (the application
+    // role) every such UPDATE (a share, a publicize, a narrowing, a
+    // re-tenant) fails LOUD with 42501, an outage of those writes; so does a
+    // trigger whose owner cannot EXECUTE the bump (210 revokes it from
+    // PUBLIC). Under a non-member owner that holds the grant the definer
+    // bypass is false: the bump's `groups` join is filtered to the session's
+    // read set, so a departure from a group the session cannot read bumps
+    // nothing and that map keeps being served as current with a row its
+    // viewers lost (fails OPEN, silently); a readable group the session
+    // cannot write is refused by the epochs WITH CHECK (loud).
+    ("epigraph_atlas_map_bump", 210),
+    ("epigraph_atlas_map_stale", 210),
+    ("epigraph_atlas_map_stale_row", 210),
     // 217, the two factor triggers (backlog a2c5f714): the application role
     // holds no INSERT / DELETE on `factors`, so they write it as their owner.
     // Under a non-member owner without the `factors` grant the edge mint

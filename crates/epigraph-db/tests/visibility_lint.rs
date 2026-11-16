@@ -1194,6 +1194,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "evidence.rs",
+        "link_to_claims_signed_conn",
+        "WRITE (backlog 2d60f619): the evidence row's `evidence -> claim` edge, inside the \
+         caller's evidence-write transaction (or the maintenance backfill's batch). It delegates \
+         to EdgeRepository::create_if_absent_including_retracted_signed_conn, itself exempt here, \
+         and returns only the edge id it wrote or found. The edge's tenancy is the edges \
+         trigger's meet of its endpoints, so there is nothing for a viewer to filter.",
+    ),
+    (
+        "evidence.rs",
         "same_tenancy_duplicate",
         "READ inside an evidence write's own transaction (migration 171, backlog 12b68201): the \
          owner and visibility of the row the caller just wrote, an advisory lock, then whether \
@@ -2819,6 +2828,67 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
          column to name (the shape of claim_theme.rs `delete_all_conn`).",
     ),
+    // Atlas W2 (migration 210): the nightly's writes of a team or public map.
+    (
+        "atlas_map.rs",
+        "write_run",
+        "WRITE. Opens one unfinished `atlas_map_runs` row of one map, declared ('group', T) for a \
+         team map or ('public', world) for the public map; the nightly calls it on the \
+         maintenance connection, the application role holds SELECT only on the table, and its \
+         `atlas_map_runs_tenancy` WITH CHECK would hold any other writer to its writable groups. \
+         The one read is the `groups` kind check of the declared owner.",
+    ),
+    (
+        "atlas_map.rs",
+        "put_level",
+        "WRITE. Upserts one `atlas_map_levels` document into an unfinished run, copying the \
+         run's own tenancy columns (pinned by the composite FK); the nightly calls it on the \
+         maintenance connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "finish_run",
+        "WRITE. Stamps one unfinished `atlas_map_runs` row finished with its level count, \
+         counted over the run's own documents; the nightly calls it on the maintenance \
+         connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "fix_repeatable_read",
+        "NO ROW READ. Private first half of `begin_build_snapshot`: runs `SET TRANSACTION \
+         ISOLATION LEVEL REPEATABLE READ` and reads back `current_setting('transaction_isolation')`; \
+         it touches no table. `begin_build_snapshot` then reads the epochs through `map_epochs`, \
+         which splices the viewer.",
+    ),
+    // Atlas W9: the nightly's housekeeping of one map.
+    (
+        "atlas_map.rs",
+        "prune_runs",
+        "WRITE. Deletes one map's old `atlas_map_runs` rows (finished runs past the newest N, \
+         unfinished runs older than the newest finished one), their levels going by the FK \
+         cascade; every statement is scoped by the map's own tenancy columns, the nightly calls \
+         it on the maintenance connection and the application role holds SELECT only on the \
+         table.",
+    ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_publish",
+        "NO ROW READ. Takes `pg_advisory_xact_lock` on a hash of the map's tenancy key so the \
+         nightly and the naming step's write serialise their publish of one map; it touches no \
+         table.",
+    ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_build",
+        "NO ROW READ. Takes the session-level `pg_advisory_lock` on the same key as \
+         lock_map_for_publish, so an operator build and the nightly's publish of one map \
+         serialise; it touches no table.",
+    ),
+    (
+        "atlas_map.rs",
+        "unlock_map_for_build",
+        "NO ROW READ. Releases lock_map_for_build's session advisory lock; it touches no table.",
+    ),
     // Backlog b7354adc: the three reads `AuthoredByRepository::for_claim` ran inline, split
     // out unchanged so `for_paper_ingests` (which takes the viewer and spends it on
     // `PaperRepository::ingest_principals`) shares them instead of copying them.
@@ -3986,6 +4056,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          no visibility or owner_group_id column and this function reads nothing, so there is no \
          predicate a Viewer could be spent on; reads of `events` go through `list_events`, which \
          applies the viewer.",
+    ),
+    (
+        "paper.rs",
+        "licence",
+        "READ of `papers.licence` for one paper id (migration 226). `papers` carries no tenancy \
+         (127): there is no visibility or owner_group_id column and no policy, so there is \
+         nothing to filter, and the answer is one operator-set licence string, never claim \
+         content. Ingest only reads it, to decide whether a source may be treated as \
+         open-licensed; `None` means all rights reserved.",
     ),
 ];
 

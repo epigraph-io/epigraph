@@ -1667,19 +1667,15 @@ async fn persist_packet(
             )
         })?;
 
-            // Materialize graph edges: evidence --supports--> claim (the canonical
-            // spelling, `epigraph_core::edge::relationships::canonical_relationship`)
-            epigraph_db::EdgeRepository::create_signed_conn(
+            // The evidence's `supports` edge to its claim, through the one
+            // writer every evidence insert calls (backlog 2d60f619), in this
+            // transaction. A packet's evidence carries no direction.
+            epigraph_db::EvidenceRepository::link_to_claims_signed_conn(
                 &mut tx,
                 state.edge_signing_key(),
                 evidence_uuid,
-                "evidence",
-                claim_uuid,
-                "claim",
-                "supports",
-                None,
-                None,
-                None,
+                &[claim_uuid],
+                epigraph_db::EvidenceDirection::Supports,
             )
             .await
             .map_err(|e| {
@@ -1687,7 +1683,7 @@ async fn persist_packet(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorResponse::new(
                         "DatabaseError",
-                        format!("Failed to create SUPPORTS edge: {}", e),
+                        format!("Failed to create the evidence's supports edge: {}", e),
                     ),
                 )
             })?;
@@ -2002,6 +1998,7 @@ pub async fn submit_packet(
     // event as a signed claim for tamper-evidence; embedding sentence-shaped
     // operational events like "Container X exited code 0 after Yms" has no
     // semantic value and costs an OpenAI call per event).
+    #[cfg(feature = "db")]
     let is_host_telemetry = packet
         .claim
         .properties
@@ -2036,14 +2033,7 @@ pub async fn submit_packet(
                 match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
                         // Provider-agnostic pgvector literal (Jina, OpenAI, ...).
-                        let pgvector_str = format!(
-                            "[{}]",
-                            embedding
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        );
+                        let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                         // Stored on the authority that wrote the claim: a
                         // transaction stamped with the caller's viewer. On the
                         // unstamped `db_pool` row security refused this UPDATE
@@ -2086,28 +2076,10 @@ pub async fn submit_packet(
             }
         }
     } // end `if !was_duplicate` (skip claim re-embed on dedup)
-    #[cfg(not(feature = "db"))]
-    if !was_duplicate {
-        if let Some(ref embedding_service) = state.embedding_service {
-            if is_host_telemetry {
-                tracing::debug!(
-                    claim_id = %claim_id,
-                    "Skipping embedding for host-provenance telemetry claim"
-                );
-            } else {
-                match embedding_service.generate(&packet.claim.content).await {
-                    Ok(embedding) => {
-                        if let Err(e) = embedding_service.store(claim_id, &embedding).await {
-                            tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store claim embedding");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for claim");
-                    }
-                }
-            }
-        }
-    } // end `if !was_duplicate` (skip claim re-embed on dedup, non-db twin)
+      // No non-`db` twin: without a database there is nowhere to store a claim
+      // vector, and generating one only to drop it would be a paid no-op. (It
+      // used to call `EmbeddingService::store`, which no real provider
+      // implemented; backlog ccc588d4.)
 
     // 8a. Generate and store embeddings for figure evidence
     //
@@ -2148,14 +2120,7 @@ pub async fn submit_packet(
 
                     match embedding_result {
                         Ok(embedding) => {
-                            let pgvector_str = format!(
-                                "[{}]",
-                                embedding
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            );
+                            let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                             // Same authority as the packet's insert, for the
                             // same reason as the claim's vector above.
                             match state

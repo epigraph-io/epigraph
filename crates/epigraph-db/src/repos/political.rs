@@ -480,6 +480,45 @@ impl PoliticalRepository {
         Ok(rows)
     }
 
+    /// The 20 agents with the highest mean `properties.inflation_factor` over
+    /// at least two claims, counting only claims `viewer` may read:
+    /// `(agent_id, display_name, mean_inflation, claim_count)`.
+    ///
+    /// This was an inline statement in `epigraph-api`'s
+    /// `routes/political.rs::inflation_leaderboard`, on the raw pool with no
+    /// viewer. The marker is in the `WHERE`, so it filters rows before the
+    /// `GROUP BY`: both the mean and the `HAVING COUNT(*) >= 2` threshold see
+    /// visible claims only, and an agent whose only qualifying claims are
+    /// hidden from the viewer is not listed at all.
+    #[instrument(skip(executor, viewer))]
+    #[allow(clippy::type_complexity)]
+    pub async fn get_inflation_leaderboard<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<Vec<(Uuid, Option<String>, f64, i64)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.agent_id, a.display_name,
+                   AVG((c.properties->>'inflation_factor')::FLOAT) AS mean_inflation,
+                   COUNT(*) AS claim_count
+            FROM claims c
+            JOIN agents a ON a.id = c.agent_id
+            WHERE c.properties ? 'inflation_factor'
+              /* {VISIBILITY:c} */
+            GROUP BY c.agent_id, a.display_name
+            HAVING COUNT(*) >= 2
+            ORDER BY mean_inflation DESC
+            LIMIT 20
+            "#,
+            1,
+        );
+        let mut vq = sqlx::query_as::<_, (Uuid, Option<String>, f64, i64)>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        Ok(vq.fetch_all(executor).await?)
+    }
+
     // ── Techniques on a claim ────────────────────────────────────────────
 
     /// Get propaganda techniques used by a claim via USES_TECHNIQUE edges.

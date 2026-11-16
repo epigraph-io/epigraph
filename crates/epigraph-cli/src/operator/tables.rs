@@ -817,6 +817,155 @@ pub async fn layout_epoch_bump_due(conn: &mut PgConnection) -> anyhow::Result<bo
     .await?)
 }
 
+/// The world group: the key of the public Atlas map (migration 210).
+const WORLD_GROUP: Uuid = Uuid::from_u128(0);
+
+/// The `atlas_map_epochs` rows a batch's tenancy changes write (migration
+/// 210), accounted as precisely as [`layout_epoch_bump_due`] accounts 197's.
+///
+/// 210's triggers bump the staleness counters of every Atlas map whose half of
+/// the readable set a claim, edge or evidence row enters or leaves: `n` for
+/// every key of the row's old and new SIGNATURE, `left_n` for every key of the
+/// old one unless the row became public. Each counter moves at most once per
+/// map per transaction, and the bump writes `n` and `left_n` in separate
+/// statements, so what a transaction writes depends only on the SETS of keys
+/// it touched: one INSERT per map with no row yet, one UPDATE per existing map
+/// whose `n` this transaction had not bumped, and one UPDATE per departed map
+/// whose `left_n` it had not bumped. A map is the world group's or a `team` /
+/// `community` group's; any other key bumps nothing.
+///
+/// A batch takes this snapshot with its `counters_before` (before its first
+/// write, which may bump), records every tenancy change its census accounts
+/// for, in the steps the census counts them (a row the trigger moved and the
+/// batch then rewrote is two changes), and adds [`MapEpochs::expect_into`] to
+/// its expected counts. A row the batch did not account for that changes
+/// tenancy can bump a map the prediction does not hold, and the census then
+/// refuses it like any other unpredicted row.
+#[derive(Debug, Default)]
+pub struct MapEpochs {
+    /// Existing rows: `(n bumped in this transaction, left_n bumped in it)`.
+    rows: BTreeMap<Uuid, (bool, bool)>,
+    changed: BTreeSet<Uuid>,
+    left: BTreeSet<Uuid>,
+}
+
+impl MapEpochs {
+    /// The epoch rows as this transaction sees them now; `None` on a database
+    /// without migration 210, where nothing is bumped.
+    ///
+    /// # Errors
+    /// The query fails.
+    pub async fn before(conn: &mut PgConnection) -> anyhow::Result<Option<Self>> {
+        let present: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.atlas_map_epochs') IS NOT NULL")
+                .fetch_one(&mut *conn)
+                .await?;
+        if !present {
+            return Ok(None);
+        }
+        let rows: Vec<(Uuid, bool, bool)> = sqlx::query_as(
+            "SELECT owner_group_id, \
+                    n_xact IS NOT DISTINCT FROM pg_current_xact_id(), \
+                    left_xact IS NOT DISTINCT FROM pg_current_xact_id() \
+               FROM atlas_map_epochs",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .context("reading atlas_map_epochs")?;
+        Ok(Some(Self {
+            rows: rows.into_iter().map(|(g, n, l)| (g, (n, l))).collect(),
+            ..Self::default()
+        }))
+    }
+
+    /// A claim's `(visibility, owner)` changed in one statement: 210's
+    /// statement trigger keys a claim by world when it is public, else by its
+    /// owner, and bumps only when that key changes.
+    pub fn claim(&mut self, old: (&str, Uuid), new: (&str, Uuid)) {
+        let key = |(v, o): (&str, Uuid)| if v == "public" { WORLD_GROUP } else { o };
+        let (ok, nk) = (key(old), key(new));
+        if ok == nk {
+            return;
+        }
+        self.changed.extend([ok, nk]);
+        if new.0 != "public" {
+            self.left.insert(ok);
+        }
+    }
+
+    /// One row of `table` went from `old` to `new` in one statement. Only
+    /// `edges` and `evidence` carry 210's row trigger; it compares whole
+    /// signatures (the visibility, and the owner and co-owner when not public).
+    pub fn row(&mut self, table: &str, old: &Tenancy, new: &Tenancy) {
+        if table != "edges" && table != "evidence" {
+            return;
+        }
+        let keys = |t: &Tenancy| -> Vec<Uuid> {
+            if t.visibility == "public" {
+                vec![WORLD_GROUP]
+            } else {
+                std::iter::once(t.owner).chain(t.co_owner).collect()
+            }
+        };
+        let sig = |t: &Tenancy| {
+            if t.visibility == "public" {
+                (t.visibility.clone(), None, None)
+            } else {
+                (t.visibility.clone(), Some(t.owner), t.co_owner)
+            }
+        };
+        if sig(old) == sig(new) {
+            return;
+        }
+        let old_keys = keys(old);
+        self.changed
+            .extend(old_keys.iter().copied().chain(keys(new)));
+        if new.visibility != "public" {
+            self.left.extend(old_keys);
+        }
+    }
+
+    /// Add the epoch rows the recorded changes write to `expect`.
+    ///
+    /// # Errors
+    /// The read of the keys' group kinds fails.
+    pub async fn expect_into(
+        &self,
+        conn: &mut PgConnection,
+        expect: &mut BTreeMap<String, (i64, i64, i64)>,
+    ) -> anyhow::Result<()> {
+        if self.changed.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<Uuid> = self.changed.iter().copied().collect();
+        let maps: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE id = ANY($1) AND kind IN ('world', 'team', 'community')",
+        )
+        .bind(&keys)
+        .fetch_all(&mut *conn)
+        .await
+        .context("reading the kinds of the bumped Atlas maps")?;
+        let (mut ins, mut upd) = (0i64, 0i64);
+        for k in &maps {
+            let row = self.rows.get(k);
+            match row {
+                None => ins += 1,
+                Some((false, _)) => upd += 1,
+                Some((true, _)) => {}
+            }
+            if self.left.contains(k) && !row.is_some_and(|r| r.1) {
+                upd += 1;
+            }
+        }
+        if (ins, upd) != (0, 0) {
+            let e = expect.entry("atlas_map_epochs".into()).or_default();
+            e.0 += ins;
+            e.1 += upd;
+        }
+        Ok(())
+    }
+}
+
 /// Refuse up front, before any manifest or write, when this connection cannot
 /// switch `session_user` to `epigraph_app` — the readability check inside
 /// every batch depends on it, and a run that could only discover that in its

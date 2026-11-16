@@ -125,6 +125,37 @@ pub enum ClaimSortOrder {
 /// the struct: a `total` produced by a different predicate set than the rows
 /// it describes is the defect this type exists to prevent (backlog
 /// `2265a67b`).
+/// A `created_at` window for [`ClaimRepository::list_by_belief_range`]: both
+/// bounds INCLUSIVE, either open. The inclusive spelling is the REST
+/// `GET /api/v1/claims` filter's (`created_after` / `created_before`), so the
+/// two surfaces agree about a row created exactly on a bound.
+///
+/// A struct rather than two more positional `Option<DateTime>` arguments
+/// beside each other, which a call site could swap silently.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedWindow {
+    /// Keep rows with `created_at >= after`.
+    pub after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keep rows with `created_at <= before`.
+    pub before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl CreatedWindow {
+    /// No bound: every `created_at` passes.
+    pub const ANY: Self = Self {
+        after: None,
+        before: None,
+    };
+
+    /// `true` when both bounds are set and `after` is later than `before`, a
+    /// window no row can fall in. Callers refuse it rather than answer an
+    /// empty page that reads as "nothing was created then".
+    #[must_use]
+    pub fn is_inverted(&self) -> bool {
+        matches!((self.after, self.before), (Some(a), Some(b)) if a > b)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ClaimListFilter<'a> {
     /// Case-insensitive `content ILIKE '%search%'`.
@@ -452,6 +483,25 @@ pub struct SemanticNeighborHit {
     pub nb_plausibility: Option<f64>,
     pub similarity: f64,
     pub direction: String,
+}
+
+/// Result row for [`ClaimRepository::semantic_selected_claims`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticSelectedClaim {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub agent_id: Uuid,
+    pub trace_id: Option<Uuid>,
+    /// `labels[1]`.
+    pub claim_type: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub theme_id: Option<Uuid>,
+    /// The claim's cluster in the most recently completed cluster run.
+    pub cluster_id: Option<Uuid>,
+    pub similarity: f64,
 }
 
 /// Result row for [`ClaimRepository::list_by_belief_bounds`].
@@ -2095,6 +2145,12 @@ impl ClaimRepository {
     /// disjunct and the result is unchanged; it becomes load-bearing exactly
     /// when the endpoints are private.
     ///
+    /// # Provenance-only evidence does not ground
+    ///
+    /// The same exclusion as [`Self::has_grounded_evidence`] (derivation rows
+    /// and memorize stamps), spelled here separately; each reader has its own
+    /// test in `grounding_excludes_provenance_evidence.rs`.
+    ///
     /// **The edge marker is defense in depth and is NOT what the acceptance
     /// test proves**, which is stated rather than left for a reader to assume.
     /// Because 070 makes the edge inherit, a private claim's grounding edge is
@@ -2130,6 +2186,13 @@ impl ClaimRepository {
                     AND e.source_type IN ('paper', 'evidence', 'analysis')
                     AND e.relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                     /* {EDGE_VISIBILITY:e} */
+                    AND NOT EXISTS (
+                        SELECT 1 FROM evidence pe
+                        WHERE e.source_type = 'evidence'
+                          AND pe.id = e.source_id
+                          AND (pe.properties ? 'derived_from_claim'
+                               OR pe.properties->>'source' = 'mcp-memorize')
+                    )
               )
               /* {VISIBILITY:c} */
             ORDER BY similarity DESC
@@ -3416,6 +3479,68 @@ impl ClaimRepository {
             3,
         );
         let mut q = sqlx::query_as::<_, SemanticNeighborHit>(&sql)
+            .bind(embedding)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The full result rows of a diverse semantic search: one row per id in
+    /// `claim_ids` that `viewer` may read, with its similarity to `embedding`
+    /// over `embedding_col`, its latest cluster from
+    /// `claim_cluster_membership`, nearest first.
+    ///
+    /// Moved here from an inline `format!`-built statement in `epigraph-api`'s
+    /// `routes/search.rs::semantic_search`, which carried no predicate and was
+    /// safe only by a caller-side derivation: every id came out of one of two
+    /// viewer-spliced theme reads. The predicate here makes the read safe
+    /// whatever its caller hands it, so a third source of ids added later does
+    /// not reopen it. For today's two sources it filters nothing they had not
+    /// already filtered, so the result set is unchanged.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails, or
+    /// `DbError::InvalidData` for an unrecognised `embedding_col`.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_selected_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding_col: &str,
+        embedding: &str,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SemanticSelectedClaim>, DbError> {
+        if embedding_col != "embedding" && embedding_col != "embedding_3072" {
+            return Err(DbError::InvalidData {
+                reason: format!("unsupported embedding column {embedding_col:?}"),
+            });
+        }
+        let sql = viewer.splice(
+            &format!(
+                r#"
+                SELECT c.id, c.content, c.truth_value, c.belief, c.plausibility,
+                       c.agent_id, c.trace_id,
+                       c.labels[1] as claim_type, c.created_at,
+                       c.theme_id,
+                       (
+                           SELECT m.cluster_id
+                           FROM claim_cluster_membership m
+                           JOIN graph_cluster_runs r ON r.run_id = m.run_id
+                           WHERE m.claim_id = c.id
+                           ORDER BY r.completed_at DESC
+                           LIMIT 1
+                       ) AS cluster_id,
+                       1 - (c.{embedding_col} <=> $1::vector) as similarity
+                FROM claims c
+                WHERE c.id = ANY($2)
+                  /* {{VISIBILITY:c}} */
+                ORDER BY c.{embedding_col} <=> $1::vector
+                "#
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, SemanticSelectedClaim>(&sql)
             .bind(embedding)
             .bind(claim_ids);
         if let Some(g) = viewer.group_bind() {
@@ -5607,13 +5732,21 @@ impl ClaimRepository {
     /// text value, never a cast, so an absent or odd `level` cannot raise.
     /// `false` folds the predicate away and leaves the page unchanged.
     ///
+    /// # `window` (backlog `24caecaa`)
+    ///
+    /// [`CreatedWindow`] bounds `created_at` in SQL, inclusive at both ends,
+    /// before `LIMIT`, so `limit` + `offset` page through EVERY claim the
+    /// viewer may read that was created in the window. `recall`'s `since` is
+    /// a semantic top-k narrowed by time, never a complete listing; this is
+    /// the complete one. [`CreatedWindow::ANY`] folds both predicates away.
+    ///
     /// # Bind layout
     ///
-    /// `is_current` occupies `$3` and `exclude_spine` `$6`, so the viewer's
-    /// group bind is `$7`. The group bind is conditional (a `Bypass` or
-    /// elevated viewer binds nothing), so it must stay LAST: were it `$6`, a
-    /// bind-less viewer would leave the statement one value short of the
-    /// `$7` it references.
+    /// `is_current` occupies `$3`, `exclude_spine` `$6` and the window `$7`
+    /// and `$8`, so the viewer's group bind is `$9`. The group bind is
+    /// conditional (a `Bypass` or elevated viewer binds nothing), so it must
+    /// stay LAST: were it `$8`, a bind-less viewer would leave the statement
+    /// one value short of the `$9` it references.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -5624,6 +5757,7 @@ impl ClaimRepository {
         limit: i64,
         offset: i64,
         exclude_spine: bool,
+        window: CreatedWindow,
     ) -> Result<Vec<(Claim, f64)>, DbError> {
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
@@ -5657,6 +5791,8 @@ impl ClaimRepository {
                 FROM claims
                 WHERE ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
                   AND (NOT $6::bool OR COALESCE(properties->>'level', '') NOT IN ('0', '1', '2'))
+                  AND ($7::timestamptz IS NULL OR created_at >= $7)
+                  AND ($8::timestamptz IS NULL OR created_at <= $8)
                   /* {VISIBILITY:claims} */
             ) scored
             WHERE belief_score >= $1 AND belief_score <= $2
@@ -5665,7 +5801,7 @@ impl ClaimRepository {
             "#,
             ]
             .concat(),
-            7,
+            9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(min_belief)
@@ -5673,7 +5809,9 @@ impl ClaimRepository {
             .bind(is_current)
             .bind(limit)
             .bind(offset)
-            .bind(exclude_spine);
+            .bind(exclude_spine)
+            .bind(window.after)
+            .bind(window.before);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -8077,6 +8215,25 @@ impl ClaimRepository {
     /// - `evidence --SUPPORTS-->       claim` (either spelling, `SUPPORTS` or `supports`)
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
+    ///
+    /// # Provenance-only evidence does not ground
+    ///
+    /// Since backlog 2d60f619 every evidence row carries its stored
+    /// `evidence -> claim` edge, including two kinds of row that are
+    /// bookkeeping, not evidence, and are excluded here (and in
+    /// [`Self::grounded_neighborhood`], which spells the same rule):
+    ///
+    /// * a DERIVATION row (`properties ? 'derived_from_claim'`,
+    ///   `EvidenceRepository::record_derivation_conn`): its text is the parent
+    ///   claim's, so it is claim-to-claim propagation by this function's own
+    ///   rule;
+    /// * a MEMORIZE stamp (`properties->>'source' = 'mcp-memorize'`): its text
+    ///   is "stored via MCP memorize tool", the claim's author remembering it.
+    ///
+    /// Before 2d60f619 neither had an edge, so neither grounded; this keeps it
+    /// so. Caller-supplied evidence text (`submit_claim`'s `evidence_data`, a
+    /// packet's evidence, an ingested passage) still grounds, as packet
+    /// evidence always did.
     pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -8091,6 +8248,13 @@ impl ClaimRepository {
                   AND source_type IN ('paper', 'evidence', 'analysis')
                   AND relationship IN ('asserts', 'SUPPORTS', 'supports', 'concludes', 'provides_evidence')
                   /* {EDGE_VISIBILITY:edges} */
+                  AND NOT EXISTS (
+                      SELECT 1 FROM evidence pe
+                      WHERE edges.source_type = 'evidence'
+                        AND pe.id = edges.source_id
+                        AND (pe.properties ? 'derived_from_claim'
+                             OR pe.properties->>'source' = 'mcp-memorize')
+                  )
             )
             "#,
             2,
@@ -11582,40 +11746,102 @@ mod label_tests {
     }
 }
 
-/// How a consolidation restates its sources. Recorded in
-/// `properties.merge.mode`; the server does not interpret it — the caller
-/// supplies the synthesized content either way.
+/// What a consolidation does to its sources (backlog 22602dd8). Three
+/// explicit modes, because "these claims are the same" and "these claims
+/// together say something new" are different acts with different reversals:
+///
+/// - [`Self::Identity`]: the sources are restatements of one of them, the
+///   caller-chosen survivor. Each other source is marked a duplicate of the
+///   survivor through the dedup act (`mark_duplicate`), so it gets the
+///   identity edge, its belief inputs pool onto the survivor, and it can be
+///   un-marked. No new claim is written. The merge act below refuses this
+///   mode: the MCP `consolidate_claims` tool runs the dedup act per source.
+/// - [`Self::Merge`]: the sources are complementary, not duplicates. A new
+///   merged claim is written and every source is retired into it.
+/// - [`Self::Abstract`]: a new, higher-level claim generalises the sources.
+///   It is linked to each source by a `generalizes` edge, and nothing is
+///   retired: the sources stay current and keep their edges.
+///
+/// Recorded in `properties.merge.mode` on the new claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsolidateMode {
-    /// Combined restatement of all sources.
+    /// Mark every non-survivor source a duplicate of the survivor.
+    Identity,
+    /// A new merged claim; every source is retired into it.
     Merge,
-    /// Higher-level generalisation over the sources.
+    /// A new generalisation; the sources stay current.
     Abstract,
-    /// Refined restatement (typically N=2, near-identical inputs).
-    Rewrite,
 }
 
 impl ConsolidateMode {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Identity => "identity",
             Self::Merge => "merge",
             Self::Abstract => "abstract",
-            Self::Rewrite => "rewrite",
         }
     }
 
-    /// Parse a wire-format mode string.
+    /// Whether this mode retires its sources into a new claim.
+    #[must_use]
+    pub fn retires_sources(self) -> bool {
+        matches!(self, Self::Merge)
+    }
+
+    /// Parse a wire-format mode string. `rewrite`, a former mode that
+    /// behaved exactly as a merge, is still accepted and means [`Self::Merge`].
     ///
     /// # Errors
     /// Returns the offending string when it is not a known mode.
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "merge" => Ok(Self::Merge),
+            "identity" => Ok(Self::Identity),
+            "merge" | "rewrite" => Ok(Self::Merge),
             "abstract" => Ok(Self::Abstract),
-            "rewrite" => Ok(Self::Rewrite),
             other => Err(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod consolidate_mode_tests {
+    use super::ConsolidateMode;
+
+    #[test]
+    fn the_three_modes_parse_and_rewrite_is_a_merge() {
+        assert_eq!(
+            ConsolidateMode::parse("identity"),
+            Ok(ConsolidateMode::Identity)
+        );
+        assert_eq!(
+            ConsolidateMode::parse(" Merge "),
+            Ok(ConsolidateMode::Merge)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("rewrite"),
+            Ok(ConsolidateMode::Merge)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("abstract"),
+            Ok(ConsolidateMode::Abstract)
+        );
+        assert_eq!(
+            ConsolidateMode::parse("obliterate"),
+            Err("obliterate".to_string())
+        );
+        // `rewrite` is an alias, not a fourth recorded mode.
+        assert_eq!(
+            ConsolidateMode::parse("rewrite").map(ConsolidateMode::as_str),
+            Ok("merge")
+        );
+    }
+
+    #[test]
+    fn only_merge_retires_its_sources() {
+        assert!(ConsolidateMode::Merge.retires_sources());
+        assert!(!ConsolidateMode::Abstract.retires_sources());
+        assert!(!ConsolidateMode::Identity.retires_sources());
     }
 }
 
@@ -11771,7 +11997,9 @@ impl ClaimRepository {
             acting_agent_id,
         )
         .await?;
-        if !result.already_existed {
+        // Only a merge retires its sources, so only a merge has edges to move:
+        // an abstraction leaves every source current with its edges.
+        if !result.already_existed && mode.retires_sources() {
             let m = migrate_consolidated_edges(&mut tx, result.merged_id, source_ids).await?;
             result.edges_migrated = m.migrated.len() as u64;
             result.edges_deduped = m.retracted.len() as u64;
@@ -11781,8 +12009,15 @@ impl ClaimRepository {
     }
 
     /// The consolidation's own act, and nothing else: validate and lock the
-    /// sources, insert the merged claim, retire every source (`supersedes =
-    /// merged`) and insert the `supersedes` edges merged → source.
+    /// sources, insert the new claim, and then by mode:
+    ///
+    /// - [`ConsolidateMode::Merge`]: retire every source (`supersedes =
+    ///   merged`) and insert the `supersedes` edges merged → source.
+    /// - [`ConsolidateMode::Abstract`]: retire nothing; insert a
+    ///   `generalizes` edge abstraction → source for each source.
+    /// - [`ConsolidateMode::Identity`] is refused (input): it writes no new
+    ///   claim, and runs as the dedup act per source instead
+    ///   ([`Self::mark_duplicate_act_attributed_conn`]).
     ///
     /// Every row it writes is one the consolidating caller authors or must be
     /// able to write (the merged claim, its own sources, the edges between
@@ -11813,6 +12048,18 @@ impl ClaimRepository {
     ) -> Result<ConsolidateResult, DbError> {
         use sqlx::Acquire;
         let refused = |kind: crate::RefusalKind, m: String| DbError::Refused { kind, message: m };
+
+        if mode == ConsolidateMode::Identity {
+            // Input: identity writes no new claim. Each non-survivor source is
+            // marked a duplicate of the survivor through the dedup act, which
+            // records the identity edge this act does not and can be un-marked.
+            return Err(refused(
+                crate::RefusalKind::Input,
+                "consolidate: mode 'identity' writes no new claim; mark each non-survivor \
+                 source a duplicate of the survivor (mark_duplicate) instead"
+                    .into(),
+            ));
+        }
 
         if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES
         {
@@ -11884,7 +12131,9 @@ impl ClaimRepository {
                     format!("consolidate: source {} is not current", r.id),
                 ));
             }
-            if r.supersedes.is_some() {
+            // Only a merge re-points `supersedes`; an abstraction may
+            // generalise a revision successor, which keeps its own pointer.
+            if mode.retires_sources() && r.supersedes.is_some() {
                 return Err(refused(
                     crate::RefusalKind::State,
                     format!(
@@ -12097,22 +12346,43 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Retire sources. One statement: chk_deprecated_no_embedding (migration
-        // 052) is a per-statement CHECK, so is_current=false and both
-        // embedding=NULL / embedding_3072=NULL must land together.
-        sqlx::query!(
-            r#"
+        // Retire sources (a merge only). One statement:
+        // chk_deprecated_no_embedding (migration 052) is a per-statement
+        // CHECK, so is_current=false and both embedding=NULL /
+        // embedding_3072=NULL must land together.
+        if mode.retires_sources() {
+            sqlx::query!(
+                r#"
             UPDATE claims
             SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL, updated_at = NOW()
             WHERE id = ANY($2)
             "#,
-            merged_id,
-            source_ids,
-        )
-        .execute(&mut *tx)
-        .await?;
+                merged_id,
+                source_ids,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
 
-        // Reverse fan-out: merged → each source, mirroring supersede()'s edge.
+        // Reverse fan-out, new claim → each source: a merge's `supersedes`
+        // (mirroring supersede()'s edge), an abstraction's `generalizes`.
+        let relationship = if mode.retires_sources() {
+            "supersedes"
+        } else {
+            "generalizes"
+        };
+        let mut edge_props = serde_json::json!({
+            "reason": reason,
+            "mode": mode.as_str(),
+            "merged_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if !mode.retires_sources() {
+            // An abstraction's default confidence is derived from its sources,
+            // so its `generalizes` edge must not feed that belief back into
+            // them: the belief readers (the factor backfill, the sheaf) skip
+            // an edge marked this way.
+            edge_props[crate::repos::edge::MOVES_BELIEF_PROPERTY] = serde_json::Value::Bool(false);
+        }
         for src in source_ids {
             crate::repos::edge::EdgeRepository::create_signed_conn(
                 &mut tx,
@@ -12121,12 +12391,8 @@ impl ClaimRepository {
                 "claim",
                 *src,
                 "claim",
-                "supersedes",
-                Some(serde_json::json!({
-                    "reason": reason,
-                    "mode": mode.as_str(),
-                    "merged_at": chrono::Utc::now().to_rfc3339(),
-                })),
+                relationship,
+                Some(edge_props.clone()),
                 None,
                 None,
             )
@@ -12137,7 +12403,11 @@ impl ClaimRepository {
 
         Ok(ConsolidateResult {
             merged_id,
-            superseded: source_ids.to_vec(),
+            superseded: if mode.retires_sources() {
+                source_ids.to_vec()
+            } else {
+                Vec::new()
+            },
             edges_migrated: 0,
             edges_deduped: 0,
             already_existed: false,

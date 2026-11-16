@@ -473,6 +473,7 @@ async fn workflow_outcome_rows_are_reported_and_excludable_apart(pool: PgPool) {
             outcome_details: "b96 outcome".to_string(),
             quality: Some(0.8),
             goal_text: None,
+            idempotency_key: None,
         },
         None,
     )

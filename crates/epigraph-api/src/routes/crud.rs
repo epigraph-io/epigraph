@@ -360,7 +360,14 @@ pub async fn create_evidence(
         ClaimId::from_uuid(request.claim_id),
     );
 
-    let created = EvidenceRepository::create(&state.db_pool, &evidence).await?;
+    // With its `evidence -> claim` edge, in the evidence's own transaction
+    // (backlog 2d60f619). The request names no direction: `supports`.
+    let created = EvidenceRepository::create(
+        &state.db_pool,
+        &evidence,
+        epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
+    )
+    .await?;
     let evidence_id: Uuid = created.id.into();
 
     // Materialize claim --DERIVED_FROM--> evidence edge
@@ -2137,14 +2144,7 @@ pub async fn create_theme_with_centroid(
     // vectors for it to average itself.
     match request.centroid.as_ref().filter(|c| !c.is_empty()) {
         Some(centroid) => {
-            let centroid_str = format!(
-                "[{}]",
-                centroid
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let centroid_str = epigraph_db::pgvector_literal(centroid);
             ClaimThemeRepository::set_centroid(&mut *tx, theme.id, &centroid_str)
                 .await
                 .map_err(map)?;

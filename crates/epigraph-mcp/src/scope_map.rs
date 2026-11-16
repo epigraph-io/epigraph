@@ -37,6 +37,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("embedding_neighborhood_density", "claims:read"),
     ("entity_neighborhood", "claims:read"),
     ("evaluate_workflow_promotion", "claims:read"),
+    // PROV-O JSON-LD export (backlog 4ba388eb): SELECTs only, on the caller's
+    // viewer-stamped read, so a read-scoped principal can export what it can read.
+    ("export_provenance_prov_o", "claims:read"),
     ("find_agent", "claims:read"),
     ("find_cross_source_matches", "claims:read"),
     ("find_workflow", "claims:read"),
@@ -79,10 +82,18 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("plan_label_dedup", "claims:read"),
     ("probe_label_dedup", "claims:read"),
     ("label_dedup_index_view", "claims:read"),
+    // Abbreviated-id resolution and the citation lint (backlog 30d8b667):
+    // viewer-stamped SELECTs only.
+    ("lint_claim_id_citations", "claims:read"),
+    ("resolve_claim_id_prefix", "claims:read"),
     ("query_claims_by_methodology", "claims:read"),
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
     ("query_undecomposed_claims", "claims:read"),
+    // The atomicity screen (backlogs 72850d43, c4a8436b): viewer-stamped
+    // SELECTs plus a text heuristic; nothing is written.
+    ("query_compound_claims", "claims:read"),
+    ("screen_claim_atomicity", "claims:read"),
     ("recall", "claims:read"),
     ("recall_with_context", "claims:read"),
     // Proposes interval corrections from a viewer-stamped read and writes
@@ -301,6 +312,31 @@ mod tests {
         // The k-means writer is retired (backlog a0ed0180): what remains is a
         // refusal, mapped at the read scope so every caller sees the reason.
         assert_eq!(required_scope("theme_cluster"), Some("claims:read"));
+    }
+
+    /// The backlog batch B41 read tools write nothing, so a read-scoped
+    /// principal reaches them. Asserted by name: their tests call the tool
+    /// functions directly, past the router's scope check, and the coverage
+    /// test passes for any mapping.
+    #[test]
+    fn b41_read_tools_are_read_scoped() {
+        for tool in [
+            "claim_context",
+            "export_provenance_prov_o",
+            "lint_claim_id_citations",
+            "resolve_claim_id_prefix",
+        ] {
+            assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
+        }
+    }
+
+    /// The atomicity screen's tools write nothing. Asserted by name for the
+    /// same reason as the B41 tools above.
+    #[test]
+    fn atomicity_screen_tools_are_read_scoped() {
+        for tool in ["query_compound_claims", "screen_claim_atomicity"] {
+            assert_eq!(required_scope(tool), Some("claims:read"), "{tool}");
+        }
     }
 
     /// `verify_claim`, `reconcile_sheaf` and `stage_claims` write nothing: the

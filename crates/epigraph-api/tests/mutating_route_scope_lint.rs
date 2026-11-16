@@ -198,10 +198,7 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
         "elevation::end_elevation",
         Exempt("ends the caller's own elevation session; narrows authority, never widens it"),
     ),
-    (
-        "embeddings::neighborhood_density",
-        Exempt(RAW_POOL_READ_POST),
-    ),
+    ("embeddings::neighborhood_density", Exempt(READ_ONLY_POST)),
     ("entities::batch_create_mentions", Scope("claims:write")),
     ("entities::batch_create_triples", Scope("claims:write")),
     ("entities::create_entity", Scope("claims:write")),

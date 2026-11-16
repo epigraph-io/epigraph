@@ -3,5 +3,6 @@
 //! merged by `app::build_app`.
 
 pub mod atlas;
+pub mod atlas_nested;
 pub mod core;
 pub mod graph;

@@ -1237,7 +1237,12 @@ pub(crate) async fn create_claim_core(
     // exist without the claim (nor the claim, on this request, without it).
     if let Some(ref d) = request.derived_from {
         match epigraph_db::EvidenceRepository::record_derivation_conn(
-            &mut tx, viewer, claim_uuid, d.claim_id, &d.method,
+            &mut tx,
+            viewer,
+            state.edge_signing_key(),
+            claim_uuid,
+            d.claim_id,
+            &d.method,
         )
         .await?
         {
@@ -1317,14 +1322,7 @@ pub(crate) async fn create_claim_core(
         if let Some(embedder) = state.storing_embedding_service() {
             match embedder.generate(&request.content).await {
                 Ok(embedding) => {
-                    let pgvector_str = format!(
-                        "[{}]",
-                        embedding
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
+                    let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                     // On the authority that wrote the claim (the caller's
                     // stamp), never the unstamped `db_pool`, where row
                     // security refused this UPDATE for every writer
@@ -2338,15 +2336,7 @@ pub async fn update_claim(
 
     // Update embedding if provided (used by backfill_embeddings.py)
     if let Some(ref embedding) = request.embedding {
-        // Convert Vec<f32> to pgvector literal format: "[0.1,0.2,...]"
-        let pgvector = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let pgvector = epigraph_db::pgvector_literal(embedding);
         ClaimRepository::store_embedding(&state.db_pool, id, &pgvector)
             .await
             .map_err(|e| ApiError::DatabaseError {

@@ -142,6 +142,7 @@ async fn store(server: &EpiGraphMcpFull, step: &str) -> Result<String, String> {
         server,
         &viewer,
         StoreWorkflowParams {
+            force_new: None,
             tenancy: None,
             goal: goal.clone(),
             steps: vec![step.to_string()],
@@ -702,7 +703,7 @@ async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
 fn document(
     authors: &[&str],
     source_text: Option<&str>,
-) -> epigraph_ingest::schema::DocumentExtraction {
+) -> epigraph_ingest::document::schema::DocumentExtraction {
     let tag = Uuid::new_v4();
     serde_json::from_value(serde_json::json!({
         "source": {

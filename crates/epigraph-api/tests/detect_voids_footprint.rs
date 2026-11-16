@@ -16,13 +16,10 @@ use axum::extract::State;
 use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::voids::{detect_voids, DetectVoidsRequest, MAX_VOID_CONCEPTS};
-use epigraph_embeddings::{
-    EmbeddingError, EmbeddingService, MockProvider, SimilarClaim, TokenUsage,
-};
+use epigraph_embeddings::{EmbeddingError, EmbeddingService, MockProvider, TokenUsage};
 use search_fixture::*;
 use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
-use uuid::Uuid;
 use viewer_fixture::{seed_agent_with_group, seed_group_claim};
 
 /// The shared mock, plus the footprint probe's record.
@@ -48,20 +45,6 @@ impl EmbeddingService for OccupancyProbe {
     async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         self.record();
         self.inner.batch_generate(texts).await
-    }
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.inner.store(claim_id, embedding).await
-    }
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.inner.get(claim_id).await
-    }
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.inner.similar(embedding, k, min_similarity).await
     }
     fn dimension(&self) -> usize {
         self.inner.dimension()

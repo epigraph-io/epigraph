@@ -46,6 +46,26 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/atlas_layout.rs",
     ),
     (
+        "atlas_links",
+        Some(env!("CARGO_BIN_EXE_atlas_links")),
+        "src/bin/atlas_links.rs",
+    ),
+    (
+        "atlas_meaning",
+        Some(env!("CARGO_BIN_EXE_atlas_meaning")),
+        "src/bin/atlas_meaning.rs",
+    ),
+    (
+        "atlas_naming",
+        Some(env!("CARGO_BIN_EXE_atlas_naming")),
+        "src/bin/atlas_naming.rs",
+    ),
+    (
+        "atlas_nightly",
+        Some(env!("CARGO_BIN_EXE_atlas_nightly")),
+        "src/bin/atlas_nightly.rs",
+    ),
+    (
         "backfill_dedup_identity_edges",
         Some(env!("CARGO_BIN_EXE_backfill_dedup_identity_edges")),
         "src/bin/backfill_dedup_identity_edges.rs",

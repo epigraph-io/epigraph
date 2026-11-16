@@ -1256,6 +1256,8 @@ async fn run_batch(
     // Narrowing a public claim bumps the Atlas layout epoch once per
     // transaction (migration 197); whether this batch is that first narrowing.
     let epoch_bump_due = tables::layout_epoch_bump_due(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
     let moved = sqlx::query(
         // No `owner_group_id IS DISTINCT FROM $2`: a public claim the target
@@ -1456,6 +1458,22 @@ async fn run_batch(
         // Migration 197's trigger: one bump for the transaction's first
         // public-to-non-public narrowing, however many rows narrowed.
         expect_counts.insert("atlas_layout_epoch".into(), (0, 1, 0));
+    }
+    // Migration 210's map epochs: the claims statement, then each row in the
+    // one step the census above counts it.
+    if let Some(me) = map_epochs.as_mut() {
+        let before: BTreeMap<Uuid, &ClaimRow> = eligible.iter().map(|c| (c.id, c)).collect();
+        for c in &after_claims {
+            if let Some(b) = before.get(&c.id) {
+                me.claim((&b.visibility, b.owner), (&c.visibility, c.owner));
+            }
+        }
+        for (k, a) in &s0 {
+            if let Some(got) = s2.get(k) {
+                me.row(&k.0, &a.tenancy, &got.tenancy);
+            }
+        }
+        me.expect_into(conn, &mut expect_counts).await?;
     }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
@@ -2118,6 +2136,9 @@ async fn reverse_batch(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = app_readable(conn, specs, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
+    let claims_prior = fetch_claims(conn, &claim_ids, false).await?;
 
     // ---- claims: the ONE widening statement, the GUC armed around it only ----
     let payload: Vec<Value> = work
@@ -2346,6 +2367,24 @@ async fn reverse_batch(
         expect_counts.entry(t.clone()).or_default().1 += n;
     }
     expect_counts.retain(|_, d| *d != (0, 0, 0));
+    // Migration 210's map epochs: the claims statement, then each row as the
+    // trigger left it and as the restore wrote it.
+    if let Some(me) = map_epochs.as_mut() {
+        let prior: BTreeMap<Uuid, &ClaimRow> = claims_prior.iter().map(|c| (c.id, c)).collect();
+        for c in &after {
+            if let Some(b) = prior.get(&c.id) {
+                me.claim((&b.visibility, b.owner), (&c.visibility, c.owner));
+            }
+        }
+        for (k, a) in &s0 {
+            let (Some(mid), Some(got)) = (s1.get(k), s2.get(k)) else {
+                continue;
+            };
+            me.row(&k.0, &a.tenancy, &mid.tenancy);
+            me.row(&k.0, &mid.tenancy, &got.tenancy);
+        }
+        me.expect_into(conn, &mut expect_counts).await?;
+    }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
         &expect_counts,

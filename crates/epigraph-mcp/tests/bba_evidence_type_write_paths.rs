@@ -174,6 +174,7 @@ async fn report_workflow_outcome_stores_the_canonical_key_of_its_observation(poo
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: claim_id.to_string(),
             success: true,
             execution_log: vec![StepExecution {

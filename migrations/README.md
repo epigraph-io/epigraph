@@ -2654,6 +2654,68 @@ restart.
   the 209 binary together (a 206..208 binary ignores `default_private`), then
   set private defaults; undo only after rolling every 209 binary back.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **210**: public `atlas_team_layout` (Atlas W2; backlog 77f4bf09, design
+  `docs/superpowers/specs/2026-11-12-atlas-nested-groups-and-subgraph-view-design.md`).
+  Per-team Atlas map storage beside 197's public-only tables. A map is a team
+  or community group's (`('group', T)`, read by T's members) or the public
+  map (`('public', world)`, read by every session, an unstamped one
+  included). Three tier-A tables, each with no-default tenancy columns,
+  074's require-tenancy trigger, 115's owner guard plus a visibility guard,
+  the standard `<table>_tenancy` policy (ENABLEd and FORCEd) and 115's
+  restrictive `<table>_delete_owner`: `atlas_map_epochs` (per map, `n` and
+  `left_n` with the `xid8` of the transaction that last bumped each),
+  `atlas_map_runs` (one build of one map, unfinished until `finished_at`,
+  recording the map's and the public map's four counters) and
+  `atlas_map_levels` (one opaque `jsonb` document per (run, hierarchy in
+  {meaning, links}, group id) with `schema_version`, `parent_group_id`,
+  `theme_id` (FK to `claim_themes` ON DELETE CASCADE) and `level`; the
+  primary key makes a level one probe, and a composite FK pins each level to
+  its run's tenancy). The application role holds SELECT only. Staleness: the
+  statement-level `claims_atlas_map_stale` (transition tables, beside 070's
+  cascade) and the row-level `edges_atlas_map_stale` and
+  `evidence_atlas_map_stale` (AFTER UPDATE, no column list, `WHEN` the
+  signature changed) call the definer `epigraph_atlas_map_bump`: `n` for
+  every key of a row's old and new signature (world for public, else the
+  owner and an edge's co-owner), `left_n` for the old keys unless the row
+  went public, team/community and world keys only, at most once per counter
+  per map per transaction (the stored `xid8` markers, which the cascade's
+  nested edge and evidence updates then find already set). All four
+  functions are on 172's `pg_catalog, pg_temp` form, owned by
+  `epigraph_maintenance`, EXECUTE revoked from PUBLIC. 197's epoch and
+  triggers are untouched. Registered in every tier-A ratchet (the four
+  FORCE-set copies, the tenancy counts, the delete census, the elevation
+  census, the materialization register). Pinned by
+  `epigraph-db/tests/atlas_map_repo.rs` and `atlas_map_undo.rs`. Undo:
+  `docs/runbooks/210-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 210); it LOSES every stored map. Checked before claiming:
+  no migration on main or an open PR head carries a `210`. **Deploy order:**
+  migrate before or with a binary that lists the three tables in
+  `FORCE_PROTECTED_SET` (173's order); creating the `claims`, `edges` and
+  `evidence` triggers needs their locks within the 3 s `lock_timeout`, so on
+  a busy table it may need a rerun. Undo only after rolling back every binary
+  that reads the tables. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **211**: public `bug_report_evidence_edge` (backlog 2d60f619; the Atlas
+  leaf view draws stored `evidence -> claim` edges only, so every evidence
+  write stores one). Redefines 207's SECURITY DEFINER
+  `epigraph_submit_bug_report` with ONE added statement: after the evidence
+  INSERT, a `supports` edge from that evidence row to the report's claim,
+  inside a transaction-local search_path window (206's pattern; without it
+  the `edges` triggers' unqualified helpers raise 42883 under the definer's
+  `pg_catalog, pg_temp` path). The edge is owned like the evidence and the
+  claim (the intake group, `group`), so it discloses nothing the evidence
+  row does not. Owner and EXECUTE grant re-asserted as 209 does. It writes
+  no data on migrate and only redefines a function body, so its order
+  against `210` (another branch) does not matter. Pinned by
+  `epigraph-db/tests/bug_report_intake.rs`
+  (`the_reports_evidence_carries_a_private_supports_edge`) and the SQL arm
+  of `epigraph-db/tests/evidence_insert_writes_claim_edge.rs`; the edge is
+  registered `Unsigned` in `edge_writer_signing_ratchet.rs` (the definer
+  holds no key). Undo: re-apply 207's definition of the function. Checked
+  before claiming: no migration on main, open PR or origin branch carries a
+  `211`. **Deploy order:** migrate with the binary of this change; an older
+  binary is unaffected (the function's signature is unchanged).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 - **212**: public `sealed_row_vector_guard` (backlog f78526ad; closes the
   tenancy register's `D-SEAL-vector-column-row-guard`). Two `BEFORE UPDATE OF
   embedding, embedding_3072` triggers, `claims_refuse_sealed_vector` and
@@ -2916,6 +2978,69 @@ restart.
   INSERT). Checked before claiming: slot 218 assigned to this batch;
   no migration on main carries a `218`. **Applied to throwaway databases only,
   NOT to any deployed database.**
+- **221**: public `workflow_outcome_reports` (backlog 9928b61f). One row per
+  hierarchical outcome report (`report_hierarchical_outcome`, the hierarchical
+  branch of `report_workflow_outcome`, `POST
+  /api/v1/workflows/hierarchical/:id/outcome`), written on the report's
+  caller-stamped transaction with its counters and step rows: what it said
+  (`success`, `quality`, `run_label`, `outcome_details`, which used to be
+  dropped), an optional `idempotency_key` (unique per workflow, reporter and
+  key, `NULLS NOT DISTINCT`, partial on keyed rows) and the transport-neutral
+  `result` a retry with that key is answered with. FK to `workflows` (`ON
+  DELETE CASCADE`). Row security ENABLEd and FORCEd, inherited from the
+  workflow row: the read and insert policies are `EXISTS` over `workflows`,
+  which `workflows_read` filters; the application role holds SELECT and
+  INSERT only; 126's three elevated refusals as on `workflows` (census class
+  T-PLAN); 166's `role_agent_write_check` statement trigger on the table, so
+  `tenancy_backfill verify` finds no app-writable table without it. Pinned by
+  `epigraph-db/tests/workflow_outcome_reports_tenancy.rs`
+  (on the application role), `epigraph-db/tests/elevation_arms_census.rs`,
+  and the idempotency tests in `epigraph-mcp`'s `tools::workflow_hierarchical`
+  and `epigraph-api`'s `routes::workflows`. Undo:
+  `docs/runbooks/221-undo.sql` (drops the table and every stored report).
+  **Deploy order:** migrate before rolling out a 221 binary (it writes the
+  table on every hierarchical report); undo only after rolling every 221
+  binary back. **Applied to throwaway databases only, NOT to any deployed
+  database.**
+- **222**: public `cluster_centroids_umap_centroid` (backlog 58452334; slot
+  assigned to backlog batch B38). `scripts/cluster_claims.py` stored its 32-d
+  UMAP k-means centroids zero-padded into `cluster_centroids.centroid
+  vector(1536)`. Adds `umap_centroid vector(32)`, backfills it from every row
+  whose elements 33..1536 are zero (a row with a non-zero tail is left NULL,
+  not truncated; the script refuses to load its run), drops NOT NULL on the
+  legacy `centroid` (no writer after this change; kept for the undo and a later
+  drop) and adds CHECK `cluster_centroids_has_a_centroid`. No index, policy,
+  grant or tenancy change (not tier-A; 118's table-level grants cover the
+  column). Idempotent. The header carries a read-only census. Pinned by
+  `epigraph-db/tests/cluster_centroids_umap_undo.rs` and
+  `tests/theme/test_cluster_centroids_umap.py`. Undo:
+  `docs/runbooks/222-undo.sql` (tested: run twice, it returns the
+  `cluster_centroids` catalog to below 222 and re-pads rows written after 222
+  so `centroid` can be NOT NULL again); it leaves the `_sqlx_migrations` row.
+  **Deploy order:** migrate before running the 222 `cluster_claims.py` (it
+  writes and reads only `umap_centroid`); undo only after rolling the script
+  back. **Applied to throwaway databases only, NOT to any deployed database.**
+- **226**: public `paper_licence` (backlog 8709d128). Adds the nullable
+  `papers.licence text` (an SPDX-style identifier; NULL = unknown) with the
+  CHECK `papers_licence_nonblank` (refuses an empty or padded value). The
+  document ingest writers (`do_ingest_document`, `do_ingest_document_spine`)
+  READ it to decide whether an evidence row may keep the verbatim source
+  passage (`passage_retention_permitted`: an exact allowlist of public
+  domain, CC0, CC BY and CC BY-SA SPDX ids; never NC/ND, and free text fails
+  closed); otherwise the row carries the citation, a locator and the
+  passage's BLAKE3 hash only. Ingest never writes the column; by convention
+  an operator sets it (not enforced: the application role keeps UPDATE on
+  the REGISTRY table `papers`). `papers` carries no tenancy, so no policy
+  changes. Sets `lock_timeout = '3s'`. **Scope:** evidence rows only; a
+  level-2 paragraph claim's `content` still holds the paragraph text. The
+  locator's byte span (a reproducible hash check) exists for Tier-1
+  extractions only.
+  Pinned by `epigraph-mcp/tests/ingest_evidence_passage_retention.rs`. Undo:
+  `docs/runbooks/226-undo.sql` (loses every recorded licence; roll back every
+  226 binary first). **Deploy order:** migrate before rolling out the 226
+  binary (it reads the column on every document ingest). Stripping passages
+  already stored is a separate operator data repair. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 - **227**: public `sealed_public_race_lock` (backlog e8f9c07e). Re-states
   176's `epigraph_no_public_sealed()` (the PRV01 trigger body on
   `claim_encryption`) so its read of `claims.visibility` is `FOR NO KEY UPDATE OF c`
@@ -2947,6 +3072,34 @@ restart.
   no migration on main or on an origin branch carries a `227`. **Deploy
   order:** none; no binary depends on it. **Applied to throwaway databases
   only, NOT to any deployed database.**
+- **228**: public `mass_functions_locality_tag_width` (backlog 01807a57).
+  Widens 045's `mass_functions.locality_tag` from `varchar(20)` to
+  `varchar(64)`: the engine-named `intra_methodological_overlap` (28
+  characters) failed the INSERT with 22001, which `submit_ds_evidence`
+  reported as an internal error. Bounded, not `text`; the MCP surface refuses
+  a longer stored tag as `invalid_params` before the write
+  (`epigraph_mcp::tools::ds::LOCALITY_TAG_MAX_CHARS`, the same number).
+  The widening is binary-coercible, so neither the table nor
+  `idx_mass_functions_locality_tag` is rewritten. PostgreSQL refuses ALTER
+  COLUMN TYPE on a column a trigger's WHEN reads, so 184's
+  `mass_functions_retracted_rewrite_guard` is dropped and re-created around
+  the ALTER with 184's definition verbatim. No function, grant, policy or
+  index changes. Pinned by
+  `epigraph-db/tests/mass_function_locality_tag_width.rs` (the 28-character
+  tag stores at 228 and fails below it, 65 characters still fails, the
+  trigger definition is identical to 184's and still refuses RT07, and the
+  undo) and `epigraph-mcp/tests/locality_tag_width.rs`. Undo:
+  `docs/runbooks/228-undo.sql` (tested: run twice, it returns the column to
+  `varchar(20)` with the trigger intact; it refuses, writing nothing, while a
+  row holds a tag over 20 characters). A retracted row cannot be re-tagged
+  (184) and is removed only by 194's purge, so once a retracted row holds a
+  tag over 20 characters 228 is forward-only. Checked before claiming: slot 228 is
+  this batch's assignment, and no migration on main or any origin branch
+  carries a `228`. **Deploy order:** migrate first; a 228 binary running on an
+  unmigrated database still gets 22001 (an internal error) for a 21-64
+  character tag, as today, and nothing else changes. Undo only after rolling
+  the 228 binary back. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

@@ -155,7 +155,7 @@ const UNSTAMPED: &[(&str, usize)] = &[
     ("community.rs", 1),
     // 6 before the W12b revise, which stamped `share_skill`'s and
     // `forget_convention`'s in-scope edge statements.
-    ("conventions.rs", 4),
+    ("conventions.rs", 3),
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
@@ -179,7 +179,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
 ///
 /// 27 -> 26 (backlog f64cf9c6): `create_reasoning_trace` was stamped and its
 /// `crud.rs` row fell 2 -> 1.
-const HIGH_WATER: usize = 26;
+/// 26 -> 25 (backlog 2d60f619, merged on staging batch 4): `learn_convention`'s
+/// evidence -> claim edge moved into the evidence write (`conventions.rs` 4 -> 3).
+const HIGH_WATER: usize = 25;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

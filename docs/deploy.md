@@ -457,7 +457,7 @@ For the others, anything else is off.
 | `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | Period of the federation health timer: an unhealthy extension is re-dialled, a healthy one has its tool list re-read (and is demoted if it no longer answers). |
 | `EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS` | `300` | Longest a proxied federated `tools/call` may take before the gateway abandons it and answers the caller with a timeout. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
-| `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio only. After the client disconnects, how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. `0` exits at once and abandons that work. |
+| `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio, and the operator `ingest-document` CLI. After the client disconnects (or, for the CLI, after its walk returns), how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. `0` exits at once and abandons that work. |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
 | `RUST_LOG` | `epigraph_mcp=info,tenancy=info` | Log filter, to stderr. `rmcp*` is capped at INFO regardless. |
 | `CALIBRATION_PATH`, the belief-mode variables | as for the API | |
@@ -499,6 +499,7 @@ not to the API.
 | `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims`, `scripts/_api_client.py` (section 7) | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
+| `CALIBRATION_PATH` | `scripts/run_assessment_worker.py` and `scripts/lib/tiered_enrichment.py::auto_tier` | The file whose `[conformal.quantiles]` Tier-1 routing reads; unset, the repository's `calibration.toml`. Unlike the Rust binaries, the scripts have no compiled-in copy to fall back to: a missing file or one without `[conformal.quantiles]` is an error, and the worker exits at startup (also under `--dry-run`). |
 
 ### Optional LLM, rerank and NLI integrations
 
@@ -2411,6 +2412,14 @@ epigraph-operator restrict-claims ... --manifest-out restrict-1.jsonl --apply \
 epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 ```
 
+- **A crashed run's manifest**: a run that crashed mid-append can leave a torn
+  final line, which `reown-reverse` refuses unless `--allow-truncated-tail`
+  (on any manifest it reads). Every record of the torn batch
+  is phantom, because its batch never committed. First prove from the
+  database that that batch rolled back. Then reverse the crashed manifest
+  TOGETHER with every manifest a resumed run wrote, in one `reown-reverse`
+  call, dry run first and then `--apply`: it applies them newest first, so the
+  crashed manifest cannot restore rows a later run moved again.
 - **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
   public owners, including the target itself: a public claim the target
   already owns is narrowed in place, owner unchanged). The target must be an existing `active` group, not world or
@@ -2785,12 +2794,33 @@ the flags.
 | Area | Verbs |
 |---|---|
 | Humans and links | `register-human-operator`, `revoke-human-operator`, `link`, `retire-link`, `link-retired`, `link-legacy-authors`, `arm-operator-binding`, `register-system-agent`, `allow-author-binding-client`, `revoke-author-binding-client` |
-| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse` |
+| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse`, `set-workflow-submitter` (and its `--reverse`) |
 | Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede` |
 | Groups | `create-group`, `group-member add\|remove\|set-role`, `define-group-role`, `bind-group-role`, `end-group-role-binding`, `group-roster` |
 | Passkeys and elevation | `passkey-enroll`, `list-passkeys`, `revoke-passkey`, `end-elevation`, `list-elevations`, `verify-confirmations` |
-| OAuth clients and scopes | `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
+| OAuth clients and scopes | `approve-client`, `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
 | Data hygiene | `delete-frames` |
+
+**`grant-role`: measure, then pick the variant.** The database decides which
+flags a grant needs, and a runbook cannot know in advance:
+
+1. `epigraph-operator list-role-assignments --role role:platform-custodian`.
+   With no live custodian, the grant is the BOOTSTRAP: omit `--granted-by`.
+   Naming a grantor then fails `CUS03`, because the grantor holds no live
+   custodian assignment.
+2. With a live custodian, `--granted-by <a live custodian's agent>` is
+   required. Without it the grant fails `CUS03`.
+3. `epigraph-operator list-passkeys --person <the grantor>`. A grantor with a
+   live passkey (migration 130) also needs `--act <id>`: a confirmed
+   `role.grant` act whose arguments are exactly the grant's flags. Without it
+   the grant fails `ELV10` (see "Pending admin acts (migration 130)").
+
+**`approve-client`.** `/oauth/register` returns the `client_id` string, while
+the operator verbs take the `oauth_clients.id` row uuid. `approve-client`
+accepts either one (`--client-id <string>` or `--client <uuid>`), maps the
+string to the row, and prints both. It approves a `pending` client only, with
+exactly the `--scope`s given, and audits the approval. Since migration 188,
+the REST approval route answers 501 and names this verb.
 
 ## 10. Elevation (migrations 124–132)
 

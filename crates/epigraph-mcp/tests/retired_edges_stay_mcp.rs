@@ -355,6 +355,7 @@ async fn consolidate_claims_leaves_agent_authorship_and_act_edges_on_the_sources
             mode: "merge".to_string(),
             reason: "retired-edges mcp".to_string(),
             confidence: Some(0.6),
+            survivor_claim_id: None,
         },
         Some(&human(author)),
     )

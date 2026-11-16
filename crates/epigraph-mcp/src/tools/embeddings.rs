@@ -44,7 +44,7 @@ pub async fn embedding_neighborhood_density(
         .await
         .map_err(|e| crate::errors::internal_error_logged("embed failed", e))?;
     let embedding_dim = embedding.len() as u32;
-    let embedding_str = crate::embed::format_pgvector(&embedding);
+    let embedding_str = epigraph_db::pgvector_literal(&embedding);
 
     let mut read = server
         .read_as(viewer, "embedding_neighborhood_density")
@@ -199,7 +199,7 @@ pub async fn backfill_embeddings(
     for (claim_id, content) in rows {
         match server.embedder.generate(&content).await {
             Ok(vec) => {
-                let pgvec = crate::embed::format_pgvector(&vec);
+                let pgvec = epigraph_db::pgvector_literal(&vec);
                 match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
                     &mut *conn, viewer, claim_id, &pgvec,
                 )

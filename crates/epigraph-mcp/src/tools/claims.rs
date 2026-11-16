@@ -522,6 +522,8 @@ async fn prepare_submission(
                         visibility: None,
                         owner_group_id: None,
                         visibility_note: None,
+                        // About the SUBMITTED text, on every path.
+                        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
                     },
                 )));
             }
@@ -726,6 +728,10 @@ async fn write_submission(
             .source_url
             .as_deref()
             .or_else(|| EvidenceRepository::source_url_of(&evidence_with_sig.evidence_type)),
+        // The evidence's own edge to the claim, in this transaction (backlog
+        // 2d60f619). A submission's evidence supports its claim: its BBA is
+        // built with `supports: true`.
+        epigraph_db::EvidenceEdge::supports(Some(edge_key)),
     )
     .await
     .map_err(internal_error)?;
@@ -953,6 +959,8 @@ async fn finish_submission(
         visibility: Some(tenancy.visibility.to_string()),
         owner_group_id: Some(tenancy.owner_group_id.to_string()),
         visibility_note: tenancy.note,
+        // Warn-only (backlog 72850d43): the claim above is already committed.
+        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
     })
 }
 
@@ -987,6 +995,25 @@ pub async fn query_claims(
     // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
     // most of the page (backlog 31e7b727). Off unless the caller asks.
     let exclude_spine = params.exclude_spine.unwrap_or(false);
+
+    // The created_at window and offset (backlog 24caecaa): bound in SQL before
+    // LIMIT, inside the same viewer-filtered statement, so paging by offset
+    // lists every readable claim created in the window. Both refusals run
+    // before any statement, so they cannot depend on what the caller may see.
+    let window = epigraph_db::CreatedWindow {
+        after: params.created_after,
+        before: params.created_before,
+    };
+    if window.is_inverted() {
+        return Err(invalid_params(
+            "created_after is later than created_before; no claim can be created in that window",
+        ));
+    }
+    let offset = params.offset.unwrap_or(0);
+    if offset < 0 {
+        return Err(invalid_params("offset must not be negative"));
+    }
+
     let mut read = server.read_as(viewer, "query_claims").await?;
     let claims = ClaimRepository::list_by_belief_range(
         &mut *read,
@@ -995,8 +1022,9 @@ pub async fn query_claims(
         max,
         is_current,
         limit,
-        0,
+        offset,
         exclude_spine,
+        window,
     )
     .await
     .map_err(internal_error)?;
@@ -1575,6 +1603,9 @@ pub async fn update_with_evidence(
             .source_url
             .as_deref()
             .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+        // The evidence's edge to the claim, in this transaction, in the
+        // direction its BBA is filed (`supports` / `refutes`, backlog 2d60f619).
+        epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.supports),
     )
     .await
     .map_err(internal_error)?;

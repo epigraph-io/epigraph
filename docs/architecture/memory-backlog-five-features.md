@@ -61,7 +61,7 @@ pub async fn consolidate(
     source_ids: &[ClaimId],        // 2..=20, distinct
     merged_content: &str,
     merged_truth: TruthValue,
-    mode: ConsolidateMode,         // Merge | Abstract | Rewrite
+    mode: ConsolidateMode,         // Identity | Merge | Abstract (rewrite parses as Merge)
     reason: &str,
     acting_agent_id: Uuid,
 ) -> Result<ConsolidateResult, DbError>  // { merged_id, superseded: Vec<Uuid> }
