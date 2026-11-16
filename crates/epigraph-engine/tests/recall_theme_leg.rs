@@ -24,8 +24,7 @@
 mod fixture;
 
 use epigraph_embeddings::{
-    config::EmbeddingConfig, providers::MockProvider, EmbeddingError, EmbeddingService,
-    SimilarClaim, TokenUsage,
+    config::EmbeddingConfig, providers::MockProvider, EmbeddingError, EmbeddingService, TokenUsage,
 };
 use epigraph_engine::recall::{recall, recall_routed, RecallRoute};
 use sqlx::PgPool;
@@ -80,20 +79,6 @@ impl EmbeddingService for FixedEmbedder {
     }
     async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         Ok(texts.iter().map(|_| self.0.clone()).collect())
-    }
-    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
-        self.1.store(claim_id, embedding).await
-    }
-    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
-        self.1.get(claim_id).await
-    }
-    async fn similar(
-        &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
-    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        self.1.similar(embedding, k, min_similarity).await
     }
     fn dimension(&self) -> usize {
         self.0.len()
