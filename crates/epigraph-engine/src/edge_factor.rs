@@ -1812,15 +1812,26 @@ pub async fn recompute_claim_cached_belief(
 /// just WIDENED (`crate::visibility_act`: publicize, share with a team),
 /// called inside the act's transaction.
 ///
-/// The owner frame and the fold are the same. The difference is the vacate:
-/// when the owner frame has inputs and the derivation scope rule admits none
-/// of them for the claim's new audience, the cache is set to full ignorance
-/// (as [`recompute_claim_cached_belief`] does only when no frame of the claim
-/// has an admissible input), provided the claim has a fold cache. Without
-/// this, a claim whose `binary_truth` inputs all stay behind (pinned evidence,
-/// an edge-factor BBA whose edge the new audience cannot read) while its
-/// `claim_validity` keeps an admissible input would serve the old
-/// `binary_truth` fold, and the influence of what stayed behind, to the
+/// Two things differ from it.
+///
+/// **The owner is kept, not re-elected.** The owner frame is the one the
+/// cache records (`claims.belief_frame_id`) while that frame still holds an
+/// input ([`MassFunctionRepository::cache_owner_frame_keeping_recorded`]); the
+/// admissible-first owner rule of [`recompute_claim_cached_belief`] (backlog
+/// 8d720490 (1)) decides only a claim that records no such owner. The cached
+/// value is that frame's fold under the OLD audience, so it is that frame's
+/// inputs the act must judge. Re-electing inside the act would hand the cache
+/// to whichever frame's input moved with the claim. The claim's next ordinary
+/// recompute applies the admissible-first rule as usual.
+///
+/// **The vacate:** when the owner frame has inputs and the derivation scope
+/// rule admits none of them for the claim's new audience, the cache is set to
+/// full ignorance (as [`recompute_claim_cached_belief`] does only when no
+/// frame of the claim has an admissible input), provided the claim has a fold
+/// cache. Without this, a claim whose `binary_truth` inputs all stay behind
+/// (pinned evidence, an edge-factor BBA whose edge the new audience cannot
+/// read) while its `claim_validity` keeps an admissible input would serve the
+/// old `binary_truth` fold, and the influence of what stayed behind, to the
 /// wider audience (backlog 31285392). A claim with no cache still gets none,
 /// and a claim with no owner frame (a non-procedural compound, template-only
 /// rows) is left as it was.
@@ -1835,9 +1846,9 @@ pub async fn recompute_widened_claim_cached_belief(
     claim_id: Uuid,
 ) -> Result<bool, String> {
     let Some(owner) =
-        MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
+        MassFunctionRepository::cache_owner_frame_keeping_recorded(&mut *conn, viewer, claim_id)
             .await
-            .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?
+            .map_err(|e| format!("cache_owner_frame_keeping_recorded: {e}"))?
     else {
         return Ok(false);
     };

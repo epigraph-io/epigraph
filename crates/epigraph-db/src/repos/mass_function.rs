@@ -1860,12 +1860,70 @@ impl MassFunctionRepository {
     /// owner as soon as the claim has an input on it of the same admissibility.
     ///
     /// Read-only: no frame is created.
+    ///
+    /// A widening act (publicize, share with a team) does not use this rule:
+    /// it keeps the recorded owner, see [`Self::cache_owner_frame_keeping_recorded`].
     #[instrument(skip(executor, viewer))]
     pub async fn cache_owner_frame_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<Uuid>, DbError> {
+        Self::resolve_cache_owner_frame(executor, viewer, claim_id, false).await
+    }
+
+    /// The cache-owner frame for a claim whose audience an act has just
+    /// WIDENED (`epigraph_engine::visibility_act`: publicize, share with a
+    /// team): the frame the cache records (`claims.belief_frame_id`), while
+    /// that frame still holds a combine input under the same exclusions as
+    /// [`Self::cache_owner_frame_for_claim`]; else what that rule elects.
+    ///
+    /// The cached value is the recorded frame's fold under the OLD audience,
+    /// so the question a widening asks is whether THAT frame's inputs may
+    /// reach the new audience (backlog 31285392): when none may, the cache is
+    /// vacated under the same owner, not re-elected to another frame. The
+    /// admissible-first key of [`Self::cache_owner_frame_for_claim`] (backlog
+    /// 8d720490 (1)) would otherwise hand the cache, inside the act, to a
+    /// frame whose input happens to move with the claim, and serve the new
+    /// audience a fold the old one never had. That key still decides the
+    /// claim's next ordinary recompute, and it decides here too when the
+    /// claim records no owner (or its recorded owner holds no input any more).
+    /// A compound still has no owner.
+    ///
+    /// Read-only: no frame is created.
+    #[instrument(skip(executor, viewer))]
+    pub async fn cache_owner_frame_keeping_recorded<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        Self::resolve_cache_owner_frame(executor, viewer, claim_id, true).await
+    }
+
+    /// The one owner query behind [`Self::cache_owner_frame_for_claim`] and
+    /// [`Self::cache_owner_frame_keeping_recorded`]. `keep_recorded` puts the
+    /// recorded owner (`claims.belief_frame_id`) ahead of every other key;
+    /// the candidate rows and exclusions are the same either way.
+    async fn resolve_cache_owner_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        keep_recorded: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        let recorded_first = if keep_recorded {
+            r#"CASE
+                       WHEN mf.frame_id = (
+                           SELECT rc.belief_frame_id
+                           FROM claims rc
+                           WHERE rc.id = $1
+                             /* {VISIBILITY:rc} */
+                       ) THEN 0
+                       ELSE 1
+                     END,
+                     "#
+        } else {
+            ""
+        };
         let sql = viewer.splice(
             &with_frozen_compound_excluded(&with_ingest_template_excluded(
                 &with_cached_combination_excluded(
@@ -1878,7 +1936,7 @@ impl MassFunctionRepository {
               /* {NOT_INGEST_TEMPLATE} */
               /* {NOT_FROZEN_COMPOUND} */
               /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
-            ORDER BY CASE
+            ORDER BY {RECORDED_FIRST}CASE
                        WHEN EXISTS (
                            SELECT 1 FROM claims ac
                            WHERE ac.id = mf.claim_id AND {CACHE_ADMISSIBLE}
@@ -1905,7 +1963,8 @@ impl MassFunctionRepository {
                 .replace(
                     "{CACHE_ADMISSIBLE}",
                     &super::derivation_scope::cache_admissible_predicate("mf", "ac"),
-                ),
+                )
+                .replace("{RECORDED_FIRST}", recorded_first),
                 "mf.",
                 "f.",
             )),
