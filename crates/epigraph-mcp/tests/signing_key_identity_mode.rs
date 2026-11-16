@@ -120,6 +120,7 @@ async fn the_new_mode_signs_with_the_signing_key_and_attributes_to_the_identity(
             novelty_threshold: Some(0.0),
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

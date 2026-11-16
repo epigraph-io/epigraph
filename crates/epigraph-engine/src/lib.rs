@@ -18,6 +18,7 @@
 
 pub mod admin_cascade;
 pub mod agent_assessment;
+pub mod atlas_flow;
 pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
@@ -31,7 +32,6 @@ pub mod bp;
 pub mod calibration;
 pub mod cdst_bp;
 pub mod cdst_sheaf;
-pub mod claim_context;
 pub mod classifier;
 pub mod compound_belief;
 pub mod confidence;
@@ -42,6 +42,7 @@ pub mod derivation_scope;
 pub mod diverse_retrieval;
 pub mod diverse_select;
 pub mod domain_decay;
+pub mod ds_divergence;
 pub mod edge_factor;
 pub mod epistemic_interval;
 pub mod error_mass;
@@ -70,6 +71,7 @@ pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;
 pub mod unified_bp;
+pub mod visibility_act;
 pub mod voi;
 pub mod workflow_promotion;
 

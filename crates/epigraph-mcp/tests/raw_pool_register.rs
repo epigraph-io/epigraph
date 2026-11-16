@@ -162,22 +162,6 @@ const FIXTURE_ENTRY: &str = "FIXTURE_ENTRY: a `*_via_pool` entry point that exis
 
 const REGISTER: &[(&str, &str, usize, &str)] = &[
     // ── epigraph-engine ──────────────────────────────────────────────────
-    // The unauthenticated listener's principal: `find_or_create` provisions its
-    // fixed reader agent (an agents read, then an idempotent create); `resolve`
-    // reads that agent's live memberships to prove it holds none. Both run before
-    // any viewer exists, on agent-identity tables, as the server's own does.
-    (
-        "epigraph-mcp/src/unauthenticated_reader.rs",
-        "find_or_create",
-        2,
-        NO_CALLER,
-    ),
-    (
-        "epigraph-mcp/src/unauthenticated_reader.rs",
-        "resolve",
-        1,
-        PRE_VIEWER,
-    ),
     (
         "epigraph-engine/src/belief_query.rs",
         "for_perspective",
@@ -302,7 +286,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/claim_helper.rs",
-        "embed_claim_author_stamped",
+        "embed_claim_author_stamped_for",
         1,
         DELEGATES_THE_STAMP,
     ),
@@ -410,7 +394,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/workflow_ingest.rs",
-        "execute_workflow_ingest_with_inserted",
+        "caller_viewer",
         1,
         PRE_VIEWER,
     ),
@@ -610,15 +594,37 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          the existence check is viewer_reads_row on read_as) and one REGISTERED_WRITE \
          (BehavioralExecutionRepository::create, a table with no tenancy).",
     ),
+    (
+        "epigraph-mcp/src/unauthenticated_reader.rs",
+        "find_or_create",
+        2,
+        "NO_ROW_SECURITY: finds or creates the `--allow-unauthenticated-http` reader agent by its \
+         public key (AgentRepository::get_by_public_key / create, twice for the lost-race \
+         lookup); `agents` carries no tenancy row security, and there is no caller to stamp \
+         from because this IS the identity the listener reads as. Registered under the \
+         operator's 2026-11-16 approval, the one HIGH_WATER raise.",
+    ),
+    (
+        "epigraph-mcp/src/unauthenticated_reader.rs",
+        "resolve",
+        1,
+        "PRE_VIEWER: asserts the reader agent holds no live membership through \
+         GroupMembershipRepository::list_live_for_agent, the `epigraph_live_memberships` \
+         SECURITY DEFINER read that answers without a stamp (the same read Viewer::resolve \
+         makes); it runs before the zero-membership viewer exists, so stamping would be \
+         circular. Registered under the operator's 2026-11-16 approval, the one HIGH_WATER \
+         raise.",
+    ),
 ];
 
 /// The never-raised ceiling on the register's total site count.
 ///
-/// 84 -> 87 once, when `unauthenticated_reader.rs` (the unauthenticated
-/// listener's zero-membership principal) landed with its three identity
-/// reads unregistered. They are not conversions that regressed but sites the
-/// register never held, so the ceiling records them; lower it as they move.
-/// Merged with the PROV-O exporter's conversion (84 -> 83): 83 + 3 = 86.
+/// ONE APPROVED EXCEPTION to "never raised": 83 -> 86 for the three
+/// `unauthenticated_reader.rs` sites above, which resolve the zero-membership
+/// identity the `--allow-unauthenticated-http` listener reads as, so there is
+/// no caller to stamp them from. The operator approved exactly that raise on
+/// 2026-11-16 and no other; every other new site is converted, not registered
+/// against a higher ceiling.
 const HIGH_WATER: usize = 86;
 
 // ===========================================================================

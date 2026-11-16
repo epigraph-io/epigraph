@@ -433,8 +433,12 @@ pub async fn custodial_supersede(
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     // The successor keeps the inherited author; the custodian who restated it
     // is recorded as its `AUTHORED` edge (backlog 73085534, ruling R-23).
+    // Unsigned (`None`): an operator CLI on the maintenance DSN holds no entity
+    // signer to attest the act's `supersedes` and `AUTHORED` edges with
+    // (backlog dae795f8; whether operator CLIs get one is an open ruling).
     let (new, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(req.claim),
         &req.content,
         truth,

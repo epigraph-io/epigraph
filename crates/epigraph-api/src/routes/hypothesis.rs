@@ -56,6 +56,8 @@ pub struct CreateHypothesisRequest {
 /// POST /api/v1/hypothesis — Create a hypothesis claim with VOI assessment.
 #[cfg(feature = "db")]
 pub async fn create_hypothesis(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<CreateHypothesisRequest>,
@@ -146,7 +148,7 @@ pub async fn create_hypothesis(
         "research_question": request.research_question,
         "search_radius": search_radius,
     }))
-    .bind(format_embedding(&embedding))
+    .bind(epigraph_db::pgvector_literal(&embedding))
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
     .fetch_one(&mut *tx)
@@ -229,7 +231,7 @@ pub async fn create_hypothesis(
     let neighbors = epigraph_db::ClaimRepository::grounded_neighborhood(
         &state.db_pool,
         &viewer,
-        &format_embedding(&embedding),
+        &epigraph_db::pgvector_literal(&embedding),
         claim_id.0,
         search_radius,
         50,
@@ -472,6 +474,8 @@ pub async fn hypothesis_status(
 /// POST /api/v1/hypothesis/:id/promote — Promote hypothesis to research_validity.
 #[cfg(feature = "db")]
 pub async fn promote_hypothesis(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -665,18 +669,6 @@ pub async fn promote_hypothesis(
 }
 
 // ── Internal types ──
-
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
 
 // `ClaimRow` was deleted with the inline claim-content read in
 // `hypothesis_status`. Its replacement is

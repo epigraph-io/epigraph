@@ -270,6 +270,10 @@ pub struct RecallWithContextParams {
     pub limit: Option<u32>,
     pub min_truth: Option<f64>,
     pub centroid_dim: Option<u32>,
+    /// Restrict hits to claims a paper with this DOI / document key `asserts`.
+    /// Applies to the flat ANN path only: combined with `diverse=true` it is
+    /// REJECTED (backlog a2991ea6), because the diverse pipeline's theme
+    /// candidate query has no DOI predicate and would silently ignore it.
     pub paper_doi_filter: Option<String>,
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
@@ -289,6 +293,8 @@ pub struct RecallWithContextParams {
     /// Default `false` (existing flat ANN behaviour).
     ///
     /// Falls back to flat ANN if the corpus has no themes yet.
+    ///
+    /// Rejected together with `paper_doi_filter` (see there).
     ///
     /// [`diverse_select`]: epigraph_engine::diverse_select::diverse_select
     pub diverse: Option<bool>,
@@ -436,6 +442,22 @@ pub struct RecallWithContextParams {
     /// diversity filtering.
     #[serde(default)]
     pub diversity_radius: Option<f64>,
+    /// When `true`, REORDER the page so hits that share a `decomposes_to`
+    /// parent (the atoms of one compound claim, the paragraphs of one
+    /// section) come back adjacent, each group at the rank of its
+    /// best-ranked member and in rank order within it (backlog 4e856a99).
+    /// Each hit with a visible parent then carries `parent_claim_id`; a hit
+    /// with none keeps its own rank. A hit with several parents is grouped
+    /// under its first by `(created_at, id)`.
+    ///
+    /// Regroups, never filters: the returned SET is identical with and
+    /// without it. Runs after every post-filter (`min_truth`,
+    /// `exclude_contested`, `diversity_radius`), so grouping cannot change
+    /// which hits survive, and before `epistemic_partition`, whose buckets
+    /// keep the grouped order. Default `false`: hit order and shape are
+    /// unchanged.
+    #[serde(default)]
+    pub group_by_parent: bool,
 }
 
 /// Why a recall audit row has no owner — and therefore must not be written.
@@ -667,6 +689,19 @@ pub struct RecallWithContextResponse {
     pub epistemic_partition: Option<crate::types::EpistemicPartition<RecallHit>>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
+    /// How many retrieved candidates the `min_truth` belief floor dropped
+    /// from this page (backlog 75920ad6). Counts only that gate: a hit removed
+    /// by `exclude_contested` or `diversity_radius`, or one whose row vanished
+    /// mid-request, is not counted. `0` when the floor dropped nothing,
+    /// including on a page with no candidates at all.
+    pub below_confidence_floor: usize,
+    /// `true` exactly when candidates WERE retrieved but none cleared the
+    /// `min_truth` floor: "relevant material exists, none believed enough",
+    /// as distinct from "nothing relevant" (`false` with
+    /// `below_confidence_floor: 0`). Read from the floor alone, so a page
+    /// later emptied by `exclude_contested` or `diversity_radius` is not
+    /// reported as insufficient confidence.
+    pub insufficient_confidence: bool,
     /// Id the audit row for this retrieval is written under (backlog
     /// 8cbffa0e), so a caller can cite which recall fed a downstream decision.
     ///
@@ -769,6 +804,11 @@ pub struct RecallHit {
     /// even when it did not ask for a window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The `decomposes_to` parent this hit was grouped under. Present only
+    /// with `group_by_parent=true` and only for a hit with a visible parent;
+    /// omitted otherwise, so a default page keeps its shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_claim_id: Option<Uuid>,
 }
 
 impl crate::types::RecallGatedSignals for RecallHit {
@@ -900,6 +940,12 @@ pub async fn recall_with_context(
     viewer: &epigraph_db::visibility::Viewer,
     params: RecallWithContextParams,
 ) -> Result<CallToolResult, McpError> {
+    // Also before any read or the embedding call (it runs again at the top of
+    // `recall_with_context_post_embed`, for the test entry point), so a
+    // refused combination costs no embedding and is reported as
+    // invalid_params even with the embedder down.
+    reject_diverse_with_paper_doi_filter(&params)?;
+
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
@@ -962,7 +1008,7 @@ pub async fn recall_with_context(
         .generate_at_dim(&params.query, centroid_dim)
         .await
         .map_err(|e| recall_fault("could not embed the query", e))?;
-    let pgvec = crate::embed::format_pgvector(&query_embedding);
+    let pgvec = epigraph_db::pgvector_literal(&query_embedding);
 
     // Resolve + existence-check the optional (frame, perspective) lens ONCE,
     // before the page loop, so a bad lens fails fast and the bounded post-pass
@@ -998,6 +1044,115 @@ pub async fn recall_with_context(
 /// Weight applied to `in_epistemic_degree` in the graph-expansion rerank
 /// formula: `similarity * (1 + GRAPH_EXPANSION_DEGREE_WEIGHT * in_degree)`.
 /// Matches the coefficient named in claim 29e789fd's design sketch.
+/// Parameters of `claim_context`: the structural context of ONE claim, by id.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaimContextParams {
+    #[schemars(
+        description = "UUID of the claim to describe: a paragraph, atom, section, workflow step or any submit_claim / memorize claim. Embedded or not."
+    )]
+    pub claim_id: String,
+    #[schemars(
+        description = "Sibling paragraphs to return (default 8), as in recall_with_context."
+    )]
+    pub siblings_limit: Option<u32>,
+    #[schemars(
+        description = "Corroborating neighbours to return (default 4), as in recall_with_context."
+    )]
+    pub corroborates_limit: Option<u32>,
+    #[schemars(
+        description = "Epistemic edges to return (default 4, minimum 1), as in recall_with_context."
+    )]
+    pub epistemic_limit: Option<u32>,
+    #[schemars(
+        description = "Neighbour paragraphs to return (default 16), as in recall_with_context."
+    )]
+    pub neighbor_paragraphs_limit: Option<u32>,
+    #[schemars(
+        description = "Optional lens frame UUID. Give it together with perspective_id to annotate the hit with that lens, as in recall_with_context."
+    )]
+    pub frame_id: Option<String>,
+    #[schemars(description = "Optional lens perspective UUID (with frame_id).")]
+    pub perspective_id: Option<String>,
+}
+
+/// What `claim_context` returns: the claim id asked for and that claim's hit,
+/// built by the same pipeline as a `recall_with_context` hit. `context` has
+/// every field such a hit has except `similarity`: nothing was searched, so
+/// there is no similarity to report.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaimContextResponse {
+    pub claim_id: Uuid,
+    pub context: serde_json::Value,
+}
+
+/// `claim_context`: the document context of one claim (paper, section, atoms,
+/// siblings, epistemic edges), looked up BY ID.
+///
+/// `recall_with_context` returns this block only for search hits, so getting
+/// it for a known claim meant searching for the claim's own text and hoping it
+/// ranked first; a near-duplicate sometimes did, and a claim with no embedding
+/// was never returned at all (backlog 0720d208). This runs the same pipeline
+/// with the candidate pinned to `claim_id`, so the answer is that claim or
+/// nothing.
+///
+/// # Errors
+/// `invalid_params` for a malformed id, a half-given lens, and a claim that is
+/// absent or that the viewer cannot read (one answer for both, so the tool is
+/// not an existence oracle).
+pub async fn claim_context(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: ClaimContextParams,
+) -> Result<CallToolResult, McpError> {
+    let claim_id = crate::errors::parse_uuid(&params.claim_id)?;
+    let lens = crate::tools::lens::resolve_lens(
+        params.frame_id.as_deref(),
+        params.perspective_id.as_deref(),
+    )?;
+    if let Some((frame_id, perspective_id)) = lens {
+        let mut read = server.read_as(viewer, "claim_context").await?;
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
+            .await?;
+        read.commit().await.map_err(internal_error)?;
+    }
+    // The recall request with every retrieval option off. The query is empty
+    // and no vector is passed: a pinned read never reaches the kNN.
+    let recall_params: RecallWithContextParams = serde_json::from_value(serde_json::json!({
+        "query": "",
+        "frame_id": params.frame_id,
+        "perspective_id": params.perspective_id,
+    }))
+    .map_err(internal_error)?;
+    let response = recall_with_context_core(
+        server,
+        viewer,
+        &recall_params,
+        1536,
+        "",
+        1,
+        // No belief gate: the caller asked for this claim, whatever it scores.
+        f64::NEG_INFINITY,
+        params.siblings_limit.unwrap_or(8),
+        params.corroborates_limit.unwrap_or(4),
+        params.epistemic_limit.unwrap_or(4).max(1),
+        params.neighbor_paragraphs_limit.unwrap_or(16),
+        lens,
+        Some(claim_id),
+    )
+    .await?;
+    let hit = response
+        .results
+        .unwrap_or_default()
+        .into_iter()
+        .find(|h| h.paragraph_id == claim_id)
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+    let mut context = serde_json::to_value(&hit).map_err(internal_error)?;
+    if let Some(map) = context.as_object_mut() {
+        map.remove("similarity");
+    }
+    success_json(&ClaimContextResponse { claim_id, context })
+}
+
 const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 
 /// Stage 4 of [`recall_with_context_post_embed`]: fold graph-reachable
@@ -1160,6 +1315,52 @@ async fn recall_with_context_post_embed(
     neighbor_paragraphs_limit: u32,
     lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
+    let response = recall_with_context_core(
+        server,
+        viewer,
+        params,
+        centroid_dim,
+        pgvec,
+        limit,
+        min_truth,
+        siblings_limit,
+        corroborates_limit,
+        epistemic_limit,
+        neighbor_paragraphs_limit,
+        lens,
+        None,
+    )
+    .await?;
+    success_json(&response)
+}
+
+/// The retrieval-and-enrichment pipeline behind `recall_with_context`, and,
+/// with `pinned`, behind `claim_context`.
+///
+/// `pinned = Some(id)` replaces the candidate retrieval (stage 3) with the one
+/// claim `id`: no kNN, no query vector, so the hit is that claim and never a
+/// near-duplicate of it (backlog 0720d208). Everything after retrieval is the
+/// same code, so the hit carries exactly the enrichment a search hit carries.
+/// A claim the viewer cannot read has no core in the viewer-filtered batch
+/// fetch and yields an empty page, as a deleted one does. A pinned read is a
+/// lookup, not a recall: it writes no recall-audit row and returns no
+/// `recall_event_id`.
+#[allow(clippy::too_many_arguments)]
+async fn recall_with_context_core(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: &RecallWithContextParams,
+    centroid_dim: u32,
+    pgvec: &str,
+    limit: u32,
+    min_truth: f64,
+    siblings_limit: u32,
+    corroborates_limit: u32,
+    epistemic_limit: u32,
+    neighbor_paragraphs_limit: u32,
+    lens: Option<(Uuid, Uuid)>,
+    pinned: Option<Uuid>,
+) -> Result<RecallWithContextResponse, McpError> {
     // Validated before any retrieval runs, so a mistyped radius is reported
     // instead of being paid for and then discarded. Checked here rather than in
     // the wrapper because `__test_only::recall_with_context_with_pgvec` enters
@@ -1210,7 +1411,12 @@ async fn recall_with_context_post_embed(
         want
     };
     let flat_limit = pool as i64;
-    let mut raw_hits = if diverse {
+    let mut raw_hits = if let Some(claim_id) = pinned {
+        vec![epigraph_db::ClaimEmbeddingHit {
+            claim_id,
+            similarity: 1.0,
+        }]
+    } else if diverse {
         let max_themes = params.max_themes.unwrap_or(5).clamp(1, 50) as i32;
         let alpha = params.diversity_weight.unwrap_or(0.4);
         // Clamp candidate_pool at the request boundary so the caller sees
@@ -1321,11 +1527,15 @@ async fn recall_with_context_post_embed(
         // back from a partitioned request would look like the flag was ignored.
         let (results, epistemic_partition) =
             crate::types::split_epistemic(Vec::<RecallHit>::new(), params.epistemic_partition);
-        return success_json(&RecallWithContextResponse {
+        return Ok(RecallWithContextResponse {
             results,
             epistemic_partition,
             corpus_scope,
             centroid_dim_used: centroid_dim,
+            // No candidates: the floor had nothing to drop. This is the
+            // "nothing relevant" answer, not "insufficient confidence".
+            below_confidence_floor: 0,
+            insufficient_confidence: false,
             recall_event_id: Some(event_id.to_string()),
         });
     }
@@ -1499,6 +1709,9 @@ async fn recall_with_context_post_embed(
 
     // Stage 4 + 6: filter min_truth, drop hits whose core vanished, assemble.
     let mut results = Vec::with_capacity(raw_hits.len());
+    // Candidates the belief floor dropped (backlog 75920ad6). Only the
+    // `min_truth` drop below counts; a vanished core is not a confidence fact.
+    let mut below_confidence_floor = 0_usize;
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
         let (rerank_score, verdict) = rerank_meta
@@ -1516,6 +1729,7 @@ async fn recall_with_context_post_embed(
             .copied()
             .unwrap_or(core.truth_value);
         if belief_score < min_truth {
+            below_confidence_floor += 1;
             continue;
         }
         // No paper attribution is NOT a reason to drop the hit (drain U082,
@@ -1625,8 +1839,13 @@ async fn recall_with_context_post_embed(
             is_contested: false,
             contesting_claim_ids: Vec::new(),
             created_at: Some(core.created_at),
+            // Filled by the `group_by_parent` pass below, when requested.
+            parent_claim_id: None,
         });
     }
+    // Read here, straight after the floor and before any later filter, so the
+    // flag means "the floor emptied the page" and nothing else.
+    let insufficient_confidence = below_confidence_floor > 0 && results.is_empty();
 
     // Bounded lens post-pass: when a lens is active, annotate each already-built
     // hit with its lensed belief, keyed by paragraph_id. This does NOT touch
@@ -1802,6 +2021,30 @@ async fn recall_with_context_post_embed(
         }
     }
 
+    // Parent grouping (backlog 4e856a99): after every filter, so it cannot
+    // change which hits survive; before the audit spawn, so
+    // `returned_claim_ids` is in the order served; before the partition, whose
+    // buckets keep the flat order they are handed. One batched parent lookup
+    // per page. Degrade-not-fail, like the post-passes above: a failed lookup
+    // serves the page in rank order rather than losing it.
+    if params.group_by_parent {
+        let ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_db::ClaimContextRepository::first_parent_ids(&mut read, viewer, &ids).await {
+            Ok(parents) => {
+                for hit in &mut results {
+                    hit.parent_claim_id = parents.get(&hit.paragraph_id).copied();
+                }
+                results = group_hits_by_parent(results);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "parent lookup failed; serving the page without group_by_parent"
+                );
+            }
+        }
+    }
+
     let corpus_scope = compute_corpus_scope(&mut *read, viewer)
         .await
         .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
@@ -1810,33 +2053,40 @@ async fn recall_with_context_post_embed(
     // `tools::memory::recall`: spawned after the response is assembled so an
     // audit failure can never fail or delay a retrieval that already
     // succeeded. Id is minted here rather than read back from the insert.
-    let event_id = Uuid::new_v4();
-    spawn_recall_audit(
-        server,
-        event_id,
-        viewer.principal(),
-        &params.query,
-        pgvec,
-        serde_json::json!({
-            "limit": limit,
-            "min_truth": min_truth,
-            "centroid_dim": centroid_dim,
-            "diverse": params.diverse,
-            "rerank": params.rerank,
-            "graph_expansion_depth": params.graph_expansion_depth,
-            "exclude_contested": params.exclude_contested,
-            // See the empty-path literal above: the window is part of the
-            // question, so it has to survive into the audit row.
-            "since": params.since,
-            // Same argument: the radius changes WHICH paragraphs came back, so
-            // a retrieval whose diversity cut cannot be reconstructed from its
-            // audit row is an unauditable retrieval. `epistemic_partition` is
-            // deliberately absent — it regroups the response without changing
-            // the set.
-            "diversity_radius": params.diversity_radius,
-        }),
-        results.iter().map(|h| h.paragraph_id).collect(),
-    );
+    // A pinned read (`claim_context`) is a lookup by id, not a retrieval: there
+    // is no query to audit and nothing ranked, so it writes no audit row.
+    let event_id = if pinned.is_some() {
+        None
+    } else {
+        let event_id = Uuid::new_v4();
+        spawn_recall_audit(
+            server,
+            event_id,
+            viewer.principal(),
+            &params.query,
+            pgvec,
+            serde_json::json!({
+                "limit": limit,
+                "min_truth": min_truth,
+                "centroid_dim": centroid_dim,
+                "diverse": params.diverse,
+                "rerank": params.rerank,
+                "graph_expansion_depth": params.graph_expansion_depth,
+                "exclude_contested": params.exclude_contested,
+                // See the empty-path literal above: the window is part of the
+                // question, so it has to survive into the audit row.
+                "since": params.since,
+                // Same argument: the radius changes WHICH paragraphs came back, so
+                // a retrieval whose diversity cut cannot be reconstructed from its
+                // audit row is an unauditable retrieval. `epistemic_partition` and
+                // `group_by_parent` are deliberately absent — they regroup the
+                // response without changing the set.
+                "diversity_radius": params.diversity_radius,
+            }),
+            results.iter().map(|h| h.paragraph_id).collect(),
+        );
+        Some(event_id)
+    };
 
     // Epistemic partitioning (backlog e7736ff6), in the same position as
     // `tools::memory::recall`'s: after the dispute post-pass (nothing is
@@ -1853,13 +2103,36 @@ async fn recall_with_context_post_embed(
     let (results, epistemic_partition) =
         crate::types::split_epistemic(results, params.epistemic_partition);
 
-    success_json(&RecallWithContextResponse {
+    Ok(RecallWithContextResponse {
         results,
         epistemic_partition,
         corpus_scope,
         centroid_dim_used: centroid_dim,
-        recall_event_id: Some(event_id.to_string()),
+        below_confidence_floor,
+        insufficient_confidence,
+        recall_event_id: event_id.map(|id| id.to_string()),
     })
+}
+
+/// Stable regrouping for `group_by_parent`: hits sharing a group key come back
+/// adjacent, each group at the position of its best-ranked (first) member and
+/// in rank order within it. The key is the hit's `parent_claim_id`, or its own
+/// id when it has none, so a parent that is itself a hit joins the group of
+/// its own child hits. Pure reordering: same hits, same count.
+fn group_hits_by_parent(hits: Vec<RecallHit>) -> Vec<RecallHit> {
+    let mut groups: Vec<Vec<RecallHit>> = Vec::new();
+    let mut slot: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
+    for hit in hits {
+        let key = hit.parent_claim_id.unwrap_or(hit.paragraph_id);
+        match slot.get(&key) {
+            Some(&i) => groups[i].push(hit),
+            None => {
+                slot.insert(key, groups.len());
+                groups.push(vec![hit]);
+            }
+        }
+    }
+    groups.into_iter().flatten().collect()
 }
 
 pub struct ParagraphCore {
@@ -1920,6 +2193,20 @@ pub struct BatchedContext {
 /// bare claim ids. They gained a `JOIN claims` purely so there is something to
 /// filter on: an id is a disclosure, and the neighbour ids feed
 /// `all_paragraph_ids`, which the last two statements then hydrate into content.
+///
+/// # The `edges` rows are filtered too (backlog batch B08)
+///
+/// The claims predicate alone left every `edges` row walked here unfiltered,
+/// so an edge private to another group between two readable claims still
+/// shaped the result: a section, an atom, a sibling, a neighbour id, a paper
+/// attribution, and the window totals (`F-edges-unfiltered`, the MCP residual).
+/// Every `edges` alias now also carries the static form of
+/// `Viewer::edge_predicate_fragment`, spelled as statement 7b already spells
+/// it, on the same two binds. In statements 4, 7 and 7b the predicate sits
+/// BEFORE the window functions, so `total` never counts a hidden edge. The
+/// paper-attribution `LEFT JOIN edges asserts_e` in statement 7 carries it in
+/// the `ON`: a hidden attribution leaves `paper_doi` empty rather than dropping
+/// the readable neighbour.
 ///
 /// # A deliberate deviation, recorded
 ///
@@ -2004,6 +2291,10 @@ pub async fn fetch_batched_context(
               AND (c.properties->>'level')::int = 1
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             "#,
             paragraph_ids,
             v_bypass,
@@ -2043,6 +2334,10 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 3
                   AND ($3::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($4::uuid[]))
+                  AND ($3::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($4::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($4::uuid[]))))
             )
             SELECT
                 paragraph_id AS "paragraph_id!",
@@ -2095,6 +2390,10 @@ pub async fn fetch_batched_context(
                   AND e.relationship = 'decomposes_to'
                   AND ($2::bool OR cp.visibility = 'public'
                        OR cp.owner_group_id = ANY($3::uuid[]))
+                  AND ($2::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($3::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($3::uuid[]))))
                 "#,
                 &atom_ids,
                 v_bypass,
@@ -2141,6 +2440,10 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 2
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
+                  AND ($2::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($3::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($3::uuid[]))))
                 "#,
                 &section_ids,
                 v_bypass,
@@ -2191,11 +2494,19 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND ($3::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($4::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($4::uuid[]))))
                 UNION ALL
                 SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND ($3::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($4::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($4::uuid[]))))
             ),
             joined AS (
                 SELECT
@@ -2211,6 +2522,10 @@ pub async fn fetch_batched_context(
                   ON asserts_e.target_id = c.id
                   AND asserts_e.relationship = 'asserts'
                   AND asserts_e.source_type = 'paper'
+                  AND ($3::bool OR asserts_e.visibility = 'public'
+                       OR (asserts_e.owner_group_id = ANY($4::uuid[])
+                           AND (asserts_e.co_owner_group_id IS NULL
+                                OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
                 LEFT JOIN papers p ON p.id = asserts_e.source_id
             ),
             ranked AS (
@@ -2375,6 +2690,10 @@ pub async fn fetch_batched_context(
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             UNION ALL
             SELECT e.target_id AS "paragraph_id!", e.source_id AS "neighbor_id!"
             FROM edges e
@@ -2382,6 +2701,10 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             "#,
             paragraph_ids,
             v_bypass,
@@ -2419,6 +2742,10 @@ pub async fn fetch_batched_context(
                       AND (cb.properties->>'level')::int = 3
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
+                      AND ($2::bool OR e.visibility = 'public'
+                           OR (e.owner_group_id = ANY($3::uuid[])
+                               AND (e.co_owner_group_id IS NULL
+                                    OR e.co_owner_group_id = ANY($3::uuid[]))))
                 ),
                 backward AS (
                     SELECT e.target_id AS atom_a, e.source_id AS atom_b, e.relationship
@@ -2431,6 +2758,10 @@ pub async fn fetch_batched_context(
                       AND (cb.properties->>'level')::int = 3
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
+                      AND ($2::bool OR e.visibility = 'public'
+                           OR (e.owner_group_id = ANY($3::uuid[])
+                               AND (e.co_owner_group_id IS NULL
+                                    OR e.co_owner_group_id = ANY($3::uuid[]))))
                 )
                 SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
                 FROM forward
@@ -2471,6 +2802,10 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 2
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
+                  AND ($2::bool OR e.visibility = 'public'
+                       OR (e.owner_group_id = ANY($3::uuid[])
+                           AND (e.co_owner_group_id IS NULL
+                                OR e.co_owner_group_id = ANY($3::uuid[]))))
                 "#,
                 &atom_b_ids,
                 v_bypass,
@@ -2554,6 +2889,10 @@ pub async fn fetch_batched_context(
               AND e.source_type = 'paper'
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             "#,
             &all_paragraph_ids,
             v_bypass,

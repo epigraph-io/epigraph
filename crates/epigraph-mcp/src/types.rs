@@ -40,14 +40,14 @@ where
 // tool uncallable.
 fn deserialize_document_source<'de, D>(
     d: D,
-) -> Result<epigraph_ingest::schema::DocumentSource, D::Error>
+) -> Result<epigraph_ingest::document::schema::DocumentSource, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Either {
-        Object(epigraph_ingest::schema::DocumentSource),
+        Object(epigraph_ingest::document::schema::DocumentSource),
         Str(String),
     }
 
@@ -59,14 +59,14 @@ where
 
 fn deserialize_document_extraction<'de, D>(
     d: D,
-) -> Result<epigraph_ingest::schema::DocumentExtraction, D::Error>
+) -> Result<epigraph_ingest::document::schema::DocumentExtraction, D::Error>
 where
     D: Deserializer<'de>,
 {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum Either {
-        Object(Box<epigraph_ingest::schema::DocumentExtraction>),
+        Object(Box<epigraph_ingest::document::schema::DocumentExtraction>),
         Str(String),
     }
 
@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -155,6 +155,89 @@ pub struct SubmitClaimParams {
     )]
     #[serde(default)]
     pub group_id: Option<String>,
+    #[schemars(
+        description = "Structured dataset evidence (optional): the evidence commits to a multi-file dataset by its manifest's digest, so a reader can resolve and verify the data without parsing evidence_data. When given, the evidence row is stored as type \"dataset\" with these fields plus an attestation: this server's Ed25519 signature over them, bound to the evidence and claim ids (returned by get_claim's datasets and get_provenance); evidence_type still sets the evidence weight as usual, and evidence_data is still required (a one-line description of the run is enough). Evidence on one claim is de-duplicated on evidence_data, so two datasets on the same claim need different evidence_data. An invalid dataset refuses the call and writes nothing."
+    )]
+    #[serde(default)]
+    pub dataset: Option<DatasetEvidenceParams>,
+}
+
+/// A dataset evidence input (backlog c8beb101): `submit_claim`'s and
+/// `batch_submit_claims`'s `dataset`, turned into
+/// `epigraph_core::EvidenceType::Dataset` by `EvidenceType::dataset`, which
+/// normalises and validates it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DatasetEvidenceParams {
+    #[schemars(
+        description = "Where the dataset lives: a URI or path naming its root directory (e.g. s3://bucket/campaign/run-0042/). Also stored as the evidence's source_url when the call passes no source_url of its own."
+    )]
+    pub root_uri: String,
+
+    #[schemars(
+        description = "Where the manifest can be fetched, if not at a known name under root_uri (optional)."
+    )]
+    #[serde(default)]
+    pub manifest_uri: Option<String>,
+
+    #[schemars(
+        description = "The blob store id of the manifest, if it was uploaded as a blob (optional)."
+    )]
+    #[serde(default)]
+    pub manifest_blob_id: Option<String>,
+
+    #[schemars(
+        description = "The manifest's digest as <algorithm>:<hex>, e.g. blake3:af13... or sha256:e3b0... (bare hex is accepted when hash_algorithm is given). Algorithms: blake3, sha256, sha512. Stored lower-case with its prefix."
+    )]
+    pub manifest_hash: String,
+
+    #[schemars(
+        description = "The digest's algorithm (blake3, sha256 or sha512). Optional when manifest_hash carries the prefix; must agree with it when both are given."
+    )]
+    #[serde(default)]
+    pub hash_algorithm: Option<String>,
+
+    #[schemars(description = "How many files the manifest lists.")]
+    pub file_count: u64,
+
+    #[schemars(description = "The summed size in bytes of the files the manifest lists.")]
+    pub total_bytes: u64,
+
+    #[schemars(description = "An episcience sample id the dataset belongs to (optional).")]
+    #[serde(default)]
+    pub sample_id: Option<String>,
+
+    #[schemars(
+        description = "Blob store ids of dataset files that were uploaded (optional, at most 64)."
+    )]
+    #[serde(default)]
+    pub blob_ids: Vec<String>,
+}
+
+impl From<DatasetEvidenceParams> for epigraph_core::DatasetManifestInput {
+    fn from(p: DatasetEvidenceParams) -> Self {
+        let DatasetEvidenceParams {
+            root_uri,
+            manifest_uri,
+            manifest_blob_id,
+            manifest_hash,
+            hash_algorithm,
+            file_count,
+            total_bytes,
+            sample_id,
+            blob_ids,
+        } = p;
+        Self {
+            root_uri,
+            manifest_uri,
+            manifest_blob_id,
+            manifest_hash,
+            hash_algorithm,
+            file_count,
+            total_bytes,
+            sample_id,
+            blob_ids,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -429,33 +512,6 @@ pub struct UpdateWithEvidenceParams {
 
 // ── Provenance ──
 
-/// Parameters for MCP `claim_context` (backlog `0720d208`), the query of
-/// `GET /api/v1/claims/:id/context`.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ClaimContextParams {
-    #[schemars(description = "The UUID of the claim whose structural context to read")]
-    pub claim_id: String,
-
-    #[schemars(
-        description = "Page mode: return the claim plus only this list, one of papers, \
-                       parents, parts, siblings, edges. Omit for full mode (the first page of \
-                       every list)."
-    )]
-    #[serde(default)]
-    pub list: Option<String>,
-
-    #[schemars(
-        description = "The next_cursor of that list's previous page, passed back unchanged. \
-                       Requires list."
-    )]
-    #[serde(default)]
-    pub after: Option<String>,
-
-    #[schemars(description = "Page size for list, clamped to 1..=200. Requires list.")]
-    #[serde(default)]
-    pub limit: Option<u32>,
-}
-
 /// Parameters for MCP `resolve_claim_id_prefix` (backlog `30d8b667`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResolveClaimIdPrefixParams {
@@ -633,27 +689,47 @@ pub struct SweepSemanticDuplicatesParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConsolidateClaimsParams {
     #[schemars(
-        description = "UUIDs of the 2..=20 is_current claims to merge. Each is retired with a \
-                       forwarding pointer to the merged claim."
+        description = "UUIDs of the 2..=20 is_current claims to consolidate. What happens to \
+                       each depends on mode."
     )]
     pub source_claim_ids: Vec<String>,
 
     #[schemars(
-        description = "The synthesized replacement text. The CALLER synthesizes this — the \
-                       server never invokes an LLM."
+        description = "The synthesized text of the new claim, for mode merge or abstract. The \
+                       CALLER synthesizes this — the server never invokes an LLM. Omit it for \
+                       mode identity, which writes no new claim."
     )]
+    #[serde(default)]
     pub merged_content: String,
 
-    #[schemars(description = "One of: merge | abstract | rewrite.")]
+    #[schemars(
+        description = "One of: identity | merge | abstract. identity: the sources restate one \
+                       of them (survivor_claim_id); every other source is marked a duplicate \
+                       of it, exactly as mark_duplicate does, and can be un-marked. merge: \
+                       the sources are complementary; a new claim is written and every \
+                       source is retired into it. abstract: a new, more general claim is \
+                       linked to each source by a generalizes edge; nothing is retired. \
+                       rewrite is accepted as merge."
+    )]
     pub mode: String,
 
-    #[schemars(description = "Why these claims were consolidated; recorded on the lineage edges.")]
+    #[schemars(
+        description = "Mode identity only: the source that stays current; every other source \
+                       is marked a duplicate of it. Refused for the other modes."
+    )]
+    #[serde(default)]
+    pub survivor_claim_id: Option<String>,
+
+    #[schemars(
+        description = "Why these claims were consolidated; recorded on the lineage, \
+                       generalizes or identity edges."
+    )]
     pub reason: String,
 
     #[schemars(
-        description = "Confidence for the merged claim. Defaults to the highest source \
-                       truth_value * 0.95, so a merge never claims more certainty than its \
-                       best input."
+        description = "Confidence for the new claim (merge or abstract). Defaults to the \
+                       highest source truth_value * 0.95, so a new claim never claims more \
+                       certainty than its best input. Refused for mode identity."
     )]
     #[serde(default)]
     pub confidence: Option<f64>,
@@ -728,7 +804,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status, grant-dedup-status or journal-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -1038,6 +1114,12 @@ pub struct StoreWorkflowParams {
     )]
     #[serde(default)]
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Mint a new generation-0 lineage even when an existing hierarchical workflow has a near-identical goal (default false). Without it, a goal whose embedding is at least 0.90 cosine-similar to a live workflow's goal under a DIFFERENT canonical_name stores nothing and returns the head of that workflow's lineage with matched_existing=true, its similarity and a hint to evolve it with improve_workflow_hierarchy instead. Only a workflow in exactly the tenancy this store would use is matched: the declared tenancy, else the private default a new lineage gets; a public or other-group plan you can merely read is never matched. An identical goal (same canonical_name) is a no-op as before (already_ingested)."
+    )]
+    #[serde(default)]
+    pub force_new: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1061,6 +1143,18 @@ pub struct GetWorkflowExecutionsParams {
 
     #[schemars(description = "Max executions to return, newest first (default 20, max 100)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Also return `deviation_summary`: this hierarchical workflow's per-step deviation_reason telemetry rolled up by step lineage over the last `window_days` days, one entry per (step_lineage_id, trimmed reason) with occurrences, first_seen, last_seen and latest_step_claim_id, most frequent first (at most 20). A reason that recurs on one lineage is an evolve_step candidate; nothing is written. Only deviated hierarchical step rows count; a flat workflow claim has none. Default false."
+    )]
+    #[serde(default)]
+    pub include_deviation_summary: Option<bool>,
+
+    #[schemars(
+        description = "Window for deviation_summary, in days back from now (default 30, clamped to 1-365)."
+    )]
+    #[serde(default)]
+    pub window_days: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1112,9 +1206,15 @@ pub struct ReportWorkflowOutcomeParams {
     pub execution_log: Vec<StepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim; not stored for a workflows-table id."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim, and on the report's row for a workflows-table id (at most 65536 bytes)."
     )]
     pub outcome_details: String,
+
+    #[schemars(
+        description = "Optional idempotency key, for a workflows-table id only (1-200 characters, e.g. a UUID you generate once per run): a retry with the same key, from you, on the same workflow, writes nothing and returns the first report's result with idempotent_replay=true. Refused for a legacy flat workflow claim."
+    )]
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 
     #[schemars(
         description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)"
@@ -1246,9 +1346,15 @@ pub struct ReportHierarchicalOutcomeParams {
     pub step_executions: Vec<HierarchicalStepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Currently accepted but not stored."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Stored on the report's row (at most 65536 bytes), readable by whoever reads the workflow."
     )]
     pub outcome_details: String,
+
+    #[schemars(
+        description = "Optional idempotency key for this report (1-200 characters, e.g. a UUID you generate once per run). A retry with the same key, from you, on the same workflow, writes nothing and returns the FIRST report's result with idempotent_replay=true, so a timed-out report can be retried without counting the run twice. Without a key every call is a new report."
+    )]
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 
     #[schemars(
         description = "Execution quality 0.0-1.0 (default: 1.0 if success, 0.0 if failure)."
@@ -1420,11 +1526,15 @@ pub struct SubmitDsEvidenceParams {
     pub evidence_type: Option<String>,
 
     #[schemars(
-        description = "Locality classification of this evidence vs. the claim's asserting paper: \
-                       'intra' (self-cite / methodological overlap) applies the calibrated intra-locality \
-                       discount on top of the evidence_type weight; 'cross' or 'unknown' apply no locality \
-                       discount. Only consulted when `evidence_type` is also supplied — otherwise ignored \
-                       and the BBA is stored with locality_tag='unknown' as before. Default: 'unknown'."
+        description = "Locality classification of this evidence vs. the claim's asserting paper. \
+                       Known tags: 'intra_self_cite' (or the shorthand 'intra') applies the calibrated \
+                       intra-locality discount on top of the evidence_type weight; 'cross' or 'unknown' \
+                       apply no locality discount. Any other tag is stored as given, combined with NO \
+                       discount unless it begins with 'intra' (case-sensitive in the cached belief; a \
+                       perspective-scoped read lowercases it), and reported in the response's \
+                       unknown_locality_tag and warnings. A stored tag longer than 64 characters is \
+                       refused. Only consulted when `evidence_type` is also supplied — otherwise ignored \
+                       (with a warning) and the BBA is stored with locality_tag='unknown'. Default: 'unknown'."
     )]
     #[serde(default)]
     pub locality_tag: Option<String>,
@@ -1555,6 +1665,14 @@ pub struct UndecomposedClaimResponse {
     /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
     /// backlog and not a defect.
     pub looks_atomic: bool,
+    /// `epigraph_core::atomicity::conjunct_estimate(content).count`: the
+    /// estimated number of independent assertions (backlog `72850d43`).
+    /// Advisory. It does not change `looks_atomic` or what `decompose_claims`
+    /// selects, and the two can disagree on a short coordinated sentence.
+    pub conjunct_estimate: usize,
+    /// The rules behind an estimate above 1 (`sentences`, `semicolon`,
+    /// `coordination`, `enumeration`, `respectively`); empty otherwise.
+    pub conjunct_signals: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2383,7 +2501,7 @@ pub struct IngestDocumentInlineParams {
         description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, an optional top-level source_text, and an optional top-level `labels` array of caller labels (e.g. a stage tag) applied to every claim the ingest writes or resolves to, in addition to the writer's own `doi:<document key>` label (a claim another agent authored that the ingest converges onto gets the doi: label only). When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting an abstract then the full paper is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
-    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
     /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
     #[schemars(
         description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
@@ -2414,7 +2532,7 @@ pub struct IngestDocumentSpineParams {
         description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph (structural nodes are scoped to this document, not shared with other papers that share a heading); atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms. An optional top-level `labels` array of caller labels (e.g. a stage tag) is applied to every node this call writes, in addition to the writer's own `doi:<document key>` label; a node another agent authored gets the doi: label only."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
-    pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
 
     #[schemars(
         description = "Who may read the claim: \"team\" (the default), \"private\" or \"public\". Omitted: PRIVATE if your own default is private (set_default_group private: true), else your default team (set_default_group) while you may still write it, else your human operator's default (private, or its team on the same condition), else your only team, else PRIVATE with a visibility_note saying why; never public unless you ask for it. \"team\" writes into group_id, or your default team, and needs a live writer or admin membership of that team, yours or your human operator's (a reader membership is refused and nothing is written). \"private\" is readable only by your home group (your personal group, or your operator's). \"public\" is readable by every authenticated agent. Applies to every claim this ingest creates; their evidence, traces and asserts edges inherit it. It scopes the new claims only: the paper's own record (title, DOI, journal), its author agents, its processed_by stamp (what check_already_ingested reports) and its asserts edges onto already-public claims it converges onto stay readable by every agent whatever you pass, so do not ingest a confidential document. Claims the ingest converges onto (existing atoms) keep their own visibility. If the same content already exists from you with another visibility, the existing claim is returned unchanged and visibility_note says so. publicize_claims (team admins) and share_claims_with_team change it later."
@@ -2448,9 +2566,13 @@ pub struct IngestDocumentSpineResponse {
     pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
-    /// The number of spine claims QUEUED for background embedding when the
-    /// response was built, not the number embedded (the same meaning as
-    /// `IngestDocumentResponse::claims_embedded`).
+    /// How many of the nodes this call created had their embedding QUEUED, to
+    /// be stored after this response, best-effort: 0 when this server has no
+    /// embedding provider. Not a count of stored vectors, which this response
+    /// cannot know (backlog fdacc14f).
+    pub paragraphs_embedding_queued: usize,
+    /// DEPRECATED alias of `paragraphs_embedding_queued`, kept for existing
+    /// readers. Despite its name it was never a count of stored vectors.
     pub paragraphs_embedded: usize,
     /// Paragraph paths (e.g. `"sections[0].paragraphs[1]"`) that were written
     /// as new in this ingest. Atomize exactly these paragraphs, then call
@@ -2484,7 +2606,7 @@ pub struct StructureSourceParams {
         description = "Document source metadata (title, doi/uri, source_type, authors, year, …) — same shape as DocumentExtraction.source."
     )]
     #[serde(deserialize_with = "deserialize_document_source")]
-    pub source: epigraph_ingest::schema::DocumentSource,
+    pub source: epigraph_ingest::document::schema::DocumentSource,
     #[schemars(
         description = "Format of `text`: \"markdown\" or \"plaintext\". Determines the deterministic parser."
     )]
@@ -2804,12 +2926,13 @@ pub struct IngestDocumentResponse {
     /// `authors[].pending_ingested_by`).
     pub ingested_by: String,
     pub claims_ingested: usize,
-    /// The number of claims QUEUED for background embedding when the response
-    /// was built, NOT the number embedded. The embedding loop is spawned and
-    /// the response returns before any embed call has run, so this is non-zero
-    /// even when every embed then fails (for example with no embedding
-    /// provider configured); a failure is only logged. The name is kept
-    /// because it is the wire field.
+    /// How many of the claims this call created had their embedding QUEUED, to
+    /// be stored after this response, best-effort: 0 when this server has no
+    /// embedding provider. Not a count of stored vectors, which this response
+    /// cannot know (backlog fdacc14f).
+    pub claims_embedding_queued: usize,
+    /// DEPRECATED alias of `claims_embedding_queued`, kept for existing
+    /// readers. Despite its name it was never a count of stored vectors.
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
     pub relationships_created: usize,
@@ -2975,6 +3098,19 @@ pub struct StoreWorkflowResponse {
     /// `true` if a workflow with this `(canonical_name, generation)` was
     /// already present and the call short-circuited.
     pub already_ingested: bool,
+    /// `true` when nothing was stored because an existing hierarchical
+    /// workflow under ANOTHER canonical_name, in the same tenancy this store
+    /// would use, has a near-identical goal (backlog 5e54282f);
+    /// `workflow_id`, `canonical_name`, `goal` and `generation` then describe
+    /// the head of that workflow's lineage. Pass `force_new: true` to mint
+    /// anyway.
+    pub matched_existing: bool,
+    /// The matched workflow's goal similarity (cosine), with `matched_existing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
+    /// What to do instead, with `matched_existing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3117,9 +3253,8 @@ pub struct TraverseNode {
     /// Dempster–Shafer pignistic probability when the node carries a DS cache,
     /// else `truth_value`. `None` for a non-claim node.
     ///
-    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
-    /// value of it could change which nodes are kept — so this equals
-    /// `truth_value` there.
+    /// The same value whatever `min_truth` was (backlog `1574d9b4`), and the
+    /// one `recall` reports as `belief_score` for the same claim and caller.
     pub belief_score: Option<f64>,
     pub depth: i32,
 }
@@ -3190,6 +3325,13 @@ pub struct DsEvidenceResponse {
     /// A matching sentence is in `warnings`. Omitted when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unknown_keys: Vec<String>,
+    /// The supplied `locality_tag`, when it was stored but is outside the
+    /// locality vocabulary (`cross`, `intra`, `intra_self_cite`, `unknown`),
+    /// so the fold discounts it only if it begins with `intra`. A WARNING, not
+    /// a refusal; a matching sentence is in `warnings`. Kept apart from
+    /// `unknown_keys`, which names evidence-type keys only. Omitted when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_locality_tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3654,6 +3796,12 @@ pub struct BatchClaimEntry {
     )]
     #[serde(default)]
     pub group_id: Option<String>,
+
+    #[schemars(
+        description = "Structured dataset evidence for this entry, exactly as submit_claim's dataset. An invalid dataset refuses THIS entry only and writes nothing for it."
+    )]
+    #[serde(default)]
+    pub dataset: Option<DatasetEvidenceParams>,
 }
 
 /// The methodology a batch entry gets when it names none — the value every
@@ -3681,6 +3829,7 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             novelty_threshold,
             visibility,
             group_id,
+            dataset,
         } = entry;
         Self {
             content,
@@ -3694,6 +3843,7 @@ impl From<BatchClaimEntry> for SubmitClaimParams {
             novelty_threshold,
             visibility,
             group_id,
+            dataset,
         }
     }
 }

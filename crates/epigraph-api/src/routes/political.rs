@@ -16,7 +16,7 @@
 //! - `GET  /api/v1/counter-narrative-gaps`             — Item 11: Gap scanner stub
 //! - `GET  /api/v1/mirror-narratives`                  — Item 12: Mirror detection stub
 //!
-//! # Tenancy: 7 of this file's 12 raw-pool sites are converted, and 5 are not
+//! # Tenancy: 8 of this file's 12 raw-pool sites are converted, and 4 are not
 //!
 //! This section sits AFTER the endpoint list on purpose. An earlier revision
 //! spliced it between two bullets, which left six routes rendering as though
@@ -30,18 +30,19 @@
 //! connection through [`AppState::read_as`] and thread it through every
 //! statement in the body.
 //!
-//! **The five that remain hold no `Viewer` at all**, which is why they are
-//! counted and not convertible. `list_techniques` and `list_coalitions` read
-//! global reference data; `create_technique` and `create_coalition` WRITE, and
-//! `read_as` is documented read-only (`ScopedRead::commit` is not called by
-//! `Drop`, so under `SessionGucMode::Transaction` a write routed through it is
-//! rolled back while still type-checking). `inflation_leaderboard` is the fifth
-//! — it is the site `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`
-//! records as `("political.rs", 1)`, so it must not be relocated to lower that
-//! register. Converting it is a repo-signature change rather than an executor
-//! swap: a handler does not own its SQL and cannot carry a marker. It stays
-//! where it is, its owner is that register, and the analysis of what it leaves
-//! open is held outside this repository.
+//! `inflation_leaderboard` is the eighth (backlog 67c905a3). It was the site
+//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` recorded as
+//! `("political.rs", 1)`: an inline `claims ⨝ agents` aggregate with no viewer.
+//! It now takes a `ViewerExtractor` and reads through the viewer-spliced
+//! `PoliticalRepository::get_inflation_leaderboard` on the caller's stamped
+//! connection, so that register no longer lists this file.
+//!
+//! **The four that remain hold no `Viewer` at all.** `list_techniques` and
+//! `list_coalitions` read global reference data; `create_technique` and
+//! `create_coalition` WRITE, and `read_as` is documented read-only
+//! (`ScopedRead::commit` is not called by `Drop`, so under
+//! `SessionGucMode::Transaction` a write routed through it is rolled back while
+//! still type-checking).
 //!
 //! Two further limits, stated so the conversion is not over-read. `compare_agents`
 //! acquires ONCE above its loop rather than per iteration; the raw-pool alias it
@@ -870,34 +871,32 @@ pub async fn inflation_index(
 
 /// GET /api/v1/inflation-index/leaderboard
 ///
-/// Ranked list of agents by mean inflation index (non-partisan metric).
+/// Ranked list of agents by mean inflation index (non-partisan metric), over
+/// the claims the caller may read, on one viewer-stamped connection.
 #[cfg(feature = "db")]
 pub async fn inflation_leaderboard(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(_params): Query<InflationIndexParams>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let pool = &state.db_pool;
-
-    // Query agents who have claims with inflation_factor
-    let rows: Vec<(Uuid, Option<String>, f64, i64)> = sqlx::query_as(
-        r#"
-        SELECT c.agent_id, a.display_name,
-               AVG((c.properties->>'inflation_factor')::FLOAT) AS mean_inflation,
-               COUNT(*) AS claim_count
-        FROM claims c
-        JOIN agents a ON a.id = c.agent_id
-        WHERE c.properties ? 'inflation_factor'
-        GROUP BY c.agent_id, a.display_name
-        HAVING COUNT(*) >= 2
-        ORDER BY mean_inflation DESC
-        LIMIT 20
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Leaderboard query failed: {e}"),
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "inflation_leaderboard",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
     })?;
+
+    // Agents who have claims with inflation_factor
+    let rows = PoliticalRepository::get_inflation_leaderboard(&mut *read, &viewer)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Leaderboard query failed: {e}"),
+        })?;
 
     let items: Vec<serde_json::Value> = rows
         .into_iter()
@@ -945,6 +944,8 @@ pub async fn list_techniques(
 /// POST /api/v1/propaganda-techniques
 #[cfg(feature = "db")]
 pub async fn create_technique(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(req): Json<CreateTechniqueRequest>,
 ) -> Result<(StatusCode, Json<TechniqueResponse>), ApiError> {
@@ -1071,6 +1072,8 @@ pub async fn list_coalitions(
 /// POST /api/v1/coalitions
 #[cfg(feature = "db")]
 pub async fn create_coalition(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(req): Json<CreateCoalitionRequest>,
 ) -> Result<(StatusCode, Json<CoalitionResponse>), ApiError> {

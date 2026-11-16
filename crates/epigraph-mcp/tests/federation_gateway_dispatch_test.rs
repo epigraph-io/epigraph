@@ -123,11 +123,13 @@ async fn the_unauthenticated_listener_lists_no_federated_tool() {
     );
 }
 
-// ── Backlog 7ea4bd74: what a failed federated call answers ──────────────────
+// ── What a failed federated call answers, end to end ─────────────────────────
 //
-// Driven over HTTP through the bearer layer and the real `call_tool`, because
-// the defect was in `call_tool`'s mapping (`.map_err(internal_error)`), which
-// redacted every failure, the downstream's own designed refusals included.
+// Driven over HTTP through the bearer layer and the real `call_tool`, so the
+// answer is the one `call_tool` maps (`errors::federated_call_error`), not one
+// a unit test builds by hand. The operator ruled on 2026-11-16: a downstream's
+// INTERNAL error is redacted; its parameter refusals, an unreachable extension
+// and a call that never answers are answered as main's design answers them.
 
 const SECRET: &[u8] = b"this-secret-is-at-least-32-bytes-long!!";
 const ACCEPT: &str = "application/json, text/event-stream";
@@ -295,14 +297,52 @@ async fn call_for_error(url: &str, tool: &str, within: std::time::Duration) -> s
         .unwrap_or_else(|| panic!("expected a JSON-RPC error, got {answer}"))
 }
 
-/// The downstream's own MCP error reaches the caller unchanged: code, message
-/// and data.
+/// A downstream's INTERNAL error reaches the caller redacted: still `-32603`,
+/// naming the extension and the tool, without the downstream's message (where
+/// a downstream that does not redact puts its driver text) or its data.
 ///
-/// Mutation: map the federated call's error with `internal_error` again (the
-/// pre-fix code) -> the caller reads "internal error; the detail is in the
-/// server log" with code -32603, and this fails.
+/// Mutation: drop the `INTERNAL_ERROR` arm in `federated_call_error` -> the
+/// stub's "stub_private_table" reaches the caller, and this fails.
 #[tokio::test]
-async fn a_downstream_mcp_error_reaches_the_caller_unchanged() {
+async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
+    let (addr, _control) = stub::spawn_controlled_stub(&[stub::INTERNAL_FAIL_TOOL]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub");
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let error = call_for_error(
+        &url,
+        stub::INTERNAL_FAIL_TOOL,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("stub_private_table") && !message.contains("database"),
+        "a downstream's internal error text must not reach the caller: {error}"
+    );
+    assert!(
+        message.contains("internal error in extension `ext`")
+            && message.contains(stub::INTERNAL_FAIL_TOOL),
+        "the caller is told which extension and tool failed: {error}"
+    );
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32603),
+        "still an internal error: {error}"
+    );
+    assert!(error["data"].is_null(), "no downstream data: {error}");
+}
+
+/// The control for the redaction: a downstream's PARAMETER refusal still
+/// reaches the caller unchanged, code, message and data, because it is the
+/// extension's designed answer to this caller's own call.
+///
+/// Mutation: redact every `Downstream` answer -> the caller reads the
+/// gateway's text with code -32603, and this fails.
+#[tokio::test]
+async fn a_downstream_parameter_refusal_reaches_the_caller_unchanged() {
     let (addr, _control) = stub::spawn_controlled_stub(&[stub::FAIL_TOOL]).await;
     let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
         .await
@@ -328,11 +368,8 @@ async fn a_downstream_mcp_error_reaches_the_caller_unchanged() {
     );
 }
 
-/// An extension that cannot be reached is named as unavailable, and its
-/// address is not: the address is deployment topology.
-///
-/// Mutation: as above -> the caller reads only "internal error", and this
-/// fails.
+/// An extension that cannot be reached is named as unavailable, with the
+/// tool, and its address is not: the address is deployment topology.
 #[tokio::test]
 async fn an_unreachable_extension_is_answered_as_unavailable_by_name() {
     let (addr, control) = stub::spawn_controlled_stub(&["federated_probe"]).await;
@@ -346,12 +383,8 @@ async fn an_unreachable_extension_is_answered_as_unavailable_by_name() {
     let error = call_for_error(&url, "federated_probe", std::time::Duration::from_secs(15)).await;
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("extension 'ext' unavailable"),
-        "the caller must be told which extension is unavailable: {error}"
-    );
-    assert!(
-        message.contains("federated_probe"),
-        "and which tool it called: {error}"
+        message.contains("extension `ext` is unavailable") && message.contains("federated_probe"),
+        "the caller must be told which extension is unavailable and which tool: {error}"
     );
     assert!(
         !message.contains(&addr) && !message.contains("127.0.0.1"),
@@ -359,68 +392,25 @@ async fn an_unreachable_extension_is_answered_as_unavailable_by_name() {
     );
 }
 
-/// The caller of a tool that never answers is told so at the extension's
-/// bound, and warned that the call may still run.
-///
-/// Mutation: drop the `tokio::time::timeout` in `client::invoke_once` -> no
-/// answer arrives within the 15 s read, and this fails.
+/// A call that never answers is answered at the gateway's bound, and the
+/// caller is warned that it may still have run.
 #[tokio::test]
-async fn a_call_that_never_answers_is_answered_at_the_extensions_bound() {
+async fn a_call_that_never_answers_is_answered_at_the_gateways_bound() {
     let (addr, _control) = stub::spawn_controlled_stub(&[stub::HANG_TOOL]).await;
-    let configs = epigraph_mcp::federation::config::parse_extensions(Some(&format!(
-        "ext=tcp:{addr};scope=ext:tools;call_timeout_secs=1"
-    )))
-    .expect("a well-formed test entry");
-    let registry = FederationRegistry::build(configs, "discovery-tok")
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
         .await
-        .expect("build against a reachable stub");
+        .expect("build against a reachable stub")
+        .with_call_timeout(std::time::Duration::from_secs(1));
     let url = spawn_gateway(SharedFederation::new(registry)).await;
 
     let error = call_for_error(&url, stub::HANG_TOOL, std::time::Duration::from_secs(15)).await;
     let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("extension 'ext' gave no answer within 1 s"),
+        message.contains("extension `ext` did not answer"),
         "the caller must be told the extension did not answer in time: {error}"
     );
     assert!(
-        message.contains("may still complete"),
+        message.contains("may still have run"),
         "and that the call may have run anyway: {error}"
-    );
-}
-
-/// A downstream's INTERNAL error is the exception to pass-through: its message
-/// is where a downstream that does not redact puts its driver text, and this
-/// server keeps that text from callers (`errors.rs`). The caller is told which
-/// extension failed, not what its database said.
-///
-/// Mutation: drop the `INTERNAL_ERROR` arm in `federated_call_error` -> the
-/// stub's "stub_private_table" reaches the caller, and this fails.
-#[tokio::test]
-async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
-    let (addr, _control) = stub::spawn_controlled_stub(&[stub::INTERNAL_FAIL_TOOL]).await;
-    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
-        .await
-        .expect("build against a reachable stub");
-    let url = spawn_gateway(SharedFederation::new(registry)).await;
-
-    let error = call_for_error(
-        &url,
-        stub::INTERNAL_FAIL_TOOL,
-        std::time::Duration::from_secs(10),
-    )
-    .await;
-    let message = error["message"].as_str().unwrap_or_default();
-    assert!(
-        !message.contains("stub_private_table") && !message.contains("database"),
-        "a downstream's internal error text must not reach the caller: {error}"
-    );
-    assert!(
-        message.contains("internal error in extension 'ext'"),
-        "the caller is told which extension failed: {error}"
-    );
-    assert_eq!(
-        error["code"].as_i64(),
-        Some(-32603),
-        "still an internal error: {error}"
     );
 }

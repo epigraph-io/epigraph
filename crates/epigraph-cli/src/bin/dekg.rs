@@ -1371,7 +1371,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
 
             // 5. Create frames for each cluster
             let mut frames_created = 0;
-            let mut claims_assigned = 0;
+            let mut claims_assigned = 0u64;
 
             for cluster_idx in 0..best_k {
                 let cluster_claims: Vec<(usize, &Uuid, &str)> = labels
@@ -1441,16 +1441,19 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     println!("  Created frame {} '{}'", frame_id, frame_name);
 
                     // Assign claims
+                    // Rows written, not attempted; a failed insert stops the
+                    // run instead of being discarded and counted.
                     for (h_idx, claim_id, _) in &cluster_claims {
-                        let _ = sqlx::query(
+                        let inserted = sqlx::query(
                             "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
                         )
                         .bind(claim_id)
                         .bind(frame_id)
                         .bind(*h_idx as i32 % hypotheses.len() as i32)
                         .execute(&pool)
-                        .await;
-                        claims_assigned += 1;
+                        .await
+                        .context("insert claim_frames assignment")?;
+                        claims_assigned += inserted.rows_affected();
                     }
 
                     frames_created += 1;

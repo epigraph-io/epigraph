@@ -221,6 +221,7 @@ async fn submit_claim_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
             novelty_threshold: Some(0.0),
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -322,7 +323,7 @@ async fn assert_signed_evidence_rows_v1(
     }
 }
 
-fn ingest_extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
+fn ingest_extraction(tag: &str) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {
             "title": format!("R-34 {tag}: Tagged Signatures for Ingested Documents"),
@@ -431,6 +432,7 @@ async fn report_workflow_outcome_signs_its_evidence_under_v1(pool: PgPool) {
         &server,
         &viewer,
         ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow.to_string(),
             success: true,
             execution_log: vec![StepExecution {

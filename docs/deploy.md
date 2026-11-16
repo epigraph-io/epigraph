@@ -66,7 +66,15 @@ The four logins:
 | **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). |
 
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
-hatch of migration 074. Nothing connects as it in production.
+hatch of migration 074. Nothing connects as it in production, and no
+production login may be GRANTed it: since migration 216 the hatch is taken only
+on an explicit grant (a superuser no longer counts by implication), so a
+granted service login would have its undeclared writes stamped onto the
+memberless seed group instead of refused. Never set
+`EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF` (the test harness's opt-in to that grant)
+on a deployed `epigraph-migrate`. Audit: `SELECT r.rolname FROM pg_auth_members
+m JOIN pg_roles r ON r.oid = m.member WHERE m.roleid = 'epigraph_seed'::regrole`
+must return no rows.
 
 Six `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
 switches the session to the application role: `reown-claims`,
@@ -349,7 +357,7 @@ reads it from the environment only:
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
-| Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 3 out of time with work pending. |
+| Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs), 3 out of time with work pending. Treat 4 as a failure (do not add it to `SuccessExitStatus=`). On an instance that will never register the type, clear it once by hand with `drain_jobs --cancel-pending <TYPE>` (repeatable): that run sets the type's pending jobs `cancelled`, lists them in `cancelled_unregistered`, and refuses (exit 1, nothing written) a type it has a handler for. Cancelling an `embedding_generation` job leaves its claim's `claims.embedding` NULL; `embed_backfill` refills missing vectors, and needs an OpenAI key. `epigraph-cli reembed` does NOT restore them: it writes `embedding_3072`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY` (or `--allow-mock` for a non-production smoke run). |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 
@@ -428,6 +436,8 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
+| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Requests per minute allowed to one client, enforced in-process on every route except the health probes. Unset → the API applies **no** rate limit (logged at boot as `Rate limiting: OFF`); limit at the reverse proxy instead, or set this. The client is its IP, taken from `X-Forwarded-For` / `X-Real-IP` when present, so set it only where a trusted proxy writes those headers, and remember that agents sharing one address share one allowance. An unusable value → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global ceiling) | Requests per minute across all clients together. Read only with `EPIGRAPH_RATE_LIMIT_RPM`, and must not be below it. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |
@@ -457,10 +467,12 @@ For the others, anything else is off.
 | `EPIGRAPH_MCP_CONNECTOR_ELEVATION` | off | `on` lets the HTTP transport elevate connector-mode sessions. Leave it unset (section 10). |
 | `EPIGRAPH_RUN_TOKENS` | `off` | As for the API. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | As for the API. |
-| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. An extension that exports a kernel tool's name (or another extension's) is a boot error too; set a `prefix=` on it. `call_timeout_secs=<n>` on an entry bounds each proxied `tools/call` (default 300). See `crates/epigraph-mcp/src/federation/config.rs`. |
-| `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. Every reconnect tick re-lists each mounted extension with it, so it must stay valid for the life of the process: an expired token demotes every extension until it is re-minted and the gateway restarted. |
-| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | How often each mounted extension is re-listed (a failure demotes it, a changed list swaps its routes) and each unhealthy one re-dialled. |
+| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. An extension that exports a kernel tool's name (or another extension's) is a boot error too; set a `prefix=` on it. See `crates/epigraph-mcp/src/federation/config.rs`. |
+| `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. |
+| `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | Period of the federation health timer: an unhealthy extension is re-dialled, a healthy one has its tool list re-read (and is demoted if it no longer answers). |
+| `EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS` | `300` | Longest a proxied federated `tools/call` may take before the gateway abandons it and answers the caller with a timeout. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
+| `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio, and the operator `ingest-document` CLI. After the client disconnects (or, for the CLI, after its walk returns), how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. `0` exits at once and abandons that work. |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
 | `RUST_LOG` | `epigraph_mcp=info,tenancy=info` | Log filter, to stderr. `rmcp*` is capped at INFO regardless. |
 | `CALIBRATION_PATH`, the belief-mode variables | as for the API | |
@@ -502,6 +514,7 @@ not to the API.
 | `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims`, `scripts/_api_client.py` (section 7) | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
+| `CALIBRATION_PATH` | `scripts/run_assessment_worker.py` and `scripts/lib/tiered_enrichment.py::auto_tier` | The file whose `[conformal.quantiles]` Tier-1 routing reads; unset, the repository's `calibration.toml`. Unlike the Rust binaries, the scripts have no compiled-in copy to fall back to: a missing file or one without `[conformal.quantiles]` is an error, and the worker exits at startup (also under `--dry-run`). |
 
 ### Optional LLM, rerank and NLI integrations
 
@@ -2379,6 +2392,10 @@ epigraph-operator group-roster --group <id> [--at <RFC3339>]
 ```
 
 Without `--apply`, each verb's writes and audit row roll back.
+`group-roster` prints a `MEMBER` line per binding-derived member and a
+`DIRECT` line per live row of the group's own roster (what `group-member add`
+writes, and the admin a team group is created with); the last line counts both
+(`members=<derived> ... direct=<rows>`).
 `define-group-role` and `bind-group-role` bind a NON-ELEVATING catalog role to
 a group. Every registered human holding a live assignment of the role is then
 a member, computed and never written, and the membership lapses at the
@@ -2410,8 +2427,17 @@ epigraph-operator restrict-claims ... --manifest-out restrict-1.jsonl --apply \
 epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 ```
 
+- **A crashed run's manifest**: a run that crashed mid-append can leave a torn
+  final line, which `reown-reverse` refuses unless `--allow-truncated-tail`
+  (on any manifest it reads). Every record of the torn batch
+  is phantom, because its batch never committed. First prove from the
+  database that that batch rolled back. Then reverse the crashed manifest
+  TOGETHER with every manifest a resumed run wrote, in one `reown-reverse`
+  call, dry run first and then `--apply`: it applies them newest first, so the
+  crashed manifest cannot restore rows a later run moved again.
 - **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
-  public owners). The target must be an existing `active` group, not world or
+  public owners, including the target itself: a public claim the target
+  already owns is narrowed in place, owner unchanged). The target must be an existing `active` group, not world or
   seed, administered by `--operator`. A claim whose move would make another
   group's row readable to the target's members (for example an edge declared
   `('group', H)`) is HELD, not widened. Pinned evidence is left as it is.
@@ -2783,12 +2809,33 @@ the flags.
 | Area | Verbs |
 |---|---|
 | Humans and links | `register-human-operator`, `revoke-human-operator`, `link`, `retire-link`, `link-retired`, `link-legacy-authors`, `arm-operator-binding`, `register-system-agent`, `allow-author-binding-client`, `revoke-author-binding-client` |
-| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse` |
+| Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse`, `set-workflow-submitter` (and its `--reverse`) |
 | Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede` |
 | Groups | `create-group`, `group-member add\|remove\|set-role`, `define-group-role`, `bind-group-role`, `end-group-role-binding`, `group-roster` |
 | Passkeys and elevation | `passkey-enroll`, `list-passkeys`, `revoke-passkey`, `end-elevation`, `list-elevations`, `verify-confirmations` |
-| OAuth clients and scopes | `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
+| OAuth clients and scopes | `approve-client`, `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
 | Data hygiene | `delete-frames` |
+
+**`grant-role`: measure, then pick the variant.** The database decides which
+flags a grant needs, and a runbook cannot know in advance:
+
+1. `epigraph-operator list-role-assignments --role role:platform-custodian`.
+   With no live custodian, the grant is the BOOTSTRAP: omit `--granted-by`.
+   Naming a grantor then fails `CUS03`, because the grantor holds no live
+   custodian assignment.
+2. With a live custodian, `--granted-by <a live custodian's agent>` is
+   required. Without it the grant fails `CUS03`.
+3. `epigraph-operator list-passkeys --person <the grantor>`. A grantor with a
+   live passkey (migration 130) also needs `--act <id>`: a confirmed
+   `role.grant` act whose arguments are exactly the grant's flags. Without it
+   the grant fails `ELV10` (see "Pending admin acts (migration 130)").
+
+**`approve-client`.** `/oauth/register` returns the `client_id` string, while
+the operator verbs take the `oauth_clients.id` row uuid. `approve-client`
+accepts either one (`--client-id <string>` or `--client <uuid>`), maps the
+string to the row, and prints both. It approves a `pending` client only, with
+exactly the `--scope`s given, and audits the approval. Since migration 188,
+the REST approval route answers 501 and names this verb.
 
 ## 10. Elevation (migrations 124–132)
 
@@ -3181,11 +3228,20 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     those confirmed, and so on, attested ones included. It never touches
     another person's passkeys. Every elevation any of them confirmed ends
     (`passkey_revoked`), and every unexecuted act they confirmed is voided,
-    as for any revoke. It first locks the person's passkeys, so an
-    enrollment completing at that moment on one of their acts is waited
-    for and then revoked with the rest, and one that starts later is
-    refused. It prints one line per passkey reached (`depth=` 0 for the
-    passkey named) and, without `--apply`, rolls everything back.
+    as for any revoke. It first locks the person's passkeys, waiting for
+    any enrollment completing at that moment on one of their acts, and
+    then walks the lineage; it locks and walks again until every passkey
+    it reached is locked (migration 214), so a passkey that completed
+    during the wait is revoked with the rest, and so is anything that
+    completed under it meanwhile. A completion that starts later is
+    refused. This holds only under READ COMMITTED, where each statement
+    sees what committed before it: since migration 214 the revoke refuses
+    to run under any other isolation level (SQLSTATE 25000, nothing
+    revoked). `epigraph-operator` runs it at the connection's default
+    level, so keep the maintenance DSN, role and database at READ
+    COMMITTED (the PostgreSQL default). It prints one line per passkey
+    reached (`depth=` 0 for the passkey named) and, without `--apply`,
+    rolls everything back.
     It also works on a passkey already revoked: revoked passkeys are walked
     through, not revoked again, and anything still live below them is
     revoked. Afterwards the person enrolls a replacement on a
@@ -3269,6 +3325,12 @@ which revokes it.
    `verify` checks the four functions' owner, the reader's grant to
    `epigraph_app` and that `epigraph_app` cannot call the compromised
    revoke. The guard and the cascade apply whatever the settings say.
+   **Migrate 214** after it (any time; no binary depends on it). It
+   re-states the compromised revoke to refuse any isolation level but READ
+   COMMITTED and to lock every passkey it walks. Before it, confirm the
+   maintenance DSN runs READ COMMITTED: `SHOW transaction_isolation` on
+   that DSN prints `read committed`. Otherwise `revoke-passkey
+   --compromised` is refused (25000) until the setting is fixed.
 2. **The status list.** Install the refresh job and its timer with the
    `OnFailure=` alert, and the age check under your monitoring (both above).
    Run the job once, then run the age check: it must print `android
@@ -3346,6 +3408,9 @@ which revokes it.
   removed from the allowlist or a root replaced: every anchor whose own chain
   or lineage depends on it stops anchoring. Synced passkeys already anchored
   stay live; revoke them, or their anchors, to remove them.
+- **Migration 214.** `docs/runbooks/214-undo.sql` on the migration DSN
+  restores 200's body of the compromised revoke (no binary to roll back
+  first). Run it BEFORE `200-undo.sql`.
 - **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
   only after no unit runs with the anchored setting on and `epigraph-operator`
   is rolled back to a build without `--compromised`. It drops the reader, the
@@ -4190,6 +4255,7 @@ here. Each migration's header is authoritative and holds its full undo.
 | 191 | The `retire-link` verb, and an audit row for every flip of `operator_links.retired`. Retired links stay retired after an undo. |
 | 193 | Apply BEFORE a binary whose `cache_owner_frame_for_claim` calls `epigraph_claim_is_compound` serves; without it every owner lookup errors (`42883`). An older binary ignores it. Undo only after rolling the binary back. |
 | 194 | **Binding order.** Migrate 194 only after every binary that can delete `mass_functions` rows on a privileged connection runs the release that keeps retracted rows on those paths. A binary still on an older build deletes a retracted row, the guard refuses it, and the whole administrative cascade aborts and is replayed for ever. Install a `delete-frames` built for 194 after the migrate. A precondition refuses (`55000`) unless `epigraph_cascade_delete_edge_bbas(uuid[], text)` has 117's body (md5 `39f3eacd53e7717a323759ec91b5c2c0`) and its `proconfig` is `search_path=pg_catalog, public` or `search_path=pg_catalog, public, pg_temp`. Check first with `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[], text)')`. Undo: `docs/runbooks/194-undo.sql`. |
+| 220 | `jobs.redelivery_count`, which bounds the crash re-delivery of a one-attempt job. **Migrate BEFORE** rolling out a `drain_jobs` built with the bounded reaper: its reaper names the column, and on a database below 220 every run fails at its first statement (`42703`) and drains nothing. An older `drain_jobs` ignores the column. Undo: `docs/runbooks/220-undo.sql`, only after rolling every such `drain_jobs` back. |
 
 The md5 values above are copied from the migrations' own preconditions. They
 are properties of the public function bodies, not of any deployment.

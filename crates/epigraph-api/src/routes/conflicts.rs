@@ -25,8 +25,6 @@ use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
-#[cfg(feature = "db")]
-use sqlx;
 
 // ── Request / Response types ──
 
@@ -85,48 +83,57 @@ pub struct LearningEventsQuery {
 const SILENCE_SCAN_FRAME_LIMIT: i64 = 100;
 
 /// GET /api/v1/conflicts/scan - Scan for high-conflict claim pairs.
+///
+/// Read as the caller, on one viewer-stamped connection. `high_conflict` lists
+/// only claims, and counts only BBAs, that the caller may read. The frame
+/// densities behind `silence_alarms` are read on the same connection, so row
+/// security scopes their counts to the same caller.
 #[cfg(feature = "db")]
 pub async fn scan_conflicts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ScanConflictsQuery>,
 ) -> Result<Json<ConflictScanResponse>, ApiError> {
     let min_k = params.min_k.unwrap_or(0.3);
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "scan_conflicts",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Scan for high-conflict claims via mass_functions
-    let high_conflict: Vec<serde_json::Value> = sqlx::query_as::<_, HighConflictRow>(
-        "SELECT mf.claim_id, mf.frame_id, MAX(mf.conflict_k) AS max_k, \
-                COUNT(*) AS bba_count, c.content \
-         FROM mass_functions mf \
-         JOIN claims c ON c.id = mf.claim_id \
-         WHERE mf.conflict_k >= $1 AND mf.retracted_at IS NULL \
-         GROUP BY mf.claim_id, mf.frame_id, c.content \
-         ORDER BY max_k DESC \
-         LIMIT $2",
-    )
-    .bind(min_k)
-    .bind(limit)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to scan conflicts: {e}"),
-    })?
-    .into_iter()
-    .map(|r| {
-        serde_json::json!({
-            "claim_id": r.claim_id,
-            "frame_id": r.frame_id,
-            "max_k": r.max_k,
-            "bba_count": r.bba_count,
-            "content": r.content,
+    let high_conflict: Vec<serde_json::Value> =
+        epigraph_db::ConflictDensityRepository::high_conflict_claims(
+            &mut *read, &viewer, min_k, limit,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to scan conflicts: {e}"),
+        })?
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "claim_id": r.claim_id,
+                "frame_id": r.frame_id,
+                "max_k": r.max_k,
+                "bba_count": r.bba_count,
+                "content": r.content,
+            })
         })
-    })
-    .collect();
+        .collect();
 
     // Scan for silence alarms. `contradicts_edges` counts distinct claim pairs
     // joined by a live contradicts/refutes edge (see `ConflictDensityRepository`).
     let frame_densities: Vec<epigraph_db::FrameConflictDensity> =
-        epigraph_db::ConflictDensityRepository::scan(&state.db_pool, SILENCE_SCAN_FRAME_LIMIT)
+        epigraph_db::ConflictDensityRepository::scan(&mut *read, SILENCE_SCAN_FRAME_LIMIT)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to scan frame densities: {e}"),
@@ -401,6 +408,8 @@ pub async fn silence_check(
 /// POST /api/v1/conflicts/:a/:b/counterfactuals - Store counterfactual scenarios.
 #[cfg(feature = "db")]
 pub async fn store_counterfactuals(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Path((claim_a_id, claim_b_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<GenerateCounterfactualsRequest>,
@@ -472,16 +481,4 @@ pub async fn list_learning_events(
         "learning_events": events,
         "total": events.len(),
     })))
-}
-
-// ── Internal row types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct HighConflictRow {
-    claim_id: Uuid,
-    frame_id: Uuid,
-    max_k: Option<f64>,
-    bba_count: i64,
-    content: String,
 }

@@ -32,8 +32,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // ─── claims:read ───────────────────────────────────────────────────
     ("check_already_ingested", "claims:read"),
     ("check_sheaf_consistency", "claims:read"),
-    // The by-id twin of GET /api/v1/claims/:id/context (backlog 0720d208):
-    // viewer-stamped SELECTs only.
     ("claim_context", "claims:read"),
     ("compare_methods", "claims:read"),
     ("embedding_neighborhood_density", "claims:read"),

@@ -466,7 +466,8 @@ impl RunSettings {
                 AtomFoldMode::AefStandalone => "aef_standalone",
                 AtomFoldMode::Aef => "aef",
             },
-            compound_source_edges: match CompoundSourceEdges::current() {
+            compound_source_edges: match epigraph_engine::atom_items::modes().compound_source_edges
+            {
                 CompoundSourceEdges::Frozen => "frozen",
                 CompoundSourceEdges::Excluded => "excluded",
             },
@@ -1501,7 +1502,9 @@ async fn sheaf_edges(
               WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
                 AND e.relationship IN ({SHEAF_RELATIONSHIPS}) \
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
-                /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:src}} */ /* {{VISIBILITY:tgt}} */"
+                AND {moves_belief} \
+                /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:src}} */ /* {{VISIBILITY:tgt}} */",
+            moves_belief = epigraph_db::EDGE_MOVES_BELIEF_SQL,
         ),
         1,
     );

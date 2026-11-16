@@ -29,8 +29,9 @@
 //!   through one of these, with the request's `Viewer`
 //!   (`routes/crud.rs`, `routes/edges.rs`, `routes/rag.rs`, `routes/claims.rs`,
 //!   `routes/graph_query_utils.rs`, `routes/staging.rs`). PROBED below.
-//! * `ClaimRepository::inherit_evidence` writes a `derived_from` edge to every
-//!   evidence row of the old claim, hidden ones included; PROBED in
+//! * a `derived_from` edge from a survivor claim to every evidence row of the
+//!   old claim, hidden ones included (what the since-removed
+//!   `ClaimRepository::inherit_evidence` wrote); PROBED in
 //!   [`the_surfaces_outside_the_content_reads_are_measured`] (the edge takes
 //!   the meet and is withheld). `epigraph_engine::edge_factor::auto_wire_ds_for_edge`
 //!   reads `properties->>'doi'` with no viewer predicate to WRITE a DS factor's
@@ -384,8 +385,8 @@ async fn app_count(pool: &PgPool, viewer: &Viewer, sql: &str, id: Uuid) -> i64 {
 /// * an edge touching the hidden row, left public by the hide: READABLE (ids,
 ///   relationship and properties; no evidence content), a known surface;
 /// * the claim the row hangs off, and its text: READABLE, by design;
-/// * the `derived_from` edge `ClaimRepository::inherit_evidence` writes from a
-///   survivor claim to every evidence row of the old claim, hidden ones
+/// * a `derived_from` edge (as the since-removed
+///   `ClaimRepository::inherit_evidence` wrote it) from a survivor claim to every evidence row of the old claim, hidden ones
 ///   included: WITHHELD, because the edge tenancy trigger takes the meet of a
 ///   public claim and a `group` evidence row, which is `group` in the hiding
 ///   group.
@@ -429,9 +430,21 @@ async fn the_surfaces_outside_the_content_reads_are_measured(pool: PgPool) {
 
     let survivor =
         fixture::seed_public_claim(&pool, fx.owner, "a survivor that inherits evidence").await;
-    let inherited = epigraph_db::ClaimRepository::inherit_evidence(&pool, fx.claim, survivor)
-        .await
-        .expect("inherit_evidence");
+    // The statement `ClaimRepository::inherit_evidence` ran before that
+    // caller-less writer was removed (backlog dae795f8): what is probed is the
+    // edge tenancy trigger's meet, which any such edge gets.
+    let inherited = sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         SELECT $1, 'claim', e.id, 'evidence', 'derived_from', \
+                jsonb_build_object('inherited_from', $2::text) \
+           FROM evidence e WHERE e.claim_id = $2 ON CONFLICT DO NOTHING",
+    )
+    .bind(survivor)
+    .bind(fx.claim)
+    .execute(&pool)
+    .await
+    .expect("inherit the evidence links")
+    .rows_affected();
     assert_eq!(
         inherited, 1,
         "the hidden row is inherited as a derived_from edge"

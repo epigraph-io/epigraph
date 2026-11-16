@@ -16,7 +16,8 @@ use epigraph_db::{
     ClaimRepository, EvidenceRepository, HybridHit, ReasoningTraceRepository, WorkflowRepository,
 };
 
-use crate::embed::{format_pgvector, HYBRID_CANDIDATE_POOL, HYBRID_RRF_K};
+use crate::embed::{HYBRID_CANDIDATE_POOL, HYBRID_RRF_K};
+use epigraph_db::pgvector_literal;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -256,9 +257,13 @@ pub async fn memorize(
         ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
+        EvidenceRepository::create(
+            &mut *tx,
+            &evidence,
+            epigraph_db::EvidenceEdge::supports(Some(server.edge_signing_key().await?)),
+        )
+        .await
+        .map_err(internal_error)?;
         ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
@@ -488,7 +493,7 @@ pub async fn recall(
     // back to lexical-only (existing behavior) and the workflows leg is
     // skipped entirely (there is no lexical fallback for goal_embedding).
     let pgvec_opt = match server.embedder.generate(&params.query).await {
-        Ok(v) => Some(format_pgvector(&v)),
+        Ok(v) => Some(pgvector_literal(&v)),
         Err(e) => {
             tracing::warn!(
                 error = %e,

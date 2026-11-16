@@ -206,28 +206,16 @@ either clash with a `prefix=`.
 
 - Downstream socket down at startup → its tools are **absent** from `tools/list`
   (logged); gateway serves everything else. Reconnect on a timer; tools reappear.
-- A mounted downstream is **re-listed** on every tick of the same timer (backlog
-  c19cdae0): a failed `tools/list` demotes it (its tools stop being listed and routed, and
-  the same tick re-dials it), and a changed list swaps its routes in one write. A per-call
-  session that cannot be opened triggers the same check at once, through the gateway's own
-  discovery session, so one caller's refused token never demotes it for everyone. Every
-  discovery `tools/list` is bounded (`LIST_TOOLS_TIMEOUT`, 10 s) and bypasses rmcp's
-  client response cache, which would otherwise answer the check from memory.
-- Downstream errors mid-call → the downstream's own MCP error reaches the caller
-  **unchanged** (code, message, data); `EpiGraphMcpFull::federated_call_error` (backlog
-  7ea4bd74). The exception is an internal error (`-32603`): its message is where a
-  downstream's driver text lands, so the gateway redacts it as it redacts its own and names
-  the extension instead. A downstream the gateway cannot open a session with is answered "extension
-  `<name>` unavailable", naming the extension and never its address.
-- A downstream that accepts a call and never answers → cut off at the extension's
-  `call_timeout_secs=` (default 300 s), and the caller is told it gave no answer and that
-  the call may still complete there.
+- Downstream errors mid-call → surfaced as a normal MCP tool error. The exception is an
+  internal error (`-32603`): its message is where a downstream's driver text lands, so the
+  gateway redacts it as it redacts its own, names the extension instead, and logs the
+  downstream's message (`errors::federated_call_error`; operator ruling of 2026-11-16).
 - Collision at startup (two extensions, or an extension and the kernel, exporting the same
   effective tool name) → **refuse to start**.
-- Collision at runtime (an extension that reconnects, or re-lists, with a name the kernel
-  or another mounted extension already routes) → that one name is **not routed** to it, with
-  a warning; the rest of its tools are. The running gateway is never taken down, and the
-  clash is refused at the next start.
+- Collision at runtime (an extension that reconnects, or re-lists, with a clashing name) →
+  never fatal, logged, and refused at the next start. A name the kernel registers is **not
+  routed** to the extension and the rest of its tools are; a name another mounted extension
+  already routes leaves the new list **not applied**, so the extension keeps what it had.
 
 ## Testing
 

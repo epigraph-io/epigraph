@@ -1421,6 +1421,9 @@ async fn apply_unit(
         caller,
         ..
     } = *ctx;
+    // The marks' identity edges are attested at INSERT with the server's key
+    // (backlog `dae795f8`), resolved before the unit's transaction opens.
+    let edge_key = server.edge_signing_key().await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "apply_label_dedup").await?;
     if let Some(why) = cross_owner(&mut tx, viewer, members).await? {
@@ -1494,6 +1497,7 @@ async fn apply_unit(
             .marked_by(Some(actor));
         let edge = ClaimRepository::mark_duplicate_act_attributed_conn(
             &mut tx,
+            Some(edge_key),
             ClaimId::from_uuid(m.dup),
             ClaimId::from_uuid(m.canonical),
             &provenance,

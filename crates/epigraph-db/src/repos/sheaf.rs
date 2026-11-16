@@ -100,6 +100,9 @@ impl SheafRepository {
             -- A retracted edge is no longer asserted by anyone, so it must not
             -- manufacture an inconsistency (as in get_epistemic_edge_pairs).
             AND (e.valid_to IS NULL OR e.valid_to > now())
+            -- An edge marked `"moves_belief": false` (an abstract
+            -- consolidation's `generalizes`) is a typed link, not evidence.
+            AND (e.properties->>'moves_belief') IS DISTINCT FROM 'false'
             AND c.pignistic_prob IS NOT NULL
             AND n.pignistic_prob IS NOT NULL
             -- A retired claim (superseded, marked duplicate, deprecated) takes
@@ -163,6 +166,9 @@ impl SheafRepository {
             -- assertion has been withdrawn, so the inconsistency it implied is
             -- no longer claimed by anyone.
             AND (e.valid_to IS NULL OR e.valid_to > now())
+            -- An edge marked `"moves_belief": false` (an abstract
+            -- consolidation's `generalizes`) is a typed link, not evidence.
+            AND (e.properties->>'moves_belief') IS DISTINCT FROM 'false'
             AND src.pignistic_prob IS NOT NULL
             AND tgt.pignistic_prob IS NOT NULL
             -- Neither may an edge to or from a retired claim (DD-20). Supersession

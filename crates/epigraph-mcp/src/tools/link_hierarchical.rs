@@ -44,7 +44,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
+use crate::errors::{internal_error, internal_error_logged, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::{LinkHierarchicalParams, LinkHierarchicalResponse};
 
@@ -130,9 +130,10 @@ async fn endpoint_exists(
         "workflow" => epigraph_db::WorkflowRepository::viewer_reads_row(&mut *conn, viewer, id)
             .await
             .map_err(internal_error),
-        other => Err(internal_error(format!(
-            "link_hierarchical: no existence check for entity type '{other}'"
-        ))),
+        other => Err(internal_error_logged(
+            "link_hierarchical: no existence check for this entity type",
+            format!("entity type '{other}'"),
+        )),
     }
 }
 

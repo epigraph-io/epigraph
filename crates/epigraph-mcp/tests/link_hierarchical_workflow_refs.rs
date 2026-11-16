@@ -34,6 +34,7 @@ async fn store(server: &epigraph_mcp::EpiGraphMcpFull, steps: &[&str]) -> Uuid {
             expected_outcome: None,
             confidence: None,
             tags: None,
+            force_new: None,
         },
         None,
     )

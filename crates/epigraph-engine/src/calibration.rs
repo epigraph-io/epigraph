@@ -744,6 +744,19 @@ mod tests {
             (cfg.get_evidence_type_weight("testimony") - 0.6).abs() < f64::EPSILON,
             "testimony → testimonial (0.6)"
         );
+        // A stored `dataset` row (backlog c8beb101) weighs as the engine maps
+        // it (`map_evidence_type`: Dataset → Empirical), not at the 0.5
+        // unknown-type fallback.
+        assert!(
+            cfg.evidence_type_weight_present("dataset"),
+            "dataset must resolve through the alias table"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("dataset") - cfg.get_evidence_type_weight("empirical"))
+                .abs()
+                < f64::EPSILON,
+            "dataset → empirical"
+        );
     }
 
     #[test]

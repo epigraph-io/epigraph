@@ -20,6 +20,19 @@ use uuid::Uuid;
 /// Kept here (the lower `epigraph-db` layer) so DB-layer batch queries like
 /// [`crate::repos::claim::ClaimRepository::in_epistemic_degree_batch`] don't
 /// need to depend upward on `epigraph-mcp` for the list.
+/// Edge property that marks an edge of an epistemic relationship as moving
+/// no belief. An edge whose `properties` hold `"moves_belief": false` is still
+/// a navigable, typed link, but the belief readers skip it (the factor
+/// backfill's edge selection and the sheaf's edge reads). Written today only
+/// by an abstract consolidation's `generalizes` edges, whose abstraction takes
+/// its default confidence from the very sources the edge points at.
+pub const MOVES_BELIEF_PROPERTY: &str = "moves_belief";
+
+/// SQL predicate, for an edge aliased `e`, that keeps every edge except one
+/// marked with `"moves_belief": false` ([`MOVES_BELIEF_PROPERTY`]). A NULL or
+/// absent property keeps the edge.
+pub const EDGE_MOVES_BELIEF_SQL: &str = "(e.properties->>'moves_belief') IS DISTINCT FROM 'false'";
+
 pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "supports",
     "corroborates",
@@ -242,6 +255,17 @@ fn symmetric_edge_row(r: SymmetricRow) -> EdgeRow {
 
 /// Repository for Edge operations
 pub struct EdgeRepository;
+
+/// One claim-to-claim link of [`EdgeRepository::links_among_claims`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimLinkRow {
+    /// The edge's id.
+    pub id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    /// Lower-cased relationship name.
+    pub relationship: String,
+}
 
 impl EdgeRepository {
     /// Create a new edge relationship
@@ -1130,6 +1154,36 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
+        Self::create_symmetric_if_absent_signed_conn(conn, None, a, b, relationship, properties)
+            .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_conn`], with the edge it INSERTS
+    /// attested at INSERT by `key` (see [`Self::create_signed_conn`]). The
+    /// same ANY-STATE dedup and the same bare `ON CONFLICT DO NOTHING`
+    /// (migration 090's index) as the unsigned form; a dedup hit writes
+    /// nothing and returns `false`.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_conn`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<bool, DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            return Ok(
+                insert_attested_conn(conn, key, att, None, SymmetricGuard::AnyState, true)
+                    .await?
+                    .is_some(),
+            );
+        }
         let result = sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
@@ -2447,6 +2501,68 @@ impl EdgeRepository {
                 properties: row.properties,
                 valid_from: row.valid_from,
                 valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
+    /// The in-force epistemic edges whose two endpoints are BOTH claims in
+    /// `claim_ids`, as `viewer` may read them: the links among a page of
+    /// claims, for a view that draws the page with its connections (a
+    /// timeline; backlog ea26d7aa).
+    ///
+    /// * relationships: [`crate::CONTEXT_EPISTEMIC_RELATIONSHIPS`], matched
+    ///   case-insensitively (the relationship text is stored in both cases);
+    /// * retracted edges are excluded (`valid_to` set and past);
+    /// * an edge the viewer may not read is absent even when it may read both
+    ///   endpoints (the edge predicate, co-ownership included);
+    /// * oldest first, at most `limit` rows. Ask for one more than the cap to
+    ///   learn whether more exist.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids), fields(id_count = claim_ids.len()))]
+    pub async fn links_among_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<ClaimLinkRow>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let relationships: Vec<String> = crate::CONTEXT_EPISTEMIC_RELATIONSHIPS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.source_id, e.target_id, lower(e.relationship) AS relationship
+            FROM edges e
+            WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+              AND e.source_id = ANY($1) AND e.target_id = ANY($1)
+              AND lower(e.relationship) = ANY($2)
+              AND (e.valid_to IS NULL OR e.valid_to > now())
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at, e.id
+            LIMIT $3
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, Uuid, String)>(&sql)
+            .bind(claim_ids)
+            .bind(&relationships)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, source_id, target_id, relationship)| ClaimLinkRow {
+                id,
+                source_id,
+                target_id,
+                relationship,
             })
             .collect())
     }

@@ -172,10 +172,18 @@ pub struct ReportOutcomeRequest {
     /// check failed is `success=false`; record what the steps did in
     /// `outcome_details` / `step_executions` instead.
     pub success: bool,
+    /// Stored on the report's row by the hierarchical route (at most 65536
+    /// bytes).
     pub outcome_details: String,
     pub quality: Option<f64>,
     pub step_executions: Option<Vec<StepExecution>>,
     pub goal_text: Option<String>,
+    /// Hierarchical route only (1-200 characters, e.g. a UUID generated once
+    /// per run): a retry with the same key, from the same caller, on the same
+    /// workflow, writes nothing and is answered with the first report's result
+    /// and `idempotent_replay: true`. The flat route refuses it (400).
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -392,6 +400,7 @@ pub async fn store_workflow(
     let mut decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
     let (mut tx, result) = execute_admitted_ingest(
         tx,
+        state.edge_signing_key(),
         None,
         &viewer,
         &plan,
@@ -401,7 +410,14 @@ pub async fn store_workflow(
     )
     .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
-    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
+    record_api_authorship(
+        &mut tx,
+        state.edge_signing_key(),
+        viewer.principal(),
+        &created,
+        "workflow_ingest",
+    )
+    .await?;
     record_workflow_submitter(
         &mut tx,
         None,
@@ -428,7 +444,7 @@ pub async fn store_workflow(
     let embedder = if result.already_ingested {
         None
     } else {
-        state.embedding_service()
+        state.storing_embedding_service()
     };
     if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
@@ -583,14 +599,7 @@ pub async fn search_workflows(
             })?;
 
             // Behavioral affinity lookup
-            let pgvec = format!(
-                "[{}]",
-                query_vec
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let pgvec = epigraph_db::pgvector_literal(&query_vec);
             //
             // PROPAGATE, do not default. This read now shares one connection
             // with every other statement in the handler, so a failure here is
@@ -847,17 +856,7 @@ pub async fn get_workflow(
     }
 
     // ── 2. Fall through to legacy flat-workflow claims ───────────────────────
-    let sql = viewer.splice(
-        "SELECT c.id, c.content, c.truth_value, c.properties \
-         FROM claims c WHERE c.id = $1 AND 'workflow' = ANY(c.labels) /* {VISIBILITY:c} */",
-        2,
-    );
-    let mut q = sqlx::query_as::<_, WorkflowContentRow>(&sql).bind(workflow_id);
-    if let Some(g) = viewer.group_bind() {
-        q = q.bind(g);
-    }
-    let row = q
-        .fetch_optional(&mut *read)
+    let row = epigraph_db::WorkflowRepository::flat_workflow_claim(&mut read, &viewer, workflow_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to fetch workflow claim: {e}"),
@@ -988,6 +987,16 @@ pub async fn report_outcome(
         })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
+    // A flat workflow claim has no report row to key a retry on; refuse a key
+    // rather than accept it and still count the retry (backlog 9928b61f).
+    if request.idempotency_key.is_some() {
+        return Err(ApiError::BadRequest {
+            message: "`idempotency_key` is supported on \
+                      POST /api/v1/workflows/hierarchical/:id/outcome only"
+                .into(),
+        });
+    }
+
     // ── The target, read through the CALLER's viewer ──
     //
     // An unreadable workflow is 404, exactly like a missing one. The read also
@@ -1080,13 +1089,7 @@ pub async fn report_outcome(
     let goal_embedding_pgvec = if let Some(embedder) = state.embedding_service() {
         match embedder.generate(&behavioral_goal).await {
             Ok(vec) => {
-                let pgvec = format!(
-                    "[{}]",
-                    vec.iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                let pgvec = epigraph_db::pgvector_literal(&vec);
                 Some(pgvec)
             }
             Err(e) => {
@@ -1111,20 +1114,18 @@ pub async fn report_outcome(
         crate::errors::write_refused("workflow claim")
     };
 
-    // The counters are read on the transaction that writes them.
-    let workflow = sqlx::query_as::<_, WorkflowRow>(
-        "SELECT id, truth_value, properties FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // The counters are read on the transaction that writes them, through the
+    // caller's viewer predicate as well as the transaction's row security.
+    let workflow =
+        epigraph_db::WorkflowRepository::flat_workflow_claim(&mut tx, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch workflow: {e}"),
+            })?
+            .ok_or(ApiError::NotFound {
+                entity: "workflow".into(),
+                id: workflow_id.to_string(),
+            })?;
 
     let before_truth = workflow.truth_value.unwrap_or(0.5);
 
@@ -1524,6 +1525,20 @@ pub async fn report_hierarchical_outcome(
             });
         }
     }
+    // Migration 221's limits on the report row (backlog 9928b61f).
+    if let Some(key) = request.idempotency_key.as_deref() {
+        epigraph_db::repos::validate_outcome_idempotency_key(key)
+            .map_err(|message| ApiError::BadRequest { message })?;
+    }
+    if request.outcome_details.len() > epigraph_db::repos::workflow::OUTCOME_DETAILS_MAX_BYTES {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "`outcome_details` is {} bytes; the limit is {}",
+                request.outcome_details.len(),
+                epigraph_db::repos::workflow::OUTCOME_DETAILS_MAX_BYTES
+            ),
+        });
+    }
 
     // Embed the goal for affinity matching, best-effort and BEFORE the
     // transaction so embedder latency stays out of the row lock. Blank goals and
@@ -1540,13 +1555,7 @@ pub async fn report_hierarchical_outcome(
         .filter(|g| !g.is_empty() && *g != "hierarchical");
     let goal_embedding_pgvec = match (goal_to_embed, state.embedding_service()) {
         (Some(goal), Some(embedder)) => match embedder.generate(goal).await {
-            Ok(vec) => Some(format!(
-                "[{}]",
-                vec.iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
+            Ok(vec) => Some(epigraph_db::pgvector_literal(&vec)),
             Err(e) => {
                 tracing::warn!(workflow_id = %workflow_id, "hierarchical goal embedding failed: {e}");
                 None
@@ -1563,89 +1572,51 @@ pub async fn report_hierarchical_outcome(
         .write_as(&viewer, "report_hierarchical_outcome")
         .await?;
 
-    // 1. Confirm this is a hierarchical workflow root, and lock its row so two
-    //    concurrent reports cannot both read `use_count = n` and write `n + 1`.
-    let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
-            .bind(workflow_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("workflows lookup failed: {e}"),
-            })?;
-    let not_found = || ApiError::NotFound {
-        entity: "hierarchical workflow".into(),
-        id: workflow_id.to_string(),
-    };
-    let mut metadata = match row {
-        Some((m,)) => m,
-        None => return Err(not_found()),
-    };
-    // A caller that does not read the PLAN (its `workflows` row, which
-    // carries the plan's tenancy since migration 183, and at least one STEP
-    // `executes` edge; a visible thesis, phase or shared atom does not count)
-    // is answered 404 exactly like a missing id, before any write. Shared with
-    // MCP. On this stamped transaction the row lookup above already hides a
-    // row the caller does not read; the predicate states the rule itself.
-    if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, &viewer, workflow_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("workflow visibility check failed: {e}"),
-        })?
-    {
-        return Err(not_found());
-    }
-
-    // 2. Compute deltas
+    // 1-3. Lock the workflow row so two concurrent reports cannot both read
+    //      `use_count = n` and write `n + 1`, answer a caller that does not
+    //      read the PLAN (its `workflows` row, which carries the plan's tenancy
+    //      since migration 183, and at least one STEP `executes` edge; a
+    //      visible thesis, phase or shared atom does not count) 404 exactly
+    //      like a missing id before any write, and move the counters. One
+    //      repository function, shared with MCP (backlog c34a0643).
     let success = request.success;
-    let variance = request.step_executions.as_ref().map_or(0.0, |steps| {
-        if steps.is_empty() {
-            0.0
-        } else {
-            let dev = steps.iter().filter(|s| s.deviated).count();
-            dev as f64 / steps.len() as f64
+    let variance = epigraph_db::repos::hierarchical_outcome_variance(
+        request.step_executions.iter().flatten().map(|s| s.deviated),
+    );
+    //      A repeated idempotency key is answered with the first report's
+    //      stored result, and nothing is written (backlog 9928b61f).
+    let counters = match epigraph_db::WorkflowRepository::record_hierarchical_outcome(
+        &mut tx,
+        &viewer,
+        workflow_id,
+        success,
+        variance,
+        request.idempotency_key.as_deref(),
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("workflow outcome counters failed: {e}"),
+    })? {
+        epigraph_db::HierarchicalOutcomeRecord::NotFound => {
+            return Err(ApiError::NotFound {
+                entity: "hierarchical workflow".into(),
+                id: workflow_id.to_string(),
+            })
         }
-    });
-    let quality = request.quality.unwrap_or(if success { 1.0 } else { 0.0 });
-
-    // 3. Update metadata counters
-    let use_count = metadata
-        .get("use_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + 1;
-    let success_count = metadata
-        .get("success_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + i64::from(success);
-    let failure_count = metadata
-        .get("failure_count")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        + i64::from(!success);
-    let prev_avg_var = metadata
-        .get("avg_variance")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    let avg_variance = if use_count > 0 {
-        (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64
-    } else {
-        variance
+        epigraph_db::HierarchicalOutcomeRecord::Replayed { report_id, result } => {
+            tx.commit().await.map_err(|e| ApiError::InternalError {
+                message: format!("outcome commit failed: {e}"),
+            })?;
+            return Ok(Json(hierarchical_outcome_response(
+                workflow_id,
+                report_id,
+                &result,
+                true,
+            )));
+        }
+        epigraph_db::HierarchicalOutcomeRecord::Recorded(counters) => counters,
     };
-    metadata["use_count"] = serde_json::json!(use_count);
-    metadata["success_count"] = serde_json::json!(success_count);
-    metadata["failure_count"] = serde_json::json!(failure_count);
-    metadata["avg_variance"] = serde_json::json!(avg_variance);
-
-    sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
-        .bind(&metadata)
-        .bind(workflow_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("metadata update failed: {e}"),
-        })?;
+    let quality = request.quality.unwrap_or(if success { 1.0 } else { 0.0 });
 
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
     //    restricted to level=2 (steps), in PLAN order, through the caller's
@@ -1702,12 +1673,39 @@ pub async fn report_hierarchical_outcome(
         }
     }
 
+    // 6. The report's own row (migration 221): what it said and what it
+    //    produced, so a retry with its key is answered from it. Same
+    //    transaction: a refused row rolls back the counters and every step row.
+    let result = epigraph_db::HierarchicalOutcomeResult {
+        counters,
+        variance,
+        step_executions_written: request.step_executions.as_ref().map_or(0, Vec::len),
+        unresolved_step_indices: unresolved,
+    };
+    let report_id = epigraph_db::WorkflowRepository::insert_hierarchical_outcome_report(
+        &mut tx,
+        &viewer,
+        epigraph_db::NewHierarchicalOutcomeReport {
+            workflow_id,
+            idempotency_key: request.idempotency_key.as_deref(),
+            success,
+            quality: Some(quality),
+            run_label: None,
+            outcome_details: &request.outcome_details,
+            result: &result,
+        },
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("outcome report write failed: {e}"),
+    })?;
+
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("outcome commit failed: {e}"),
     })?;
 
-    let warning = epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning(&unresolved);
-    if warning.is_some() {
+    let unresolved = &result.unresolved_step_indices;
+    if !unresolved.is_empty() {
         // Every unattributed row is logged, the all-invisible case included;
         // the old guard (`!step_claim_ids.is_empty()`) kept that case silent.
         tracing::warn!(
@@ -1719,19 +1717,45 @@ pub async fn report_hierarchical_outcome(
         );
     }
 
+    Ok(Json(hierarchical_outcome_response(
+        workflow_id,
+        report_id,
+        &result,
+        false,
+    )))
+}
+
+/// The hierarchical outcome route's answer, built from the report's
+/// transport-neutral result: the same shape for a fresh report and for an
+/// idempotent replay (`idempotent_replay: true`), so a retry that crosses
+/// transports reads the same fields.
+#[cfg(feature = "db")]
+fn hierarchical_outcome_response(
+    workflow_id: Uuid,
+    report_id: Uuid,
+    result: &epigraph_db::HierarchicalOutcomeResult,
+    replayed: bool,
+) -> serde_json::Value {
+    let c = result.counters;
     let mut response = serde_json::json!({
         "workflow_id": workflow_id,
-        "use_count": use_count,
-        "success_count": success_count,
-        "failure_count": failure_count,
-        "variance": variance,
+        "report_id": report_id,
+        "idempotent_replay": replayed,
+        "use_count": c.use_count,
+        "success_count": c.success_count,
+        "failure_count": c.failure_count,
+        "avg_variance": c.avg_variance,
+        "variance": result.variance,
+        "step_executions_written": result.step_executions_written,
         // The rows written with a NULL step_claim_id, in request order.
-        "unresolved_step_indices": unresolved,
+        "unresolved_step_indices": result.unresolved_step_indices,
     });
-    if let Some(w) = warning {
+    if let Some(w) = epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning(
+        &result.unresolved_step_indices,
+    ) {
         response["warning"] = serde_json::Value::String(w);
     }
-    Ok(Json(response))
+    response
 }
 
 /// POST /api/v1/workflows/steps/:id/evolve — atomically evolve a step claim.
@@ -1866,8 +1890,11 @@ pub async fn evolve_step(
     // step lineage, checked for the SAME principal the step is authored as,
     // on the act's own transaction and before it, so a refusal writes nothing.
     let grants = require_api_lineage_authority(&mut tx, &auth, &viewer, agent, parent_id).await?;
+    // The step edge is attested at INSERT with the API's own key (backlog
+    // dae795f8), `None` when this API has none configured.
     let result = epigraph_db::ClaimRepository::evolve_step_conn(
         &mut tx,
+        state.edge_signing_key(),
         epigraph_core::ClaimId::from_uuid(parent_id),
         &req.content,
         &req.edge_type,
@@ -1977,6 +2004,20 @@ pub async fn evolve_step(
         Some((_, None, status)) => (Some(status), Some(Default::default())),
         None => (None, None),
     };
+
+    // The new step is a current claim with no vector: embed it post-commit,
+    // best-effort, on the caller's stamp, as the ingest routes above embed
+    // theirs (CLAUDE.md "Embedding policy"; backlog 7628ab2c).
+    if let Some(embedder) = state.embedding_service() {
+        embed_inserted_workflow_claims(
+            &state,
+            &viewer,
+            embedder.as_ref(),
+            "workflows/steps/evolve",
+            &[(result.new_claim_id, req.content.clone())],
+        )
+        .await;
+    }
 
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
@@ -2249,7 +2290,7 @@ pub async fn record_behavioral_execution(
     let mut embedded = false;
     if let Some(embedder) = state.embedding_service() {
         if let Ok(vec) = embedder.generate(&body.goal_text).await {
-            embedding_pgvec = Some(format_embedding(&vec));
+            embedding_pgvec = Some(epigraph_db::pgvector_literal(&vec));
             embedded = true;
         }
     }
@@ -2421,6 +2462,7 @@ pub async fn ingest_workflow(
     let mut decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let (mut tx, result) = execute_admitted_ingest(
         tx,
+        state.edge_signing_key(),
         auth,
         &viewer,
         &plan,
@@ -2430,7 +2472,14 @@ pub async fn ingest_workflow(
     )
     .await?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
-    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
+    record_api_authorship(
+        &mut tx,
+        state.edge_signing_key(),
+        viewer.principal(),
+        &created,
+        "workflow_ingest",
+    )
+    .await?;
     record_workflow_submitter(
         &mut tx,
         auth,
@@ -2456,7 +2505,7 @@ pub async fn ingest_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     // `embed: false` (OD-6) sends no text to the embedder at all.
     let embedder = if embed.unwrap_or(true) && !result.already_ingested {
-        state.embedding_service()
+        state.storing_embedding_service()
     } else {
         None
     };
@@ -2667,7 +2716,7 @@ async fn embed_inserted_workflow_claims(
     let mut vectors: Vec<(Uuid, String)> = Vec::with_capacity(inserted.len());
     for (claim_id, content) in inserted {
         match embedder.generate(content).await {
-            Ok(embedding) => vectors.push((*claim_id, format_embedding(&embedding))),
+            Ok(embedding) => vectors.push((*claim_id, epigraph_db::pgvector_literal(&embedding))),
             Err(e) => {
                 tracing::warn!(claim_id = %claim_id, route = route, error = %e, "Failed to generate embedding for ingested workflow claim");
             }
@@ -2757,18 +2806,6 @@ async fn store_workflow_goal_embedding(
     }
 }
 
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
 /// Fire `auto_wire_edge_if_epistemic` for each plan edge the executor newly
 /// inserted. Best-effort (the helper logs and swallows individual failures).
 /// Source-claim agent attribution is handled by the engine helper via
@@ -2824,27 +2861,6 @@ async fn auto_wire_inserted_edges(
              no edge-factor BBA until a recompute reaches them"
         );
     }
-}
-
-// ── Internal types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    truth_value: Option<f64>,
-    properties: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowContentRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    content: String,
-    truth_value: Option<f64>,
-    properties: Option<serde_json::Value>,
 }
 
 // ── add_step / delete_step ──────────────────────────────────────────────────
@@ -3367,19 +3383,22 @@ async fn require_api_workflow_authority(
 /// transaction, before the act. Returns each workflow with its grant, for
 /// [`record_api_lineage_writes`].
 ///
-/// # Accepted residual: the lineage split (operator ruling R-21)
+/// # A workflow the caller cannot see
 ///
 /// The workflow set is read on the caller's RLS-bound transaction, so it holds
 /// only the workflows whose `executes` edge (and lineage member) the caller
-/// can see. A group-private workflow outside the caller's groups that executes
-/// the same lineage is therefore not in the set and is not authority-checked.
-/// Every claim of a lineage takes its parent's tenancy at `evolve_step` and an
-/// `executes` edge takes its step's, so this needs a lineage whose members were
-/// split across tenancies; the ruling ACCEPTS that residual rather than moving
-/// the read into a privileged (definer) frame. Stated on
-/// `WorkflowRepository::workflows_executing_step_lineage` and in the MCP
-/// `evolve_step` tool description, whose twin
-/// (`tools/evolve_step.rs::require_lineage_authority`) shares it.
+/// can see. Since migration 219 an `executes` edge also takes its PLAN's
+/// tenancy, so a group plan reusing a public step is invisible to a
+/// non-member, edge and all; a lineage whose members were split across
+/// tenancies hid a plan the same way before. The gate therefore also reads
+/// `WorkflowRepository::step_lineage_executors` (219's definer: the same set,
+/// read unfiltered, for the server only) and runs [`workflow_authority`] on
+/// every workflow the caller's own read did not find, exactly as on the rest:
+/// its arms are unchanged (a row the caller cannot read yields no submitter
+/// on the caller's stamp, so only the audited admin arm can admit there, as
+/// before 219). Any refusal over such a workflow is the missing-parent answer,
+/// even over a row the caller can read, so no answer names it. The MCP twin
+/// (`tools/evolve_step.rs::require_lineage_authority`) does the same.
 #[cfg(feature = "db")]
 async fn require_api_lineage_authority(
     conn: &mut sqlx::PgConnection,
@@ -3403,7 +3422,21 @@ async fn require_api_lineage_authority(
         entity: "Claim".into(),
         id: parent.to_string(),
     };
-    let mut grants = Vec::with_capacity(workflows.len());
+    // Since migration 219 such a workflow's `executes` edge is hidden from the
+    // caller too, so `workflows` above does not hold it: the definer returns
+    // the whole set, unfiltered, to the server.
+    let every = epigraph_db::WorkflowRepository::step_lineage_executors(&mut *conn, parent)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!(
+                "evolve_step: could not read every workflow executing the step's lineage: {e}"
+            ),
+        })?;
+    let hidden: Vec<Uuid> = every
+        .into_iter()
+        .filter(|w| !workflows.contains(w))
+        .collect();
+    let mut grants = Vec::with_capacity(workflows.len() + hidden.len());
     for workflow in workflows {
         let grant = workflow_authority(
             &mut *conn,
@@ -3414,6 +3447,26 @@ async fn require_api_lineage_authority(
             &not_found,
         )
         .await?;
+        grants.push((workflow, grant));
+    }
+    // A workflow the caller did not find: the same arms, but EVERY refusal is
+    // the missing-parent answer, even over a row the caller can read (a
+    // public plan whose edge onto a hidden lineage member is hidden), so the
+    // answer never names it.
+    for workflow in hidden {
+        let grant = workflow_authority(
+            &mut *conn,
+            Some(auth),
+            viewer,
+            Some(caller),
+            workflow,
+            &not_found,
+        )
+        .await
+        .map_err(|e| match e {
+            e @ ApiError::InternalError { .. } => e,
+            _ => not_found(),
+        })?;
         grants.push((workflow, grant));
     }
     Ok(grants)
@@ -3465,10 +3518,13 @@ async fn record_api_lineage_writes(
 /// `epigraph_ingest_executor::record_caller_authorship` call): one `AUTHORED`
 /// edge from the acting principal to each claim this request CREATED, on its
 /// own (caller-stamped) transaction; the claims are the caller's too. A
-/// request with no principal records nothing (it names no agent).
+/// request with no principal records nothing (it names no agent). Each edge
+/// is attested at INSERT by `key`, the API's own signing key, when one is
+/// configured.
 #[cfg(feature = "db")]
 async fn record_api_authorship(
     conn: &mut sqlx::PgConnection,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     acting: Option<Uuid>,
     created: &[Uuid],
     route: &str,
@@ -3476,7 +3532,7 @@ async fn record_api_authorship(
     let Some(acting) = acting else {
         return Ok(());
     };
-    epigraph_ingest_executor::record_caller_authorship(conn, acting, created, route)
+    epigraph_ingest_executor::record_caller_authorship(conn, key, acting, created, route)
         .await
         .map(|_| ())
         .map_err(|e| ApiError::InternalError {
@@ -3588,9 +3644,12 @@ async fn workflow_ingest_submitter(
 ///
 /// Takes the route's caller-stamped transaction and hands it back, so the
 /// walk and the check run on it and the route goes on to record and commit.
+/// `key` (the API's own signing key) attests every edge the walk inserts.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn execute_admitted_ingest<'s>(
     mut tx: epigraph_db::ScopedTx<'s>,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     viewer: &epigraph_db::Viewer,
     plan: &epigraph_ingest::common::plan::IngestPlan,
@@ -3607,7 +3666,7 @@ async fn execute_admitted_ingest<'s>(
     let mut admitted: Option<Uuid> = None;
     let result = loop {
         match epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-            &mut tx, plan, extraction, viewer, declared, admitted,
+            &mut tx, key, plan, extraction, viewer, declared, admitted,
         )
         .await
         {
@@ -3766,6 +3825,7 @@ pub async fn add_step(
         require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
+        state.edge_signing_key(),
         author,
         &req.canonical_name,
         &req.step_text,
@@ -3774,7 +3834,14 @@ pub async fn add_step(
     .await
     .map_err(map_step_err)?;
     if r.claim_created {
-        record_api_authorship(&mut tx, auth.agent_id, &[r.step_claim_id], "add_step").await?;
+        record_api_authorship(
+            &mut tx,
+            state.edge_signing_key(),
+            auth.agent_id,
+            &[r.step_claim_id],
+            "add_step",
+        )
+        .await?;
     }
     if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
         let details = serde_json::json!({
@@ -4649,6 +4716,104 @@ mod tests {
                 .await
                 .unwrap();
         (metadata, rows)
+    }
+
+    /// POST `body` as `auth`, answering the status and the JSON body.
+    async fn post_outcome_as(
+        app: axum::Router,
+        workflow_id: uuid::Uuid,
+        body: serde_json::Value,
+        auth: crate::middleware::bearer::AuthContext,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                    ))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .extension(auth)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Backlog 9928b61f, HTTP twin: a retry with the same `idempotency_key`
+    /// from the same caller counts the run once and is answered with the
+    /// first report (`idempotent_replay: true`, same `report_id`); the same
+    /// key from ANOTHER caller is that caller's own report. `outcome_details`
+    /// is stored. On the old code the retry moved `use_count` to 2.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_replays_a_retried_idempotency_key(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-idempotent-http").await;
+        let reporter = outcome_reporter();
+        let mut body = two_step_body(None);
+        body["idempotency_key"] = serde_json::json!("http-run-1");
+        body["outcome_details"] = serde_json::json!("all gates green");
+
+        let (status, first) =
+            post_outcome_as(app.clone(), workflow_id, body.clone(), reporter.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["idempotent_replay"], serde_json::json!(false));
+        let (status, retry) =
+            post_outcome_as(app.clone(), workflow_id, body.clone(), reporter.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{retry}");
+        assert_eq!(
+            retry["idempotent_replay"],
+            serde_json::json!(true),
+            "{retry}"
+        );
+        assert_eq!(retry["report_id"], first["report_id"]);
+        assert_eq!(retry["use_count"], serde_json::json!(1));
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 1, "{metadata}");
+        assert_eq!(rows, 2, "the retry must write no step row");
+
+        let (status, other) = post_outcome_as(app, workflow_id, body, outcome_reporter()).await;
+        assert_eq!(status, StatusCode::OK, "{other}");
+        assert_eq!(
+            other["idempotent_replay"],
+            serde_json::json!(false),
+            "another caller's key is its own report: {other}"
+        );
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 2, "{metadata}");
+        assert_eq!(rows, 4);
+
+        let details: Vec<String> = sqlx::query_scalar(
+            "SELECT outcome_details FROM workflow_outcome_reports WHERE workflow_id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(details, vec!["all gates green", "all gates green"]);
+    }
+
+    /// A blank key is refused 400 before anything is written.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_refuses_a_blank_idempotency_key(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-blank-key-http").await;
+        let mut body = two_step_body(None);
+        body["idempotency_key"] = serde_json::json!("  ");
+        assert_eq!(
+            post_outcome(app, workflow_id, body).await,
+            StatusCode::BAD_REQUEST
+        );
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(metadata.get("use_count").is_none(), "{metadata}");
+        assert_eq!(rows, 0);
     }
 
     /// U033 / I229, HTTP twin: a step row the database refuses fails the
