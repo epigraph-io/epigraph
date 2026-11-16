@@ -2989,6 +2989,34 @@ restart.
   no migration on main or on an origin branch carries a `227`. **Deploy
   order:** none; no binary depends on it. **Applied to throwaway databases
   only, NOT to any deployed database.**
+- **228**: public `mass_functions_locality_tag_width` (backlog 01807a57).
+  Widens 045's `mass_functions.locality_tag` from `varchar(20)` to
+  `varchar(64)`: the engine-named `intra_methodological_overlap` (28
+  characters) failed the INSERT with 22001, which `submit_ds_evidence`
+  reported as an internal error. Bounded, not `text`; the MCP surface refuses
+  a longer stored tag as `invalid_params` before the write
+  (`epigraph_mcp::tools::ds::LOCALITY_TAG_MAX_CHARS`, the same number).
+  The widening is binary-coercible, so neither the table nor
+  `idx_mass_functions_locality_tag` is rewritten. PostgreSQL refuses ALTER
+  COLUMN TYPE on a column a trigger's WHEN reads, so 184's
+  `mass_functions_retracted_rewrite_guard` is dropped and re-created around
+  the ALTER with 184's definition verbatim. No function, grant, policy or
+  index changes. Pinned by
+  `epigraph-db/tests/mass_function_locality_tag_width.rs` (the 28-character
+  tag stores at 228 and fails below it, 65 characters still fails, the
+  trigger definition is identical to 184's and still refuses RT07, and the
+  undo) and `epigraph-mcp/tests/locality_tag_width.rs`. Undo:
+  `docs/runbooks/228-undo.sql` (tested: run twice, it returns the column to
+  `varchar(20)` with the trigger intact; it refuses, writing nothing, while a
+  row holds a tag over 20 characters). A retracted row cannot be re-tagged
+  (184) and is removed only by 194's purge, so once a retracted row holds a
+  tag over 20 characters 228 is forward-only. Checked before claiming: slot 228 is
+  this batch's assignment, and no migration on main or any origin branch
+  carries a `228`. **Deploy order:** migrate first; a 228 binary running on an
+  unmigrated database still gets 22001 (an internal error) for a 21-64
+  character tag, as today, and nothing else changes. Undo only after rolling
+  the 228 binary back. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

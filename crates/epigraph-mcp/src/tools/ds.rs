@@ -231,7 +231,7 @@ pub async fn submit_ds_evidence(
     } else {
         "unknown"
     };
-    // A tag that is STORED must fit the column (`varchar(20)`, migration 045).
+    // A tag that is STORED must fit the column (`varchar(64)`, migration 228).
     // A longer one used to reach the INSERT and come back as a redacted
     // internal error with nothing written, so this refusal changes no call
     // that succeeds today; a tag sent without `evidence_type` is dropped, not
@@ -868,14 +868,16 @@ fn locality_tag_warning(
 }
 
 /// The longest `mass_functions.locality_tag` the column stores, in
-/// characters: it is `varchar(20)` (migration 045). A longer tag is a
-/// database error at write time, so write paths refuse it up front. A column
-/// width, not a belief parameter: it lives here, outside the belief fold
-/// modules the literal ratchet scans.
-const LOCALITY_TAG_MAX_CHARS: usize = 20;
+/// characters: it is `varchar(64)` (migration 228, which widened 045's
+/// `varchar(20)` so `intra_methodological_overlap` fits). A longer tag is a
+/// database error at write time, so write paths that take a caller's tag
+/// refuse it up front. A column width, not a belief parameter: it lives here,
+/// outside the belief fold modules the literal ratchet scans.
+const LOCALITY_TAG_MAX_CHARS: usize = 64;
 
 /// Refuse a `locality_tag` that would be stored but cannot fit the column
-/// ([`LOCALITY_TAG_MAX_CHARS`], counted in characters as `varchar` does).
+/// ([`LOCALITY_TAG_MAX_CHARS`], counted in characters as `varchar` does), as a
+/// parameter error naming the limit.
 fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
     let max = LOCALITY_TAG_MAX_CHARS;
     let len = stored.chars().count();
@@ -1355,18 +1357,23 @@ mod tests {
         assert!(w.contains("ignored") && w.contains("evidence_type"), "{w}");
     }
 
-    /// A stored tag longer than the `varchar(20)` column is refused as a
-    /// parameter error naming the limit; 20 characters (or 20 multi-byte
-    /// characters, which is more than 20 bytes) still pass.
+    /// Backlog 01807a57: a stored tag longer than the `varchar(64)` column
+    /// (migration 228) is refused as a parameter error naming the limit; 64
+    /// characters, or 64 multi-byte characters (more than 64 bytes), pass,
+    /// and so does the engine-named 28-character tag 045's column refused.
     #[test]
     fn an_over_long_stored_locality_tag_is_refused_by_characters() {
         assert!(check_stored_locality_tag_len("unknown").is_ok());
-        assert!(check_stored_locality_tag_len(&"a".repeat(20)).is_ok());
-        assert!(check_stored_locality_tag_len(&"é".repeat(20)).is_ok());
-        let err = check_stored_locality_tag_len("intra_methodological_overlap")
-            .expect_err("28 characters");
+        assert!(check_stored_locality_tag_len("intra_methodological_overlap").is_ok());
+        assert!(check_stored_locality_tag_len(&"a".repeat(64)).is_ok());
+        assert!(check_stored_locality_tag_len(&"\u{e9}".repeat(64)).is_ok());
+        let err = check_stored_locality_tag_len(&"a".repeat(65)).expect_err("65 characters");
         assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-        assert!(err.message.contains("28 characters") && err.message.contains("20"));
+        assert!(
+            err.message.contains("65 characters") && err.message.contains("64"),
+            "{}",
+            err.message
+        );
     }
 
     /// Backlog 2fe81d61: on the write path an unparseable focal key became the

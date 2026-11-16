@@ -1449,7 +1449,7 @@ pub struct SubmitDsEvidenceParams {
                        apply no locality discount. Any other tag is stored as given, combined with NO \
                        discount unless it begins with 'intra' (case-sensitive in the cached belief; a \
                        perspective-scoped read lowercases it), and reported in the response's \
-                       unknown_locality_tag and warnings. A stored tag longer than 20 characters is \
+                       unknown_locality_tag and warnings. A stored tag longer than 64 characters is \
                        refused. Only consulted when `evidence_type` is also supplied — otherwise ignored \
                        (with a warning) and the BBA is stored with locality_tag='unknown'. Default: 'unknown'."
     )]
