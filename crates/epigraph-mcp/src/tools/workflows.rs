@@ -634,7 +634,7 @@ async fn matching_workflow(
     let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
         &mut *tx,
         caller_viewer,
-        &format_pgvector(qvec),
+        &epigraph_db::pgvector_literal(qvec),
         0.3,
         10,
     )
