@@ -465,10 +465,13 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// leaves, not a fold of the BBAs that sit on it, so no recompute that
 /// resolves its owner through
 /// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite it.
-/// Writers that fold a named frame directly (for example the post-removal
-/// recompute of `backfill_factors`' edge re-wire, or the per-write
-/// `recompute_claim_belief_on_frame` callers) do not pass through this check;
-/// they are moved onto the single atom-cache writer separately.
+/// MCP `submit_ds_evidence` and `POST /api/v1/frames/:id/evidence` resolve
+/// the owner here too, and refold only when the posted frame is the owner
+/// (backlog d33a5c9f). Other writers that fold a named frame directly (for
+/// example the post-removal recompute of `backfill_factors`' edge re-wire, or
+/// the remaining per-write `recompute_claim_belief_on_frame` callers) do not
+/// pass through this check; they are moved onto the single atom-cache writer
+/// separately.
 ///
 /// A procedural node (every root above it is a workflow thesis authored by the
 /// registered `workflow-ingest` system agent) is no compound and keeps today's
@@ -1812,13 +1815,29 @@ impl MassFunctionRepository {
     /// **A compound has no owner** ([`super::claim_role::IS_COMPOUND_SQL`]):
     /// its belief is a query over its leaves, so no recompute that resolves its
     /// owner here (the three bulk recomputers and the `routes::assess`
-    /// refresh) refolds the BBAs that sit on it into its cache. Writers that
-    /// fold a named frame directly are not covered. A procedural node (one
+    /// refresh, and the two evidence writers, MCP `submit_ds_evidence` and
+    /// `POST /api/v1/frames/:id/evidence`, which refold only when the posted
+    /// frame is the owner) refolds the BBAs that sit on it into its cache.
+    /// Other writers that fold a named frame directly are not covered. A
+    /// procedural node (one
     /// whose every root is a workflow thesis authored by the registered
     /// `workflow-ingest` system agent, [`super::claim_role::IS_PROCEDURAL_SQL`])
     /// keeps the rules below.
     ///
-    /// Among the frames holding the claim's remaining inputs:
+    /// **A frame with a cache-admissible input outranks one without**
+    /// (backlog 8d720490 (1)). Admissibility is the fold's own
+    /// rule ([`super::derivation_scope::cache_admissible_predicate`]: every
+    /// source of the row at least as widely readable as the claim), so the
+    /// owner is never a frame whose every input the fold would drop while
+    /// another frame has one it keeps. Before this, `binary_truth` holding only
+    /// narrowed inputs still owned the cache, so the claim kept a fold of the
+    /// narrowed evidence and was neither refolded from its admissible input
+    /// nor vacated (the vacate is claim-wide). When NO input is admissible the
+    /// order below decides as before, and the owner frame's fold is then the
+    /// vacate.
+    ///
+    /// Then, among the frames holding the claim's remaining inputs (the
+    /// admissible ones, when there are any):
     ///
     /// 1. the frame named `binary_truth`, when the claim has an input on it;
     /// 2. else the frame named `claim_validity`, when the claim has an input on it;
@@ -1831,6 +1850,11 @@ impl MassFunctionRepository {
     /// frame each (migration 114 treats the frame named `binary_truth` the same
     /// way). No other frame name plays a part.
     ///
+    /// The rest of this paragraph holds among frames of the SAME admissibility:
+    /// the admissible-first key above is applied before rules 1-4, so a frame
+    /// that gains the claim's only admissible input takes the cache from a
+    /// recorded or canonical owner whose inputs are all inadmissible.
+    ///
     /// Once a claim's cache has an owner, a later input on another non-canonical
     /// frame does not move it (rule 3): `belief_frame_id` is written only by the
     /// claim's owner or by migration 114's definer, which keeps the recorded
@@ -1839,15 +1863,73 @@ impl MassFunctionRepository {
     /// replaces its own BBA ([`Self::store_with_perspective`]'s upsert), so it
     /// decides only a claim with no recorded owner, or one whose recorded owner
     /// no longer holds an input. A canonical frame still outranks the recorded
-    /// owner as soon as the claim has an input on it.
+    /// owner as soon as the claim has an input on it of the same admissibility.
     ///
     /// Read-only: no frame is created.
+    ///
+    /// A widening act (publicize, share with a team) does not use this rule:
+    /// it keeps the recorded owner, see [`Self::cache_owner_frame_keeping_recorded`].
     #[instrument(skip(executor, viewer))]
     pub async fn cache_owner_frame_for_claim<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<Uuid>, DbError> {
+        Self::resolve_cache_owner_frame(executor, viewer, claim_id, false).await
+    }
+
+    /// The cache-owner frame for a claim whose audience an act has just
+    /// WIDENED (`epigraph_engine::visibility_act`: publicize, share with a
+    /// team): the frame the cache records (`claims.belief_frame_id`), while
+    /// that frame still holds a combine input under the same exclusions as
+    /// [`Self::cache_owner_frame_for_claim`]; else what that rule elects.
+    ///
+    /// The cached value is the recorded frame's fold under the OLD audience,
+    /// so the question a widening asks is whether THAT frame's inputs may
+    /// reach the new audience (backlog 31285392): when none may, the cache is
+    /// vacated under the same owner, not re-elected to another frame. The
+    /// admissible-first key of [`Self::cache_owner_frame_for_claim`] (backlog
+    /// 8d720490 (1)) would otherwise hand the cache, inside the act, to a
+    /// frame whose input happens to move with the claim, and serve the new
+    /// audience a fold the old one never had. That key still decides the
+    /// claim's next ordinary recompute, and it decides here too when the
+    /// claim records no owner (or its recorded owner holds no input any more).
+    /// A compound still has no owner.
+    ///
+    /// Read-only: no frame is created.
+    #[instrument(skip(executor, viewer))]
+    pub async fn cache_owner_frame_keeping_recorded<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        Self::resolve_cache_owner_frame(executor, viewer, claim_id, true).await
+    }
+
+    /// The one owner query behind [`Self::cache_owner_frame_for_claim`] and
+    /// [`Self::cache_owner_frame_keeping_recorded`]. `keep_recorded` puts the
+    /// recorded owner (`claims.belief_frame_id`) ahead of every other key;
+    /// the candidate rows and exclusions are the same either way.
+    async fn resolve_cache_owner_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        keep_recorded: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        let recorded_first = if keep_recorded {
+            r#"CASE
+                       WHEN mf.frame_id = (
+                           SELECT rc.belief_frame_id
+                           FROM claims rc
+                           WHERE rc.id = $1
+                             /* {VISIBILITY:rc} */
+                       ) THEN 0
+                       ELSE 1
+                     END,
+                     "#
+        } else {
+            ""
+        };
         let sql = viewer.splice(
             &with_frozen_compound_excluded(&with_ingest_template_excluded(
                 &with_cached_combination_excluded(
@@ -1860,7 +1942,14 @@ impl MassFunctionRepository {
               /* {NOT_INGEST_TEMPLATE} */
               /* {NOT_FROZEN_COMPOUND} */
               /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
-            ORDER BY CASE
+            ORDER BY {RECORDED_FIRST}CASE
+                       WHEN EXISTS (
+                           SELECT 1 FROM claims ac
+                           WHERE ac.id = mf.claim_id AND {CACHE_ADMISSIBLE}
+                       ) THEN 0
+                       ELSE 1
+                     END,
+                     CASE
                        WHEN f.name = 'binary_truth' THEN 0
                        WHEN f.name = 'claim_validity' THEN 1
                        WHEN mf.frame_id = (
@@ -1876,7 +1965,12 @@ impl MassFunctionRepository {
             LIMIT 1
             "#,
                     "mf.",
-                ),
+                )
+                .replace(
+                    "{CACHE_ADMISSIBLE}",
+                    &super::derivation_scope::cache_admissible_predicate("mf", "ac"),
+                )
+                .replace("{RECORDED_FIRST}", recorded_first),
                 "mf.",
                 "f.",
             )),

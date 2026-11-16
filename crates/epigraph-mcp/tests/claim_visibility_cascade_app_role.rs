@@ -26,7 +26,10 @@
 //!   full ignorance after the act, not the old `binary_truth` fold. Pinned for
 //!   publicize (a BBA on evidence left behind) and for share (an edge-factor
 //!   BBA from a home-private source claim, through an edge the team cannot
-//!   read). An ordinary recompute leaves such a cache as it was.
+//!   read). The widening keeps the recorded owner
+//!   (`cache_owner_frame_keeping_recorded`); the claim's NEXT ordinary
+//!   recompute applies the admissible-first owner rule (8d720490) and refolds
+//!   the cache from `claim_validity`.
 //! * the refold fails closed: an operated agent whose session does not itself
 //!   write the target team is refused, and nothing moves.
 
