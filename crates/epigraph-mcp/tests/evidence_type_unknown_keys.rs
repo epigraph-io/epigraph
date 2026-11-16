@@ -375,10 +375,12 @@ async fn submit_ds_evidence_reports_an_unknown_or_ignored_locality_tag(pool: PgP
     assert_eq!(stored_locality(&pool, c).await, "unknown");
 }
 
-/// A stored `locality_tag` longer than the `varchar(20)` column used to reach
-/// the INSERT and fail as a redacted internal error. It is now refused as a
-/// parameter error before anything is written; the same tag sent without
-/// `evidence_type` is dropped, not stored, so it still succeeds.
+/// A stored `locality_tag` longer than the column (`varchar(64)` since
+/// migration 228) used to reach the INSERT and fail as a redacted internal
+/// error. It is now refused as a parameter error before anything is written;
+/// the same tag sent without `evidence_type` is dropped, not stored, so it
+/// still succeeds. (A 28-character tag now fits; `locality_tag_width.rs` pins
+/// that side.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_over_long_stored_locality_tag_is_a_parameter_error(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -388,20 +390,26 @@ async fn an_over_long_stored_locality_tag_is_a_parameter_error(pool: PgPool) {
         .unwrap();
 
     let c = insert_claim(&pool, "86ee2d30 over-long locality").await;
+    let over_long = format!("intra_{}", "methodological_overlap_".repeat(3));
+    assert_eq!(
+        over_long.chars().count(),
+        75,
+        "longer than the 64-character column"
+    );
     let p = serde_json::from_value(serde_json::json!({
         "claim_id": c.to_string(),
         "frame_id": frame.to_string(),
         "hypothesis_index": 0,
         "masses": {"0": 0.7, "0,1": 0.3},
         "evidence_type": "empirical",
-        "locality_tag": "intra_methodological_overlap",
+        "locality_tag": over_long,
     }))
     .unwrap();
     let err = tools::ds::submit_ds_evidence(&server, &viewer, p, None)
         .await
-        .expect_err("a 28-character stored tag cannot fit varchar(20)");
+        .expect_err("a 75-character stored tag cannot fit varchar(64)");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
-    assert!(err.message.contains("20"), "{err:?}");
+    assert!(err.message.contains("64"), "{err:?}");
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
         .bind(c)
         .fetch_one(&pool)
@@ -409,14 +417,6 @@ async fn an_over_long_stored_locality_tag_is_a_parameter_error(pool: PgPool) {
         .unwrap();
     assert_eq!(rows, 0, "a refusal writes nothing");
 
-    let out = submit_with_locality(
-        &server,
-        &viewer,
-        c,
-        frame,
-        None,
-        "intra_methodological_overlap",
-    )
-    .await;
+    let out = submit_with_locality(&server, &viewer, c, frame, None, &over_long).await;
     assert_eq!(stored_locality(&pool, c).await, "unknown", "{out}");
 }
