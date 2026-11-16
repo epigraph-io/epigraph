@@ -690,6 +690,31 @@ pub async fn list_claims_query(
     // viewer is a unit and nothing reads it.
     let _ = &viewer;
 
+    // ---- Refuse the parameters this arm cannot honour ----
+    //
+    // The in-memory store has no themes, no keyset walk and no edges. Dropping
+    // the keys would answer the unfiltered set for `theme_id` and page 1 again
+    // for `after`, each as if honoured: the same silent drop the `db` arm's
+    // `UNHONORED_LABEL_FILTERS` refuses.
+    for (field, given) in [
+        ("theme_id", params.theme_id.is_some()),
+        (
+            "after",
+            params.after.as_deref().is_some_and(|a| !a.is_empty()),
+        ),
+        ("include_links", params.include_links == Some(true)),
+    ] {
+        if given {
+            return Err(ApiError::ValidationError {
+                field: field.to_string(),
+                reason: format!(
+                    "`{field}` needs the database; this build serves claims from an \
+                     in-memory store that cannot honour it"
+                ),
+            });
+        }
+    }
+
     // ---- Validate and normalize pagination ----
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
@@ -1410,6 +1435,38 @@ mod tests {
     }
 
     // ---- Additional validation tests ----
+
+    #[tokio::test]
+    async fn test_db_only_params_are_refused_not_dropped() {
+        let state = AppState::new(ApiConfig::default());
+        insert_test_claim(&state, "a claim", 0.5);
+        for (query, field) in [
+            (format!("theme_id={}", uuid::Uuid::new_v4()), "theme_id"),
+            ("after=k1.0.whatever".to_string(), "after"),
+            ("include_links=true".to_string(), "include_links"),
+        ] {
+            let request = Request::builder()
+                .uri(format!("/api/v1/claims?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = test_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(body.contains(field), "{query}: {body}");
+        }
+        // Absent or off, they change nothing.
+        for query in ["include_links=false", "after="] {
+            let request = Request::builder()
+                .uri(format!("/api/v1/claims?{query}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = test_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+        }
+    }
 
     #[tokio::test]
     async fn test_invalid_truth_min_returns_400() {
